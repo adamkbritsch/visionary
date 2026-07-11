@@ -1,0 +1,22 @@
+{
+  "_readme": "Copy to ~/.topaz-pipeline/config.json (chmod 600) and fill in. Every key also has a TOPAZ_* env-var override — see README 'Configuration'. Keys marked optional can be deleted.",
+
+  "ftp_hosts": ["100.x.y.z", "mynas.local"],
+  "ftp_port": 21,
+  "ftp_user": "<nas-ftp-user>",
+  "ftp_pass": "<nas-ftp-password>",
+
+  "plex_url": "http://<nas-host>:32400",
+  "plex_token": "<your X-Plex-Token>",
+  "plex_tv_section": "",
+  "plex_movie_section": "",
+
+  "tmdb_api_key": "",
+
+  "youtarr_url": "",
+  "youtarr_user": "",
+  "youtarr_pass": "",
+  "youtube_client_id": "",
+  "youtube_client_secret": "",
+  "youtube_refresh_token": ""
+}

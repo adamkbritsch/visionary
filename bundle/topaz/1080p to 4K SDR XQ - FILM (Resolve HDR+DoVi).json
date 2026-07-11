@@ -1,0 +1,106 @@
+{
+    "date": "Sat Jun 13 14:00:00 2026 GMT-0600",
+    "editable": true,
+    "enabled": true,
+    "name": "1080p to 4K SDR XQ - FILM (Resolve HDR+DoVi)",
+    "outputSettings": {
+        "active": true,
+        "appendModelNameForIS": false,
+        "audioBitrate": 320,
+        "audioCodec": "PCM",
+        "audioMode": 1,
+        "createOutputDir": true,
+        "dynamicBitrateOn": false,
+        "encoderId": "prores-422-xq-osx",
+        "extension": "mov",
+        "includeAlphaChannelEnabled": false,
+        "includeAlphaChannelOn": false,
+        "keepFrameNumber": true,
+        "keepOriginalFileNameForIS": false,
+        "lutFilepath": "",
+        "startFrameNumber": 0,
+        "videoBitrate": 40
+    },
+    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K SDR XQ - FILM (Resolve HDR+DoVi).json",
+    "saveOutputSettings": true,
+    "settings": {
+        "enhance": {
+            "active": true,
+            "addNoise": 0,
+            "auto": 2,
+            "compress": 5,
+            "deblur": 0,
+            "dehalo": 4,
+            "denoise": 0,
+            "detail": 0,
+            "fieldOrder": 0,
+            "focusFixLevel": "Off",
+            "model": "prob-4",
+            "recoverOriginalDetailValue": 50,
+            "sharpen": 0,
+            "videoType": 1,
+            "isSecondEnhancement": false
+        },
+        "grain": {
+            "active": false,
+            "grain": 5,
+            "grainSize": 2
+        },
+        "hdr": {
+            "active": false,
+            "auto": 0,
+            "exposure": 0,
+            "fieldOrder": 0,
+            "hdrOutputTRC": 0,
+            "model": "hyp-1",
+            "saturation": 0,
+            "sdrInflectionPoint": 0.75,
+            "videoType": 1
+        },
+        "motionblur": {
+            "active": false,
+            "modelName": "thm-2"
+        },
+        "output": {
+            "active": true,
+            "cropToFit": false,
+            "customResolutionPriority": 1,
+            "height": "2160",
+            "lockAspectRatio": true,
+            "outSizeMethod": 9,
+            "outputPAR": 0
+        },
+        "secondEnhance": {
+            "active": false,
+            "addNoise": 0,
+            "auto": 0,
+            "compress": 0,
+            "deblur": 0,
+            "dehalo": 0,
+            "denoise": 0,
+            "detail": 0,
+            "fieldOrder": 0,
+            "focusFixLevel": "Off",
+            "model": "iris-3",
+            "recoverOriginalDetailValue": 20,
+            "sharpen": 0,
+            "videoType": 1
+        },
+        "slowmo": {
+            "active": false,
+            "duplicate": true,
+            "duplicateThreshold": 10,
+            "factor": 1,
+            "model": "apo-8"
+        },
+        "stabilize": {
+            "active": false,
+            "method": 1,
+            "reduceMotion": false,
+            "reduceMotionIteration": 2,
+            "rsc": false,
+            "smooth": 50
+        }
+    },
+    "veaiversion": "7.0.1"
+}

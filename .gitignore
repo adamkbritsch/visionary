@@ -1,0 +1,28 @@
+# --- secrets & local machine config — NEVER commit -------------------------
+config.json
+.env
+*.secret
+
+# --- build outputs / local state -------------------------------------------
+Visionary.app/
+Archive/
+*.tgz
+*.tar.gz
+*.log
+.deploy-dockbar.log
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- macOS / editors ---------------------------------------------------------
+.DS_Store
+*.swp
+*.bak
+.idea/
+.vscode/

@@ -1,0 +1,11 @@
+# Install for the SYSTEM python3 — the app launches the engine with /usr/bin/python3:
+#   /usr/bin/python3 -m pip install --user -r requirements.txt
+# (If pip is missing: /usr/bin/python3 -m ensurepip --user first.)
+#
+# opencv-python powers the DaVinci Resolve UI automation (template matching in
+# engine/dv_shim.py). numpy comes with it. Everything else in the engine is stdlib.
+opencv-python
+numpy
+
+# NOT needed on the Mac: `plexapi` is only used by the OPTIONAL NAS-side tool in
+# resolver/ (see resolver/README.md) — install it on the NAS, not here.

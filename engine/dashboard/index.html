@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overnight Upscaler</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1b2230; --border:#232b36; --border2:#2b3442;
+    --txt:#e6edf3; --muted:#8b949e; --faint:#6e7681;
+    --accent:#39b6e8; --green:#3fb950; --amber:#d29922; --red:#f85149; --violet:#a371f7; --pink:#db61a2;
+    --radius:14px; --shadow:0 1px 0 rgba(255,255,255,.03), 0 8px 24px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:linear-gradient(180deg,#0e141c,#0d1117);
+    color:var(--txt); font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased; padding:22px; max-width:1100px; margin:0 auto;
+  }
+  .ic{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
+  .ic.sm{width:15px;height:15px}.ic.lg{width:22px;height:22px}
+  code,.mono{font-family:ui-monospace,Menlo,monospace}
+  /* header */
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:14px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:13px}
+  .logo{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(160deg,var(--accent),var(--violet));color:#06121a;box-shadow:var(--shadow)}
+  .brand h1{font-size:17px;margin:0;letter-spacing:.2px;font-weight:650}
+  .brand .sub{color:var(--muted);font-size:12px;margin-top:1px}
+  .pills{display:flex;align-items:center;gap:9px;flex-wrap:wrap;justify-content:flex-end}
+  .pill{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--border);padding:7px 12px;border-radius:999px;color:var(--muted);font-size:12.5px;font-weight:500}
+  .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+  .pill.off{color:#e8c98c;border-color:#3a2f17;background:rgba(210,153,34,.08)}.pill.off .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .pill.good .dot{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .pill.bad{color:#f0a9a4}.pill.bad .dot{background:var(--red)}
+  /* notice */
+  .notice{display:flex;align-items:center;gap:14px;border:1px solid #3a2f17;background:linear-gradient(110deg,rgba(210,153,34,.12),transparent 70%);border-radius:var(--radius);padding:15px 18px;margin-bottom:16px;box-shadow:var(--shadow)}
+  .notice .ico{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;background:rgba(210,153,34,.14);color:var(--amber);border:1px solid #3a2f17;flex:0 0 auto}
+  .notice .ttl{font-weight:650;font-size:14.5px}
+  .notice .meta{color:var(--muted);font-size:12.5px;margin-top:2px}
+  .notice.armed{border-color:#1d3a26;background:linear-gradient(110deg,rgba(63,185,80,.12),transparent 72%)}
+  .notice.armed .ico{background:rgba(63,185,80,.14);color:var(--green);border-color:#1d3a26}
+  #statusPill{cursor:pointer;user-select:none;transition:border-color .15s,background .15s}
+  #statusPill:hover{border-color:var(--faint)}
+  .issues{display:flex;align-items:flex-start;gap:14px;border:1px solid #4a2222;background:linear-gradient(110deg,rgba(248,81,73,.10),transparent 70%);border-radius:var(--radius);padding:13px 18px;margin-bottom:16px}
+  .issues .ico{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;background:rgba(248,81,73,.14);color:var(--red);border:1px solid #4a2222;flex:0 0 auto}
+  .issues .ttl{font-weight:650;font-size:14px}
+  .issues .meta{color:var(--muted);font-size:11px;margin-top:4px;font-family:ui-monospace,Menlo,monospace;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+  .nprog{margin-top:9px}
+  .nprog-bar{height:7px;border-radius:4px;background:rgba(255,255,255,.08);overflow:hidden}
+  .nprog-bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--green));transition:width .6s ease}
+  .nprog-txt{color:var(--muted);font-size:11.5px;margin-top:5px;font-variant-numeric:tabular-nums}
+  /* cards / layout */
+  .grid{display:grid;grid-template-columns:1.3fr 1fr;gap:16px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:17px 18px;box-shadow:var(--shadow);margin-bottom:16px}
+  .card h2{font-size:11.5px;letter-spacing:.10em;text-transform:uppercase;color:var(--faint);margin:0 0 14px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .card h2 .hint{margin-left:auto;text-transform:none;letter-spacing:0;color:var(--faint);font-weight:500;font-size:11px}
+  .grid .card{margin-bottom:0}
+  /* pipeline flow */
+  .flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+  .stage{flex:1 1 0;min-width:172px;background:var(--panel2);border:1px solid var(--border2);border-radius:12px;padding:13px 13px 12px;display:flex;flex-direction:column;gap:7px}
+  .stage .top{display:flex;align-items:center;gap:9px}
+  .stage .si{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;border:1px solid var(--border2)}
+  .stage .nm{font-weight:650;font-size:13.5px}
+  .stage .no{margin-left:auto;color:var(--faint);font-size:11px;font-weight:600}
+  .stage .desc{color:var(--muted);font-size:11.5px;line-height:1.4}
+  .stage .how{color:var(--faint);font-size:10.5px;font-family:ui-monospace,Menlo,monospace;line-height:1.4}
+  .stage .tag{align-self:flex-start;margin-top:auto}
+  .conn{flex:0 0 22px;display:grid;place-items:center;color:var(--faint)}
+  .s1 .si{background:rgba(57,182,232,.12);color:var(--accent);border-color:#1c3b48}
+  .s2 .si{background:rgba(163,113,247,.12);color:var(--violet);border-color:#332749}
+  .s3 .si{background:rgba(219,97,162,.12);color:var(--pink);border-color:#43243a}
+  .s4 .si{background:rgba(210,153,34,.12);color:var(--amber);border-color:#3a2f17}
+  .s5 .si{background:rgba(63,185,80,.12);color:var(--green);border-color:#1d3a26}
+  /* tags */
+  .tag{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:650;padding:3px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--faint);letter-spacing:.02em}
+  .tag .d{width:6px;height:6px;border-radius:50%;background:currentColor}
+  .tag.ok{color:#7fd594;border-color:#1d3a26;background:rgba(63,185,80,.07)}
+  .tag.built{color:#8fc7e6;border-color:#1c3b48;background:rgba(57,182,232,.07)}
+  /* current series picker */
+  .series-top{display:flex;align-items:center;gap:13px;flex-wrap:wrap;margin-bottom:13px}
+  .sel-wrap{display:flex;align-items:center;gap:10px;background:var(--panel2);border:1px solid var(--border2);border-radius:10px;padding:9px 13px;flex:1 1 260px;position:relative}
+  .sel-wrap::after{content:"";position:absolute;right:14px;width:8px;height:8px;border-right:1.6px solid var(--faint);border-bottom:1.6px solid var(--faint);transform:rotate(45deg) translateY(-2px);pointer-events:none}
+  .sel-wrap select{flex:1;background:transparent;border:0;color:var(--txt);font:inherit;font-weight:650;font-size:14px;outline:none;cursor:pointer;-webkit-appearance:none;appearance:none;padding-right:18px}
+  .sel-wrap select:disabled{color:var(--muted);cursor:default}
+  .sel-wrap select option{background:#10151c;color:var(--txt)}
+  .series-stats{display:flex;gap:8px;flex-wrap:wrap}
+  .series-next{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:9px;min-height:18px;margin-bottom:11px}
+  .series-next b{color:var(--txt);font-weight:650}
+  .series-next .badge{font-family:ui-monospace,Menlo,monospace;font-size:11px;font-weight:700;color:#7fd594;background:rgba(63,185,80,.08);border:1px solid #1d3a26;padding:2px 8px;border-radius:6px}
+  .series-bar{height:7px;background:var(--panel2);border:1px solid var(--border2);border-radius:99px;overflow:hidden}
+  .series-bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--green),#62d67c);border-radius:99px;transition:width .45s ease}
+  .series-note{color:var(--faint);font-size:11.5px;margin-top:10px;display:flex;align-items:center;gap:7px}
+  /* readiness rows */
+  .row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border)}
+  .row:last-child{border-bottom:0}
+  .row .k{display:flex;align-items:center;gap:10px;color:var(--txt)}
+  .row .k .ck{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;border:1px solid var(--border);background:var(--panel2);color:var(--faint)}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:4px 11px;border-radius:99px;border:1px solid var(--border);color:var(--muted)}
+  .chip .d{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .chip.yes{color:#7fd594;border-color:#1d3a26;background:rgba(63,185,80,.07)}
+  .chip.no{color:#f0a9a4;border-color:#43221f;background:rgba(248,81,73,.06)}
+  .chip.neutral{color:var(--faint)}
+  .ck.yes{color:var(--green);border-color:#1d3a26}.ck.no{color:var(--red);border-color:#43221f}
+  /* key-values */
+  .kv{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)}
+  .kv:last-child{border-bottom:0}.kv .k{color:var(--muted);display:flex;align-items:center;gap:8px}
+  .kv .v{font-weight:600;font-variant-numeric:tabular-nums}
+  .v.good{color:var(--green)}.v.acc{color:var(--accent)}.v.bad{color:var(--red)}
+  /* spec list (how-it-works) */
+  .spec{display:flex;flex-direction:column}
+  .spec-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:10px 0;border-bottom:1px solid var(--border)}
+  .spec-row:last-child{border-bottom:0}
+  .spec-k{color:var(--txt);font-weight:600;font-size:12.5px;display:flex;align-items:center;gap:8px}
+  .spec-k .si{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;border:1px solid var(--border);background:var(--panel2);color:var(--accent)}
+  .spec-v{color:var(--muted);font-size:12.5px;line-height:1.5}
+  .spec-v b{color:var(--txt);font-weight:600}
+  .spec-v .note{color:var(--amber)}
+  .spec-v code{color:#a9c7da;background:rgba(57,182,232,.08);padding:1px 5px;border-radius:5px;font-size:11.5px}
+  @media(max-width:640px){.spec-row{grid-template-columns:1fr;gap:4px}}
+  /* lifecycle */
+  .life{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+  .lc{font-size:11px;font-weight:600;font-family:ui-monospace,Menlo,monospace;color:var(--muted);background:var(--panel2);border:1px solid var(--border2);padding:4px 9px;border-radius:7px}
+  .lc.io{color:#8fc7e6;border-color:#1c3b48}
+  .lc.cpu{color:#c4a6f5;border-color:#332749}
+  .lc.dlv{color:#7fd594;border-color:#1d3a26}
+  .life .arr{color:var(--faint);font-size:11px}
+  .life .err{color:#f0a9a4;border-color:#43221f;background:rgba(248,81,73,.05)}
+  /* drive + outputs */
+  .drive{display:flex;align-items:center;gap:13px;margin-bottom:12px}
+  .drive .disk{width:42px;height:42px;border-radius:11px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--border);color:var(--accent)}
+  .drive .nm{font-weight:650;font-size:14.5px}
+  .drive .pth{color:var(--faint);font-size:11px;font-family:ui-monospace,Menlo,monospace;margin-top:2px;word-break:break-all}
+  .out-row{display:flex;align-items:center;gap:11px;padding:9px 0;border-bottom:1px solid var(--border)}
+  .out-row:last-child{border-bottom:0}
+  .out-row .oi{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;border:1px solid var(--border);background:var(--panel2);flex:0 0 auto}
+  .out-row .onm{font-size:12px;word-break:break-all;line-height:1.35}
+  .out-row .osz{margin-left:auto;color:var(--muted);font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .out-row .master .oi{color:var(--green)} .out-row .render .oi{color:var(--pink)}
+  .empty{color:var(--faint);font-size:12.5px;padding:6px 2px}
+  /* settings */
+  .set-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(195px,1fr));gap:13px}
+  .set-item{background:var(--panel2);border:1px solid var(--border2);border-radius:11px;padding:12px 13px}
+  .set-lbl{font-weight:600;font-size:13px}
+  .set-sub{color:var(--faint);font-size:11px;margin:3px 0 9px;line-height:1.4}
+  .inp{background:var(--bg);border:1px solid var(--border2);color:var(--txt);border-radius:8px;padding:7px 9px;font:inherit;font-size:13px;width:100%}
+  .inp:focus{outline:none;border-color:var(--accent)}
+  .inp-row{display:flex;align-items:center;gap:8px}.set-unit{color:var(--muted);font-size:12px}
+  .tog{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--muted)}
+  .tog input{width:16px;height:16px;accent-color:var(--green)}
+  .prof{margin-top:16px;border-top:1px solid var(--border);padding-top:15px}
+  .prof-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .prof-sub{color:var(--muted);font-size:12px;margin:6px 0 12px;line-height:1.45}
+  .prof-show{color:var(--accent);font-weight:600}
+  .prof-pick{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
+  .prof-sel{display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:var(--muted);min-width:230px}
+  .prof-desc{flex:1;min-width:200px;color:var(--muted);font-size:12px;line-height:1.45;padding-top:20px}
+  .prof-actions{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+  .btn{background:linear-gradient(160deg,var(--accent),var(--violet));color:#06121a;border:none;border-radius:9px;padding:9px 15px;font:inherit;font-weight:650;font-size:13px;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)}
+  .prof-note{color:var(--green);font-size:12px}
+  footer{color:var(--faint);font-size:11.5px;margin-top:6px;display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}
+  footer code{color:var(--muted)}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}.conn{display:none}.stage{min-width:0;flex:1 1 46%}.stage.active{flex-basis:100%}}
+  /* pipeline: collapsed to titles; full info as a hover popover (no layout shift) */
+  .stage{position:relative;cursor:default;transition:border-color .18s,background .18s}
+  .stage:hover{border-color:#3a4554;background:#1f2735;border-bottom-left-radius:0;border-bottom-right-radius:0;z-index:6}
+  .stage .caret{margin-left:8px;color:var(--faint);transition:transform .2s ease;flex:0 0 auto}
+  .stage:hover .caret{transform:rotate(180deg);color:var(--muted)}
+  .stage .detail{position:absolute;left:0;right:0;top:100%;z-index:6;background:#1f2735;border:1px solid #3a4554;border-top:0;border-radius:0 0 12px 12px;box-shadow:0 14px 28px rgba(0,0,0,.45);padding:0 13px;opacity:0;visibility:hidden;transform:translateY(-5px);transition:opacity .16s ease,transform .16s ease,visibility .16s}
+  .stage:hover .detail{opacity:1;visibility:visible;transform:translateY(0);padding:11px 13px 13px}
+  .stage .detail-inner{display:flex;flex-direction:column;gap:7px}
+  /* keep collapsed siblings short (don't stretch to the active one); align connectors to the title row */
+  .flow{align-items:flex-start}
+  .conn{align-self:flex-start;margin-top:20px}
+  /* the CURRENT (running) stage: highlighted, blown up, full info inline + live progress */
+  .stage.active{flex-grow:2.4;border-color:var(--accent);background:linear-gradient(165deg,rgba(57,182,232,.12),var(--panel2));animation:activePulse 2.4s ease-in-out infinite}
+  .stage.active .nm{font-size:15.5px}
+  .stage.active .si{background:rgba(57,182,232,.2);color:var(--accent);border-color:var(--accent)}
+  .stage.active .no{color:var(--accent)}
+  .stage.active .caret{display:none}
+  .stage.active .detail{position:static;opacity:1;visibility:visible;transform:none;border:0;box-shadow:none;background:transparent;padding:0;margin-top:12px}
+  .stage.active .desc{color:var(--txt);font-size:12.5px}
+  @keyframes activePulse{0%,100%{box-shadow:0 0 0 1px rgba(57,182,232,.45),0 10px 26px rgba(57,182,232,.12)}50%{box-shadow:0 0 0 1px rgba(57,182,232,.7),0 14px 32px rgba(57,182,232,.24)}}
+  .livedot{width:8px;height:8px;border-radius:50%;background:var(--accent);margin-left:9px;display:none;animation:livePulse 1.6s ease-out infinite}
+  .stage.active .livedot{display:inline-block}
+  @keyframes livePulse{0%{box-shadow:0 0 0 0 rgba(57,182,232,.55)}70%{box-shadow:0 0 0 7px rgba(57,182,232,0)}100%{box-shadow:0 0 0 0 rgba(57,182,232,0)}}
+  /* series picker locked while the pipeline is armed */
+  .series-lock{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:#e8c98c;background:rgba(210,153,34,.08);border:1px solid #3a2f17;padding:5px 11px;border-radius:99px}
+  #seriesCard.locked .sel-wrap{opacity:.65}
+  /* topaz profile: collapses to a one-line summary once the show is set */
+  .prof-set{display:flex;align-items:center;gap:13px;flex-wrap:wrap;background:var(--panel2);border:1px solid var(--border2);border-radius:11px;padding:13px 15px}
+  .prof-set .pchk{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:rgba(63,185,80,.12);color:var(--green);border:1px solid #1d3a26;flex:0 0 auto}
+  .prof-set .ptxt{flex:1;min-width:170px;color:var(--muted);font-size:13px}
+  .prof-set .ppreset{color:var(--violet);font-weight:650}
+  .prof-change{background:transparent;border:1px solid var(--border2);color:var(--muted);border-radius:8px;padding:8px 14px;font:inherit;font-weight:600;font-size:12.5px;cursor:pointer}
+  .prof-change:hover{border-color:var(--faint);color:var(--txt)}
+  /* collapsible technical ("how it works") sections — reference only */
+  .tech-toggle{margin-bottom:16px}
+  .tech-btn{width:100%;display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:14px 17px;font:inherit;cursor:pointer;box-shadow:var(--shadow);text-align:left}
+  .tech-btn:hover{border-color:var(--border2)}
+  .tech-btn .ti{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--border2);color:var(--accent);flex:0 0 auto}
+  .tech-btn .tt{font-weight:650;font-size:13.5px;color:var(--txt)}
+  .tech-btn .ts{font-size:11.5px;color:var(--faint);margin-top:1px}
+  .tech-btn .tcaret{margin-left:auto;color:var(--faint);transition:transform .2s ease;flex:0 0 auto}
+  .tech-btn.open .tcaret{transform:rotate(180deg)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M17 9h4M3 15h4M17 15h4"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-drive" viewBox="0 0 24 24"><rect x="3" y="13" width="18" height="6" rx="2"/><path d="M6 13l3-8h6l3 8M8 16h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 13l4-4"/><path d="M3 17a9 9 0 1 1 18 0"/></symbol>
+  <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 21h14"/></symbol>
+  <symbol id="i-ul" viewBox="0 0 24 24"><path d="M12 21V9m0 0 4 4m-4-4-4 4"/><path d="M5 3h14"/></symbol>
+  <symbol id="i-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
+  <symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8l1.4 1.4M17.8 6.2l1.4-1.4"/><path d="m3 21 9-9M12.2 6.2 10.8 4.8"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 17l9 5 9-5"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-paint" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="8.5" cy="9.5" r="1.2"/><circle cx="15.5" cy="9.5" r="1.2"/><circle cx="9" cy="15" r="1.2"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r=".6" fill="currentColor"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="18" r="2"/></symbol>
+  <symbol id="i-cut" viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M8.5 7.5 20 18M8.5 16.5 20 6"/></symbol>
+  <symbol id="i-route" viewBox="0 0 24 24"><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h6a4 4 0 0 0 0-8H10a4 4 0 0 1 0-8h6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3Z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+</svg>
+
+<header>
+  <div class="brand">
+    <div class="logo"><svg class="ic lg" style="stroke:#06121a"><use href="#i-film"/></svg></div>
+    <div><h1>Overnight Upscaler</h1><div class="sub">1080p &rarr; 4K Dolby Vision &middot; NAS&ndash;to&ndash;NAS, processed locally overnight</div></div>
+  </div>
+  <div class="pills">
+    <span class="pill off" id="statusPill" onclick="toggleAutomation()" title="Arm / disarm tonight's run"><span class="dot"></span>Loading&hellip;</span>
+    <span class="pill" id="pwrPill"><svg class="ic sm"><use href="#i-power"/></svg><span data-pwr>&mdash;</span></span>
+    <span class="pill" id="winPill"><svg class="ic sm"><use href="#i-clock"/></svg><span data-win>&mdash;</span></span>
+  </div>
+</header>
+
+<section class="notice" id="notice">
+  <div class="ico"><svg class="ic lg"><use href="#i-lock" data-notice-icon/></svg></div>
+  <div style="flex:1;min-width:0">
+    <div class="ttl" data-notice-ttl>Automation off</div>
+    <div class="meta" data-notice-meta>Loading&hellip;</div>
+  </div>
+</section>
+
+<section class="issues" id="issues" style="display:none">
+  <div class="ico"><svg class="ic lg"><use href="#i-x"/></svg></div>
+  <div style="flex:1;min-width:0">
+    <div class="ttl">Recent issues <span class="hint" style="font-weight:500;color:var(--faint)">auto-logged &middot; full log at ~/.topaz-pipeline/logs/</span></div>
+    <div class="meta" data-issues></div>
+  </div>
+</section>
+
+<!-- THE PIPELINE -->
+<div class="card">
+  <h2><svg class="ic sm"><use href="#i-route"/></svg>The pipeline <span class="hint">one episode, processed serially &mdash; all heavy work on local scratch</span></h2>
+  <div class="flow">
+    <div class="stage s1" data-stage="download">
+      <div class="top"><div class="si"><svg class="ic sm"><use href="#i-dl"/></svg></div><div class="nm">Download</div><span class="livedot"></span><div class="no">1</div><svg class="ic sm caret"><use href="#i-chev"/></svg></div>
+      <div class="detail"><div class="detail-inner">
+        <div class="desc">Pull the 1080p source from the NAS to local scratch.</div>
+        <div class="how">FTP RETR &middot; size-verified</div>
+      </div></div>
+    </div>
+    <div class="conn"><svg class="ic sm"><use href="#i-route"/></svg></div>
+    <div class="stage s2" data-stage="topaz">
+      <div class="top"><div class="si"><svg class="ic sm"><use href="#i-chip"/></svg></div><div class="nm">Topaz</div><span class="livedot"></span><div class="no">2</div><svg class="ic sm caret"><use href="#i-chev"/></svg></div>
+      <div class="detail"><div class="detail-inner">
+        <div class="desc">Upscale 1080p &rarr; 4K (or clean an already-4K source). ProRes 4444 XQ, range preserved &mdash; never SDR&harr;HDR. Needs &ge;140&nbsp;W.</div>
+        <div class="how" data-topaz-how>per-show preset</div>
+        <div class="nprog" data-stage-prog style="display:none">
+          <div class="nprog-bar"><i data-sprog-fill></i></div>
+          <div class="nprog-txt" data-sprog-txt></div>
+        </div>
+      </div></div>
+    </div>
+    <div class="conn"><svg class="ic sm"><use href="#i-route"/></svg></div>
+    <div class="stage s3" data-stage="resolve">
+      <div class="top"><div class="si"><svg class="ic sm"><use href="#i-wand"/></svg></div><div class="nm">Resolve</div><span class="livedot"></span><div class="no">3</div><svg class="ic sm caret"><use href="#i-chev"/></svg></div>
+      <div class="detail"><div class="detail-inner">
+        <div class="desc">Scene-cut, Dolby Vision analyze, render mute master &mdash; HDR inherited from the project.</div>
+        <div class="how">H.265 Main10 &middot; DV Profile 8.1</div>
+      </div></div>
+    </div>
+    <div class="conn"><svg class="ic sm"><use href="#i-route"/></svg></div>
+    <div class="stage s4" data-stage="remux">
+      <div class="top"><div class="si"><svg class="ic sm"><use href="#i-layers"/></svg></div><div class="nm">Remux</div><span class="livedot"></span><div class="no">4</div><svg class="ic sm caret"><use href="#i-chev"/></svg></div>
+      <div class="detail"><div class="detail-inner">
+        <div class="desc">Fold the original audio + subtitles back onto the DV video.</div>
+        <div class="how">MP4Box, DV-preserving &middot; interleaved</div>
+      </div></div>
+    </div>
+    <div class="conn"><svg class="ic sm"><use href="#i-route"/></svg></div>
+    <div class="stage s5" data-stage="upload">
+      <div class="top"><div class="si"><svg class="ic sm"><use href="#i-ul"/></svg></div><div class="nm">Upload</div><span class="livedot"></span><div class="no">5</div><svg class="ic sm caret"><use href="#i-chev"/></svg></div>
+      <div class="detail"><div class="detail-inner">
+        <div class="desc">Push the finished master into the NAS Plex library.</div>
+        <div class="how">FTP STOR &middot; owner 1000:10</div>
+      </div></div>
+    </div>
+  </div>
+</div>
+
+<!-- CURRENT SERIES -->
+<div class="card" id="seriesCard">
+  <h2><svg class="ic sm"><use href="#i-film"/></svg>Current series <span class="hint">processed in order until you pick another</span></h2>
+  <div class="series-top">
+    <div class="sel-wrap">
+      <svg class="ic sm" style="color:var(--accent)"><use href="#i-list"/></svg>
+      <select id="seriesSelect" disabled><option>Loading series&hellip;</option></select>
+    </div>
+    <div class="series-stats" data-series-stats></div>
+    <span class="series-lock" data-series-lock style="display:none"><svg class="ic sm"><use href="#i-lock"/></svg>Locked &mdash; stop the run to change</span>
+  </div>
+  <div class="series-next" data-series-next><span style="color:var(--faint)">&mdash;</span></div>
+  <div class="series-bar"><i data-series-fill></i></div>
+  <div class="series-note" data-series-note><svg class="ic sm"><use href="#i-lock"/></svg>Selecting a series sets the work order &mdash; it starts at the first 1080p episode with no DV master and walks the series. Processing begins when you press Start.</div>
+</div>
+
+<!-- SETTINGS -->
+<div class="card" id="settingsCard">
+  <h2><svg class="ic sm"><use href="#i-sliders"/></svg>Settings <span class="hint">tune the run &amp; per-show upscale profiles</span></h2>
+  <div class="set-grid">
+    <div class="set-item">
+      <div class="set-lbl">Auto-stop</div>
+      <div class="set-sub">A run auto-ends at the next time below. Turn off to run until you stop it manually.</div>
+      <label class="tog"><input type="checkbox" id="setAuto" onchange="saveAuto()"><span>Stop automatically</span></label>
+      <input class="inp" type="time" id="setStop" value="09:00" onchange="saveStop()" style="margin-top:9px">
+    </div>
+    <div class="set-item">
+      <div class="set-lbl">Pause if battery drains on AC</div>
+      <div class="set-sub">Hold off when the power brick can&rsquo;t keep up under load.</div>
+      <label class="tog"><input type="checkbox" id="setDrain" onchange="saveDrain()"><span>Enabled</span></label>
+    </div>
+    <div class="set-item">
+      <div class="set-lbl">Re-check interval</div>
+      <div class="set-sub">How often to retry while paused (no power / no episode).</div>
+      <div class="inp-row"><input class="inp" type="number" id="setPoll" min="1" max="120" onchange="savePoll()"><span class="set-unit">min</span></div>
+    </div>
+  </div>
+
+  <div class="prof">
+    <div class="prof-head">
+      <div><svg class="ic sm" style="color:var(--violet)"><use href="#i-chip"/></svg> <b>Topaz upscale profile</b> &mdash; <span data-prof-show class="prof-show">&mdash;</span></div>
+      <span class="tag" data-prof-state><span class="d"></span>&mdash;</span>
+    </div>
+    <div class="prof-set" data-prof-set style="display:none">
+      <span class="pchk"><svg class="ic sm"><use href="#i-check"/></svg></span>
+      <div class="ptxt">This show is set to <span class="ppreset" data-prof-set-label>&mdash;</span> &mdash; every episode uses it.</div>
+      <button class="prof-change" onclick="editProfile()">Change preset</button>
+    </div>
+    <div data-prof-edit>
+      <div class="prof-sub">Match each show to ONE preset based on its content (which camera, or animation vs live-action). Every preset outputs range-preserving ProRes &mdash; Topaz never changes SDR&harr;HDR; DaVinci Resolve adds HDR + Dolby Vision afterward. Pick it once per show; it&rsquo;s saved and used for every episode.</div>
+      <div class="prof-pick">
+        <label class="prof-sel">Preset<select class="inp" id="pfPreset" onchange="onPresetPick()"></select></label>
+        <div class="prof-desc" data-prof-desc></div>
+      </div>
+      <div class="prof-actions">
+        <button class="btn" onclick="saveProfile()">Save preset for this show</button>
+        <span class="prof-note" data-prof-note></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2><svg class="ic sm"><use href="#i-check"/></svg>Readiness <span class="hint">would it run right now?</span></h2>
+    <div class="row" data-r="wall"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-power"/></svg></span>On wall power</div><span class="chip neutral">&mdash;</span></div>
+    <div class="row" data-r="power"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-bolt"/></svg></span>Power adequate (battery not draining)</div><span class="chip neutral">&mdash;</span></div>
+    <div class="row" data-r="scratch"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-drive"/></svg></span>Scratch volume connected</div><span class="chip neutral">&mdash;</span></div>
+    <div class="row" data-r="job"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-list"/></svg></span>Episode queued</div><span class="chip neutral">&mdash;</span></div>
+  </div>
+
+  <div class="card">
+    <h2><svg class="ic sm"><use href="#i-gauge"/></svg>Power &amp; gating</h2>
+    <div class="kv"><span class="k">Status</span><span class="v" data-pwr-state>&mdash;</span></div>
+    <div class="kv"><span class="k">Adapter</span><span class="v" data-pwr-watts>&mdash;</span></div>
+    <div class="kv"><span class="k">Battery</span><span class="v" data-pwr-cap>&mdash;</span></div>
+    <div class="kv"><span class="k">Current</span><span class="v" data-pwr-amp>&mdash;</span></div>
+    <div class="kv"><span class="k">Runs on</span><span class="v" style="color:var(--muted);font-weight:500;font-size:12.5px">AC + adequate power &middot; stops at the next stop-time</span></div>
+  </div>
+</div>
+
+
+<div class="grid">
+  <div class="card">
+    <h2><svg class="ic sm"><use href="#i-drive"/></svg>Scratch volume</h2>
+    <div class="drive">
+      <div class="disk"><svg class="ic lg"><use href="#i-drive"/></svg></div>
+      <div><div class="nm" data-scr-nm>&mdash;</div><div class="pth" data-scr-path>&mdash;</div></div>
+    </div>
+    <div class="kv"><span class="k">Connection</span><span class="v" data-scr-conn>&mdash;</span></div>
+    <div class="kv"><span class="k">Free space</span><span class="v" data-scr-free>&mdash;</span></div>
+    <div class="kv"><span class="k">Why internal</span><span class="v" style="color:var(--muted);font-weight:500;font-size:12px">2&nbsp;TB SSD was flaky &rarr; cold storage</span></div>
+  </div>
+
+  <div class="card">
+    <h2><svg class="ic sm"><use href="#i-list"/></svg>Episode lifecycle <span class="hint">idempotent &middot; resumable</span></h2>
+    <div class="life">
+      <span class="lc">PENDING</span><span class="arr">&rsaquo;</span>
+      <span class="lc io">DOWNLOAD</span><span class="arr">&rsaquo;</span>
+      <span class="lc cpu">UPSCALE</span><span class="arr">&rsaquo;</span>
+      <span class="lc cpu">SCENE&nbsp;CUT</span><span class="arr">&rsaquo;</span>
+      <span class="lc cpu">DV&nbsp;ANALYZE</span><span class="arr">&rsaquo;</span>
+      <span class="lc cpu">RENDER</span><span class="arr">&rsaquo;</span>
+      <span class="lc">REMUX</span><span class="arr">&rsaquo;</span>
+      <span class="lc dlv">VERIFIED</span><span class="arr">&rsaquo;</span>
+      <span class="lc io">UPLOAD</span><span class="arr">&rsaquo;</span>
+      <span class="lc dlv">CLEANED</span>
+    </div>
+    <div class="kv" style="margin-top:12px"><span class="k">On any error</span><span class="v bad">&rarr; QUARANTINED (with its log), continue next</span></div>
+  </div>
+</div>
+
+<!-- SCRATCH CONTENTS (live) -->
+<div class="card">
+  <h2><svg class="ic sm"><use href="#i-drive"/></svg>Scratch contents <span class="hint" data-out-count>&mdash;</span></h2>
+  <div data-outputs><div class="empty">Loading&hellip;</div></div>
+</div>
+
+<footer>
+  <span><svg class="ic sm" style="vertical-align:-3px"><use href="#i-film"/></svg> Live status &middot; automation off &middot; processing stays 100% local</span>
+  <span>updated <code data-gen>&mdash;</code></span>
+</footer>
+
+<script>
+function chip(el, ok, yes, no){
+  el.className = "chip " + (ok ? "yes" : "no");
+  el.innerHTML = '<span class="d"></span>' + (ok ? yes : no);
+}
+function setRow(key, ok, yes, no){
+  const row = document.querySelector('[data-r="'+key+'"]');
+  chip(row.querySelector(".chip"), ok, yes, no);
+  row.querySelector(".ck").className = "ck " + (ok ? "yes":"no");
+  row.querySelector(".ck use").setAttribute("href", ok ? "#i-check" : "#i-x");
+}
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function fmtBytes(b){ b = Number(b) || 0; if(b>=1e9) return (b/1e9).toFixed(2)+' GB'; if(b>=1e6) return Math.round(b/1e6)+' MB'; if(b>=1e3) return Math.round(b/1e3)+' KB'; return b+' B'; }
+function fmtTime(hhmm){ const [h,m]=String(hhmm).split(':').map(Number); const ap=h>=12?'PM':'AM'; const hr=h%12||12; return (m?hr+':'+String(m).padStart(2,'0'):hr)+' '+ap; }
+function fmtStop(st){ st=st||{}; return fmtTime((st.stop_hour??9)+':'+(st.stop_minute??0)); }
+async function refresh(){
+  let s; try { s = await (await fetch('/api/state')).json(); } catch(e){ return; }
+  const p = s.power, sc = s.scratch;
+  const sp = document.getElementById('statusPill');
+  const orch = s.orchestrator || {};
+  const autoStop = s.settings.auto_stop !== false;
+  const stop = orch.stop_at ? fmtTime(orch.stop_at) : fmtStop(s.settings);
+  const stopTxt = autoStop ? ("stops " + stop) : "no auto-stop";
+  sp.className = "pill " + (s.automation_enabled ? "good":"off");
+  sp.innerHTML = '<span class="dot"></span>' + (s.automation_enabled
+    ? (orch.running ? "Running · " + stopTxt + " · tap to stop"
+                    : "Started · " + stopTxt + " · tap to stop")
+    : (autoStop ? "Off · tap to start (runs to " + fmtStop(s.settings) + ")"
+                : "Off · tap to start (runs until stopped)"));
+  renderNotice(s.automation_enabled, orch, s.settings);
+  renderActiveStage(s.automation_enabled, orch);
+  document.querySelector('[data-pwr]').textContent =
+    (p.external_connected ? "Wall power" : "On battery") + (p.adapter_watts ? " · " + p.adapter_watts + " W" : "");
+  document.getElementById('pwrPill').className = "pill " + (p.adequate && p.external_connected ? "good":"bad");
+  document.querySelector('[data-win]').textContent = autoStop ? ((s.automation_enabled ? "Stops " : "Stop at ") + stop) : "No auto-stop";
+  document.getElementById('winPill').className = "pill " + (s.automation_enabled ? "good":"");
+  renderLog(s.log);
+  setRow("wall", p.external_connected, "Yes","No");
+  setRow("power", p.adequate, "Adequate","Draining");
+  setRow("scratch", sc.connected, "Connected","Disconnected");
+  setRow("job", !!s.job, "Queued","None");
+  const ps = document.querySelector('[data-pwr-state]');
+  ps.textContent = p.external_connected ? (p.adequate ? "Adequate" : "Battery draining") : "On battery";
+  ps.className = "v " + (p.external_connected && p.adequate ? "good" : "bad");
+  document.querySelector('[data-pwr-watts]').textContent = p.adapter_watts ? p.adapter_watts + " W" : "—";
+  document.querySelector('[data-pwr-cap]').textContent = p.capacity + "%" + (p.charging ? " (charging)" : "");
+  document.querySelector('[data-pwr-amp]').textContent = p.amperage_ma + " mA";
+  document.querySelector('[data-scr-nm]').textContent = sc.name + (sc.source === "fallback" ? " (fallback)" : "");
+  document.querySelector('[data-scr-path]').textContent = sc.path;
+  const conn = document.querySelector('[data-scr-conn]');
+  conn.textContent = sc.connected ? "Always mounted" : "Disconnected";
+  conn.className = "v " + (sc.connected ? "good":"bad");
+  document.querySelector('[data-scr-free]').textContent = (sc.free_gb!=null ? sc.free_gb + " GB free" : "—");
+  // scratch contents — a plain preview of what's in the topaz-scratch folder right now
+  const items = s.scratch_contents || [];
+  const host = document.querySelector('[data-outputs]');
+  document.querySelector('[data-out-count]').textContent = items.length ? items.length + " item" + (items.length>1?"s":"") : "";
+  if(!items.length){
+    host.innerHTML = '<div class="empty">Nothing in topaz-scratch right now.</div>';
+  } else {
+    host.innerHTML = items.map(it => {
+      const dir = !!it.is_dir;
+      return '<div class="out-row"><div class="oi"><svg class="ic sm"><use href="#'
+        + (dir ? "i-drive" : "i-film") + '"/></svg></div><div class="onm">' + esc(it.name) + '</div>'
+        + '<div class="osz">' + fmtBytes(it.bytes) + '</div></div>';
+    }).join("");
+  }
+  if(s.series) renderSeries(s.series.selected, s.series.queue, false);
+  // lock the series picker while the pipeline is armed — change only when stopped
+  const seriesSel = document.getElementById('seriesSelect');
+  if(seriesSel.dataset.ready === '1') seriesSel.disabled = s.automation_enabled;
+  document.getElementById('seriesCard').classList.toggle('locked', s.automation_enabled);
+  const lk = document.querySelector('[data-series-lock]');
+  if(lk) lk.style.display = s.automation_enabled ? 'inline-flex' : 'none';
+  document.querySelector('[data-gen]').textContent = s.generated_at;
+}
+// ---- automation toggle ----
+function renderNotice(armed, o, settings){
+  const note = document.getElementById('notice');
+  const icon = document.querySelector('[data-notice-icon]');
+  const ttl = document.querySelector('[data-notice-ttl]');
+  const meta = document.querySelector('[data-notice-meta]');
+  if(armed){
+    note.classList.add('armed');
+    icon.setAttribute('href', o.running ? '#i-bolt' : '#i-clock');
+    ttl.textContent = o.running ? ('Running' + (o.episode ? ' · ' + o.episode : '')) : 'Started';
+    meta.textContent = o.message || 'working…';
+  } else {
+    note.classList.remove('armed');
+    icon.setAttribute('href', '#i-lock');
+    ttl.textContent = 'Idle';
+    const autoStop = (settings||{}).auto_stop !== false;
+    meta.textContent = 'Tap “Start” to begin now — it runs on AC, walks the selected series episode by episode using that show’s preset, and ' + (autoStop ? ('auto-stops at the next ' + fmtStop(settings)) : 'runs until you stop it') + '. Every stage resumes where it left off.';
+  }
+}
+async function toggleAutomation(){
+  let on = false;
+  try { on = (await (await fetch('/api/state')).json()).automation_enabled; } catch(e){ return; }
+  try { await fetch('/api/automation', {method:'POST', headers:{'Content-Type':'application/json'},
+                                        body: JSON.stringify({enabled: !on})}); } catch(e){}
+  refresh();
+}
+// ---- current series ----
+function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+function prettySeries(s){ return s.length>54 ? s.slice(0,52)+'…' : s; }
+function epTitle(name){ if(!name) return ''; const m = name.match(/[sS]\d+[eE]\d+\s+(.+?)\s*\(/); return m ? m[1] : ''; }
+function renderSeries(selected, q, fromPicker){
+  const stats = document.querySelector('[data-series-stats]');
+  const nextEl = document.querySelector('[data-series-next]');
+  const fill = document.querySelector('[data-series-fill]');
+  if(!selected){ stats.innerHTML=''; nextEl.innerHTML='<span style="color:var(--faint)">No series selected — pick one above.</span>'; fill.style.width='0%'; return; }
+  if(!q){ if(fromPicker) nextEl.innerHTML='<span style="color:var(--faint)">Reading queue…</span>'; return; }
+  const total = q.done_count + q.remaining_count;
+  const pct = total ? Math.round(q.done_count/total*100) : 100;
+  stats.innerHTML = '<span class="tag built"><span class="d"></span>'+q.remaining_count+' to upscale</span>'
+                  + '<span class="tag ok"><span class="d"></span>'+q.done_count+' done</span>';
+  nextEl.innerHTML = q.next
+    ? '<span>Next up</span> <span class="badge">'+esc(q.next.ep)+'</span> <b>'+esc(epTitle(q.next.source_name))+'</b>'
+    : '<span style="color:var(--green)">Series complete — every source has a DV master.</span>';
+  fill.style.width = pct+'%';
+}
+async function fetchSeries(){
+  const sel = document.getElementById('seriesSelect');
+  let d; try{ d = await (await fetch('/api/series')).json(); }catch(e){ d=null; }
+  if(!d || !(d.series && d.series.length)){
+    sel.innerHTML = '<option>NAS unreachable</option>'; sel.disabled = true;
+    document.querySelector('[data-series-note]').innerHTML = '<svg class="ic sm"><use href="#i-x"/></svg>Can\'t reach the NAS to list series right now — works on the home network.';
+    return;
+  }
+  sel.disabled = false;
+  sel.dataset.ready = '1';
+  sel.innerHTML = '<option value="">— pick a series —</option>'
+    + d.series.map(x => '<option value="'+escAttr(x)+'"'+(x===d.selected?' selected':'')+'>'+esc(prettySeries(x))+'</option>').join('');
+  renderSeries(d.selected, d.queue, true);
+  refresh();
+}
+async function selectSeries(name){
+  if(!name) return;
+  const note = document.querySelector('[data-series-note]');
+  note.innerHTML = '<svg class="ic sm"><use href="#i-clock"/></svg>Setting series &amp; reading the queue…';
+  document.querySelector('[data-series-next]').innerHTML = '<span style="color:var(--faint)">Reading queue…</span>';
+  let d; try{ d = await (await fetch('/api/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({series:name})})).json(); }catch(e){ return; }
+  renderSeries(d.selected, d.queue, true);
+  note.innerHTML = '<svg class="ic sm"><use href="#i-check"/></svg>Work order set — first 1080p episode without a DV master, then down the series. Configure this show’s upscale profile below, then press Start.';
+  profEditing = false;
+  loadProfile();
+}
+// ---- settings ----
+async function loadSettings(){
+  let d; try{ d = await (await fetch('/api/settings')).json(); }catch(e){ return; }
+  const st = d.settings, on = st.auto_stop !== false;
+  document.getElementById('setAuto').checked = on;
+  document.getElementById('setStop').value = String(st.stop_hour).padStart(2,'0')+':'+String(st.stop_minute).padStart(2,'0');
+  document.getElementById('setStop').disabled = !on;
+  document.getElementById('setDrain').checked = !!st.pause_on_battery_drain;
+  document.getElementById('setPoll').value = st.poll_minutes;
+}
+async function postSettings(obj){ try{ await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }catch(e){} }
+async function saveAuto(){ const on=document.getElementById('setAuto').checked; document.getElementById('setStop').disabled=!on; await postSettings({auto_stop:on}); refresh(); }
+async function saveStop(){ const [h,m]=document.getElementById('setStop').value.split(':').map(Number); await postSettings({stop_hour:h,stop_minute:m}); refresh(); }
+function renderLog(lines){
+  const box = document.getElementById('issues');
+  if(!lines || !lines.length){ box.style.display='none'; return; }
+  box.style.display='flex';
+  document.querySelector('[data-issues]').textContent = lines.slice(-6).join('\n');
+}
+function renderActiveStage(armed, o){
+  // highlight + blow up the stage that's currently running; surface its live info there
+  const active = (armed && o.running) ? o.stage : null;
+  document.querySelectorAll('.stage').forEach(st =>
+    st.classList.toggle('active', st.dataset.stage === active));
+  const box = document.querySelector('[data-stage-prog]');
+  if(!box) return;
+  const pr = o.progress;
+  if(active === 'topaz' && pr && pr.stage === 'topaz'){
+    box.style.display = 'block';
+    const pct = pr.pct;
+    document.querySelector('[data-sprog-fill]').style.width = (pct!=null ? pct : 0) + '%';
+    const done = pr.ep_secs_done!=null ? Math.round(pr.ep_secs_done/60) : null;
+    const tot  = pr.ep_secs_total!=null ? Math.round(pr.ep_secs_total/60) : null;
+    const eta  = pr.eta_secs!=null ? Math.max(1, Math.round(pr.eta_secs/60)) : null;
+    let txt = 'Topaz upscale';
+    if(done!=null && tot!=null) txt += ' · ' + done + ' of ' + tot + ' min processed';
+    txt += (eta!=null) ? ' · ~' + eta + ' min left' : ' · estimating time left…';
+    document.querySelector('[data-sprog-txt]').textContent = txt;
+  } else {
+    box.style.display = 'none';
+  }
+}
+async function saveDrain(){ await postSettings({pause_on_battery_drain:document.getElementById('setDrain').checked}); }
+async function savePoll(){ await postSettings({poll_minutes:parseInt(document.getElementById('setPoll').value)||30}); }
+// ---- per-show topaz profile ----
+let PRESET_CATALOG = [];
+let profEditing = false;
+async function loadProfile(){
+  let d; try{ d = await (await fetch('/api/show-profile')).json(); }catch(e){ return; }
+  document.querySelector('[data-prof-show]').textContent = d.show ? prettySeries(d.show) : 'no show selected';
+  const stt = document.querySelector('[data-prof-state]');
+  stt.className = 'tag ' + (d.configured ? 'ok' : 'built');
+  stt.innerHTML = '<span class="d"></span>' + (d.configured ? 'CONFIGURED' : 'USING DEFAULT');
+  PRESET_CATALOG = d.catalog || [];
+  const sel = document.getElementById('pfPreset');
+  sel.innerHTML = PRESET_CATALOG.map(c =>
+    '<option value="'+escAttr(c.key)+'"'+(c.key===d.preset?' selected':'')+'>'+esc(c.label)+'</option>').join('');
+  onPresetPick();
+  const cur = PRESET_CATALOG.find(c => c.key === d.preset);
+  const how = document.querySelector('[data-topaz-how]');
+  if(how) how.textContent = cur ? cur.label : 'per-show preset';
+  // once the show's preset is saved, collapse to a one-line summary; "Change" re-opens it
+  const showEdit = !d.configured || profEditing || !d.show;
+  document.querySelector('[data-prof-edit]').style.display = showEdit ? '' : 'none';
+  document.querySelector('[data-prof-set]').style.display = showEdit ? 'none' : 'flex';
+  if(!showEdit) document.querySelector('[data-prof-set-label]').textContent = cur ? cur.label : d.preset;
+}
+function editProfile(){ profEditing = true; loadProfile(); }
+function onPresetPick(){
+  const key = document.getElementById('pfPreset').value;
+  const c = PRESET_CATALOG.find(x => x.key === key);
+  document.querySelector('[data-prof-desc]').textContent = c ? c.desc : '';
+}
+async function saveProfile(){
+  const key = document.getElementById('pfPreset').value;
+  const note = document.querySelector('[data-prof-note]');
+  try{ await fetch('/api/show-profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preset:key})});
+       note.textContent='Saved ✓'; profEditing=false; setTimeout(loadProfile, 800); }
+  catch(e){ note.textContent='Save failed'; }
+}
+document.getElementById('seriesSelect').addEventListener('change', e => selectSeries(e.target.value));
+refresh(); setInterval(refresh, 5000); fetchSeries(); loadSettings(); loadProfile();
+</script>
+</body>
+</html>
