@@ -182,6 +182,10 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
   episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**.
+- **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
+  under a hard peak-bitrate cap (x265, a 50 Mbps per-second ceiling), so a finished 4K
+  Dolby Vision master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p file it replaces**
+  (measured across 48 upscaled episodes). Full 4K DV, without a 4K-sized storage bill.
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
   pauses on battery and dims the screen after idle. **Screen Control** holds the
   screen-invasive Resolve stage so it never grabs your Mac while you're using it — the
