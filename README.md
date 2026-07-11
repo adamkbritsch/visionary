@@ -183,8 +183,10 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
   episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**.
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
-  pauses on battery, dims the screen after idle, and defers Resolve while you're
-  watching Plex or using Screen Control.
+  pauses on battery and dims the screen after idle. **Screen Control** holds the
+  screen-invasive Resolve stage so it never grabs your Mac while you're using it — the
+  other stages keep running. Separately, it pauses its NAS precaching whenever a Plex
+  stream is live, so pulling ahead can't stutter playback.
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
 | Round-robin queue | Guardrails |
