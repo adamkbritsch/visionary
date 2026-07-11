@@ -1,4 +1,6 @@
-# Visionary
+<p align="center">
+  <img src="docs/assets/visionary-wordmark.png" alt="Visionary" width="280">
+</p>
 
 **An overnight appliance that upscales your TV library to 4K Dolby Vision.**
 Topaz Video AI → DaVinci Resolve (real Dolby Vision 8.1, not a tone-map) → peak-capped
