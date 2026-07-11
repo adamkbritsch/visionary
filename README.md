@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/visionary-lockup-v5.png" alt="Visionary" width="340">
+  <img src="docs/assets/visionary-wordmark-v6.png" alt="Visionary" width="300">
 </p>
 
 **An overnight appliance that upscales your TV library to 4K Dolby Vision.**
