@@ -229,8 +229,8 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 - The youtarr integration assumes a UGREEN-style docker layout for its FTP archive path
   (env-overridable).
 
-## License
+## Legal
 
-[MIT](LICENSE) © 2026 Adam Britsch. Resolve, Topaz Video AI, Plex, and Dolby Vision are
-trademarks of their respective owners; you must own licenses for the commercial apps.
+© 2026 Adam Britsch. Resolve, Topaz Video AI, Plex, and Dolby Vision are trademarks of
+their respective owners; you must own licenses for the commercial apps.
 Use this only on content you legally own.
