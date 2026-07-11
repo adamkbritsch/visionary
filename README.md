@@ -1,4 +1,7 @@
 <p align="center">
+  <img src="docs/assets/app-icon.png" alt="The Visionary app icon" width="112">
+</p>
+<p align="center">
   <img src="docs/assets/visionary-lockup-v5.png" alt="Visionary" width="340">
 </p>
 
