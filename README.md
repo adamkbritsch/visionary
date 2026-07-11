@@ -173,6 +173,11 @@ NAS (FTP) ──download──▶ local scratch
 NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p original in Plex
 ```
 
+- **Smart upscaling profiles**: it detects how a title was actually made — **film, digital,
+  or animation (2D vs CGI)** — by consulting TMDb (animation + technique) and ShotOnWhat
+  (live-action film vs digital), then picks the matching tuned Topaz profile automatically,
+  with per-resolution variants for 480p/720p/1080p sources. No confident match → it asks
+  once, and every choice is overridable per show.
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment).
