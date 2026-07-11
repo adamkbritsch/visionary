@@ -1,7 +1,4 @@
 <p align="center">
-  <img src="docs/assets/app-icon.png" alt="The Visionary app icon" width="112">
-</p>
-<p align="center">
   <img src="docs/assets/visionary-lockup-v5.png" alt="Visionary" width="340">
 </p>
 
@@ -237,3 +234,9 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 © 2026 Adam Britsch. Resolve, Topaz Video AI, Plex, and Dolby Vision are trademarks of
 their respective owners; you must own licenses for the commercial apps.
 Use this only on content you legally own.
+
+---
+
+<p align="center">
+  <img src="docs/assets/app-icon.png" alt="The Visionary app icon" width="96">
+</p>
