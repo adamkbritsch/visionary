@@ -7,6 +7,11 @@ Topaz Video AI → DaVinci Resolve (real Dolby Vision 8.1, not a tone-map) → p
 x265 remux → straight back into your NAS's Plex library, replacing the 1080p original.
 Arm it in the evening; wake up to finished episodes.
 
+<p align="center">
+  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one in Topaz while the previous one remuxes" width="820">
+</p>
+<p align="center"><sub><b>Two episodes in flight at once</b> — S07E21 upscaling in Topaz while S07E20's Dolby Vision remux runs beside it, each with its own segmented, resumable progress.</sub></p>
+
 > [!IMPORTANT]
 > **Visionary is built for one exact hardware + software combination and refuses to run
 > on anything else:**
@@ -175,6 +180,11 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   pauses on battery, dims the screen after idle, and defers Resolve while you're
   watching Plex or using Screen Control.
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
+
+| Round-robin queue | Guardrails |
+|:---:|:---:|
+| <img src="docs/assets/app-queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine episodes lined up" width="420"> | <img src="docs/assets/app-power.png" alt="Settings and scratch: the 140 W power gate, screen dimming, live per-episode scratch usage" width="420"> |
+| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence.</sub> | <sub>The <b>140 W power gate</b> and idle screen-off, plus live per-episode scratch usage (Topaz segments, DV render, remux segments).</sub> |
 
 ## Configuration
 
