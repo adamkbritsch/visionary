@@ -243,13 +243,14 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 - One hardware target (see the requirements box) — by design, not laziness: the DV
   analysis step is screen automation and pixel-exact.
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
-  there* is not: Topaz's 4K ProRes intermediate is near-lossless, so a single **~0.8 GB**
-  1080p episode balloons to about **130 GB of scratch** while it processes — **~160× the
-  source file** — and a feature film's intermediate can reach ~245 GB. The dual pipeline
-  keeps two working sets alive at once and holds a **600 GB free-space floor** before
-  starting the next item, so plan for a fast SSD with ~1 TB free (a 2 TB SSD is
-  comfortable). It's all transient — each episode's scratch is deleted right after a
-  verified upload — but the peak is real.
+  there* is not: Topaz's 4K ProRes intermediate is near-lossless, so while an item is
+  being upscaled it holds about **130 GB of scratch** — **~160× the ~0.8 GB source** (a
+  feature film's intermediate can reach ~245 GB). That intermediate is **deleted the
+  moment Resolve finishes its export** — the remux only needs the DV render plus the
+  original — so the item being remuxed alongside the next upscale carries just ~10 GB, and
+  the dual pipeline never doubles the peak. Still, budget generously: the pipeline keeps a
+  **600 GB free-space floor** before starting an item, so plan for a fast SSD with ~1 TB
+  free (a 2 TB SSD is comfortable).
 - Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
   library (that's the point — keep backups if you want a way back).
 - The youtarr integration assumes a UGREEN-style docker layout for its FTP archive path
