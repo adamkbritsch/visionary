@@ -45,6 +45,9 @@ STAGES = ["download", "topaz", "resolve", "remux", "upload", "cleanup"]
 # runs WHILE item N+1 downloads/upscales — the peak-cap re-encode costs ~zero wall-clock.
 RUN_STAGES = ["download", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
+FINISHER_LANES = 2           # max concurrent remuxes. The 2nd lane ONLY runs while DRAINING a Resolve-stall
+                             # backlog (>=2 finished-topaz items waiting): Resolve is let 2 items ahead so a
+                             # 2nd x265 remux clears the buffer ~2x faster. Normal runs keep 1-at-a-time.
 OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/upload), gate the NEXT
                              # item's start on RAW physical free. Its topaz intermediate was dropped at
                              # hand-off so the finisher item is small (~10 GB), but available_gb still
@@ -586,6 +589,10 @@ class Orchestrator:
         self._stall_probe = None               # the ONE held item _maybe_retry_stall released to re-test
                                                # Resolve (only it attempts Resolve; the rest stay held)
         self._stall_retry_at = 0.0             # monotonic time to release the next probe (set on first hold)
+        self._draining = set()                 # _skip_key(p) of items released from a Resolve-stall buffer and
+                                               # not yet finished. While >=2 remain, the 2nd remux lane runs +
+                                               # Resolve is let 2 items ahead so the backlog clears ~2x faster.
+        self._upload_lock = threading.Lock()   # one NAS push at a time even when 2 remux lanes run concurrently
         self._rr = 0                           # round-robin pointer over the active TV series
         c = self._load_cadence()
         self._yt_wait = c["yt_wait"]           # YouTube TURN deferral (same as movies: a >90-min video
@@ -607,7 +614,8 @@ class Orchestrator:
         self.state = {"enabled": False, "running": False, "episode": None,
                       "stage": None, "message": "idle", "ended_reason": None,
                       "progress": None, "current": None, "plex_playing": False,
-                      "finishing": None}   # {"ep","stage","pct",...} while the finisher works an item
+                      "finishing": None,   # {"ep","stage","pct",...} while the finisher works an item
+                      "finishing2": None}  # the 2nd remux lane (only while draining a Resolve-stall backlog)
 
     def _elapsed_begin(self, key):
         """Start OR resume a stage's elapsed clock: load its accumulated total and anchor a fresh
@@ -962,6 +970,7 @@ class Orchestrator:
             self._resolve_stall.clear()
             self._resolve_fails.clear()
             self._stall_probe = None
+            self._draining.clear()
             self._yt_refresh_at = 0.0           # fresh run: re-scan staging + refresh popular sets at once
             self._yt_meta_done = False
             # _tv_since_yt / _movie_wait deliberately NOT reset — they're processing HISTORY
@@ -981,6 +990,7 @@ class Orchestrator:
             # remux resumes in parallel with the next topaz — instead of the item being forgotten.
             self._finisher_reconcile()
             for name, target in (("run", self._run), ("finisher", self._finisher),
+                                 ("finisher2", self._finisher2),   # 2nd remux lane (backlog-drain only)
                                  ("power_monitor", self._power_monitor), ("dimmer", self._dimmer),
                                  ("prefetch", self._prefetch), ("plex_monitor", self._plex_monitor)):
                 self._ensure(name, target)
@@ -1279,6 +1289,7 @@ class Orchestrator:
         is gone. Release the whole held buffer so every waiting item drains through Resolve."""
         held = len(self._resolve_stall)
         self._stall_active = False
+        self._draining |= self._resolve_stall   # track the freed backlog: while >=2 remain, run 2 remux lanes
         self._resolve_stall.clear()
         self._stall_probe = None
         logbook.event(f"resolve recovered — draining {held} held item(s)")
@@ -1719,8 +1730,7 @@ class Orchestrator:
                 self.state.update(stage=None, progress=None, current=None,
                     message=f"{ep_disp}: turn (90 min) over before {st} — one episode next, then it resumes")
                 return
-            while st == "resolve" and resolve_must_wait(self.state.get("finishing"),
-                                                        self._finish_q.qsize()):
+            while st == "resolve" and self._resolve_should_hold():
                 # RESOLVE GATE (user-dictated): hold this item at the Resolve doorstep until the
                 # previous item's remux fully completes. Side benefit: topaz is idle while we
                 # hold, so that remux runs at full tilt and clears fastest.
@@ -1804,6 +1814,21 @@ class Orchestrator:
     def _in_finisher_keys(self) -> set:
         with self._finisher_lock:
             return set(self._in_finisher)
+
+    def _resolve_should_hold(self) -> bool:
+        """Should the run thread HOLD an item at the Resolve doorstep? Normally yes while the previous
+        item's remux runs (user-dictated 1-at-a-time timing). But while DRAINING a Resolve-stall backlog
+        of >=2 items, let Resolve get up to FINISHER_LANES items ahead so a 2nd remux can run — hold only
+        once both lanes are full."""
+        if len(self._draining) >= 2:
+            return len(self._in_finisher_keys()) >= FINISHER_LANES
+        return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize())
+
+    def _lane2_should_help(self) -> bool:
+        """The 2nd remux lane pulls work ONLY when draining a Resolve-stall backlog of >=2 items, behind
+        an already-busy primary lane, with an item actually waiting — so it never splits a lone item."""
+        return (len(self._draining) >= 2 and self.state.get("finishing") is not None
+                and self._finish_q.qsize() >= 1)
 
     def _advance_cadence_at_handoff(self, p: EpisodePaths):
         """Scheduling FAIRNESS (cadence counters + round-robin) advances the moment an item's
@@ -1912,6 +1937,16 @@ class Orchestrator:
                 m = _elapsed_map(); m[self._fin_el_key] = round(self._fin_elapsed_value(), 1); _elapsed_write(m)
             self._fin_el_save = mono
 
+    def _set_finishing2_progress(self, info):
+        """The 2nd remux lane's progress surface (state['finishing2']) — a lightweight mirror of
+        _set_finishing_progress WITHOUT the single-slot elapsed/ETA machinery, which belongs to lane 1."""
+        f = dict(self.state.get("finishing2") or {})
+        f.update({"stage": info.get("stage") or f.get("stage"), "pct": info.get("pct"),
+                  "frames": info.get("frames"), "total": info.get("total"),
+                  "notches": info.get("notches"), "seg_done": info.get("seg_done"),
+                  "seg_total": info.get("seg_total")})
+        self.state["finishing2"] = f
+
     def _finisher(self):
         """Daemon worker: drains _finish_q one item at a time (so there is never more than one
         x265/upload in flight). Ownership is DURABLE: an item stays on _finisher_persisted from
@@ -1950,22 +1985,59 @@ class Orchestrator:
                         self._in_finisher_movies.discard(self._skip_key(p))
                     self.state["finishing"] = None
 
-    def _finish_item(self, p: EpisodePaths, run_stage):
+    def _finisher2(self):
+        """SECOND remux lane. Runs ONLY while draining a Resolve-stall backlog (>=2 finished-topaz items):
+        pulls a queued item and remuxes it CONCURRENTLY with the primary lane so the buffer clears ~2x
+        faster. Never splits a single item's work (needs the primary lane busy AND an item waiting); uploads
+        still serialize via _upload_lock. Ownership/abort/power mirror the primary finisher."""
+        from stages import run_stage
+        while True:
+            if not self._enabled or not self._lane2_should_help():
+                time.sleep(2); continue
+            try:
+                p = self._finish_q.get_nowait()
+            except queue.Empty:
+                continue
+            requeued = False
+            try:
+                if not self._enabled:
+                    continue                              # drop; finally re-exposes it to selection next arm
+                if self._power_paused or self._power_ok()[0] == "pause" or self._finish_abort.is_set():
+                    self._finish_q.put(p); requeued = True; time.sleep(5); continue
+                self._finish_item(p, run_stage, lane=2)
+            except Exception as e:
+                logbook.exception(f"finisher2 {p.ep}", e)
+            finally:
+                if not requeued:
+                    with self._finisher_lock:
+                        self._in_finisher.discard(self._skip_key(p))
+                        self._in_finisher_movies.discard(self._skip_key(p))
+                    self.state["finishing2"] = None
+
+    def _finish_item(self, p: EpisodePaths, run_stage, lane=1):
         ep_disp = transfer.display_name(p.ep)
+        fin_key = "finishing" if lane == 1 else "finishing2"
+        prog = self._set_finishing_progress if lane == 1 else self._set_finishing2_progress
         for st in FINISH_STAGES:
             if not self._enabled or self._finish_abort.is_set():
                 return
             if stage_done(st, p):
                 continue
             self._reclaim_for_pipeline()   # same pipeline>queue guarantee for the finisher's writes
-            self.state["finishing"] = {"ep": ep_disp, "stage": st, "pct": None}
-            ekey = p.source_basename + "|" + st
-            self._fin_elapsed_begin(ekey)
-            ok, msg = run_stage(st, p, abort=self._finish_abort, progress=self._set_finishing_progress)
-            if ok:
-                self._fin_elapsed_done(ekey)
-                self._fail_counts.pop(p.ep, None)     # forward progress clears the fail streak
+            self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None}
+            if lane == 1:
+                ekey = p.source_basename + "|" + st
+                self._fin_elapsed_begin(ekey)
+            if st == "upload":
+                with self._upload_lock:               # one NAS push at a time even with 2 remux lanes
+                    ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog)
             else:
+                ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog)
+            if ok:
+                if lane == 1:
+                    self._fin_elapsed_done(ekey)
+                self._fail_counts.pop(p.ep, None)     # forward progress clears the fail streak
+            elif lane == 1:
                 self._fin_elapsed_pause()
             if ok and st == "upload":   # now has a DV master → COMPLETION side-effects only
                 # (cadence/round-robin already advanced at HAND-OFF on the run thread — see
@@ -1996,6 +2068,7 @@ class Orchestrator:
                 if n >= MAX_EPISODE_FAILS:
                     self._parked.add(self._skip_key(p))
                     self._fail_counts.pop(p.ep, None)
+                    self._draining.discard(self._skip_key(p))   # left the backlog (parked)
                     with self._cadence_lock:       # finisher thread — never race the run thread
                         self._cadence_advanced.discard(p.source_basename)   # parked: turn spent, done
                         if p.youtube:
@@ -2013,6 +2086,7 @@ class Orchestrator:
         # left a window where a deactivate/relaunch between upload and cleanup dropped the item, so
         # cleanup never re-ran on resume and its ~250-350 GB working set leaked (review-caught).
         self._finisher_persist_remove(p)
+        self._draining.discard(self._skip_key(p))   # fully done → left the stall-drain backlog
 
 
 # module-level singleton the dashboard server drives

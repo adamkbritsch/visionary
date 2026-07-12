@@ -986,6 +986,69 @@ class ResolveStall(unittest.TestCase):
         self.assertIsNotNone(msg); self.assertIn("update prompt", msg)
 
 
+class DoubleRemux(unittest.TestCase):
+    """Backlog-scoped 2nd remux lane: while DRAINING a Resolve-stall buffer (>=2 finished-topaz items),
+    let Resolve get 2 items ahead and run 2 remuxes at once; revert to 1-at-a-time below 2."""
+
+    def test_recovery_moves_the_held_buffer_into_the_drain_backlog(self):
+        o = orch.Orchestrator()
+        o._stall_active = True; o._resolve_stall = {"A", "B", "C"}
+        o._resolve_recovered()
+        self.assertEqual(o._draining, {"A", "B", "C"})     # tracked as the backlog to double-remux
+        self.assertEqual(o._resolve_stall, set())
+        self.assertFalse(o._stall_active)
+
+    def test_resolve_gate_keeps_single_timing_when_not_draining(self):
+        o = orch.Orchestrator(); o._draining = set()
+        o.state["finishing"] = {"stage": "remux"}
+        self.assertTrue(o._resolve_should_hold())          # normal: hold while the one remux runs
+        o.state["finishing"] = None
+        self.assertFalse(o._resolve_should_hold())         # nothing remuxing, queue empty → proceed
+
+    def test_resolve_gate_lets_two_ahead_while_draining(self):
+        o = orch.Orchestrator(); o._draining = {"A", "B", "C"}
+        with mock.patch.object(o, "_in_finisher_keys", return_value={"A"}):
+            self.assertFalse(o._resolve_should_hold())     # only 1 in finisher → room for the 2nd remux
+        with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
+            self.assertTrue(o._resolve_should_hold())      # both lanes full → hold
+
+    def test_lane2_only_helps_with_a_backlog_behind_a_busy_primary(self):
+        o = orch.Orchestrator(); o._finish_q.put(object())   # an item is waiting
+        o.state["finishing"] = {"stage": "remux"}            # primary lane busy
+        o._draining = {"A"}
+        self.assertFalse(o._lane2_should_help())             # backlog < 2 → don't split a lone item
+        o._draining = {"A", "B"}
+        self.assertTrue(o._lane2_should_help())              # backlog >= 2, primary busy, item waiting
+        o.state["finishing"] = None
+        self.assertFalse(o._lane2_should_help())             # primary idle → nothing to run alongside
+
+    def test_lane2_finish_uses_its_own_slot_and_leaves_the_backlog(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        o._draining = {o._skip_key(p), "B"}
+        seen = []
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(orch.series, "refresh_queue"), \
+             mock.patch.object(orch.movies, "decrement_positions"), \
+             mock.patch.object(o, "_finisher_persist_remove"), \
+             mock.patch.object(o, "_save_cadence"):
+            o._finish_item(p, lambda st, *a, **k: seen.append(st) or (True, "ok"), lane=2)
+        self.assertEqual(seen, ["remux", "upload", "cleanup"])
+        self.assertIsNone(o.state["finishing"])              # lane-1 slot untouched by lane 2
+        self.assertNotIn(o._skip_key(p), o._draining)        # completed → left the backlog
+        self.assertIn("B", o._draining)                      # the other item still pending
+
+    def test_second_lane_registered_on_enable(self):
+        o = orch.Orchestrator()
+        started = []
+        with mock.patch.object(o, "_start_caffeinate"), \
+             mock.patch.object(o, "_finisher_reconcile"), \
+             mock.patch.object(o, "_ensure", side_effect=lambda name, t: started.append(name)):
+            o.enable()
+        self.assertIn("finisher2", started)                  # the 2nd remux lane thread is spawned
+
+
 class FinisherOverlap(unittest.TestCase):
     """TOPAZ/REMUX OVERLAP: the run thread owns download/topaz/resolve, then hands the item to
     the FINISHER thread (remux/upload/cleanup) so the ~75-min x265 peak-cap re-encode runs while
