@@ -184,6 +184,10 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   (live-action film vs digital), then picks the matching tuned Topaz profile automatically,
   with per-resolution variants for 480p/720p/1080p sources. No confident match → it asks
   once, and every choice is overridable per show.
+- **Intake-matched Dolby Vision mastering**: the Resolve stage picks one of two hand-configured
+  projects by the source's range. An **SDR** input is mastered to **Dolby Vision at 1000 nits**;
+  an **HDR** input to **2000 nits** — so each gets the right DV target-display ceiling for how
+  bright it was meant to go. Both export HDR10 + Dolby Vision Profile 8.1.
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
