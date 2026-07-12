@@ -22,7 +22,7 @@ Arm it in the evening; wake up to finished episodes.
 > | DaVinci Resolve | **Studio 18.6.0** (build 18.6.00009) — the paid Studio edition, this exact build |
 > | Topaz Video AI | **7.0.1** — this exact build |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
-> | NAS | reachable over FTP, hosting your media + a Plex server |
+> | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
 >
 > Why the 16-inch specifically — two independent reasons:
 > 1. **The display.** The Resolve stage drives the *real* Resolve UI by screen-capture
@@ -133,9 +133,9 @@ cp config.example.json ~/.topaz-pipeline/config.json
 chmod 600 ~/.topaz-pipeline/config.json
 ```
 
-Fill in ([Configuration](#configuration) below): NAS FTP host(s) + credentials, Plex URL +
-token ([how to find your token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)),
-optional TMDb key, optional youtarr.
+Fill in ([Configuration](#configuration) below): NAS FTP host(s) + credentials, and — all
+optional — a Plex URL + token ([how to find it](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)),
+a TMDb key, and youtarr.
 
 ### 9. NAS check
 
@@ -143,7 +143,7 @@ optional TMDb key, optional youtarr.
 python3 engine/preflight.py --network
 ```
 
-FTP must connect and Plex must answer. Optional NAS extras: [nas/dv_probe.py](nas/README.md)
+FTP must connect; Plex, if you configured it, must answer (it's optional). Optional NAS extras: [nas/dv_probe.py](nas/README.md)
 (precise Dolby Vision detection for pre-existing DV content) and
 [youtarr](https://github.com/DialmasterOrg/Youtarr) (enables the YouTube mode — without it
 that mode simply stays off).
@@ -218,12 +218,26 @@ override (env wins):
 | `ftp_hosts` / `ftp_host` | `TOPAZ_NAS_FTP_HOST` | NAS host(s), tried in order (VPN IP first, then LAN name) |
 | `ftp_port` | `TOPAZ_NAS_FTP_PORT` | FTP port (default 21) |
 | `ftp_user` / `ftp_pass` | `TOPAZ_NAS_FTP_USER` / `_PASS` | FTP credentials |
-| `plex_url` / `plex_urls` | `TOPAZ_PLEX_URL` | Plex server URL(s); defaults to the NAS hosts on :32400 |
-| `plex_token` | `TOPAZ_PLEX_TOKEN` | your X-Plex-Token |
+| `plex_url` / `plex_urls` | `TOPAZ_PLEX_URL` | **optional** (see note below) — Plex server URL(s); defaults to the NAS hosts on :32400 |
+| `plex_token` | `TOPAZ_PLEX_TOKEN` | **optional** — your X-Plex-Token |
 | `plex_tv_section` / `plex_movie_section` | `TOPAZ_PLEX_SECTION` / `TOPAZ_PLEX_MOVIE_SECTION` | optional — auto-discovered when empty |
 | `tmdb_api_key` | `TOPAZ_TMDB_KEY` | optional — richer show metadata |
 | `youtarr_url` / `youtarr_user` / `youtarr_pass` | `TOPAZ_YOUTARR_URL` / `_USER` / `_PASS` | optional — YouTube mode |
 | `youtube_client_id` / `_secret` / `_refresh_token` | — | optional — YouTube subscriptions picker |
+
+> **Plex is optional — you don't need it to run this.** Leave the `plex_*` keys blank and
+> everything still works. Show and movie names come from your **NAS folder structure**, not
+> Plex, and Plex never decides *what* gets upscaled (that's always "a 1080p file with no 4K
+> Dolby Vision master yet"). The token only enables two best-effort extras:
+>
+> - **Playback failsafe** — while you're streaming from your Plex server, the background
+>   prefetch of upcoming downloads pauses so it can't stutter your playback.
+> - **Watched-first ordering** — an optional per-show toggle (on by default) processes
+>   unwatched episodes before watched ones, plus a "watched" badge in the dashboard. Without
+>   Plex it just falls back to plain episode order.
+>
+> Everything degrades gracefully: no token, or an unreachable Plex, just makes these two
+> extras inert — the pipeline carries on.
 
 Media roots default to `/Media/TV-Shows`, `/Media/Movies`, `/Media/YouTube` (+ multi-volume
 variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_FTP_YOUTUBE`
