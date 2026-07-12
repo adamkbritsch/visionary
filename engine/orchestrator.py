@@ -100,6 +100,8 @@ PREFETCH_HARD_CAP_GB = 100   # HARD ceiling on the prefetch buffer's total size 
 PREFETCH_GATE_GB = MIN_FREE_GB + 30   # prefetch a source only while free stays above this (small margin
                              # over the floor so prefetched sources never eat into the intermediate reserve)
 MAX_EPISODE_FAILS = 5        # consecutive GENUINE failures of one episode → park it, move on
+MOVIE_SIZED_BYTES = 150e9    # a non-movie item whose topaz working set exceeds this is treated as
+                             # movie-sized by the finisher's disk gate (feature-length YouTube videos)
 
 # ---- RESOLVE-STALL buffering ------------------------------------------------------------------
 # ~weekly, DaVinci Resolve throws an "update available" dialog on launch that blocks its screen
@@ -1170,8 +1172,8 @@ class Orchestrator:
                 if (dmsg := self._low_disk_pause()) is not None:   # not enough room to start an item
                     self.state.update(stage=None, message=dmsg)
                     self._sleep(DRAIN_POLL_SECONDS); continue
-                if self._finish_q.qsize() > 0:   # BACKPRESSURE: an item is WAITING behind the one the
-                    # finisher is working — starting another would put a 3rd working set on scratch
+                if self._finisher_backlogged():   # BACKPRESSURE: 2+ items already wait behind the one
+                    # the finisher is working — only then does starting another risk stacking working sets
                     fin = self.state.get("finishing") or {}
                     self.state.update(stage=None, current=None,
                         message=f"holding the next item — finisher backlog ({fin.get('ep') or 'queued'} still finishing)")
@@ -1830,6 +1832,18 @@ class Orchestrator:
             return len(self._in_finisher_keys()) >= FINISHER_LANES
         return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize())
 
+    def _finisher_backlogged(self) -> bool:
+        """Should the run thread hold before STARTING a new item? Only when TWO OR MORE items wait
+        behind the finisher's current one. One waiter is normal and must NOT freeze the run thread:
+        a re-picked item whose GPU stages were already done on disk (e.g. a movie resumed after its
+        resolve had rendered) fast-paths through _process — skipping the resolve GATE — and hands
+        off while another item is mid-remux. The old qsize>0 freeze then serialized the whole
+        pipeline: no download/topaz ran for the entire ~65-min remux (user-caught). A single queued
+        finisher item holds only ~10 GB post-drop, the resolve gate already holds the NEXT item at
+        the resolve doorstep while anything is queued, and the disk gates guard raw free — so one
+        waiter is safe to overlap; two says the finisher is genuinely behind."""
+        return self._finish_q.qsize() >= 2
+
     def _lane2_should_help(self) -> bool:
         """The 2nd remux lane pulls work ONLY when draining a Resolve-stall backlog of >=2 items, behind
         an already-busy primary lane, with an item actually waiting — so it never splits a lone item."""
@@ -1877,6 +1891,26 @@ class Orchestrator:
             except Exception:
                 pass
 
+    @staticmethod
+    def _topaz_working_bytes(p: EpisodePaths) -> int:
+        """Bytes of this item's topaz output currently on disk: the scene-cut segment chunks (the
+        no-concat design's real working set) plus the legacy single-file ProRes if one ever exists.
+        MUST be called BEFORE _drop_topaz_intermediates — after the drop there is nothing to measure
+        (the old gauge ran post-drop AND probed only p.prores, which the no-concat design never
+        writes, so it always read 0 and feature-length YouTube items never counted as movie-sized)."""
+        total = 0
+        try:
+            total += os.path.getsize(p.prores)
+        except OSError:
+            pass
+        for root, _, files in os.walk(p.segdir):   # nonexistent dir → walks nothing
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return total
+
     def _drop_topaz_intermediates(self, p: EpisodePaths):
         """The moment an item heads to the finisher, its ProRes + topaz segment chunks are dead
         weight: resolve consumed them and produced the VERIFIED DV render that the remux
@@ -1892,14 +1926,15 @@ class Orchestrator:
         shutil.rmtree(p.segdir, ignore_errors=True)
 
     def _hand_to_finisher(self, p: EpisodePaths):
-        self._drop_topaz_intermediates(p)   # frees ~250-350 GB the finisher never reads
-        self._advance_cadence_at_handoff(p)
         big = p.movie
         if not big:
-            try:      # gauge by the ACTUAL working set: a feature-length YouTube video's ProRes
-                big = os.path.getsize(p.prores) > 150e9   # is movie-sized too (review-caught)
-            except OSError:
-                pass
+            # gauge by the ACTUAL working set: a feature-length YouTube video's topaz output is
+            # movie-sized too. Measured BEFORE the drop below — the old getsize(p.prores) ran
+            # after the drop (and only probed the legacy single-file name the no-concat design
+            # never writes), so it always raised OSError and `big` stayed False (user-caught).
+            big = self._topaz_working_bytes(p) > MOVIE_SIZED_BYTES
+        self._drop_topaz_intermediates(p)   # frees ~250-350 GB the finisher never reads
+        self._advance_cadence_at_handoff(p)
         with self._finisher_lock:
             self._in_finisher.add(self._skip_key(p))
             if big:

@@ -1061,6 +1061,70 @@ class DoubleRemux(unittest.TestCase):
         self.assertIn("finisher2", started)                  # the 2nd remux lane thread is spawned
 
 
+class HandoffMovieGauge(unittest.TestCase):
+    """The finisher's movie-sized flag is gauged from the topaz working set, which must be measured
+    BEFORE _drop_topaz_intermediates: the old gauge ran AFTER the drop and probed only p.prores —
+    the legacy single-file name the no-concat design never writes — so it always raised OSError and
+    a feature-length YouTube item never entered _in_finisher_movies (user-caught)."""
+
+    def _yt(self, tmp):
+        return orch.youtube_paths("Some Channel", "/staging/Some Channel/Feature Documentary.mp4",
+                                  "Feature Documentary", scratch_dir=tmp)
+
+    def test_working_bytes_sums_the_segment_chunks(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._yt(tmp)
+            os.makedirs(p.segdir)
+            with open(os.path.join(p.segdir, "seg000.mov"), "wb") as f:
+                f.write(b"x" * 1000)
+            with open(os.path.join(p.segdir, "seg001.mov"), "wb") as f:
+                f.write(b"y" * 500)
+            self.assertEqual(orch.Orchestrator._topaz_working_bytes(p), 1500)
+
+    def test_working_bytes_zero_when_nothing_on_disk(self):
+        p = self._yt("/nonexistent-scratch")
+        self.assertEqual(orch.Orchestrator._topaz_working_bytes(p), 0)
+
+    def test_feature_youtube_counts_movie_sized_and_is_measured_before_the_drop(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._yt(tmp)
+            os.makedirs(p.segdir)
+            with open(os.path.join(p.segdir, "seg000.mov"), "wb") as f:
+                f.write(b"x" * 4096)
+            o = orch.Orchestrator(); o._enabled = True
+            with mock.patch.object(orch, "MOVIE_SIZED_BYTES", 1024), \
+                 mock.patch.object(o, "_advance_cadence_at_handoff"):
+                o._hand_to_finisher(p)                       # REAL drop — measurement must beat it
+            self.assertIn(o._skip_key(p), o._in_finisher_movies)   # gauged movie-sized...
+            self.assertFalse(os.path.isdir(p.segdir))              # ...even though the drop ran
+
+    def test_small_episode_stays_non_movie(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            p = episode_paths("The Office X", "S02E10", SRC,
+                              scratch_dir=tmp, nas_tv_root="/Media/TV-Shows")
+            os.makedirs(p.segdir)
+            with open(os.path.join(p.segdir, "seg000.mov"), "wb") as f:
+                f.write(b"x" * 10)
+            o = orch.Orchestrator(); o._enabled = True
+            with mock.patch.object(o, "_advance_cadence_at_handoff"):
+                o._hand_to_finisher(p)
+            self.assertIn(o._skip_key(p), o._in_finisher_keys())
+            self.assertNotIn(o._skip_key(p), o._in_finisher_movies)
+
+    def test_movie_flag_short_circuits_without_measuring(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M", scratch_dir="/scratch")
+        with mock.patch.object(o, "_drop_topaz_intermediates"), \
+             mock.patch.object(o, "_advance_cadence_at_handoff"), \
+             mock.patch.object(orch.Orchestrator, "_topaz_working_bytes",
+                               side_effect=AssertionError("a movie must not be measured")):
+            o._hand_to_finisher(p)
+        self.assertIn(o._skip_key(p), o._in_finisher_movies)
+
+
 class FinisherOverlap(unittest.TestCase):
     """TOPAZ/REMUX OVERLAP: the run thread owns download/topaz/resolve, then hands the item to
     the FINISHER thread (remux/upload/cleanup) so the ~75-min x265 peak-cap re-encode runs while
@@ -1073,6 +1137,19 @@ class FinisherOverlap(unittest.TestCase):
 
     def test_stage_split_covers_all_stages_no_overlap(self):
         self.assertEqual(orch.RUN_STAGES + orch.FINISH_STAGES, orch.STAGES)
+
+    def test_one_queued_waiter_does_not_freeze_the_run_thread(self):
+        # A re-picked item with all GPU stages already done fast-paths past the resolve gate and
+        # queues behind a live remux. The old qsize>0 freeze then serialized the pipeline for the
+        # whole remux (user-caught) — one waiter must still overlap; the resolve GATE (not the run
+        # freeze) is what holds the NEXT item at the resolve doorstep while anything is queued.
+        o = orch.Orchestrator()
+        self.assertFalse(o._finisher_backlogged())            # empty → run freely
+        o._finish_q.put(object())                             # ONE waiter (movie fast-path scenario)
+        self.assertFalse(o._finisher_backlogged())            # download/topaz still overlap...
+        self.assertTrue(orch.resolve_must_wait(None, o._finish_q.qsize()))   # ...resolve holds instead
+        o._finish_q.put(object())                             # TWO waiters = genuine backlog
+        self.assertTrue(o._finisher_backlogged())
 
     def test_process_runs_gpu_stages_then_hands_off(self):
         o = orch.Orchestrator(); o._enabled = True
