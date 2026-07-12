@@ -1039,6 +1039,18 @@ class DoubleRemux(unittest.TestCase):
         self.assertNotIn(o._skip_key(p), o._draining)        # completed → left the backlog
         self.assertIn("B", o._draining)                      # the other item still pending
 
+    def test_topaz_pauses_for_a_fresh_item_while_two_remuxes_drain(self):
+        o = orch.Orchestrator()
+        fresh = episode_paths("The Office", "S02E10", SRC)
+        o._draining = {"A", "B"}
+        with mock.patch.object(orch, "stage_done", return_value=False):     # fresh: not yet upscaled
+            self.assertTrue(o._drain_pauses_topaz(fresh))                    # → hold Topaz
+        with mock.patch.object(orch, "stage_done", return_value=True):      # already upscaled → resolve it
+            self.assertFalse(o._drain_pauses_topaz(fresh))                   # (feeds the remux lanes)
+        o._draining = {"A"}
+        with mock.patch.object(orch, "stage_done", return_value=False):     # backlog < 2 → Topaz resumes
+            self.assertFalse(o._drain_pauses_topaz(fresh))
+
     def test_second_lane_registered_on_enable(self):
         o = orch.Orchestrator()
         started = []

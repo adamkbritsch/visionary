@@ -254,8 +254,9 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   re-probing Resolve on a timer. Dismiss the prompt whenever you notice — open DaVinci
   Resolve, click it away (or just deactivate/reactivate the pipeline to force an immediate
   retry) — and the whole buffer drains through Resolve automatically, running **two remuxes
-  at once** while the backlog is ≥2 items to clear it ~2× faster. Nothing is lost or parked;
-  you just reclaim the idle GPU time the stall would've wasted.
+  at once** while the backlog is ≥2 items to clear it ~2× faster (Topaz pauses while those
+  two x265 encodes run, so the CPU is theirs). Nothing is lost or parked; you just reclaim
+  the idle GPU time the stall would've wasted.
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless, so while an item is
   being upscaled it holds about **130 GB of scratch** — **~160× the ~0.8 GB source** (a

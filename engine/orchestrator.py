@@ -1203,6 +1203,12 @@ class Orchestrator:
                             message=f"Resolve stalled — upscale buffer full ({phys} GB free); dismiss "
                                     f"Resolve's update prompt to drain {len(self._resolve_stall)} held item(s)")
                         self._sleep(DRAIN_POLL_SECONDS); continue
+                if self._drain_pauses_topaz(ep):
+                    # 2 remuxes are clearing the drain backlog — hold fresh Topaz off the machine until the
+                    # backlog is < 2 (already-upscaled items still flow through Resolve to feed the lanes).
+                    self.state.update(stage=None, current=None,
+                        message=f"draining backlog — Topaz paused while 2 remuxes run ({len(self._draining)} left)")
+                    self._sleep(DRAIN_POLL_SECONDS); continue
                 self._process(ep)
         except Exception as e:                       # never die silently — leave a trace
             logbook.exception("orchestrator loop", e)
@@ -1829,6 +1835,13 @@ class Orchestrator:
         an already-busy primary lane, with an item actually waiting — so it never splits a lone item."""
         return (len(self._draining) >= 2 and self.state.get("finishing") is not None
                 and self._finish_q.qsize() >= 1)
+
+    def _drain_pauses_topaz(self, ep) -> bool:
+        """While >=2 items drain a Resolve-stall backlog (two remuxes running), the run thread must NOT
+        start a fresh Topaz on top of them — the two x265 encodes get the machine. It still RESOLVES
+        already-upscaled items (topaz done) to feed the lanes; only a fresh (not-yet-upscaled) item waits
+        until the backlog clears below 2."""
+        return len(self._draining) >= 2 and not stage_done("topaz", ep)
 
     def _advance_cadence_at_handoff(self, p: EpisodePaths):
         """Scheduling FAIRNESS (cadence counters + round-robin) advances the moment an item's
