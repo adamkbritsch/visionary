@@ -195,7 +195,11 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
-  episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**.
+  episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**. Those are
+  the ~30-minute extended-cut episodes in the test library; that's about **4.9 minutes of
+  wall-clock per minute of content**, so a standard **20-minute 1080p episode** comes out a
+  finished 4K Dolby Vision master in **roughly 1h35m** (measured median across 65 finished
+  episodes).
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265, a 50 Mbps per-second ceiling), so a finished 4K
