@@ -154,9 +154,11 @@ def parse_x265_encoded(text: str):
 
 # ---- peak measurement (the verification gate's ruler) ----------------------------------
 
-def peak_1s_mbps_from_packets(csv_text: str) -> float:
-    """Max 1-second video bitrate from ffprobe packet CSV ('packet,<pts_time>,<size>' rows).
-    Pure — unit-tested; the same per-second bucketing used to diagnose the S05E23 spikes."""
+def peak_buckets_from_packets(csv_text: str) -> dict:
+    """Per-second video bitrate {sec: mbps} from ffprobe packet CSV ('packet,<pts_time>,<size>'
+    rows). Pure — unit-tested; the same bucketing used to diagnose the S05E23 spikes. The full
+    map (not just the max) is what lets the peak-repair ladder LOCALIZE an over-cap burst to
+    the segment(s) that produced it."""
     buckets = {}
     for line in (csv_text or "").splitlines():
         parts = line.split(",")
@@ -167,18 +169,47 @@ def peak_1s_mbps_from_packets(csv_text: str) -> float:
             buckets[sec] = buckets.get(sec, 0) + int(parts[2])
         except ValueError:
             continue                      # N/A pts on some packets — skip, don't crash
-    return max(buckets.values()) * 8 / 1e6 if buckets else 0.0
+    return {sec: byts * 8 / 1e6 for sec, byts in buckets.items()}
 
 
-def video_peak_1s_mbps(path: str, ffprobe: str = FFPROBE) -> float:
+def peak_1s_mbps_from_packets(csv_text: str) -> float:
+    b = peak_buckets_from_packets(csv_text)
+    return max(b.values()) if b else 0.0
+
+
+def video_peak_buckets(path: str, ffprobe: str = FFPROBE) -> dict:
     r = subprocess.run([ffprobe, "-v", "quiet", "-select_streams", "v:0",
                         "-show_entries", "packet=pts_time,size", "-of", "csv", path],
                        capture_output=True, text=True)
-    return peak_1s_mbps_from_packets(r.stdout)
+    return peak_buckets_from_packets(r.stdout)
+
+
+def video_peak_1s_mbps(path: str, ffprobe: str = FFPROBE) -> float:
+    b = video_peak_buckets(path, ffprobe)
+    return max(b.values()) if b else 0.0
 
 
 def peak_ok(measured_mbps: float, cap_mbps: int, tolerance: float = PEAK_TOLERANCE) -> bool:
     return 0 < measured_mbps <= cap_mbps * tolerance
+
+
+def over_gate_segments(buckets: dict, segs: list, fps_str: str, cap_mbps: int,
+                       tolerance: float = PEAK_TOLERANCE) -> list:
+    """PURE. Which segments produced an over-gate second? `buckets` is {sec: mbps} of the
+    SHIPPED file; `segs` the plan's [a, b) frame ranges. A second [s, s+1) is charged to every
+    segment whose time-range [a/fps, b/fps) overlaps it — a burst straddling a segment cut
+    charges both sides. Sorted, deduped segment indices."""
+    fps = float(Fraction(str(fps_str)))
+    gate = cap_mbps * tolerance
+    hot = [s for s, m in (buckets or {}).items() if m > gate]
+    if not hot or fps <= 0:
+        return []
+    out = []
+    for i, (a, b) in enumerate(segs):
+        t0, t1 = a / fps, b / fps
+        if any(s < t1 and (s + 1) > t0 for s in hot):
+            out.append(i)
+    return out
 
 
 # ---- orchestration ---------------------------------------------------------------------
@@ -518,3 +549,47 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
     if not ok:
         return False, base, why
     return True, base, "encoded %d frames in %d segments" % (base, len(segs))
+
+
+def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: list,
+                              tight_cap_mbps: int, *, total_frames: int, fps: str,
+                              master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
+                              boundaries: list | None = None, abort=None,
+                              ffmpeg=FFMPEG, x265=X265, dovi_tool=DOVI_TOOL):
+    """PEAK REPAIR: delete and re-encode ONLY `indices` segments at a TIGHTER cap. The full-cap
+    encode can measure over the gate — VBV bufsize == maxrate legally allows a 1-second burst
+    up to ~2× cap while the gate is cap × PEAK_TOLERANCE — and re-running the identical encode
+    reuses the identical segments, so it can never pass (user-caught: a movie parked at
+    58.6 > 50 five times, shipped nothing). The resume manifest is deliberately unchanged
+    (same source, same GLOBAL cap): a tighter segment is strictly safer to resume, and a
+    mid-repair kill just resumes with the already-tightened segments. Returns (ok, reason)."""
+    segs = plan_segments(total_frames, fps, seg_seconds, boundaries=boundaries)
+    for i in indices:
+        if abort is not None and abort.is_set():
+            return False, "aborted"
+        if not (0 <= i < len(segs)):
+            return False, f"repair segment index {i} out of range (plan has {len(segs)})"
+        a, b = segs[i]
+        n = b - a
+        sf = os.path.join(segdir, f"seg_{i:04d}.hevc")
+        stmp = sf + ".part"
+        _rm(sf); _rm(stmp)                               # the over-peak segment is what we're replacing
+        rslice = os.path.join(segdir, f"seg_{i:04d}.rpu")
+        ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
+        if not ok:
+            return False, why
+        dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps)
+        enc = build_x265_command(x265, rslice, stmp, tight_cap_mbps, master_display, max_cll)
+        got, why, _t = _encode_pipe(dec, enc, stmp, abort, None)
+        _rm(rslice)
+        if why == "aborted":
+            _rm(stmp)
+            return False, "aborted"
+        if got is None:
+            _rm(stmp)
+            return False, f"repair segment {i}: {why}"
+        if got != n:                                     # same drift guard as the main encode
+            _rm(stmp)
+            return False, f"repair segment {i} frame mismatch: {got} != {n}"
+        os.replace(stmp, sf)                             # atomic publish, like the main encode
+    return True, "re-capped %d segment(s) @ %d Mbps" % (len(indices), tight_cap_mbps)

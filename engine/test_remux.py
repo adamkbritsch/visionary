@@ -188,3 +188,59 @@ class SublerOptimize(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PeakRepairLadder(unittest.TestCase):
+    """A peak-gate miss re-encodes ONLY the offending segments at a tighter cap and re-gates,
+    instead of failing forever on identical retries (user-caught: a movie parked at
+    58.6 > 50 five times, shipped nothing)."""
+
+    def _run(self, tmp, buckets_seq, reencode_calls):
+        import os
+        out = os.path.join(tmp, "master.mkv")             # MKV path: no audio machinery to mock
+        info = {"frames": 100, "fps": "24000/1001", "master_display": None, "max_cll": None}
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+        def fake_reencode(dv, rpu, segdir, idx, tight, **kw):
+            reencode_calls.append((list(idx), tight))
+            return True, "ok"
+        with mock.patch.object(remux.dvcap, "probe_video", return_value=info), \
+             mock.patch.object(remux.dvcap, "ensure_segdir", return_value="fresh"), \
+             mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
+             mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+             mock.patch.object(remux.dvcap, "encode_capped_segmented", return_value=(True, 100, "ok")), \
+             mock.patch.object(remux.dvcap, "reencode_segments_tighter", side_effect=fake_reencode), \
+             mock.patch.object(remux.dvcap, "video_peak_buckets", side_effect=list(buckets_seq)), \
+             mock.patch.object(remux, "_verify",
+                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1,
+                                                                           "DV 8.1 · 1 audio · 1 sub")), \
+             mock.patch.object(remux.subprocess, "run", return_value=ran):
+            return remux.remux(os.path.join(tmp, "dv.mov"), "cfr.mp4", "orig.mkv", out)
+
+    def test_clean_first_pass_never_repairs(self):
+        import tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, [{1: 45.0}], calls)
+        self.assertTrue(res.ok)
+        self.assertEqual(calls, [])                       # under the gate → no repair rung ran
+        self.assertNotIn("repair", res.reason)
+        self.assertIn("peak 45.0 ≤ 50", res.reason)
+
+    def test_over_gate_repairs_offending_segment_then_ships(self):
+        import tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, [{1: 58.6}, {1: 40.0}], calls)   # over → repaired → clean
+        self.assertTrue(res.ok)
+        self.assertEqual(calls, [([0], 42)])              # only the hot segment, at 85% of 50
+        self.assertIn("peak repair: 1 seg(s) re-capped @ 42 Mbps", res.reason)
+        self.assertIn("peak 40.0 ≤ 50", res.reason)
+
+    def test_ladder_exhaustion_ships_nothing(self):
+        import tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, [{1: 58.6}] * 3, calls)  # never comes under the gate
+        self.assertFalse(res.ok)
+        self.assertEqual(calls, [([0], 42), ([0], 35)])   # both rungs tried (85%, then 70%)
+        self.assertIn("peak still over cap after encode + repair: 58.6", res.reason)

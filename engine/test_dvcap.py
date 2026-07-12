@@ -433,3 +433,78 @@ class RpuGroundTruth(unittest.TestCase):
             rpu = os.path.join(td, "r.bin"); open(rpu, "wb").write(b"x")
             with mock.patch.object(dvcap.subprocess, "run", return_value=R()):
                 self.assertEqual(dvcap.rpu_frame_count(rpu), 0)   # → remux fails, segdir intact
+
+
+class OverGateSegments(unittest.TestCase):
+    """Peak-repair localization: map over-gate 1-second buckets to the segments that made them."""
+
+    def test_hot_second_maps_to_its_segment(self):
+        segs = [(0, 50), (50, 100)]                       # fps 25 → 0..2s and 2..4s
+        self.assertEqual(dvcap.over_gate_segments({0: 60.0}, segs, "25", 50), [0])
+        self.assertEqual(dvcap.over_gate_segments({3: 60.0}, segs, "25", 50), [1])
+
+    def test_burst_straddling_a_cut_charges_both_segments(self):
+        segs = [(0, 45), (45, 100)]                       # fps 25 → cut at 1.8s; second [1,2) spans it
+        self.assertEqual(dvcap.over_gate_segments({1: 60.0}, segs, "25", 50), [0, 1])
+
+    def test_under_gate_is_clean_and_boundary_matches_peak_ok(self):
+        segs = [(0, 100)]
+        self.assertEqual(dvcap.over_gate_segments({0: 57.4}, segs, "25", 50), [])   # under the gate
+        self.assertEqual(dvcap.over_gate_segments({}, segs, "25", 50), [])
+        self.assertEqual(dvcap.over_gate_segments(None, segs, "25", 50), [])
+        # the localizer must agree with peak_ok about what's "over" — same floats, same verdict
+        for m in (57.4, 57.5, 58.6):
+            charged = bool(dvcap.over_gate_segments({0: m}, segs, "25", 50))
+            self.assertEqual(charged, not dvcap.peak_ok(m, 50))
+
+    def test_buckets_refactor_keeps_max_semantics(self):
+        csv = "packet,0.0,125000\npacket,0.5,125000\npacket,1.2,250000\n"
+        self.assertEqual(dvcap.peak_buckets_from_packets(csv), {0: 2.0, 1: 2.0})
+        self.assertEqual(dvcap.peak_1s_mbps_from_packets(csv), 2.0)
+
+
+class ReencodeTighter(unittest.TestCase):
+    """Peak repair re-encodes ONLY the named segments at the tighter cap, atomically."""
+
+    def test_replaces_the_segment_at_the_tight_cap(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "seg_0000.hevc")
+            with open(sf, "wb") as f:
+                f.write(b"OLD-OVER-PEAK")
+            captured = {}
+            def fake_pipe(dec, enc, out, abort, cb):
+                captured["enc"] = enc
+                with open(out, "wb") as f:
+                    f.write(b"NEW-TIGHT")
+                return 100, "ok", []
+            with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe):
+                ok, why = dvcap.reencode_segments_tighter("dv.mov", "rpu.bin", td, [0], 42,
+                                                          total_frames=100, fps="25")
+            self.assertTrue(ok); self.assertIn("42", why)
+            with open(sf, "rb") as f:
+                self.assertEqual(f.read(), b"NEW-TIGHT")            # atomically replaced
+            i = captured["enc"].index("--vbv-maxrate")
+            self.assertEqual(captured["enc"][i + 1], "42000")       # tight cap drives the VBV
+            self.assertEqual(captured["enc"][captured["enc"].index("--vbv-bufsize") + 1], "42000")
+
+    def test_frame_mismatch_fails_and_publishes_nothing(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            def bad_pipe(dec, enc, out, abort, cb):
+                with open(out, "wb") as f:
+                    f.write(b"SHORT")
+                return 99, "ok", []                                  # one frame short → drift risk
+            with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=bad_pipe):
+                ok, why = dvcap.reencode_segments_tighter("dv.mov", "rpu.bin", td, [0], 42,
+                                                          total_frames=100, fps="25")
+            self.assertFalse(ok); self.assertIn("mismatch", why)
+            self.assertFalse(os.path.exists(os.path.join(td, "seg_0000.hevc")))
+            self.assertFalse(os.path.exists(os.path.join(td, "seg_0000.hevc.part")))
+
+    def test_out_of_range_index_fails_cleanly(self):
+        ok, why = dvcap.reencode_segments_tighter("dv.mov", "rpu.bin", "/nowhere", [7], 42,
+                                                  total_frames=100, fps="25")
+        self.assertFalse(ok); self.assertIn("out of range", why)

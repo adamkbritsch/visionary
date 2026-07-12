@@ -337,19 +337,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         if frames != real_frames:
             return RemuxResult(False, output,
                                reason=f"frame count changed by cap encode: {frames} != {real_frames}")
-        if output.lower().endswith(".mkv"):
-            # wrap the ES in a video-only MP4 (writes the dvcC), then one ffmpeg copy-mux to MKV
-            dv_mp4 = output + ".dv.mp4"
-            vx = subprocess.run(build_capped_video_mux_command(mp4box, hevc, info["fps"], dv_mp4),
-                                capture_output=True, text=True, timeout=timeout)
-            if vx.returncode != 0:
-                return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-            mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                capture_output=True, text=True, timeout=timeout)
-            if mx.returncode != 0:
-                return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
-        else:
-            # MP4: extract audio (CFR) + text subs (original) → track file, then MP4Box mux (writes DV box).
+        if not output.lower().endswith(".mkv"):
+            # MP4 path: extract audio (CFR) + text subs (original) → track file, built ONCE — it's
+            # video-independent, so the peak-repair rungs below reuse it.
             # SMART LOUDNESS BOOST: measure this item's integrated LUFS, gain to the target (boost-only,
             # limiter-capped). Validated on the cheap tracks file BEFORE the mux — a bad landing falls
             # back to a bit-exact copy of the original audio (never fails the 75-min x265 pass over audio).
@@ -369,29 +359,73 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
-            mx = subprocess.run(build_capped_mux_command(mp4box, hevc, info["fps"], tracks, output),
-                                capture_output=True, text=True, timeout=timeout)
-            if mx.returncode != 0:
-                return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
-        res = _verify(output, ffprobe)
-        if not res.ok:
-            return res
-        if output.lower().endswith(".mp4"):
-            tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
-            if tag != "hvc1":                              # hev1 masters DON'T direct-play (SHIELD)
-                res.ok = False
-                res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
-                _rm(output)
+        # ---- mux + verify + PEAK GATE, with a tightening ladder on a peak miss ------------------
+        # VBV bufsize == maxrate legally allows a 1-second burst past cap × tolerance, and an
+        # identical retry reuses the identical segments — it can never pass (user-caught: a movie
+        # parked at 58.6 > 50 five times, shipped nothing). On a miss, LOCALIZE the burst to its
+        # segment(s) and re-encode only those at 85% then 70% of the cap, then re-gate.
+        segs_plan = dvcap.plan_segments(real_frames, info["fps"], dvcap.SEG_SECONDS,
+                                        boundaries=boundaries)
+        repair_note, buckets, peak = "", None, 0.0
+        for tight in (None, int(cap_mbps * 0.85), int(cap_mbps * 0.70)):
+            if tight is not None:
+                offenders = dvcap.over_gate_segments(buckets, segs_plan, info["fps"], cap_mbps)
+                if not offenders:
+                    return RemuxResult(False, output,
+                                       reason=f"peak over cap and burst not localizable: "
+                                              f"{peak:.1f} Mbps > {cap_mbps} (shipped nothing)")
+                ok, why = dvcap.reencode_segments_tighter(
+                    dv_video, rpu, segdir, offenders, tight,
+                    total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
+                    master_display=info["master_display"], max_cll=info["max_cll"],
+                    abort=abort, ffmpeg=ffmpeg)
+                if not ok:
+                    return RemuxResult(False, output, reason="peak repair: " + why)
+                # every segment is complete now → this call just re-verifies counts and re-concats
+                ok, frames, why = dvcap.encode_capped_segmented(
+                    dv_video, rpu, hevc, cap_mbps, segdir=segdir,
+                    total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
+                    master_display=info["master_display"], max_cll=info["max_cll"],
+                    abort=abort, ffmpeg=ffmpeg)
+                if not ok or frames != real_frames:
+                    return RemuxResult(False, output, reason="peak repair concat: " + why)
+                repair_note = f" · peak repair: {len(offenders)} seg(s) re-capped @ {tight} Mbps"
+            if output.lower().endswith(".mkv"):
+                # wrap the ES in a video-only MP4 (writes the dvcC), then one ffmpeg copy-mux to MKV
+                dv_mp4 = output + ".dv.mp4"
+                vx = subprocess.run(build_capped_video_mux_command(mp4box, hevc, info["fps"], dv_mp4),
+                                    capture_output=True, text=True, timeout=timeout)
+                if vx.returncode != 0:
+                    return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
+                mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
+                                    capture_output=True, text=True, timeout=timeout)
+                if mx.returncode != 0:
+                    return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
+            else:
+                mx = subprocess.run(build_capped_mux_command(mp4box, hevc, info["fps"], tracks, output),
+                                    capture_output=True, text=True, timeout=timeout)
+                if mx.returncode != 0:
+                    return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+            res = _verify(output, ffprobe)
+            if not res.ok:
                 return res
-        peak = dvcap.video_peak_1s_mbps(output, ffprobe)   # re-measure the SHIPPED file
-        if not dvcap.peak_ok(peak, cap_mbps):
-            res.ok = False
-            res.reason = f"peak still over cap after encode: {peak:.1f} Mbps > {cap_mbps} (shipped nothing)"
+            if output.lower().endswith(".mp4"):
+                tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
+                if tag != "hvc1":                          # hev1 masters DON'T direct-play (SHIELD)
+                    res.ok = False
+                    res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
+                    _rm(output)
+                    return res
+            buckets = dvcap.video_peak_buckets(output, ffprobe)   # re-measure the SHIPPED file
+            peak = max(buckets.values()) if buckets else 0.0
+            if dvcap.peak_ok(peak, cap_mbps):
+                res.reason += f" · peak {peak:.1f} ≤ {cap_mbps} Mbps cap" + repair_note + audio_note
+                shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the segments won't be needed again
+                return res
             _rm(output)                                    # never leave an over-peak master around
-            return res
-        res.reason += f" · peak {peak:.1f} ≤ {cap_mbps} Mbps cap" + audio_note
-        shutil.rmtree(segdir, ignore_errors=True)      # SUCCESS: the segments won't be needed again
-        return res
+        return RemuxResult(False, output,
+                           reason=f"peak still over cap after encode + repair: "
+                                  f"{peak:.1f} Mbps > {cap_mbps} (shipped nothing)")
     finally:
         # transient only — segdir is KEPT on any non-success return so the next attempt resumes
         _rm(hevc); _rm(tracks); _rm(dv_mp4)
