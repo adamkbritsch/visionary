@@ -272,3 +272,7 @@ Use this only on content you legally own.
 <p align="center">
   <img src="docs/assets/app-icon.png" alt="The Visionary app icon" width="96">
 </p>
+
+<p align="center">
+  <sub>Pirate ship icon by <a href="https://thenounproject.com/">Madison Apple</a> from the Noun Project, licensed under <a href="https://creativecommons.org/licenses/by/3.0/">CC&nbsp;BY&nbsp;3.0</a>.</sub>
+</p>
