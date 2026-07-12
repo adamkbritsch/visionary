@@ -30,6 +30,7 @@ Arm it in the evening; wake up to finished episodes.
 >    scripting API). The templates and click coordinates were captured from this exact
 >    Resolve build on this exact 3456×2234 panel — any other version or screen silently
 >    breaks the automation.
+>
 > 2. **The power.** The Topaz stage runs the GPU flat-out for hours and needs the 16-inch
 >    model's full **140 W** power envelope. The 14-inch MacBook Pro tops out at a 96 W
 >    adapter — the pipeline's power gate would hold forever (and on a lesser brick the
@@ -67,6 +68,7 @@ If the `display` check fails, **stop here** — this machine can't run Visionary
   [support archive](https://www.blackmagicdesign.com/support/family/davinci-resolve-and-fusion)
   (expand "Older versions"). Install, enter your Studio license, launch it once, quit.
   **Never accept an in-app upgrade** or let a newer Resolve touch its project library.
+
 - **Topaz Video AI 7.0.1** — from Topaz's
   [release archive](https://community.topazlabs.com/c/video-ai/releases). Install, log in
   once in the app (that activates the license + downloads models; the pipeline runs it
@@ -184,23 +186,28 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   (live-action film vs digital), then picks the matching tuned Topaz profile automatically,
   with per-resolution variants for 480p/720p/1080p sources. No confident match → it asks
   once, and every choice is overridable per show.
+
 - **Intake-matched Dolby Vision mastering**: the Resolve stage picks one of two hand-configured
   projects by the source's range. An **SDR** input is mastered to **Dolby Vision at 1000 nits**;
   an **HDR** input to **2000 nits** — so each gets the right DV target-display ceiling for how
   bright it was meant to go. Both export HDR10 + Dolby Vision Profile 8.1.
+
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
   episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**.
+
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265, a 50 Mbps per-second ceiling), so a finished 4K
   Dolby Vision master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p file it replaces**
   (measured across 48 upscaled episodes). Full 4K DV, without a 4K-sized storage bill.
+
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
   pauses on battery and dims the screen after idle. **Screen Control** holds the
   screen-invasive Resolve stage so it never grabs your Mac while you're using it — the
   other stages keep running. Separately, it pauses its NAS precaching whenever a Plex
   stream is live, so pulling ahead can't stutter playback.
+
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
 | Round-robin queue | Guardrails |
@@ -233,6 +240,7 @@ override (env wins):
 >
 > - **Playback failsafe** — while you're streaming from your Plex server, the background
 >   prefetch of upcoming downloads pauses so it can't stutter your playback.
+>
 > - **Watched-first ordering** — an optional per-show toggle (on by default) processes
 >   unwatched episodes before watched ones, plus a "watched" badge in the dashboard. Without
 >   Plex it just falls back to plain episode order.
@@ -261,6 +269,7 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 
 - One hardware target (see the requirements box) — by design, not laziness: the DV
   analysis step is screen automation and pixel-exact.
+
 - **Resolve's upgrade nag stalls Resolve — not the pipeline.** Every week or so, DaVinci
   Resolve throws an "update available" dialog on launch that blocks its screen automation.
   After a few failed attempts rule out a fluke, the pipeline stops idling: it holds each
@@ -272,6 +281,7 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   at once** while the backlog is ≥2 items to clear it ~2× faster (Topaz pauses while those
   two x265 encodes run, so the CPU is theirs). Nothing is lost or parked; you just reclaim
   the idle GPU time the stall would've wasted.
+
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless, so while an item is
   being upscaled it holds about **130 GB of scratch** — **~160× the ~0.8 GB source** (a
@@ -282,6 +292,7 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   **400 GB free-space floor** before starting an item (room for one movie-sized
   intermediate plus margin), so plan for a fast SSD with ~1 TB free (a 2 TB SSD is
   comfortable).
+
 - Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
   library (that's the point — keep backups if you want a way back).
 
