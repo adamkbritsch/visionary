@@ -83,16 +83,20 @@ Optional: the user can import `bundle/topaz/*.json` in Topaz's GUI (reference on
 mkdir -p ~/.topaz-pipeline && cp config.example.json ~/.topaz-pipeline/config.json && chmod 600 ~/.topaz-pipeline/config.json
 ```
 Walk the user through each key (README "Configuration" table): NAS host(s) (VPN IP
-first, LAN name second), FTP user/pass, Plex URL + token (link them Plex's
-find-your-token article), optional TMDb, optional youtarr. If their media roots differ
-from `/Media/TV-Shows` etc., set the `TOPAZ_NAS_FTP_*` env overrides.
+first, LAN name second), FTP user/pass — then the OPTIONAL extras: Plex URL + token
+(only if they use Plex; link them Plex's find-your-token article), TMDb, youtarr. If
+their media roots differ from `/Media/TV-Shows` etc., set the `TOPAZ_NAS_FTP_*` env
+overrides. A user without Plex leaves the `plex_*` keys blank — that is a fully
+supported setup (see the README's "Plex is optional" note).
 
 ### Step 9 — NAS check
 ```bash
 python3 engine/preflight.py --json --network
 ```
-`config` must show `FTP: connected` + `Plex: reachable`. Failures are network truths —
-VPN down, wrong host, bad token; fix with the user, don't skip. Optional NAS extras:
+`config` must show `FTP: connected`, plus `Plex: reachable` if a token is configured
+(a Plex-less setup shows `Plex: not configured (optional)` — that's a pass, not a
+failure). Real failures are network truths — VPN down, wrong host, bad token; fix
+with the user, don't skip. Optional NAS extras:
 `nas/dv_probe.py` (see `nas/README.md`) and youtarr (its absence just disables the
 YouTube mode — say so and move on).
 

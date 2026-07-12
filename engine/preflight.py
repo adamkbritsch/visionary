@@ -339,17 +339,21 @@ def check_config(network=False):
     hosts = transfer.nas_hosts()
     s = transfer.ftp_settings()
     token = plex.plex_token()
+    # plex_token is NOT required — Plex is an optional extra (README 'Configuration'): the
+    # token is the optionality signal, so a blank one must neither fail this check nor block
+    # the FTP probe below (it used to do both, so a Plex-less setup could never go all-green).
     missing = [k for k, v in (("ftp_host(s)", hosts), ("ftp_user", s["user"]),
-                              ("ftp_pass", s["passwd"]), ("plex_token", token)) if not v]
+                              ("ftp_pass", s["passwd"])) if not v]
     if missing:
         return _check("config", False, "warn",
                       f"{cfg_path}: missing/empty -> " + ", ".join(missing),
                       "cp config.example.json ~/.topaz-pipeline/config.json && chmod 600 "
-                      "~/.topaz-pipeline/config.json — then fill in the NAS + Plex values "
-                      "(see README 'Configuration').")
+                      "~/.topaz-pipeline/config.json — then fill in the NAS values (Plex is "
+                      "optional; see README 'Configuration').")
     if not network:
-        return _check("config", True, "warn", "all required keys set (run --network to probe live)", "")
-    # live probes: FTP + Plex (Youtarr only when configured — optional feature)
+        note = "all required keys set" + ("" if token else " · Plex not configured (optional)")
+        return _check("config", True, "warn", note + " (run --network to probe live)", "")
+    # live probes: FTP always; Plex/Youtarr only when configured — both optional features
     detail, ok = [], True
     try:
         ftp = transfer.connect(timeout=10)
@@ -359,19 +363,22 @@ def check_config(network=False):
     except Exception as e:
         ok = False
         detail.append(f"FTP: {e}")
-    try:
-        import urllib.request
-        base = plex.plex_base_urls()[0]
-        req = urllib.request.Request(base + "/identity", headers={"X-Plex-Token": token})
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-        detail.append("Plex: reachable")
-    except Exception as e:
-        ok = False
-        detail.append(f"Plex: {e}")
+    if token:
+        try:
+            import urllib.request
+            base = plex.plex_base_urls()[0]
+            req = urllib.request.Request(base + "/identity", headers={"X-Plex-Token": token})
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            detail.append("Plex: reachable")
+        except Exception as e:
+            ok = False
+            detail.append(f"Plex: {e}")
+    else:
+        detail.append("Plex: not configured (optional)")
     return _check("config", ok, "warn", "; ".join(detail),
-                  "Check the NAS is reachable (VPN up? LAN name resolves?) and the Plex "
-                  "URL/token in ~/.topaz-pipeline/config.json are right.")
+                  "Check the NAS is reachable (VPN up? LAN name resolves?) and — if you use "
+                  "Plex — the URL/token in ~/.topaz-pipeline/config.json are right.")
 
 
 def check_shim_smoke():

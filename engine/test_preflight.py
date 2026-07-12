@@ -124,3 +124,64 @@ class LiveOnReferenceMachine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigCheck(unittest.TestCase):
+    """Plex is OPTIONAL (README 'Configuration'): a blank plex_token must neither fail the
+    config check nor block the FTP probe — it used to do both, so a Plex-less setup could
+    never pass setup steps 9-10 (fact-check-caught)."""
+
+    def _mocks(self, token, connect=None):
+        import transfer, plex
+        ms = [mock.patch.object(transfer, "nas_hosts", return_value=["10.0.0.2"]),
+              mock.patch.object(transfer, "ftp_settings", return_value={"user": "u", "passwd": "p"}),
+              mock.patch.object(plex, "plex_token", return_value=token)]
+        if connect is not None:
+            ms.append(mock.patch.object(transfer, "connect", return_value=connect))
+        return ms
+
+    class _FTP:
+        def quit(self): pass
+
+    def test_blank_plex_token_is_not_required(self):
+        import contextlib
+        with contextlib.ExitStack() as es:
+            for m in self._mocks(""):
+                es.enter_context(m)
+            c = preflight.check_config(network=False)
+        self.assertTrue(c["ok"])
+        self.assertIn("Plex not configured (optional)", c["detail"])
+
+    def test_blank_plex_token_still_probes_ftp_and_skips_plex(self):
+        import contextlib
+        with contextlib.ExitStack() as es:
+            for m in self._mocks("", connect=self._FTP()):
+                es.enter_context(m)
+            c = preflight.check_config(network=True)
+        self.assertTrue(c["ok"])                            # all-green is reachable Plex-less now
+        self.assertIn("FTP: connected", c["detail"])        # the FTP probe actually ran
+        self.assertIn("Plex: not configured (optional)", c["detail"])
+
+    def test_missing_ftp_keys_still_fail_without_naming_plex(self):
+        import contextlib, transfer
+        with contextlib.ExitStack() as es:
+            for m in self._mocks(""):
+                es.enter_context(m)
+            es.enter_context(mock.patch.object(transfer, "ftp_settings",
+                                               return_value={"user": "", "passwd": ""}))
+            c = preflight.check_config(network=False)
+        self.assertFalse(c["ok"])
+        self.assertIn("ftp_user", c["detail"])
+        self.assertNotIn("plex_token", c["detail"])         # never demanded anymore
+
+    def test_configured_plex_is_still_probed_and_must_answer(self):
+        import contextlib, plex
+        with contextlib.ExitStack() as es:
+            for m in self._mocks("tok", connect=self._FTP()):
+                es.enter_context(m)
+            es.enter_context(mock.patch.object(plex, "plex_base_urls",
+                                               return_value=["http://nas:32400"]))
+            es.enter_context(mock.patch("urllib.request.urlopen", side_effect=OSError("refused")))
+            c = preflight.check_config(network=True)
+        self.assertFalse(c["ok"])                           # configured but unreachable = real failure
+        self.assertIn("Plex:", c["detail"])
