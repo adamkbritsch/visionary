@@ -61,7 +61,7 @@ cd visionary && python3 engine/preflight.py
 If the `display` check fails, **stop here** — this machine can't run Visionary
 (see the requirements box above). Nothing you install later will change that.
 
-### 2. Install the two apps — exact versions&nbsp;&nbsp;<picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/pirate-ship-white.png"><img src="docs/assets/pirate-ship.png" alt="" height="55" align="middle"></picture>
+### 2. Install the two apps — exact versions&nbsp;&nbsp;<picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/pirate-ship-white-v2.png"><img src="docs/assets/pirate-ship-v2.png" alt="" height="59" align="middle"></picture>
 
 - **DaVinci Resolve Studio 18.6** — from Blackmagic's
   [support archive](https://www.blackmagicdesign.com/support/family/davinci-resolve-and-fusion)
