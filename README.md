@@ -21,6 +21,7 @@ Arm it in the evening; wake up to finished episodes.
 > | Mac | **16-inch MacBook Pro** (Apple Silicon), using its **built-in display** (3456×2234) as the main display, on its **140 W power adapter** |
 > | DaVinci Resolve | **Studio 18.6.0** (build 18.6.00009) — the paid Studio edition, this exact build |
 > | Topaz Video AI | **7.0.1** — this exact build |
+> | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media + a Plex server |
 >
 > Why the 16-inch specifically — two independent reasons:
@@ -241,6 +242,14 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 
 - One hardware target (see the requirements box) — by design, not laziness: the DV
   analysis step is screen automation and pixel-exact.
+- **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
+  there* is not: Topaz's 4K ProRes intermediate is near-lossless, so a single **~0.8 GB**
+  1080p episode balloons to about **130 GB of scratch** while it processes — **~160× the
+  source file** — and a feature film's intermediate can reach ~245 GB. The dual pipeline
+  keeps two working sets alive at once and holds a **600 GB free-space floor** before
+  starting the next item, so plan for a fast SSD with ~1 TB free (a 2 TB SSD is
+  comfortable). It's all transient — each episode's scratch is deleted right after a
+  verified upload — but the peak is real.
 - Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
   library (that's the point — keep backups if you want a way back).
 - The youtarr integration assumes a UGREEN-style docker layout for its FTP archive path
