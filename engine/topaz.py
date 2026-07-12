@@ -502,8 +502,14 @@ def _cached_scene_frames(source, segdir, fps) -> list:
 
 
 def _frame_count(path, ffprobe=FFPROBE_HB) -> int:
-    """Frames in a file — fast header read, falling back to a full count if unknown."""
+    """Frames in a file — fast header/tag reads first; a full-decode count only as a LAST
+    resort. `nb_frames` is present in MP4 but N/A in MKV, where the EXACT count instead lives
+    in a NUMBER_OF_FRAMES stream tag (written by any muxer/copy) — read that before decoding.
+    Critical for an already-CFR stream-COPY that keeps HEVC: a full HEVC `-count_frames` decode
+    of a feature can take minutes and time out → the good CFR would be judged 'not ready' and
+    re-copied forever. All three yield the SAME exact count, so segment planning is unaffected."""
     for args in (["-show_entries", "stream=nb_frames"],
+                 ["-show_entries", "stream_tags=NUMBER_OF_FRAMES"],   # MKV exact count — no decode
                  ["-count_frames", "-show_entries", "stream=nb_read_frames"]):
         try:
             out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",

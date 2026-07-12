@@ -265,3 +265,17 @@ class CfrFastPath(unittest.TestCase):
              mock.patch.object(topaz, "source_color", return_value=None):
             topaz.to_cfr("src.mkv", "dst.mkv")
         self.assertIn("libx264", captured["cmd"])
+
+    def test_frame_count_uses_mkv_tag_not_slow_decode(self):
+        # MKV: nb_frames is N/A -> the NUMBER_OF_FRAMES tag gives the exact count with NO
+        # `-count_frames` full decode (which times out on HEVC and broke the CFR fast-path).
+        calls = []
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if "stream=nb_frames" in cmd: return mock.Mock(stdout="N/A\n")
+            if "stream_tags=NUMBER_OF_FRAMES" in cmd: return mock.Mock(stdout="60961\n")
+            return mock.Mock(stdout="")
+        with mock.patch.object(topaz.subprocess, "run", side_effect=fake_run):
+            n = topaz._frame_count("x.mkv")
+        self.assertEqual(n, 60961)
+        self.assertFalse(any("-count_frames" in c for c in calls))   # never decoded
