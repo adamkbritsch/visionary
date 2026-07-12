@@ -955,6 +955,13 @@ class Orchestrator:
             self._drain_baseline = None        # fresh run: never inherit a stale drain baseline
             self._parked.clear()               # a manual Start retries everything, incl. parked eps
             self._fail_counts.clear()
+            # A manual Start is ALSO the "retry Resolve now" signal: drop any Resolve-stall state so the
+            # items held before a stalled Resolve re-enter selection and Resolve is re-tried fresh (another
+            # STALL_TRIGGER_ATTEMPTS before we'd re-conclude a stall) — e.g. after you dismiss its prompt.
+            self._stall_active = False
+            self._resolve_stall.clear()
+            self._resolve_fails.clear()
+            self._stall_probe = None
             self._yt_refresh_at = 0.0           # fresh run: re-scan staging + refresh popular sets at once
             self._yt_meta_done = False
             # _tv_since_yt / _movie_wait deliberately NOT reset — they're processing HISTORY

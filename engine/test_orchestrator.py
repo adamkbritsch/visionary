@@ -962,6 +962,19 @@ class ResolveStall(unittest.TestCase):
         o._maybe_retry_stall()
         self.assertIsNone(o._stall_probe)
 
+    def test_reactivating_clears_the_stall_so_resolve_is_retried(self):
+        o = orch.Orchestrator()
+        o._stall_active = True; o._resolve_stall = {"S02E10", "S02E11"}
+        o._resolve_fails = {"S02E10": 3}; o._stall_probe = "S02E10"
+        with mock.patch.object(o, "_start_caffeinate"), \
+             mock.patch.object(o, "_finisher_reconcile"), \
+             mock.patch.object(o, "_ensure"):
+            o.enable()                                       # deactivate→reactivate = "retry Resolve now"
+        self.assertFalse(o._stall_active)                    # stall dropped → held items re-enter selection
+        self.assertEqual(o._resolve_stall, set())
+        self.assertEqual(o._resolve_fails, {})               # fresh count → another 5 attempts before re-stall
+        self.assertIsNone(o._stall_probe)
+
     def test_low_disk_pause_uses_stall_floor_not_the_normal_floor(self):
         o = orch.Orchestrator(); o._stall_active = True; o._resolve_stall = {"S02E10"}
         # below the normal 400 GB floor but above the 100 GB stall floor → keep buffering (no pause)
