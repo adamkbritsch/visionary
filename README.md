@@ -249,8 +249,9 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   moment Resolve finishes its export** — the remux only needs the DV render plus the
   original — so the item being remuxed alongside the next upscale carries just ~10 GB, and
   the dual pipeline never doubles the peak. Still, budget generously: the pipeline keeps a
-  **600 GB free-space floor** before starting an item, so plan for a fast SSD with ~1 TB
-  free (a 2 TB SSD is comfortable).
+  **400 GB free-space floor** before starting an item (room for one movie-sized
+  intermediate plus margin), so plan for a fast SSD with ~1 TB free (a 2 TB SSD is
+  comfortable).
 - Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
   library (that's the point — keep backups if you want a way back).
 - The youtarr integration assumes a UGREEN-style docker layout for its FTP archive path

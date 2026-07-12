@@ -45,10 +45,11 @@ STAGES = ["download", "topaz", "resolve", "remux", "upload", "cleanup"]
 # runs WHILE item N+1 downloads/upscales — the peak-cap re-encode costs ~zero wall-clock.
 RUN_STAGES = ["download", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
-OVERLAP_MIN_PHYS_GB = 400    # while a finished item still holds its working set (~310 GB, freed at
-                             # its cleanup), gate the NEXT item's start on RAW physical free — the
-                             # available_gb metric would count the finisher item's files as
-                             # reclaimable scratch and overcommit the disk
+OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/upload), gate the NEXT
+                             # item's start on RAW physical free. Its topaz intermediate was dropped at
+                             # hand-off so the finisher item is small (~10 GB), but available_gb still
+                             # counts scratch as reclaimable — so gate on physical free to reserve room
+                             # for the NEXT item's own intermediate. Room for one movie ProRes + margin.
 STATE_FILE = os.path.expanduser("~/.topaz-pipeline/run-state.json")
 DIM_IDLE_MINUTES_DEFAULT = 15   # fallback for the 'dim_after_minutes' setting (idle this long → backlight 0)
 DRAIN_PCT_THRESHOLD = 5      # pause once the battery drains more than this % below where draining began
@@ -60,11 +61,16 @@ UNPLUG_GRACE_SECONDS = 60    # unplugged mid-stage (ANY stage, incl. remux): wai
                              # exactly like topaz. So it pauses at the same 60 s cutoff (user-dictated).
 YT_REFRESH_SECONDS = 300     # re-scan youtarr's staging this often mid-run → new downloads join the
                              # upscale queue live (the queue keeps growing while the user is away)
-MIN_FREE_GB = 600            # floor kept before starting an item + by the prefetcher. Sized for the
-                             # HQ-era peak: two feature-length MOVIE HQ ProRes intermediates coexisting
-                             # (~245 GB each = ~490 GB) during a tail-overlap, plus ~110 GB OS margin.
-                             # (HQ is ~1/3 of the old XQ, so this dropped from 1 TB — the freed room is
-                             # what lets the prefetcher stage the upcoming queue's downloads ahead.)
+MIN_FREE_GB = 400            # floor kept free before starting an item + by the prefetcher. The topaz
+                             # ProRes intermediate is now DROPPED at hand-off — right after Resolve's
+                             # export (_drop_topaz_intermediates) — so only ONE item's intermediate is
+                             # ever on disk at a time; the previous item, now remuxing, holds ~10 GB.
+                             # Sized for that single peak: one feature-length MOVIE ProRes (~245 GB) +
+                             # its source/CFR/render (~10 GB) + ~145 GB OS/FS margin ≈ 400. (A TV
+                             # episode's intermediate is only ~140 GB — measured — so this is generous
+                             # for the current all-TV workload.) Was 600 back when topaz lingered into
+                             # the finisher and TWO intermediates could coexist during a tail-overlap.
+                             # Keep >= OVERLAP_MIN_PHYS_GB (the finisher-overlap gate reuses this floor).
 MOVIE_TURN_SECONDS = 90 * 60  # a movie OR a long YouTube video runs at most this long per TURN —
                               # then one TV episode runs, then it resumes (segments + completed
                               # stages survive between turns). Keeps a 5-6h feature or a slow
@@ -1167,10 +1173,12 @@ class Orchestrator:
             if phys is not None and phys < MIN_FREE_GB:
                 return f"paused — low disk ({phys} GB): turn off Quiet Mode to drain items through Resolve"
         if self._in_finisher_keys():
-            # OVERLAP: the finisher item's ~310 GB working set is still resident (freed at its
-            # cleanup) but available_gb counts it as reclaimable scratch → would overcommit. Gate
-            # the next item's start on RAW physical free (after offering the prefetch buffer up).
-            # A finishing MOVIE holds a feature-length ProRes → demand the full MIN_FREE_GB.
+            # OVERLAP: an item is finishing in the background (remux/upload). Its topaz ProRes was
+            # dropped at hand-off so it's small (~10 GB), but available_gb still counts scratch as
+            # reclaimable → gate the next item's start on RAW physical free (after offering the
+            # prefetch buffer up) so the next item's own intermediate has guaranteed room. (Since the
+            # drop, a finishing MOVIE no longer holds its ProRes, so both demands converge to the
+            # floor — the fin_movie branch is a harmless legacy knob while MIN_FREE_GB == OVERLAP.)
             with self._finisher_lock:
                 fin_movie = bool(self._in_finisher_movies)
             need = MIN_FREE_GB if fin_movie else OVERLAP_MIN_PHYS_GB
