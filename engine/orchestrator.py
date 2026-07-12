@@ -106,6 +106,9 @@ MAX_EPISODE_FAILS = 5        # consecutive GENUINE failures of one episode → p
 # upscaling the NEXT items into a buffer — the GPU would otherwise sit idle through the stall. We
 # buffer down to STALL_FLOOR_GB free, then just re-probe Resolve on a cadence until the prompt is
 # cleared, at which point the whole buffer drains through Resolve.
+STALL_TRIGGER_ATTEMPTS = 5    # a Resolve failure could be a FLUKE — retry the SAME item this many times
+                              # (like a normal stage failure) before concluding Resolve is really stalled
+                              # and switching to buffer-ahead mode
 STALL_FLOOR_GB = 100          # free space to preserve while buffering topaz ahead of a stalled Resolve
 STALL_ITEM_RESERVE_GB = 150   # a TV-episode ProRes intermediate needs ~140 GB (measured) — don't START
                               # a fresh upscale during a stall unless raw free ≥ FLOOR + this (so the
@@ -114,8 +117,10 @@ STALL_MOVIE_RESERVE_GB = 260  # a feature ProRes can reach ~245 GB — a movie n
 STALL_RETRY_SECONDS = 300     # while stalled, release ONE held item this often to re-probe Resolve
                               # (only the probe attempts Resolve — a blocked attempt can hang for up to
                               # RESOLVE_TIMEOUT, so we never spend one per buffered item)
-STALL_MAX_ITEM_RETRIES = 6    # one item failing Resolve this many times = genuinely unrenderable (not the
-                              # prompt) → park it so a bad file can't loop forever (≈ hours at the cadence)
+STALL_MAX_ITEM_RETRIES = 12   # one item failing Resolve this many times TOTAL = genuinely unrenderable
+                              # (Resolve works for others but not this file) → park it so it can't loop
+                              # forever. Comfortably above STALL_TRIGGER_ATTEMPTS so the item that first
+                              # detected a real stall is never parked while the prompt is simply still up.
 
 
 # ---- pure: file/path plan for one episode --------------------------------
@@ -574,8 +579,10 @@ class Orchestrator:
         self._resolve_stall = set()            # items topaz'd but HELD before a STALLED Resolve (its update
                                                # prompt): buffered ahead down to STALL_FLOOR_GB, drained when
                                                # Resolve recovers. In-memory; self-heals each run.
-        self._resolve_fails = {}               # ep -> that item's Resolve-failure count (parks a genuinely
-                                               # unrenderable file after STALL_MAX_ITEM_RETRIES)
+        self._resolve_fails = {}               # ep -> that item's consecutive Resolve-failure count (drives
+                                               # the fluke-retry trigger; parks a genuinely bad file at cap)
+        self._stall_active = False             # True once STALL_TRIGGER_ATTEMPTS confirm a real Resolve
+                                               # stall — gates buffer-ahead mode until the prompt is cleared
         self._stall_probe = None               # the ONE held item _maybe_retry_stall released to re-test
                                                # Resolve (only it attempts Resolve; the rest stay held)
         self._stall_retry_at = 0.0             # monotonic time to release the next probe (set on first hold)
@@ -1167,7 +1174,7 @@ class Orchestrator:
                                           message="series complete — nothing left to upscale")
                         self._sleep(self._retry_seconds())
                     continue
-                if self._resolve_stall and not stage_done("topaz", ep) \
+                if self._stall_active and not stage_done("topaz", ep) \
                         and self._skip_key(ep) != self._stall_probe:
                     # Resolve is stalled and we're buffering topaz ahead. Only START a fresh upscale if
                     # its intermediate fits above the floor — else the buffer is full: wait and let the
@@ -1219,20 +1226,33 @@ class Orchestrator:
         self.state.update(stage=None,
             message=f"{ep_disp} parked after {n} failures at {st} — moving to the next episode")
 
-    def _enter_resolve_stall(self, p, ep_disp, last_msg):
-        """A Resolve ATTEMPT failed (most often Resolve's update prompt blocking its automation). Hold
-        this item before Resolve and move on to buffer the next upscale, instead of the sleep-60/park
-        path. Park it only if IT alone keeps failing (a genuinely unrenderable file, not the prompt)."""
+    def _on_resolve_failure(self, p, ep_disp, last_msg):
+        """A Resolve ATTEMPT failed. A single failure can be a FLUKE, so until a stall is confirmed we
+        retry the SAME item (like a normal stage failure); only after STALL_TRIGGER_ATTEMPTS straight
+        failures do we conclude Resolve is really stalled (its update prompt) and switch to buffer-ahead
+        mode — HOLD this item before Resolve and move on to upscale the next ones. Once buffering, every
+        failure is a probe result → just re-hold. A file that keeps failing even across recoveries (bad
+        file, not the prompt) parks at STALL_MAX_ITEM_RETRIES so it can't loop forever."""
         key = self._skip_key(p)
         n = self._resolve_fails.get(p.ep, 0) + 1
         self._resolve_fails[p.ep] = n
         if n >= STALL_MAX_ITEM_RETRIES:                 # this file itself is the problem, not Resolve
             self._resolve_stall.discard(key)
             self._resolve_fails.pop(p.ep, None)
+            if self._stall_active and not self._resolve_stall:
+                self._stall_active = False              # parked the last held item → leave stall mode
             self._park_item(p, ep_disp, n, "resolve", last_msg)
             return
-        if not self._resolve_stall:                     # first hold of this stall → start the probe clock
+        if not self._stall_active and n < STALL_TRIGGER_ATTEMPTS:
+            # not a confirmed stall yet — could be a fluke that clears on retry. Retry the SAME item.
+            self.state.update(stage=None, progress=None,
+                message=f"{ep_disp}: resolve failed (attempt {n}/{STALL_TRIGGER_ATTEMPTS}) — retrying (could be a fluke)")
+            self._sleep(60)
+            return
+        if not self._stall_active:                      # STALL_TRIGGER_ATTEMPTS reached → confirmed stall
+            self._stall_active = True
             self._stall_retry_at = time.monotonic() + STALL_RETRY_SECONDS
+            logbook.event(f"resolve stalled after {n} attempts on {p.ep} — buffering topaz ahead")
         self._resolve_stall.add(key)
         self.state.update(stage=None, progress=None, current=None,
             message=f"{ep_disp}: Resolve stalled (dismiss its update prompt) — held; "
@@ -1251,6 +1271,7 @@ class Orchestrator:
         """A Resolve render SUCCEEDED while items were held before a stalled Resolve → the update prompt
         is gone. Release the whole held buffer so every waiting item drains through Resolve."""
         held = len(self._resolve_stall)
+        self._stall_active = False
         self._resolve_stall.clear()
         self._stall_probe = None
         logbook.event(f"resolve recovered — draining {held} held item(s)")
@@ -1259,8 +1280,10 @@ class Orchestrator:
         """While Resolve is stalled, release ONE held item on a cadence so the next selection RETRIES
         Resolve — this is how we detect the moment the update prompt is dismissed (that retry succeeds
         → _resolve_recovered drains the buffer). Only this released 'probe' item attempts Resolve."""
-        if not self._resolve_stall:
+        if not self._stall_active:
             self._stall_probe = None
+            return
+        if not self._resolve_stall:        # nothing held to probe (the only item is already in flight)
             return
         now = time.monotonic()
         if now < self._stall_retry_at:
@@ -1273,7 +1296,7 @@ class Orchestrator:
         """A pause message if there isn't room to START an item, else None. In QUIET MODE the scratch
         fills with un-cleanable topaz outputs, so available_gb (which counts the scratch footprint as
         reclaimable) can't see the disk fill → gate on RAW physical free so a write can't ENOSPC/truncate."""
-        if self._resolve_stall:
+        if self._stall_active:
             # A stalled Resolve is DELIBERATELY buffering topaz output down to STALL_FLOOR_GB — the
             # normal 400 GB floor doesn't apply. The per-item reserve gate in _run stops a fresh
             # upscale that wouldn't fit; here we only hard-stop once we've actually reached the floor.
@@ -1677,7 +1700,7 @@ class Orchestrator:
                 continue
             if st == "resolve" and self._quiet_mode():     # SCREEN CONTROL OFF: hold before the screen-
                 self._defer_resolve(p, ep_disp); return    # invasive Resolve stage; process other items
-            if st == "resolve" and self._resolve_stall:    # Resolve known-stalled (update prompt): don't
+            if st == "resolve" and self._stall_active:     # Resolve known-stalled (update prompt): don't
                 if self._skip_key(p) != self._stall_probe: # attempt it (a blocked attempt hangs to
                     self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
                 self._stall_probe = None                   # this IS the probe → fall through and re-test Resolve
@@ -1733,7 +1756,7 @@ class Orchestrator:
                 self._fail_counts.pop(p.ep, None)   # any forward progress clears the fail streak
                 if st == "resolve":
                     self._resolve_fails.pop(p.ep, None)
-                    if self._resolve_stall:         # Resolve works again → release the whole buffer to drain
+                    if self._stall_active:          # Resolve works again → release the whole buffer to drain
                         self._resolve_recovered()
             if not ok:
                 # A movie's 90-min TURN ending (clean stop at a segment boundary) is NOT a
@@ -1751,10 +1774,9 @@ class Orchestrator:
                 if self._abort.is_set() or not self._enabled:
                     return
                 if st == "resolve":
-                    # Resolve failed — most often its weekly update prompt blocking automation. Hold this
-                    # item before Resolve and move on to buffer the next upscale (down to STALL_FLOOR_GB)
-                    # instead of parking it; _maybe_retry_stall re-probes until the prompt is dismissed.
-                    self._enter_resolve_stall(p, ep_disp, msg)
+                    # Resolve failed. Retry the same item a few times (fluke window); once confirmed a real
+                    # stall, hold it and buffer the next upscales (down to STALL_FLOOR_GB) instead of parking.
+                    self._on_resolve_failure(p, ep_disp, msg)
                     return
                 n = self._fail_counts.get(p.ep, 0) + 1
                 self._fail_counts[p.ep] = n
