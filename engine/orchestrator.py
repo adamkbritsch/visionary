@@ -98,6 +98,25 @@ PREFETCH_GATE_GB = MIN_FREE_GB + 30   # prefetch a source only while free stays 
                              # over the floor so prefetched sources never eat into the intermediate reserve)
 MAX_EPISODE_FAILS = 5        # consecutive GENUINE failures of one episode → park it, move on
 
+# ---- RESOLVE-STALL buffering ------------------------------------------------------------------
+# ~weekly, DaVinci Resolve throws an "update available" dialog on launch that blocks its screen
+# automation, so every Resolve attempt fails (or hangs to RESOLVE_TIMEOUT) until a human dismisses
+# it. Rather than park each episode after MAX_EPISODE_FAILS (wasting its topaz and giving up on it
+# for the whole run), we HOLD topaz'd items before Resolve (same primitive as Quiet Mode) and keep
+# upscaling the NEXT items into a buffer — the GPU would otherwise sit idle through the stall. We
+# buffer down to STALL_FLOOR_GB free, then just re-probe Resolve on a cadence until the prompt is
+# cleared, at which point the whole buffer drains through Resolve.
+STALL_FLOOR_GB = 100          # free space to preserve while buffering topaz ahead of a stalled Resolve
+STALL_ITEM_RESERVE_GB = 150   # a TV-episode ProRes intermediate needs ~140 GB (measured) — don't START
+                              # a fresh upscale during a stall unless raw free ≥ FLOOR + this (so the
+                              # last one that starts lands near the floor, never past it)
+STALL_MOVIE_RESERVE_GB = 260  # a feature ProRes can reach ~245 GB — a movie needs this much headroom
+STALL_RETRY_SECONDS = 300     # while stalled, release ONE held item this often to re-probe Resolve
+                              # (only the probe attempts Resolve — a blocked attempt can hang for up to
+                              # RESOLVE_TIMEOUT, so we never spend one per buffered item)
+STALL_MAX_ITEM_RETRIES = 6    # one item failing Resolve this many times = genuinely unrenderable (not the
+                              # prompt) → park it so a bad file can't loop forever (≈ hours at the cadence)
+
 
 # ---- pure: file/path plan for one episode --------------------------------
 
@@ -552,6 +571,14 @@ class Orchestrator:
         self._resolve_deferred = set()         # items topaz'd but held before Resolve by QUIET MODE (in-memory;
                                                # self-heals each run — re-encountered items re-add themselves)
         self._fail_counts = {}                 # ep -> consecutive genuine-failure count
+        self._resolve_stall = set()            # items topaz'd but HELD before a STALLED Resolve (its update
+                                               # prompt): buffered ahead down to STALL_FLOOR_GB, drained when
+                                               # Resolve recovers. In-memory; self-heals each run.
+        self._resolve_fails = {}               # ep -> that item's Resolve-failure count (parks a genuinely
+                                               # unrenderable file after STALL_MAX_ITEM_RETRIES)
+        self._stall_probe = None               # the ONE held item _maybe_retry_stall released to re-test
+                                               # Resolve (only it attempts Resolve; the rest stay held)
+        self._stall_retry_at = 0.0             # monotonic time to release the next probe (set on first hold)
         self._rr = 0                           # round-robin pointer over the active TV series
         c = self._load_cadence()
         self._yt_wait = c["yt_wait"]           # YouTube TURN deferral (same as movies: a >90-min video
@@ -1107,6 +1134,7 @@ class Orchestrator:
             while self._enabled:
                 self._abort.clear()          # fresh iteration — consume any mid-stage power abort
                 self._maybe_resume_deferred()        # Quiet Mode off → resume items held before Resolve
+                self._maybe_retry_stall()            # stalled Resolve → release a held item to re-probe it
                 pstatus, pmsg = self._power_ok()
                 self._power_paused = (pstatus == "pause")        # let the prefetcher back off too
                 if pstatus == "pause":
@@ -1139,6 +1167,18 @@ class Orchestrator:
                                           message="series complete — nothing left to upscale")
                         self._sleep(self._retry_seconds())
                     continue
+                if self._resolve_stall and not stage_done("topaz", ep) \
+                        and self._skip_key(ep) != self._stall_probe:
+                    # Resolve is stalled and we're buffering topaz ahead. Only START a fresh upscale if
+                    # its intermediate fits above the floor — else the buffer is full: wait and let the
+                    # retry cadence re-probe Resolve (nothing else is productive until the prompt clears).
+                    reserve = STALL_MOVIE_RESERVE_GB if (ep.movie or ep.youtube) else STALL_ITEM_RESERVE_GB
+                    phys = scratch.physical_free_gb()
+                    if phys is not None and phys < STALL_FLOOR_GB + reserve:
+                        self.state.update(stage=None, current=None,
+                            message=f"Resolve stalled — upscale buffer full ({phys} GB free); dismiss "
+                                    f"Resolve's update prompt to drain {len(self._resolve_stall)} held item(s)")
+                        self._sleep(DRAIN_POLL_SECONDS); continue
                 self._process(ep)
         except Exception as e:                       # never die silently — leave a trace
             logbook.exception("orchestrator loop", e)
@@ -1164,10 +1204,83 @@ class Orchestrator:
         if self._resolve_deferred and not self._quiet_mode():
             self._resolve_deferred.clear()
 
+    def _park_item(self, p, ep_disp, n, st, last_msg=""):
+        """Give up on this item for the run after repeated GENUINE failures: skip it so the series
+        keeps moving. A parked YouTube video restarts its cadence (it spent no TV turn). Shared by the
+        generic download/topaz fail path and the Resolve-stall path (a truly unrenderable file)."""
+        self._parked.add(self._skip_key(p))
+        self._fail_counts.pop(p.ep, None)
+        if p.youtube:                     # a parked video SPENT its YouTube turn — restart the cadence
+            with self._cadence_lock:      # so the gate doesn't serve another video with no intervening TV
+                self._tv_since_yt = 0
+                self._save_cadence()
+        logbook.failure(f"{p.ep}: parked after {n} failures at {st} — skipping so the "
+                        f"series keeps moving (last: {' '.join(str(last_msg).split())[-120:]})")
+        self.state.update(stage=None,
+            message=f"{ep_disp} parked after {n} failures at {st} — moving to the next episode")
+
+    def _enter_resolve_stall(self, p, ep_disp, last_msg):
+        """A Resolve ATTEMPT failed (most often Resolve's update prompt blocking its automation). Hold
+        this item before Resolve and move on to buffer the next upscale, instead of the sleep-60/park
+        path. Park it only if IT alone keeps failing (a genuinely unrenderable file, not the prompt)."""
+        key = self._skip_key(p)
+        n = self._resolve_fails.get(p.ep, 0) + 1
+        self._resolve_fails[p.ep] = n
+        if n >= STALL_MAX_ITEM_RETRIES:                 # this file itself is the problem, not Resolve
+            self._resolve_stall.discard(key)
+            self._resolve_fails.pop(p.ep, None)
+            self._park_item(p, ep_disp, n, "resolve", last_msg)
+            return
+        if not self._resolve_stall:                     # first hold of this stall → start the probe clock
+            self._stall_retry_at = time.monotonic() + STALL_RETRY_SECONDS
+        self._resolve_stall.add(key)
+        self.state.update(stage=None, progress=None, current=None,
+            message=f"{ep_disp}: Resolve stalled (dismiss its update prompt) — held; "
+                    f"buffering the next upscale ahead ({len(self._resolve_stall)} waiting)")
+
+    def _hold_before_stalled_resolve(self, p, ep_disp):
+        """Resolve is already known-stalled, so a freshly-upscaled item is HELD without attempting
+        Resolve (a blocked attempt can hang for up to RESOLVE_TIMEOUT). No fail count — it never
+        actually failed; only the periodic probe re-tests Resolve."""
+        self._resolve_stall.add(self._skip_key(p))
+        self.state.update(stage=None, progress=None, current=None,
+            message=f"{ep_disp}: Resolve stalled — held, buffering the next upscale "
+                    f"({len(self._resolve_stall)} waiting)")
+
+    def _resolve_recovered(self):
+        """A Resolve render SUCCEEDED while items were held before a stalled Resolve → the update prompt
+        is gone. Release the whole held buffer so every waiting item drains through Resolve."""
+        held = len(self._resolve_stall)
+        self._resolve_stall.clear()
+        self._stall_probe = None
+        logbook.event(f"resolve recovered — draining {held} held item(s)")
+
+    def _maybe_retry_stall(self):
+        """While Resolve is stalled, release ONE held item on a cadence so the next selection RETRIES
+        Resolve — this is how we detect the moment the update prompt is dismissed (that retry succeeds
+        → _resolve_recovered drains the buffer). Only this released 'probe' item attempts Resolve."""
+        if not self._resolve_stall:
+            self._stall_probe = None
+            return
+        now = time.monotonic()
+        if now < self._stall_retry_at:
+            return
+        self._stall_retry_at = now + STALL_RETRY_SECONDS
+        self._stall_probe = next(iter(self._resolve_stall))   # any held item probes Resolve equally
+        self._resolve_stall.discard(self._stall_probe)        # re-enters selection (topaz done → served)
+
     def _low_disk_pause(self):
         """A pause message if there isn't room to START an item, else None. In QUIET MODE the scratch
         fills with un-cleanable topaz outputs, so available_gb (which counts the scratch footprint as
         reclaimable) can't see the disk fill → gate on RAW physical free so a write can't ENOSPC/truncate."""
+        if self._resolve_stall:
+            # A stalled Resolve is DELIBERATELY buffering topaz output down to STALL_FLOOR_GB — the
+            # normal 400 GB floor doesn't apply. The per-item reserve gate in _run stops a fresh
+            # upscale that wouldn't fit; here we only hard-stop once we've actually reached the floor.
+            phys = scratch.physical_free_gb()
+            if phys is not None and phys < STALL_FLOOR_GB:
+                return f"paused — low disk ({phys} GB): dismiss Resolve's update prompt to drain held items"
+            return None
         if self._quiet_mode():
             phys = scratch.physical_free_gb()
             if phys is not None and phys < MIN_FREE_GB:
@@ -1443,6 +1556,7 @@ class Orchestrator:
         # item runs first, then the movie resumes. If nothing else is ready, the fallbacks at
         # the bottom serve the movie anyway — a deferral never stalls the run.
         skip = (self._parked | self._resolve_deferred        # + items QUIET MODE is holding before Resolve
+                | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
                 | self._in_finisher_keys()                   # + items the FINISHER already owns (still
                                                              #   un-mastered on the NAS — must not re-pick)
                 | self._finisher_persisted_keys())           # + DURABLE finisher items momentarily absent
@@ -1563,6 +1677,10 @@ class Orchestrator:
                 continue
             if st == "resolve" and self._quiet_mode():     # SCREEN CONTROL OFF: hold before the screen-
                 self._defer_resolve(p, ep_disp); return    # invasive Resolve stage; process other items
+            if st == "resolve" and self._resolve_stall:    # Resolve known-stalled (update prompt): don't
+                if self._skip_key(p) != self._stall_probe: # attempt it (a blocked attempt hangs to
+                    self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
+                self._stall_probe = None                   # this IS the probe → fall through and re-test Resolve
             if deadline is not None and st in ("topaz", "resolve") and time.monotonic() >= deadline:
                 with self._cadence_lock:
                     if p.youtube: self._yt_wait = 1
@@ -1613,6 +1731,10 @@ class Orchestrator:
             self.state.update(message=" ".join(f"{ep_disp}: {st} — {msg}".split()), progress=None)
             if ok:
                 self._fail_counts.pop(p.ep, None)   # any forward progress clears the fail streak
+                if st == "resolve":
+                    self._resolve_fails.pop(p.ep, None)
+                    if self._resolve_stall:         # Resolve works again → release the whole buffer to drain
+                        self._resolve_recovered()
             if not ok:
                 # A movie's 90-min TURN ending (clean stop at a segment boundary) is NOT a
                 # failure: defer the movie behind one other item and move on — no fail count.
@@ -1628,20 +1750,16 @@ class Orchestrator:
                 # and don't sit in the 60s retry; let the loop re-evaluate (power/stop) at once.
                 if self._abort.is_set() or not self._enabled:
                     return
+                if st == "resolve":
+                    # Resolve failed — most often its weekly update prompt blocking automation. Hold this
+                    # item before Resolve and move on to buffer the next upscale (down to STALL_FLOOR_GB)
+                    # instead of parking it; _maybe_retry_stall re-probes until the prompt is dismissed.
+                    self._enter_resolve_stall(p, ep_disp, msg)
+                    return
                 n = self._fail_counts.get(p.ep, 0) + 1
                 self._fail_counts[p.ep] = n
                 if n >= MAX_EPISODE_FAILS:
-                    self._parked.add(self._skip_key(p))   # movies key on basename, not the stem (else never skips)
-                    self._fail_counts.pop(p.ep, None)
-                    if p.youtube:                     # a parked video SPENT its YouTube turn — restart the
-                        with self._cadence_lock:      # cadence so the gate doesn't serve another video with
-                            self._tv_since_yt = 0     # no intervening TV
-                            self._save_cadence()
-                                                      # no intervening TV (park never reached the upload reset)
-                    logbook.failure(f"{p.ep}: parked after {n} failures at {st} — skipping so the "
-                                    f"series keeps moving (last: {' '.join(str(msg).split())[-120:]})")
-                    self.state.update(stage=None,
-                        message=f"{ep_disp} parked after {n} failures at {st} — moving to the next episode")
+                    self._park_item(p, ep_disp, n, st, msg)   # movies key on basename (see _skip_key)
                     self._sleep(5)
                     return
                 # otherwise leave it; next pass resumes this stage from its start

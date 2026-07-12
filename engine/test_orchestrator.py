@@ -844,6 +844,125 @@ class QuietMode(unittest.TestCase):
         self.assertFalse(o2.reclaim_screen()); self.assertFalse(o2._abort.is_set())
 
 
+class ResolveStall(unittest.TestCase):
+    """A stalled Resolve (its weekly update prompt blocks automation): HOLD topaz'd items before
+    Resolve and keep upscaling the next ones into a buffer (down to STALL_FLOOR_GB), re-probing
+    Resolve on a cadence, instead of parking each episode and piling ProRes intermediates."""
+
+    def _stall_ctx(self, o, run):
+        return [
+            mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "topaz")),
+            mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+            mock.patch.object(o, "_claim_prefetched"),
+            mock.patch.object(o, "_reclaim_for_pipeline"),
+            mock.patch.object(o, "_sleep"),
+            mock.patch.object(o, "_quiet_mode", return_value=False),
+            mock.patch.object(o, "_hand_to_finisher"),
+            mock.patch("stages.run_stage", side_effect=run),
+        ]
+
+    def test_resolve_failure_holds_and_buffers_instead_of_parking(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        run = lambda st, *_a, **_k: (False, "resolve failed (rc=1): update available") if st == "resolve" else (True, "ok")
+        with contextlib.ExitStack() as es:
+            for cm in self._stall_ctx(o, run):
+                es.enter_context(cm)
+            o._process(p)
+        self.assertIn("S02E10", o._resolve_stall)          # HELD before Resolve, not parked
+        self.assertEqual(o._parked, set())
+        self.assertEqual(o._fail_counts, {})               # a resolve fail doesn't use the generic streak
+        self.assertEqual(o._resolve_fails.get("S02E10"), 1)
+        self.assertEqual(o._finish_q.qsize(), 0)           # a failed resolve never hands off
+
+    def test_next_episode_skips_resolve_stalled_items(self):
+        o = orch.Orchestrator(); o._resolve_stall = {"S02E10"}
+        def eq(ref, skip=()):
+            nxt = None if "S02E10" in skip else {"ep": "S02E10", "source_name": SRC}
+            return {"next": nxt, "done_count": 1, "source_count": 1}
+        with mock.patch.object(orch.movies, "next_due", return_value=None), \
+             mock.patch.object(orch.youtube, "next_due", return_value=None), \
+             mock.patch.object(orch.series, "get_active_series", return_value=["The Office"]), \
+             mock.patch.object(orch.series, "series_root", return_value="/Media/TV"), \
+             mock.patch.object(orch.series, "episode_queue", side_effect=eq):
+            p, why = o._next_episode()
+        self.assertIsNone(p)                               # the only episode is held → nothing to pick
+
+    def test_fresh_item_is_held_without_attempting_a_stalled_resolve(self):
+        o = orch.Orchestrator(); o._enabled = True
+        o._resolve_stall = {"S02E09"}; o._stall_probe = None      # already stalled on another item
+        p = episode_paths("The Office", "S02E10", SRC)
+        ran = []
+        run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
+        with contextlib.ExitStack() as es:
+            for cm in self._stall_ctx(o, run):
+                es.enter_context(cm)
+            o._process(p)
+        self.assertEqual(ran, [])                          # Resolve NOT attempted (would hang to timeout)
+        self.assertIn("S02E10", o._resolve_stall)          # just buffered
+        self.assertEqual(o._resolve_fails, {})             # it never failed → no count against it
+
+    def test_probe_item_retries_resolve_and_recovers_on_success(self):
+        o = orch.Orchestrator(); o._enabled = True
+        o._resolve_stall = {"S02E09"}; o._stall_probe = "S02E10"   # designated probe
+        p = episode_paths("The Office", "S02E10", SRC)
+        ran = []
+        run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
+        with contextlib.ExitStack() as es:
+            for cm in self._stall_ctx(o, run):
+                es.enter_context(cm)
+            o._process(p)
+        self.assertEqual(ran, ["resolve"])                 # the probe DID re-test Resolve
+        self.assertIsNone(o._stall_probe)                  # token consumed
+        self.assertEqual(o._resolve_stall, set())          # success → whole buffer released to drain
+
+    def test_resolve_recovered_releases_the_whole_buffer(self):
+        o = orch.Orchestrator()
+        o._resolve_stall = {"A", "B", "C"}; o._stall_probe = "A"
+        o._resolve_recovered()
+        self.assertEqual(o._resolve_stall, set())
+        self.assertIsNone(o._stall_probe)
+
+    def test_persistently_failing_item_parks_after_the_cap(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        o._resolve_fails[p.ep] = orch.STALL_MAX_ITEM_RETRIES - 1   # one more fail → genuinely bad
+        o._enter_resolve_stall(p, "S02E10", "resolve failed (rc=1)")
+        self.assertIn(o._skip_key(p), o._parked)                  # parked, not held forever
+        self.assertNotIn("S02E10", o._resolve_stall)
+        self.assertNotIn(p.ep, o._resolve_fails)
+
+    def test_maybe_retry_stall_releases_a_probe_after_the_interval(self):
+        o = orch.Orchestrator(); o._resolve_stall = {"S02E10"}; o._stall_retry_at = 0.0
+        with mock.patch.object(orch.time, "monotonic", return_value=1000.0):
+            o._maybe_retry_stall()
+        self.assertEqual(o._stall_probe, "S02E10")                # released as the probe
+        self.assertEqual(o._resolve_stall, set())                 # re-enters selection
+        self.assertEqual(o._stall_retry_at, 1000.0 + orch.STALL_RETRY_SECONDS)
+
+    def test_maybe_retry_stall_waits_for_the_cadence(self):
+        o = orch.Orchestrator(); o._resolve_stall = {"S02E10"}; o._stall_retry_at = 2000.0
+        with mock.patch.object(orch.time, "monotonic", return_value=1000.0):
+            o._maybe_retry_stall()
+        self.assertIsNone(o._stall_probe)
+        self.assertEqual(o._resolve_stall, {"S02E10"})
+
+    def test_maybe_retry_stall_clears_probe_when_not_stalled(self):
+        o = orch.Orchestrator(); o._stall_probe = "leftover"
+        o._maybe_retry_stall()
+        self.assertIsNone(o._stall_probe)
+
+    def test_low_disk_pause_uses_stall_floor_not_the_normal_floor(self):
+        o = orch.Orchestrator(); o._resolve_stall = {"S02E10"}
+        # below the normal 400 GB floor but above the 100 GB stall floor → keep buffering (no pause)
+        with mock.patch.object(orch.scratch, "physical_free_gb", return_value=250):
+            self.assertIsNone(o._low_disk_pause())
+        # at/below the stall floor → pause and ask to clear the prompt
+        with mock.patch.object(orch.scratch, "physical_free_gb", return_value=80):
+            msg = o._low_disk_pause()
+        self.assertIsNotNone(msg); self.assertIn("update prompt", msg)
+
+
 class FinisherOverlap(unittest.TestCase):
     """TOPAZ/REMUX OVERLAP: the run thread owns download/topaz/resolve, then hands the item to
     the FINISHER thread (remux/upload/cleanup) so the ~75-min x265 peak-cap re-encode runs while

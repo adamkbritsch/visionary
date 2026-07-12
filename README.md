@@ -246,11 +246,13 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 
 - One hardware target (see the requirements box) — by design, not laziness: the DV
   analysis step is screen automation and pixel-exact.
-- **Resolve's upgrade nag can pause a run.** Every week or so, DaVinci Resolve throws an
-  "update available" dialog on launch that sits in front of everything and blocks the
-  screen automation, so the pipeline parks at the `resolve` stage until it's cleared. The
-  fix is trivial: open DaVinci Resolve, click the prompt away, and the run picks up from
-  where it left off — nothing else to do.
+- **Resolve's upgrade nag stalls Resolve — not the pipeline.** Every week or so, DaVinci
+  Resolve throws an "update available" dialog on launch that blocks its screen automation.
+  Instead of idling, the pipeline holds each finished upscale *before* Resolve and keeps
+  Topaz-ing the next episodes into a buffer (down to a **~100 GB** free-disk floor),
+  re-probing Resolve on a timer. Dismiss the prompt whenever you notice — open DaVinci
+  Resolve, click it away — and the whole buffer drains through Resolve automatically.
+  Nothing is lost or parked; you just reclaim the idle GPU time the stall would've wasted.
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless, so while an item is
   being upscaled it holds about **130 GB of scratch** — **~160× the ~0.8 GB source** (a
