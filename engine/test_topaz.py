@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import topaz
 from topaz import build_filter, build_command, build_env, summarize, is_valid_upscale
 
@@ -210,3 +211,57 @@ class LowPrioCfr(unittest.TestCase):
                                       rate="24000/1001", pix="yuv420p")
         self.assertNotIn("nice", cmd)
         self.assertNotIn("-threads", cmd)
+
+
+class CfrFastPath(unittest.TestCase):
+    """Already-CFR 4:2:0 sources stream-COPY instead of a wasteful full re-encode."""
+    def _probe(self, avg, r, pix):
+        js = ('{"streams":[{"avg_frame_rate":"%s","r_frame_rate":"%s","pix_fmt":"%s"}]}'
+              % (avg, r, pix))
+        return mock.patch.object(topaz.subprocess, "run", return_value=mock.Mock(stdout=js))
+
+    def test_detects_constant_frame_rate_420(self):
+        with self._probe("24000/1001", "24000/1001", "yuv420p10le"):
+            self.assertTrue(topaz._is_already_cfr("x.mkv"))
+
+    def test_variable_frame_rate_still_reencodes(self):
+        with self._probe("23976/1000", "24000/1001", "yuv420p"):   # avg != r → VFR
+            self.assertFalse(topaz._is_already_cfr("x.mkv"))
+
+    def test_wide_chroma_still_reencodes(self):
+        with self._probe("24000/1001", "24000/1001", "yuv422p10le"):  # 4:2:2 → normalize
+            self.assertFalse(topaz._is_already_cfr("x.mkv"))
+
+    def test_unreadable_falls_back(self):
+        with self._probe("0/0", "0/0", "yuv420p"):
+            self.assertFalse(topaz._is_already_cfr("x.mkv"))
+
+    def test_copy_command_is_stream_copy_no_reencode(self):
+        cmd = topaz.build_cfr_copy_command("/ff", "/in.mkv", "/out.mkv")
+        self.assertIn("copy", cmd); self.assertNotIn("libx264", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+
+    def test_to_cfr_streamcopies_when_already_cfr(self):
+        captured = {}
+        def fake_run(cmd, env, *, abort=None, on_progress=None):
+            captured["cmd"] = cmd; return (0, 100, False, "")
+        with mock.patch.object(topaz, "_is_already_cfr", return_value=True), \
+             mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"):
+            r = topaz.to_cfr("src.mkv", "dst.mkv")
+        self.assertTrue(r.ok)
+        self.assertIn("copy", captured["cmd"]); self.assertNotIn("libx264", captured["cmd"])
+
+    def test_to_cfr_reencodes_when_not_cfr(self):
+        captured = {}
+        def fake_run(cmd, env, *, abort=None, on_progress=None):
+            captured["cmd"] = cmd; return (0, 100, False, "")
+        with mock.patch.object(topaz, "_is_already_cfr", return_value=False), \
+             mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
+             mock.patch.object(topaz, "_cfr_pix_fmt", return_value="yuv420p"), \
+             mock.patch.object(topaz, "source_color", return_value=None):
+            topaz.to_cfr("src.mkv", "dst.mkv")
+        self.assertIn("libx264", captured["cmd"])

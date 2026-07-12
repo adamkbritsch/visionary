@@ -268,14 +268,54 @@ def is_cfr_ready(path) -> bool:
     return os.path.exists(path) and _frame_count(path) > 0
 
 
+def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
+    """The source is ALREADY constant frame rate at a 4:2:0 pixel format → the CFR step can
+    stream-COPY the video instead of a full re-encode (identical pixels, ~seconds not minutes).
+    `avg_frame_rate == r_frame_rate` (both valid) is the CFR signal — for VFR they differ; 4:2:0
+    because the re-encode also normalizes chroma to what the upscaler ingests, so 4:2:2/4:4:4
+    still transcode. CONSERVATIVE: any doubt (unreadable, VFR, wide chroma) → False → safe re-encode."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=avg_frame_rate,r_frame_rate,pix_fmt",
+                              "-of", "json", path], capture_output=True, text=True, timeout=30).stdout
+        s = (json.loads(out).get("streams") or [{}])[0]
+    except Exception:
+        return False
+    avg, r, pix = s.get("avg_frame_rate"), s.get("r_frame_rate"), s.get("pix_fmt")
+    if not avg or not r or avg in ("0/0", "N/A") or r in ("0/0", "N/A"):
+        return False
+    return avg == r and pix in ("yuv420p", "yuv420p10le")
+
+
+def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False):
+    """Fast path for an already-CFR 4:2:0 source (see _is_already_cfr): stream-COPY the video
+    (+audio) into the CFR file — no re-encode. Subtitles stay out (PGS can't ride the CFR and
+    aren't needed; the remux re-attaches them from the original). `-progress` still lets
+    _run_ffmpeg surface progress + a frame count."""
+    prio = ["/usr/sbin/taskpolicy", "-c", "background"] if low_prio else []
+    return [
+        *prio,
+        ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
+        "-i", src,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c", "copy",
+        dst,
+    ]
+
+
 def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False) -> CfrResult:
-    """Re-encode `source` to a CONSTANT frame rate at its own rate, into `dst`. Runs via
+    """Give `source` a CONSTANT frame rate in `dst`. If the source is ALREADY CFR (the common
+    case for modern rips), stream-COPY the video — a full re-encode of an already-CFR file is
+    pure waste (~minutes for a movie). Otherwise re-encode at the source's own rate. Runs via
     _run_ffmpeg so it's registered for kill-on-stop/shutdown and dies within ~0.5 s of an
     abort. A failed/aborted/partial output is removed (never left to be reused as 'ready')."""
     rate = _fps_fraction(source)
-    cmd = build_cfr_command(FFMPEG_HB, source, dst, rate=rate,
-                            pix=_cfr_pix_fmt(source), color=source_color(source),
-                            low_prio=low_prio)
+    if _is_already_cfr(source):
+        cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio)
+    else:
+        cmd = build_cfr_command(FFMPEG_HB, source, dst, rate=rate,
+                                pix=_cfr_pix_fmt(source), color=source_color(source),
+                                low_prio=low_prio)
     rc, frames, aborted, tail = _run_ffmpeg(cmd, os.environ.copy(),
                                             abort=abort, on_progress=on_progress)
     # A negative rc = the process was killed by a signal — that's ALWAYS our own stop/shutdown
@@ -286,6 +326,8 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False) -> CfrR
     if not ok and os.path.exists(dst):
         try: os.remove(dst)
         except OSError: pass
+    if ok and not frames:            # a stream copy may not emit frame= progress → re-probe
+        frames = _frame_count(dst)
     return CfrResult(ok=ok, frames=frames, rate=(rate or "source"),
                      error_tail=("aborted" if aborted else tail))
 
