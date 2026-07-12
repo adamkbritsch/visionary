@@ -16,6 +16,7 @@
   "youtarr_url": "",
   "youtarr_user": "",
   "youtarr_pass": "",
+  "youtarr_archive": "",
   "youtube_client_id": "",
   "youtube_client_secret": "",
   "youtube_refresh_token": ""

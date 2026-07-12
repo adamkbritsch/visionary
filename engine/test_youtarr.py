@@ -59,5 +59,23 @@ class Forget(unittest.TestCase):
             self.assertEqual(youtarr.channel_video_ids("UCx"), ["aaaaaaaaaa1", "bbbbbbbbbb2"])
 
 
+class ArchivePath(unittest.TestCase):
+    def test_defaults_to_the_ugreen_docker_layout(self):
+        with mock.patch.dict("os.environ", {"TOPAZ_YOUTARR_ARCHIVE": ""}), \
+             mock.patch.object(youtarr, "_config", return_value={}):
+            self.assertEqual(youtarr.archive_ftp_path(), youtarr.ARCHIVE_FTP_DEFAULT)
+
+    def test_env_var_overrides_the_path(self):
+        with mock.patch.dict("os.environ", {"TOPAZ_YOUTARR_ARCHIVE": "/volume1/docker/youtarr/config/complete.list"}), \
+             mock.patch.object(youtarr, "_config", return_value={}):
+            self.assertEqual(youtarr.archive_ftp_path(), "/volume1/docker/youtarr/config/complete.list")
+
+    def test_config_key_overrides_the_path(self):
+        with mock.patch.dict("os.environ", {"TOPAZ_YOUTARR_ARCHIVE": ""}), \
+             mock.patch.object(youtarr, "_config",
+                               return_value={"youtarr_archive": "/appdata/youtarr/config/complete.list"}):
+            self.assertEqual(youtarr.archive_ftp_path(), "/appdata/youtarr/config/complete.list")
+
+
 if __name__ == "__main__":
     unittest.main()

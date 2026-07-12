@@ -173,8 +173,18 @@ def channel_video_ids(channel_id, *, timeout=15):
     return out
 
 
-# youtarr's yt-dlp download ARCHIVE (the skip list), reachable over the FTP `[docker]` share.
-ARCHIVE_FTP = "/docker/youtarr/config/complete.list"
+# youtarr's yt-dlp download ARCHIVE (the skip list), reachable over the FTP share. Defaults to the
+# UGREEN docker layout (the `[docker]` share → the docker appdata volume). Point it anywhere for other
+# NAS layouts via TOPAZ_YOUTARR_ARCHIVE or config `youtarr_archive`, e.g.
+# "/volume1/docker/youtarr/config/complete.list" (Synology) or "/appdata/youtarr/config/complete.list".
+ARCHIVE_FTP_DEFAULT = "/docker/youtarr/config/complete.list"
+
+
+def archive_ftp_path() -> str:
+    """FTP path to youtarr's yt-dlp download archive (complete.list). Env/config override with the
+    UGREEN default, so existing setups are unaffected and any NAS layout can point it at its own path."""
+    return (os.environ.get("TOPAZ_YOUTARR_ARCHIVE")
+            or _config().get("youtarr_archive") or ARCHIVE_FTP_DEFAULT)
 
 
 def forget_downloads(video_ids) -> int:
@@ -185,6 +195,7 @@ def forget_downloads(video_ids) -> int:
     ids = {str(i) for i in (video_ids or []) if i}
     if not ids:
         return 0
+    archive = archive_ftp_path()
     import io
     import transfer
     try:
@@ -194,11 +205,11 @@ def forget_downloads(video_ids) -> int:
     try:
         # SIZE first, so a short/partial RETR can never truncate the real archive
         try:
-            expect = ftp.size(ARCHIVE_FTP)
+            expect = ftp.size(archive)
         except Exception:
             expect = None
         buf = io.BytesIO()
-        ftp.retrbinary("RETR " + ARCHIVE_FTP, buf.write)
+        ftp.retrbinary("RETR " + archive, buf.write)
         raw = buf.getvalue()
         if expect is not None and len(raw) != expect:
             return 0                                # incomplete read — do NOT rewrite the archive
@@ -213,11 +224,11 @@ def forget_downloads(video_ids) -> int:
         if removed:
             data = ("\n".join(kept) + ("\n" if kept else "")).encode("utf-8")
             # write to a temp then atomically rename, so a mid-write failure never truncates complete.list
-            tmp = ARCHIVE_FTP + ".tmp"
+            tmp = archive + ".tmp"
             ftp.storbinary("STOR " + tmp, io.BytesIO(data))
-            try: ftp.delete(ARCHIVE_FTP)
+            try: ftp.delete(archive)
             except Exception: pass
-            ftp.rename(tmp, ARCHIVE_FTP)
+            ftp.rename(tmp, archive)
         return removed
     except Exception:
         return 0

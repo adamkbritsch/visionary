@@ -223,6 +223,7 @@ override (env wins):
 | `plex_tv_section` / `plex_movie_section` | `TOPAZ_PLEX_SECTION` / `TOPAZ_PLEX_MOVIE_SECTION` | optional — auto-discovered when empty |
 | `tmdb_api_key` | `TOPAZ_TMDB_KEY` | optional — richer show metadata |
 | `youtarr_url` / `youtarr_user` / `youtarr_pass` | `TOPAZ_YOUTARR_URL` / `_USER` / `_PASS` | optional — YouTube mode |
+| `youtarr_archive` | `TOPAZ_YOUTARR_ARCHIVE` | optional — FTP path to youtarr's yt-dlp download archive (`complete.list`); defaults to the UGREEN docker layout `/docker/youtarr/config/complete.list` |
 | `youtube_client_id` / `_secret` / `_refresh_token` | — | optional — YouTube subscriptions picker |
 
 > **Plex is optional — you don't need it to run this.** Leave the `plex_*` keys blank and
@@ -283,8 +284,6 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   comfortable).
 - Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
   library (that's the point — keep backups if you want a way back).
-- The youtarr integration assumes a UGREEN-style docker layout for its FTP archive path
-  (env-overridable).
 
 ## Legal
 
