@@ -173,6 +173,11 @@ NAS (FTP) ──download──▶ local scratch
 NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p original in Plex
 ```
 
+<p align="center">
+  <img src="docs/assets/before-after-4k.png" alt="Before/after: a 1080p source frame vs Visionary's 4K upscale, cropped equally" width="880">
+</p>
+<p align="center"><sub><b>1080p source vs Visionary's 4K master</b> — same frame, cropped equally (colour-matched to isolate the resolution gain; the master is also Dolby Vision).</sub></p>
+
 - **Smart upscaling profiles**: it detects how a title was actually made — **film, digital,
   or animation (2D vs CGI)** — by consulting TMDb (animation + technique) and ShotOnWhat
   (live-action film vs digital), then picks the matching tuned Topaz profile automatically,
