@@ -480,8 +480,20 @@ class MovieTurns(unittest.TestCase):
 
     def test_due_movie_runs_when_not_deferred(self):
         o = orch.Orchestrator()
-        p, why = self._decide(o)
+        p, why = self._decide(o)               # fresh episode (no topaz on disk) → movie interrupts
         self.assertTrue(p.movie)
+
+    def test_midpipeline_episode_finishes_before_a_due_movie(self):
+        # a part-processed episode (topaz segments already on disk) must NOT be preempted by a
+        # due movie — else its ~140 GB intermediate sits idle through the movie's turn.
+        import tempfile, os as _os
+        o = orch.Orchestrator()
+        scratchd = tempfile.mkdtemp()
+        _os.makedirs(orch.episode_paths("A", "S01E01", SRC, scratch_dir=scratchd).segdir)
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=scratchd):
+            p, why = self._decide(o)           # movie IS due + not deferred, but episode is mid-pipeline
+        self.assertEqual(why, "ok")
+        self.assertFalse(p.movie); self.assertEqual(p.ep, "S01E01")   # the episode wins
 
     def test_turn_budget_message_defers_without_fail_count(self):
         o = orch.Orchestrator(); o._enabled = True

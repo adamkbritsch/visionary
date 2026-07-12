@@ -1408,6 +1408,26 @@ class Orchestrator:
                 pass
             self._sleep(15 if did else 60)                        # tight while working, relaxed when full/idle
 
+    def _midpipeline_tv(self, skip):
+        """The active-series next episode IF it's already PART-PROCESSED on disk — its topaz
+        segments dir exists or a DV render is present, so only resolve+remux remain. Returns
+        its EpisodePaths (to finish it before a movie/YouTube interrupt) or None. Cheap local
+        stat checks; `skip` keeps parked/finisher-owned items out. Only one episode is ever
+        part-processed at a time (segments are dropped at hand-off), so this can't starve a
+        movie — the next episode is fresh once this one uploads."""
+        for ref in self._participants():
+            try:
+                nxt = series.episode_queue(ref, skip=skip).get("next")
+            except Exception:
+                continue
+            if not nxt:
+                continue
+            p = episode_paths(ref, nxt["ep"], nxt["source_name"],
+                              nas_tv_root=series.series_root(ref))
+            if os.path.isdir(p.segdir) or os.path.exists(p.dv_render):
+                return p
+        return None
+
     def _next_episode(self):
         """(EpisodePaths|None, reason). reason ∈ {ok, no-series, complete, unreachable}.
         Mode-aware: TV walks the selected series' episodes, Movie walks the whole Movies
@@ -1429,6 +1449,14 @@ class Orchestrator:
                                                              #   from _in_finisher (disable→enable discard
                                                              #   race): the reconcile owns their resume, so
                                                              #   the run thread must not also grab them
+        # FINISH a part-processed episode before any movie/YouTube priority interrupt. If the
+        # active series' next episode already has its topaz on disk (segments or a DV render —
+        # only resolve+remux left), resume it: a fresh movie must NOT preempt it and strand its
+        # ~140 GB intermediate idle through the movie's 90-min turn. (Live-hit: a deploy killed
+        # S07E22 mid-resolve; on re-arm a due movie jumped the queue and its topaz sat unused.)
+        mid = self._midpipeline_tv(skip)
+        if mid is not None:
+            return mid, "ok"
         nx = movies.next_due(skip=skip) if self._movie_wait <= 0 else None
         if nx:
             return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title")), "ok"
