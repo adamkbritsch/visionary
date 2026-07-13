@@ -438,10 +438,10 @@ class YouTubeCadence(unittest.TestCase):
             self.assertEqual(o._yt_every_tv(), 2)          # default
 
 
-class MovieTurns(unittest.TestCase):
-    """A movie runs at most MOVIE_TURN_SECONDS per turn, then one other item, then resumes.
-    CADENCE_FILE is patched per-test — the counters PERSIST for real, so an unpatched test
-    would pollute the production file (and earlier tests would leak into later ones)."""
+class MovieScheduling(unittest.TestCase):
+    """Movies interrupt when due and run START-TO-FINISH in one go (the 90-min turn system is
+    gone — user-dictated). CADENCE_FILE is patched per-test — the counter PERSISTS for real, so
+    an unpatched test would pollute the production file (and earlier tests would leak)."""
 
     def setUp(self):
         import tempfile, os as _os
@@ -468,20 +468,27 @@ class MovieTurns(unittest.TestCase):
             s.enter_context(mock.patch.object(orch.youtube, "next_due", return_value=None))
             return o._next_episode()
 
-    def test_deferred_movie_yields_to_an_episode(self):
-        o = orch.Orchestrator(); o._movie_wait = 1
-        p, why = self._decide(o)
-        self.assertEqual(why, "ok"); self.assertFalse(p.movie); self.assertEqual(p.ep, "S01E01")
-
-    def test_deferred_movie_resumes_when_nothing_else_ready(self):
-        o = orch.Orchestrator(); o._movie_wait = 1
-        p, why = self._decide(o, ep=False)             # no TV, no YT → the deferral must not stall
-        self.assertEqual(why, "ok"); self.assertTrue(p.movie)
-
-    def test_due_movie_runs_when_not_deferred(self):
+    def test_due_movie_interrupts_a_fresh_episode(self):
         o = orch.Orchestrator()
         p, why = self._decide(o)               # fresh episode (no topaz on disk) → movie interrupts
         self.assertTrue(p.movie)
+
+    def test_movie_runs_all_gpu_stages_in_one_go(self):
+        # No turn deadline anywhere: a selected movie's download/topaz/resolve all run in one
+        # _process pass, then it hands off to the finisher.
+        o = orch.Orchestrator(); o._enabled = True
+        p = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M")
+        ran = []
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_download_once", side_effect=lambda _p, on_progress=None: ran.append("download") or (True, "ok")), \
+             mock.patch.object(o, "_hand_to_finisher", side_effect=lambda _p: ran.append("handoff")), \
+             mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
+            o._process(p)
+        self.assertEqual(ran, ["download", "topaz", "resolve", "handoff"])
 
     def test_midpipeline_episode_finishes_before_a_due_movie(self):
         # a part-processed episode (topaz segments already on disk) must NOT be preempted by a
@@ -495,132 +502,34 @@ class MovieTurns(unittest.TestCase):
         self.assertEqual(why, "ok")
         self.assertFalse(p.movie); self.assertEqual(p.ep, "S01E01")   # the episode wins
 
-    def test_turn_budget_message_defers_without_fail_count(self):
-        o = orch.Orchestrator(); o._enabled = True
-        p = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M")
-        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st == "download"), \
-             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
-             mock.patch("stages.run_stage",
-                        return_value=(False, "turn-budget: paused at a segment boundary")):
-            o._process(p)
-        self.assertEqual(o._movie_wait, 1)             # deferred behind one other item
-        self.assertEqual(o._fail_counts, {})           # NOT a failure
-        self.assertIn("90-minute turn", o.state["message"])
-
-    def test_turn_budget_gates_resolve_start(self):
-        # deadline already passed when the loop reaches 'resolve' → turn ends, no resolve run.
-        o = orch.Orchestrator(); o._enabled = True
-        p = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M")
-        ran = []
-        with mock.patch.object(orch, "stage_done",
-                               side_effect=lambda st, _p: st in ("download", "topaz")), \
-             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
-             mock.patch.object(orch, "MOVIE_TURN_SECONDS", -1), \
-             mock.patch("stages.run_stage",
-                        side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
-            o._process(p)
-        self.assertEqual(ran, [])                      # resolve never started
-        self.assertEqual(o._movie_wait, 1)
-
     def test_cadence_persists_across_orchestrators_and_enable(self):
-        # The YouTube cadence + movie deferral are HISTORY — they must survive a relaunch
-        # (new Orchestrator) and an enable() re-arm. Resetting them on every deploy/self-arm
-        # is what starved YouTube (4 TV uploads, 0 videos).
-        import tempfile, os as _os
+        # The YouTube cadence is HISTORY — it must survive a relaunch (new Orchestrator) and
+        # an enable() re-arm. Resetting it on every deploy/self-arm is what starved YouTube
+        # (4 TV uploads, 0 videos). Old cadence files' turn-era keys are ignored.
+        import tempfile, os as _os, json as _json
         cf = _os.path.join(tempfile.mkdtemp(), "cadence.json")
         with mock.patch.object(orch, "CADENCE_FILE", cf):
             a = orch.Orchestrator()
-            a._tv_since_yt = 2; a._movie_wait = 1; a._yt_wait = 1
+            a._tv_since_yt = 2
             a._save_cadence()
+            with open(cf) as f:                            # simulate an old-schema file on disk
+                d = _json.load(f)
+            d["movie_wait"] = 1; d["yt_wait"] = 1          # legacy turn keys must be tolerated
+            with open(cf, "w") as f:
+                _json.dump(d, f)
             b = orch.Orchestrator()                        # relaunch
             self.assertEqual(b._tv_since_yt, 2)
-            self.assertEqual(b._movie_wait, 1)
-            self.assertEqual(b._yt_wait, 1)
             with mock.patch.object(orch.settings, "get_settings",
                                    return_value={}), \
                  mock.patch.object(orch.logbook, "event"), \
                  mock.patch.object(b, "_start_caffeinate"), \
                  mock.patch.object(b, "_ensure"):
-                b.enable()                                 # re-arm must NOT reset either
+                b.enable()                                 # re-arm must NOT reset it
             self.assertEqual(b._tv_since_yt, 2)
-            self.assertEqual(b._movie_wait, 1)
-
-    def test_non_movie_completion_decrements_the_deferral(self):
-        o = orch.Orchestrator(); o._enabled = True; o._movie_wait = 1
-        p = episode_paths("A", "S01E01", SRC)
-        with mock.patch.object(orch, "stage_done", return_value=False), \
-             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
-             mock.patch("stages.run_stage", return_value=(True, "ok")), \
-             mock.patch.object(orch.series, "refresh_queue"), \
-             mock.patch.object(orch.series, "get_active_series", return_value=["A"]), \
-             mock.patch.object(orch.movies, "decrement_positions"), \
-             mock.patch.object(orch.movies, "get_selected", return_value=[]):
-            o._process(p)
-            # upload bookkeeping moved to the FINISHER — drain the hand-off like the thread would
-            o._finish_item(o._finish_q.get_nowait(), lambda st, *_a, **_k: (True, "ok"))
-        self.assertEqual(o._movie_wait, 0)             # the movie is due again
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class YouTubeTurns(MovieTurns):
-    """A >90-min YouTube video postpones at a segment boundary, one episode runs, then it
-    resumes — the same turn machinery as movies, tracked by _yt_wait. (Subclasses MovieTurns
-    for the hermetic CADENCE_FILE setUp/tearDown + the _decide harness.)"""
-    VP = "/Media/YouTube-raw/Chan/Chan - T - abc/Chan - T [abc12345678].mp4"
-
-    def _decide_yt(self, o, *, ep=True):
-        q = {"next": ({"ep": "S01E01", "source_name": SRC} if ep else None),
-             "done_count": 0, "source_count": (5 if ep else 0)}
-        v = {"channel": "Chan", "video_path": self.VP, "title": "T"}
-        with contextlib.ExitStack() as s:
-            s.enter_context(mock.patch.object(orch.movies, "next_due", return_value=None))
-            s.enter_context(mock.patch.object(orch.settings, "get_settings",
-                                              return_value={"youtube_every_tv_episodes": 2}))
-            s.enter_context(mock.patch.object(orch.series, "get_active_series",
-                                              return_value=(["A"] if ep else [])))
-            s.enter_context(mock.patch.object(orch.series, "series_root", return_value="/Media/TV"))
-            s.enter_context(mock.patch.object(orch.series, "episode_queue", return_value=q))
-            s.enter_context(mock.patch.object(orch.youtube, "next_due", return_value=v))
-            return o._next_episode()
-
-    def test_deferred_video_yields_to_an_episode(self):
-        o = orch.Orchestrator(); o._tv_since_yt = 5; o._yt_wait = 1
-        p, why = self._decide_yt(o)                    # gate due, but deferred → episode first
-        self.assertEqual(why, "ok"); self.assertFalse(p.youtube); self.assertEqual(p.ep, "S01E01")
-
-    def test_deferred_video_drains_when_nothing_else(self):
-        o = orch.Orchestrator(); o._tv_since_yt = 5; o._yt_wait = 1
-        p, why = self._decide_yt(o, ep=False)          # no TV at all → drain (never stall)
-        self.assertEqual(why, "ok"); self.assertTrue(p.youtube)
-
-    def test_yt_turn_budget_sets_yt_wait_not_movie_wait(self):
-        o = orch.Orchestrator(); o._enabled = True
-        p = orch.youtube_paths("Chan", self.VP, "T")
-        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st == "download"), \
-             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
-             mock.patch("stages.run_stage",
-                        return_value=(False, "turn-budget: paused at a segment boundary")):
-            o._process(p)
-        self.assertEqual(o._yt_wait, 1)                # the VIDEO is deferred
-        self.assertEqual(o._movie_wait, 0)             # movies untouched
-        self.assertEqual(o._fail_counts, {})           # not a failure
-
-    def test_tv_completion_releases_a_deferred_video(self):
-        o = orch.Orchestrator(); o._enabled = True; o._yt_wait = 1
-        p = episode_paths("A", "S01E01", SRC)
-        with mock.patch.object(orch, "stage_done", return_value=False), \
-             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
-             mock.patch("stages.run_stage", return_value=(True, "ok")), \
-             mock.patch.object(orch.series, "refresh_queue"), \
-             mock.patch.object(orch.series, "get_active_series", return_value=["A"]), \
-             mock.patch.object(orch.movies, "decrement_positions"), \
-             mock.patch.object(orch.movies, "get_selected", return_value=[]):
-            o._process(p)
-            o._finish_item(o._finish_q.get_nowait(), lambda st, *_a, **_k: (True, "ok"))
-        self.assertEqual(o._yt_wait, 0)
 
 
 class SegmentETA(unittest.TestCase):

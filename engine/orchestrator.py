@@ -74,16 +74,14 @@ MIN_FREE_GB = 400            # floor kept free before starting an item + by the 
                              # for the current all-TV workload.) Was 600 back when topaz lingered into
                              # the finisher and TWO intermediates could coexist during a tail-overlap.
                              # Keep >= OVERLAP_MIN_PHYS_GB (the finisher-overlap gate reuses this floor).
-MOVIE_TURN_SECONDS = 90 * 60  # a movie OR a long YouTube video runs at most this long per TURN —
-                              # then one TV episode runs, then it resumes (segments + completed
-                              # stages survive between turns). Keeps a 5-6h feature or a slow
-                              # 4K-SDR video from monopolizing the queue.
 CADENCE_FILE = os.path.expanduser("~/.topaz-pipeline/orch_cadence.json")
-                              # the YouTube cadence counter + movie-turn deferral PERSIST here:
-                              # they're facts about processing HISTORY (episodes since the last
-                              # video; items owed before a movie resumes), so a re-arm or app
-                              # relaunch must NOT reset them — resetting is what starved YouTube
+                              # the YouTube cadence counter PERSISTS here: it's a fact about
+                              # processing HISTORY (episodes since the last video), so a re-arm or
+                              # app relaunch must NOT reset it — resetting is what starved YouTube
                               # (every deploy/self-arm zeroed the counter before it reached N).
+                              # (Movies/YouTube run start-to-finish now — the 90-min turn system
+                              # and its wait counters are gone, user-dictated; old files' extra
+                              # keys are simply ignored.)
 FINISHER_FILE = os.path.expanduser("~/.topaz-pipeline/finisher_queue.json")
                               # DURABLE finisher work-list: every item HANDED OFF to the finisher
                               # (remux/upload/cleanup) is recorded here and removed only when it
@@ -278,8 +276,8 @@ def _buffer_names(source_basename: str) -> set:
 
 
 def discard_workfiles(source_basename: str) -> None:
-    """Delete every LOCAL working file of an item REMOVED from its queue (e.g. a movie taken
-    out mid-deferral between its 90-min turns) — without this, a part-processed feature
+    """Delete every LOCAL working file of an item REMOVED from its queue (e.g. a part-processed
+    movie the user withdraws) — without this, a part-processed feature
     orphans 100+ GB on scratch FOREVER (the cleanup stage only runs as a processed item's
     terminal stage, and next_due never serves a removed item again). SKIPS the currently-
     processing item — its own pipeline owns those files. EXACT names only (both container
@@ -597,11 +595,6 @@ class Orchestrator:
         self._upload_lock = threading.Lock()   # one NAS push at a time even when 2 remux lanes run concurrently
         self._rr = 0                           # round-robin pointer over the active TV series
         c = self._load_cadence()
-        self._yt_wait = c["yt_wait"]           # YouTube TURN deferral (same as movies: a >90-min video
-                                               # postpones, one episode runs, then it resumes)
-        self._movie_wait = c["movie_wait"]     # movie TURN deferral: >0 = this many other items must
-                                               # finish before a movie is due again (set to 1 when a
-                                               # movie's 90-min turn ends; the movie then resumes)
         self._tv_since_yt = c["tv_since_yt"]   # TV episodes completed since the last YouTube video — the
                                                # cadence counter: at >= youtube_every_tv_episodes, 1 YT
                                                # video is served next, then this resets to 0
@@ -787,21 +780,18 @@ class Orchestrator:
             with open(CADENCE_FILE) as f:
                 d = json.load(f)
             return {"tv_since_yt": max(0, int(d.get("tv_since_yt", 0))),
-                    "movie_wait": max(0, int(d.get("movie_wait", 0))),
-                    "yt_wait": max(0, int(d.get("yt_wait", 0))),
                     "advanced": [str(x) for x in d.get("advanced", [])]}
         except (OSError, ValueError, TypeError):
-            return {"tv_since_yt": 0, "movie_wait": 0, "yt_wait": 0, "advanced": []}
+            return {"tv_since_yt": 0, "advanced": []}
 
     def _save_cadence(self):
         """Persist the scheduling history counters (atomic tmp+rename) — call after every
-        mutation of _tv_since_yt / _movie_wait so relaunches and re-arms can't reset them."""
+        mutation of _tv_since_yt so relaunches and re-arms can't reset it."""
         try:
             os.makedirs(os.path.dirname(CADENCE_FILE), exist_ok=True)
             tmp = CADENCE_FILE + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"tv_since_yt": self._tv_since_yt, "movie_wait": self._movie_wait,
-                           "yt_wait": self._yt_wait,
+                json.dump({"tv_since_yt": self._tv_since_yt,
                            "advanced": sorted(self._cadence_advanced)}, f)
             os.replace(tmp, CADENCE_FILE)
         except OSError:
@@ -975,7 +965,7 @@ class Orchestrator:
             self._draining.clear()
             self._yt_refresh_at = 0.0           # fresh run: re-scan staging + refresh popular sets at once
             self._yt_meta_done = False
-            # _tv_since_yt / _movie_wait deliberately NOT reset — they're processing HISTORY
+            # _tv_since_yt deliberately NOT reset — it's processing HISTORY
             # (see CADENCE_FILE); resetting them on every re-arm starved the YouTube cadence.
             self._start_caffeinate()           # display + system awake for the whole run
             msg = "started — running until you stop it"   # no auto-stop; ends only on a manual stop
@@ -1601,9 +1591,8 @@ class Orchestrator:
         # interrupt), but the user can move it later so it processes BETWEEN chosen episodes. A
         # movie is taken only once it's 'due' (reached the front); otherwise the next episode
         # runs and every movie's slot decrements (see _process). Nav bar is VIEW-only.
-        # A movie whose 90-min TURN just ended is DEFERRED (self._movie_wait > 0): one other
-        # item runs first, then the movie resumes. If nothing else is ready, the fallbacks at
-        # the bottom serve the movie anyway — a deferral never stalls the run.
+        # A selected movie/YouTube video runs START-TO-FINISH in one go (the 90-min turn
+        # system is gone — user-dictated).
         skip = (self._parked | self._resolve_deferred        # + items QUIET MODE is holding before Resolve
                 | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
                 | self._in_finisher_keys()                   # + items the FINISHER already owns (still
@@ -1615,12 +1604,12 @@ class Orchestrator:
         # FINISH a part-processed episode before any movie/YouTube priority interrupt. If the
         # active series' next episode already has its topaz on disk (segments or a DV render —
         # only resolve+remux left), resume it: a fresh movie must NOT preempt it and strand its
-        # ~140 GB intermediate idle through the movie's 90-min turn. (Live-hit: a deploy killed
+        # ~140 GB intermediate idle through the movie's whole run. (Live-hit: a deploy killed
         # S07E22 mid-resolve; on re-arm a due movie jumped the queue and its topaz sat unused.)
         mid = self._midpipeline_tv(skip)
         if mid is not None:
             return mid, "ok"
-        nx = movies.next_due(skip=skip) if self._movie_wait <= 0 else None
+        nx = movies.next_due(skip=skip)
         if nx:
             return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title")), "ok"
         # YOUTUBE CADENCE: YouTube is NOT a round-robin peer (its 4K-SDR upscales are far slower than a
@@ -1630,9 +1619,7 @@ class Orchestrator:
         # checked BEFORE the TV rotation so the video fires the moment the count is reached.
         yt = youtube.next_due(skip=skip)
         every = self._yt_every_tv()
-        if yt is not None and self._tv_since_yt >= every and self._yt_wait <= 0:
-            # (a turn-deferred video skips this gate — one episode runs first; the DRAIN
-            # fallbacks below still serve it when nothing else is ready, so no stall)
+        if yt is not None and self._tv_since_yt >= every:
             return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
         # Round-robin over the ACTIVE TV SERIES (one episode each in turn, looping). `_rr` advances only
         # on completion (see _process), so a retry re-serves the same series. Per-run, reset on relaunch.
@@ -1654,17 +1641,10 @@ class Orchestrator:
             # run waiting on a cadence that can't advance because TV is exhausted/blocked).
             if yt is not None:
                 return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
-            # Nothing but a DEFERRED movie left → serve it anyway (deferral must never stall).
-            nx = movies.next_due(skip=skip)
-            if nx:
-                return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title")), "ok"
             return None, ("complete" if saw_files else "unreachable")
         # No active TV series at all — YouTube-only: drain the queue one video after another.
         if yt is not None:
             return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
-        nx = movies.next_due(skip=skip)          # deferred movie + nothing else → resume it
-        if nx:
-            return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title")), "ok"
         return None, "no-series"
 
     def _yt_every_tv(self) -> int:
@@ -1712,13 +1692,11 @@ class Orchestrator:
         self.state.update(episode=ep_disp, current=p.item_view(), message=f"working {p.series} {ep_disp}")
         self._claim_prefetched(p)      # pull any prefetched source+CFR from the buffer into main scratch
         p = apply_container(p)         # resume: if the source is already on disk, lock its container
-        # A movie gets a 90-min TURN, then one other item runs, then it resumes (segments +
-        # completed stages survive). The budget gates the two LONG stages: topaz stops at a
-        # segment boundary mid-stage; resolve simply doesn't start past the deadline (it can't
-        # be interrupted). The tail (remux/upload/cleanup) belongs to the FINISHER thread —
-        # this loop runs ONLY the GPU/screen stages, then hands the item off so the next
-        # item's download/topaz overlaps the ~75-min x265 remux.
-        deadline = (time.monotonic() + MOVIE_TURN_SECONDS) if (p.movie or p.youtube) else None
+        # Every item — TV, movie, or YouTube — runs its GPU stages START-TO-FINISH in one go
+        # (the 90-min movie/YouTube turn system is gone — user-dictated). The tail
+        # (remux/upload/cleanup) belongs to the FINISHER thread — this loop runs ONLY the
+        # GPU/screen stages, then hands the item off so the next item's download/topaz
+        # overlaps the ~75-min x265 remux.
         for st in RUN_STAGES:
             if not self._enabled or self._abort.is_set():
                 return
@@ -1730,14 +1708,6 @@ class Orchestrator:
                 if self._skip_key(p) != self._stall_probe: # attempt it (a blocked attempt hangs to
                     self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
                 self._stall_probe = None                   # this IS the probe → fall through and re-test Resolve
-            if deadline is not None and st in ("topaz", "resolve") and time.monotonic() >= deadline:
-                with self._cadence_lock:
-                    if p.youtube: self._yt_wait = 1
-                    else:         self._movie_wait = 1
-                    self._save_cadence()
-                self.state.update(stage=None, progress=None, current=None,
-                    message=f"{ep_disp}: turn (90 min) over before {st} — one episode next, then it resumes")
-                return
             while st == "resolve" and self._resolve_should_hold():
                 # RESOLVE GATE (user-dictated): hold this item at the Resolve doorstep until the
                 # previous item's remux fully completes. Side benefit: topaz is idle while we
@@ -1746,14 +1716,6 @@ class Orchestrator:
                     return
                 if self._quiet_mode():                     # Screen Control turned OFF mid-hold (this gate
                     self._defer_resolve(p, ep_disp); return   # can span the whole previous remux) → defer
-                if deadline is not None and time.monotonic() >= deadline:
-                    with self._cadence_lock:
-                        if p.youtube: self._yt_wait = 1
-                        else:         self._movie_wait = 1
-                        self._save_cadence()
-                    self.state.update(stage=None, progress=None, current=None,
-                        message=f"{ep_disp}: turn (90 min) over before {st} — one episode next, then it resumes")
-                    return
                 fin = self.state.get("finishing") or {}
                 self.state.update(stage=None, progress=None,
                     message=f"{ep_disp}: holding before Resolve — finishing "
@@ -1770,7 +1732,7 @@ class Orchestrator:
             if st == "download":              # per-source lock: the prefetcher may already be pulling
                 ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
             else:
-                ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress, deadline=deadline)
+                ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress)
             self._stage_active = False
             if ok:  self._elapsed_done(ekey)         # stage complete → reset its timer for any re-run
             else:   self._elapsed_pause()            # interrupted/failed → persist so it RESUMES from here
@@ -1784,16 +1746,6 @@ class Orchestrator:
                     if self._stall_active:          # Resolve works again → release the whole buffer to drain
                         self._resolve_recovered()
             if not ok:
-                # A movie's 90-min TURN ending (clean stop at a segment boundary) is NOT a
-                # failure: defer the movie behind one other item and move on — no fail count.
-                if str(msg).startswith("turn-budget"):
-                    with self._cadence_lock:
-                        if p.youtube: self._yt_wait = 1
-                        else:         self._movie_wait = 1
-                        self._save_cadence()
-                    self.state.update(stage=None, progress=None, current=None,
-                        message=f"{ep_disp}: 90-minute turn done — one episode next, then it resumes")
-                    return
                 # A stop/pause abort isn't an episode FAILURE — don't count it toward parking
                 # and don't sit in the 60s retry; let the loop re-evaluate (power/stop) at once.
                 if self._abort.is_set() or not self._enabled:
@@ -1872,17 +1824,8 @@ class Orchestrator:
                 self._cadence_advanced.add(p.source_basename)
                 if p.youtube:
                     self._tv_since_yt = 0                 # cadence: restart the N-episode countdown
-                    if self._movie_wait > 0:              # a non-movie item took its turn → a deferred
-                        self._movie_wait -= 1             # movie's next turn is due again
-                elif p.movie:
-                    if self._yt_wait > 0:                 # a non-YouTube item took its turn
-                        self._yt_wait -= 1
-                else:                                     # a TV episode
+                elif not p.movie:                         # a TV episode
                     self._tv_since_yt += 1                # one more TV episode toward the next video
-                    if self._movie_wait > 0:
-                        self._movie_wait -= 1
-                    if self._yt_wait > 0:
-                        self._yt_wait -= 1
                     parts = self._participants()          # active TV series (round-robin peers)
                     idx = next((i for i, r in enumerate(parts) if r == p.series), None)
                     if idx is not None and parts:

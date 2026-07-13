@@ -733,11 +733,11 @@ struct SeriesCard: View {
         let locked = store.state?.automation_enabled ?? false
         let title = mode == "movie" ? "Current library" : (mode == "youtube" ? "YouTube channels" : "Current series")
         let icon = mode == "movie" ? "film.stack" : (mode == "youtube" ? "play.rectangle" : "tv")
-        // the ONE statement of the scheduling model — kept accurate: movies and long videos
-        // take 90-min turns; YouTube is cadence-gated, not a queue-jumper
+        // the ONE statement of the scheduling model — kept accurate: movies and videos run
+        // start-to-finish when their slot comes up; YouTube is cadence-gated, not a queue-jumper
         let n = store.state?.settings?.youtube_every_tv_episodes ?? 2
         Card(title: title, systemImage: icon,
-             hint: "TV in order · movies slot in (90-min turns) · 1 video per \(n) episodes") {
+             hint: "TV in order · movies run whole when due · 1 video per \(n) episodes") {
             ModeNavBar()                              // the TV / YouTube / Movies view toggle
             switch mode {
             case "movie":   MovieMode(locked: locked)

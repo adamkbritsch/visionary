@@ -583,7 +583,7 @@ def _concat_segments(seg_files, output, *, ffmpeg=FFMPEG_HB) -> tuple:
 
 def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_height=None,
                       preserve_color=True, on_progress=None, abort=None,
-                      target_seconds=SEGMENT_TARGET_SECONDS, deadline=None, on_plan=None,
+                      target_seconds=SEGMENT_TARGET_SECONDS, on_plan=None,
                       ffmpeg=FFMPEG, models_dir=MODELS) -> UpscaleResult:
     """Topaz upscale that RESUMES where it left off. The source is split at strong scene
     cuts into ~SEGMENT_TARGET_SECONDS chunks, each encoded to its own ProRes file in
@@ -592,10 +592,7 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
     the chunks stay as separate files and a manifest records their order — the Resolve
     stage assembles them on its timeline (frame-accurate), so we never write the ~238 GB
     twice. `on_progress(total_frames_done)` reports cumulative progress across chunks.
-    `on_plan(seg_end_frames, exact_total)` fires once after planning (progress-bar notches).
-    `deadline` (time.monotonic) stops CLEANLY at the next segment boundary — completed
-    chunks stay, nothing partial is lost — returning msg='turn-budget…' (a movie's 90-min
-    turn, NOT a failure)."""
+    `on_plan(seg_end_frames, exact_total)` fires once after planning (progress-bar notches)."""
     os.makedirs(segdir, exist_ok=True)
     fps, _dur = media_timing(source)
     total = _frame_count(source)          # EXACT frame count (nb_frames). A duration×fps
@@ -629,11 +626,6 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
             if on_progress:
                 on_progress(done)
             continue
-        # Movie TURN BUDGET: stop cleanly at a segment boundary once the deadline passes —
-        # every completed chunk stays on disk, the next turn resumes exactly here.
-        if deadline is not None and time.monotonic() >= deadline:
-            return UpscaleResult(False, 0, done, segdir,
-                                 "turn-budget: paused at a segment boundary — resumes next movie turn")
         # Accurate input seek to the scene-cut start `a` (cold start is seamless there).
         # Middle chunks encode exactly n frames; the LAST chunk omits -frames:v and reads
         # to the source's end — so a source whose last frame won't decode can't fail it.

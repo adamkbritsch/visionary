@@ -135,9 +135,10 @@ class PlanSegments(unittest.TestCase):
         self.assertEqual(topaz.plan_segments(0, 24, [100]), [])
 
 
-class TurnBudget(unittest.TestCase):
-    """upscale_resumable stops CLEANLY at a segment boundary once `deadline` passes."""
-    def _run(self, deadline, tmp):
+class RunsToCompletion(unittest.TestCase):
+    """upscale_resumable has NO mid-run deadline (the 90-min turn system is gone —
+    user-dictated): once started, it plans and encodes straight through."""
+    def _run(self, tmp):
         import topaz
         from unittest import mock
         with mock.patch.object(topaz, "media_timing", return_value=(24.0, 100.0)), \
@@ -146,26 +147,23 @@ class TurnBudget(unittest.TestCase):
              mock.patch.object(topaz, "_cached_scene_frames", return_value=[1200]), \
              mock.patch.object(topaz, "source_color", return_value=None), \
              mock.patch.object(topaz, "_run_ffmpeg") as rf:
-            rf.return_value = (1, 0, False, "should not run")
+            rf.return_value = (1, 0, False, "encode error (harness)")
             plan_seen = {}
-            res = topaz.upscale_resumable("/in.mp4", segdir=tmp, deadline=deadline,
+            res = topaz.upscale_resumable("/in.mp4", segdir=tmp,
                                           on_plan=lambda ends, tot: plan_seen.update(ends=ends, tot=tot),
                                           target_seconds=10)
             return res, rf, plan_seen
 
-    def test_expired_deadline_stops_before_encoding(self):
-        import tempfile, time
-        res, rf, plan = self._run(time.monotonic() - 1, tempfile.mkdtemp())
-        self.assertFalse(res.ok)
-        self.assertTrue(res.error_tail.startswith("turn-budget"))
-        rf.assert_not_called()                            # nothing encoded past the budget
+    def test_plans_and_starts_encoding_immediately(self):
+        import tempfile
+        res, rf, plan = self._run(tempfile.mkdtemp())
+        rf.assert_called()                                # attempted the first segment at once
         self.assertEqual(plan["tot"], 2400)               # on_plan fired with the exact total
         self.assertEqual(plan["ends"], [1200, 2400])      # cumulative segment ends
 
-    def test_no_deadline_encodes_normally(self):
-        import tempfile
-        res, rf, _ = self._run(None, tempfile.mkdtemp())
-        rf.assert_called()                                # attempted the first segment
+    def test_no_deadline_parameter_anymore(self):
+        import inspect, topaz
+        self.assertNotIn("deadline", inspect.signature(topaz.upscale_resumable).parameters)
 
 
 class SegmentManifest(unittest.TestCase):
