@@ -921,15 +921,20 @@ class DoubleRemux(unittest.TestCase):
         with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
             self.assertTrue(o._resolve_should_hold())      # both lanes full → hold
 
-    def test_lane2_only_helps_with_a_backlog_behind_a_busy_primary(self):
+    def test_lane2_helps_any_item_queued_behind_a_busy_primary(self):
+        # GENERAL dual-remux (user-widened from drain-only): any queued finisher item is by
+        # definition past Resolve, so lane 2 takes it whenever lane 1 is busy — a re-picked
+        # movie whose GPU stages were already done counts, not just a stall drain.
         o = orch.Orchestrator(); o._finish_q.put(object())   # an item is waiting
         o.state["finishing"] = {"stage": "remux"}            # primary lane busy
-        o._draining = {"A"}
-        self.assertFalse(o._lane2_should_help())             # backlog < 2 → don't split a lone item
-        o._draining = {"A", "B"}
-        self.assertTrue(o._lane2_should_help())              # backlog >= 2, primary busy, item waiting
+        self.assertTrue(o._lane2_should_help())              # no _draining needed anymore
         o.state["finishing"] = None
-        self.assertFalse(o._lane2_should_help())             # primary idle → nothing to run alongside
+        self.assertFalse(o._lane2_should_help())             # primary idle → the lone item is lane 1's
+
+    def test_lane2_declines_with_nothing_queued(self):
+        o = orch.Orchestrator()
+        o.state["finishing"] = {"stage": "remux"}            # busy primary, but empty queue
+        self.assertFalse(o._lane2_should_help())
 
     def test_lane2_finish_uses_its_own_slot_and_leaves_the_backlog(self):
         o = orch.Orchestrator(); o._enabled = True
@@ -953,12 +958,23 @@ class DoubleRemux(unittest.TestCase):
         fresh = episode_paths("The Office", "S02E10", SRC)
         o._draining = {"A", "B"}
         with mock.patch.object(orch, "stage_done", return_value=False):     # fresh: not yet upscaled
-            self.assertTrue(o._drain_pauses_topaz(fresh))                    # → hold Topaz
+            self.assertTrue(o._dual_remux_pauses_topaz(fresh))               # → hold Topaz
         with mock.patch.object(orch, "stage_done", return_value=True):      # already upscaled → resolve it
-            self.assertFalse(o._drain_pauses_topaz(fresh))                   # (feeds the remux lanes)
+            self.assertFalse(o._dual_remux_pauses_topaz(fresh))              # (feeds the remux lanes)
         o._draining = {"A"}
         with mock.patch.object(orch, "stage_done", return_value=False):     # backlog < 2 → Topaz resumes
-            self.assertFalse(o._drain_pauses_topaz(fresh))
+            self.assertFalse(o._dual_remux_pauses_topaz(fresh))
+
+    def test_topaz_pauses_whenever_both_remux_lanes_are_live(self):
+        # The general case (no stall drain): two lanes actually running → fresh Topaz waits.
+        o = orch.Orchestrator()
+        fresh = episode_paths("The Office", "S02E10", SRC)
+        o.state["finishing"] = {"stage": "remux"}; o.state["finishing2"] = {"stage": "remux"}
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            self.assertTrue(o._dual_remux_pauses_topaz(fresh))
+        o.state["finishing2"] = None                          # a lane freed → Topaz resumes
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            self.assertFalse(o._dual_remux_pauses_topaz(fresh))
 
     def test_second_lane_registered_on_enable(self):
         o = orch.Orchestrator()

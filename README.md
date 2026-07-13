@@ -199,7 +199,9 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   the ~30-minute extended-cut episodes in the test library; that's about **4.9 minutes of
   wall-clock per minute of content**, so a standard **20-minute 1080p episode** comes out a
   finished 4K Dolby Vision master in **roughly 1h35m** (measured median across 65 finished
-  episodes).
+  episodes). And if two finished upscales are ever waiting at once, **both remux in
+  parallel** on a second lane (Topaz pauses until a lane frees, so the two x265 encodes
+  get the machine).
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265, a 50 Mbps per-second ceiling), so a finished 4K

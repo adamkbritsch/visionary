@@ -45,9 +45,11 @@ STAGES = ["download", "topaz", "resolve", "remux", "upload", "cleanup"]
 # runs WHILE item N+1 downloads/upscales — the peak-cap re-encode costs ~zero wall-clock.
 RUN_STAGES = ["download", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
-FINISHER_LANES = 2           # max concurrent remuxes. The 2nd lane ONLY runs while DRAINING a Resolve-stall
-                             # backlog (>=2 finished-topaz items waiting): Resolve is let 2 items ahead so a
-                             # 2nd x265 remux clears the buffer ~2x faster. Normal runs keep 1-at-a-time.
+FINISHER_LANES = 2           # max concurrent remuxes. The 2nd lane runs whenever >=2 topaz-done items need
+                             # finishing at once (an item queued behind a busy lane 1 — a re-picked movie
+                             # whose GPU stages were already done, or a Resolve-stall drain, where Resolve
+                             # is also let 2 items ahead). Normal runs stay 1-at-a-time: the resolve gate
+                             # keeps the finisher queue empty, so the 2nd lane never fires in steady state.
 OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/upload), gate the NEXT
                              # item's start on RAW physical free. Its topaz intermediate was dropped at
                              # hand-off so the finisher item is small (~10 GB), but available_gb still
@@ -1195,11 +1197,11 @@ class Orchestrator:
                             message=f"Resolve stalled — upscale buffer full ({phys} GB free); dismiss "
                                     f"Resolve's update prompt to drain {len(self._resolve_stall)} held item(s)")
                         self._sleep(DRAIN_POLL_SECONDS); continue
-                if self._drain_pauses_topaz(ep):
-                    # 2 remuxes are clearing the drain backlog — hold fresh Topaz off the machine until the
-                    # backlog is < 2 (already-upscaled items still flow through Resolve to feed the lanes).
+                if self._dual_remux_pauses_topaz(ep):
+                    # 2 remuxes have the machine — hold fresh Topaz until a lane frees (already-
+                    # upscaled items still flow through Resolve to feed the lanes).
                     self.state.update(stage=None, current=None,
-                        message=f"draining backlog — Topaz paused while 2 remuxes run ({len(self._draining)} left)")
+                        message="two remuxes running — Topaz paused until a lane frees")
                     self._sleep(DRAIN_POLL_SECONDS); continue
                 self._process(ep)
         except Exception as e:                       # never die silently — leave a trace
@@ -1797,17 +1799,24 @@ class Orchestrator:
         return self._finish_q.qsize() >= 2
 
     def _lane2_should_help(self) -> bool:
-        """The 2nd remux lane pulls work ONLY when draining a Resolve-stall backlog of >=2 items, behind
-        an already-busy primary lane, with an item actually waiting — so it never splits a lone item."""
-        return (len(self._draining) >= 2 and self.state.get("finishing") is not None
-                and self._finish_q.qsize() >= 1)
+        """The 2nd remux lane pulls work whenever an item is QUEUED behind a busy primary lane. Any
+        queued finisher item is by definition fully past Resolve, and in the normal TV flow the
+        resolve GATE keeps the queue empty — so this only ever fires on a genuine backlog of >=2
+        topaz-done items (a re-picked movie whose GPU stages were already done, a Resolve-stall
+        drain), never in the user-dictated 1-at-a-time steady state. A lone item is never split:
+        with lane 1 idle it declines, and the primary picks it up."""
+        return self.state.get("finishing") is not None and self._finish_q.qsize() >= 1
 
-    def _drain_pauses_topaz(self, ep) -> bool:
-        """While >=2 items drain a Resolve-stall backlog (two remuxes running), the run thread must NOT
-        start a fresh Topaz on top of them — the two x265 encodes get the machine. It still RESOLVES
-        already-upscaled items (topaz done) to feed the lanes; only a fresh (not-yet-upscaled) item waits
-        until the backlog clears below 2."""
-        return len(self._draining) >= 2 and not stage_done("topaz", ep)
+    def _dual_remux_pauses_topaz(self, ep) -> bool:
+        """While TWO remuxes run (or >=2 items drain a Resolve-stall backlog and are about to), the
+        run thread must NOT start a fresh Topaz on top of them — the two x265 encodes get the
+        machine (user-dictated). It still RESOLVES already-upscaled items (topaz done) to feed the
+        lanes; only a fresh (not-yet-upscaled) item waits until a lane frees."""
+        if stage_done("topaz", ep):
+            return False
+        dual_active = (self.state.get("finishing") is not None
+                       and self.state.get("finishing2") is not None)
+        return dual_active or len(self._draining) >= 2
 
     def _advance_cadence_at_handoff(self, p: EpisodePaths):
         """Scheduling FAIRNESS (cadence counters + round-robin) advances the moment an item's
@@ -1977,10 +1986,12 @@ class Orchestrator:
                     self.state["finishing"] = None
 
     def _finisher2(self):
-        """SECOND remux lane. Runs ONLY while draining a Resolve-stall backlog (>=2 finished-topaz items):
-        pulls a queued item and remuxes it CONCURRENTLY with the primary lane so the buffer clears ~2x
-        faster. Never splits a single item's work (needs the primary lane busy AND an item waiting); uploads
-        still serialize via _upload_lock. Ownership/abort/power mirror the primary finisher."""
+        """SECOND remux lane. Runs whenever >=2 topaz-done items need finishing at once (an item
+        queued behind a busy primary lane — e.g. a re-picked movie whose GPU stages were already
+        done, or a Resolve-stall drain): it remuxes the queued item CONCURRENTLY so the backlog
+        clears ~2x faster. Never splits a single item's work (needs the primary lane busy AND an
+        item waiting); uploads still serialize via _upload_lock. Ownership/abort/power mirror the
+        primary finisher."""
         from stages import run_stage
         while True:
             if not self._enabled or not self._lane2_should_help():
