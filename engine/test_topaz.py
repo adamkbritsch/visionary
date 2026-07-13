@@ -165,6 +165,23 @@ class RunsToCompletion(unittest.TestCase):
         import inspect, topaz
         self.assertNotIn("deadline", inspect.signature(topaz.upscale_resumable).parameters)
 
+    def test_should_pause_stops_cleanly_between_segments(self):
+        # Two live remuxes → the encoder yields at the NEXT segment boundary (zero loss),
+        # returning a benign 'paused:' hold, not a failure.
+        import tempfile, topaz
+        from unittest import mock
+        with mock.patch.object(topaz, "media_timing", return_value=(24.0, 100.0)), \
+             mock.patch.object(topaz, "_frame_count", return_value=0), \
+             mock.patch.object(topaz, "total_frames", return_value=2400), \
+             mock.patch.object(topaz, "_cached_scene_frames", return_value=[1200]), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "_run_ffmpeg") as rf:
+            res = topaz.upscale_resumable("/in.mp4", segdir=tempfile.mkdtemp(),
+                                          should_pause=lambda: True, target_seconds=10)
+        self.assertFalse(res.ok)
+        self.assertTrue(res.error_tail.startswith("paused:"))
+        rf.assert_not_called()                            # yielded before encoding anything
+
 
 class SegmentManifest(unittest.TestCase):
     """No-concat: Topaz writes a manifest; stage_done = every chunk present + exact frames."""

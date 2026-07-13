@@ -135,7 +135,8 @@ class TopazSegBounds(unittest.TestCase):
                 fh.write("x")
             pl = {"topaz": "clean" if is_4k else "upscale", "scale": 1, "res": "1080p",
                   "fit_height": None, "input": {"is_4k": is_4k}}
-            def fake_upscale(cfr, *, segdir, profile, scale, fit_height, on_progress, abort, on_plan):
+            def fake_upscale(cfr, *, segdir, profile, scale, fit_height, on_progress, abort, on_plan,
+                             should_pause=None):
                 on_plan(ends, 400)
                 return types.SimpleNamespace(ok=True, error_tail="", frames=400)
             d = tempfile.mkdtemp()

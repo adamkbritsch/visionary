@@ -1734,7 +1734,8 @@ class Orchestrator:
             if st == "download":              # per-source lock: the prefetcher may already be pulling
                 ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
             else:
-                ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress)
+                ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
+                                    should_pause=self._dual_remux_live)   # topaz: yield to 2 live remuxes
             self._stage_active = False
             if ok:  self._elapsed_done(ekey)         # stage complete → reset its timer for any re-run
             else:   self._elapsed_pause()            # interrupted/failed → persist so it RESUMES from here
@@ -1748,6 +1749,13 @@ class Orchestrator:
                     if self._stall_active:          # Resolve works again → release the whole buffer to drain
                         self._resolve_recovered()
             if not ok:
+                # A clean segment-boundary PAUSE (two remuxes have the machine) is NOT a failure:
+                # return without a fail count — the run loop's dual gate holds this item until a
+                # lane frees, then it's re-selected and topaz resumes from its completed segments.
+                if str(msg).startswith("paused:"):
+                    self.state.update(stage=None, progress=None, current=None,
+                        message=f"{ep_disp}: topaz paused at a segment boundary — two remuxes running")
+                    return
                 # A stop/pause abort isn't an episode FAILURE — don't count it toward parking
                 # and don't sit in the 60s retry; let the loop re-evaluate (power/stop) at once.
                 if self._abort.is_set() or not self._enabled:
@@ -1807,16 +1815,22 @@ class Orchestrator:
         with lane 1 idle it declines, and the primary picks it up."""
         return self.state.get("finishing") is not None and self._finish_q.qsize() >= 1
 
+    def _dual_remux_live(self) -> bool:
+        """Both remux lanes actually working right now."""
+        return (self.state.get("finishing") is not None
+                and self.state.get("finishing2") is not None)
+
     def _dual_remux_pauses_topaz(self, ep) -> bool:
         """While TWO remuxes run (or >=2 items drain a Resolve-stall backlog and are about to), the
         run thread must NOT start a fresh Topaz on top of them — the two x265 encodes get the
         machine (user-dictated). It still RESOLVES already-upscaled items (topaz done) to feed the
-        lanes; only a fresh (not-yet-upscaled) item waits until a lane frees."""
+        lanes; only a fresh (not-yet-upscaled) item waits until a lane frees. An IN-FLIGHT topaz
+        is handled by the stage itself: run_stage's should_pause holds it at its next segment
+        boundary (user-caught: S08E04's topaz kept running through a dual remux because this
+        selection-time gate can't see a stage that already started)."""
         if stage_done("topaz", ep):
             return False
-        dual_active = (self.state.get("finishing") is not None
-                       and self.state.get("finishing2") is not None)
-        return dual_active or len(self._draining) >= 2
+        return self._dual_remux_live() or len(self._draining) >= 2
 
     def _advance_cadence_at_handoff(self, p: EpisodePaths):
         """Scheduling FAIRNESS (cadence counters + round-robin) advances the moment an item's

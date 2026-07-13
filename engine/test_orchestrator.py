@@ -965,6 +965,41 @@ class DoubleRemux(unittest.TestCase):
         with mock.patch.object(orch, "stage_done", return_value=False):     # backlog < 2 → Topaz resumes
             self.assertFalse(o._dual_remux_pauses_topaz(fresh))
 
+    def test_paused_topaz_is_a_hold_not_a_failure(self):
+        # An in-flight topaz that yields to two live remuxes ('paused:' message) must not
+        # count as a failure — no fail streak, no park; the item just re-enters selection.
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st == "download"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch("stages.run_stage",
+                        return_value=(False, "paused: two remuxes running — topaz resumes when a lane frees")):
+            o._process(p)
+        self.assertEqual(o._fail_counts, {})
+        self.assertEqual(o._parked, set())
+        self.assertIn("paused at a segment boundary", o.state["message"])
+
+    def test_in_flight_topaz_gets_the_dual_remux_pause_predicate(self):
+        # run_stage must receive should_pause=_dual_remux_live so a topaz that STARTED before
+        # the 2nd lane spun up still yields at its next segment boundary (user-caught).
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        seen = {}
+        def spy(st, _p, *, abort=None, progress=None, should_pause=None, **_k):
+            seen[st] = should_pause
+            return True, "ok"
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st == "download"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_hand_to_finisher"), \
+             mock.patch("stages.run_stage", side_effect=spy):
+            o._process(p)
+        self.assertEqual(seen.get("topaz"), o._dual_remux_live)
+
     def test_topaz_pauses_whenever_both_remux_lanes_are_live(self):
         # The general case (no stall drain): two lanes actually running → fresh Topaz waits.
         o = orch.Orchestrator()

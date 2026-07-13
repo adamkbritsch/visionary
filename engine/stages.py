@@ -91,21 +91,28 @@ def _source_video_kbps(path):
     return 0
 
 
-def run_stage(stage, p, *, abort=None, progress=None, low_prio=False):
+def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pause=None):
     fn = {
         "download": _download, "topaz": _topaz, "resolve": _resolve,
         "remux": _remux, "upload": _upload, "cleanup": _cleanup,
     }.get(stage, lambda *_a, **_k: (False, f"unknown stage {stage}"))
     ep = getattr(p, "ep", "?")
     try:
-        if stage == "download":
+        # `should_pause` = hold topaz at its next segment boundary (two remuxes have the
+        # machine); only the topaz stage can honor it mid-stage.
+        if stage == "topaz":
+            ok, msg = fn(p, abort, progress, should_pause)
+        elif stage == "download":
             ok, msg = fn(p, abort, progress, low_prio)
         else:
             ok, msg = fn(p, abort, progress)
     except Exception as e:                       # any stage bug is logged, never silent
         logbook.exception(f"{stage} {ep}", e)
         return False, f"{stage} crashed: {e.__class__.__name__}: {e}"
-    (logbook.event if ok else logbook.failure)(f"{stage} {ep}: {msg}")
+    # A clean segment-boundary pause is NOT a failure — log it as an event so it never
+    # shows up in the red "Recent issues" banner.
+    benign = (not ok) and str(msg).startswith("paused:")
+    (logbook.event if (ok or benign) else logbook.failure)(f"{stage} {ep}: {msg}")
     return ok, msg
 
 
@@ -181,7 +188,7 @@ def _source_complete(p):
         return False
 
 
-def _topaz(p, abort, progress=None):
+def _topaz(p, abort, progress=None, should_pause=None):
     """source -> ProRes 4444 XQ. Uses the SHOW's chosen preset + the input plan
     (upscale 1080p 2×, clean already-4K 1×; range PRESERVED, never SDR<->HDR).
     Reports live frame progress to the dashboard (Topaz is headless — the app is
@@ -233,7 +240,9 @@ def _topaz(p, abort, progress=None):
     # interruption, removed only at cleanup. stage_done("topaz") checks the manifest.
     res = topaz.upscale_resumable(p.source_cfr, segdir=p.segdir, profile=params, scale=pl["scale"],
                                   fit_height=pl.get("fit_height"), on_progress=on_progress, abort=abort,
-                                  on_plan=on_plan)
+                                  on_plan=on_plan, should_pause=should_pause)
+    if not res.ok and str(res.error_tail).startswith("paused:"):
+        return False, res.error_tail            # NOT a failure — held cleanly at a segment boundary
     return res.ok, (f"[{key} · {pl.get('res') or '?'} {pl['topaz']} {pl['scale']}× → 4K] "
                     f"{res.frames} frames → segments"
                     if res.ok else _err_tail(res.error_tail))
