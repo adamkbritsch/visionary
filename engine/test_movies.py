@@ -119,3 +119,36 @@ class SelectedQueue(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseTags(unittest.TestCase):
+    """Picker tags parsed from release names — approximate routing info (no probe)."""
+
+    def test_wwdits_style_4k_webdl(self):
+        t = movies.release_tags("What We Do in the Shadows - S02E01 - 2160p WEB-DL HULU [EAC3 5.1 h265-FLUX].mkv")
+        self.assertEqual(t, ["4K", "HEVC"])
+        self.assertEqual(movies.route_hint(t), "fast path ~2.5× runtime")
+
+    def test_1080p_bluray_x264(self):
+        t = movies.release_tags("12 Years a Slave (2013) [1080p BluRay x264].mkv")
+        self.assertEqual(t, ["1080p", "H264"])
+        self.assertEqual(movies.route_hint(t), "full upscale ~5× runtime")
+
+    def test_hdr_dv_and_remux_markers(self):
+        self.assertIn("HDR", movies.release_tags("Movie (2020) 2160p HDR10 WEB-DL HEVC.mkv"))
+        self.assertIn("DV", movies.release_tags("Movie.2020.2160p.UHD.BluRay.DV.HDR10.x265.mkv"))
+        t = movies.release_tags("Movie (2020) [2160p UHD BluRay REMUX HDR HEVC].mkv")
+        self.assertEqual(t, ["4K", "HDR", "HEVC", "REMUX"])
+
+    def test_no_false_dv_from_ordinary_words(self):
+        self.assertNotIn("DV", movies.release_tags("Advent Movie (2019) 1080p WEB x264.mkv"))
+
+    def test_untagged_name_yields_full_route(self):
+        t = movies.release_tags("Plain Name.mkv")
+        self.assertEqual(t, [])
+        self.assertEqual(movies.route_hint(t), "full upscale ~5× runtime")
+
+    def test_parse_movies_carries_tags_and_route(self):
+        ms = movies.parse_movies([{"name": "Alpha (2010) [2160p WEB HEVC].mkv", "dir": "/M"}])
+        self.assertEqual(ms[0]["tags"], ["4K", "HEVC"])
+        self.assertEqual(ms[0]["route"], "fast path ~2.5× runtime")

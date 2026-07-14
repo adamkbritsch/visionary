@@ -104,7 +104,16 @@ struct MovieItemDTO: Codable, Identifiable {
     var title: String?     // clean display title
     var watched: Bool?
     var preset: String?    // the Topaz preset chosen for this queued movie
+    var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
+    var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
     var id: String { name ?? title ?? "" }
+
+    // "4K · HDR · HEVC — fast path ~2.5× runtime" (empty when the name carries no tags)
+    var pipelineHint: String {
+        let t = (tags ?? []).joined(separator: " · ")
+        let parts = [t, route ?? ""].filter { !$0.isEmpty }
+        return parts.joined(separator: " — ")
+    }
 }
 
 struct MovieSelectedDTO: Codable {        // the curated queue

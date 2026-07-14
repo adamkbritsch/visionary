@@ -13,6 +13,7 @@ import ftplib
 import io
 import json
 import os
+import re
 
 from transfer import connect as ftp_connect, ftp_listdir, NAS_FTP_MOVIES_ROOT, NAS_FTP_MOVIES_ROOTS
 from series import MANIFEST_DIR, _DV_MARK
@@ -44,17 +45,59 @@ def movie_title(name: str) -> str:
     return stem.strip() or os.path.splitext(name)[0]
 
 
+def release_tags(name: str) -> list:
+    """APPROXIMATE pipeline-routing tags parsed from the release FILENAME (no probe — the
+    authoritative plan comes from ffprobe at process time). Shown in the movie picker so each
+    title telegraphs how it will route: resolution, dynamic range, codec, REMUX."""
+    n = name.lower()
+    tags = []
+    if re.search(r"\b(2160p|4k|uhd)\b", n):
+        tags.append("4K")
+    elif "1080p" in n:
+        tags.append("1080p")
+    elif "720p" in n:
+        tags.append("720p")
+    elif re.search(r"\b(480p|576p|dvdrip)\b", n):
+        tags.append("SD")
+    if re.search(r"\b(dv|dovi|dolby.?vision)\b", n):
+        tags.append("DV")
+    elif "hdr" in n:                                   # covers hdr / hdr10 / hdr10+
+        tags.append("HDR")
+    if re.search(r"\b(x265|h\.?265|hevc)\b", n):
+        tags.append("HEVC")
+    elif re.search(r"\b(x264|h\.?264|avc)\b", n):
+        tags.append("H264")
+    elif re.search(r"\bav1\b", n):
+        tags.append("AV1")
+    if "remux" in n:
+        tags.append("REMUX")
+    return tags
+
+
+def route_hint(tags) -> str:
+    """One-line route + duration hint for the picker, from the name tags. Approximate by
+    design (bitrate is only known after download): a 4K source at/above the fast-path
+    threshold skips Topaz (~2.5× runtime wall-clock); everything else runs the full
+    upscale (~5× runtime)."""
+    if "4K" in tags:
+        return "fast path ~2.5× runtime"
+    return "full upscale ~5× runtime"
+
+
 def parse_movies(entries, dv_map=None, watched_map=None) -> list:
-    """entries = [{name, dir}] -> [{name, dir, title, has_dv, watched}] sorted by title.
-    A movie 'has DV' if the NAS-probed dv_map says so OR the name carries the DV mark."""
+    """entries = [{name, dir}] -> [{name, dir, title, has_dv, watched, tags, route}] sorted
+    by title. A movie 'has DV' if the NAS-probed dv_map says so OR the name carries the DV
+    mark."""
     out = []
     for e in entries:
         n = e["name"]
         has_dv = (_DV_MARK in n.lower())
         if dv_map is not None:
             has_dv = has_dv or bool(dv_map.get(n))
+        tags = release_tags(n)
         out.append({"name": n, "dir": e["dir"], "title": movie_title(n), "has_dv": has_dv,
-                    "watched": bool(watched_map.get(n)) if watched_map else False})
+                    "watched": bool(watched_map.get(n)) if watched_map else False,
+                    "tags": tags, "route": route_hint(tags)})
     return sorted(out, key=lambda m: m["title"].lower())
 
 
@@ -150,7 +193,8 @@ def refresh_library() -> list:
     except Exception:
         wm = None
     movies = parse_movies(list_movie_entries(), load_movies_dv_manifest(), watched_map=wm)
-    _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"], "watched": m["watched"]}
+    _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
+                      "watched": m["watched"], "tags": m["tags"], "route": m["route"]}
                      for m in movies if not m["has_dv"]]
     return _CACHE["lib"]
 

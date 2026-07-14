@@ -840,7 +840,11 @@ struct PresetChooser: View {
 
 // A reusable search-as-you-type picker (the series + movie lists are too long for a plain
 // dropdown). Picking calls onSelect(id) and clears the query.
-struct PickOption: Identifiable { let id: String; let label: String }
+struct PickOption: Identifiable {
+    let id: String
+    let label: String
+    var detail: String? = nil   // secondary line under the label (e.g. a movie's routing tags)
+}
 
 struct SearchablePicker: View {
     let placeholder: String
@@ -873,10 +877,16 @@ struct SearchablePicker: View {
                             VStack(alignment: .leading, spacing: 0) {
                                 ForEach(shown) { m in
                                     Button { onSelect(m.id); query = "" } label: {
-                                        Text(m.label).font(.system(size: 13)).lineLimit(1)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .padding(.vertical, 6).padding(.horizontal, 9)
-                                            .contentShape(Rectangle())
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(m.label).font(.system(size: 13)).lineLimit(1)
+                                            if let d = m.detail, !d.isEmpty {
+                                                Text(d).font(.system(size: 10.5))
+                                                    .foregroundStyle(.secondary).lineLimit(1)
+                                            }
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.vertical, 6).padding(.horizontal, 9)
+                                        .contentShape(Rectangle())
                                     }.buttonStyle(.plain)
                                     Divider()
                                 }
@@ -1074,7 +1084,7 @@ private struct MovieMode: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 8) {
                 SearchablePicker(placeholder: "Search movies to add…",   // never locked — addable mid-run
-                                 options: store.movieLibrary.map { PickOption(id: $0.id, label: store.movieTitle($0.name, $0.title ?? $0.name)) },
+                                 options: store.movieLibrary.map { PickOption(id: $0.id, label: store.movieTitle($0.name, $0.title ?? $0.name), detail: $0.pipelineHint) },
                                  disabled: !store.moviesReachable) { id in
                     if let m = store.movieLibrary.first(where: { $0.id == id }) {
                         let queued = items.contains { $0.name == m.name }
