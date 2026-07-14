@@ -46,12 +46,15 @@ def resolution_bucket(height) -> str:
 
 
 def probe_input(path: str) -> dict:
-    info = {"width": 0, "height": 0, "is_4k": False, "is_hdr": False, "is_dv": False}
+    info = {"width": 0, "height": 0, "is_4k": False, "is_hdr": False, "is_dv": False,
+            "codec": None, "transfer": None, "pix_fmt": None, "is_cfr": False, "video_kbps": 0}
     try:
         out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
-                              "-show_streams", "-of", "json", path],
+                              "-show_streams", "-show_format", "-of", "json", path],
                              capture_output=True, text=True, timeout=60).stdout
-        v = (json.loads(out).get("streams") or [{}])[0]
+        d = json.loads(out)
+        v = (d.get("streams") or [{}])[0]
+        fmt = d.get("format") or {}
     except Exception:
         return info
     info["width"] = int(v.get("width") or 0)
@@ -60,21 +63,62 @@ def probe_input(path: str) -> dict:
     info["is_hdr"] = v.get("color_transfer") in HDR_TRANSFERS
     info["is_dv"] = any(sd.get("side_data_type") == "DOVI configuration record"
                         for sd in (v.get("side_data_list") or []))
+    info["codec"] = v.get("codec_name")
+    info["transfer"] = v.get("color_transfer")
+    info["pix_fmt"] = v.get("pix_fmt")
+    # CFR: avg == r frame rate, both valid (mirror of topaz._is_already_cfr — no import cycle)
+    avg, r = v.get("avg_frame_rate") or "", v.get("r_frame_rate") or ""
+    info["is_cfr"] = bool(avg and r and avg == r and not avg.startswith("0"))
+    # VIDEO bitrate in Kb/s, best source first: stream bit_rate (MP4) → MKV track-statistics
+    # tag → container total (overestimates: includes audio — fine for a threshold gate).
+    # plan_for runs on the fully-downloaded local file, so MKV end-of-file tags read fine.
+    tags = v.get("tags") or {}
+    for cand in (v.get("bit_rate"), tags.get("BPS"), tags.get("BPS-eng"), fmt.get("bit_rate")):
+        try:
+            if cand and int(cand) > 0:
+                info["video_kbps"] = int(cand) // 1000
+                break
+        except (TypeError, ValueError):
+            continue
     return info
 
 
-def choose_plan(info: dict) -> dict:
+def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
     """Map input characteristics to the path (PURE — unit-tested). Topaz preserves range;
     Resolve adds HDR only for SDR sources. Every sub-4K source upscales to 4K. Returns
     {topaz, scale, res, fit_height, resolve, is_hdr, reason}: `scale` = the tvai AI factor,
     `res` = the preset/resolution bucket (which variant's params to use), `fit_height` = the
-    final lanczos-fit height (2160) or None when the AI scale already lands on 2160."""
+    final lanczos-fit height (2160) or None when the AI scale already lands on 2160.
+
+    HIGH-BITRATE 4K FAST PATH (`passthrough_min_kbps` > 0, user-dictated): an exactly-4K
+    HEVC 10-bit CFR source at/above the threshold skips Topaz — its picture is already the
+    deliverable. HDR10 (PQ) intake → topaz "rpu-only": keep the ORIGINAL stream, Resolve runs
+    only for the DV analysis and its RPU is injected (no re-encode). SDR/HLG intake →
+    topaz "resolve-only": Resolve's HDR+DV conversion ships through the normal capped remux
+    (an RPU alone can't be put on a non-PQ base layer). `"skip"` stays reserved for
+    already-DV (an abort, not a fast path)."""
     is_hdr = bool(info.get("is_hdr"))
     resolve = "add_dv" if is_hdr else "add_hdr_dv"
     rng = "HDR" if is_hdr else "SDR"
     if info.get("is_dv"):
         return {"topaz": "skip", "scale": 1, "res": None, "fit_height": None,
                 "resolve": "skip", "is_hdr": is_hdr, "reason": "already Dolby Vision — nothing to do"}
+    kbps = int(info.get("video_kbps") or 0)
+    if (passthrough_min_kbps and info.get("is_4k")
+            and info.get("codec") == "hevc"
+            and info.get("pix_fmt") == "yuv420p10le"          # Main10 base layer
+            and info.get("width") == 3840 and info.get("height") == 2160
+            and info.get("is_cfr")                            # frame-exact RPU alignment needs CFR
+            and kbps >= passthrough_min_kbps):
+        if info.get("transfer") == "smpte2084":               # PQ — DV 8.1 needs an HDR10 base
+            return {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
+                    "resolve": "add_dv", "is_hdr": True,
+                    "reason": "4K HDR10 HEVC @ ~%d Mbps ≥ threshold — original stream kept, "
+                              "Resolve adds the DV layer only" % (kbps // 1000)}
+        return {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
+                "resolve": resolve, "is_hdr": is_hdr,
+                "reason": "4K %s HEVC @ ~%d Mbps ≥ threshold — no upscale needed, Resolve %s"
+                          % (rng, kbps // 1000, "adds DV" if is_hdr else "adds HDR + DV")}
     if info.get("is_4k"):
         return {"topaz": "clean", "scale": 1, "res": "1080p", "fit_height": None,
                 "resolve": resolve, "is_hdr": is_hdr,
@@ -91,8 +135,17 @@ def choose_plan(info: dict) -> dict:
             "resolve": resolve, "is_hdr": is_hdr, "reason": reason}
 
 
+def passthrough_min_kbps() -> int:
+    """The live fast-path threshold (Kb/s) from settings; 0 = feature off or unreadable."""
+    try:
+        import settings
+        return max(0, int(settings.get_settings().get("passthrough_min_mbps", 0))) * 1000
+    except Exception:
+        return 0
+
+
 def plan_for(path: str) -> dict:
     info = probe_input(path)
-    p = choose_plan(info)
+    p = choose_plan(info, passthrough_min_kbps=passthrough_min_kbps())
     p["input"] = info
     return p

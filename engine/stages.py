@@ -200,6 +200,10 @@ def _topaz(p, abort, progress=None, should_pause=None):
     pl = plan.plan_for(p.source)
     if pl["topaz"] == "skip":
         return False, "source is already Dolby Vision — nothing to upscale"
+    if pl["topaz"] in ("rpu-only", "resolve-only"):
+        # HIGH-BITRATE 4K FAST PATH: the source picture IS the deliverable — no upscale.
+        # Succeed as a no-op so the run loop proceeds straight to the Resolve stage.
+        return True, pl["reason"] + " — skipping upscale"
     # Per-resolution preset variant: the plan's bucket (from the source height) picks which
     # tuned param set to use; the source can be ANY of 480p/720p/1080p and still reach 4K.
     params = settings.show_topaz_params(p.series, pl.get("res") or "1080p")
@@ -289,11 +293,16 @@ def _resolve(p, abort, progress=None):
     if pl.get("resolve") == "skip":
         return False, "source is already Dolby Vision — nothing for Resolve to do"
     mode = "hdr" if pl.get("is_hdr") else "sdr"   # HDR intake → 2000-nit HDR project
+    fast = pl.get("topaz") in ("rpu-only", "resolve-only")
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
-    # near-lossless crf bitrate, which would inflate the export for no quality gain.
-    bitrate = max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS)
+    # near-lossless crf bitrate, which would inflate the export for no quality gain. In
+    # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
+    bitrate = (EXPORT_BITRATE_FLOOR_KBPS if pl.get("topaz") == "rpu-only"
+               else max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS))
+    # FAST PATH: no topaz segments exist — Resolve ingests the ORIGINAL source as one clip.
     cmd = [sys.executable, os.path.join(ENGINE_DIR, "resolve_pipeline.py"),
-           "episode", p.segdir, p.dv_render, mode, str(bitrate)]
+           ("single" if fast else "episode"),
+           (p.source if fast else p.segdir), p.dv_render, mode, str(bitrate)]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
@@ -340,11 +349,19 @@ def _remux(p, abort, progress=None):
     the CFR pass no longer carries them. remux() dispatches on p.final's extension: MKV
     (lossless audio / bitmap subs) or MP4 (default). The x265 pass makes this stage LONG
     (~an hour per episode) — it reports live progress and honours abort."""
+    import plan
     import remux
     import settings as settings_mod
     _st = settings_mod.get_settings()
     cap = int(_st.get("max_peak_mbps", 50))
     lufs = _st.get("audio_target_lufs", -16) or None   # 0/None = boost off
+    if plan.plan_for(p.source).get("topaz") == "rpu-only":
+        # FAST PATH (HDR10 keep-the-source): no re-encode, no peak cap — the ORIGINAL stream
+        # ships with Resolve's DV RPU injected (user-dictated; the source's own peaks were
+        # already direct-playing before the pipeline touched it).
+        res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
+                                 audio_target_lufs=lufs, abort=abort)
+        return res.ok, res.reason
     bounds = _read_topaz_bounds(p.source_basename) or None   # segment at this episode's topaz boundaries
 
     # Same notched segment bar as Topaz: on_plan gives the cumulative segment-end frames once,
@@ -410,6 +427,10 @@ def _cleanup(p, abort, progress=None):
             os.remove(p.final + ".capped.hevc")
         if os.path.exists(p.final + ".dv.mp4"):         # remux temp: MKV-path DV video intermediate
             os.remove(p.final + ".dv.mp4")
+        if os.path.exists(p.final + ".src.hevc"):       # inject temp: source Annex-B ES
+            os.remove(p.final + ".src.hevc")
+        if os.path.exists(p.final + ".inject.hevc"):    # inject temp: RPU-injected ES
+            os.remove(p.final + ".inject.hevc")
     except OSError:
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)

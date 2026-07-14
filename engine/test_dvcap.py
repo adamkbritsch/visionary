@@ -508,3 +508,22 @@ class ReencodeTighter(unittest.TestCase):
         ok, why = dvcap.reencode_segments_tighter("dv.mov", "rpu.bin", "/nowhere", [7], 42,
                                                   total_frames=100, fps="25")
         self.assertFalse(ok); self.assertIn("out of range", why)
+
+
+class InjectBuilders(unittest.TestCase):
+    """FAST-PATH builders: the source ES copy and the RPU inject — never a re-encode."""
+
+    def test_annexb_file_command_is_a_pure_stream_copy(self):
+        cmd = dvcap.build_annexb_file_command("ffmpeg", "src.mkv", "out.hevc")
+        self.assertIn("copy", cmd[cmd.index("-c:v") + 1])
+        self.assertEqual(cmd[cmd.index("-bsf:v") + 1], "hevc_mp4toannexb")
+        self.assertEqual(cmd[cmd.index("-f") + 1], "hevc")
+        self.assertEqual(cmd[-1], "out.hevc")
+        self.assertNotIn("-c:v libx265", " ".join(cmd))
+
+    def test_inject_command_uses_dovi_tool_inject_rpu(self):
+        cmd = dvcap.build_inject_command("/opt/homebrew/bin/dovi_tool", "src.hevc", "r.bin", "inj.hevc")
+        self.assertEqual(cmd[:2], ["/opt/homebrew/bin/dovi_tool", "inject-rpu"])
+        self.assertEqual(cmd[cmd.index("-i") + 1], "src.hevc")
+        self.assertEqual(cmd[cmd.index("--rpu-in") + 1], "r.bin")
+        self.assertEqual(cmd[cmd.index("-o") + 1], "inj.hevc")

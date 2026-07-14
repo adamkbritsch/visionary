@@ -153,3 +153,94 @@ class TopazSegBounds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FastPathDispatch(unittest.TestCase):
+    """HIGH-BITRATE 4K FAST PATH plumbing: topaz no-ops, resolve runs the `single` entry on
+    the SOURCE, remux dispatches to the inject path (rpu-only) or the capped path otherwise."""
+
+    RPU_PLAN = {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
+                "resolve": "add_dv", "is_hdr": True, "reason": "4K HDR10 HEVC @ ~15 Mbps"}
+    RES_PLAN = {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
+                "resolve": "add_hdr_dv", "is_hdr": False, "reason": "4K SDR HEVC @ ~15 Mbps"}
+
+    def test_topaz_noops_successfully_for_both_modes(self):
+        import plan, topaz
+        p = _paths(tempfile.mkdtemp())
+        for pl in (self.RPU_PLAN, self.RES_PLAN):
+            with mock.patch.object(plan, "plan_for", return_value=pl), \
+                 mock.patch.object(topaz, "upscale_resumable",
+                                   side_effect=AssertionError("must not upscale")):
+                ok, msg = stages.run_stage("topaz", p)
+            self.assertTrue(ok)
+            self.assertIn("skipping upscale", msg)
+
+    def test_resolve_runs_single_on_the_source(self):
+        import plan
+        p = _paths(tempfile.mkdtemp())
+        seen = {}
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+            ok, msg = stages.run_stage("resolve", p)
+        self.assertFalse(ok)                              # launch failed on purpose — we only
+        cmd = seen["cmd"]                                 # care what it TRIED to run
+        self.assertIn("single", cmd)
+        self.assertIn(p.source, cmd)                      # the ORIGINAL file, not the segdir
+        self.assertNotIn(p.segdir, cmd)
+        self.assertEqual(cmd[cmd.index("single") + 3], "hdr")
+        self.assertEqual(cmd[-1], str(stages.EXPORT_BITRATE_FLOOR_KBPS))   # render video discarded
+
+    def test_resolve_only_uses_source_bitrate_floor_max(self):
+        import plan
+        p = _paths(tempfile.mkdtemp())
+        seen = {}
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=90000), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+            stages.run_stage("resolve", p)
+        cmd = seen["cmd"]
+        self.assertIn("single", cmd)
+        self.assertEqual(cmd[cmd.index("single") + 3], "sdr")
+        self.assertEqual(cmd[-1], "90000")                # conversion IS the ship — match intake
+
+    def test_remux_dispatches_to_inject_for_rpu_only(self):
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as inj, \
+             mock.patch.object(remux, "remux", side_effect=AssertionError("cap path must not run")):
+            ok, msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        args = inj.call_args[0]
+        self.assertEqual(args, (p.dv_render, p.source_cfr, p.source, p.final))
+
+    def test_remux_resolve_only_still_uses_the_capped_path(self):
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(stages, "_read_topaz_bounds", return_value=[]), \
+             mock.patch.object(remux, "remux_inject",
+                               side_effect=AssertionError("inject must not run for SDR tier")), \
+             mock.patch.object(remux, "remux",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as rm:
+            ok, msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        rm.assert_called_once()
+
+    def test_cleanup_sweeps_inject_transients(self):
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        for suffix in (".src.hevc", ".inject.hevc"):
+            with open(p.final + suffix, "w") as fh:
+                fh.write("x")
+        ok, _msg = stages.run_stage("cleanup", p)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(p.final + ".src.hevc"))
+        self.assertFalse(os.path.exists(p.final + ".inject.hevc"))

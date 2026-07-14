@@ -102,6 +102,20 @@ def build_annexb_command(ffmpeg: str, src: str) -> list:
             "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"]
 
 
+def build_annexb_file_command(ffmpeg: str, src: str, out_hevc: str) -> list:
+    """Source container -> Annex-B HEVC ES FILE, stream-copied — the original bits, untouched.
+    The inject path's base layer (vs build_annexb_command's stdout pipe for RPU extraction)."""
+    return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", src,
+            "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", out_hevc]
+
+
+def build_inject_command(dovi_tool: str, src_es: str, rpu: str, out_es: str) -> list:
+    """Interleave an extracted RPU into an existing HEVC ES — dovi_tool's standard inject
+    subcommand. The ONLY re-attachment path that keeps the base layer's original bits (the
+    x265 path re-encodes; this one must not)."""
+    return [dovi_tool, "inject-rpu", "-i", src_es, "--rpu-in", rpu, "-o", out_es]
+
+
 def build_rpu_extract_command(dovi_tool: str, rpu_out: str) -> list:
     """Reads Annex-B HEVC from stdin, writes the binary RPU."""
     return [dovi_tool, "extract-rpu", "-", "-o", rpu_out]

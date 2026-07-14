@@ -223,6 +223,78 @@ def render(out, mode="sdr", bitrate=60000):
     return 0
 
 
+def setup_single(video, mode="hdr"):
+    """Single-file variant of setup() for the HIGH-BITRATE 4K FAST PATH: the ORIGINAL source
+    goes on the timeline as ONE clip (no topaz segments exist — the source picture is the
+    deliverable; Resolve runs only to produce the DV analysis/conversion). Same persistent
+    project + inherited color management as setup(); fps comes from the clip itself and is
+    set BEFORE the timeline exists (same conform rule as the segment path)."""
+    print(f"[{time.strftime('%H:%M:%S')}] launching Resolve… (single, mode={mode})", flush=True)
+    resolve = connect(launch=True)
+    if not resolve:
+        print("CONNECT FAILED"); return 1
+    print(f"[{time.strftime('%H:%M:%S')}] connected: {resolve.GetVersionString()}", flush=True)
+    pm = resolve.GetProjectManager()
+    want, exists = project_for(pm, mode)
+    if not exists:
+        print(f"MISSING PROJECT '{want}' (mode={mode}): configure it ONCE in Resolve "
+              f"(color management to HDR PQ + DV Profile 8.1 + "
+              f"{'2000' if mode == 'hdr' else '1000'}-nit Target Display), then re-run. "
+              f"The pipeline inherits those and will not create a blank project.")
+        return 1
+    pm.LoadProject(want)
+    proj = pm.GetCurrentProject()
+    _clear_project(proj)
+    mp = proj.GetMediaPool()
+    clips = mp.ImportMedia([video])
+    if not clips or len(clips) != 1:
+        print(f"IMPORT FAILED: {len(clips) if clips else 0}/1 clips"); return 1
+    src_fps = clips[0].GetClipProperty("FPS")   # Resolve's own notion (e.g. '23.976') — no
+    if not src_fps:                             # fraction-vs-decimal format mismatch possible
+        print("FPS UNREADABLE from the imported clip"); return 1
+    proj.SetSetting("timelineFrameRate", str(src_fps))   # BEFORE the timeline exists
+    print(f"[{time.strftime('%H:%M:%S')}] single clip @ {src_fps}fps | "
+          f"INHERITED color out={proj.GetSetting('colorSpaceOutput')!r}", flush=True)
+    tl = mp.CreateTimelineFromClips("_tl", clips)
+    tl_fps = tl.GetSetting("timelineFrameRate")
+    if abs(float(tl_fps) - float(src_fps)) > 0.01:   # a conform would drop/dupe frames — the
+        print(f"FRAME-RATE CONFORM! tl={tl_fps!r} src={src_fps!r}"); return 1   # RPU gate's enemy
+    try:
+        items = tl.GetItemListInTrack("video", 1) or []
+        if len(items) != 1:
+            print(f"TIMELINE ASSEMBLY WRONG: {len(items)} clips on the timeline, expected 1")
+            return 1
+        got = tl.GetEndFrame() - tl.GetStartFrame() + 1
+        print(f"[{time.strftime('%H:%M:%S')}] timeline = 1 clip, {got} frames", flush=True)
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] (timeline integrity unverifiable: {e})", flush=True)
+    resolve.OpenPage("color")
+    t = time.time()
+    ok = tl.DetectSceneCuts()
+    shots = tl.GetItemListInTrack("video", 1)
+    print(f"[{time.strftime('%H:%M:%S')}] DetectSceneCuts={ok} ({(time.time()-t)/60:.1f}min) "
+          f"shots={len(shots) if shots else 0}", flush=True)
+    print("SETUP_DONE — Resolve on Color page, ready for DV Analyze All Shots (shim)", flush=True)
+    return 0
+
+
+def single(video, out, mode="hdr", bitrate=60000):
+    """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
+    (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
+    rc = setup_single(video, mode)
+    if rc != 0:
+        return rc
+    import dv_shim
+    try:
+        if not dv_shim.run_dv_ui(expect_nit=(2000 if mode == "hdr" else 1000)):
+            print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
+            return 2
+    except Exception as e:
+        print(f"DV_UI_EXC: {e.__class__.__name__}: {e}", flush=True)
+        return 2
+    return render(out, mode, bitrate)
+
+
 def episode(segdir, out, mode="sdr", bitrate=60000):
     """The WHOLE resolve stage in one process: setup (assemble the Topaz chunks on the
     timeline) -> DV Analyze All (UI shim) -> render. Run as a SUBPROCESS so a hung
@@ -252,7 +324,9 @@ if __name__ == "__main__":
         sys.exit(render(a[0], a[1] if len(a) > 1 else "sdr", int(a[2]) if len(a) > 2 else 60000))
     elif phase == "episode":
         sys.exit(episode(a[0], a[1], a[2] if len(a) > 2 else "sdr", int(a[3]) if len(a) > 3 else 60000))
+    elif phase == "single":
+        sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else "hdr", int(a[3]) if len(a) > 3 else 60000))
     else:
         print("usage: resolve_pipeline.py setup <src> [mode] | render <out> [mode] [kbps] "
-              "| episode <prores> <out> [mode] [kbps]")
+              "| episode <prores> <out> [mode] [kbps] | single <video> <out> [mode] [kbps]")
         sys.exit(2)

@@ -244,3 +244,89 @@ class PeakRepairLadder(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertEqual(calls, [([0], 42), ([0], 35)])   # both rungs tried (85%, then 70%)
         self.assertIn("peak still over cap after encode + repair: 58.6", res.reason)
+
+
+class InjectPath(unittest.TestCase):
+    """FAST-PATH remux (rpu-only): the ORIGINAL stream ships with Resolve's RPU injected —
+    no re-encode, no peak gate; strict frame/fps alignment gates ship-nothing on mismatch."""
+
+    R_INFO = {"frames": 100, "fps": "24000/1001", "start_time": 0.0,
+              "master_display": None, "max_cll": None}
+    S_INFO = {"frames": 100, "fps": "24000/1001", "start_time": 0.0,
+              "master_display": None, "max_cll": None}
+
+    def _fake_run(self, cmd, **kw):
+        R = type("R", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+        if "-bsf:v" in cmd:                                # source ES extract → must exist
+            with open(cmd[-1], "wb") as f:
+                f.write(b"ES")
+        elif len(cmd) > 1 and cmd[1] == "inject-rpu":      # inject → must exist
+            with open(cmd[cmd.index("-o") + 1], "wb") as f:
+                f.write(b"INJECTED")
+        return R
+
+    def test_success_ships_injected_stream_with_no_peak_gate(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "master.mkv")          # MKV path: no audio machinery
+            with mock.patch.object(remux.dvcap, "probe_video",
+                                   side_effect=[self.R_INFO, self.S_INFO]), \
+                 mock.patch.object(remux.dvcap, "count_hevc_frames", side_effect=[100, 100]), \
+                 mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+                 mock.patch.object(remux.dvcap, "video_peak_buckets") as peak, \
+                 mock.patch.object(remux, "_verify",
+                                   side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 2, 1,
+                                                                               "DV 8.1 · 2 audio · 1 sub")), \
+                 mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run):
+                res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
+            self.assertTrue(res.ok)
+            self.assertIn("original stream + injected RPU", res.reason)
+            peak.assert_not_called()                        # NO peak measurement in this mode
+            self.assertFalse(os.path.exists(out + ".remuxsegs"))   # success → RPU dir gone
+            self.assertFalse(os.path.exists(out + ".src.hevc"))    # transients swept
+            self.assertFalse(os.path.exists(out + ".inject.hevc"))
+
+    def test_rpu_source_frame_mismatch_ships_nothing(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "master.mkv")
+            with mock.patch.object(remux.dvcap, "probe_video",
+                                   side_effect=[self.R_INFO, self.S_INFO]), \
+                 mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
+                 mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=99), \
+                 mock.patch.object(remux.subprocess, "run",
+                                   side_effect=AssertionError("must fail BEFORE any mux work")):
+                res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
+            self.assertFalse(res.ok)
+            self.assertIn("RPU/source frame mismatch", res.reason)
+            self.assertTrue(os.path.isdir(out + ".remuxsegs"))  # RPU dir KEPT for the retry
+
+    def test_fps_mismatch_fails_before_any_work(self):
+        import os, tempfile
+        s = dict(self.S_INFO, fps="25/1")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "master.mkv")
+            with mock.patch.object(remux.dvcap, "probe_video", side_effect=[self.R_INFO, s]), \
+                 mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
+                 mock.patch.object(remux.dvcap, "extract_rpu",
+                                   side_effect=AssertionError("no extract on fps mismatch")):
+                res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
+        self.assertFalse(res.ok)
+        self.assertIn("fps mismatch", res.reason)
+
+    def test_injected_count_change_ships_nothing(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "master.mkv")
+            with mock.patch.object(remux.dvcap, "probe_video",
+                                   side_effect=[self.R_INFO, self.S_INFO]), \
+                 mock.patch.object(remux.dvcap, "count_hevc_frames", side_effect=[100, 99]), \
+                 mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+                 mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run):
+                res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
+            self.assertFalse(res.ok)
+            self.assertIn("frame count changed", res.reason)
+            self.assertFalse(os.path.exists(out + ".inject.hevc"))   # transients swept on failure too

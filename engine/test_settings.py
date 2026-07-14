@@ -151,3 +151,53 @@ class TopazColorAndScale(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FastPathGate(unittest.TestCase):
+    """HIGH-BITRATE 4K FAST PATH: exactly-4K HEVC 10-bit CFR at/above the threshold skips
+    Topaz — HDR10 (PQ) keeps the original stream (rpu-only), SDR/HLG ships Resolve's
+    conversion (resolve-only). Every disqualifier falls through to today's plans."""
+
+    GOOD = dict(is_4k=True, is_hdr=False, is_dv=False, codec="hevc", pix_fmt="yuv420p10le",
+                width=3840, height=2160, is_cfr=True, video_kbps=15000, transfer=None)
+
+    def _plan(self, thresh=12000, **kw):
+        return plan.choose_plan({**self.GOOD, **kw}, passthrough_min_kbps=thresh)
+
+    def test_hdr10_takes_rpu_only(self):
+        pl = self._plan(transfer="smpte2084", is_hdr=True)
+        self.assertEqual((pl["topaz"], pl["resolve"], pl["is_hdr"]), ("rpu-only", "add_dv", True))
+
+    def test_sdr_takes_resolve_only(self):
+        pl = self._plan()                                    # WWDITS profile: SDR 4K ~15 Mbps
+        self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_hdr_dv"))
+
+    def test_hlg_takes_resolve_only_not_inject(self):
+        pl = self._plan(transfer="arib-std-b67", is_hdr=True)  # HLG base can't carry an 8.1 RPU
+        self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
+
+    def test_threshold_boundary_is_inclusive(self):
+        self.assertEqual(self._plan(video_kbps=12000)["topaz"], "resolve-only")   # == passes
+        self.assertEqual(self._plan(video_kbps=11999)["topaz"], "clean")          # below → full path
+
+    def test_disqualifiers_fall_through_to_todays_plans(self):
+        for kw in (dict(codec="av1"), dict(codec="h264"), dict(pix_fmt="yuv420p"),
+                   dict(is_cfr=False), dict(width=4096), dict(height=2072, width=3840),
+                   dict(video_kbps=0)):
+            self.assertEqual(self._plan(**kw)["topaz"], "clean", kw)
+
+    def test_already_dv_still_wins(self):
+        self.assertEqual(self._plan(is_dv=True)["topaz"], "skip")
+
+    def test_threshold_zero_disables_the_gate(self):
+        self.assertEqual(self._plan(thresh=0)["topaz"], "clean")
+
+    def test_settings_clamp_for_the_knob(self):
+        import settings as s
+        import tempfile, os as _os
+        from unittest import mock
+        with mock.patch.object(s, "SETTINGS_FILE", _os.path.join(tempfile.mkdtemp(), "s.json")):
+            self.assertEqual(s.set_settings({"passthrough_min_mbps": 3})["passthrough_min_mbps"], 5)
+            self.assertEqual(s.set_settings({"passthrough_min_mbps": 999})["passthrough_min_mbps"], 200)
+            self.assertEqual(s.set_settings({"passthrough_min_mbps": 0})["passthrough_min_mbps"], 0)
+            self.assertEqual(s.set_settings({"passthrough_min_mbps": 12})["passthrough_min_mbps"], 12)

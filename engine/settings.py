@@ -50,6 +50,12 @@ DEFAULT_SETTINGS = {
                                 # rate (dvcap.py). Resolve's VideoToolbox export spikes to ~139 Mbps on
                                 # a ~27 Mbps average, which glitches players; ~2x the average only clips
                                 # the pathological seconds. NO uncapped fallback — cap fails => stage fails.
+    "passthrough_min_mbps": 12, # HIGH-BITRATE 4K FAST PATH: a 3840x2160 HEVC 10-bit CFR source whose
+                                # VIDEO bitrate is at/above this skips Topaz entirely. HDR10 (PQ) intake
+                                # keeps its ORIGINAL stream and gets Resolve's Dolby Vision RPU injected
+                                # (no re-encode); SDR intake ships Resolve's HDR+DV conversion through
+                                # the normal capped remux. Sized so WWDITS-tier 4K web-DLs (~15 Mbps)
+                                # qualify while starved 4K still gets the full Topaz cleanup. 0 = off.
     "max_youtube_minutes": 20,  # YouTube: the per-channel length-cap threshold (applied only to channels
                                 # whose 'capped' toggle is on).
     "youtube_every_tv_episodes": 2,  # YouTube CADENCE: serve exactly 1 YouTube video after every N TV
@@ -172,6 +178,9 @@ def set_settings(updates: dict) -> dict:
                                             DEFAULT_SETTINGS["audio_target_lufs"])
         s["min_adapter_watts"] = _clamp(s.get("min_adapter_watts"), 1, 500,
                                         DEFAULT_SETTINGS["min_adapter_watts"])
+        if s.get("passthrough_min_mbps") != 0:   # 0 = fast path off; else keep the floor sane
+            s["passthrough_min_mbps"] = _clamp(s.get("passthrough_min_mbps"), 5, 200,
+                                               DEFAULT_SETTINGS["passthrough_min_mbps"])
         s["max_youtube_minutes"] = _clamp(s.get("max_youtube_minutes"), 1, 600,
                                           DEFAULT_SETTINGS["max_youtube_minutes"])
         s["youtube_every_tv_episodes"] = _clamp(s.get("youtube_every_tv_episodes"), 1, 50,

@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from fractions import Fraction
 
 import dvcap
 
@@ -429,6 +430,128 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     finally:
         # transient only — segdir is KEPT on any non-success return so the next attempt resumes
         _rm(hevc); _rm(tracks); _rm(dv_mp4)
+
+
+def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
+                 audio_target_lufs=None, abort=None,
+                 ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
+    """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream with
+    Resolve's Dolby Vision RPU injected — NO re-encode, NO peak cap (the source's own peaks
+    were already direct-playing before the pipeline touched it). The DV render contributes
+    ONLY its RPU; its video is discarded. HARD GATE: the RPU frame count must exactly equal
+    the source's coded-frame count — a misaligned RPU time-shifts every frame's DV trim,
+    which is worse than no DV, so a mismatch ships NOTHING."""
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    info = dvcap.probe_video(dv_video, ffprobe)
+    if info["frames"] <= 0:      # transient ffprobe blip — fail cleanly, resume state intact
+        return RemuxResult(False, output,
+                           reason="could not probe render frame count — resume state left intact")
+    n_src = dvcap.count_hevc_frames(orig_source, ffprobe)   # container packets = coded frames
+    if n_src <= 0:
+        return RemuxResult(False, output, reason="could not count source frames")
+    src_info = dvcap.probe_video(orig_source, ffprobe)
+    try:
+        if Fraction(str(src_info["fps"])) != Fraction(str(info["fps"])):
+            return RemuxResult(False, output,
+                               reason=f"fps mismatch: source {src_info['fps']} vs render "
+                                      f"{info['fps']} — RPU cannot align (shipped nothing)")
+    except (ValueError, ZeroDivisionError):
+        return RemuxResult(False, output, reason="unreadable fps — RPU alignment unverifiable")
+    # Small resume dir: keeps ONLY the extracted RPU (tens of MB). Same name the cleanup
+    # stage already sweeps; the manifest identity wipes a stale RPU if the render changed.
+    segdir = output + ".remuxsegs"
+    try:
+        st = os.stat(dv_video)
+        src_id = f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        src_id = "missing"
+    dvcap.ensure_segdir(segdir, {"mode": "inject", "src": src_id,
+                                 "frames": n_src, "fps": str(info["fps"])})
+    rpu = os.path.join(segdir, "rpu.bin")
+    src_es = output + ".src.hevc"           # transient: the source's Annex-B ES (original bits)
+    inj_es = output + ".inject.hevc"        # transient: same ES with the RPU interleaved
+    tracks = dv_mp4 = None
+    try:
+        if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):
+            ok, why = dvcap.extract_rpu(dv_video, rpu, ffmpeg=ffmpeg, timeout=timeout)
+            if not ok:
+                return RemuxResult(False, output, reason=why)
+        n_rpu = dvcap.rpu_frame_count(rpu)
+        if n_rpu != n_src:
+            return RemuxResult(False, output,
+                               reason=f"RPU/source frame mismatch: rpu {n_rpu} != source {n_src} "
+                                      f"— Resolve render is not frame-aligned with the original "
+                                      f"(shipped nothing)")
+        if abort is not None and abort.is_set():
+            return RemuxResult(False, output, reason="aborted")
+        ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, orig_source, src_es),
+                            capture_output=True, text=True, timeout=timeout)
+        if ex.returncode != 0 or not (os.path.exists(src_es) and os.path.getsize(src_es) > 0):
+            return RemuxResult(False, output, reason="source ES extract failed: " + _tail(ex.stderr))
+        if abort is not None and abort.is_set():
+            return RemuxResult(False, output, reason="aborted")
+        ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
+                            capture_output=True, text=True, timeout=timeout)
+        if ij.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
+            return RemuxResult(False, output,
+                               reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
+        n_inj = dvcap.count_hevc_frames(inj_es, ffprobe)    # inject writes AUDs → 1 packet/frame
+        if n_inj != n_src:
+            return RemuxResult(False, output,
+                               reason=f"injected ES frame count changed: {n_inj} != {n_src} "
+                                      f"(shipped nothing)")
+        audio_note = ""
+        if output.lower().endswith(".mkv"):
+            dv_mp4 = output + ".dv.mp4"
+            vx = subprocess.run(build_capped_video_mux_command(mp4box, inj_es, info["fps"], dv_mp4),
+                                capture_output=True, text=True, timeout=timeout)
+            if vx.returncode != 0:
+                return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
+            mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
+                                capture_output=True, text=True, timeout=timeout)
+            if mx.returncode != 0:
+                return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
+        else:
+            # same audio machinery as the cap path (boost validated, falls back to a copy);
+            # the CFR gate guarantees cfr audio is a bit-exact stream copy of the source's
+            gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
+            tracks = output + ".tracks.mp4"
+            for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
+                ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
+                                                          gain_db=attempt_gain),
+                                    capture_output=True, text=True, timeout=timeout)
+                if ex.returncode != 0:
+                    return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
+                if attempt_gain <= 0:
+                    break
+                landed = measure_lufs(tracks, ffmpeg)
+                want = float(audio_target_lufs)
+                if landed is not None and abs(landed - want) <= 1.5:
+                    audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
+                    break
+                audio_note = " · audio unboosted (landing off target — kept original)"
+            mx = subprocess.run(build_capped_mux_command(mp4box, inj_es, info["fps"], tracks, output),
+                                capture_output=True, text=True, timeout=timeout)
+            if mx.returncode != 0:
+                return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+        res = _verify(output, ffprobe)
+        if not res.ok:
+            return res
+        if output.lower().endswith(".mp4"):
+            tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
+            if tag != "hvc1":                          # hev1 masters DON'T direct-play (SHIELD)
+                res.ok = False
+                res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
+                _rm(output)
+                return res
+        # NO peak gate here (user-dictated): the shipped video IS the source's own encode.
+        res.reason += " · original stream + injected RPU (no re-encode, peak gate n/a)" + audio_note
+        shutil.rmtree(segdir, ignore_errors=True)      # SUCCESS: the RPU won't be needed again
+        return res
+    finally:
+        # the two big ESes are transient EVERY attempt (recreated in minutes); only the small
+        # rpu.bin persists (in segdir) for resume — segdir is KEPT on any non-success return
+        _rm(src_es); _rm(inj_es); _rm(tracks); _rm(dv_mp4)
 
 
 def main(argv=None):
