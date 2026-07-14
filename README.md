@@ -192,6 +192,15 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   an **HDR** input to **2000 nits** — so each gets the right DV target-display ceiling for how
   bright it was meant to go. Both export HDR10 + Dolby Vision Profile 8.1.
 
+- **High-bitrate 4K fast path**: a 4K CFR source whose video bitrate is already healthy
+  (≥ the `passthrough_min_mbps` setting, default **12 Mbps**) skips Topaz entirely — its
+  picture is the deliverable. Eligibility is purely measured (nothing is excluded by
+  provenance — a 4K YouTube VP9 qualifies on its numbers). Two tiers by what the stream can
+  technically carry: an **HDR10/HEVC** source keeps its **original bits untouched** and gets
+  Resolve's Dolby Vision RPU injected onto it (no re-encode, no peak cap — those peaks were
+  already direct-playing); everything else ships Resolve's HDR+DV conversion through the
+  normal capped remux. Either way a movie lands in **~2.5× its runtime** instead of ~5×.
+
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
@@ -204,9 +213,12 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
   get the machine).
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
-  under a hard peak-bitrate cap (x265, a 50 Mbps per-second ceiling), so a finished 4K
+  under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K
   Dolby Vision master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p file it replaces**
   (measured across 48 upscaled episodes). Full 4K DV, without a 4K-sized storage bill.
+  If a master still measures over the cap, the remux **repairs itself**: it localizes the
+  offending second(s), re-encodes only those segments at a tighter cap (85%, then 70%),
+  and re-gates — instead of failing on identical retries.
 
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
   pauses on battery and dims the screen after idle. **Screen Control** holds the
@@ -219,7 +231,7 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
 | Round-robin queue | Guardrails |
 |:---:|:---:|
 | <img src="docs/assets/app-queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine episodes lined up" width="420"> | <img src="docs/assets/app-power.png" alt="Settings and scratch: the 140 W power gate, screen dimming, live per-episode scratch usage" width="420"> |
-| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence.</sub> | <sub>The <b>140 W power gate</b> and idle screen-off, plus live per-episode scratch usage (Topaz segments, DV render, remux segments).</sub> |
+| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. Movie search shows each title's <b>routing tags</b> (4K/1080p · HDR/DV · codec) with an approximate duration hint, filterable by 1080p / 4K SDR / 4K HDR.</sub> | <sub>The <b>140 W power gate</b> and idle screen-off, plus live per-episode scratch usage (Topaz segments, DV render, remux segments).</sub> |
 
 ## Configuration
 
