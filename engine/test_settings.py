@@ -180,11 +180,23 @@ class FastPathGate(unittest.TestCase):
         self.assertEqual(self._plan(video_kbps=12000)["topaz"], "resolve-only")   # == passes
         self.assertEqual(self._plan(video_kbps=11999)["topaz"], "clean")          # below → full path
 
-    def test_disqualifiers_fall_through_to_todays_plans(self):
+    def test_nothing_is_categorically_excluded(self):
+        # Eligibility is PURELY measured (4K + CFR + bitrate) — codec/bit-depth/geometry only
+        # pick the tier (user-dictated: no carve-outs; e.g. YouTube must not be discounted).
         for kw in (dict(codec="av1"), dict(codec="h264"), dict(pix_fmt="yuv420p"),
-                   dict(is_cfr=False), dict(width=4096), dict(height=2072, width=3840),
-                   dict(video_kbps=0)):
-            self.assertEqual(self._plan(**kw)["topaz"], "clean", kw)
+                   dict(width=4096), dict(height=2072, width=3840)):
+            self.assertEqual(self._plan(**kw)["topaz"], "resolve-only", kw)
+        # a PQ source that misses an inject prerequisite still fast-paths via resolve-only
+        pl = self._plan(transfer="smpte2084", is_hdr=True, codec="av1")
+        self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
+
+    def test_youtube_profile_qualifies_on_its_numbers(self):
+        pl = self._plan(codec="vp9", pix_fmt="yuv420p", video_kbps=20000)   # typical 4K VP9
+        self.assertEqual(pl["topaz"], "resolve-only")
+
+    def test_only_measured_disqualifiers_fall_through(self):
+        self.assertEqual(self._plan(is_cfr=False)["topaz"], "clean")   # VFR: timing untrustworthy
+        self.assertEqual(self._plan(video_kbps=0)["topaz"], "clean")   # unknown/zero bitrate
 
     def test_already_dv_still_wins(self):
         self.assertEqual(self._plan(is_dv=True)["topaz"], "skip")

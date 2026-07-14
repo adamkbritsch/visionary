@@ -90,13 +90,14 @@ def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
     `res` = the preset/resolution bucket (which variant's params to use), `fit_height` = the
     final lanczos-fit height (2160) or None when the AI scale already lands on 2160.
 
-    HIGH-BITRATE 4K FAST PATH (`passthrough_min_kbps` > 0, user-dictated): an exactly-4K
-    HEVC 10-bit CFR source at/above the threshold skips Topaz — its picture is already the
-    deliverable. HDR10 (PQ) intake → topaz "rpu-only": keep the ORIGINAL stream, Resolve runs
-    only for the DV analysis and its RPU is injected (no re-encode). SDR/HLG intake →
-    topaz "resolve-only": Resolve's HDR+DV conversion ships through the normal capped remux
-    (an RPU alone can't be put on a non-PQ base layer). `"skip"` stays reserved for
-    already-DV (an abort, not a fast path)."""
+    HIGH-BITRATE 4K FAST PATH (`passthrough_min_kbps` > 0, user-dictated): ANY 4K CFR source
+    at/above the threshold skips Topaz — its picture is already the deliverable, whatever the
+    codec or provenance (no categorical exclusions). The tier split is technical, not
+    eligibility: an HDR10/PQ HEVC Main10 exact-3840×2160 source → topaz "rpu-only" (keep the
+    ORIGINAL stream, Resolve runs only for the DV analysis and its RPU is injected — no
+    re-encode); everything else → topaz "resolve-only" (Resolve's HDR+DV conversion ships
+    through the normal capped remux — an RPU alone can't sit on a non-PQ/non-HEVC base).
+    `"skip"` stays reserved for already-DV (an abort, not a fast path)."""
     is_hdr = bool(info.get("is_hdr"))
     resolve = "add_dv" if is_hdr else "add_hdr_dv"
     rng = "HDR" if is_hdr else "SDR"
@@ -104,21 +105,25 @@ def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
         return {"topaz": "skip", "scale": 1, "res": None, "fit_height": None,
                 "resolve": "skip", "is_hdr": is_hdr, "reason": "already Dolby Vision — nothing to do"}
     kbps = int(info.get("video_kbps") or 0)
-    if (passthrough_min_kbps and info.get("is_4k")
-            and info.get("codec") == "hevc"
-            and info.get("pix_fmt") == "yuv420p10le"          # Main10 base layer
-            and info.get("width") == 3840 and info.get("height") == 2160
-            and info.get("is_cfr")                            # frame-exact RPU alignment needs CFR
+    # ELIGIBILITY is purely measured — 4K + CFR + bitrate. NOTHING is categorically excluded
+    # (user-dictated: no carve-outs by provenance — a 4K YouTube VP9 at threshold bitrate
+    # qualifies the same as a web-DL). The stricter stream properties below only decide WHICH
+    # tier, never whether the fast path applies.
+    if (passthrough_min_kbps and info.get("is_4k") and info.get("is_cfr")
             and kbps >= passthrough_min_kbps):
-        if info.get("transfer") == "smpte2084":               # PQ — DV 8.1 needs an HDR10 base
+        if (info.get("transfer") == "smpte2084"               # PQ — DV 8.1 needs an HDR10 base
+                and info.get("codec") == "hevc"               # ...an HEVC one
+                and info.get("pix_fmt") == "yuv420p10le"      # ...Main10
+                and info.get("width") == 3840 and info.get("height") == 2160):
             return {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
                     "resolve": "add_dv", "is_hdr": True,
                     "reason": "4K HDR10 HEVC @ ~%d Mbps ≥ threshold — original stream kept, "
                               "Resolve adds the DV layer only" % (kbps // 1000)}
         return {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
                 "resolve": resolve, "is_hdr": is_hdr,
-                "reason": "4K %s HEVC @ ~%d Mbps ≥ threshold — no upscale needed, Resolve %s"
-                          % (rng, kbps // 1000, "adds DV" if is_hdr else "adds HDR + DV")}
+                "reason": "4K %s (%s) @ ~%d Mbps ≥ threshold — no upscale needed, Resolve %s"
+                          % (rng, info.get("codec") or "?", kbps // 1000,
+                             "adds DV" if is_hdr else "adds HDR + DV")}
     if info.get("is_4k"):
         return {"topaz": "clean", "scale": 1, "res": "1080p", "fit_height": None,
                 "resolve": resolve, "is_hdr": is_hdr,
