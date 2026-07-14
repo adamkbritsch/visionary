@@ -1074,23 +1074,6 @@ private struct TVMode: View {
 private struct MovieMode: View {
     @EnvironmentObject var store: AppStore
     let locked: Bool
-    // Search-result filter by name-parsed tags. View-local @State is fine HERE (unlike the
-    // add flow below): a tab switch resetting the filter to All is cosmetic, not data loss.
-    // "4K HDR DV" is not a bucket — DV-complete titles never appear in this pool at all.
-    @State private var resFilter = "all"
-    private static let FILTERS: [(String, String)] =
-        [("all", "All"), ("1080p", "1080p"), ("4ksdr", "4K SDR"), ("4khdr", "4K HDR")]
-
-    private func matches(_ m: MovieItemDTO) -> Bool {
-        let t = m.tags ?? []
-        switch resFilter {
-        case "1080p": return t.contains("1080p")
-        case "4ksdr": return t.contains("4K") && !t.contains("HDR") && !t.contains("DV")
-        case "4khdr": return t.contains("4K") && (t.contains("HDR") || t.contains("DV"))
-        default:      return true
-        }
-    }
-
     // NOTE: the in-flight add state (pendingMovie/moviePick/movieDetecting) lives in the
     // STORE, not view @State — this view is recreated on every tab switch, and view-local
     // state silently dropped a mid-detection or awaiting-confirm add (the reported "added
@@ -1099,24 +1082,9 @@ private struct MovieMode: View {
         let items = store.state?.movies?.selected?.items ?? []
         let catalog = store.presetCatalog
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 6) {                       // resolution/range filter chips
-                ForEach(Self.FILTERS, id: \.0) { key, label in
-                    Button { resFilter = key } label: {
-                        Text(label)
-                            .font(.system(size: 11, weight: resFilter == key ? .semibold : .regular))
-                            .foregroundStyle(resFilter == key ? Color.primary : Color.secondary)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
-                            .background(Capsule().fill(resFilter == key
-                                ? Color.brand.opacity(0.28) : Color.white.opacity(0.06)))
-                            .overlay(Capsule().strokeBorder(resFilter == key
-                                ? Color.brand.opacity(0.75) : Color.white.opacity(0.10), lineWidth: 0.7))
-                    }.buttonStyle(.plain)
-                }
-                Spacer()
-            }
             HStack(alignment: .top, spacing: 8) {
                 SearchablePicker(placeholder: "Search movies to add…",   // never locked — addable mid-run
-                                 options: store.movieLibrary.filter(matches).map { PickOption(id: $0.id, label: store.movieTitle($0.name, $0.title ?? $0.name), detail: $0.pipelineHint) },
+                                 options: store.movieLibrary.map { PickOption(id: $0.id, label: store.movieTitle($0.name, $0.title ?? $0.name), detail: $0.pipelineHint) },
                                  disabled: !store.moviesReachable) { id in
                     if let m = store.movieLibrary.first(where: { $0.id == id }) {
                         let queued = items.contains { $0.name == m.name }

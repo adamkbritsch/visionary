@@ -231,7 +231,7 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the 1080p orig
 | Round-robin queue | Guardrails |
 |:---:|:---:|
 | <img src="docs/assets/app-queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine episodes lined up" width="420"> | <img src="docs/assets/app-power.png" alt="Settings and scratch: the 140 W power gate, screen dimming, live per-episode scratch usage" width="420"> |
-| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. Movie search shows each title's <b>routing tags</b> (4K/1080p · HDR/DV · codec) with an approximate duration hint, filterable by 1080p / 4K SDR / 4K HDR.</sub> | <sub>The <b>140 W power gate</b> and idle screen-off, plus live per-episode scratch usage (Topaz segments, DV render, remux segments).</sub> |
+| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. Movie search shows each title's <b>routing tags</b> (4K/1080p · HDR/DV · codec) with an approximate duration hint.</sub> | <sub>The <b>140 W power gate</b> and idle screen-off, plus live per-episode scratch usage (Topaz segments, DV render, remux segments).</sub> |
 
 ## Configuration
 
