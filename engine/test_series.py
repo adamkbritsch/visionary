@@ -164,3 +164,27 @@ class ActiveSeries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NxNNConvention(unittest.TestCase):
+    """The '9x01' episode-naming convention must parse like SxxExx — live-hit: Season 9 of
+    The Office ('The Office (US) - 9x01 - New Guys.mkv') was invisible to the queue."""
+
+    def test_9x01_names_parse_and_zero_pad(self):
+        eps = series.parse_episodes(["The Office (US) - 9x01 - New Guys.mkv",
+                                     "The Office (US) - 9x02 - Roy's Wedding.mkv"])
+        self.assertEqual([e["ep"] for e in eps], ["S09E01", "S09E02"])
+        self.assertTrue(all(e["has_source"] for e in eps))
+
+    def test_mixed_conventions_sort_together(self):
+        eps = series.parse_episodes(["Show S08e24 Finale.mkv",
+                                     "Show - 9x01 - Opener.mkv"])
+        self.assertEqual([e["ep"] for e in eps], ["S08E24", "S09E01"])
+
+    def test_sxxexx_wins_when_both_present(self):
+        eps = series.parse_episodes(["Show S02E11 something 3x99 else.mkv"])
+        self.assertEqual(eps[0]["ep"], "S02E11")
+
+    def test_resolution_tokens_never_match(self):
+        for n in ("Movie 1920x1080 BluRay.mkv", "Clip 3840x2160 HDR.mkv", "Thing 720x480.mkv"):
+            self.assertEqual(series.parse_episodes([n]), [], n)

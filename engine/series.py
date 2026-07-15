@@ -18,6 +18,10 @@ from transfer import connect as ftp_connect, ftp_listdir, ftp_walk_files, NAS_FT
 
 SELECTION_FILE = os.path.expanduser("~/.topaz-pipeline/selection.json")
 _EP = re.compile(r"[sS](\d{1,2})[eE](\d{1,3})")
+_EPX = re.compile(r"\b(\d{1,2})x(\d{2,3})\b")   # the '9x01' naming convention ('The Office (US)
+                                                # - 9x01 - New Guys.mkv'). Word-bounded on both
+                                                # numbers so resolution tokens (1920x1080) can
+                                                # never match. Checked AFTER SxxExx.
 # Any container ffmpeg can decode is fine — the pipeline re-encodes to a CFR intermediate first,
 # so support all common video inputs, not just the mp4/mkv the library mostly holds.
 _VID = (".mp4", ".mkv", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".avi", ".wmv",
@@ -44,7 +48,7 @@ def parse_episodes(names, dv_map=None, watched_map=None) -> list:
     for n in names:
         if not n.lower().endswith(_VID):
             continue
-        m = _EP.search(n)
+        m = _EP.search(n) or _EPX.search(n)
         if not m:
             continue
         key = f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
