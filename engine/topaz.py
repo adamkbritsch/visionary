@@ -268,15 +268,58 @@ def is_cfr_ready(path) -> bool:
     return os.path.exists(path) and _frame_count(path) > 0
 
 
+def _frac(s):
+    """Parse a ffprobe 'num/den' (or bare int) rational to (num, den); None if unparseable."""
+    if not s or s in ("0/0", "N/A"):
+        return None
+    try:
+        if "/" in s:
+            n, d = s.split("/", 1)
+            n, d = int(n), int(d)
+        else:
+            n, d = int(s), 1
+    except (ValueError, TypeError):
+        return None
+    if n <= 0 or d <= 0:
+        return None
+    return (n, d)
+
+
+def _period_exact_in_timebase(r_frame_rate: str, time_base: str) -> bool:
+    """Can one frame's duration be represented EXACTLY as a whole number of container
+    time_base ticks? A frame lasts 1/fps = fps_den/fps_num seconds; in ticks of
+    time_base tb_num/tb_den that is (fps_den * tb_den) / (fps_num * tb_num). If that
+    isn't an integer, the muxer must round each frame's timestamp — over an episode the
+    rounding wobbles the cadence (avg_frame_rate drifts off r_frame_rate) even though the
+    source is nominally CFR. A stream-COPY carries that jitter into the MP4, and the
+    upscaler then duplicates frames to fill it → the render grows by ~1 frame per minute
+    and the audio steadily leads the picture. This is exactly the matroska case: its
+    1/1000 (millisecond) timebase can't represent a 1001/24000 s (41.708 ms) NTSC frame,
+    while an MP4 written at 1/24000 can. Return False on any doubt → force the re-encode,
+    which regenerates uniform PTS (what MP4 sources already get, and never drift)."""
+    fps = _frac(r_frame_rate)
+    tb = _frac(time_base)
+    if not fps or not tb:
+        return False
+    fps_num, fps_den = fps
+    tb_num, tb_den = tb
+    return (fps_den * tb_den) % (fps_num * tb_num) == 0
+
+
 def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
-    """The source is ALREADY constant frame rate at a 4:2:0 pixel format → the CFR step can
-    stream-COPY the video instead of a full re-encode (identical pixels, ~seconds not minutes).
+    """The source is ALREADY constant frame rate at a 4:2:0 pixel format AND its container
+    timebase can represent that rate EXACTLY → the CFR step can stream-COPY the video instead
+    of a full re-encode (identical pixels, ~seconds not minutes).
     `avg_frame_rate == r_frame_rate` (both valid) is the CFR signal — for VFR they differ; 4:2:0
     because the re-encode also normalizes chroma to what the upscaler ingests, so 4:2:2/4:4:4
-    still transcode. CONSERVATIVE: any doubt (unreadable, VFR, wide chroma) → False → safe re-encode."""
+    still transcode. The timebase check (see _period_exact_in_timebase) is the matroska guard:
+    an MKV is nominally CFR (avg==r) but its 1 ms timebase can't hold an NTSC frame period, so a
+    stream-copy inherits jitter the upscaler turns into a growing audio/video drift — such a
+    source must re-encode to get uniform PTS (the path MP4 sources already take).
+    CONSERVATIVE: any doubt (unreadable, VFR, wide chroma, lossy timebase) → False → safe re-encode."""
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
-                              "-show_entries", "stream=avg_frame_rate,r_frame_rate,pix_fmt",
+                              "-show_entries", "stream=avg_frame_rate,r_frame_rate,pix_fmt,time_base",
                               "-of", "json", path], capture_output=True, text=True, timeout=30).stdout
         s = (json.loads(out).get("streams") or [{}])[0]
     except Exception:
@@ -284,7 +327,8 @@ def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
     avg, r, pix = s.get("avg_frame_rate"), s.get("r_frame_rate"), s.get("pix_fmt")
     if not avg or not r or avg in ("0/0", "N/A") or r in ("0/0", "N/A"):
         return False
-    return avg == r and pix in ("yuv420p", "yuv420p10le")
+    return (avg == r and pix in ("yuv420p", "yuv420p10le")
+            and _period_exact_in_timebase(r, s.get("time_base")))
 
 
 def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False):

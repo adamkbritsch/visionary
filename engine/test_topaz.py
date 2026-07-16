@@ -230,13 +230,25 @@ class LowPrioCfr(unittest.TestCase):
 
 class CfrFastPath(unittest.TestCase):
     """Already-CFR 4:2:0 sources stream-COPY instead of a wasteful full re-encode."""
-    def _probe(self, avg, r, pix):
-        js = ('{"streams":[{"avg_frame_rate":"%s","r_frame_rate":"%s","pix_fmt":"%s"}]}'
-              % (avg, r, pix))
+    def _probe(self, avg, r, pix, time_base="1/24000"):
+        js = ('{"streams":[{"avg_frame_rate":"%s","r_frame_rate":"%s","pix_fmt":"%s",'
+              '"time_base":"%s"}]}' % (avg, r, pix, time_base))
         return mock.patch.object(topaz.subprocess, "run", return_value=mock.Mock(stdout=js))
 
     def test_detects_constant_frame_rate_420(self):
-        with self._probe("24000/1001", "24000/1001", "yuv420p10le"):
+        # clean MP4-style timebase (1/24000) that holds a 24000/1001 frame exactly → copy
+        with self._probe("24000/1001", "24000/1001", "yuv420p10le", "1/24000"):
+            self.assertTrue(topaz._is_already_cfr("x.mp4"))
+
+    def test_matroska_ms_timebase_reencodes(self):
+        # nominally CFR (avg==r) but a 1 ms timebase can't hold a 41.708 ms NTSC frame →
+        # a stream-copy would carry jitter the upscaler turns into growing A/V drift → re-encode
+        with self._probe("24000/1001", "24000/1001", "yuv420p10le", "1/1000"):
+            self.assertFalse(topaz._is_already_cfr("x.mkv"))
+
+    def test_pal_rate_on_ms_timebase_is_exact(self):
+        # 25 fps = 40 ms lands exactly on a 1 ms grid → still safe to copy
+        with self._probe("25/1", "25/1", "yuv420p", "1/1000"):
             self.assertTrue(topaz._is_already_cfr("x.mkv"))
 
     def test_variable_frame_rate_still_reencodes(self):
@@ -250,6 +262,14 @@ class CfrFastPath(unittest.TestCase):
     def test_unreadable_falls_back(self):
         with self._probe("0/0", "0/0", "yuv420p"):
             self.assertFalse(topaz._is_already_cfr("x.mkv"))
+
+    def test_period_exact_helper(self):
+        self.assertFalse(topaz._period_exact_in_timebase("24000/1001", "1/1000"))   # NTSC on ms
+        self.assertTrue(topaz._period_exact_in_timebase("24000/1001", "1/24000"))   # native
+        self.assertTrue(topaz._period_exact_in_timebase("25/1", "1/1000"))          # PAL on ms
+        self.assertFalse(topaz._period_exact_in_timebase("30/1", "1/1000"))         # 33.33 ms
+        self.assertFalse(topaz._period_exact_in_timebase("24000/1001", None))       # missing → unsafe
+        self.assertFalse(topaz._period_exact_in_timebase(None, "1/1000"))           # missing → unsafe
 
     def test_copy_command_is_stream_copy_no_reencode(self):
         cmd = topaz.build_cfr_copy_command("/ff", "/in.mkv", "/out.mkv")
