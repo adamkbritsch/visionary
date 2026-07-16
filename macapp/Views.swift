@@ -1052,8 +1052,8 @@ private struct TVMode: View {
                 }
                 Spacer()
             }
-            unwatchedToggle(name, show.unwatched_first ?? true)
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
+            unwatchedToggle(name, show.unwatched_first ?? true)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
     }
