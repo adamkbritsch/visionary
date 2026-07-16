@@ -85,6 +85,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var preset: String?
     var configured: Bool?
     var unwatched_first: Bool?
+    var normalize_audio: Bool?    // per-show loudness-boost gate (default on)
     var queue: QueueDTO?
     var id: String { name ?? "" }
 }
@@ -104,6 +105,7 @@ struct MovieItemDTO: Codable, Identifiable {
     var title: String?     // clean display title
     var watched: Bool?
     var preset: String?    // the Topaz preset chosen for this queued movie
+    var normalize_audio: Bool?   // per-movie loudness-boost gate (keyed by title, like preset)
     var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
     var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
     var id: String { name ?? title ?? "" }
@@ -138,6 +140,7 @@ struct YouTubeChannelDTO: Codable, Identifiable {   // a queued channel (standin
     var paused: Bool?         // paused → no downloading/upscaling, but keeps existing files
     var max_age_days: Int?    // delete/skip videos older than this many days (0 = no limit)
     var preset: String?       // per-channel Topaz preset (keyed by folder)
+    var normalize_audio: Bool?   // per-channel loudness-boost gate (keyed by folder, like preset)
     var pending: Int?         // videos to upscale (within cap + scope, not done)
     var downloaded: Int?      // videos youtarr has on disk
     var id: String { channelId ?? title ?? "" }
@@ -194,6 +197,7 @@ struct ShowProfileDTO: Codable {
     var configured: Bool?
     var preset: String?
     var unwatched_first: Bool?
+    var normalize_audio: Bool?
     var catalog: [PresetDTO]?
 }
 

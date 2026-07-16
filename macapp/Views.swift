@@ -1053,6 +1053,7 @@ private struct TVMode: View {
                 Spacer()
             }
             unwatchedToggle(name, show.unwatched_first ?? true)
+            NormalizeAudioToggle(key: name, on: show.normalize_audio ?? true)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
     }
@@ -1065,6 +1066,23 @@ private struct TVMode: View {
             Text("Unwatched episodes first").font(.system(size: 12)).foregroundStyle(.secondary)
         }
         .help("On: skip ahead to episodes you haven't watched. Off: start at the beginning of the show.")
+    }
+}
+
+// Per-item "Normalize audio" checkbox — the SAME control under a TV show, a queued movie,
+// and a YouTube channel. `key` is the item's show_profiles string (show name / movie title /
+// channel folder — the same key its Topaz preset uses), which is also what the remux stage
+// looks up (p.series) to gate the smart loudness boost.
+private struct NormalizeAudioToggle: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let on: Bool
+    var body: some View {
+        Toggle(isOn: Binding(get: { on },
+                             set: { v in Task { await store.setNormalizeAudio(key, v) } })) {
+            Text("Normalize audio").font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+        .help("On: boost quiet audio to the loudness target during remux. Off: keep this item's audio bit-exact.")
     }
 }
 
@@ -1171,6 +1189,11 @@ private struct MovieRow: View {
             .contentShape(Rectangle())
             .onTapGesture { onTap() }
             .help("Tap to change this movie's Topaz preset")
+            // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
+            // checkbox must not trigger it. Keyed by TITLE (the movie's settings key).
+            NormalizeAudioToggle(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
+                .padding(.horizontal, 10).padding(.bottom, 7)
+                .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
         }
     }
@@ -1391,6 +1414,12 @@ private struct ChannelRow: View {
             }
             .padding(.vertical, 7).padding(.horizontal, 10)
             .contentShape(Rectangle())
+            // Under the channel's control row; keyed by FOLDER (the channel's settings key).
+            // Dimmed with the row's other controls while paused (it sits outside their Group).
+            NormalizeAudioToggle(key: ch.folder_name ?? "", on: ch.normalize_audio ?? true)
+                .disabled(paused).opacity(paused ? 0.35 : 1)
+                .padding(.horizontal, 10).padding(.bottom, 7)
+                .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
         }
         .confirmationDialog("Remove \(ch.title ?? ch.folder_name ?? "this channel")?",

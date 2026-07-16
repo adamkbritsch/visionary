@@ -58,6 +58,28 @@ class Presets(unittest.TestCase):
         self.assertEqual(settings.get_show_preset("Old"), "animation2d") # preset preserved
         self.assertFalse(settings.get_show_unwatched_first("Old"))
 
+    def test_normalize_audio_defaults_true(self):
+        # Works for ANY item kind — the key is a show name, movie title, or channel folder.
+        self.assertTrue(settings.get_show_normalize_audio("Brand New Show"))
+        self.assertTrue(settings.get_show_normalize_audio("Some Movie Title (2024)"))
+
+    def test_normalize_audio_set_persists_and_coexists_with_preset(self):
+        settings.set_show_preset("S", "film")
+        settings.set_show_normalize_audio("S", False)
+        self.assertEqual(settings.get_show_preset("S"), "film")          # preset survives
+        self.assertFalse(settings.get_show_normalize_audio("S"))
+        self.assertTrue(settings.get_show_unwatched_first("S"))          # sibling key untouched
+        settings.set_show_normalize_audio("S", True)
+        self.assertTrue(settings.get_show_normalize_audio("S"))
+        self.assertEqual(settings.get_show_preset("S"), "film")
+
+    def test_normalize_audio_legacy_string_entry_migrates(self):
+        settings._save(settings.PROFILES_FILE, {"Old": "animation2d"})   # old preset-only form
+        self.assertTrue(settings.get_show_normalize_audio("Old"))        # default
+        settings.set_show_normalize_audio("Old", False)                  # migrates to dict
+        self.assertEqual(settings.get_show_preset("Old"), "animation2d") # preset preserved
+        self.assertFalse(settings.get_show_normalize_audio("Old"))
+
     def test_settings_only_accepts_known_keys(self):
         s = settings.set_settings({"poll_minutes": 45, "bogus": 1})
         self.assertEqual(s["poll_minutes"], 45)

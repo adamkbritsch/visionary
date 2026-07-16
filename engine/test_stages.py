@@ -126,6 +126,56 @@ class TopazSegBounds(unittest.TestCase):
             stages.run_stage("remux", p, progress=lambda d: None)
         self.assertIsNone(got["b"])                                     # [] → None → ~SEG_SECONDS plan
 
+
+class NormalizeAudioGate(unittest.TestCase):
+    """The per-item "Normalize audio" checkbox gates the SMART LOUDNESS BOOST at the remux
+    stage: OFF → audio_target_lufs=None (remux's existing boost-off bit-exact copy path).
+    The lookup key is p.series — the show name for TV, the movie TITLE for movies, the
+    channel FOLDER for YouTube (the same key each item's preset uses)."""
+
+    def _lufs_reaching_remux(self, p, *, per_item, target=-16):
+        import types, remux, settings
+        got = {}
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan):
+            got["lufs"] = audio_target_lufs
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(settings, "get_show_normalize_audio", return_value=per_item) as g, \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": target}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: None)
+        self.assertTrue(ok)
+        got["key_lookups"] = [c.args[0] for c in g.call_args_list]
+        return got
+
+    def test_off_passes_none_for_a_tv_episode(self):
+        got = self._lufs_reaching_remux(_paths(tempfile.mkdtemp()), per_item=False)
+        self.assertIsNone(got["lufs"])
+        self.assertEqual(got["key_lookups"], ["Show"])                  # keyed by the series name
+
+    def test_on_passes_the_global_target_through(self):
+        got = self._lufs_reaching_remux(_paths(tempfile.mkdtemp()), per_item=True)
+        self.assertEqual(got["lufs"], -16)
+
+    def test_off_gates_a_movie_via_its_title(self):
+        p = _paths(tempfile.mkdtemp())
+        p.movie, p.series, p.title = True, "Some Movie (2024)", "Some Movie (2024)"
+        got = self._lufs_reaching_remux(p, per_item=False)
+        self.assertIsNone(got["lufs"])
+        self.assertEqual(got["key_lookups"], ["Some Movie (2024)"])     # keyed by the TITLE
+
+    def test_off_gates_a_youtube_item_via_its_folder(self):
+        p = _paths(tempfile.mkdtemp())
+        p.youtube, p.series = True, "Channel Folder"
+        got = self._lufs_reaching_remux(p, per_item=False)
+        self.assertIsNone(got["lufs"])
+        self.assertEqual(got["key_lookups"], ["Channel Folder"])        # keyed by the FOLDER
+
+    def test_global_zero_stays_off_without_a_per_item_lookup(self):
+        got = self._lufs_reaching_remux(_paths(tempfile.mkdtemp()), per_item=True, target=0)
+        self.assertIsNone(got["lufs"])                                  # global off wins
+        self.assertEqual(got["key_lookups"], [])                        # gate short-circuits
+
     def test_topaz_writes_boundaries_no_4k_multiplier(self):
         import types, plan, settings, topaz
         ends = [100, 220, 400]                          # topaz scene-cut ends

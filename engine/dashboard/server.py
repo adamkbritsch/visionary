@@ -157,6 +157,7 @@ def series_info():
     shows = [{"name": nm, "preset": settings.show_preset_key(nm),
               "configured": settings.get_show_preset(nm) is not None,
               "unwatched_first": settings.get_show_unwatched_first(nm),
+              "normalize_audio": settings.get_show_normalize_audio(nm),
               "queue": series.cached_queue(nm)} for nm in active]
     return {"selected": sel, "active": active, "rotation": series.get_rotation(),
             "queue": shows[0]["queue"] if shows else None,
@@ -379,6 +380,7 @@ def show_profile_info(show=None):
     return {"show": target, "configured": saved is not None,
             "preset": settings.show_preset_key(target) if target else settings.DEFAULT_PRESET,
             "unwatched_first": settings.get_show_unwatched_first(target) if target else True,
+            "normalize_audio": settings.get_show_normalize_audio(target) if target else True,
             "catalog": settings.preset_catalog()}
 
 
@@ -723,6 +725,11 @@ class Handler(BaseHTTPRequestHandler):
                 settings.set_show_unwatched_first(show, bool(body.get("unwatched_first")))
                 try: series.refresh_queue(show)   # re-order the queue with the new setting
                 except Exception: pass
+            if "normalize_audio" in body:
+                # Per-item loudness-boost gate — `show` is the show_profiles key, so movies
+                # (title) and YouTube channels (folder) reuse this endpoint verbatim. No
+                # queue refresh: audio doesn't affect ordering.
+                settings.set_show_normalize_audio(show, bool(body.get("normalize_audio")))
             self._json(show_profile_info(show))
         else:
             self._send(404, b"not found", "text/plain")

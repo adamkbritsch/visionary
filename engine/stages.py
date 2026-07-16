@@ -355,6 +355,11 @@ def _remux(p, abort, progress=None):
     _st = settings_mod.get_settings()
     cap = int(_st.get("max_peak_mbps", 50))
     lufs = _st.get("audio_target_lufs", -16) or None   # 0/None = boost off
+    # Per-item "Normalize audio" gate — p.series is the item's settings key for ALL kinds
+    # (TV series name / movie title / channel folder — the same key its preset uses).
+    # OFF -> None -> the boost-off bit-exact copy path remux already has.
+    if lufs and p.series and not settings_mod.get_show_normalize_audio(p.series):
+        lufs = None
     if plan.plan_for(p.source).get("topaz") == "rpu-only":
         # FAST PATH (HDR10 keep-the-source): no re-encode, no peak cap — the ORIGINAL stream
         # ships with Resolve's DV RPU injected (user-dictated; the source's own peaks were

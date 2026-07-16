@@ -273,6 +273,19 @@ def set_show_unwatched_first(show: str, value) -> bool:
     return bool(value)
 
 
+def get_show_normalize_audio(key: str) -> bool:
+    """Per-item (TV show / movie title / channel folder — the same string the item's
+    preset is keyed by): apply the SMART LOUDNESS BOOST (global audio_target_lufs) to
+    this item's remuxes? Default True (the prior always-on behavior); False = keep this
+    item's audio bit-exact (the remux's existing boost-off copy path)."""
+    return bool(_show_entry(key).get("normalize_audio", True))
+
+
+def set_show_normalize_audio(key: str, value) -> bool:
+    _update_show(key, normalize_audio=bool(value))
+    return bool(value)
+
+
 def show_topaz_params(show: str, res: str = DEFAULT_RES) -> dict:
     """What the Topaz stage actually uses for a show: its preset's params for the source's
     resolution bucket (the bucket comes from plan.resolution_bucket(source height))."""

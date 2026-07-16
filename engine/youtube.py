@@ -676,6 +676,9 @@ def queue_view() -> dict:
                       "capped": bool(e.get("capped")), "paused": bool(e.get("paused")),
                       "max_age_days": int(e.get("max_age_days") or 0),
                       "preset": settings.get_show_preset(folder or "") or YOUTUBE_PRESET,
+                      # per-channel loudness-boost gate — keyed by FOLDER like the preset
+                      # (= p.series at the remux stage for YouTube items)
+                      "normalize_audio": settings.get_show_normalize_audio(folder or ""),
                       "pending": len(channel_pending(e)), "downloaded": len(cached_videos(folder))})
     return {"items": items, "count": len(items), "connected": _connected()}
 
