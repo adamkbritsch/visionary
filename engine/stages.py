@@ -279,6 +279,66 @@ def _quit_resolve_focus_app():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ---- FAST-PATH RESOLVE-COMPAT MEZZANINE -----------------------------------------------
+# The fast path feeds the ORIGINAL source to Resolve, and the eligibility gate excludes
+# nothing by codec (user-dictated) — so a 4K VP9/AV1 source (typical 4K YouTube) can land
+# on a Resolve build that can't decode it. That fails at import ("IMPORT FAILED" /
+# "FPS UNREADABLE" from resolve_pipeline), NOT at render — so when that exact signature
+# appears, transcode a lightweight HEVC Main10 mezzanine (hardware videotoolbox — plain
+# ffmpeg, ~45 GB/hr vs ProRes' ~340) and retry ONCE. HEVC Main10 is what the fast path's
+# HDR10 sources already are, so Resolve ingests it by construction. Sources Resolve
+# decodes never take this path.
+MEZZ_MIN_KBPS = 80_000        # floor; else 4× the source bitrate — transparent for a 12-25 Mbps intake
+MEZZ_TIMEOUT = 7200           # hardware encode runs >100 fps; even a movie is well inside 2 h
+_MEZZ_MARKERS = ("IMPORT FAILED", "FPS UNREADABLE")   # resolve_pipeline's ingest-failure prints
+
+
+def mezzanine_path(source: str) -> str:
+    """The mezzanine sits next to the source in scratch (cleanup sweeps it by this name)."""
+    return os.path.splitext(source)[0] + "_mezz.mp4"
+
+
+def build_mezzanine_command(ffmpeg, src, dst, *, rate, color=None, kbps=MEZZ_MIN_KBPS):
+    """Resolve-compat mezzanine: video-only HEVC Main10 at ≥4× the source bitrate. CFR
+    flags regenerate uniform PTS (a webm/mkv ms-timebase must not reach a frame-counted
+    render); color tags carry the source's range (bt709 or PQ) so the persistent
+    project's color management reads the mezzanine exactly like the original. Audio
+    stays out — the remux ships it from the CFR file."""
+    import topaz
+    rate_flags = ["-r", rate] if rate else []
+    return [ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
+            "-i", src, "-map", "0:v:0", "-an",
+            "-c:v", "hevc_videotoolbox", "-b:v", f"{int(kbps)}k",
+            "-pix_fmt", "p010le", "-tag:v", "hvc1", "-allow_sw", "1",
+            *rate_flags, "-fps_mode", "cfr",
+            *topaz.color_flags(color),
+            dst]
+
+
+def _build_mezzanine(p, abort, progress=None):
+    """Transcode p.source -> the mezzanine via topaz's registered/killable ffmpeg runner
+    (the repo-standard wrapper — no Topaz processing involved). (ok, path_or_tail)."""
+    import topaz
+    dst = mezzanine_path(p.source)
+    kbps = max(4 * _source_video_kbps(p.source), MEZZ_MIN_KBPS)
+    cmd = build_mezzanine_command(topaz.FFMPEG_HB, p.source, dst,
+                                  rate=topaz._fps_fraction(p.source),
+                                  color=topaz.source_color(p.source), kbps=kbps)
+    total = topaz.total_frames(p.source) or 0
+    on_prog = None
+    if progress and total:
+        def on_prog(frames):
+            progress({"stage": "resolve", "ep": p.ep, "pct": min(99, round(frames / total * 100))})
+    rc, _frames, aborted, tail = topaz._run_ffmpeg(cmd, os.environ.copy(), abort=abort,
+                                                   on_progress=on_prog, timeout=MEZZ_TIMEOUT)
+    ok = rc == 0 and not aborted and os.path.exists(dst) and os.path.getsize(dst) > 0
+    if not ok:
+        try: os.remove(dst)
+        except OSError: pass
+        return False, ("aborted" if aborted else (tail or "")[-180:])
+    return True, dst
+
+
 def _resolve(p, abort, progress=None):
     """ProRes -> mute Dolby Vision .mov, run in a KILLABLE SUBPROCESS (setup + DV
     Analyze All + render, via resolve_pipeline.py episode). The Resolve scripting
@@ -287,7 +347,9 @@ def _resolve(p, abort, progress=None):
     that froze the app mid-run). As a child process it's killable on timeout/abort,
     so a Resolve hang fails this stage cleanly and the orchestrator keeps breathing.
     ONE project handles SDR and HDR input (the ProRes color tags pick the range).
-    When the stage finishes (any outcome) Resolve is quit and the app refocused."""
+    When the stage finishes (any outcome) Resolve is quit and the app refocused.
+    FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
+    nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""
     import plan
     pl = plan.plan_for(p.source)   # ORIGINAL: CFR re-encode strips DV side data (skip-detection)
     if pl.get("resolve") == "skip":
@@ -297,31 +359,35 @@ def _resolve(p, abort, progress=None):
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In
     # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
+    # (A mezzanine retry keeps this same value — the inflated mezz bitrate is not quality.)
     bitrate = (EXPORT_BITRATE_FLOOR_KBPS if pl.get("topaz") == "rpu-only"
                else max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS))
-    # FAST PATH: no topaz segments exist — Resolve ingests the ORIGINAL source as one clip.
-    cmd = [sys.executable, os.path.join(ENGINE_DIR, "resolve_pipeline.py"),
-           ("single" if fast else "episode"),
-           (p.source if fast else p.segdir), p.dv_render, mode, str(bitrate)]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
-    except Exception as e:
-        logbook.exception(f"resolve {p.ep}: launch", e)
-        return False, f"resolve launch failed: {e}"
-    out_lines = []
 
-    def _reader():
-        # stream output live so the RENDER part's % surfaces as a progress bar;
-        # keep the lines around for the failure tail. (Reader thread so the abort/
-        # timeout poll below stays responsive even between sparse render updates.)
-        for line in proc.stdout:
-            out_lines.append(line)
-            m = re.match(r"RENDER_PCT (\d+)", line.strip())
-            if m and progress:
-                progress({"stage": "resolve", "ep": p.ep, "pct": int(m.group(1))})
-    threading.Thread(target=_reader, daemon=True).start()
-    try:
+    def _run(video_in):
+        """One resolve_pipeline subprocess pass. (ok, out, reason) — `out` is the FULL
+        output (the import-failure markers print mid-stream, not on the last line);
+        reason is None on a hard kill/abort/launch failure (no retry on those)."""
+        cmd = [sys.executable, os.path.join(ENGINE_DIR, "resolve_pipeline.py"),
+               ("single" if fast else "episode"),
+               (video_in if fast else p.segdir), p.dv_render, mode, str(bitrate)]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+        except Exception as e:
+            logbook.exception(f"resolve {p.ep}: launch", e)
+            return False, "", f"resolve launch failed: {e}"
+        out_lines = []
+
+        def _reader():
+            # stream output live so the RENDER part's % surfaces as a progress bar;
+            # keep the lines around for the failure tail. (Reader thread so the abort/
+            # timeout poll below stays responsive even between sparse render updates.)
+            for line in proc.stdout:
+                out_lines.append(line)
+                m = re.match(r"RENDER_PCT (\d+)", line.strip())
+                if m and progress:
+                    progress({"stage": "resolve", "ep": p.ep, "pct": int(m.group(1))})
+        threading.Thread(target=_reader, daemon=True).start()
         deadline = time.time() + RESOLVE_TIMEOUT
         while proc.poll() is None:
             aborted = abort is not None and abort.is_set()
@@ -329,14 +395,33 @@ def _resolve(p, abort, progress=None):
                 proc.kill()
                 reason = "aborted (stop-time)" if aborted else "TIMED OUT — Resolve unresponsive"
                 logbook.failure(f"resolve {p.ep}: killed subprocess — {reason}")
-                return False, f"resolve killed — {reason}"
+                return False, "", f"resolve killed — {reason}"
             time.sleep(5)
         out = "".join(out_lines)
         tail = " ".join(out.strip().splitlines()[-1:])[:180]
         ok = _is_dv81(_vstream(p.dv_render))
         if not ok:
             logbook.failure(f"resolve {p.ep}: rc={proc.returncode} :: {tail}")
-        return ok, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")
+        return ok, out, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")
+
+    try:
+        ok, out, reason = _run(p.source)
+        if ok or not fast or not any(mk in out for mk in _MEZZ_MARKERS):
+            return ok, reason
+        # Fast-path ingest failure — Resolve can't decode this source (VP9/AV1). Build the
+        # compat mezzanine and retry ONCE; either way the big temp is deleted before return.
+        logbook.failure(f"resolve {p.ep}: source not ingestible — building HEVC compat mezzanine")
+        if progress:
+            progress({"stage": "resolve", "ep": p.ep, "pct": 0})
+        mok, mezz = _build_mezzanine(p, abort, progress)
+        if not mok:
+            return False, f"compat mezzanine failed: {mezz}"
+        try:
+            ok, _out, reason = _run(mezz)
+            return ok, (reason + " (via compat mezzanine)" if ok else reason)
+        finally:
+            try: os.remove(mezz)
+            except OSError: pass
     finally:
         _quit_resolve_focus_app()
 
@@ -436,6 +521,8 @@ def _cleanup(p, abort, progress=None):
             os.remove(p.final + ".src.hevc")
         if os.path.exists(p.final + ".inject.hevc"):    # inject temp: RPU-injected ES
             os.remove(p.final + ".inject.hevc")
+        if os.path.exists(mezzanine_path(p.source)):    # fast-path Resolve-compat mezzanine
+            os.remove(mezzanine_path(p.source))
     except OSError:
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)

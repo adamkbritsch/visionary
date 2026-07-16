@@ -233,6 +233,7 @@ class FastPathDispatch(unittest.TestCase):
             seen["cmd"] = cmd
             raise RuntimeError("stop here")
         with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             ok, msg = stages.run_stage("resolve", p)
         self.assertFalse(ok)                              # launch failed on purpose — we only
@@ -252,6 +253,7 @@ class FastPathDispatch(unittest.TestCase):
             raise RuntimeError("stop here")
         with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
              mock.patch.object(stages, "_source_video_kbps", return_value=90000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
         cmd = seen["cmd"]
@@ -294,3 +296,145 @@ class FastPathDispatch(unittest.TestCase):
         self.assertTrue(ok)
         self.assertFalse(os.path.exists(p.final + ".src.hevc"))
         self.assertFalse(os.path.exists(p.final + ".inject.hevc"))
+
+
+class _FakeResolveProc:
+    """Scripted resolve_pipeline subprocess: yields its lines, then polls done."""
+    def __init__(self, lines, rc):
+        self.stdout = iter(lines)
+        self.returncode = rc
+    def poll(self): return self.returncode
+    def kill(self): pass
+
+
+class _InlineThread:
+    """threading.Thread stand-in that runs the target synchronously on start() — the
+    reader must have consumed the fake proc's stdout before the poll loop reads it."""
+    def __init__(self, target=None, daemon=None, **kw): self._t = target
+    def start(self): self._t()
+
+
+class MezzanineFallback(unittest.TestCase):
+    """FAST-PATH compat mezzanine: a Resolve INGEST failure (VP9/AV1 the pinned Resolve
+    can't decode → 'IMPORT FAILED'/'FPS UNREADABLE') builds a lightweight HEVC Main10
+    mezzanine and retries ONCE; render failures and the normal segment path never do."""
+
+    RES_PLAN = FastPathDispatch.RES_PLAN
+
+    def test_command_is_lightweight_hevc_main10_cfr(self):
+        cmd = stages.build_mezzanine_command("/ff", "/in.webm", "/out_mezz.mp4",
+                                             rate="24000/1001",
+                                             color={"primaries": "bt709",
+                                                    "transfer": "bt709", "space": "bt709"},
+                                             kbps=123456)
+        self.assertIn("hevc_videotoolbox", cmd)               # hardware, plain ffmpeg — no Topaz/ProRes
+        self.assertEqual(cmd[cmd.index("-b:v") + 1], "123456k")
+        self.assertEqual(cmd[cmd.index("-pix_fmt") + 1], "p010le")      # Main10
+        self.assertEqual(cmd[cmd.index("-tag:v") + 1], "hvc1")
+        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")        # uniform PTS out
+        self.assertIn("cfr", cmd)
+        self.assertIn("-an", cmd)                             # video only — audio ships from the CFR
+        self.assertNotIn("-map 0:s", " ".join(cmd))
+        self.assertIn("bt709", cmd)                           # color tags carried
+
+    def _run_resolve(self, p, procs, mezz_ok=True, dv_ok_sequence=(False, True)):
+        """Drive _resolve with scripted subprocess passes; returns (ok, msg, popen_calls, mezz_calls)."""
+        import plan
+        calls, mezz_calls = [], []
+        mezz = stages.mezzanine_path(p.source)
+        def fake_popen(cmd, **kw):
+            calls.append(cmd)
+            return procs.pop(0)
+        def fake_mezz(pp, abort, progress=None):
+            mezz_calls.append(pp.source)
+            if not mezz_ok:
+                return False, "encode blew up"
+            with open(mezz, "w") as fh:
+                fh.write("m")
+            return True, mezz
+        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.threading, "Thread", _InlineThread), \
+             mock.patch.object(stages.time, "sleep"), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", side_effect=list(dv_ok_sequence)), \
+             mock.patch.object(stages, "_build_mezzanine", side_effect=fake_mezz), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
+            ok, msg = stages.run_stage("resolve", p)
+        return ok, msg, calls, mezz_calls
+
+    def test_import_failure_builds_mezz_and_retries_once(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, msg, calls, mezz_calls = self._run_resolve(
+            p, [_FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1),
+                _FakeResolveProc(["render ok\n"], 0)])
+        self.assertTrue(ok)
+        self.assertIn("compat mezzanine", msg)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(mezz_calls, [p.source])
+        mezz = stages.mezzanine_path(p.source)
+        self.assertIn(mezz, calls[1])                          # retry ingests the mezzanine
+        self.assertNotIn(p.source, calls[1])
+        self.assertEqual(calls[1][-1], calls[0][-1])           # export bitrate from the ORIGINAL
+        self.assertFalse(os.path.exists(mezz))                 # big temp deleted after success
+
+    def test_retry_failure_stops_after_second_run(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, _msg, calls, mezz_calls = self._run_resolve(
+            p, [_FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1),
+                _FakeResolveProc(["FPS UNREADABLE from the imported clip\n"], 1)],
+            dv_ok_sequence=(False, False))
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 2)                        # never a third attempt
+        self.assertEqual(len(mezz_calls), 1)
+        self.assertFalse(os.path.exists(stages.mezzanine_path(p.source)))
+
+    def test_mezz_build_failure_fails_the_stage(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, msg, calls, _ = self._run_resolve(
+            p, [_FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1)], mezz_ok=False,
+            dv_ok_sequence=(False,))
+        self.assertFalse(ok)
+        self.assertIn("compat mezzanine failed", msg)
+        self.assertEqual(len(calls), 1)
+
+    def test_unrelated_failure_never_builds_a_mezzanine(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, _msg, calls, mezz_calls = self._run_resolve(
+            p, [_FakeResolveProc(["render exploded at 42%\n"], 1)], dv_ok_sequence=(False,))
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(mezz_calls, [])
+
+    def test_segment_path_never_builds_a_mezzanine(self):
+        import plan
+        p = _paths(tempfile.mkdtemp())
+        normal = dict(self.RES_PLAN, topaz="upscale")          # the ordinary Topaz-segment path
+        calls = []
+        def fake_popen(cmd, **kw):
+            calls.append(cmd)
+            return _FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1)
+        with mock.patch.object(plan, "plan_for", return_value=normal), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.threading, "Thread", _InlineThread), \
+             mock.patch.object(stages.time, "sleep"), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", return_value=False), \
+             mock.patch.object(stages, "_build_mezzanine",
+                               side_effect=AssertionError("segment path must never mezzanine")), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
+            ok, _msg = stages.run_stage("resolve", p)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(p.segdir, calls[0])                      # episode mode ingests the segdir
+
+    def test_cleanup_sweeps_a_stranded_mezzanine(self):
+        p = _paths(tempfile.mkdtemp())
+        mezz = stages.mezzanine_path(p.source)
+        with open(mezz, "w") as fh:
+            fh.write("x")
+        ok, _msg = stages.run_stage("cleanup", p)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(mezz))
