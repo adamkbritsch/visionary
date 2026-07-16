@@ -481,9 +481,12 @@ def _remux(p, abort, progress=None):
 
 
 def _upload(p, abort, progress=None):
-    """final master -> NAS library (FTP STOR, owner 1000:10), then REPLACE: delete
-    the superseded 1080p original — but only after the 4K master is verified on the
-    NAS (transfer.replace_original guards on size). The 4K keeps the HDR10 DV name."""
+    """final master -> NAS library (FTP STOR, owner 1000:10, size-verified). The 1080p
+    original is KEPT alongside it (user-dictated, 2026-07-16): Plex merges both files
+    into one episode/movie with two versions and serves the 4K preferentially, and the
+    source is the option contract on a future re-run with better upscale models — the
+    old REPLACE step burned it. The 4K keeps the HDR10 DV name (queue done-detection
+    keys on that mark, so a kept source can't make an episode look unprocessed)."""
     on_prog = None
     if progress:
         def on_prog(done, total):
@@ -497,8 +500,7 @@ def _upload(p, abort, progress=None):
     ok, remote, reason = transfer.upload(p.final, p.nas_dir, on_progress=on_prog)
     if not ok:
         return False, reason
-    rok, rmsg = transfer.replace_original(remote, p.nas_source, p.final)
-    return True, f"{reason}; {rmsg}"
+    return True, f"{reason}; 1080p source kept (Plex serves the 4K version)"
 
 
 def _cleanup(p, abort, progress=None):

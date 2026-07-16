@@ -276,28 +276,10 @@ def upload(local_file, remote_dir, *, timeout=None, on_progress=None):
         except ftplib.all_errors: pass
 
 
-def replace_original(master_remote, original_remote, local_master) -> tuple:
-    """REPLACE step: permanently delete the superseded 1080p `original_remote`,
-    but ONLY after confirming the 4K `master_remote` is intact on the NAS (remote
-    size == local size). The 1080p is irreplaceable, so it is NEVER deleted unless
-    the replacement is verified present and whole. Returns (ok, reason)."""
-    try:
-        ftp = connect()
-    except ftplib.all_errors as e:
-        return False, f"FTP connect/login failed: {e}"
-    try:
-        lsz = os.path.getsize(local_master)
-        if remote_size(ftp, master_remote) != lsz:
-            return False, "master NOT verified on NAS (size mismatch) — 1080p kept"
-        if remote_size(ftp, original_remote) is None:
-            return True, "no 1080p original present (nothing to replace)"
-        ftp.delete(original_remote)
-        return True, "replaced — deleted 1080p original"
-    except ftplib.all_errors as e:
-        return False, f"replace-delete failed: {e}"
-    finally:
-        try: ftp.quit()
-        except ftplib.all_errors: pass
+# (The REPLACE step — delete the 1080p original once the 4K master verified — was REMOVED
+# 2026-07-16, user-dictated: sources are KEPT next to their masters. Plex merges the two
+# files into one item with two versions and serves the 4K; the source stays on disk as the
+# re-run option for future, better upscale models.)
 
 
 def _rmtree(ftp, path):
