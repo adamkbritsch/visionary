@@ -1390,7 +1390,8 @@ private struct ChannelRow: View {
                 Button { Task { await store.setChannelPaused(ch.channelId ?? "", !paused) } } label: {
                     // Monochrome: Resume is BRIGHT (a paused channel wants attention), Pause is dim.
                     Label(paused ? "Resume" : "Pause", systemImage: paused ? "play.fill" : "pause.fill")
-                        .font(.system(size: 11, weight: .medium)).frame(width: 62)
+                        .font(.system(size: 11, weight: .medium)).lineLimit(1).fixedSize()
+                        .frame(width: 76)   // fits "Resume" + icon; fixed so both states align across rows
                         .foregroundStyle(paused ? DS.steelBright : DS.steelDim)
                         .padding(.vertical, 4)
                         .background(Capsule().fill(Color.white.opacity(paused ? 0.10 : 0.05)))
