@@ -30,6 +30,20 @@ class BuildCommands(unittest.TestCase):
         self.assertIn("mov_text", cmd)   # text subs -> mp4 timed text
         self.assertNotIn("0:v", cmd)     # never copies video
         self.assertEqual(cmd[-1], "/t.mp4")
+        # -fix_sub_duration guards the ORIGINAL input (S09E08: a negative-duration .ass cue
+        # otherwise aborts the whole mux) — it must sit BEFORE the second -i, as an input option.
+        fix = cmd.index("-fix_sub_duration")
+        second_i = [i for i, x in enumerate(cmd) if x == "-i"][1]
+        self.assertEqual(fix, second_i - 1)
+
+    def test_extract_without_subs_drops_all_sub_flags(self):
+        # Last-resort retry: an unconvertible subtitle track ships the master without subs
+        # instead of parking the episode.
+        cmd = build_extract_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mp4", include_subs=False)
+        self.assertNotIn("1:s?", cmd)
+        self.assertNotIn("mov_text", cmd)
+        self.assertIn("0:a", cmd)                      # audio untouched
+        self.assertIn("-fix_sub_duration", cmd)        # harmless to keep; input opt only
 
     def test_mkv_mux_copies_dv_video_audio_subs(self):
         # MKV path: one ffmpeg copy — DV video (in0) + audio (CFR, in1) + all subs (original, in2).

@@ -120,19 +120,27 @@ def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
 
 
 def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_out: str,
-                          gain_db: float = 0.0) -> list:
+                          gain_db: float = 0.0, include_subs: bool = True) -> list:
     """Pull audio from the CFR file (input 0) + text subtitles from the ORIGINAL (input 1) into an
     MP4 track file. Subtitles come from the original because the CFR pass no longer carries them
     (they don't need frame-rate re-timing); bitmap subs never reach the MP4 path (they force MKV).
     With `gain_db` > 0 the audio is loudness-boosted (volume + limiter -> aac_at 384k) instead of
-    stream-copied; subtitles are unaffected either way."""
+    stream-copied; subtitles are unaffected either way.
+    `-fix_sub_duration` on the original: a corrupt text cue with a NEGATIVE duration (S09E08's
+    .ass had end < start, wrapping to 4294967213000 ms) is otherwise passed through by the
+    mov_text encoder and the mp4 muxer aborts the WHOLE extract on it ("Error submitting a
+    packet to the muxer: Invalid argument"). The flag recomputes cue durations at decode.
+    `include_subs=False` is the last-resort retry: ship the master without subs rather than
+    park the episode over a subtitle track."""
     audio = (["-filter:a", build_audio_boost_filter(gain_db),
               "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
+    subs = (["-map", "1:s?"] if include_subs else [])
+    subs_codec = (["-c:s", "mov_text"] if include_subs else [])
     return [
         ffmpeg, "-hide_banner", "-nostdin", "-y",
-        "-i", cfr_source, "-i", orig_source,
-        "-map", "0:a", "-map", "1:s?",     # audio from CFR, subs (optional) from the original
-        "-c", "copy", *audio, "-c:s", "mov_text",  # subs -> mp4 timed text
+        "-i", cfr_source, "-fix_sub_duration", "-i", orig_source,
+        "-map", "0:a", *subs,              # audio from CFR, subs (optional) from the original
+        "-c", "copy", *audio, *subs_codec,  # subs -> mp4 timed text
         tracks_out,
     ]
 
@@ -346,12 +354,22 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             # back to a bit-exact copy of the original audio (never fails the 75-min x265 pass over audio).
             gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
             tracks = output + ".tracks.mp4"   # temp, next to output (on scratch)
+            subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
                                                           gain_db=attempt_gain),
                                     capture_output=True, text=True, timeout=timeout)
                 if ex.returncode != 0:
-                    return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
+                    # LAST-RESORT RETRY, no subs: a still-broken subtitle track (even past
+                    # -fix_sub_duration) must not park the episode — audio is essential,
+                    # subs are not. Same gain; the landing check below still applies.
+                    ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
+                                                              tracks, gain_db=attempt_gain,
+                                                              include_subs=False),
+                                        capture_output=True, text=True, timeout=timeout)
+                    if ex.returncode != 0:
+                        return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
+                    subs_note = " · subs dropped (unconvertible track)"
                 if attempt_gain <= 0:
                     break
                 landed = measure_lufs(tracks, ffmpeg)
@@ -360,6 +378,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
+            audio_note += subs_note
         # ---- mux + verify + PEAK GATE, with a tightening ladder on a peak miss ------------------
         # VBV bufsize == maxrate legally allows a 1-second burst past cap × tolerance, and an
         # identical retry reuses the identical segments — it can never pass (user-caught: a movie
@@ -516,12 +535,21 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             # the CFR gate guarantees cfr audio is a bit-exact stream copy of the source's
             gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
             tracks = output + ".tracks.mp4"
+            subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
                                                           gain_db=attempt_gain),
                                     capture_output=True, text=True, timeout=timeout)
                 if ex.returncode != 0:
-                    return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
+                    # LAST-RESORT RETRY, no subs (same rule as the cap path): a broken
+                    # subtitle track must not park a fast-path item over nice-to-haves.
+                    ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
+                                                              tracks, gain_db=attempt_gain,
+                                                              include_subs=False),
+                                        capture_output=True, text=True, timeout=timeout)
+                    if ex.returncode != 0:
+                        return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
+                    subs_note = " · subs dropped (unconvertible track)"
                 if attempt_gain <= 0:
                     break
                 landed = measure_lufs(tracks, ffmpeg)
@@ -530,6 +558,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
+            audio_note += subs_note
             mx = subprocess.run(build_capped_mux_command(mp4box, inj_es, info["fps"], tracks, output),
                                 capture_output=True, text=True, timeout=timeout)
             if mx.returncode != 0:
