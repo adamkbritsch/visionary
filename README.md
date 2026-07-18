@@ -211,7 +211,9 @@ NAS (FTP) ◀──upload─── finished 4K DV master lands NEXT TO the 1080p
   finished 4K Dolby Vision master in **roughly 1h35m** (measured median across 65 finished
   episodes). And if two finished upscales are ever waiting at once, **both remux in
   parallel** on a second lane (Topaz pauses until a lane frees, so the two x265 encodes
-  get the machine).
+  get the machine). High-bitrate fast-path items overlap too: while one is remuxing, the
+  next item starts — its Resolve included, fast-path or full pipeline — so back-to-back
+  4K intakes run **two-at-once** instead of serializing (capped at two heavy jobs).
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K

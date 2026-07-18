@@ -384,12 +384,23 @@ def unplug_decision(*, on_ac, stage_active, unplug_since, now,
     return "pause", None, 0
 
 
-def resolve_must_wait(finishing, queued: int) -> bool:
+def resolve_must_wait(finishing, queued: int, finishing2=None) -> bool:
     """PURE. The next item may NOT start its Resolve while the previous item's remux is in
-    flight (finisher stage == remux) or still queued to start (user-dictated): Resolve is the
-    one stage that can't be paced or interrupted — its render+DV analyze would crater the
-    un-resumable x265 far worse than topaz does. Upload/cleanup are light: no need to wait."""
-    return (finishing or {}).get("stage") == "remux" or queued > 0
+    flight (finisher stage == remux) or still queued to start — deliberate 1-at-a-time
+    pacing for the topaz path (whose next item overlaps via download/topaz anyway; the old
+    'un-resumable x265' rationale is stale — the remux is segmented/resumable now).
+    Upload/cleanup are light: no need to wait.
+    FAST-PATH EXCEPTION (user-dictated 2026-07-16): while the in-flight remux belongs to a
+    high-bitrate fast-path item (finishing['fast']), the NEXT item starts — its Resolve
+    included, whatever its own kind — so consecutive 4K intakes run 2-at-once instead of
+    serializing (they have no topaz stage to overlap with). Capped at exactly two heavy
+    jobs: the exception applies only while the 2nd remux lane is idle and nothing is
+    queued behind the finisher (once the overlapped item hands off, lane 2 makes it a dual
+    remux and the THIRD item holds here)."""
+    f = finishing or {}
+    if f.get("stage") == "remux" and f.get("fast") and finishing2 is None and queued == 0:
+        return False
+    return f.get("stage") == "remux" or queued > 0
 
 
 def grace_label(seconds: int) -> str:
@@ -1792,7 +1803,8 @@ class Orchestrator:
         once both lanes are full."""
         if len(self._draining) >= 2:
             return len(self._in_finisher_keys()) >= FINISHER_LANES
-        return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize())
+        return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize(),
+                                 self.state.get("finishing2"))
 
     def _finisher_backlogged(self) -> bool:
         """Should the run thread hold before STARTING a new item? Only when TWO OR MORE items wait
@@ -2034,13 +2046,20 @@ class Orchestrator:
         ep_disp = transfer.display_name(p.ep)
         fin_key = "finishing" if lane == 1 else "finishing2"
         prog = self._set_finishing_progress if lane == 1 else self._set_finishing2_progress
+        # FAST-PATH TAG for resolve_must_wait's 2-at-once exception: probed ONCE from the
+        # ORIGINAL source (the local copy lives until cleanup; the CFR would mis-probe).
+        import plan as plan_mod
+        try:
+            fast = plan_mod.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
+        except Exception:
+            fast = False
         for st in FINISH_STAGES:
             if not self._enabled or self._finish_abort.is_set():
                 return
             if stage_done(st, p):
                 continue
             self._reclaim_for_pipeline()   # same pipeline>queue guarantee for the finisher's writes
-            self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None}
+            self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast}
             if lane == 1:
                 ekey = p.source_basename + "|" + st
                 self._fin_elapsed_begin(ekey)

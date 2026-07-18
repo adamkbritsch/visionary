@@ -1532,13 +1532,60 @@ class DropTopazAtHandoff(unittest.TestCase):
 
 class ResolveGate(unittest.TestCase):
     """The next item may not START Resolve while the previous item's remux is in flight or
-    queued — Resolve can't be paced, and its load would crater the un-resumable x265."""
+    queued — deliberate topaz-path pacing — EXCEPT while a FAST-PATH item's remux runs
+    (user-dictated 2-at-once): then the next item's Resolve proceeds, capped at two heavy
+    jobs (2nd lane idle + nothing queued)."""
 
     def test_pure_gate(self):
         self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0))
         self.assertTrue(orch.resolve_must_wait(None, 1))               # queued, not yet started
         self.assertFalse(orch.resolve_must_wait({"stage": "upload"}, 0))   # light tail — no wait
         self.assertFalse(orch.resolve_must_wait(None, 0))
+
+    def test_fast_path_remux_lets_the_next_item_resolve(self):
+        # A fast-path item's remux in flight → the next item runs its Resolve concurrently.
+        self.assertFalse(orch.resolve_must_wait({"stage": "remux", "fast": True}, 0))
+
+    def test_fast_exception_is_capped_at_two(self):
+        # Anything queued behind the finisher, or a live 2nd lane, re-arms the hold —
+        # never more than two heavy jobs at once.
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux", "fast": True}, 1))
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux", "fast": True}, 0,
+                                               {"stage": "remux", "ep": "B"}))
+
+    def test_topaz_path_remux_still_holds(self):
+        # No fast tag (or False) = the ordinary topaz-path pacing, unchanged.
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux", "fast": False}, 0))
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0, None))
+
+    def test_finish_item_publishes_the_fast_tag(self):
+        import plan as plan_mod
+        o = orch.Orchestrator()
+        o._enabled = True
+        p = episode_paths("A", "S01E01", SRC)
+        seen = {}
+        def fake_run(st, pp, abort=None, progress=None):
+            seen[st] = dict(o.state["finishing"] or {})
+            return False, "stop here"          # first stage fails -> loop exits after one publish
+        with mock.patch.object(plan_mod, "plan_for",
+                               return_value={"topaz": "resolve-only"}), \
+             mock.patch.object(orch, "stage_done", return_value=False):
+            o._finish_item(p, fake_run)
+        self.assertTrue(seen["remux"]["fast"])
+
+    def test_finish_item_fast_tag_false_on_probe_failure(self):
+        import plan as plan_mod
+        o = orch.Orchestrator()
+        o._enabled = True
+        p = episode_paths("A", "S01E01", SRC)
+        seen = {}
+        def fake_run(st, pp, abort=None, progress=None):
+            seen[st] = dict(o.state["finishing"] or {})
+            return False, "stop here"
+        with mock.patch.object(plan_mod, "plan_for", side_effect=RuntimeError("probe died")), \
+             mock.patch.object(orch, "stage_done", return_value=False):
+            o._finish_item(p, fake_run)
+        self.assertFalse(seen["remux"]["fast"])
 
     def test_process_holds_resolve_until_remux_clears(self):
         o = orch.Orchestrator(); o._enabled = True
