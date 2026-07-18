@@ -25,7 +25,7 @@ class BuildCommands(unittest.TestCase):
         cmd = build_extract_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mp4")
         inputs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"]
         self.assertEqual(inputs, ["/cfr.mp4", "/orig.mkv"])
-        self.assertIn("0:a", cmd)        # audio from input 0 (the CFR file)
+        self.assertIn("0:a:0", cmd)      # FIRST audio only from input 0 (multi-track masters -> SHIELD drift)
         self.assertIn("1:s?", cmd)       # subs from input 1 (the original)
         self.assertIn("mov_text", cmd)   # text subs -> mp4 timed text
         self.assertNotIn("0:v", cmd)     # never copies video
@@ -42,7 +42,7 @@ class BuildCommands(unittest.TestCase):
         cmd = build_extract_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mp4", include_subs=False)
         self.assertNotIn("1:s?", cmd)
         self.assertNotIn("mov_text", cmd)
-        self.assertIn("0:a", cmd)                      # audio untouched
+        self.assertIn("0:a:0", cmd)                    # audio untouched (still first-track-only)
         self.assertIn("-fix_sub_duration", cmd)        # harmless to keep; input opt only
 
     def test_mkv_mux_copies_dv_video_audio_subs(self):
@@ -52,7 +52,7 @@ class BuildCommands(unittest.TestCase):
         inputs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"]
         self.assertEqual(inputs, ["/dv.mov", "/cfr.mkv", "/orig.mkv"])
         self.assertIn("0:v:0", cmd)      # DV video
-        self.assertIn("1:a", cmd)        # audio from the CFR file
+        self.assertIn("1:a:0", cmd)      # FIRST audio only from the CFR file (SHIELD drift)
         self.assertIn("2:s?", cmd)       # ALL subs (incl. bitmap PGS) from the original
         self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
         self.assertEqual(cmd[-1], "/out.mkv")

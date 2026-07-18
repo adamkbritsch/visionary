@@ -139,7 +139,7 @@ def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks
     return [
         ffmpeg, "-hide_banner", "-nostdin", "-y",
         "-i", cfr_source, "-fix_sub_duration", "-i", orig_source,
-        "-map", "0:a", *subs,              # audio from CFR, subs (optional) from the original
+        "-map", "0:a:0", *subs,            # FIRST audio only (multi-track masters push the SHIELD into Direct Stream -> clock drift), subs (optional) from the original
         "-c", "copy", *audio, *subs_codec,  # subs -> mp4 timed text
         tracks_out,
     ]
@@ -155,7 +155,7 @@ def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
     is exactly why these titles route here instead of MP4."""
     return [ffmpeg, "-hide_banner", "-nostdin", "-y",
             "-i", dv_video, "-i", cfr_source, "-i", orig_source,
-            "-map", "0:v:0", "-map", "1:a", "-map", "2:s?",   # video / audio / all subs
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:s?",   # video / FIRST audio only (SHIELD drift) / all subs
             "-c", "copy",
             output]
 
