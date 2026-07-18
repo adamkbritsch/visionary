@@ -52,7 +52,7 @@ class BuildCommands(unittest.TestCase):
         inputs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"]
         self.assertEqual(inputs, ["/dv.mov", "/cfr.mkv", "/orig.mkv"])
         self.assertIn("0:v:0", cmd)      # DV video
-        self.assertIn("1:a:0", cmd)      # FIRST audio only from the CFR file (SHIELD drift)
+        self.assertIn("1:a", cmd)        # audio from the CFR file
         self.assertIn("2:s?", cmd)       # ALL subs (incl. bitmap PGS) from the original
         self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
         self.assertEqual(cmd[-1], "/out.mkv")
