@@ -265,6 +265,35 @@ class Segmentation(unittest.TestCase):
                     segdir=segdir, total_frames=100, fps="24000/1001", seg_seconds=4)
             self.assertFalse(ok); self.assertIn("mismatch", why)
 
+    def test_should_pause_yields_between_segments(self):
+        # Resolve preemption (like topaz's pause): a True should_pause between segments
+        # returns a benign 'paused:' — every finished segment kept, no concat, resume
+        # re-enters right where it left off.
+        import tempfile, os
+        TOTAL, SS = 200, 4
+        plan = dvcap.plan_segments(TOTAL, "24000/1001", SS)
+        n_of = {i: b - a for i, (a, b) in enumerate(plan)}
+        idx = lambda p: int(os.path.basename(p).split("_")[1].split(".")[0])
+        with tempfile.TemporaryDirectory() as td:
+            segdir = os.path.join(td, "segs"); os.makedirs(segdir)
+            calls = []
+            def fake_pipe(dec, enc, out, abort, on_frame):
+                calls.append(out); open(out, "wb").write(b"y")
+                return n_of[idx(out)], "ok", []
+            with mock.patch.object(dvcap, "count_hevc_frames", return_value=0), \
+                 mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe), \
+                 mock.patch.object(dvcap, "concat_segments",
+                                   side_effect=AssertionError("paused run must not concat")):
+                ok, frames, why = dvcap.encode_capped_segmented(
+                    "/r.mov", "/rpu.bin", os.path.join(td, "out.hevc"), 50,
+                    segdir=segdir, total_frames=TOTAL, fps="24000/1001", seg_seconds=SS,
+                    should_pause=lambda: len(calls) >= 2)   # yield after 2 encoded segments
+            self.assertFalse(ok)
+            self.assertTrue(why.startswith("paused:"), why)
+            self.assertEqual(len(calls), 2)                       # stopped BETWEEN segments
+            self.assertEqual(frames, n_of[0] + n_of[1])           # finished work reported/kept
+
     def test_on_plan_fires_cumulative_segment_ends(self):
         # the dashboard's notched segment bar (same as topaz) needs the cumulative segment END
         # frames + the exact total, fired ONCE after planning — before any progress tick.

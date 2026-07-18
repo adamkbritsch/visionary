@@ -65,7 +65,7 @@ class RemuxProgress(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         emitted = []
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
             on_plan([100, 200, 300], 300)      # 3 segments ending at 100/200/300 of 300 frames
             on_progress(0, 300)                # nothing done
             on_progress(150, 300)              # into segment 2 → 1 done
@@ -101,7 +101,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[137, 402, 1000]), \
@@ -116,7 +116,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[]), \
@@ -136,7 +136,7 @@ class NormalizeAudioGate(unittest.TestCase):
     def _lufs_reaching_remux(self, p, *, per_item, target=-16):
         import types, remux, settings
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
             got["lufs"] = audio_target_lufs
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(remux, "remux", side_effect=fake_remux), \
@@ -285,6 +285,19 @@ class FastPathDispatch(unittest.TestCase):
             ok, msg = stages.run_stage("remux", p)
         self.assertTrue(ok)
         rm.assert_called_once()
+
+    def test_remux_threads_should_pause_through(self):
+        # run_stage("remux", should_pause=...) must reach remux.remux — the Resolve
+        # preemption's between-segment yield rides this.
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        flag = lambda: False
+        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(stages, "_read_topaz_bounds", return_value=[]), \
+             mock.patch.object(remux, "remux",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as rm:
+            stages.run_stage("remux", p, should_pause=flag)
+        self.assertIs(rm.call_args.kwargs.get("should_pause"), flag)
 
     def test_cleanup_sweeps_inject_transients(self):
         d = tempfile.mkdtemp()

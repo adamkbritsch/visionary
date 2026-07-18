@@ -98,9 +98,10 @@ def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pau
     }.get(stage, lambda *_a, **_k: (False, f"unknown stage {stage}"))
     ep = getattr(p, "ep", "?")
     try:
-        # `should_pause` = hold topaz at its next segment boundary (two remuxes have the
-        # machine); only the topaz stage can honor it mid-stage.
-        if stage == "topaz":
+        # `should_pause` = yield at the next segment boundary: topaz yields to two live
+        # remuxes; a remux yields to an active Resolve (Resolve gets the whole machine).
+        # Both are segmented, so a pause costs nothing — the retry resumes in place.
+        if stage in ("topaz", "remux"):
             ok, msg = fn(p, abort, progress, should_pause)
         elif stage == "download":
             ok, msg = fn(p, abort, progress, low_prio)
@@ -426,7 +427,7 @@ def _resolve(p, abort, progress=None):
         _quit_resolve_focus_app()
 
 
-def _remux(p, abort, progress=None):
+def _remux(p, abort, progress=None, should_pause=None):
     """mute DV video -> PEAK-CAPPED DV video (dvcap x265 re-encode, hard `max_peak_mbps`
     ceiling — see remux.py; NO uncapped fallback) + audio (CFR file) + subtitles (ORIGINAL
     download) -> final master. Audio comes from the CFR file — the DV video derives from the
@@ -476,7 +477,7 @@ def _remux(p, abort, progress=None):
 
     res = remux.remux(p.dv_render, p.source_cfr, p.source, p.final,
                       cap_mbps=cap, audio_target_lufs=lufs, boundaries=bounds, abort=abort,
-                      on_progress=_prog, on_plan=_on_plan)
+                      on_progress=_prog, on_plan=_on_plan, should_pause=should_pause)
     return res.ok, res.reason
 
 

@@ -392,11 +392,13 @@ def resolve_must_wait(finishing, queued: int, finishing2=None) -> bool:
     Upload/cleanup are light: no need to wait.
     FAST-PATH EXCEPTION (user-dictated 2026-07-16): while the in-flight remux belongs to a
     high-bitrate fast-path item (finishing['fast']), the NEXT item starts — its Resolve
-    included, whatever its own kind — so consecutive 4K intakes run 2-at-once instead of
-    serializing (they have no topaz stage to overlap with). Capped at exactly two heavy
-    jobs: the exception applies only while the 2nd remux lane is idle and nothing is
-    queued behind the finisher (once the overlapped item hands off, lane 2 makes it a dual
-    remux and the THIRD item holds here)."""
+    included, whatever its own kind — so consecutive 4K intakes don't serialize (they have
+    no topaz stage to overlap with). The Resolve does NOT share the machine: starting it
+    sets _resolve_active, which PAUSES the in-flight remux at its next ~5-min segment
+    (resumed losslessly after — Resolve must finish ASAP, user-dictated). Simultaneous
+    remuxes stay capped at the 2 lanes: the exception applies only while the 2nd lane is
+    idle and nothing is queued behind the finisher, so the cadence is A-remux → B-resolve
+    (A holds) → A+B dual remux → the THIRD item waits here for a free lane."""
     f = finishing or {}
     if f.get("stage") == "remux" and f.get("fast") and finishing2 is None and queued == 0:
         return False
@@ -568,6 +570,9 @@ class Orchestrator:
         # two stage-running threads never share single-slot state (see _finisher / FINISH_STAGES)
         self._finish_q = queue.Queue()         # EpisodePaths handed off after their resolve completes
         self._finish_abort = threading.Event() # aborts the finisher's CURRENT stage (disable / power pause)
+        self._resolve_active = threading.Event()   # run thread's Resolve is live → remux lanes HOLD/yield
+                                               # (user-dictated: Resolve gets the whole machine; a remux
+                                               # pauses at its next ~5-min segment and resumes after)
         self._in_finisher = set()              # _skip_key(p) of queued+in-flight finisher items — excluded
         self._finisher_lock = threading.Lock() # from selection so the run thread can't re-pick them
         self._fin_el_key = None                # finisher's own elapsed slot (mirrors _elapsed_* above)
@@ -989,6 +994,7 @@ class Orchestrator:
             # activity (that felt unreliable) — the user taps the brightness key; we only restore on stop.
             # caffeinate keeps the display logically ON so the resolve stage's screencapture still works.
             self._finish_abort.clear()
+            self._resolve_active.clear()       # fresh run: never inherit a stale Resolve hold
             self.state["finishing"] = None
             # RESUME BOTH: re-queue any item whose remux was interrupted mid-flight (durable work-list)
             # onto the finisher BEFORE the run thread starts, so selection already excludes it and the
@@ -1005,6 +1011,7 @@ class Orchestrator:
             self._enabled = False
             self._abort.set()
             self._finish_abort.set()           # the finisher's in-flight remux/upload stops too
+            self._resolve_active.clear()       # never leave the remux lanes held by a dead run
             self._stop_caffeinate()            # let the display sleep again
             self.state.update(enabled=False, ended_reason=reason)
         try:
@@ -1742,11 +1749,20 @@ class Orchestrator:
             ekey = p.source_basename + "|" + st      # per-(item, stage) elapsed key
             self._elapsed_begin(ekey)                # RESUMES this stage's clock if it ran before
             self._stage_active = True
-            if st == "download":              # per-source lock: the prefetcher may already be pulling
-                ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
-            else:
-                ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
-                                    should_pause=self._dual_remux_live)   # topaz: yield to 2 live remuxes
+            if st == "resolve":
+                # Resolve gets the WHOLE machine (user-dictated: it must finish ASAP —
+                # it holds the screen and can't be paced): both remux lanes hold/yield
+                # for its duration and resume losslessly from their segdirs after.
+                self._resolve_active.set()
+            try:
+                if st == "download":          # per-source lock: the prefetcher may already be pulling
+                    ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
+                else:
+                    ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
+                                        should_pause=self._dual_remux_live)   # topaz: yield to 2 live remuxes
+            finally:
+                if st == "resolve":
+                    self._resolve_active.clear()
             self._stage_active = False
             if ok:  self._elapsed_done(ekey)         # stage complete → reset its timer for any re-run
             else:   self._elapsed_pause()            # interrupted/failed → persist so it RESUMES from here
@@ -2066,6 +2082,25 @@ class Orchestrator:
             if st == "upload":
                 with self._upload_lock:               # one NAS push at a time even with 2 remux lanes
                     ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog)
+            elif st == "remux":
+                # RESOLVE PREEMPTION (user-dictated): while the run thread's Resolve is
+                # active, a remux neither starts nor keeps encoding — it holds here, and an
+                # in-flight x265 yields at its next ~5-min segment (should_pause) with every
+                # finished segment kept. When Resolve ends, the retry resumes in place.
+                while True:
+                    while (self._resolve_active.is_set() and self._enabled
+                           and not self._finish_abort.is_set()):
+                        self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None,
+                                               "fast": fast, "holding": "Resolve has the machine"}
+                        time.sleep(5)
+                    if not self._enabled or self._finish_abort.is_set():
+                        return
+                    self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast}
+                    ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog,
+                                        should_pause=self._resolve_active.is_set)
+                    if not ok and str(msg).startswith("paused:"):
+                        continue               # benign yield to Resolve — go back to the hold
+                    break
             else:
                 ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog)
             if ok:

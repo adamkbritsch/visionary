@@ -508,13 +508,16 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
                             segdir: str, total_frames: int, fps: str,
                             master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
                             boundaries: list | None = None,
-                            abort=None, on_progress=None, on_plan=None,
+                            abort=None, on_progress=None, on_plan=None, should_pause=None,
                             ffmpeg=FFMPEG, x265=X265, ffprobe=FFPROBE, dovi_tool=DOVI_TOOL):
     """Resumable peak-cap encode: per-segment native-DV x265 (own RPU slice) → concat.
     Segments persist in `segdir`; a completed segment is skipped on the next attempt.
     Returns (ok, frames_encoded, reason). Reports cumulative frames via on_progress, and fires
     on_plan([segment_end_frame, ...], total_frames) ONCE after planning so the dashboard can draw
-    the same notched segment bar Topaz uses (seg_done is derived from cumulative frames ≥ each end)."""
+    the same notched segment bar Topaz uses (seg_done is derived from cumulative frames ≥ each end).
+    `should_pause` (like topaz's): polled between segments — a True yields cleanly with a benign
+    "paused:" reason (every finished segment kept; the next attempt resumes right here). Used to
+    give the run thread's Resolve the whole machine (user-dictated: Resolve finishes ASAP)."""
     if total_frames <= 0:
         return False, 0, "unknown total frame count"
     os.makedirs(segdir, exist_ok=True)
@@ -528,6 +531,8 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         seg_files.append(sf)
         if abort is not None and abort.is_set():
             return False, base, "aborted"
+        if should_pause is not None and should_pause():
+            return False, base, "paused: Resolve has the machine — this remux resumes when it finishes"
         if count_hevc_frames(sf, ffprobe) == n:          # already encoded (resume) → skip
             base += n
             if on_progress:

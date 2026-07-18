@@ -1564,7 +1564,7 @@ class ResolveGate(unittest.TestCase):
         o._enabled = True
         p = episode_paths("A", "S01E01", SRC)
         seen = {}
-        def fake_run(st, pp, abort=None, progress=None):
+        def fake_run(st, pp, abort=None, progress=None, should_pause=None):
             seen[st] = dict(o.state["finishing"] or {})
             return False, "stop here"          # first stage fails -> loop exits after one publish
         with mock.patch.object(plan_mod, "plan_for",
@@ -1579,13 +1579,52 @@ class ResolveGate(unittest.TestCase):
         o._enabled = True
         p = episode_paths("A", "S01E01", SRC)
         seen = {}
-        def fake_run(st, pp, abort=None, progress=None):
+        def fake_run(st, pp, abort=None, progress=None, should_pause=None):
             seen[st] = dict(o.state["finishing"] or {})
             return False, "stop here"
         with mock.patch.object(plan_mod, "plan_for", side_effect=RuntimeError("probe died")), \
              mock.patch.object(orch, "stage_done", return_value=False):
             o._finish_item(p, fake_run)
         self.assertFalse(seen["remux"]["fast"])
+
+    def test_finisher_remux_holds_while_resolve_active(self):
+        # RESOLVE PREEMPTION: the remux stage does not START while _resolve_active is set —
+        # it holds (state shows the reason) and runs the moment the flag clears.
+        import plan as plan_mod
+        o = orch.Orchestrator()
+        o._enabled = True
+        o._resolve_active.set()
+        p = episode_paths("A", "S01E01", SRC)
+        calls, holds = [], []
+        def fake_run(st, pp, abort=None, progress=None, should_pause=None):
+            calls.append(st); return False, "stop here"
+        def fake_sleep(s):
+            holds.append(dict(o.state["finishing"] or {}))
+            o._resolve_active.clear()          # Resolve finishes → the hold releases
+        with mock.patch.object(plan_mod, "plan_for", return_value={"topaz": "resolve-only"}), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch.time, "sleep", side_effect=fake_sleep):
+            o._finish_item(p, fake_run)
+        self.assertEqual(calls, ["remux"])                       # ran only AFTER the release
+        self.assertTrue(holds and holds[0].get("holding"))       # the hold was visible
+
+    def test_finisher_remux_paused_result_retries_not_fails(self):
+        # A benign 'paused:' from the segment loop loops back into the hold and RETRIES —
+        # it never counts toward the park threshold; only real failures do.
+        import plan as plan_mod
+        o = orch.Orchestrator()
+        o._enabled = True
+        p = episode_paths("A", "S01E01", SRC)
+        results = [(False, "paused: Resolve has the machine"), (False, "genuine failure")]
+        calls = []
+        def fake_run(st, pp, abort=None, progress=None, should_pause=None):
+            calls.append(st); return results.pop(0)
+        with mock.patch.object(plan_mod, "plan_for", return_value={"topaz": "resolve-only"}), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch.time, "sleep"):
+            o._finish_item(p, fake_run)
+        self.assertEqual(calls, ["remux", "remux"])              # pause → retry in place
+        self.assertEqual(o._fail_counts.get(p.ep), 1)            # only the REAL failure counted
 
     def test_process_holds_resolve_until_remux_clears(self):
         o = orch.Orchestrator(); o._enabled = True

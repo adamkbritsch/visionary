@@ -299,13 +299,16 @@ def _verify(output: str, ffprobe: str, optimized: bool = None) -> RemuxResult:
 
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None, boundaries=None,
-          abort=None, on_progress=None, on_plan=None,
+          abort=None, on_progress=None, on_plan=None, should_pause=None,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
     failure (RPU, encode, frame mismatch, DV lost, measured peak over cap) fails the stage.
     Audio comes from the CFR file (same timing as the pipeline video); subs from the ORIGINAL.
-    Dispatches on `output`'s extension, decided by `container_ext` upstream."""
+    Dispatches on `output`'s extension, decided by `container_ext` upstream.
+    `should_pause`: polled between x265 segments — yields a benign "paused:" result so the
+    finisher can hold this remux while the run thread's Resolve is active (Resolve gets the
+    whole machine, user-dictated); every finished segment is kept and the retry resumes here."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     info = dvcap.probe_video(dv_video, ffprobe)
     # GUARD BEFORE touching the resume state (review-caught): a transient ffprobe failure returns
@@ -340,8 +343,11 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             dv_video, rpu, hevc, cap_mbps, segdir=segdir,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
             master_display=info["master_display"], max_cll=info["max_cll"],
-            abort=abort, on_progress=on_progress, on_plan=on_plan, ffmpeg=ffmpeg)
+            abort=abort, on_progress=on_progress, on_plan=on_plan,
+            should_pause=should_pause, ffmpeg=ffmpeg)
         if not ok:
+            if why.startswith("paused:"):
+                return RemuxResult(False, output, reason=why)   # benign hold, not a failure
             return RemuxResult(False, output, reason="cap encode: " + why)
         if frames != real_frames:
             return RemuxResult(False, output,
