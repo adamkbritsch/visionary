@@ -225,6 +225,66 @@ class FastPathDispatch(unittest.TestCase):
             self.assertTrue(ok)
             self.assertIn("skipping upscale", msg)
 
+    def test_resolve_only_topaz_plans_scene_cut_bounds_for_the_remux(self):
+        # resolve-only still runs topaz's PLANNING front half: scene detect + grouping →
+        # bounds stashed so the capped remux segments at scene cuts (user-dictated).
+        import plan, topaz
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        # 300 frames @ 24 fps with target 90 s would swallow every cut — use the REAL
+        # plan_segments with a fps/total shaped so both cuts survive the grouping.
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
+             mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(topaz, "total_frames", return_value=30000), \
+             mock.patch.object(topaz, "media_timing", return_value=(24.0, 1250.0)), \
+             mock.patch.object(topaz, "_cached_scene_frames", return_value=[10000, 20000]):
+            ok, msg = stages.run_stage("topaz", p)
+            bounds = stages._read_topaz_bounds(p.source_basename)
+        self.assertTrue(ok)
+        self.assertIn("scene-cut segments planned", msg)
+        self.assertEqual(bounds, [10000, 20000, 30000])
+
+    def test_rpu_only_topaz_never_scans(self):
+        import plan, topaz
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
+             mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(topaz, "_cached_scene_frames",
+                               side_effect=AssertionError("rpu-only must not scene-scan")):
+            ok, msg = stages.run_stage("topaz", p)
+            bounds = stages._read_topaz_bounds(p.source_basename)
+        self.assertTrue(ok)
+        self.assertEqual(bounds, [])
+
+    def test_resolve_only_cached_bounds_skip_the_scan(self):
+        import plan, topaz
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
+             mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(topaz, "_cached_scene_frames",
+                               side_effect=AssertionError("cached bounds must skip the scan")):
+            stages._write_topaz_bounds(p.source_basename, [500, 900])   # a prior attempt planned
+            ok, msg = stages.run_stage("topaz", p)
+            bounds = stages._read_topaz_bounds(p.source_basename)
+        self.assertTrue(ok)
+        self.assertIn("cached", msg)
+        self.assertEqual(bounds, [500, 900])
+
+    def test_resolve_only_scan_failure_degrades_to_flat_segments(self):
+        import plan, topaz
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
+             mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(topaz, "total_frames", return_value=0):   # unprobeable
+            ok, msg = stages.run_stage("topaz", p)
+            bounds = stages._read_topaz_bounds(p.source_basename)
+        self.assertTrue(ok)                                # NEVER a stage failure
+        self.assertIn("flat remux segments", msg)
+        self.assertEqual(bounds, [])
+
     def test_resolve_runs_single_on_the_source(self):
         import plan
         p = _paths(tempfile.mkdtemp())

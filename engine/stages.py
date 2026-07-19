@@ -75,6 +75,35 @@ def _write_topaz_bounds(basename: str, bounds: list) -> None:
         pass
 
 
+def _plan_fast_path_bounds(p, progress=None) -> str:
+    """RESOLVE-ONLY fast path: no upscale, but the capped remux still re-encodes — so run
+    topaz's PLANNING front half (scene detect + ~90 s grouping, the exact same utilities)
+    and stash the cumulative end-frames, so the remux segments at scene cuts like the
+    topaz path (user-dictated). Best-effort: any failure just leaves the remux on its
+    flat ~SEG_SECONDS plan. Returns a short note for the stage message. The scan is
+    cached twice over — bounds in _SEGBOUNDS_FILE (checked first, so retries are free)
+    and raw cut times in segdir/scenes.json (swept at cleanup like any segdir)."""
+    import topaz
+    if _read_topaz_bounds(p.source_basename):        # resume: already planned — no re-scan
+        return " (scene plan cached)"
+    try:
+        if progress:
+            progress({"stage": "topaz", "ep": p.ep, "pct": None})
+        total = topaz.total_frames(p.source_cfr)
+        fps, _dur = topaz.media_timing(p.source_cfr)
+        if not total or not fps:
+            return " (no scene plan — flat remux segments)"
+        os.makedirs(p.segdir, exist_ok=True)         # scenes.json cache lives here
+        cuts = topaz._cached_scene_frames(p.source_cfr, p.segdir, fps)
+        segs = topaz.plan_segments(total, fps, cuts)
+        if segs:
+            _write_topaz_bounds(p.source_basename, [b for (_a, b) in segs])
+            return f" — {len(segs)} scene-cut segments planned for the remux"
+    except Exception:
+        pass
+    return " (no scene plan — flat remux segments)"
+
+
 def _source_video_kbps(path):
     """The intake's video-stream bitrate in Kb/s (fallback: overall file bitrate); 0 if
     unknown. Lets a high-bitrate source export at its own bitrate instead of being
@@ -204,7 +233,10 @@ def _topaz(p, abort, progress=None, should_pause=None):
     if pl["topaz"] in ("rpu-only", "resolve-only"):
         # HIGH-BITRATE 4K FAST PATH: the source picture IS the deliverable — no upscale.
         # Succeed as a no-op so the run loop proceeds straight to the Resolve stage.
-        return True, pl["reason"] + " — skipping upscale"
+        # resolve-only still runs topaz's scene-cut PLANNING so its capped remux segments
+        # at scene cuts (rpu-only is exempt — remux_inject copies the stream, no segments).
+        note = _plan_fast_path_bounds(p, progress) if pl["topaz"] == "resolve-only" else ""
+        return True, pl["reason"] + " — skipping upscale" + note
     # Per-resolution preset variant: the plan's bucket (from the source height) picks which
     # tuned param set to use; the source can be ANY of 480p/720p/1080p and still reach 4K.
     params = settings.show_topaz_params(p.series, pl.get("res") or "1080p")
