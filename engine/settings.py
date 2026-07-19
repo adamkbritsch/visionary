@@ -286,6 +286,21 @@ def set_show_normalize_audio(key: str, value) -> bool:
     return bool(value)
 
 
+def get_show_replace_source(key: str) -> bool:
+    """Per-item (TV show / movie title): after the 4K master is VERIFIED on the NAS,
+    delete the superseded source (True, default — the output replaces its input) or
+    keep it beside the master (False: Plex merges the two files into one item with two
+    versions and serves the 4K; the source stays as the re-run option for future,
+    better upscale models). Consulted by stages._upload; YouTube's folder-split is
+    unaffected (its staging copy is not a Plex version)."""
+    return bool(_show_entry(key).get("replace_source", True))
+
+
+def set_show_replace_source(key: str, value) -> bool:
+    _update_show(key, replace_source=bool(value))
+    return bool(value)
+
+
 def show_topaz_params(show: str, res: str = DEFAULT_RES) -> dict:
     """What the Topaz stage actually uses for a show: its preset's params for the source's
     resolution bucket (the bucket comes from plan.resolution_bucket(source height))."""

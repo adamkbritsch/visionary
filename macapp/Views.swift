@@ -1053,6 +1053,7 @@ private struct TVMode: View {
                 Spacer()
             }
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
+            ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
             unwatchedToggle(name, show.unwatched_first ?? true)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
@@ -1105,6 +1106,45 @@ private struct NormalizeAudioRow: View {
         } message: {
             Text("Decide this at the start of a show — episodes already made keep their current "
                  + "audio, so changing it mid-show leaves the show inconsistent.")
+        }
+    }
+}
+
+// Per-item "Replace source" row (shows + movies — NOT YouTube, whose folder-split has no
+// Plex-visible source): same preset-style shape as NormalizeAudioRow. ON (default) = after
+// the 4K master is size-verified on the NAS, the superseded source is permanently deleted;
+// OFF = both files stay and Plex serves them as one item with two versions. Change requires
+// a confirmation because replacing burns the re-run option for future upscale models.
+private struct ReplaceSourceRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let on: Bool
+    var locked: Bool = false          // hides Change (TV passes the run-lock; movies false)
+    @State private var confirming = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.up.circle").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            Text(on ? "Replaces source" : "Keeps source")
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .help("Upload policy: replace = delete the source once the 4K master is verified on the NAS; keep = Plex serves both versions and the source stays for a future re-run")
+            if !locked {
+                Button("Change") { confirming = true }
+                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
+            }
+            Spacer()
+        }
+        .confirmationDialog("Switch to \(on ? "keeping" : "replacing") the source?",
+                            isPresented: $confirming, titleVisibility: .visible) {
+            Button(on ? "Keep the source beside the master" : "Replace the source with the master") {
+                Task { await store.setReplaceSource(key, !on) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Replacing permanently deletes each source after its 4K master is verified — "
+                 + "a future re-run with better upscale models needs the source again. Keeping "
+                 + "both costs the source's size and shows one item with two versions in Plex.")
         }
     }
 }
@@ -1213,9 +1253,12 @@ private struct MovieRow: View {
             .onTapGesture { onTap() }
             .help("Tap to change this movie's Topaz preset")
             // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
-            // Change button must not trigger it. Keyed by TITLE (the movie's settings key).
+            // Change buttons must not trigger it. Keyed by TITLE (the movie's settings key).
             NormalizeAudioRow(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
-                .padding(.horizontal, 10).padding(.bottom, 7)
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ReplaceSourceRow(key: m.title ?? m.name ?? "", on: m.replace_source ?? true)
+                .padding(.horizontal, 10).padding(.bottom, 7).padding(.top, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
         }

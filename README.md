@@ -173,8 +173,9 @@ NAS (FTP) ──download──▶ local scratch
                         remux — x265 re-encode under a hard peak-bitrate cap (native DV RPU),
                           │  original audio folded back + smart loudness boost, hvc1 mp4
                           ▼
-NAS (FTP) ◀──upload─── finished 4K DV master lands NEXT TO the 1080p original —
-                       Plex merges them into one item and serves the 4K version
+NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the source (default) or lands
+                       NEXT TO it — per-show/movie "Replaces source" setting; keeping
+                       both makes Plex serve them as one item with two versions
 ```
 
 <p align="center">
@@ -218,9 +219,11 @@ NAS (FTP) ◀──upload─── finished 4K DV master lands NEXT TO the 1080p
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K
-  Dolby Vision master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p source it sits
-  beside** (measured across 48 upscaled episodes; the source is **kept**, so Plex offers
-  both versions and a future, better model can re-run it). Full 4K DV, without a 4K bill.
+  Dolby Vision master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p source**
+  (measured across 48 upscaled episodes). A per-show/movie **"Replaces source"** setting
+  decides the source's fate: replace (default — deleted only after the master
+  size-verifies on the NAS) or keep it beside the master, where Plex serves both as one
+  item with two versions and the source stays re-runnable by future, better models.
   If a master still measures over the cap, the remux **repairs itself**: it localizes the
   offending second(s), re-encodes only those segments at a tighter cap (85%, then 70%),
   and re-gates — instead of failing on identical retries.

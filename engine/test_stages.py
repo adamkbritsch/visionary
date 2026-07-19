@@ -127,6 +127,55 @@ class TopazSegBounds(unittest.TestCase):
         self.assertIsNone(got["b"])                                     # [] → None → ~SEG_SECONDS plan
 
 
+class ReplaceSourcePolicy(unittest.TestCase):
+    """The per-item `replace_source` setting decides the source's fate at upload: ON
+    (default) → transfer.replace_original deletes the verified-superseded source; OFF →
+    both files stay (Plex two-version). Keyed by p.series (show name / movie title)."""
+
+    def _upload(self, p, *, per_item):
+        import settings
+        calls = {}
+        def fake_replace(*a):
+            calls["args"] = a
+            return True, "replaced — deleted 1080p original"
+        with mock.patch.object(stages.transfer, "upload",
+                               return_value=(True, "/Media/x HDR10 DV.mp4", "uploaded 1 bytes")), \
+             mock.patch.object(stages.transfer, "replace_original", side_effect=fake_replace), \
+             mock.patch.object(settings, "get_show_replace_source", return_value=per_item) as g:
+            ok, msg = stages.run_stage("upload", p)
+        calls["keys"] = [c.args[0] for c in g.call_args_list]
+        return ok, msg, calls
+
+    def test_on_replaces_via_transfer(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, msg, calls = self._upload(p, per_item=True)
+        self.assertTrue(ok)
+        self.assertIn("replaced", msg)
+        self.assertEqual(calls["args"], ("/Media/x HDR10 DV.mp4", p.nas_source, p.final))
+        self.assertEqual(calls["keys"], ["Show"])            # keyed by p.series
+
+    def test_off_keeps_the_source(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, msg, calls = self._upload(p, per_item=False)
+        self.assertTrue(ok)
+        self.assertIn("kept", msg)
+        self.assertNotIn("args", calls)                      # replace_original never called
+
+    def test_youtube_folder_split_never_consults_the_setting(self):
+        import settings
+        from orchestrator import youtube_paths
+        p = youtube_paths("SomeChannel", "SomeChannel/vid [abcdefghijk]/vid [abcdefghijk].mp4",
+                          scratch_dir=tempfile.mkdtemp())
+        with mock.patch.object(stages.transfer, "publish_master",
+                               return_value=(True, "/Media/YouTube/x.mp4", "published")), \
+             mock.patch.object(stages.transfer, "replace_original",
+                               side_effect=AssertionError("youtube must not replace")), \
+             mock.patch.object(settings, "get_show_replace_source",
+                               side_effect=AssertionError("youtube must not consult")):
+            ok, _msg = stages.run_stage("upload", p)
+        self.assertTrue(ok)
+
+
 class NormalizeAudioGate(unittest.TestCase):
     """The per-item "Normalize audio" checkbox gates the SMART LOUDNESS BOOST at the remux
     stage: OFF → audio_target_lufs=None (remux's existing boost-off bit-exact copy path).

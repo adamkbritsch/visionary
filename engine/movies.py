@@ -317,7 +317,8 @@ def selected_view(skip=()) -> dict:
     # Per-movie settings key on TITLE (matching the preset convention) — queue identity
     # stays `name`; the remux stage looks this up via p.series (= title for movies).
     items = [{**i, "preset": settings.show_preset_key(i.get("title") or ""),
-              "normalize_audio": settings.get_show_normalize_audio(i.get("title") or "")}
+              "normalize_audio": settings.get_show_normalize_audio(i.get("title") or ""),
+              "replace_source": settings.get_show_replace_source(i.get("title") or "")}
              for i in get_selected()]
     nextable = [i for i in items if i.get("name") not in skip]
     nx = nextable[0] if nextable else None

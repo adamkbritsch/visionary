@@ -80,6 +80,27 @@ class Presets(unittest.TestCase):
         self.assertEqual(settings.get_show_preset("Old"), "animation2d") # preset preserved
         self.assertFalse(settings.get_show_normalize_audio("Old"))
 
+    def test_replace_source_defaults_true(self):
+        # Default = REPLACE (the output replaces its input); key is show name or movie title.
+        self.assertTrue(settings.get_show_replace_source("Brand New Show"))
+        self.assertTrue(settings.get_show_replace_source("Some Movie Title (2024)"))
+
+    def test_replace_source_set_persists_and_coexists(self):
+        settings.set_show_preset("S", "film")
+        settings.set_show_replace_source("S", False)
+        self.assertFalse(settings.get_show_replace_source("S"))
+        self.assertEqual(settings.get_show_preset("S"), "film")          # preset survives
+        self.assertTrue(settings.get_show_normalize_audio("S"))          # sibling key untouched
+        settings.set_show_replace_source("S", True)
+        self.assertTrue(settings.get_show_replace_source("S"))
+
+    def test_replace_source_legacy_string_entry_migrates(self):
+        settings._save(settings.PROFILES_FILE, {"Old": "animation2d"})   # old preset-only form
+        self.assertTrue(settings.get_show_replace_source("Old"))         # default
+        settings.set_show_replace_source("Old", False)                   # migrates to dict
+        self.assertEqual(settings.get_show_preset("Old"), "animation2d")
+        self.assertFalse(settings.get_show_replace_source("Old"))
+
     def test_settings_only_accepts_known_keys(self):
         s = settings.set_settings({"poll_minutes": 45, "bogus": 1})
         self.assertEqual(s["poll_minutes"], 45)

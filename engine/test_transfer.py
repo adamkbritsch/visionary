@@ -128,6 +128,43 @@ class TransferOps(unittest.TestCase):
         self.assertTrue(local.endswith("ep (Extended Cut).mp4"))
 
 
+class Replace(unittest.TestCase):
+    """replace_original (behind the per-item `replace_source` setting): deletes the
+    superseded source ONLY after the uploaded master's remote size matches local."""
+
+    def _local(self, n=4):
+        t = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        t.write(b"x" * n); t.close()
+        return t.name
+
+    def test_deletes_original_only_when_master_verified(self):
+        master = "/Media/TV/ep (Extended Cut) HDR10 DV.mp4"
+        original = "/Media/TV/ep (Extended Cut).mp4"
+        local = self._local(4)
+        try:
+            f = FakeFTP(files={master: 4, original: 999})   # remote master == local (4)
+            with mock.patch.object(transfer, "connect", return_value=f):
+                ok, msg = transfer.replace_original(master, original, local)
+            self.assertTrue(ok)
+            self.assertIn(original, f.deleted)              # source removed
+            self.assertNotIn(master, f.deleted)             # 4K master untouched
+        finally:
+            os.remove(local)
+
+    def test_keeps_original_when_master_not_verified(self):
+        master = "/Media/TV/ep HDR10 DV.mp4"
+        original = "/Media/TV/ep.mp4"
+        local = self._local(4)
+        try:
+            f = FakeFTP(files={master: 99, original: 999})  # remote master != local (4)
+            with mock.patch.object(transfer, "connect", return_value=f):
+                ok, msg = transfer.replace_original(master, original, local)
+            self.assertFalse(ok)
+            self.assertNotIn(original, f.deleted)           # irreplaceable source kept
+        finally:
+            os.remove(local)
+
+
 class FolderSplitPublish(unittest.TestCase):
     """YouTube folder-split: master publishes to the Plex lib + sidecars copied, videos/junk skipped."""
     SRC = "/Media/YouTube-raw/Chan/Chan - T - id"

@@ -158,6 +158,7 @@ def series_info():
               "configured": settings.get_show_preset(nm) is not None,
               "unwatched_first": settings.get_show_unwatched_first(nm),
               "normalize_audio": settings.get_show_normalize_audio(nm),
+              "replace_source": settings.get_show_replace_source(nm),
               "queue": series.cached_queue(nm)} for nm in active]
     return {"selected": sel, "active": active, "rotation": series.get_rotation(),
             "queue": shows[0]["queue"] if shows else None,
@@ -381,6 +382,7 @@ def show_profile_info(show=None):
             "preset": settings.show_preset_key(target) if target else settings.DEFAULT_PRESET,
             "unwatched_first": settings.get_show_unwatched_first(target) if target else True,
             "normalize_audio": settings.get_show_normalize_audio(target) if target else True,
+            "replace_source": settings.get_show_replace_source(target) if target else True,
             "catalog": settings.preset_catalog()}
 
 
@@ -730,6 +732,10 @@ class Handler(BaseHTTPRequestHandler):
                 # (title) and YouTube channels (folder) reuse this endpoint verbatim. No
                 # queue refresh: audio doesn't affect ordering.
                 settings.set_show_normalize_audio(show, bool(body.get("normalize_audio")))
+            if "replace_source" in body:
+                # Per-item upload policy (shows + movies): replace the source with the
+                # verified master (default) vs keep both. No queue refresh needed.
+                settings.set_show_replace_source(show, bool(body.get("replace_source")))
             self._json(show_profile_info(show))
         else:
             self._send(404, b"not found", "text/plain")

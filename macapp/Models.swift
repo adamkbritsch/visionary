@@ -86,6 +86,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var configured: Bool?
     var unwatched_first: Bool?
     var normalize_audio: Bool?    // per-show loudness-boost gate (default on)
+    var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
     var queue: QueueDTO?
     var id: String { name ?? "" }
 }
@@ -106,6 +107,7 @@ struct MovieItemDTO: Codable, Identifiable {
     var watched: Bool?
     var preset: String?    // the Topaz preset chosen for this queued movie
     var normalize_audio: Bool?   // per-movie loudness-boost gate (keyed by title, like preset)
+    var replace_source: Bool?    // per-movie upload policy (keyed by title, like preset)
     var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
     var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
     var id: String { name ?? title ?? "" }
@@ -198,6 +200,7 @@ struct ShowProfileDTO: Codable {
     var preset: String?
     var unwatched_first: Bool?
     var normalize_audio: Bool?
+    var replace_source: Bool?
     var catalog: [PresetDTO]?
 }
 

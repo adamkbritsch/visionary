@@ -137,6 +137,12 @@ final class AppStore: ObservableObject {
         guard !key.isEmpty else { return }
         await post("/api/show-profile", ["show": key, "normalize_audio": on]); await refresh()
     }
+
+    // Per-item (show / movie title) upload policy: master replaces the source (on) vs both kept (off).
+    func setReplaceSource(_ key: String, _ on: Bool) async {
+        guard !key.isEmpty else { return }
+        await post("/api/show-profile", ["show": key, "replace_source": on]); await refresh()
+    }
     func setMode(_ m: String) async {            // the nav bar VIEW (doesn't gate processing)
         modeOverride = m                         // optimistic → the chip slides now, not after the round-trip
         await post("/api/mode", ["mode": m])
