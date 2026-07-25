@@ -63,6 +63,54 @@ class DisplayGeometry(unittest.TestCase):
             self.assertEqual(dv_shim.retina_scale(), 2.0)
 
 
+class FullScreen(unittest.TestCase):
+    """enter_fullscreen must target the window that OWNS AXFullScreen and VERIFY it.
+    'window 1' can be the Project Manager dialog, where the attribute is settable:false
+    and the set is silently dropped (osascript still exits 0) — that left Resolve
+    windowed, and a windowed layout is where the DV palette click does not register
+    (live-caught lid-closed, 2026-07-17)."""
+
+    def test_returns_true_when_already_fullscreen(self):
+        with mock.patch.object(dv_shim, "fullscreen_state", return_value=(1, True, "Main")):
+            self.assertTrue(dv_shim.enter_fullscreen(settle=0))
+
+    def test_sets_then_verifies_and_retries(self):
+        # windowed -> set -> verified fullscreen on the readback
+        states = [(2, False, "Main"), (2, True, "Main")]
+        with mock.patch.object(dv_shim, "fullscreen_state", side_effect=states), \
+             mock.patch.object(dv_shim, "_osa", return_value=(0, "", "")) as osa, \
+             mock.patch.object(dv_shim, "activate"):
+            self.assertTrue(dv_shim.enter_fullscreen(settle=0))
+        # it must address the window index that owns the attribute — NOT a hardcoded 1
+        self.assertIn("window 2", osa.call_args[0][0])
+
+    def test_raises_when_no_window_accepts_fullscreen(self):
+        # e.g. only the Project Manager dialog is open
+        with mock.patch.object(dv_shim, "fullscreen_state", return_value=(None, None, None)), \
+             mock.patch.object(dv_shim, "_osa", return_value=(0, "Project Manager", "")), \
+             mock.patch.object(dv_shim, "activate"), \
+             mock.patch.object(dv_shim, "_diag") as dg:
+            with self.assertRaises(RuntimeError) as e:
+                dv_shim.enter_fullscreen(attempts=2, settle=0)
+        self.assertIn("Project Manager", str(e.exception))
+        dg.assert_called_once()
+
+    def test_raises_when_set_never_takes(self):
+        with mock.patch.object(dv_shim, "fullscreen_state", return_value=(1, False, "Main")), \
+             mock.patch.object(dv_shim, "_osa", return_value=(0, "", "")), \
+             mock.patch.object(dv_shim, "activate"), \
+             mock.patch.object(dv_shim, "_diag") as dg:
+            with self.assertRaises(RuntimeError):
+                dv_shim.enter_fullscreen(attempts=2, settle=0)
+        dg.assert_called_once()
+
+    def test_fullscreen_state_parses_the_owning_window(self):
+        with mock.patch.object(dv_shim, "_osa", return_value=(0, "3|true|Overnight Upscaler SDR", "")):
+            self.assertEqual(dv_shim.fullscreen_state(), (3, True, "Overnight Upscaler SDR"))
+        with mock.patch.object(dv_shim, "_osa", return_value=(0, "none", "")):
+            self.assertEqual(dv_shim.fullscreen_state(), (None, None, None))
+
+
 class Forensics(unittest.TestCase):
     """With the lid closed nobody can see the screen, so a failed match must leave
     evidence: the screenshot + a sidecar JSON, ring-buffered."""

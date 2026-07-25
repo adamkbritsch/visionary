@@ -184,14 +184,77 @@ def activate():
     time.sleep(1)
 
 
-def enter_fullscreen():
-    """Deterministic full-screen via Accessibility (no coordinate click).
-    No-op-safe: if already full-screen, AXFullScreen=true does nothing."""
-    subprocess.run(["osascript", "-e",
-                    f'tell application "System Events" to tell process "{APP}" '
-                    'to set value of attribute "AXFullScreen" of window 1 to true'],
-                   check=False)
-    time.sleep(2)
+def _osa(script):
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+# Pick the window that actually OWNS full-screen. "window 1" is NOT reliably the main
+# window — Resolve's Project Manager (and progress sheets) can be window 1, and on those
+# AXFullScreen is settable:false, so the set is SILENTLY IGNORED (osascript still exits 0).
+_FS_PICK = ('tell application "System Events" to tell process "%s"\n'
+            ' repeat with i from 1 to (count of windows)\n'
+            '  try\n'
+            '   if settable of attribute "AXFullScreen" of window i then\n'
+            '    return (i as text) & "|" & (value of attribute "AXFullScreen" of window i as text)'
+            ' & "|" & (name of window i)\n'
+            '   end if\n'
+            '  end try\n'
+            ' end repeat\n'
+            ' return "none"\n'
+            'end tell') % APP
+
+
+def fullscreen_state():
+    """(window_index, is_fullscreen, window_name) for the window that owns AXFullScreen,
+    or (None, None, None) when no window exposes it settably."""
+    _rc, out, _err = _osa(_FS_PICK)
+    if not out or out == "none" or "|" not in out:
+        return (None, None, None)
+    idx, val, name = (out.split("|", 2) + ["", ""])[:3]
+    try:
+        return (int(idx), val.strip().lower() == "true", name)
+    except ValueError:
+        return (None, None, None)
+
+
+def enter_fullscreen(*, attempts: int = 3, settle: float = 2.0) -> bool:
+    """Deterministic full-screen via Accessibility (no coordinate click), VERIFIED.
+
+    Why this is strict: the shim matches templates against a full-screen layout, and a
+    WINDOWED Resolve is where the Dolby Vision palette click does not register at all —
+    the exact lid-closed failure caught 2026-07-17 (clicks landed dead-centre on the
+    icon and did nothing; the same click worked the instant the window was full-screen).
+    The old version fired at `window 1` and never checked: when window 1 was the Project
+    Manager dialog, AXFullScreen is settable:false and the set was silently dropped.
+
+    So: find the window that OWNS the attribute, set it, read it back, retry. Returns
+    True when full-screen; raises when it can't get there (a wrong layout is known-bad,
+    and failing here names the cause instead of a baffling click failure later)."""
+    for i in range(attempts):
+        idx, is_fs, name = fullscreen_state()
+        if is_fs:
+            return True
+        if idx is None:
+            _rc, wins, _e = _osa(f'tell application "System Events" to tell process "{APP}" '
+                                 'to get name of every window')
+            if i == attempts - 1:
+                _diag("no-fullscreen-window", windows=wins)
+                raise RuntimeError(f"no {APP} window accepts full-screen (windows: {wins or 'none'}) "
+                                   "— a dialog (Project Manager / progress sheet) is in front")
+            activate()
+            time.sleep(settle)
+            continue
+        _osa(f'tell application "System Events" to tell process "{APP}" '
+             f'to set value of attribute "AXFullScreen" of window {idx} to true')
+        time.sleep(settle)
+        _idx2, is_fs2, _n2 = fullscreen_state()
+        if is_fs2:
+            return True
+        activate()                      # a background app can refuse the change — refocus and retry
+    _diag("fullscreen-refused", window=name)
+    raise RuntimeError(f"could not put {APP} full-screen (window {name!r}) — the shim's "
+                       "template layout and clicks require it")
 
 
 def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
