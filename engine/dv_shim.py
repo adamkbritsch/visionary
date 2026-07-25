@@ -194,9 +194,21 @@ def enter_fullscreen():
     time.sleep(2)
 
 
-def screenshot(path="/tmp/_dvshim_shot.png") -> str:
-    subprocess.run(["screencapture", "-x", path], check=True)
-    return path
+def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
+    """Capture the main display, RETRYING briefly on failure. `screencapture` returns
+    "could not create image from display" while the display set is in transition — the
+    lid closing/opening (clamshell switch) tears the old display down and a single-shot
+    capture fails (live-caught 2026-07-17 the instant the lid shut). A few retries ride
+    that out; a persistent failure still raises, so a real grant/lock problem is loud."""
+    last = None
+    for i in range(attempts):
+        r = subprocess.run(["screencapture", "-x", path], capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        last = (r.stderr or r.stdout or "").strip()
+        if i < attempts - 1:
+            time.sleep(delay)
+    raise RuntimeError(f"screencapture failed after {attempts} attempts: {last}")
 
 
 def click(x, y):
