@@ -15,23 +15,39 @@ adds per-step machine-readable checks. The operating loop:
 3. Steps the USER must do themselves: buying/entering licenses, the Resolve/Topaz
    installers + first-launch logins, and the System Settings privacy toggles. Guide;
    don't attempt to do these for them.
-4. If the `display` check fails, stop — the machine is unsupported (16" MacBook Pro
-   built-in display only). Say so plainly; nothing else will fix it.
+4. If the `display` check fails, stop — the main display isn't one of the VERIFIED
+   configs in `versions.SUPPORTED_DISPLAYS` (the 16" MBP built-in panel, or the 4K dummy
+   HDMI plug used for lid-closed clamshell runs). Say so plainly.
 
 ## Hard rules (do NOT)
 
 - **Never weaken the pins.** Do not edit `engine/versions.py`, `engine/preflight.py`,
   or the server's arm gate to make a mismatched Resolve/Topaz/display pass. The pins are
-  load-bearing (pixel-exact screen automation) — install the exact builds instead.
+  load-bearing (the screen automation matches templates against the live UI) — install
+  the exact builds instead. Display support is an ALLOW-LIST (`SUPPORTED_DISPLAYS`):
+  adding a configuration requires PASSING the all-template smoke test on it
+  (`python3 engine/preflight.py --smoke`, or `GET /api/shim-smoke` while it runs), then
+  adding the entry — never editing a check so an unverified display slips through. The
+  invariant every entry shares is the 2.0 backing scale (templates only match at the
+  same UI pixel size); screen SIZE is free, because every click is template-derived.
 - **Never commit or print secrets.** `~/.topaz-pipeline/config.json` and `.env` are
   gitignored for a reason. Ask the user to fill values in; never echo tokens/passwords
   back into chat, logs, or commits.
-- **Never edit** `engine/dv_shim_templates/` or `ANALYSIS_REGION`/`retina_scale()` in
-  `engine/dv_shim.py` — they're calibrated to the pinned hardware.
+- **Never edit** `engine/dv_shim_templates/` — the PNGs are calibrated to the pinned
+  Resolve build. If a new display needs different crops, capture a SECOND set beside the
+  existing one; never overwrite a working calibration. (`retina_scale()` now READS the
+  main display, and the old `ANALYSIS_REGION` was deleted with the dead region-hash path.)
 - **Never run `tools/export_artifacts.py`** — maintainer-only; it drives the
   maintainer's live Resolve library.
 - **Never merge the render preset while Resolve is open** (`setup/import_resolve.py`
   guards this — don't bypass it; Resolve rewrites the preset file on exit).
+- **Debugging a lid-closed (clamshell) run:** nobody can see the screen, so use
+  `GET /api/screen.png` (the app process holds the Screen Recording grant — a plain
+  shell's `screencapture` cannot), `GET /api/shim-smoke` for per-template match scores,
+  and `~/.topaz-pipeline/diag/` where every shim failure drops a screenshot + JSON
+  (template, score, display geometry, lock state). A LOCKED session makes every match
+  fail — `caffeinate -d` does not prevent it.
+
 - **Respect the live pipeline.** Before any disruptive action (kill/relaunch/rebuild),
   read `GET http://127.0.0.1:8765/api/state`: never interrupt while the run stage is
   `resolve` or the finisher stage is `upload`. To redeploy the app, use

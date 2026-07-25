@@ -629,6 +629,24 @@ class Handler(BaseHTTPRequestHandler):
                         "issues": logbook.tail(40)})
         elif path == "/api/selftest":
             self._json(selftest_full())
+        elif path == "/api/screen.png":
+            # SEE THE SCREEN WITH THE LID CLOSED. Only this process holds the Screen
+            # Recording grant (a plain shell's screencapture returns "could not create
+            # image from display"), so remote debugging of the DV automation has to come
+            # from here. Localhost-only, like the rest of the API.
+            try:
+                import tempfile, dv_shim
+                png = os.path.join(tempfile.gettempdir(), "_api_screen.png")
+                dv_shim.screenshot(png)
+                with open(png, "rb") as f:
+                    self._send(200, f.read(), "image/png")
+            except Exception as e:
+                self._json({"error": f"screenshot failed: {e.__class__.__name__}: {e}"}, code=500)
+        elif path == "/api/shim-smoke":
+            # Per-template match scores against the LIVE screen + display/lock context —
+            # the acceptance gate for a display config and the first thing to check when
+            # the Resolve stage misbehaves on a screen nobody can see.
+            self._json(preflight.shim_smoke_scores())
         elif path == "/api/request-accessibility":
             self._json(request_accessibility())
         elif path == "/oauth/youtube":

@@ -24,11 +24,26 @@ TOPAZ_APP = "/Applications/Topaz Video AI.app"
 TOPAZ_VERSION = "7.0.1"        # CFBundleShortVersionString — the gate (exact match)
 
 # Hardware: the 16-inch MacBook Pro — required for TWO independent reasons:
-#  1) Its BUILT-IN display (Liquid Retina XDR, used as the MAIN display, native pixels):
-#     dv_shim's capture region + click math assume exactly this geometry.
+#  1) A VERIFIED DISPLAY as the MAIN display (see SUPPORTED_DISPLAYS below).
 #  2) Its 140 W power adapter: the Topaz stage runs the GPU flat-out for hours and needs the
 #     full 140 W envelope. The 14-inch MBP maxes out at a 96 W brick — the power gate would
 #     hold the pipeline forever (and on a lesser brick the battery drains mid-encode).
-DISPLAY_PIXELS = (3456, 2234)
-RETINA_SCALE = 2.0
+#
+# SUPPORTED_DISPLAYS — an ALLOW-LIST of display configurations the DV screen automation has
+# been SMOKE-TESTED on (preflight --smoke / GET /api/shim-smoke matches every dv_shim
+# template against the live screen). It is NOT a relaxed check: an unrecognised display
+# still hard-fails, because dv_shim locates buttons by template matching and a template
+# only matches when the UI renders at the SAME BACKING-PIXEL SIZE — i.e. the same `scale`.
+# That 2.0 backing scale is the load-bearing invariant; the screen's SIZE is not (every
+# click is derived from a template match, never from a fixed coordinate).
+# To add a config: run the all-template smoke test on it, then add it here — never edit a
+# check to make an unverified display pass.
+SUPPORTED_DISPLAYS = (
+    {"name": "16-inch MacBook Pro built-in", "backing": (3456, 2234), "scale": 2.0, "builtin": True},
+    # Lid-CLOSED clamshell operation: a 4K dummy HDMI plug keeps a framebuffer alive for
+    # screencapture while the laptop is shut (verified 2026-07-17: HDP-V104, 1920x1080 pt).
+    {"name": "4K dummy HDMI (clamshell)", "backing": (3840, 2160), "scale": 2.0, "builtin": False},
+)
+DISPLAY_PIXELS = SUPPORTED_DISPLAYS[0]["backing"]   # the built-in (back-compat for importers)
+RETINA_SCALE = 2.0                                  # the invariant every supported config shares
 REQUIRED_ADAPTER_WATTS = 140   # the run-time power gate (settings min_adapter_watts) defaults to this

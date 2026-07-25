@@ -146,11 +146,24 @@ def _display_via_system_profiler():
     raise RuntimeError("main display not found in system_profiler output")
 
 
+def match_display(px_w, px_h, scale, builtin):
+    """PURE (unit-tested). The SUPPORTED_DISPLAYS entry this main display is, or None.
+    `scale` may be None (the system_profiler fallback can't read it) — then only the
+    geometry + builtin flag decide, since every supported config shares the same scale."""
+    for cfg in versions.SUPPORTED_DISPLAYS:
+        if ((px_w, px_h) == tuple(cfg["backing"]) and bool(builtin) == bool(cfg["builtin"])
+                and (scale is None or abs(scale - cfg["scale"]) < 0.01)):
+            return cfg
+    return None
+
+
 def check_display():
-    want_w, want_h = versions.DISPLAY_PIXELS
-    fix = (f"Visionary only works on the 16-inch MacBook Pro BUILT-IN display "
-           f"({want_w}x{want_h} native) used as the MAIN display. Unplug/stop mirroring to an "
-           f"external main display; if this Mac isn't a 16\" MacBook Pro, it cannot run Visionary.")
+    supported = " or ".join(f"{c['name']} ({c['backing'][0]}x{c['backing'][1]})"
+                            for c in versions.SUPPORTED_DISPLAYS)
+    fix = (f"Visionary's Resolve automation is calibrated to specific displays used as the "
+           f"MAIN display: {supported}. Unplug/stop mirroring to any other external display "
+           f"(or close the lid onto the 4K dummy plug for clamshell); if this Mac isn't a "
+           f"16\" MacBook Pro, it cannot run Visionary.")
     try:
         px_w, px_h, scale, builtin = _display_via_coregraphics()
         via = "CoreGraphics"
@@ -160,12 +173,11 @@ def check_display():
             via = "system_profiler"
         except Exception as e:
             return _check("display", False, "fail", f"could not read display geometry: {e}", fix)
-    ok = (px_w, px_h) == (want_w, want_h) and builtin \
-         and (scale is None or abs(scale - versions.RETINA_SCALE) < 0.01)
-    return _check("display", ok, "fail",
+    cfg = match_display(px_w, px_h, scale, builtin)
+    return _check("display", cfg is not None, "fail",
                   f"main display {px_w}x{px_h} builtin={builtin}"
                   + (f" scale={scale:g}" if scale is not None else "") + f" (via {via}); "
-                  f"require builtin {want_w}x{want_h} @ {versions.RETINA_SCALE:g}x", fix)
+                  + (f"matched: {cfg['name']}" if cfg else f"require {supported}"), fix)
 
 
 def check_power_adapter():
@@ -381,31 +393,52 @@ def check_config(network=False):
                   "Plex — the URL/token in ~/.topaz-pipeline/config.json are right.")
 
 
-def check_shim_smoke():
-    """OPTIONAL (--smoke): with Resolve running, prove the full chain — screencapture works
-    AND the 18.6 Color-page template actually matches this screen."""
-    if subprocess.run(["pgrep", "-x", "DaVinci Resolve"], capture_output=True).returncode != 0:
-        return _check("shim_smoke", True, "warn", "skipped — DaVinci Resolve is not running", "")
+def shim_smoke_scores():
+    """Match EVERY dv_shim template against the live screen -> {template: score} plus
+    context. The acceptance gate for calling a display configuration supported: a
+    template only matches when the UI renders at the same backing-pixel size, so this is
+    what proves a new display (e.g. the clamshell dummy) is really usable. Also the
+    remote debugging entry point (GET /api/shim-smoke) when nobody can see the screen."""
+    import tempfile, cv2, dv_shim
+    out = {"scores": {}, "resolve_running": False, "display": dv_shim.main_display_geometry(),
+           "screen_locked": dv_shim.screen_locked(), "error": None}
+    out["resolve_running"] = subprocess.run(["pgrep", "-x", "DaVinci Resolve"],
+                                            capture_output=True).returncode == 0
     try:
-        import tempfile, cv2
         png = os.path.join(tempfile.gettempdir(), "_preflight_smoke.png")
         subprocess.run(["screencapture", "-x", png], timeout=15, check=True)
-        shot = cv2.imread(png)
-        tpl = cv2.imread(os.path.join(TEMPLATES_DIR, "dolby_vision_palette.png"))
-        if shot is None or tpl is None:
-            return _check("shim_smoke", False, "warn", "could not load screenshot/template",
-                          "Grant Screen Recording to this process and retry.")
-        score = float(cv2.minMaxLoc(cv2.matchTemplate(shot, tpl, cv2.TM_CCOEFF_NORMED))[1])
-        ok = score >= 0.8
-        return _check("shim_smoke", ok, "warn",
-                      f"template match score {score:.3f} (need >=0.8; Resolve must be on the "
-                      f"Color page, full screen)",
-                      "Open Resolve full-screen on the Color page with the Dolby Vision palette "
-                      "visible and re-run --smoke. A persistent low score means the UI doesn't "
-                      "match the pinned Resolve build / display.")
+        for name in sorted(os.listdir(TEMPLATES_DIR)):
+            if not name.endswith(".png") or name.startswith("_"):
+                continue
+            _pos, score = dv_shim.match_template(png, os.path.join(TEMPLATES_DIR, name))
+            out["scores"][name] = round(score, 4)
     except Exception as e:
-        return _check("shim_smoke", False, "warn", f"smoke test error: {e}",
+        out["error"] = f"{e.__class__.__name__}: {e}"
+    return out
+
+
+def check_shim_smoke():
+    """OPTIONAL (--smoke): with Resolve running, prove the full chain — screencapture works
+    AND EVERY dv_shim template matches this screen (not just the palette). The per-template
+    scores are what diagnose a display/Resolve-build mismatch."""
+    if subprocess.run(["pgrep", "-x", "DaVinci Resolve"], capture_output=True).returncode != 0:
+        return _check("shim_smoke", True, "warn", "skipped — DaVinci Resolve is not running", "")
+    fixit = ("Open Resolve full-screen on the Color page with the Dolby Vision palette "
+             "visible and re-run --smoke. A persistently low score for a template means "
+             "the UI doesn't match the pinned Resolve build / this display config — "
+             "re-capture that template on THIS display (see dv_shim_templates/README.md).")
+    r = shim_smoke_scores()
+    if r["error"] or not r["scores"]:
+        return _check("shim_smoke", False, "warn",
+                      f"smoke test error: {r['error'] or 'no templates matched'}",
                       "Grant Screen Recording to this process (terminal) and retry.")
+    # analyze_modal only exists WHILE analyzing, so it is reported but never gates.
+    gated = {k: v for k, v in r["scores"].items() if k != "analyze_modal.png"}
+    worst = min(gated.values()) if gated else 0.0
+    detail = " ".join(f"{k.replace('.png','')}={v:.3f}" for k, v in sorted(r["scores"].items()))
+    return _check("shim_smoke", worst >= 0.8, "warn",
+                  f"template scores: {detail} (need >=0.8 each, analyze_modal excluded — "
+                  f"it only exists during an analysis)", fixit)
 
 
 def run_cheap():

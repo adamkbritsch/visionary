@@ -18,7 +18,7 @@ Arm it in the evening; wake up to finished episodes.
 >
 > | Requirement | Exactly |
 > |---|---|
-> | Mac | **16-inch MacBook Pro** (Apple Silicon), using its **built-in display** (3456×2234) as the main display, on its **140 W power adapter** |
+> | Mac | **16-inch MacBook Pro** (Apple Silicon) on its **140 W power adapter**, with a verified main display: the **built-in panel** (3456×2234) — or a **4K dummy HDMI plug** (3840×2160 @2×) to run **lid-closed** |
 > | DaVinci Resolve | **Studio 18.6.0** (build 18.6.00009) — the paid Studio edition, this exact build |
 > | Topaz Video AI | **7.0.1** — this exact build |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
@@ -27,9 +27,13 @@ Arm it in the evening; wake up to finished episodes.
 > Why the 16-inch specifically — two independent reasons:
 > 1. **The display.** The Resolve stage drives the *real* Resolve UI by screen-capture
 >    template matching and synthetic clicks (Dolby Vision's "Analyze All Shots" has no
->    scripting API). The templates and click coordinates were captured from this exact
->    Resolve build on this exact 3456×2234 panel — any other version or screen silently
->    breaks the automation.
+>    scripting API). The templates were cropped from this exact Resolve build, and they
+>    only match when the UI renders at the same **pixel scale** — so the main display must
+>    be one of the verified configurations in `engine/versions.py` (`SUPPORTED_DISPLAYS`):
+>    the built-in panel, or a 4K dummy HDMI plug at 2× for **lid-closed (clamshell)** runs.
+>    Screen *size* is free (every click is derived from a template match, never a fixed
+>    coordinate); the 2× backing scale is not. Adding a display means passing
+>    `preflight --smoke` on it, not editing the check.
 >
 > 2. **The power.** The Topaz stage runs the GPU flat-out for hours and needs the 16-inch
 >    model's full **140 W** power envelope. The 14-inch MacBook Pro tops out at a 96 W
@@ -59,8 +63,10 @@ git clone https://github.com/adamkbritsch/visionary.git
 cd visionary && python3 engine/preflight.py
 ```
 
-If the `display` check fails, **stop here** — this machine can't run Visionary
-(see the requirements box above). Nothing you install later will change that.
+If the `display` check fails, **stop here** — the main display isn't one of the verified
+configurations (see the requirements box above). Nothing you install later will change
+that, though plugging in a supported 4K dummy HDMI plug (and closing the lid) is one way
+to reach a verified config.
 
 ### 2. Install the two apps — exact versions&nbsp;&nbsp;<picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/pirate-ship-white-v2.png"><img src="docs/assets/pirate-ship-v2.png" alt="" height="59" align="middle"></picture>
 

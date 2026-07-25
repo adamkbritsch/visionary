@@ -14,18 +14,20 @@ class Pins(unittest.TestCase):
         import dv_shim
         self.assertEqual(dv_shim.retina_scale(), versions.RETINA_SCALE)
 
-    def test_shim_region_fits_the_pinned_display(self):
-        import dv_shim
-        x0, y0, x1, y1 = dv_shim.ANALYSIS_REGION
-        w, h = versions.DISPLAY_PIXELS
-        self.assertTrue(0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h,
-                        f"ANALYSIS_REGION {dv_shim.ANALYSIS_REGION} outside {w}x{h}")
+    def test_every_supported_display_shares_the_invariant_scale(self):
+        # The templates only match when the UI renders at the same BACKING-PIXEL size —
+        # i.e. the same scale. Screen SIZE may differ (clicks are template-derived).
+        for cfg in versions.SUPPORTED_DISPLAYS:
+            self.assertEqual(cfg["scale"], versions.RETINA_SCALE, cfg["name"])
 
     def test_pin_values(self):
         # the exact builds this repo ships templates/params for — bump ONLY with new templates
         self.assertEqual(versions.RESOLVE_VERSION, "18.6.0")
         self.assertEqual(versions.TOPAZ_VERSION, "7.0.1")
         self.assertEqual(versions.DISPLAY_PIXELS, (3456, 2234))
+        # the verified allow-list: built-in + the 4K dummy plug used for clamshell
+        self.assertEqual([c["backing"] for c in versions.SUPPORTED_DISPLAYS],
+                         [(3456, 2234), (3840, 2160)])
 
 
 class VersionChecks(unittest.TestCase):
@@ -48,30 +50,61 @@ class VersionChecks(unittest.TestCase):
 
 
 class DisplayCheck(unittest.TestCase):
+    """The display gate is an ALLOW-LIST of verified configs (versions.SUPPORTED_DISPLAYS):
+    the built-in panel, and the 4K dummy HDMI plug used for LID-CLOSED clamshell runs.
+    Anything else still hard-fails — an unverified display breaks template matching."""
+
     def test_wrong_geometry_fails(self):
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(3024, 1964, 2.0, True)):    # a 14" MBP
             c = preflight.check_display()
         self.assertFalse(c["ok"]); self.assertEqual(c["severity"], "fail")
 
-    def test_external_main_display_fails_even_at_native_res(self):
+    def test_unverified_external_display_still_fails(self):
+        with mock.patch.object(preflight, "_display_via_coregraphics",
+                               return_value=(2560, 1440, 2.0, False)):   # some random monitor
+            self.assertFalse(preflight.check_display()["ok"])
+
+    def test_builtin_geometry_on_an_external_display_fails(self):
+        # the builtin flag is part of the identity — a panel merely reporting the
+        # built-in's pixels is not the verified config
         w, h = versions.DISPLAY_PIXELS
         with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(w, h, 2.0, False)):         # builtin=False
+                               return_value=(w, h, 2.0, False)):
+            self.assertFalse(preflight.check_display()["ok"])
+
+    def test_wrong_scale_fails(self):
+        # 1x (or any non-2x) mode renders the UI at a different pixel size -> no match
+        with mock.patch.object(preflight, "_display_via_coregraphics",
+                               return_value=(3840, 2160, 1.0, False)):
             self.assertFalse(preflight.check_display()["ok"])
 
     def test_pinned_display_passes(self):
         w, h = versions.DISPLAY_PIXELS
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(w, h, versions.RETINA_SCALE, True)):
-            self.assertTrue(preflight.check_display()["ok"])
+            c = preflight.check_display()
+        self.assertTrue(c["ok"]); self.assertIn("built-in", c["detail"])
+
+    def test_clamshell_dummy_passes(self):
+        # LID-CLOSED: the 4K dummy plug is the main display and is NOT builtin
+        with mock.patch.object(preflight, "_display_via_coregraphics",
+                               return_value=(3840, 2160, 2.0, False)):
+            c = preflight.check_display()
+        self.assertTrue(c["ok"]); self.assertIn("clamshell", c["detail"])
+
+    def test_match_display_is_pure(self):
+        self.assertIsNotNone(preflight.match_display(3456, 2234, 2.0, True))
+        self.assertIsNotNone(preflight.match_display(3840, 2160, 2.0, False))
+        self.assertIsNone(preflight.match_display(3840, 2160, 2.0, True))    # dummy can't be builtin
+        self.assertIsNone(preflight.match_display(1920, 1080, 2.0, False))   # logical, not backing
 
     def test_coregraphics_failure_falls_back_to_system_profiler(self):
         w, h = versions.DISPLAY_PIXELS
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                side_effect=RuntimeError("no CG")), \
              mock.patch.object(preflight, "_display_via_system_profiler",
-                               return_value=(w, h, None, True)):
+                               return_value=(w, h, None, True)):           # scale unknown
             c = preflight.check_display()
         self.assertTrue(c["ok"]); self.assertIn("system_profiler", c["detail"])
 

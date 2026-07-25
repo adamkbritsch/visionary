@@ -26,7 +26,6 @@ cliclick`. Templates in dv_shim_templates/ are captured at screencapture (Retina
 resolution on the target machine — see capture_reference().
 """
 from __future__ import annotations
-import hashlib
 import os
 import shutil
 import subprocess
@@ -46,16 +45,98 @@ CLICLICK = shutil.which("cliclick",
                         path=(os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")) or "/opt/homebrew/bin/cliclick"
 APP = "DaVinci Resolve"
 
-# Bottom-left of the DV palette (Analyze row + Min/Max/Avg), in screencapture
-# pixels on the target 3456x2234 Retina panel. This strip reads 0.000 during
-# analysis and flips to populated values when it finishes — see wait_for_analysis.
-ANALYSIS_REGION = (15, 1840, 690, 2180)
+# Forensics for LID-CLOSED (clamshell) runs: nobody can see the screen, so every shim
+# failure drops the full screenshot + a sidecar JSON here (ring-buffered) — see _diag().
+DIAG_DIR = os.path.expanduser("~/.topaz-pipeline/diag")
+DIAG_KEEP = 20
+
+
+def main_display_geometry():
+    """(backing_w, backing_h, scale, is_builtin) of the MAIN display, or None. ctypes
+    argtypes are REQUIRED — without them CoreGraphics segfaults (CGDisplayModeRef is
+    truncated to 32 bits). Mirrors preflight._display_via_coregraphics."""
+    try:
+        import ctypes, ctypes.util
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+        u32, sz, vp = ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p
+        cg.CGMainDisplayID.argtypes = []; cg.CGMainDisplayID.restype = u32
+        cg.CGDisplayPixelsWide.argtypes = [u32]; cg.CGDisplayPixelsWide.restype = sz
+        cg.CGDisplayIsBuiltin.argtypes = [u32]; cg.CGDisplayIsBuiltin.restype = u32
+        cg.CGDisplayCopyDisplayMode.argtypes = [u32]; cg.CGDisplayCopyDisplayMode.restype = vp
+        cg.CGDisplayModeGetPixelWidth.argtypes = [vp]; cg.CGDisplayModeGetPixelWidth.restype = sz
+        cg.CGDisplayModeGetPixelHeight.argtypes = [vp]; cg.CGDisplayModeGetPixelHeight.restype = sz
+        cg.CGDisplayModeRelease.argtypes = [vp]; cg.CGDisplayModeRelease.restype = None
+        d = cg.CGMainDisplayID()
+        mode = cg.CGDisplayCopyDisplayMode(d)
+        bw, bh = cg.CGDisplayModeGetPixelWidth(mode), cg.CGDisplayModeGetPixelHeight(mode)
+        cg.CGDisplayModeRelease(mode)
+        lw = cg.CGDisplayPixelsWide(d)
+        return (bw, bh, (bw / lw) if lw else None, bool(cg.CGDisplayIsBuiltin(d)))
+    except Exception:
+        return None
+
+
+def screen_locked():
+    """True if the login window/lock screen is up — then EVERY template match fails and
+    the failure looks inexplicable. caffeinate -d blocks the screensaver but NOT this."""
+    try:
+        import ctypes, ctypes.util
+        from ctypes import c_void_p, c_char_p
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        cg.CGSessionCopyCurrentDictionary.argtypes = []
+        cg.CGSessionCopyCurrentDictionary.restype = c_void_p
+        cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = c_void_p
+        cf.CFDictionaryGetValue.argtypes = [c_void_p, c_void_p]
+        cf.CFDictionaryGetValue.restype = c_void_p
+        cf.CFBooleanGetValue.argtypes = [c_void_p]; cf.CFBooleanGetValue.restype = ctypes.c_ubyte
+        cf.CFRelease.argtypes = [c_void_p]; cf.CFRelease.restype = None
+        d = cg.CGSessionCopyCurrentDictionary()
+        if not d:
+            return None
+        try:
+            k = cf.CFStringCreateWithCString(None, b"CGSSessionScreenIsLocked", 0x08000100)
+            v = cf.CFDictionaryGetValue(d, k)
+            cf.CFRelease(k)
+            return bool(cf.CFBooleanGetValue(v)) if v else False
+        finally:
+            cf.CFRelease(d)
+    except Exception:
+        return None
 
 
 def retina_scale() -> float:
-    """screencapture pixels per cliclick logical point. The target panel is a
-    3456x2234 Retina display at 2x backing scale → 2.0 (verified)."""
-    return 2.0
+    """screencapture pixels per cliclick logical point — READ from the main display
+    (every SUPPORTED_DISPLAYS config is 2.0; falls back to 2.0 if unreadable)."""
+    g = main_display_geometry()
+    return float(g[2]) if (g and g[2]) else 2.0
+
+
+def _diag(what: str, shot_path: str | None = None, **facts) -> str:
+    """Preserve the evidence for a shim failure: copy the screenshot + write a sidecar
+    JSON (what was sought, match scores, display geometry, lock state) into DIAG_DIR,
+    keeping only the newest DIAG_KEEP pairs. Returns the saved path ('' on failure).
+    This is what makes a lid-closed overnight failure debuggable after the fact."""
+    try:
+        import json, glob, shutil as _sh
+        os.makedirs(DIAG_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(DIAG_DIR, f"{stamp}-{what}")
+        if shot_path and os.path.exists(shot_path):
+            _sh.copy2(shot_path, base + ".png")
+        g = main_display_geometry()
+        with open(base + ".json", "w") as f:
+            json.dump({"what": what, "when": stamp, "display": g,
+                       "screen_locked": screen_locked(), **facts}, f, indent=1)
+        olds = sorted(glob.glob(os.path.join(DIAG_DIR, "*.json")))[:-DIAG_KEEP]
+        for j in olds:                      # ring-buffer: drop the oldest pairs
+            for p in (j, j[:-5] + ".png"):
+                try: os.remove(p)
+                except OSError: pass
+        return base + ".png"
+    except Exception:
+        return ""
 
 
 def find_button(screenshot_path: str, template_path: str, *,
@@ -66,54 +147,34 @@ def find_button(screenshot_path: str, template_path: str, *,
     confidence < threshold. Robust to where the button sits on screen — the
     whole reason we template-match instead of using fixed coordinates.
     """
+    pos, score = match_template(screenshot_path, template_path, scale=scale)
+    if pos is None or score < threshold:
+        # A MISS is the failure mode nobody can see with the lid closed — preserve it.
+        _diag("miss-" + os.path.splitext(os.path.basename(template_path))[0],
+              screenshot_path, template=os.path.basename(template_path),
+              score=round(score, 4), threshold=threshold)
+        return None
+    return pos
+
+
+def match_template(screenshot_path: str, template_path: str, *, scale: float | None = None):
+    """((x, y) logical points | None, best_score). Same matcher as find_button without
+    the threshold — used by the smoke test so every template reports a SCORE, making a
+    drifting match visible BEFORE it drops under the threshold mid-run."""
     shot = cv2.imread(screenshot_path)
     tmpl = cv2.imread(template_path)
     if shot is None or tmpl is None:
-        return None
+        return None, 0.0
     res = cv2.matchTemplate(shot, tmpl, cv2.TM_CCOEFF_NORMED)
     _minv, maxv, _minl, maxloc = cv2.minMaxLoc(res)
-    if maxv < threshold:
-        return None
     h, w = tmpl.shape[:2]
     s = scale if scale is not None else retina_scale()
-    return ((maxloc[0] + w / 2) / s, (maxloc[1] + h / 2) / s)
+    return ((maxloc[0] + w / 2) / s, (maxloc[1] + h / 2) / s), float(maxv)
 
 
 def found(screenshot_path: str, template_path: str, *, threshold: float = 0.8) -> bool:
     """True if the template is present at/above threshold (no coordinate needed)."""
     return find_button(screenshot_path, template_path, threshold=threshold) is not None
-
-
-# --- region-hash completion detection (pure-ish; the decider is unit-tested) ---
-
-def region_hash(screenshot_path: str, box=ANALYSIS_REGION) -> str:
-    """Stable fingerprint of a screen region. Downsized so sub-pixel noise
-    doesn't register as a change, but any real UI change (0.000 -> populated
-    L1 values, a progress bar) does."""
-    img = cv2.imread(screenshot_path)
-    if img is None:
-        return ""
-    x0, y0, x1, y1 = box
-    crop = img[y0:y1, x0:x1]
-    if crop.size == 0:
-        return ""
-    small = cv2.resize(crop, (64, 16))
-    return hashlib.md5(small.tobytes()).hexdigest()
-
-
-def is_analysis_done(hashes, *, stable_polls: int = 3) -> bool:
-    """Decide completion from a sequence of region hashes (PURE — unit-tested).
-
-    Done only when BOTH hold:
-      * the region has CHANGED at least once (analysis produced output — guards
-        the "stable because it never started" false positive), and
-      * the last `stable_polls` samples are identical (it has settled).
-    """
-    if len(hashes) < stable_polls + 1:
-        return False
-    if len(set(hashes[-stable_polls:])) != 1:
-        return False
-    return len(set(hashes)) > 1
 
 
 # --- UI primitives (each needs the runner's TCC grants) --------------------
@@ -227,15 +288,29 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     so the resolve stage reports it and the episode parks (resumable)."""
     if cv2 is None:
         raise RuntimeError("cv2 not available — needed for DV template matching")
+    # LID-CLOSED CONTEXT: log which display this ran against, and catch the failure mode
+    # that makes every template miss look inexplicable — a locked session (caffeinate -d
+    # blocks the screensaver but NOT the login-window lock).
+    g = main_display_geometry()
+    locked = screen_locked()
+    print(f"[{time.strftime('%H:%M:%S')}] dv_ui: display={g} locked={locked}", flush=True)
+    if locked:
+        _diag("session-locked")
+        raise RuntimeError("the session is LOCKED — screencapture only sees the lock screen, "
+                           "so no template can match. Disable the screen lock for lid-closed runs.")
     import resolve
     r = resolve.connect()
     if not goto_dolby_vision(r):
-        raise RuntimeError("Dolby Vision palette did not open")
+        raise RuntimeError("Dolby Vision palette did not open (see ~/.topaz-pipeline/diag)")
     if expect_nit == 1000 and not verify_target_display():
+        _diag("wrong-target-display", expect_nit=expect_nit)
         raise RuntimeError("Target Display Output is not the 1000-nit ST.2084 entry — "
                            "refusing to analyze against the wrong (likely 100-nit SDR) target")
     click_analyze_all()
-    return wait_for_analysis(abort=abort)
+    ok = wait_for_analysis(abort=abort)
+    if not ok:
+        _diag("analysis-incomplete", expect_nit=expect_nit)
+    return ok
 
 
 def capture_reference():

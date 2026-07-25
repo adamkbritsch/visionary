@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import dv_shim
 
@@ -47,22 +48,64 @@ class FindButton(unittest.TestCase):
             self.assertIsNone(dv_shim.find_button(sp, other, threshold=0.9, scale=1.0))
 
 
-class AnalysisDone(unittest.TestCase):
-    """Completion is decided purely from a sequence of region hashes."""
+class DisplayGeometry(unittest.TestCase):
+    """retina_scale() is READ from the main display (every supported config is 2.0), so a
+    second supported display (the clamshell dummy) needs no recalibration."""
 
-    def test_not_done_with_too_few_samples(self):
-        self.assertFalse(dv_shim.is_analysis_done(["a", "a"]))
+    def test_scale_derived_from_geometry(self):
+        with mock.patch.object(dv_shim, "main_display_geometry", return_value=(3840, 2160, 2.0, False)):
+            self.assertEqual(dv_shim.retina_scale(), 2.0)
+        with mock.patch.object(dv_shim, "main_display_geometry", return_value=(3456, 2234, 2.0, True)):
+            self.assertEqual(dv_shim.retina_scale(), 2.0)
 
-    def test_not_done_while_unchanged(self):
-        # stable but never changed = analysis hasn't started, NOT done
-        self.assertFalse(dv_shim.is_analysis_done(["a", "a", "a", "a", "a"]))
+    def test_scale_falls_back_when_unreadable(self):
+        with mock.patch.object(dv_shim, "main_display_geometry", return_value=None):
+            self.assertEqual(dv_shim.retina_scale(), 2.0)
 
-    def test_not_done_while_still_moving(self):
-        self.assertFalse(dv_shim.is_analysis_done(["a", "a", "b", "c"]))
 
-    def test_done_after_change_then_settle(self):
-        # 0.000 (a...) -> populated (b) -> settled (b,b,b)
-        self.assertTrue(dv_shim.is_analysis_done(["a", "a", "b", "b", "b"]))
+class Forensics(unittest.TestCase):
+    """With the lid closed nobody can see the screen, so a failed match must leave
+    evidence: the screenshot + a sidecar JSON, ring-buffered."""
+
+    def test_diag_writes_screenshot_and_json(self):
+        import json, tempfile, glob
+        with tempfile.TemporaryDirectory() as d:
+            shot = os.path.join(d, "shot.png")
+            open(shot, "wb").write(b"notarealpng")
+            with mock.patch.object(dv_shim, "DIAG_DIR", os.path.join(d, "diag")), \
+                 mock.patch.object(dv_shim, "main_display_geometry", return_value=(3840, 2160, 2.0, False)), \
+                 mock.patch.object(dv_shim, "screen_locked", return_value=False):
+                out = dv_shim._diag("miss-analyze_all", shot, template="analyze_all.png", score=0.42)
+            self.assertTrue(out.endswith(".png") and os.path.exists(out))
+            js = glob.glob(os.path.join(d, "diag", "*.json"))[0]
+            rec = json.load(open(js))
+            self.assertEqual(rec["what"], "miss-analyze_all")
+            self.assertEqual(rec["score"], 0.42)
+            self.assertEqual(rec["display"], [3840, 2160, 2.0, False])
+
+    def test_diag_ring_buffer_caps_growth(self):
+        import tempfile, glob
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(dv_shim, "DIAG_DIR", d), \
+                 mock.patch.object(dv_shim, "DIAG_KEEP", 3), \
+                 mock.patch.object(dv_shim, "main_display_geometry", return_value=None), \
+                 mock.patch.object(dv_shim, "screen_locked", return_value=None):
+                for i in range(6):
+                    dv_shim._diag(f"miss-{i}")
+            self.assertLessEqual(len(glob.glob(os.path.join(d, "*.json"))), 3)
+
+    def test_failed_match_leaves_evidence(self):
+        import tempfile
+        import numpy as np
+        with tempfile.TemporaryDirectory() as d:
+            sp = os.path.join(d, "s.png"); tp = os.path.join(d, "t.png")
+            rng = np.random.default_rng(1)
+            cv2.imwrite(sp, rng.integers(0, 256, (80, 120, 3), dtype=np.uint8))
+            cv2.imwrite(tp, rng.integers(0, 256, (20, 40, 3), dtype=np.uint8))
+            with mock.patch.object(dv_shim, "_diag") as dg:
+                self.assertIsNone(dv_shim.find_button(sp, tp, threshold=0.99, scale=1.0))
+            dg.assert_called_once()
+            self.assertIn("score", dg.call_args.kwargs)
 
 
 class RealTemplates(unittest.TestCase):
