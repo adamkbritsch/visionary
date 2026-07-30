@@ -358,6 +358,7 @@ def show_settings_view(name) -> dict:
     slot's follow-up (all three live in show_profiles.json keyed by show name)."""
     return {"preset": settings.show_preset_key(name),
             "configured": settings.get_show_preset(name) is not None,
+            "unwatched_first": settings.get_show_unwatched_first(name),
             "normalize_audio": settings.get_show_normalize_audio(name),
             "replace_source": settings.get_show_replace_source(name)}
 

@@ -1054,18 +1054,25 @@ private struct TVMode: View {
             }
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
-            unwatchedToggle(name, show.unwatched_first ?? true)
+            UnwatchedFirstRow(key: name, on: show.unwatched_first ?? true)
             NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false,
                       active: active, profile: show.next_up_profile, catalog: catalog)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
     }
 
-    // Compact per-show checkbox — sits under each show's preset so it's set per show, not global.
-    @ViewBuilder
-    func unwatchedToggle(_ show: String, _ on: Bool) -> some View {
+}
+
+// Compact per-show checkbox — under each show's preset so it's set per show, not global.
+// A standalone view (not a TVMode method) so the QUEUED follow-up show can carry the same
+// control: it keys on the show NAME, so it is settable before that show is ever active.
+private struct UnwatchedFirstRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let on: Bool
+    var body: some View {
         Toggle(isOn: Binding(get: { on },
-                             set: { v in Task { await store.setShowUnwatchedFirst(show, v) } })) {
+                             set: { v in Task { await store.setShowUnwatchedFirst(key, v) } })) {
             Text("Unwatched episodes first").font(.system(size: 12)).foregroundStyle(.secondary)
         }
         .help("On: skip ahead to episodes you haven't watched. Off: start at the beginning of the show.")
@@ -1157,6 +1164,7 @@ private struct NextUpRow: View {
                     }
                     NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
+                    UnwatchedFirstRow(key: n, on: profile?.unwatched_first ?? true)
                 }
                 .padding(.leading, 20)      // nested under the up-next line — these are ITS settings
             }

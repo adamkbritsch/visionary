@@ -269,9 +269,11 @@ class NextUpSlot(unittest.TestCase):
             st.set_show_preset("B", "film")                 # configured while NOT active
             st.set_show_normalize_audio("B", False)
             st.set_show_replace_source("B", False)
+            st.set_show_unwatched_first("B", False)
             with self._queues({"A": (0, 10), "B": (5, 0)}):
                 self.assertEqual(series.promote_finished_slots(), [("A", "B")])
             self.assertEqual(series.get_active_series(), ["B"])
             self.assertEqual(st.get_show_preset("B"), "film")        # survives promotion
             self.assertFalse(st.get_show_normalize_audio("B"))
             self.assertFalse(st.get_show_replace_source("B"))
+            self.assertFalse(st.get_show_unwatched_first("B"))   # queue ORDER too

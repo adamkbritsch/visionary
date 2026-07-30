@@ -85,6 +85,7 @@ struct QueueDTO: Codable {
 struct ShowSettingsDTO: Codable {
     var preset: String?
     var configured: Bool?
+    var unwatched_first: Bool?
     var normalize_audio: Bool?
     var replace_source: Bool?
 }
