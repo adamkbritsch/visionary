@@ -22,6 +22,7 @@ remux); the pure planning logic (paths, stage-done detection, gating) is unit-te
 from __future__ import annotations
 import json
 import os
+import re
 import queue
 import shutil
 import subprocess
@@ -171,11 +172,39 @@ class EpisodePaths:
         return [self.source, self.source_cfr, self.prores, self.dv_render, self.final]
 
 
+# A source filename advertises the SOURCE's encoding — "1080p", "x264", "8bit", "SDR".
+# Once the master exists those terms are factually WRONG: every deliverable is 4K HEVC
+# Main10 Dolby Vision. So the master's name retags them. PROVENANCE tokens (BluRay,
+# WEB-DL, AMZN, the release group, the episode key) are deliberately left ALONE — they
+# still describe where the picture came from, which is still true.
+_MASTER_RETAG = (
+    (re.compile(r"(?<![A-Za-z0-9])(?:x[\s._-]?264|h[\s._-]?264|avc|xvid|divx|vp9|av1)(?![A-Za-z0-9])",
+                re.I), "x265"),
+    (re.compile(r"(?<![A-Za-z0-9])(?:1080[pi]|1440p|720[pi]|576[pi]|480[pi])(?![A-Za-z0-9])",
+                re.I), "2160p"),
+    (re.compile(r"(?<![A-Za-z0-9])8[\s._-]?bits?(?![A-Za-z0-9])", re.I), "10bit"),
+    (re.compile(r"(?<![A-Za-z0-9])sdr(?![A-Za-z0-9])", re.I), "HDR"),
+)
+
+
+def master_stem(source_basename: str) -> str:
+    """The DELIVERABLE's stem: the source stem with now-inaccurate encoding terms retagged
+    to what the master actually is (x264 -> x265, 1080p -> 2160p, 8bit -> 10bit, SDR -> HDR).
+    Everything else — including the SxxExx key the queue parses and the `hdr10 dv` mark that
+    marks an episode done — is untouched. Applies to episodes and movies; YouTube keeps
+    youtarr's exact stem so its copied .nfo/.jpg/.srt sidecars still match."""
+    stem = os.path.splitext(source_basename)[0]
+    for pat, rep in _MASTER_RETAG:
+        stem = pat.sub(rep, stem)
+    return stem
+
+
 def episode_paths(series_name, ep, source_basename, *,
                   scratch_dir=None, nas_tv_root=None) -> EpisodePaths:
     scratch_dir = scratch_dir or scratch.default_scratch()
     nas_tv_root = nas_tv_root or transfer.NAS_FTP_TV_ROOT
     stem = os.path.splitext(source_basename)[0]          # "...(Extended Cut)"
+    mstem = master_stem(source_basename)                 # deliverable: stale codec/res retagged
     # The season folder is the one the file ACTUALLY sits in (learned during the episode
     # walk). Season dirs are NOT reliably `S01` — real libraries carry `Season 1` or
     # `Arrested Development Season 2 S02 1080p BluRay x264-BiA`, and synthesizing the path
@@ -199,10 +228,10 @@ def episode_paths(series_name, ep, source_basename, *,
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),   # Topaz chunks + manifest live here
         dv_render=j(stem + " HDR10 DV upscaled.mov"),
-        final=j(stem + " HDR10 DV upscaled.mp4"),
+        final=j(mstem + " HDR10 DV upscaled.mp4"),
         nas_dir=nas_dir,
         nas_source=f"{nas_dir}/{source_basename}",
-        nas_final=f"{nas_dir}/{stem} HDR10 DV upscaled.mp4",
+        nas_final=f"{nas_dir}/{mstem} HDR10 DV upscaled.mp4",
     )
 
 
@@ -215,6 +244,7 @@ def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None) -> Ep
     scratch_dir = scratch_dir or scratch.default_scratch()
     stem = os.path.splitext(source_basename)[0]
     nas_dir = nas_dir.rstrip("/")
+    mstem = master_stem(source_basename)                 # deliverable: stale codec/res retagged
     j = lambda n: os.path.join(scratch_dir, n)
     return EpisodePaths(
         series=(title or stem), ep=stem, source_basename=source_basename,
@@ -224,10 +254,10 @@ def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None) -> Ep
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),
         dv_render=j(stem + " HDR10 DV upscaled.mov"),
-        final=j(stem + " HDR10 DV upscaled.mp4"),
+        final=j(mstem + " HDR10 DV upscaled.mp4"),
         nas_dir=nas_dir,
         nas_source=nas_dir + "/" + source_basename,
-        nas_final=nas_dir + "/" + stem + " HDR10 DV upscaled.mp4",
+        nas_final=nas_dir + "/" + mstem + " HDR10 DV upscaled.mp4",
         movie=True,
         title=(title or stem),
     )
@@ -256,7 +286,8 @@ def youtube_paths(channel, video_path, title=None, *, scratch_dir=None) -> Episo
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),
         dv_render=j(stem + " HDR10 DV upscaled.mov"),
-        final=j(stem + " HDR10 DV upscaled.mp4"),   # LOCAL master name
+        final=j(stem + " HDR10 DV upscaled.mp4"),    # LOCAL master name — youtarr's stem
+                                                     # (no retag: the .nfo/.jpg/.srt must match)
         nas_dir=plex_dir,                           # publish INTO the Plex library
         nas_source=video_path,                      # raw source in STAGING
         nas_final=plex_dir + "/" + source_basename, # keep youtarr's stem (ext locked in apply_container)
@@ -298,8 +329,9 @@ def discard_workfiles(source_basename: str) -> None:
     names = _buffer_names(source_basename) | {
         stem + "_prob4_upscaled.mov",
         stem + " HDR10 DV upscaled.mov",
-        stem + " HDR10 DV upscaled.mp4",
-        stem + " HDR10 DV upscaled.mkv",
+    } | {                       # BOTH stems: the deliverable is retagged (x264 -> x265 ...),
+        m + " HDR10 DV upscaled" + e            # and a pre-retag leftover must still be swept
+        for m in {stem, master_stem(source_basename)} for e in (".mp4", ".mkv")
     }
     main = scratch.default_scratch()
     for d in (main, scratch.prefetch_dir()):
@@ -333,13 +365,16 @@ def relabel_container(p: EpisodePaths, ext: str) -> EpisodePaths:
     resumed remux rebuilds an MKV item as .mp4, silently downgrading lossless audio / dropping bitmap
     subs and orphaning the real .mkv partial + '.mkv.remuxsegs' resume dir (review-caught HIGH)."""
     stem = os.path.splitext(p.source_basename)[0]
+    # The DELIVERABLE carries the retagged stem (x264 -> x265, 1080p -> 2160p, ...), except
+    # for YouTube, which keeps youtarr's exact stem so the copied sidecars still match.
+    mstem = stem if p.youtube else master_stem(p.source_basename)
     d = os.path.dirname(p.source)
     p.source_cfr = os.path.join(d, stem + "_cfr" + ext)
-    p.final = os.path.join(d, stem + " HDR10 DV upscaled" + ext)
+    p.final = os.path.join(d, mstem + " HDR10 DV upscaled" + ext)
     if p.youtube:                                   # keep youtarr's stem so the copied .nfo matches
         p.nas_final = f"{p.nas_dir}/{stem}{ext}"
     else:
-        p.nas_final = f"{p.nas_dir}/{stem} HDR10 DV upscaled{ext}"
+        p.nas_final = f"{p.nas_dir}/{mstem} HDR10 DV upscaled{ext}"
     return p
 
 

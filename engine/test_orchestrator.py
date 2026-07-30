@@ -3,8 +3,9 @@ import datetime
 import unittest
 from unittest import mock
 
+import os
 import orchestrator as orch
-from orchestrator import episode_paths, gate_state
+from orchestrator import episode_paths, gate_state, youtube_paths
 
 SRC = "The Office  Superfan Episodes S02e10 Christmas Party (Extended Cut).mp4"
 
@@ -1723,3 +1724,42 @@ class FinisherEta(unittest.TestCase):
             o._set_finishing_progress({"stage": "remux", "frames": 10, "total": 41071, "pct": 0})
         self.assertNotIn("eta_secs", o.state["finishing"] or {})
 
+
+
+class MasterNaming(unittest.TestCase):
+    """A source filename advertises the SOURCE's encoding; once the master exists those
+    terms are wrong (every deliverable is 4K HEVC Main10 DV), so the master's name retags
+    them. Provenance (BluRay/WEB-DL/release group) and the SxxExx key are untouched."""
+
+    def test_retags_stale_encoding_terms(self):
+        self.assertEqual(orch.master_stem("Arrested.Development.S01E01.1080p.BluRay.x264-BiA.mkv"),
+                         "Arrested.Development.S01E01.2160p.BluRay.x265-BiA")
+        self.assertEqual(orch.master_stem("Show.S02E03.720p.WEB-DL.h264.8bit-GRP.mkv"),
+                         "Show.S02E03.2160p.WEB-DL.x265.10bit-GRP")
+        self.assertEqual(orch.master_stem("Doc S01E01 480i XviD SDR.avi"),
+                         "Doc S01E01 2160p x265 HDR")
+
+    def test_leaves_correct_and_unrelated_names_alone(self):
+        for n in ("Doc.S01E01.2160p.HEVC.10bit.mkv",
+                  "The Office  Superfan Episodes S09e01 New Guys (Extended Cut).mkv"):
+            self.assertEqual(orch.master_stem(n), os.path.splitext(n)[0])
+
+    def test_never_matches_inside_a_larger_token(self):
+        # a release group or title that merely CONTAINS the letters must not be mangled
+        self.assertEqual(orch.master_stem("Show.S01E01.1080p.x264-AVCHDTeam.mkv"),
+                         "Show.S01E01.2160p.x265-AVCHDTeam")
+
+    def test_deliverable_uses_the_retagged_stem_source_does_not(self):
+        p = episode_paths("Show", "S01E01", "Show.S01E01.1080p.BluRay.x264-BiA.mkv",
+                          scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+        self.assertTrue(p.nas_source.endswith("Show.S01E01.1080p.BluRay.x264-BiA.mkv"))  # SOURCE as-is
+        self.assertTrue(p.final.endswith("Show.S01E01.2160p.BluRay.x265-BiA HDR10 DV upscaled.mp4"))
+        self.assertEqual(os.path.basename(p.final), os.path.basename(p.nas_final))  # upload derives
+        self.assertIn("hdr10 dv", os.path.basename(p.nas_final).lower())            # done-mark kept
+        self.assertIn("S01E01", p.nas_final)                                        # queue key kept
+
+    def test_youtube_keeps_youtarrs_stem_for_sidecars(self):
+        p = youtube_paths("Chan", "Chan/vid [abcdefghijk]/Chan - T 1080p x264 [abcdefghijk].mp4",
+                          scratch_dir="/tmp")
+        self.assertIn("x264", os.path.basename(p.final))       # NOT retagged
+        self.assertIn("1080p", os.path.basename(p.final))
