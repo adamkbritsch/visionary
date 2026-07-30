@@ -240,6 +240,13 @@ def get_selection():
     return a[0] if a else None
 
 
+def _write_selection_file(d: dict) -> dict:
+    os.makedirs(os.path.dirname(SELECTION_FILE), exist_ok=True)
+    with open(SELECTION_FILE, "w") as f:
+        json.dump(d, f)
+    return d
+
+
 def _write_active(active, rotation=None) -> list:
     active = [s for s in active if s][:MAX_ACTIVE]
     d = _read_selection_file()
@@ -247,10 +254,97 @@ def _write_active(active, rotation=None) -> list:
     d["series"] = active[0] if active else None      # keep the legacy field in sync
     rot = d.get("rotation", 0) if rotation is None else rotation
     d["rotation"] = (rot % len(active)) if active else 0
-    os.makedirs(os.path.dirname(SELECTION_FILE), exist_ok=True)
-    with open(SELECTION_FILE, "w") as f:
-        json.dump(d, f)
+    _write_selection_file(d)
     return active
+
+
+# ---- per-slot "Up next" (a show queued to take over the slot) ---------------
+# A slot is ONE show at a time. `next_up` maps a currently-active show -> the show that
+# takes its slot the moment it finishes (CLEAN HANDOFF, user-dictated: no interleaving —
+# the successor starts only once the old show has no episodes left). The 10%-remaining
+# mark is when the successor is ARMED: locked in and prefetch-eligible, so its first
+# sources are already on disk when the handoff happens and the slot never stalls.
+# Keyed by SHOW NAME (not slot index) so it survives slot reordering/removal.
+
+NEXT_UP_ARM_FRACTION = 0.10
+
+
+def get_next_up_map() -> dict:
+    m = _read_selection_file().get("next_up")
+    if not isinstance(m, dict):
+        return {}
+    return {k: v for k, v in m.items()
+            if isinstance(k, str) and isinstance(v, str) and k and v}
+
+
+def get_next_up(show):
+    return get_next_up_map().get(show or "")
+
+
+def set_next_up(show, nxt) -> dict:
+    """Queue `nxt` to take over `show`'s slot when `show` finishes. Falsy `nxt` clears it.
+    A show can't follow itself, and an ALREADY-ACTIVE show is rejected (it's running in
+    its own slot — queueing it here would duplicate it on promotion)."""
+    m = get_next_up_map()
+    if not show:
+        return m
+    if nxt and nxt != show and nxt not in get_active_series():
+        m[show] = nxt
+    else:
+        m.pop(show, None)
+    d = _read_selection_file()
+    d["next_up"] = m
+    _write_selection_file(d)
+    return m
+
+
+def slot_progress(show) -> tuple:
+    """(remaining, total, fraction_left) for a show, from the CACHED queue (no NAS I/O).
+    fraction_left is 1.0 when nothing is known yet, so an unreachable NAS never reads as
+    'finished' and can't trigger a promotion."""
+    q = cached_queue(show) or {}
+    rem = int(q.get("remaining_count") or 0)
+    total = rem + int(q.get("done_count") or 0)
+    return rem, total, (rem / total if total else 1.0)
+
+
+def next_up_armed(show) -> bool:
+    """The successor is locked in: `show` is under the arm threshold and has one queued."""
+    if not get_next_up(show):
+        return False
+    _rem, total, frac = slot_progress(show)
+    return total > 0 and frac < NEXT_UP_ARM_FRACTION
+
+
+def promote_finished_slots() -> list:
+    """Swap every active show that has NO episodes left for its queued follow-up, IN PLACE
+    (slot order preserved), and clear the mapping. Returns [(old, new)]. Guarded on
+    total > 0 so an empty/unreachable listing can't promote a show that isn't really done.
+    Cheap: returns immediately when nothing is queued."""
+    m = get_next_up_map()
+    active = get_active_series()
+    if not m or not active:
+        return []
+    slots, promos = list(active), []
+    for i, s in enumerate(slots):
+        nxt = m.get(s)
+        if not nxt or nxt in slots:
+            continue
+        rem, total, _frac = slot_progress(s)
+        if total > 0 and rem == 0:
+            slots[i] = nxt
+            promos.append((s, nxt))
+    if promos:
+        for old, _new in promos:
+            m.pop(old, None)
+        d = _read_selection_file()
+        d["next_up"] = m
+        _write_selection_file(d)
+        _write_active(slots)
+        for _old, new in promos:
+            try: refresh_queue(new)
+            except Exception: pass
+    return promos
 
 
 def add_series(name) -> list:

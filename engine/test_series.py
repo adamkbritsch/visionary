@@ -188,3 +188,72 @@ class NxNNConvention(unittest.TestCase):
     def test_resolution_tokens_never_match(self):
         for n in ("Movie 1920x1080 BluRay.mkv", "Clip 3840x2160 HDR.mkv", "Thing 720x480.mkv"):
             self.assertEqual(series.parse_episodes([n]), [], n)
+
+
+class NextUpSlot(unittest.TestCase):
+    """Per-slot follow-up: a show queued to take the slot the moment its current show
+    finishes (CLEAN HANDOFF — no interleaving). Armed at <10% remaining, which is when it
+    locks in and becomes prefetch-eligible."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = mock.patch.object(series, "SELECTION_FILE", os.path.join(self.d, "selection.json"))
+        self.p.start()
+        series.set_selection("A")
+
+    def tearDown(self):
+        self.p.stop()
+
+    def _queues(self, mapping):
+        # mapping: show -> (remaining, done)
+        return mock.patch.object(series, "cached_queue",
+                                 side_effect=lambda s: {"remaining_count": mapping.get(s, (0, 0))[0],
+                                                        "done_count": mapping.get(s, (0, 0))[1]})
+
+    def test_set_get_and_clear(self):
+        series.set_next_up("A", "B")
+        self.assertEqual(series.get_next_up("A"), "B")
+        series.set_next_up("A", "")                       # falsy clears
+        self.assertIsNone(series.get_next_up("A") or None)
+
+    def test_rejects_self_and_already_active(self):
+        series.set_series_at(1, "B")                       # B is ACTIVE in another slot
+        series.set_next_up("A", "A")                       # can't follow itself
+        self.assertFalse(series.get_next_up("A"))
+        series.set_next_up("A", "B")                       # would duplicate B on promotion
+        self.assertFalse(series.get_next_up("A"))
+
+    def test_armed_only_under_ten_percent(self):
+        series.set_next_up("A", "B")
+        with self._queues({"A": (5, 45)}):                 # 10% left — not yet under
+            self.assertFalse(series.next_up_armed("A"))
+        with self._queues({"A": (4, 46)}):                 # 8% left
+            self.assertTrue(series.next_up_armed("A"))
+        with self._queues({"A": (0, 0)}):                  # nothing known -> never armed
+            self.assertFalse(series.next_up_armed("A"))
+
+    def test_no_follow_up_is_never_armed(self):
+        with self._queues({"A": (1, 99)}):
+            self.assertFalse(series.next_up_armed("A"))
+
+    def test_promotes_in_place_only_when_finished(self):
+        series.set_series_at(1, "C")
+        series.set_next_up("A", "B")
+        with self._queues({"A": (3, 47), "C": (10, 0)}):   # A still has episodes
+            self.assertEqual(series.promote_finished_slots(), [])
+            self.assertEqual(series.get_active_series(), ["A", "C"])
+        with self._queues({"A": (0, 50), "C": (10, 0), "B": (20, 0)}):
+            self.assertEqual(series.promote_finished_slots(), [("A", "B")])
+        self.assertEqual(series.get_active_series(), ["B", "C"])   # slot ORDER preserved
+        self.assertFalse(series.get_next_up("A"))                  # mapping consumed
+
+    def test_unreachable_nas_never_promotes(self):
+        series.set_next_up("A", "B")
+        with self._queues({"A": (0, 0)}):        # empty listing = unknown, NOT finished
+            self.assertEqual(series.promote_finished_slots(), [])
+        self.assertEqual(series.get_active_series(), ["A"])
+
+    def test_promote_is_a_noop_without_any_mapping(self):
+        with self._queues({"A": (0, 10)}):
+            self.assertEqual(series.promote_finished_slots(), [])
+        self.assertEqual(series.get_active_series(), ["A"])

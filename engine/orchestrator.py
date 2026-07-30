@@ -94,6 +94,7 @@ FINISHER_FILE = os.path.expanduser("~/.topaz-pipeline/finisher_queue.json")
                               # aborted remux. On re-arm we RECONCILE from this file so the finisher
                               # RESUMES that remux on its own thread, concurrently with the run thread's
                               # topaz ("resume with both") — see _finisher_reconcile.
+PREFETCH_NEXT_UP_EPISODES = 2   # how many episodes of an ARMED follow-up show to pre-stage
 PREFETCH_HARD_CAP_GB = 100   # HARD ceiling on the prefetch buffer's total size — never stage more than
                              # this much queued content (the soft limit — _reclaim_for_pipeline purging
                              # the buffer when the pipeline needs disk — still applies on top of it)
@@ -1475,6 +1476,17 @@ class Orchestrator:
                         add(episode_paths(s, it["ep"], it["source_name"], scratch_dir=PF, nas_tv_root=root))
         except Exception:
             pass
+        try:
+            for s in series.get_active_series():             # 4. the ARMED follow-up show (<10% left):
+                if not series.next_up_armed(s):              #    stage its first episodes so the handoff
+                    continue                                 #    doesn't start with a cold download
+                nxt = series.get_next_up(s)
+                root = series.series_root(nxt)
+                for it in (series.cached_queue(nxt) or {}).get("remaining_items", [])[:PREFETCH_NEXT_UP_EPISODES]:
+                    if it.get("ep") not in skip:
+                        add(episode_paths(nxt, it["ep"], it["source_name"], scratch_dir=PF, nas_tv_root=root))
+        except Exception:
+            pass
         return cands
 
     def _purge_prefetch_orphans(self, cands):
@@ -1613,6 +1625,13 @@ class Orchestrator:
         # runs and every movie's slot decrements (see _process). Nav bar is VIEW-only.
         # A selected movie/YouTube video runs START-TO-FINISH in one go (the 90-min turn
         # system is gone — user-dictated).
+        # A finished slot hands off to its queued follow-up BEFORE selection, so the slot
+        # never idles for a rotation (no-op when nothing is queued — see series.next_up).
+        try:
+            for _old, _new in series.promote_finished_slots():
+                logbook.event(f"slot handoff: {_old} finished -> {_new} takes its slot")
+        except Exception:
+            pass
         skip = (self._parked | self._resolve_deferred        # + items QUIET MODE is holding before Resolve
                 | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
                 | self._in_finisher_keys()                   # + items the FINISHER already owns (still

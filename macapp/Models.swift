@@ -87,6 +87,8 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var unwatched_first: Bool?
     var normalize_audio: Bool?    // per-show loudness-boost gate (default on)
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
+    var next_up: String?          // show queued to take this slot when this one finishes
+    var next_up_armed: Bool?      // <10% left -> the follow-up is locked in + pre-downloading
     var queue: QueueDTO?
     var id: String { name ?? "" }
 }

@@ -159,6 +159,8 @@ def series_info():
               "unwatched_first": settings.get_show_unwatched_first(nm),
               "normalize_audio": settings.get_show_normalize_audio(nm),
               "replace_source": settings.get_show_replace_source(nm),
+              "next_up": series.get_next_up(nm) or None,
+              "next_up_armed": series.next_up_armed(nm),
               "queue": series.cached_queue(nm)} for nm in active]
     return {"selected": sel, "active": active, "rotation": series.get_rotation(),
             "queue": shows[0]["queue"] if shows else None,
@@ -349,6 +351,9 @@ def api_series():
     Hits the NAS over FTP, so it's called on demand (opening the picker), not on poll."""
     sel = series.get_selection()
     available = series.list_series()
+    try: series.promote_finished_slots()   # hand a finished slot to its follow-up even while STOPPED
+    except Exception: pass
+    sel = series.get_selection()           # a promotion may have just changed the primary
     queue = series.refresh_queue(sel) if sel else None
     return {"series": available, "selected": sel, "queue": queue,
             "reachable": bool(available)}
@@ -735,6 +740,16 @@ class Handler(BaseHTTPRequestHandler):
             if on:
                 orchestrator.ORCH.reclaim_screen()
             self._json(orchestrator.ORCH.snapshot())
+        elif path == "/api/next-up":
+            # Per-slot follow-up: the show that takes this slot the moment `show` finishes.
+            # Empty `next` clears it. NOT arm-gated (unlike picking the slot's CURRENT show):
+            # this only records a future intent, so it's safe to set mid-run — the promotion
+            # itself happens on the run thread (series.promote_finished_slots).
+            show = (body.get("show") or "").strip()
+            if not show:
+                return self._json({"error": "no show given"}, 400)
+            series.set_next_up(show, (body.get("next") or "").strip())
+            self._json(series_info())
         elif path == "/api/show-profile":
             show = (body.get("show") or series.get_selection() or "").strip()
             if not show:

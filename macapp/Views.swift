@@ -1055,6 +1055,7 @@ private struct TVMode: View {
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
             unwatchedToggle(name, show.unwatched_first ?? true)
+            NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false, active: active)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
     }
@@ -1106,6 +1107,57 @@ private struct NormalizeAudioRow: View {
         } message: {
             Text("Decide this at the start of a show — episodes already made keep their current "
                  + "audio, so changing it mid-show leaves the show inconsistent.")
+        }
+    }
+}
+
+// Per-slot "Up next" row: the show queued to take THIS slot the moment its current show
+// finishes (clean handoff — no interleaving). Deliberately NOT gated by the run lock: the
+// slot's CURRENT show can't be swapped mid-run, but queueing what comes AFTER only records
+// a future intent, so it's safe (and useful) to set while the pipeline is running.
+// At <10% remaining the follow-up is ARMED — locked in, and its first episodes start
+// pre-downloading so the handoff doesn't begin with a cold download.
+private struct NextUpRow: View {
+    @EnvironmentObject var store: AppStore
+    let show: String
+    let next: String?
+    let armed: Bool
+    let active: [String]
+    @State private var picking = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.turn.down.right").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            if picking {
+                SearchablePicker(placeholder: "Queue a show for when this one finishes…",
+                                 options: store.seriesOptions
+                                     .filter { $0 != show && !active.contains($0) }
+                                     .map { PickOption(id: $0, label: store.seriesTitle($0)) },
+                                 disabled: !store.seriesReachable) { id in
+                    picking = false
+                    Task { await store.setNextUp(show, id) }
+                }
+                Button("Cancel") { picking = false }
+                    .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)
+            } else if let n = next, !n.isEmpty {
+                Text("Up next: \(store.seriesTitle(n))")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel).lineLimit(1)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .help("Takes this slot the moment the current show finishes")
+                if armed {
+                    Text("ready").font(.system(size: 11, weight: .medium)).foregroundStyle(Color.brand)
+                        .help("Under 10% left — the follow-up is locked in and pre-downloading")
+                }
+                Button("Change") { picking = true }
+                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
+                Button("Clear") { Task { await store.setNextUp(show, "") } }
+                    .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)
+            } else {
+                Button("Queue a show for when this one finishes") { picking = true }
+                    .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .help("Pick the show that takes this slot next — settable while the pipeline runs")
+            }
+            Spacer()
         }
     }
 }
