@@ -101,6 +101,16 @@ class Walk(unittest.TestCase):
         self.assertIn("e01 (Extended Cut).mp4", files)
         self.assertIn("poster.jpg", files)
 
+    def test_with_dirs_reports_the_real_containing_folder(self):
+        # Season folders are NOT reliably "S01" — the caller needs the ACTUAL dir so the
+        # download path isn't synthesized (a wrong path 550s).
+        tree = {
+            "/Media/TV-Shows/Show": [("Season 1", {"type": "dir"})],
+            "/Media/TV-Shows/Show/Season 1": [("Show.S01E01.mkv", {"type": "file"})],
+        }
+        pairs = transfer.ftp_walk_files(FakeFTP(tree=tree), "/Media/TV-Shows/Show", with_dirs=True)
+        self.assertEqual(pairs, [("/Media/TV-Shows/Show/Season 1", "Show.S01E01.mkv")])
+
 
 class TransferOps(unittest.TestCase):
     def test_upload_sends_spacey_path_verbatim(self):

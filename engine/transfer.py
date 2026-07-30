@@ -165,13 +165,21 @@ _VIDEO_EXT = (".mp4", ".mkv", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".avi", ".
               ".webm", ".mpg", ".mpeg", ".vob", ".flv", ".ogv", ".m2v", ".divx", ".mpv")
 
 
-def ftp_walk_files(ftp, base, depth=3) -> list:
+def ftp_walk_files(ftp, base, depth=3, with_dirs=False) -> list:
     """Recursively collect file basenames under an FTP dir (series → season → files).
     Uses MLSD types when the server supports them; otherwise falls back to NLST and
-    guesses dir-vs-file by extension (smbftpd may not implement MLSD)."""
+    guesses dir-vs-file by extension (smbftpd may not implement MLSD).
+
+    `with_dirs=True` returns (containing_dir, name) pairs instead of bare names. The
+    caller needs that because season folders are NOT reliably named `S01`: real
+    libraries carry things like `Season 1` or
+    `Arrested Development Season 2 S02 1080p BluRay x264-BiA`. Synthesizing the season
+    path from the episode number silently 550s on those shows (live-caught 2026-07-30)."""
     out = []
     if depth < 0:
         return out
+    hit = (lambda d, n: out.append((d, n))) if with_dirs else (lambda d, n: out.append(n))
+    base = base.rstrip("/")
     try:
         entries = list(ftp.mlsd(base))
     except ftplib.all_errors:
@@ -182,15 +190,15 @@ def ftp_walk_files(ftp, base, depth=3) -> list:
                 continue
             t = facts.get("type")
             if t == "dir":
-                out.extend(ftp_walk_files(ftp, base.rstrip("/") + "/" + name, depth - 1))
+                out.extend(ftp_walk_files(ftp, base + "/" + name, depth - 1, with_dirs))
             elif t == "file":
-                out.append(name)
+                hit(base, name)
     else:
         for name in ftp_listdir(ftp, base):     # NLST fallback (no types)
             if name.lower().endswith(_VIDEO_EXT):
-                out.append(name)                # a video file
+                hit(base, name)                 # a video file
             else:
-                out.extend(ftp_walk_files(ftp, base.rstrip("/") + "/" + name, depth - 1))
+                out.extend(ftp_walk_files(ftp, base + "/" + name, depth - 1, with_dirs))
     return out
 
 

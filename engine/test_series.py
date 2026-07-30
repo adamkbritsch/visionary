@@ -277,3 +277,42 @@ class NextUpSlot(unittest.TestCase):
             self.assertFalse(st.get_show_normalize_audio("B"))
             self.assertFalse(st.get_show_replace_source("B"))
             self.assertFalse(st.get_show_unwatched_first("B"))   # queue ORDER too
+
+
+class RealSeasonDirs(unittest.TestCase):
+    """Season folders are NOT reliably named `S01` (real libraries carry `Season 1`,
+    `Show Season 2 S02 1080p BluRay`, ...). The walk learns each file's REAL directory so
+    the download/upload path isn't synthesized as <show>/S{NN} — which 550s on such shows."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = mock.patch.object(series, "EPISODE_DIRS_FILE", os.path.join(self.d, "ep_dirs.json"))
+        self.p.start()
+        series._EP_DIRS = None                      # force a reload from the patched path
+
+    def tearDown(self):
+        self.p.stop()
+        series._EP_DIRS = None
+
+    def test_remembers_and_persists_the_real_dir(self):
+        series.remember_episode_dirs("Show", [("/Vol/TV/Show/Season 1", "Show.S01E01.mkv"),
+                                              ("/Vol/TV/Show/Weird S02 Folder", "Show.S02E01.mkv")])
+        self.assertEqual(series.episode_nas_dir("Show", "Show.S01E01.mkv"), "/Vol/TV/Show/Season 1")
+        self.assertEqual(series.episode_nas_dir("Show", "Show.S02E01.mkv"), "/Vol/TV/Show/Weird S02 Folder")
+        series._EP_DIRS = None                      # simulate a relaunch — must survive on disk
+        self.assertEqual(series.episode_nas_dir("Show", "Show.S01E01.mkv"), "/Vol/TV/Show/Season 1")
+
+    def test_unknown_file_returns_none_so_the_caller_falls_back(self):
+        self.assertIsNone(series.episode_nas_dir("Show", "never-walked.mkv"))
+        self.assertIsNone(series.episode_nas_dir("", ""))
+
+    def test_episode_paths_uses_the_real_dir_and_falls_back(self):
+        from orchestrator import episode_paths
+        series.remember_episode_dirs("Show", [("/Vol/TV/Show/Season 1", "Show.S01E01.mkv")])
+        p = episode_paths("Show", "S01E01", "Show.S01E01.mkv",
+                          scratch_dir=self.d, nas_tv_root="/Vol/TV")
+        self.assertEqual(p.nas_dir, "/Vol/TV/Show/Season 1")          # REAL dir, not /Show/S01
+        self.assertTrue(p.nas_source.endswith("/Season 1/Show.S01E01.mkv"))
+        q = episode_paths("Show", "S03E02", "unwalked.mkv",           # not walked -> convention
+                          scratch_dir=self.d, nas_tv_root="/Vol/TV")
+        self.assertEqual(q.nas_dir, "/Vol/TV/Show/S03")

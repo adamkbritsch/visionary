@@ -176,8 +176,14 @@ def episode_paths(series_name, ep, source_basename, *,
     scratch_dir = scratch_dir or scratch.default_scratch()
     nas_tv_root = nas_tv_root or transfer.NAS_FTP_TV_ROOT
     stem = os.path.splitext(source_basename)[0]          # "...(Extended Cut)"
+    # The season folder is the one the file ACTUALLY sits in (learned during the episode
+    # walk). Season dirs are NOT reliably `S01` — real libraries carry `Season 1` or
+    # `Arrested Development Season 2 S02 1080p BluRay x264-BiA`, and synthesizing the path
+    # from the episode number 550s on those (live-caught 2026-07-30). The `S{NN}` form
+    # stays as the fallback for anything not yet walked.
     season = "S" + ep[1:3]                               # "S02E10" -> "S02"
-    nas_dir = f"{nas_tv_root.rstrip('/')}/{series_name}/{season}"
+    nas_dir = (series.episode_nas_dir(series_name, source_basename)
+               or f"{nas_tv_root.rstrip('/')}/{series_name}/{season}")
     j = lambda n: os.path.join(scratch_dir, n)
     return EpisodePaths(
         series=series_name, ep=ep, source_basename=source_basename,

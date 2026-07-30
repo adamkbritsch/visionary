@@ -13,6 +13,7 @@ import ftplib
 import json
 import os
 import re
+import threading
 
 from transfer import connect as ftp_connect, ftp_listdir, ftp_walk_files, NAS_FTP_TV_ROOT, NAS_FTP_TV_ROOTS
 
@@ -125,15 +126,69 @@ def series_root(series) -> str:
     return _SERIES_ROOTS.get(series, NAS_FTP_TV_ROOT)
 
 
+# ---- real season directories -------------------------------------------------------
+# Season folders are NOT reliably named `S01` — a real library carries `Season 1`,
+# `Arrested Development Season 2 S02 1080p BluRay x264-BiA`, etc. The queue always found
+# those episodes (the walk recurses), but the DOWNLOAD path used to be synthesized as
+# `<show>/S{NN}`, which 550s on any show that doesn't use that convention (live-caught
+# 2026-07-30, the first non-`SNN` show to reach the pipeline). So remember where each
+# source file actually lives, learned for free during the same walk, and persist it so a
+# relaunch (or a finisher resuming an upload) still knows the real directory.
+EPISODE_DIRS_FILE = os.path.expanduser("~/.topaz-pipeline/episode_dirs.json")
+_EP_DIRS = None
+_EP_DIRS_LOCK = threading.Lock()
+
+
+def _episode_dirs() -> dict:
+    global _EP_DIRS
+    if _EP_DIRS is None:
+        try:
+            with open(EPISODE_DIRS_FILE) as f:
+                d = json.load(f)
+            _EP_DIRS = d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            _EP_DIRS = {}
+    return _EP_DIRS
+
+
+def remember_episode_dirs(series, pairs) -> None:
+    """Record {basename: containing FTP dir} for a series from a (dir, name) walk."""
+    if not series or not pairs:
+        return
+    with _EP_DIRS_LOCK:
+        d = _episode_dirs()
+        d[series] = {name: dirpath for dirpath, name in pairs}
+        try:
+            os.makedirs(os.path.dirname(EPISODE_DIRS_FILE), exist_ok=True)
+            tmp = EPISODE_DIRS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, EPISODE_DIRS_FILE)
+        except OSError:
+            pass
+
+
+def episode_nas_dir(series, basename):
+    """The FTP dir a source file ACTUALLY lives in, or None if not learned yet (the
+    caller then falls back to the `S{NN}` convention)."""
+    if not series or not basename:
+        return None
+    with _EP_DIRS_LOCK:
+        return (_episode_dirs().get(series) or {}).get(basename)
+
+
 def list_episode_files(series, *, timeout=40) -> list:
-    """All video basenames under a series dir on its volume (FTP, recurses into seasons)."""
+    """All video basenames under a series dir on its volume (FTP, recurses into seasons).
+    Also records each file's REAL directory (see episode_nas_dir) — same walk, no extra I/O."""
     root = series_root(series)                 # resolve the volume first (own connection if it re-lists)
     try:
         ftp = ftp_connect(timeout=timeout)
     except ftplib.all_errors:
         return []
     try:
-        return ftp_walk_files(ftp, root.rstrip("/") + "/" + series)
+        pairs = ftp_walk_files(ftp, root.rstrip("/") + "/" + series, with_dirs=True)
+        remember_episode_dirs(series, pairs)
+        return [name for _d, name in pairs]
     except ftplib.all_errors:
         return []
     finally:
