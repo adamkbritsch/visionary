@@ -363,12 +363,17 @@ def slot_progress(show) -> tuple:
     return rem, total, (rem / total if total else 1.0)
 
 
-def next_up_armed(show) -> bool:
-    """The successor is locked in: `show` is under the arm threshold and has one queued."""
-    if not get_next_up(show):
-        return False
+def near_done(show) -> bool:
+    """`show` is into the last NEXT_UP_ARM_FRACTION of its episodes — i.e. ≥90% done.
+    The ONE definition of that threshold: the UI only offers "queue a follow-up" here
+    (it's inert noise earlier), and it's also when a queued successor arms."""
     _rem, total, frac = slot_progress(show)
     return total > 0 and frac < NEXT_UP_ARM_FRACTION
+
+
+def next_up_armed(show) -> bool:
+    """The successor is locked in: `show` is ≥90% done and has one queued."""
+    return bool(get_next_up(show)) and near_done(show)
 
 
 def promote_finished_slots() -> list:

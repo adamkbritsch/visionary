@@ -223,6 +223,18 @@ class NextUpSlot(unittest.TestCase):
         series.set_next_up("A", "B")                       # would duplicate B on promotion
         self.assertFalse(series.get_next_up("A"))
 
+    def test_near_done_is_the_single_threshold(self):
+        # The UI only OFFERS a follow-up from >=90% done; the same predicate arms a queued
+        # one, so the threshold has exactly one definition.
+        with self._queues({"A": (5, 45)}):        # exactly 10% left -> not yet
+            self.assertFalse(series.near_done("A"))
+        with self._queues({"A": (4, 46)}):        # 8% left
+            self.assertTrue(series.near_done("A"))
+        with self._queues({"A": (0, 0)}):         # nothing known
+            self.assertFalse(series.near_done("A"))
+        with self._queues({"A": (84, 0)}):        # a show that just STARTED
+            self.assertFalse(series.near_done("A"))
+
     def test_armed_only_under_ten_percent(self):
         series.set_next_up("A", "B")
         with self._queues({"A": (5, 45)}):                 # 10% left — not yet under

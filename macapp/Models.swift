@@ -99,6 +99,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
     var next_up: String?          // show queued to take this slot when this one finishes
     var next_up_armed: Bool?      // <10% left -> the follow-up is locked in + pre-downloading
+    var near_done: Bool?          // >=90% done -> only then is "queue a follow-up" offered
     var next_up_profile: ShowSettingsDTO?   // the QUEUED show's own settings (configurable early)
     var queue: QueueDTO?
     var id: String { name ?? "" }

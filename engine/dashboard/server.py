@@ -164,6 +164,8 @@ def series_info():
                       "replace_source": settings.get_show_replace_source(nm),
                       "next_up": nu,
                       "next_up_armed": series.next_up_armed(nm),
+                      # ≥90% done — the UI only offers "queue a follow-up" from here
+                      "near_done": series.near_done(nm),
                       # The QUEUED show's own settings, so they can be configured BEFORE it
                       # is promoted (they're keyed by show name in show_profiles.json, so
                       # they already persist for a show that isn't active yet).

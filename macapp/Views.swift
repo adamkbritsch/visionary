@@ -1056,7 +1056,8 @@ private struct TVMode: View {
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
             UnwatchedFirstRow(key: name, on: show.unwatched_first ?? true)
             NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false,
-                      active: active, profile: show.next_up_profile, catalog: catalog)
+                      active: active, profile: show.next_up_profile, catalog: catalog,
+                      nearDone: show.near_done ?? false)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
     }
@@ -1133,9 +1134,20 @@ private struct NextUpRow: View {
     let active: [String]
     let profile: ShowSettingsDTO?
     let catalog: [PresetDTO]
+    let nearDone: Bool          // >=90% of the current show is done
     @State private var picking = false
 
+    /// The row is INVISIBLE until the slot's show is ≥90% done — queueing a successor is
+    /// meaningless noise before then (user-dictated: hide inert controls, don't disable
+    /// them). Once a follow-up IS queued it stays visible regardless, so it can always be
+    /// seen, reconfigured or cleared.
+    private var visible: Bool { (next?.isEmpty == false) || nearDone || picking }
+
     var body: some View {
+        if visible { content }
+    }
+
+    @ViewBuilder private var content: some View {
         VStack(alignment: .leading, spacing: 6) {
             headerRow
             // The QUEUED show's own settings — configurable BEFORE it starts, so it never
@@ -1219,7 +1231,7 @@ private struct NextUpRow: View {
             } else {
                 Button("Queue a show for when this one finishes") { picking = true }
                     .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)
-                    .help("Pick the show that takes this slot next — settable while the pipeline runs")
+                    .help("Pick the show that takes this slot next — offered once this show is 90% done, and settable while the pipeline runs")
             }
             Spacer()
         }
