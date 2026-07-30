@@ -257,3 +257,21 @@ class NextUpSlot(unittest.TestCase):
         with self._queues({"A": (0, 10)}):
             self.assertEqual(series.promote_finished_slots(), [])
         self.assertEqual(series.get_active_series(), ["A"])
+
+    def test_queued_show_settings_persist_before_it_is_active(self):
+        # The point of configuring a follow-up EARLY: its settings key on the show NAME in
+        # show_profiles.json, so they persist while it is only queued and are already in
+        # force the moment it is promoted into the slot.
+        import settings as st
+        d2 = tempfile.mkdtemp()
+        with mock.patch.object(st, "PROFILES_FILE", os.path.join(d2, "profiles.json")):
+            series.set_next_up("A", "B")
+            st.set_show_preset("B", "film")                 # configured while NOT active
+            st.set_show_normalize_audio("B", False)
+            st.set_show_replace_source("B", False)
+            with self._queues({"A": (0, 10), "B": (5, 0)}):
+                self.assertEqual(series.promote_finished_slots(), [("A", "B")])
+            self.assertEqual(series.get_active_series(), ["B"])
+            self.assertEqual(st.get_show_preset("B"), "film")        # survives promotion
+            self.assertFalse(st.get_show_normalize_audio("B"))
+            self.assertFalse(st.get_show_replace_source("B"))

@@ -80,6 +80,15 @@ struct QueueDTO: Codable {
     var source_count: Int?
 }
 
+/// Per-show settings that apply to ANY show — active, or merely queued as a slot's
+/// follow-up (all keyed by show name in show_profiles.json, so they persist before it runs).
+struct ShowSettingsDTO: Codable {
+    var preset: String?
+    var configured: Bool?
+    var normalize_audio: Bool?
+    var replace_source: Bool?
+}
+
 struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (all rendered the same)
     var name: String?
     var preset: String?
@@ -89,6 +98,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
     var next_up: String?          // show queued to take this slot when this one finishes
     var next_up_armed: Bool?      // <10% left -> the follow-up is locked in + pre-downloading
+    var next_up_profile: ShowSettingsDTO?   // the QUEUED show's own settings (configurable early)
     var queue: QueueDTO?
     var id: String { name ?? "" }
 }

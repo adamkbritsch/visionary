@@ -1055,7 +1055,8 @@ private struct TVMode: View {
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
             unwatchedToggle(name, show.unwatched_first ?? true)
-            NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false, active: active)
+            NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false,
+                      active: active, profile: show.next_up_profile, catalog: catalog)
             if let q = show.queue { QueueProgress(q: q) }     // the per-show total progress bar (moved here)
         }
     }
@@ -1123,8 +1124,46 @@ private struct NextUpRow: View {
     let next: String?
     let armed: Bool
     let active: [String]
+    let profile: ShowSettingsDTO?
+    let catalog: [PresetDTO]
     @State private var picking = false
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            headerRow
+            // The QUEUED show's own settings — configurable BEFORE it starts, so it never
+            // begins a run on defaults. Same controls as an active show; they key on the
+            // show NAME, which is why they can be set while it's only queued.
+            if let n = next, !n.isEmpty, !picking {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "cpu").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+                        Text(catalog.first { $0.key == (profile?.preset ?? "") }?.label
+                             ?? (profile?.preset ?? "—"))
+                            .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
+                            .padding(.horizontal, 7).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                            .help("Topaz preset for the queued show")
+                        if !(profile?.configured ?? false) {
+                            Text("(default)").font(.system(size: 11)).foregroundStyle(.tertiary)
+                        }
+                        Button("Change") {
+                            store.seriesPick = profile?.preset ?? catalog.first?.key ?? ""
+                            store.pendingSeriesSlot = nil       // preset-only: does NOT change the slot
+                            store.pendingSeries = n
+                        }
+                        .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
+                        Spacer()
+                    }
+                    NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
+                    ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
+                }
+                .padding(.leading, 20)      // nested under the up-next line — these are ITS settings
+            }
+        }
+    }
+
+    @ViewBuilder private var headerRow: some View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.turn.down.right").font(.system(size: 12)).foregroundStyle(DS.steelDim)
             if picking {
@@ -1134,7 +1173,24 @@ private struct NextUpRow: View {
                                      .map { PickOption(id: $0, label: store.seriesTitle($0)) },
                                  disabled: !store.seriesReachable) { id in
                     picking = false
-                    Task { await store.setNextUp(show, id) }
+                    Task {
+                        await store.setNextUp(show, id)
+                        // Same smart flow as picking a slot's show: settle its preset NOW
+                        // (auto-detect, else ask) so the queued show is fully configured
+                        // long before it is promoted.
+                        if await store.profileFor(id)?.configured != true {
+                            store.tvDetecting = true
+                            let auto = await store.detectPreset("tv", id)
+                            store.tvDetecting = false
+                            if let key = auto {
+                                await store.setPreset(id, key)
+                            } else {
+                                store.seriesPick = catalog.first?.key ?? ""
+                                store.pendingSeriesSlot = nil
+                                store.pendingSeries = id
+                            }
+                        }
+                    }
                 }
                 Button("Cancel") { picking = false }
                     .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)

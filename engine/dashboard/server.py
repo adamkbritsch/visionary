@@ -154,14 +154,21 @@ def series_info():
     active = series.get_active_series()
     sel = active[0] if active else None
     # Uniform per-show info for ALL active shows, so the UI renders each as the same block.
-    shows = [{"name": nm, "preset": settings.show_preset_key(nm),
-              "configured": settings.get_show_preset(nm) is not None,
-              "unwatched_first": settings.get_show_unwatched_first(nm),
-              "normalize_audio": settings.get_show_normalize_audio(nm),
-              "replace_source": settings.get_show_replace_source(nm),
-              "next_up": series.get_next_up(nm) or None,
-              "next_up_armed": series.next_up_armed(nm),
-              "queue": series.cached_queue(nm)} for nm in active]
+    shows = []
+    for nm in active:
+        nu = series.get_next_up(nm) or None
+        shows.append({"name": nm, "preset": settings.show_preset_key(nm),
+                      "configured": settings.get_show_preset(nm) is not None,
+                      "unwatched_first": settings.get_show_unwatched_first(nm),
+                      "normalize_audio": settings.get_show_normalize_audio(nm),
+                      "replace_source": settings.get_show_replace_source(nm),
+                      "next_up": nu,
+                      "next_up_armed": series.next_up_armed(nm),
+                      # The QUEUED show's own settings, so they can be configured BEFORE it
+                      # is promoted (they're keyed by show name in show_profiles.json, so
+                      # they already persist for a show that isn't active yet).
+                      "next_up_profile": show_settings_view(nu) if nu else None,
+                      "queue": series.cached_queue(nm)})
     return {"selected": sel, "active": active, "rotation": series.get_rotation(),
             "queue": shows[0]["queue"] if shows else None,
             "shows": shows, "titles": plex.peek_titles()}
@@ -344,6 +351,15 @@ def api_mode(mode):
     elif m == "youtube":
         out["youtube"] = youtube.queue_view()
     return out
+
+
+def show_settings_view(name) -> dict:
+    """The per-show settings that can be set for ANY show — active or merely queued as a
+    slot's follow-up (all three live in show_profiles.json keyed by show name)."""
+    return {"preset": settings.show_preset_key(name),
+            "configured": settings.get_show_preset(name) is not None,
+            "normalize_audio": settings.get_show_normalize_audio(name),
+            "replace_source": settings.get_show_replace_source(name)}
 
 
 def api_series():
