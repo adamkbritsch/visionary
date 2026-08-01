@@ -684,12 +684,13 @@ class QuietMode(unittest.TestCase):
     """QUIET MODE: keep download+topaz running but hold each item before the screen-invasive Resolve
     stage, process others, and resume when it's turned off. Movies key on basename, TV/YouTube on ep."""
 
-    def test_skip_key_movie_uses_basename_tv_uses_ep(self):
+    def test_skip_key_movie_uses_basename_tv_is_show_namespaced(self):
         o = orch.Orchestrator()
         mv = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M")
         tv = episode_paths("The Office", "S02E10", SRC)
         self.assertEqual(o._skip_key(mv), "Movie.mkv")     # basename WITH extension (movies.next_due key)
-        self.assertEqual(o._skip_key(tv), "S02E10")        # p.ep
+        # TV is namespaced by show — a bare "S02E10" would collide across the round-robin
+        self.assertEqual(o._skip_key(tv), "The Office" + o.TV_KEY_SEP + "S02E10")
 
     def test_process_defers_before_resolve_when_quiet(self):
         o = orch.Orchestrator(); o._enabled = True
@@ -705,7 +706,8 @@ class QuietMode(unittest.TestCase):
         self.assertIn("Screen Control", o.state["message"])
 
     def test_next_episode_skips_resolve_deferred(self):
-        o = orch.Orchestrator(); o._resolve_deferred = {"S02E10"}
+        o = orch.Orchestrator()
+        o._resolve_deferred = {o._skip_key(episode_paths("The Office", "S02E10", SRC))}
         def eq(ref, skip=()):
             nxt = None if "S02E10" in skip else {"ep": "S02E10", "source_name": SRC}
             return {"next": nxt, "done_count": 1, "source_count": 1}
@@ -783,24 +785,25 @@ class ResolveStall(unittest.TestCase):
         run = lambda st, *_a, **_k: (False, "resolve failed (rc=1)") if st == "resolve" else (True, "ok")
         self._run_process(o, p, run)
         self.assertFalse(o._stall_active)                  # one failure is NOT a stall
-        self.assertNotIn("S02E10", o._resolve_stall)       # not buffered — the same item retries
-        self.assertEqual(o._resolve_fails.get("S02E10"), 1)
+        self.assertNotIn(o._skip_key(p), o._resolve_stall)  # not buffered — the same item retries
+        self.assertEqual(o._resolve_fails.get(o._skip_key(p)), 1)
         self.assertEqual(o._parked, set())
 
     def test_buffering_starts_only_after_the_trigger_attempts(self):
         o = orch.Orchestrator(); o._enabled = True
         p = episode_paths("The Office", "S02E10", SRC)
-        o._resolve_fails[p.ep] = orch.STALL_TRIGGER_ATTEMPTS - 1   # this failure is the Nth in a row
+        o._resolve_fails[o._skip_key(p)] = orch.STALL_TRIGGER_ATTEMPTS - 1   # this failure is the Nth in a row
         run = lambda st, *_a, **_k: (False, "resolve failed (rc=1): update available") if st == "resolve" else (True, "ok")
         self._run_process(o, p, run)
         self.assertTrue(o._stall_active)                   # confirmed stall → buffer-ahead mode on
-        self.assertIn("S02E10", o._resolve_stall)          # HELD before Resolve, not parked
+        self.assertIn(o._skip_key(p), o._resolve_stall)          # HELD before Resolve, not parked
         self.assertEqual(o._parked, set())
         self.assertEqual(o._fail_counts, {})               # a resolve fail doesn't use the generic streak
         self.assertEqual(o._finish_q.qsize(), 0)           # a failed resolve never hands off
 
     def test_next_episode_skips_resolve_stalled_items(self):
-        o = orch.Orchestrator(); o._resolve_stall = {"S02E10"}
+        o = orch.Orchestrator()
+        o._resolve_stall = {o._skip_key(episode_paths("The Office", "S02E10", SRC))}
         def eq(ref, skip=()):
             nxt = None if "S02E10" in skip else {"ep": "S02E10", "source_name": SRC}
             return {"next": nxt, "done_count": 1, "source_count": 1}
@@ -820,13 +823,15 @@ class ResolveStall(unittest.TestCase):
         run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
         self._run_process(o, p, run)
         self.assertEqual(ran, [])                          # Resolve NOT attempted (would hang to timeout)
-        self.assertIn("S02E10", o._resolve_stall)          # just buffered
+        self.assertIn(o._skip_key(p), o._resolve_stall)          # just buffered
         self.assertEqual(o._resolve_fails, {})             # it never failed → no count against it
 
     def test_probe_item_retries_resolve_and_recovers_on_success(self):
         o = orch.Orchestrator(); o._enabled = True
-        o._stall_active = True; o._resolve_stall = {"S02E09"}; o._stall_probe = "S02E10"   # designated probe
         p = episode_paths("The Office", "S02E10", SRC)
+        o._stall_active = True
+        o._resolve_stall = {o._skip_key(episode_paths("The Office", "S02E09", SRC))}
+        o._stall_probe = o._skip_key(p)                    # designated probe
         ran = []
         run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
         self._run_process(o, p, run)
@@ -846,7 +851,7 @@ class ResolveStall(unittest.TestCase):
     def test_persistently_failing_item_parks_after_the_cap(self):
         o = orch.Orchestrator(); o._enabled = True; o._stall_active = True
         p = episode_paths("The Office", "S02E10", SRC)
-        o._resolve_fails[p.ep] = orch.STALL_MAX_ITEM_RETRIES - 1   # one more fail → genuinely bad file
+        o._resolve_fails[o._skip_key(p)] = orch.STALL_MAX_ITEM_RETRIES - 1   # one more fail → genuinely bad file
         o._on_resolve_failure(p, "S02E10", "resolve failed (rc=1)")
         self.assertIn(o._skip_key(p), o._parked)                  # parked, not held forever
         self.assertNotIn("S02E10", o._resolve_stall)
@@ -1151,7 +1156,7 @@ class FinisherOverlap(unittest.TestCase):
     def test_next_episode_skips_in_finisher_items(self):
         o = orch.Orchestrator()
         with o._finisher_lock:
-            o._in_finisher.add("S02E10")
+            o._in_finisher.add(o._skip_key(episode_paths("The Office X", "S02E10", SRC)))
         def eq(ref, skip=()):
             nxt = None if "S02E10" in skip else {"ep": "S02E10", "source_name": SRC}
             return {"next": nxt, "done_count": 1, "source_count": 1}
@@ -1178,12 +1183,12 @@ class FinisherOverlap(unittest.TestCase):
     def test_finisher_failure_counts_and_parks(self):
         o = orch.Orchestrator(); o._enabled = True
         p = self._ep()
-        o._fail_counts[p.ep] = orch.MAX_EPISODE_FAILS - 1
+        o._fail_counts[o._skip_key(p)] = orch.MAX_EPISODE_FAILS - 1
         with mock.patch.object(orch, "stage_done", return_value=False), \
              mock.patch.object(o, "_reclaim_for_pipeline"):
             o._finish_item(p, lambda st, *_a, **_k: (False, "x265 exploded"))
         self.assertIn(o._skip_key(p), o._parked)                  # threshold reached → parked
-        self.assertNotIn(p.ep, o._fail_counts)
+        self.assertNotIn(o._skip_key(p), o._fail_counts)
 
     def test_finisher_abort_is_not_a_failure(self):
         o = orch.Orchestrator(); o._enabled = True
@@ -1204,7 +1209,7 @@ class FinisherOverlap(unittest.TestCase):
     def test_low_disk_gates_on_physical_free_while_finishing(self):
         o = orch.Orchestrator()
         with o._finisher_lock:
-            o._in_finisher.add("S02E10")
+            o._in_finisher.add(o._skip_key(episode_paths("The Office X", "S02E10", SRC)))
         with mock.patch.object(o, "_quiet_mode", return_value=False), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
              mock.patch.object(orch.scratch, "physical_free_gb", return_value=100):
@@ -1308,7 +1313,7 @@ class FinisherResume(unittest.TestCase):
         with mock.patch.object(o, "_drop_topaz_intermediates"), \
              mock.patch.object(o, "_advance_cadence_at_handoff"):
             o._hand_to_finisher(p)
-        o._fail_counts[p.ep] = orch.MAX_EPISODE_FAILS - 1
+        o._fail_counts[o._skip_key(p)] = orch.MAX_EPISODE_FAILS - 1
         with mock.patch.object(orch, "stage_done", return_value=False), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
              mock.patch.object(o, "_save_cadence"):
@@ -1625,7 +1630,7 @@ class ResolveGate(unittest.TestCase):
              mock.patch.object(orch.time, "sleep"):
             o._finish_item(p, fake_run)
         self.assertEqual(calls, ["remux", "remux"])              # pause → retry in place
-        self.assertEqual(o._fail_counts.get(p.ep), 1)            # only the REAL failure counted
+        self.assertEqual(o._fail_counts.get(o._skip_key(p)), 1)            # only the REAL failure counted
 
     def test_process_holds_resolve_until_remux_clears(self):
         o = orch.Orchestrator(); o._enabled = True
@@ -1848,3 +1853,45 @@ class AbandonSeries(unittest.TestCase):
             res = o.abandon_series("Old")
         self.assertEqual(res["dropped"], [])
         self.assertEqual(o._finish_q.qsize(), 1)      # a movie whose TITLE matches survives
+
+
+class SkipKeyNamespacing(unittest.TestCase):
+    """A bare "S01E01" collides across the round-robin: one show's in-flight or parked
+    episode silently suppressed another show's same-numbered one, and they shared the
+    fail counter that parks an episode after 5 failures."""
+
+    def _ep(self, show, ep):
+        return episode_paths(show, ep, f"{show}.{ep}.mkv", scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+
+    def test_same_episode_of_two_shows_has_distinct_keys(self):
+        o = orch.Orchestrator()
+        a, b = self._ep("Lost (2004)", "S01E01"), self._ep("Arrested Development", "S01E01")
+        self.assertNotEqual(o._skip_key(a), o._skip_key(b))
+
+    def test_descriptor_key_mirrors_the_paths_key(self):
+        o = orch.Orchestrator()
+        p = self._ep("Lost (2004)", "S02E07")
+        self.assertEqual(o._desc_skip_key(o._finisher_descriptor(p)), o._skip_key(p))
+
+    def test_movies_and_youtube_keys_are_unchanged(self):
+        o = orch.Orchestrator()
+        mv = orch.movie_paths("Film.mkv", "/Media/Movies", title="Film")
+        yt = youtube_paths("Chan", "Chan/v [abcdefghijk]/v [abcdefghijk].mp4", scratch_dir="/tmp")
+        self.assertEqual(o._skip_key(mv), "Film.mkv")            # basename WITH extension
+        self.assertNotIn(o.TV_KEY_SEP, o._skip_key(yt))          # globally-unique stem
+
+    def test_tv_skip_only_yields_this_shows_episodes(self):
+        o = orch.Orchestrator()
+        skip = {o._skip_key(self._ep("Lost (2004)", "S01E01")),
+                o._skip_key(self._ep("Arrested Development", "S01E01")),
+                o._skip_key(self._ep("Arrested Development", "S02E05")),
+                "Some Movie.mkv"}                                 # a movie key must be ignored
+        self.assertEqual(o._tv_skip("Lost (2004)", skip), {"S01E01"})
+        self.assertEqual(o._tv_skip("Arrested Development", skip), {"S01E01", "S02E05"})
+        self.assertEqual(o._tv_skip("Never Queued", skip), set())
+
+    def test_fail_counts_do_not_bleed_between_shows(self):
+        o = orch.Orchestrator()
+        a, b = self._ep("Lost (2004)", "S01E01"), self._ep("Arrested Development", "S01E01")
+        o._fail_counts[o._skip_key(a)] = orch.MAX_EPISODE_FAILS - 1
+        self.assertEqual(o._fail_counts.get(o._skip_key(b), 0), 0)   # B starts clean

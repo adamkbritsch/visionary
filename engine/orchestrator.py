@@ -639,11 +639,11 @@ class Orchestrator:
         self._parked = set()                   # episodes skipped after repeated failures (this run)
         self._resolve_deferred = set()         # items topaz'd but held before Resolve by QUIET MODE (in-memory;
                                                # self-heals each run — re-encountered items re-add themselves)
-        self._fail_counts = {}                 # ep -> consecutive genuine-failure count
+        self._fail_counts = {}                 # skip-key -> consecutive genuine-failure count
         self._resolve_stall = set()            # items topaz'd but HELD before a STALLED Resolve (its update
                                                # prompt): buffered ahead down to STALL_FLOOR_GB, drained when
                                                # Resolve recovers. In-memory; self-heals each run.
-        self._resolve_fails = {}               # ep -> that item's consecutive Resolve-failure count (drives
+        self._resolve_fails = {}               # skip-key -> consecutive Resolve-failure count (drives
                                                # the fluke-retry trigger; parks a genuinely bad file at cap)
         self._stall_active = False             # True once STALL_TRIGGER_ATTEMPTS confirm a real Resolve
                                                # stall — gates buffer-ahead mode until the prompt is cleared
@@ -870,7 +870,7 @@ class Orchestrator:
                     for st in (self._in_finisher, self._in_finisher_movies, self._draining,
                                self._resolve_stall, self._resolve_deferred, self._parked):
                         st.discard(k)
-                    self._fail_counts.pop(p.ep, None)
+                    self._fail_counts.pop(self._skip_key(p), None)
                 sweep.append(p.source_basename)
             gone = [cid for cid, d in self._finisher_persisted.items()
                     if d.get("kind") == "episode" and d.get("series") == show]
@@ -962,9 +962,13 @@ class Orchestrator:
 
     @staticmethod
     def _desc_skip_key(d: dict) -> str:
-        """The selection skip-key a descriptor maps to — mirrors _skip_key(p): movies key on the
-        basename-with-extension, TV/YouTube on the stem (p.ep)."""
-        return d.get("source_basename") if d.get("kind") == "movie" else d.get("ep")
+        """The selection skip-key a descriptor maps to — MIRRORS _skip_key(p): movies key on
+        the basename-with-extension, YouTube on the stem, TV on show+episode."""
+        if d.get("kind") == "movie":
+            return d.get("source_basename")
+        if d.get("kind") == "youtube":
+            return d.get("ep")
+        return f"{d.get('series')}{Orchestrator.TV_KEY_SEP}{d.get('ep')}"
 
     @classmethod
     def _desc_cid(cls, d: dict) -> str:
@@ -1385,7 +1389,7 @@ class Orchestrator:
         keeps moving. A parked YouTube video restarts its cadence (it spent no TV turn). Shared by the
         generic download/topaz fail path and the Resolve-stall path (a truly unrenderable file)."""
         self._parked.add(self._skip_key(p))
-        self._fail_counts.pop(p.ep, None)
+        self._fail_counts.pop(self._skip_key(p), None)
         if p.youtube:                     # a parked video SPENT its YouTube turn — restart the cadence
             with self._cadence_lock:      # so the gate doesn't serve another video with no intervening TV
                 self._tv_since_yt = 0
@@ -1403,11 +1407,11 @@ class Orchestrator:
         failure is a probe result → just re-hold. A file that keeps failing even across recoveries (bad
         file, not the prompt) parks at STALL_MAX_ITEM_RETRIES so it can't loop forever."""
         key = self._skip_key(p)
-        n = self._resolve_fails.get(p.ep, 0) + 1
-        self._resolve_fails[p.ep] = n
+        n = self._resolve_fails.get(self._skip_key(p), 0) + 1
+        self._resolve_fails[self._skip_key(p)] = n
         if n >= STALL_MAX_ITEM_RETRIES:                 # this file itself is the problem, not Resolve
             self._resolve_stall.discard(key)
-            self._resolve_fails.pop(p.ep, None)
+            self._resolve_fails.pop(self._skip_key(p), None)
             if self._stall_active and not self._resolve_stall:
                 self._stall_active = False              # parked the last held item → leave stall mode
             self._park_item(p, ep_disp, n, "resolve", last_msg)
@@ -1725,6 +1729,12 @@ class Orchestrator:
                 pass
             self._sleep(15 if did else 60)                        # tight while working, relaxed when full/idle
 
+    def _tv_skip(self, ref, skip):
+        """The bare episode keys `series.episode_queue(ref)` matches — only THIS show's,
+        de-namespaced. Without the filter, another show's S01E01 would suppress this one's."""
+        pre = f"{ref}{self.TV_KEY_SEP}"
+        return {k[len(pre):] for k in skip if isinstance(k, str) and k.startswith(pre)}
+
     def _midpipeline_tv(self, skip):
         """The active-series next episode IF it's already PART-PROCESSED on disk — its topaz
         segments dir exists or a DV render is present, so only resolve+remux remain. Returns
@@ -1734,7 +1744,7 @@ class Orchestrator:
         movie — the next episode is fresh once this one uploads."""
         for ref in self._participants():
             try:
-                nxt = series.episode_queue(ref, skip=skip).get("next")
+                nxt = series.episode_queue(ref, skip=self._tv_skip(ref, skip)).get("next")
             except Exception:
                 continue
             if not nxt:
@@ -1802,7 +1812,7 @@ class Orchestrator:
             saw_files = False
             for off in range(n):
                 ref = parts[(rot + off) % n]
-                q = series.episode_queue(ref, skip=skip)
+                q = series.episode_queue(ref, skip=self._tv_skip(ref, skip))
                 nxt = q.get("next")
                 if nxt:
                     return episode_paths(ref, nxt["ep"], nxt["source_name"],
@@ -1844,10 +1854,21 @@ class Orchestrator:
         self.state.update(stage=None, progress=None, current=None,
             message=f"{ep_disp}: Screen Control off — deferred before Resolve (screen stays yours)")
 
+    # Two shows both have an "S01E01", so a bare episode key COLLIDES across the
+    # round-robin: one show's in-flight/parked episode silently suppressed the other's
+    # same-numbered one, and the fail counter that parks an episode was shared too.
+    # TV keys are therefore namespaced by show. NUL is the separator because it is the one
+    # byte that cannot appear in a filename or a show directory name.
+    TV_KEY_SEP = "\x00"
+
     def _skip_key(self, p) -> str:
-        """The id the queue skip= sets (movies.next_due / youtube.next_due / series.episode_queue) match
-        against: movies key on the basename WITH extension, TV/YouTube on p.ep (the stem)."""
-        return p.source_basename if p.movie else p.ep
+        """The id the queue skip= sets match against: movies key on the basename WITH
+        extension, YouTube on its (globally unique) stem, TV on show+episode."""
+        if p.movie:
+            return p.source_basename
+        if p.youtube:
+            return p.ep
+        return f"{p.series}{self.TV_KEY_SEP}{p.ep}"
 
     def _participants(self):
         """The active TV series (round-robin peers — one episode each per rotation). YouTube is NOT
@@ -1924,9 +1945,9 @@ class Orchestrator:
             # which would otherwise put multi-line junk in the UI status.
             self.state.update(message=" ".join(f"{ep_disp}: {st} — {msg}".split()), progress=None)
             if ok:
-                self._fail_counts.pop(p.ep, None)   # any forward progress clears the fail streak
+                self._fail_counts.pop(self._skip_key(p), None)   # any forward progress clears the fail streak
                 if st == "resolve":
-                    self._resolve_fails.pop(p.ep, None)
+                    self._resolve_fails.pop(self._skip_key(p), None)
                     if self._stall_active:          # Resolve works again → release the whole buffer to drain
                         self._resolve_recovered()
             if not ok:
@@ -1946,8 +1967,8 @@ class Orchestrator:
                     # stall, hold it and buffer the next upscales (down to STALL_FLOOR_GB) instead of parking.
                     self._on_resolve_failure(p, ep_disp, msg)
                     return
-                n = self._fail_counts.get(p.ep, 0) + 1
-                self._fail_counts[p.ep] = n
+                n = self._fail_counts.get(self._skip_key(p), 0) + 1
+                self._fail_counts[self._skip_key(p)] = n
                 if n >= MAX_EPISODE_FAILS:
                     self._park_item(p, ep_disp, n, st, msg)   # movies key on basename (see _skip_key)
                     self._sleep(5)
@@ -2266,7 +2287,7 @@ class Orchestrator:
             if ok:
                 if lane == 1:
                     self._fin_elapsed_done(ekey)
-                self._fail_counts.pop(p.ep, None)     # forward progress clears the fail streak
+                self._fail_counts.pop(self._skip_key(p), None)     # forward progress clears the fail streak
             elif lane == 1:
                 self._fin_elapsed_pause()
             if ok and st == "upload":   # now has a DV master → COMPLETION side-effects only
@@ -2293,11 +2314,11 @@ class Orchestrator:
             if not ok:
                 if self._finish_abort.is_set() or not self._enabled:
                     return                                # stop/pause abort — not an episode failure
-                n = self._fail_counts.get(p.ep, 0) + 1
-                self._fail_counts[p.ep] = n
+                n = self._fail_counts.get(self._skip_key(p), 0) + 1
+                self._fail_counts[self._skip_key(p)] = n
                 if n >= MAX_EPISODE_FAILS:
                     self._parked.add(self._skip_key(p))
-                    self._fail_counts.pop(p.ep, None)
+                    self._fail_counts.pop(self._skip_key(p), None)
                     self._draining.discard(self._skip_key(p))   # left the backlog (parked)
                     with self._cadence_lock:       # finisher thread — never race the run thread
                         self._cadence_advanced.discard(p.source_basename)   # parked: turn spent, done
