@@ -68,14 +68,25 @@ def parse_episodes(names, dv_map=None, watched_map=None) -> list:
     return [eps[k] for k in sorted(eps)]
 
 
-def build_queue(names, dv_map=None, watched_map=None, skip=()) -> dict:
+def is_featurette(ep_key: str) -> bool:
+    """Season 00 = specials / featurettes / mobisodes (Lost's "Missing Pieces", cast
+    interviews, behind-the-scenes). They are real, correctly-named SxxExx files — and
+    because "S00" sorts before "S01" they would otherwise be upscaled BEFORE the show
+    itself, which is never what anyone wants."""
+    return str(ep_key or "").upper().startswith("S00")
+
+
+def build_queue(names, dv_map=None, watched_map=None, skip=(), featurettes_last=True) -> dict:
     """Queue = episodes with a non-DV source and no DV anywhere yet. Ordered UNWATCHED-FIRST
     then watched, numeric within each group (do the episodes the user hasn't seen yet before
     the ones they have). With no watched_map it's plain numeric order. `skip` excludes ep keys
     from `next` (e.g. episodes the orchestrator PARKED after repeated failures)."""
     eps = parse_episodes(names, dv_map, watched_map)
     remaining = [e for e in eps if e["has_source"] and not e["has_dv"]]
-    remaining.sort(key=lambda e: 1 if e.get("watched") else 0)   # stable → unwatched, then watched
+    # Sort is STABLE, so numeric order survives inside every group. Featurettes-last
+    # dominates (they belong after the whole show); unwatched-first applies within each.
+    remaining.sort(key=lambda e: ((1 if (featurettes_last and is_featurette(e["ep"])) else 0),
+                                  1 if e.get("watched") else 0))
     nextable = [e for e in remaining if e["ep"] not in skip]
     return {
         "next": nextable[0] if nextable else None,
@@ -85,6 +96,8 @@ def build_queue(names, dv_map=None, watched_map=None, skip=()) -> dict:
         "remaining_count": len(remaining),
         "unwatched_count": sum(1 for e in remaining if not e.get("watched")),
         "done_count": sum(1 for e in eps if e["has_dv"]),
+        # >0 means the show HAS specials, which is what makes the UI toggle relevant
+        "featurette_count": sum(1 for e in eps if is_featurette(e["ep"])),
         "source_count": sum(1 for e in eps if e["has_source"]),
     }
 
@@ -104,13 +117,25 @@ def list_series(*, timeout=20) -> list:
     except ftplib.all_errors:
         return []
     try:
+        global _SERIES_ROOTS
+        fresh, a_root_failed = {}, False
         for root in NAS_FTP_TV_ROOTS:
             try:
                 for n in ftp_listdir(ftp, root):
                     if not n.startswith("."):
-                        _SERIES_ROOTS.setdefault(n, root)
+                        fresh.setdefault(n, root)      # vol1 priority WITHIN this pass
             except ftplib.all_errors:
+                a_root_failed = True                   # keep what we already knew for THAT volume
                 continue
+        # REBUILD rather than setdefault-forever. The old code never updated an existing
+        # entry, so a show MOVED between volumes (or one cached from a pass where its real
+        # volume failed to list) kept a wrong root permanently: the episode walk found
+        # nothing and the run reported "NAS unreachable" forever, with a restart the only
+        # cure (live-caught 2026-08-01 on Lost (2004) after it moved to MediaVolume3).
+        if fresh:
+            merged = dict(_SERIES_ROOTS) if a_root_failed else {}
+            merged.update(fresh)                       # this pass always WINS over stale data
+            _SERIES_ROOTS = merged                     # rebind (atomic for readers)
         return sorted(_SERIES_ROOTS)
     finally:
         try: ftp.quit()
@@ -232,8 +257,13 @@ def episode_queue(series, skip=()) -> dict:
             wm = plex.watched_map(series)
     except Exception:
         wm = None
+    try:
+        import settings
+        feat_last = settings.get_show_featurettes_last(series)
+    except Exception:
+        feat_last = True
     return build_queue(list_episode_files(series), load_dv_manifest(series),
-                       watched_map=wm, skip=skip)
+                       watched_map=wm, skip=skip, featurettes_last=feat_last)
 
 
 # ---- queue cache (so /api/state polling never hits the NAS) ---------------

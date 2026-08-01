@@ -1235,7 +1235,20 @@ class Orchestrator:
                 if ep is None:
                     self.state["current"] = None                 # nothing processing → header falls back to up-next
                     if why == "unreachable":     # NAS listing came back empty — a blip, not 'done'
-                        self.state.update(episode=None, stage=None, message="NAS unreachable — retrying")
+                        # Say WHICH it is. An empty listing has two very different causes and
+                        # the old blanket "NAS unreachable" sent the user hunting a network
+                        # fault while the real problem was a show whose folder yields nothing
+                        # (wrong volume cached, renamed/moved on the NAS). Probe the NAS once:
+                        # if it answers, name the show instead of blaming the network.
+                        msg = "NAS unreachable — retrying"
+                        try:
+                            if series.list_series():          # NAS answered → not a network fault
+                                shows = ", ".join(self._participants()) or "the selected show"
+                                msg = (f"no episodes found for {shows} — check the show's folder "
+                                       f"on the NAS (retrying)")
+                        except Exception:
+                            pass
+                        self.state.update(episode=None, stage=None, message=msg)
                         self._sleep(DRAIN_POLL_SECONDS)
                     elif why == "no-series":
                         self.state.update(episode=None, stage=None, message="no series selected")

@@ -1054,6 +1054,10 @@ private struct TVMode: View {
             }
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
+            if (show.queue?.featurette_count ?? 0) > 0 {
+                FeaturettesLastRow(key: name, on: show.featurettes_last ?? true,
+                                   count: show.queue?.featurette_count ?? 0)
+            }
             UnwatchedFirstRow(key: name, on: show.unwatched_first ?? true)
             NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false,
                       active: active, profile: show.next_up_profile, catalog: catalog,
@@ -1067,6 +1071,24 @@ private struct TVMode: View {
 // Compact per-show checkbox — under each show's preset so it's set per show, not global.
 // A standalone view (not a TVMode method) so the QUEUED follow-up show can carry the same
 // control: it keys on the show NAME, so it is settable before that show is ever active.
+// Season-00 specials (Lost's "Missing Pieces" mobisodes, featurettes) are real SxxExx
+// files, and "S00" sorts before "S01" — so without this they get upscaled BEFORE the show
+// itself. Shown ONLY when the show actually has some (inert noise otherwise).
+private struct FeaturettesLastRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let on: Bool
+    let count: Int
+    var body: some View {
+        Toggle(isOn: Binding(get: { on },
+                             set: { v in Task { await store.setFeaturettesLast(key, v) } })) {
+            Text("Featurettes last").font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+        .help("On: the \(count) season-00 special\(count == 1 ? "" : "s") run after the whole "
+              + "show. Off: they keep numeric order, which puts them FIRST.")
+    }
+}
+
 private struct UnwatchedFirstRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
@@ -1176,6 +1198,9 @@ private struct NextUpRow: View {
                     }
                     NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
+                    if profile?.has_featurettes == true {
+                        FeaturettesLastRow(key: n, on: profile?.featurettes_last ?? true, count: 0)
+                    }
                     UnwatchedFirstRow(key: n, on: profile?.unwatched_first ?? true)
                 }
                 .padding(.leading, 20)      // nested under the up-next line — these are ITS settings

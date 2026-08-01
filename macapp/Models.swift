@@ -78,6 +78,7 @@ struct QueueDTO: Codable {
     var unwatched_count: Int?
     var done_count: Int?
     var source_count: Int?
+    var featurette_count: Int?     // season-00 specials; >0 makes the "Featurettes last" toggle relevant
 }
 
 /// Per-show settings that apply to ANY show — active, or merely queued as a slot's
@@ -86,6 +87,8 @@ struct ShowSettingsDTO: Codable {
     var preset: String?
     var configured: Bool?
     var unwatched_first: Bool?
+    var featurettes_last: Bool?
+    var has_featurettes: Bool?
     var normalize_audio: Bool?
     var replace_source: Bool?
 }
@@ -95,6 +98,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var preset: String?
     var configured: Bool?
     var unwatched_first: Bool?
+    var featurettes_last: Bool?   // per-show: season-00 specials go after the whole show
     var normalize_audio: Bool?    // per-show loudness-boost gate (default on)
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
     var next_up: String?          // show queued to take this slot when this one finishes

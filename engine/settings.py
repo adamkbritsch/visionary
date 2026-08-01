@@ -286,6 +286,18 @@ def set_show_normalize_audio(key: str, value) -> bool:
     return bool(value)
 
 
+def get_show_featurettes_last(key: str) -> bool:
+    """Per-show: process season-00 specials/featurettes AFTER the whole show (True,
+    default) or leave them in numeric order, where "S00" sorts ahead of "S01" and they
+    would be upscaled BEFORE the show itself."""
+    return bool(_show_entry(key).get("featurettes_last", True))
+
+
+def set_show_featurettes_last(key: str, value) -> bool:
+    _update_show(key, featurettes_last=bool(value))
+    return bool(value)
+
+
 def get_show_replace_source(key: str) -> bool:
     """Per-item (TV show / movie title): after the 4K master is VERIFIED on the NAS,
     delete the superseded source (True, default — the output replaces its input) or

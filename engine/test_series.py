@@ -328,3 +328,79 @@ class RealSeasonDirs(unittest.TestCase):
         q = episode_paths("Show", "S03E02", "unwalked.mkv",           # not walked -> convention
                           scratch_dir=self.d, nas_tv_root="/Vol/TV")
         self.assertEqual(q.nas_dir, "/Vol/TV/Show/S03")
+
+
+class SeriesRootCache(unittest.TestCase):
+    """The volume map is REBUILT on each successful listing. The old setdefault-forever
+    behaviour meant a show that MOVED volumes (or was cached from a pass where its real
+    volume failed to list) kept a wrong root permanently — the episode walk then found
+    nothing and the run reported "NAS unreachable" until the app restarted."""
+
+    def setUp(self):
+        self._saved = dict(series._SERIES_ROOTS)
+        series._SERIES_ROOTS = {}
+
+    def tearDown(self):
+        series._SERIES_ROOTS = self._saved
+
+    def _listing(self, per_root, fail=()):
+        def fake(ftp, root):
+            if root in fail:
+                raise series.ftplib.error_perm("550 nope")
+            return per_root.get(root, [])
+        return mock.patch.object(series, "ftp_listdir", side_effect=fake)
+
+    def test_moved_show_follows_its_new_volume(self):
+        V1, V3 = "/Media/TV-Shows", "/MediaVolume3/TV-Shows"
+        with mock.patch.object(series, "ftp_connect", return_value=mock.MagicMock()):
+            with self._listing({V1: ["Lost (2004)"], V3: []}):
+                series.list_series()
+            self.assertEqual(series.series_root("Lost (2004)"), V1)
+            with self._listing({V1: [], V3: ["Lost (2004)"]}):    # moved to vol3
+                series.list_series()
+        self.assertEqual(series.series_root("Lost (2004)"), V3)   # follows it (was stuck on V1)
+
+    def test_vol1_still_wins_a_real_name_collision(self):
+        V1, V3 = "/Media/TV-Shows", "/MediaVolume3/TV-Shows"
+        with mock.patch.object(series, "ftp_connect", return_value=mock.MagicMock()), \
+             self._listing({V1: ["Dup Show"], V3: ["Dup Show"]}):
+            series.list_series()
+        self.assertEqual(series.series_root("Dup Show"), V1)
+
+    def test_a_failed_volume_does_not_forget_its_shows(self):
+        V1, V3 = "/Media/TV-Shows", "/MediaVolume3/TV-Shows"
+        with mock.patch.object(series, "ftp_connect", return_value=mock.MagicMock()):
+            with self._listing({V1: ["A"], V3: ["B"]}):
+                series.list_series()
+            with self._listing({V1: ["A"], V3: []}, fail=(V3,)):   # vol3 unreadable this pass
+                names = series.list_series()
+        self.assertIn("B", names)                                  # kept, not dropped
+        self.assertEqual(series.series_root("B"), V3)
+
+
+class FeaturettesLast(unittest.TestCase):
+    """Season 00 = specials/featurettes. They are real SxxExx files and "S00" sorts before
+    "S01", so by default they would be upscaled BEFORE the show itself."""
+
+    NAMES = ["Lost - S00E17 - Missing Pieces.mkv", "Lost - S00E18 - More Pieces.mkv",
+             "Lost - S01E01 - Pilot.mkv", "Lost - S01E02 - Tabula Rasa.mkv"]
+
+    def test_on_by_default_pushes_specials_to_the_end(self):
+        q = build_queue(self.NAMES)
+        self.assertEqual(q["remaining"], ["S01E01", "S01E02", "S00E17", "S00E18"])
+        self.assertEqual(q["next"]["ep"], "S01E01")     # a REAL episode, not a mobisode
+        self.assertEqual(q["featurette_count"], 2)
+
+    def test_off_restores_plain_numeric_order(self):
+        q = build_queue(self.NAMES, featurettes_last=False)
+        self.assertEqual(q["remaining"], ["S00E17", "S00E18", "S01E01", "S01E02"])
+        self.assertEqual(q["next"]["ep"], "S00E17")
+
+    def test_zero_count_when_a_show_has_no_specials(self):
+        self.assertEqual(build_queue(self.NAMES[2:])["featurette_count"], 0)
+
+    def test_unwatched_first_still_applies_within_each_group(self):
+        watched = {"Lost - S01E01 - Pilot.mkv": True}          # S01E01 already seen
+        q = build_queue(self.NAMES, watched_map=watched)
+        self.assertEqual(q["remaining"], ["S01E02", "S01E01", "S00E17", "S00E18"])
+        self.assertTrue(all(series.is_featurette(e) for e in q["remaining"][-2:]))
