@@ -1763,3 +1763,88 @@ class MasterNaming(unittest.TestCase):
                           scratch_dir="/tmp")
         self.assertIn("x264", os.path.basename(p.final))       # NOT retagged
         self.assertIn("1080p", os.path.basename(p.final))
+
+
+class AbandonSeries(unittest.TestCase):
+    """Swapping a show out of its slot must switch COMPLETELY. Changing the slot only
+    redirected the RUN thread's next pick; the finisher kept working the old show's remux
+    (and its durable list would re-queue it after a restart)."""
+
+    def _orch(self):
+        o = orch.Orchestrator()
+        o._enabled = True
+        return o
+
+    def _ep(self, show, ep):
+        return episode_paths(show, ep, f"{show}.{ep}.mkv", scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+
+    def test_drops_queued_items_of_that_show_only(self):
+        o = self._orch()
+        old_a, old_b = self._ep("Old", "S01E01"), self._ep("Old", "S01E02")
+        keeper = self._ep("Keep", "S01E01")
+        for p in (old_a, keeper, old_b):
+            o._finish_q.put(p); o._in_finisher.add(o._skip_key(p))
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_series("Old")
+        self.assertEqual(sorted(res["dropped"]), ["S01E01", "S01E02"])
+        left = []
+        while not o._finish_q.empty():
+            left.append(o._finish_q.get_nowait())
+        self.assertEqual([p.series for p in left], ["Keep"])          # the other show survives
+        self.assertNotIn("S01E02", o._in_finisher)
+        self.assertIn(o._skip_key(keeper), o._in_finisher)
+
+    def test_aborts_the_in_flight_run_item(self):
+        o = self._orch()
+        o._current_paths = self._ep("Old", "S01E03")
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_series("Old")
+        self.assertTrue(res["aborted_run"])
+        self.assertTrue(o._abort.is_set())
+
+    def test_leaves_a_different_shows_run_item_alone(self):
+        o = self._orch()
+        o._current_paths = self._ep("Keep", "S01E03")
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_series("Old")
+        self.assertFalse(res["aborted_run"])
+        self.assertFalse(o._abort.is_set())
+
+    def test_aborts_a_lane_mid_remux_for_that_show(self):
+        o = self._orch()
+        o.state["finishing"] = {"ep": "S01E01", "stage": "remux", "series": "Old",
+                                "source": "Old.S01E01.mkv"}
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_series("Old")
+        self.assertTrue(res["aborted_finisher"])
+        self.assertTrue(o._finish_abort.is_set())
+
+    def test_does_not_abort_a_lane_working_another_show(self):
+        o = self._orch()
+        o.state["finishing"] = {"ep": "S01E01", "stage": "remux", "series": "Keep",
+                                "source": "Keep.S01E01.mkv"}
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_series("Old")
+        self.assertFalse(res["aborted_finisher"])
+        self.assertFalse(o._finish_abort.is_set())
+
+    def test_clears_the_durable_worklist_so_it_cannot_come_back(self):
+        o = self._orch()
+        o._finisher_persisted = {
+            "a": {"kind": "episode", "series": "Old", "ep": "S01E01"},
+            "b": {"kind": "episode", "series": "Keep", "ep": "S01E01"},
+            "c": {"kind": "movie", "ep": "Some Movie"},
+        }
+        with mock.patch.object(o, "_save_finisher_persisted_locked"), \
+             mock.patch.object(orch.threading, "Thread"):
+            o.abandon_series("Old")
+        self.assertEqual(sorted(o._finisher_persisted), ["b", "c"])   # movies untouched
+
+    def test_movies_and_youtube_are_never_collateral(self):
+        o = self._orch()
+        mv = orch.movie_paths("Film.mkv", "/Media/Movies", title="Old")   # series == TITLE
+        o._finish_q.put(mv); o._in_finisher.add(o._skip_key(mv))
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_series("Old")
+        self.assertEqual(res["dropped"], [])
+        self.assertEqual(o._finish_q.qsize(), 1)      # a movie whose TITLE matches survives

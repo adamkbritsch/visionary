@@ -386,6 +386,7 @@ def api_select(name, action="set", index=0):
     """Pick a series. action: 'at' = put it in round-robin slot `index` (replace or append — the
     per-slot picker); 'set' = make it the SOLE series (resets the round-robin); 'add' = append;
     'remove' = drop it."""
+    before = set(series.get_active_series())
     if action == "at":
         series.set_series_at(index, name); series.refresh_queue(name)
     elif action == "add":
@@ -394,6 +395,12 @@ def api_select(name, action="set", index=0):
         series.remove_series(name)
     else:
         series.set_selection(name); series.refresh_queue(name)
+    # Bailing on a show must switch COMPLETELY: drop its in-flight item, everything queued
+    # behind the finisher, and its durable entries — otherwise the finisher keeps grinding
+    # the old show's ~1 h remux while the newly-picked show waits (user-caught).
+    for gone in (before - set(series.get_active_series())):
+        try: orchestrator.ORCH.abandon_series(gone)
+        except Exception: pass
     sel = series.get_selection()
     return {"selected": sel, "active": series.get_active_series(),
             "queue": series.cached_queue(sel) if sel else None}

@@ -592,6 +592,7 @@ class Orchestrator:
                                                # background pull of the item the run thread is about to process
                                                # itself (at normal priority) — so the overlap never waits out a
                                                # slow low-prio prefetch of its own current item (see _claim_prefetched)
+        self._current_paths = None             # the in-flight EpisodePaths (abandon_series discards it)
         self._current_skip_key = None          # skip-key of the item the run thread is processing NOW — the
                                                # prefetcher excludes it so it never competes for the current item
         self._plex_errs = 0                    # consecutive Plex-check failures (tolerate a couple of blips)
@@ -824,6 +825,84 @@ class Orchestrator:
             self._abort.set()
             return True
         return False
+
+    def abandon_series(self, show: str) -> dict:
+        """The user swapped this show OUT of its slot — stop working on it ENTIRELY.
+
+        Changing the slot only redirected what the RUN thread picked NEXT; the finisher
+        kept grinding through the old show's ~1 h remux (and its durable work-list would
+        re-queue it after any restart), so "switch shows" didn't actually switch
+        (user-caught 2026-08-01). This drops the whole show: the in-flight run item, every
+        item queued behind the finisher, the durable entries, and any lane mid-remux.
+
+        Work already UPLOADED is untouched — only unfinished work is discarded. Scratch
+        files are swept a few seconds later, once the aborted encoders have actually died."""
+        result = {"show": show, "aborted_run": False, "aborted_finisher": False, "dropped": []}
+        if not show:
+            return result
+        sweep = []                      # source basenames whose scratch files to discard
+
+        # --- the RUN thread's in-flight item -------------------------------------------
+        cp = self._current_paths
+        if cp is not None and not cp.movie and not cp.youtube and cp.series == show:
+            self._abort.set()           # kills the live download/topaz/resolve within ~0.5 s
+            sweep.append(cp.source_basename)
+            result["aborted_run"] = True
+
+        # --- the finisher: queued items + the durable work-list -------------------------
+        with self._finisher_lock:
+            keep = []
+            while True:
+                try:
+                    p = self._finish_q.get_nowait()
+                except queue.Empty:
+                    break
+                (keep if (p.movie or p.youtube or p.series != show) else result["dropped"]).append(p)
+            for p in keep:
+                self._finish_q.put(p)
+            # A TV skip-key is just the episode number (_skip_key -> p.ep), so two shows'
+            # "S01E01" COLLIDE. Only release a key no surviving item still needs, or
+            # abandoning one show would un-track another show's same-numbered episode.
+            keep_keys = {self._skip_key(p) for p in keep}
+            for p in result["dropped"]:
+                k = self._skip_key(p)
+                if k not in keep_keys:
+                    for st in (self._in_finisher, self._in_finisher_movies, self._draining,
+                               self._resolve_stall, self._resolve_deferred, self._parked):
+                        st.discard(k)
+                    self._fail_counts.pop(p.ep, None)
+                sweep.append(p.source_basename)
+            gone = [cid for cid, d in self._finisher_persisted.items()
+                    if d.get("kind") == "episode" and d.get("series") == show]
+            for cid in gone:            # durable list, or _finisher_reconcile re-queues it
+                self._finisher_persisted.pop(cid, None)
+            if gone:
+                self._save_finisher_persisted_locked()
+
+        # --- a lane MID-remux/upload for this show --------------------------------------
+        for key in ("finishing", "finishing2"):
+            lane = self.state.get(key) or {}
+            if lane.get("series") == show and not lane.get("movie") and not lane.get("youtube"):
+                self._finish_abort.set()        # the x265/upload stops within seconds
+                if lane.get("source"):
+                    sweep.append(lane["source"])
+                result["aborted_finisher"] = True
+
+        result["dropped"] = [p.ep for p in result["dropped"]]
+        if sweep:
+            # DELAYED: an aborted ffmpeg/x265 needs a moment to exit, and discard_workfiles
+            # deliberately refuses to touch whatever state['current'] still points at.
+            def _sweep_later(names):
+                time.sleep(8)
+                for n in names:
+                    try: discard_workfiles(n)
+                    except Exception: pass
+            threading.Thread(target=_sweep_later, args=(list(dict.fromkeys(sweep)),),
+                             daemon=True).start()
+        if result["aborted_run"] or result["aborted_finisher"] or result["dropped"]:
+            logbook.event(f"abandoned {show}: run={result['aborted_run']} "
+                          f"finisher={result['aborted_finisher']} dropped={result['dropped']}")
+        return result
 
     def reclaim_screen(self) -> bool:
         """QUIET MODE just turned ON: if an item is MID-RESOLVE (Resolve has the screen), abort it so the
@@ -1782,6 +1861,8 @@ class Orchestrator:
         # State/messages use the DISPLAY form of the id (a YouTube stem carries wire encoding).
         ep_disp = transfer.display_name(p.ep)
         self._current_skip_key = self._skip_key(p)   # the prefetcher excludes this item (we download it now)
+        self._current_paths = p                      # abandon_series needs the real paths (state's
+                                                     # item_view carries DISPLAY names, not wire ones)
         self.state.update(episode=ep_disp, current=p.item_view(), message=f"working {p.series} {ep_disp}")
         self._claim_prefetched(p)      # pull any prefetched source+CFR from the buffer into main scratch
         p = apply_container(p)         # resume: if the source is already on disk, lock its container
@@ -2148,7 +2229,10 @@ class Orchestrator:
             if stage_done(st, p):
                 continue
             self._reclaim_for_pipeline()   # same pipeline>queue guarantee for the finisher's writes
-            self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast}
+            self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast,
+                                   # so abandon_series can tell whose work this lane is doing
+                                   "series": p.series, "source": p.source_basename,
+                                   "movie": bool(p.movie), "youtube": bool(p.youtube)}
             if lane == 1:
                 ekey = p.source_basename + "|" + st
                 self._fin_elapsed_begin(ekey)
@@ -2168,7 +2252,10 @@ class Orchestrator:
                         time.sleep(5)
                     if not self._enabled or self._finish_abort.is_set():
                         return
-                    self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast}
+                    self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast,
+                                   # so abandon_series can tell whose work this lane is doing
+                                   "series": p.series, "source": p.source_basename,
+                                   "movie": bool(p.movie), "youtube": bool(p.youtube)}
                     ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog,
                                         should_pause=self._resolve_active.is_set)
                     if not ok and str(msg).startswith("paused:"):
