@@ -1895,3 +1895,40 @@ class SkipKeyNamespacing(unittest.TestCase):
         a, b = self._ep("Lost (2004)", "S01E01"), self._ep("Arrested Development", "S01E01")
         o._fail_counts[o._skip_key(a)] = orch.MAX_EPISODE_FAILS - 1
         self.assertEqual(o._fail_counts.get(o._skip_key(b), 0), 0)   # B starts clean
+
+
+class DesktopPowerGate(unittest.TestCase):
+    """A Mac with no battery is mains-powered by definition. It also has no
+    AppleSmartBattery, so read_power() reports external_connected=False — without the
+    short-circuit the run gate pauses a Mac Studio FOREVER 'waiting for the 140 W adapter'
+    and the power monitor aborts every stage it starts."""
+
+    def test_no_battery_runs_even_with_no_adapter_reading(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.power, "has_battery", return_value=False), \
+             mock.patch.object(orch.power, "read_power",
+                               return_value=orch.power.PowerReading(False, False, -1, 0)), \
+             mock.patch.object(orch.power, "adapter_watts", return_value=None):
+            status, msg = o._power_ok()
+        self.assertEqual(status, "run")
+        self.assertIsNone(msg)
+
+    def test_laptop_on_battery_still_pauses(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.power, "has_battery", return_value=True), \
+             mock.patch.object(orch.power, "read_power",
+                               return_value=orch.power.PowerReading(False, False, 80, -1200)), \
+             mock.patch.object(orch.power, "adapter_watts", return_value=None):
+            status, msg = o._power_ok()
+        self.assertEqual(status, "pause")
+        self.assertIn("battery", msg)
+
+    def test_laptop_on_a_small_brick_still_pauses(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.power, "has_battery", return_value=True), \
+             mock.patch.object(orch.power, "read_power",
+                               return_value=orch.power.PowerReading(True, True, 80, 500)), \
+             mock.patch.object(orch.power, "adapter_watts", return_value=96):
+            status, msg = o._power_ok()
+        self.assertEqual(status, "pause")
+        self.assertIn("96", msg)

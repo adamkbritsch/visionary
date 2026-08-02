@@ -1158,6 +1158,13 @@ class Orchestrator:
         BRICK, nothing else: on the >= min_adapter_watts (140 W) adapter → run, even if the
         battery dips under load; a lesser brick or battery → full passive pause (the run
         loop also releases caffeinate, so nothing holds the screen awake while waiting)."""
+        # A machine with NO BATTERY (Mac mini/Studio/iMac) is mains-powered by definition,
+        # and the wattage rule is about a battery draining under load. It also has no
+        # AppleSmartBattery, so read_power() reports external_connected=False — without
+        # this short-circuit a desktop Mac pauses FOREVER "waiting for the 140 W adapter"
+        # and never processes a single episode.
+        if not power.has_battery():
+            return "run", None
         r = power.read_power()
         if not r.external_connected:
             return "pause", "paused — on battery (waiting for the 140 W adapter)"
@@ -1224,8 +1231,11 @@ class Orchestrator:
             if any_active:
                 # sufficiency = the brick: unplugged OR a lesser adapter both count as
                 # "no power" for the grace countdown → abort → the run pauses passively.
-                sufficient = (bool(power.read_power().external_connected)
-                              and (power.adapter_watts() or 0) >= self._min_watts())
+                # No battery (desktop Mac) = always sufficient. Otherwise this would see
+                # external_connected=False, count down, and ABORT every stage it ran.
+                sufficient = (not power.has_battery()) or (
+                    bool(power.read_power().external_connected)
+                    and (power.adapter_watts() or 0) >= self._min_watts())
             else:
                 sufficient = True
             action, unplug_since, remaining = unplug_decision(

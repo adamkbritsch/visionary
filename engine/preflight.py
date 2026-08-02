@@ -147,23 +147,44 @@ def _display_via_system_profiler():
 
 
 def match_display(px_w, px_h, scale, builtin):
-    """PURE (unit-tested). The SUPPORTED_DISPLAYS entry this main display is, or None.
-    `scale` may be None (the system_profiler fallback can't read it) — then only the
-    geometry + builtin flag decide, since every supported config shares the same scale."""
-    for cfg in versions.SUPPORTED_DISPLAYS:
+    """PURE (unit-tested). A descriptor for this main display if it can run the Resolve
+    automation, else None.
+
+    The rule is the BACKING SCALE, not the geometry: dv_shim derives every click from a
+    template match, so a template lands whenever the UI renders at the same pixel size.
+    A named SUPPORTED_DISPLAYS entry is returned when the geometry is one we've actually
+    smoke-tested (nicer message); anything else at 2x passes with a generic name.
+
+    `scale is None` means the system_profiler fallback couldn't read it — the invariant is
+    then UNVERIFIABLE, so only a known-good geometry is accepted (unchanged behaviour)."""
+    for cfg in versions.SUPPORTED_DISPLAYS:      # verified config → name it
         if ((px_w, px_h) == tuple(cfg["backing"]) and bool(builtin) == bool(cfg["builtin"])
                 and (scale is None or abs(scale - cfg["scale"]) < 0.01)):
             return cfg
-    return None
+    if scale is None:
+        return None                              # can't confirm the invariant → refuse
+    if abs(scale - versions.REQUIRED_BACKING_SCALE) >= 0.01:
+        return None
+    min_w, min_h = versions.MIN_LOGICAL_SIZE     # sanity: Resolve's UI must actually fit
+    if (px_w / scale) < min_w or (px_h / scale) < min_h:
+        return None
+    kind = "built-in Retina display" if builtin else (
+        "4K display" if (px_w, px_h) == (3840, 2160) else "external display")
+    return {"name": f"{kind} @{versions.REQUIRED_BACKING_SCALE:g}x ({px_w}x{px_h})",
+            "backing": (px_w, px_h), "scale": scale, "builtin": bool(builtin),
+            "verified": False}
 
 
 def check_display():
-    supported = " or ".join(f"{c['name']} ({c['backing'][0]}x{c['backing'][1]})"
-                            for c in versions.SUPPORTED_DISPLAYS)
-    fix = (f"Visionary's Resolve automation is calibrated to specific displays used as the "
-           f"MAIN display: {supported}. Unplug/stop mirroring to any other external display "
-           f"(or close the lid onto the 4K dummy plug for clamshell); if this Mac isn't a "
-           f"16\" MacBook Pro, it cannot run Visionary.")
+    verified = " or ".join(f"{c['name']} ({c['backing'][0]}x{c['backing'][1]})"
+                           for c in versions.SUPPORTED_DISPLAYS)
+    fix = (f"Visionary's Resolve automation needs the MAIN display to render at "
+           f"{versions.REQUIRED_BACKING_SCALE:g}x backing scale (Retina/HiDPI) — its screen "
+           f"templates only match at that pixel size; the display's SIZE doesn't matter. A "
+           f"built-in Retina panel, a 4K display in its default HiDPI mode, or a 4K dummy "
+           f"HDMI plug (for lid-closed running) all qualify. If your 4K display is set to a "
+           f"1x/'More Space'-style mode, switch it to the default (scaled) mode. "
+           f"Smoke-tested so far: {verified}.")
     try:
         px_w, px_h, scale, builtin = _display_via_coregraphics()
         via = "CoreGraphics"
@@ -174,29 +195,65 @@ def check_display():
         except Exception as e:
             return _check("display", False, "fail", f"could not read display geometry: {e}", fix)
     cfg = match_display(px_w, px_h, scale, builtin)
+    note = ""
+    if cfg:
+        note = f"matched: {cfg['name']}"
+        if not cfg.get("verified", True):        # admitted by the scale rule, not smoke-tested
+            note += " — run `preflight.py --smoke` once to confirm the templates match here"
+    else:
+        note = f"require {versions.REQUIRED_BACKING_SCALE:g}x backing scale (verified: {verified})"
     return _check("display", cfg is not None, "fail",
                   f"main display {px_w}x{px_h} builtin={builtin}"
                   + (f" scale={scale:g}" if scale is not None else "") + f" (via {via}); "
-                  + (f"matched: {cfg['name']}" if cfg else f"require {supported}"), fix)
+                  + note, fix)
 
 
 def check_power_adapter():
-    """The Topaz stage runs the GPU flat-out for hours and needs the 16-inch MBP's full
-    140 W adapter — the 14-inch MBP's 96 W maximum can never satisfy the run-time power
-    gate (the pipeline would hold forever / drain the battery mid-encode). WARN severity:
-    being unplugged during setup is fine; the run-time gate enforces this when it matters."""
+    """The Topaz stage runs the GPU flat-out for hours, so the machine must sustain
+    ~140 W. Three cases:
+
+    * NO BATTERY (Mac mini/Studio/iMac) → mains-powered by definition: PASS, no wattage
+      rule. (Without this a desktop is blocked outright — it has no AppleSmartBattery, so
+      the run gate reads "on battery" and pauses forever.)
+    * A LAPTOP on a KNOWN model → its documented ceiling decides, because a 140 W brick
+      plugged into a 96 W-max machine still REPORTS 140 W; wattage alone can't tell you
+      what the machine draws. Known-under-140 W is a HARD FAIL.
+    * A LAPTOP we don't recognise (newer than these lists) → don't block it: fall back to
+      the LIVE adapter reading and name the model so versions.MODELS_140W can be extended.
+
+    WARN severity for the wattage part — being unplugged during setup is fine; the
+    run-time gate enforces it when it actually matters."""
     import power
-    w = power.adapter_watts()
     need = versions.REQUIRED_ADAPTER_WATTS
-    fix = (f"Plug in the {need} W adapter (the 16-inch MacBook Pro's brick). Smaller bricks "
-           f"— including the 14-inch MBP's 96 W maximum — cannot power the Topaz stage; the "
+    kind, model = ("laptop" if power.has_battery() else "desktop"), power.model_id()
+    if kind == "desktop":
+        return _check("power_adapter", True, "warn",
+                      f"{model or 'desktop Mac'}: mains-powered (no battery) — the "
+                      f"{need} W rule doesn't apply", "")
+    if model in versions.MODELS_BELOW_140W:
+        return _check("power_adapter", False, "fail",
+                      f"{model} tops out below {need} W — it cannot power the Topaz stage",
+                      f"Visionary needs a Mac that sustains {need} W: a 140 W-class MacBook "
+                      f"Pro (16-inch Apple Silicon) on its own brick, or any desktop Mac.")
+    known = model in versions.MODELS_140W
+    w = power.adapter_watts()
+    fix = (f"Plug in the {need} W adapter. Smaller bricks cannot power the Topaz stage; the "
            f"pipeline will refuse to run on them.")
+    if known and w is None:
+        return _check("power_adapter", True, "warn",
+                      f"{model} is a {need} W-class Mac; no adapter connected right now "
+                      f"(the run-time gate checks this live)", "")
+    if known:
+        return _check("power_adapter", w >= need, "warn",
+                      f"{model} ({need} W-class); connected adapter: {w} W", fix)
+    # unknown laptop — the live reading is all we have
     if w is None:
         return _check("power_adapter", True, "warn",
-                      f"no adapter connected right now — the pipeline requires >= {need} W "
-                      f"to run (checked live by its power gate)", "")
+                      f"{model or 'this Mac'} isn't in the known {need} W list; connect its "
+                      f"adapter — the run-time gate requires >= {need} W", "")
     return _check("power_adapter", w >= need, "warn",
-                  f"connected adapter: {w} W (require >= {need} W to run)", fix)
+                  f"{model or 'this Mac'} isn't in the known {need} W list; connected "
+                  f"adapter reads {w} W (require >= {need} W)", fix)
 
 
 def check_brew_tools():

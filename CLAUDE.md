@@ -15,21 +15,28 @@ adds per-step machine-readable checks. The operating loop:
 3. Steps the USER must do themselves: buying/entering licenses, the Resolve/Topaz
    installers + first-launch logins, and the System Settings privacy toggles. Guide;
    don't attempt to do these for them.
-4. If the `display` check fails, stop — the main display isn't one of the VERIFIED
-   configs in `versions.SUPPORTED_DISPLAYS` (the 16" MBP built-in panel, or the 4K dummy
-   HDMI plug used for lid-closed clamshell runs). Say so plainly.
+4. If the `display` check fails, stop — the main display isn't at 2.0 backing scale
+   (`versions.REQUIRED_BACKING_SCALE`). Say so plainly, with the fix: a built-in Retina
+   panel, a 4K/5K display in its DEFAULT HiDPI mode, or a 4K dummy HDMI plug all qualify;
+   a 1x / "More Space" mode does not.
 
 ## Hard rules (do NOT)
 
 - **Never weaken the pins.** Do not edit `engine/versions.py`, `engine/preflight.py`,
   or the server's arm gate to make a mismatched Resolve/Topaz/display pass. The pins are
   load-bearing (the screen automation matches templates against the live UI) — install
-  the exact builds instead. Display support is an ALLOW-LIST (`SUPPORTED_DISPLAYS`):
-  adding a configuration requires PASSING the all-template smoke test on it
-  (`python3 engine/preflight.py --smoke`, or `GET /api/shim-smoke` while it runs), then
-  adding the entry — never editing a check so an unverified display slips through. The
-  invariant every entry shares is the 2.0 backing scale (templates only match at the
-  same UI pixel size); screen SIZE is free, because every click is template-derived.
+  the exact builds instead. DISPLAY support is the 2.0 BACKING-SCALE invariant
+  (`versions.REQUIRED_BACKING_SCALE`), not a geometry list — templates only match at the
+  same UI pixel size, while screen SIZE is free because every click is template-derived
+  (proven: the 16" panel's templates matched the 3840x2160 dummy at >=0.96 untouched).
+  `SUPPORTED_DISPLAYS` is now only the SMOKE-TESTED list, used for a precise message. On
+  a display that isn't on it yet, run the all-template smoke test
+  (`python3 engine/preflight.py --smoke`, or `GET /api/shim-smoke` while it runs) and add
+  the entry. NEVER relax the scale rule or the wattage rule to make a machine pass.
+  POWER: a Mac with NO BATTERY is mains-powered and always passes; a laptop is judged by
+  `hw.model` against `MODELS_140W` / `MODELS_BELOW_140W`, because a 140 W brick in a
+  96 W-max machine still REPORTS 140 W. Extend those lists for new Macs — never guess a
+  model into MODELS_140W (an unknown laptop already falls back to the live reading).
 - **Never commit or print secrets.** `~/.topaz-pipeline/config.json` and `.env` are
   gitignored for a reason. Ask the user to fill values in; never echo tokens/passwords
   back into chat, logs, or commits.

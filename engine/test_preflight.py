@@ -50,63 +50,103 @@ class VersionChecks(unittest.TestCase):
 
 
 class DisplayCheck(unittest.TestCase):
-    """The display gate is an ALLOW-LIST of verified configs (versions.SUPPORTED_DISPLAYS):
-    the built-in panel, and the 4K dummy HDMI plug used for LID-CLOSED clamshell runs.
-    Anything else still hard-fails — an unverified display breaks template matching."""
+    """The display gate is the BACKING SCALE, not a geometry list: dv_shim derives every
+    click from a template match, so a template lands whenever the UI renders at the same
+    pixel size (proven — the 16-inch panel's templates matched the 3840x2160 dummy at
+    >=0.96 with no recalibration). Verified geometries just get a nicer name."""
 
-    def test_wrong_geometry_fails(self):
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(3024, 1964, 2.0, True)):    # a 14" MBP
-            c = preflight.check_display()
-        self.assertFalse(c["ok"]); self.assertEqual(c["severity"], "fail")
-
-    def test_unverified_external_display_still_fails(self):
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(2560, 1440, 2.0, False)):   # some random monitor
-            self.assertFalse(preflight.check_display()["ok"])
-
-    def test_builtin_geometry_on_an_external_display_fails(self):
-        # the builtin flag is part of the identity — a panel merely reporting the
-        # built-in's pixels is not the verified config
-        w, h = versions.DISPLAY_PIXELS
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(w, h, 2.0, False)):
-            self.assertFalse(preflight.check_display()["ok"])
-
-    def test_wrong_scale_fails(self):
-        # 1x (or any non-2x) mode renders the UI at a different pixel size -> no match
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(3840, 2160, 1.0, False)):
-            self.assertFalse(preflight.check_display()["ok"])
-
-    def test_pinned_display_passes(self):
+    def test_verified_builtin_passes_by_name(self):
         w, h = versions.DISPLAY_PIXELS
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(w, h, versions.RETINA_SCALE, True)):
             c = preflight.check_display()
         self.assertTrue(c["ok"]); self.assertIn("built-in", c["detail"])
 
-    def test_clamshell_dummy_passes(self):
+    def test_clamshell_dummy_passes_by_name(self):
         # LID-CLOSED: the 4K dummy plug is the main display and is NOT builtin
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(3840, 2160, 2.0, False)):
             c = preflight.check_display()
         self.assertTrue(c["ok"]); self.assertIn("clamshell", c["detail"])
 
+    def test_other_2x_displays_pass_generically(self):
+        # a 14-inch MBP panel, and a 5K external — neither smoke-tested, both valid 2x
+        for geom, builtin in (((3024, 1964), True), ((5120, 2880), False), ((2560, 1600), False)):
+            with mock.patch.object(preflight, "_display_via_coregraphics",
+                                   return_value=(geom[0], geom[1], 2.0, builtin)):
+                c = preflight.check_display()
+            self.assertTrue(c["ok"], geom)
+            self.assertIn("@2x", c["detail"])
+            self.assertIn("--smoke", c["detail"])      # says it is unverified, run the smoke test
+
+    def test_non_2x_scale_still_fails(self):
+        # 1x renders the UI at half the templates' pixel size -> nothing would match
+        for scale in (1.0, 1.5, 3.0):
+            with mock.patch.object(preflight, "_display_via_coregraphics",
+                                   return_value=(3840, 2160, scale, False)):
+                self.assertFalse(preflight.check_display()["ok"], scale)
+
+    def test_absurdly_small_2x_display_fails(self):
+        # 1920x1080 BACKING at 2x is 960x540 points — Resolve's Color page cannot lay out
+        with mock.patch.object(preflight, "_display_via_coregraphics",
+                               return_value=(1920, 1080, 2.0, False)):
+            self.assertFalse(preflight.check_display()["ok"])
+
     def test_match_display_is_pure(self):
         self.assertIsNotNone(preflight.match_display(3456, 2234, 2.0, True))
         self.assertIsNotNone(preflight.match_display(3840, 2160, 2.0, False))
-        self.assertIsNone(preflight.match_display(3840, 2160, 2.0, True))    # dummy can't be builtin
-        self.assertIsNone(preflight.match_display(1920, 1080, 2.0, False))   # logical, not backing
+        self.assertIsNotNone(preflight.match_display(3024, 1964, 2.0, True))   # unverified but 2x
+        self.assertIsNone(preflight.match_display(3840, 2160, 1.0, False))     # 1x
+        self.assertIsNone(preflight.match_display(1920, 1080, 2.0, False))     # too small at 2x
 
-    def test_coregraphics_failure_falls_back_to_system_profiler(self):
+    def test_unreadable_scale_accepts_only_a_verified_geometry(self):
+        # system_profiler can't report the scale — the invariant is unverifiable, so only a
+        # known-good geometry is accepted (an unknown one must NOT be waved through).
         w, h = versions.DISPLAY_PIXELS
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                side_effect=RuntimeError("no CG")), \
              mock.patch.object(preflight, "_display_via_system_profiler",
-                               return_value=(w, h, None, True)):           # scale unknown
+                               return_value=(w, h, None, True)):
             c = preflight.check_display()
         self.assertTrue(c["ok"]); self.assertIn("system_profiler", c["detail"])
+        with mock.patch.object(preflight, "_display_via_coregraphics",
+                               side_effect=RuntimeError("no CG")), \
+             mock.patch.object(preflight, "_display_via_system_profiler",
+                               return_value=(5120, 2880, None, False)):
+            self.assertFalse(preflight.check_display()["ok"])
+
+
+class PowerRule(unittest.TestCase):
+    """Sustained 140 W. A desktop Mac has no battery and is mains-powered by definition;
+    a laptop is judged by MODEL, because a 140 W brick in a 96 W-max machine still reports
+    140 W. An unrecognised laptop falls back to the live reading rather than being blocked."""
+
+    def _check(self, *, battery, model, watts):
+        import power
+        with mock.patch.object(power, "has_battery", return_value=battery), \
+             mock.patch.object(power, "model_id", return_value=model), \
+             mock.patch.object(power, "adapter_watts", return_value=watts):
+            return preflight.check_power_adapter()
+
+    def test_desktop_passes_with_no_adapter_reading(self):
+        c = self._check(battery=False, model="Mac16,11", watts=None)
+        self.assertTrue(c["ok"]); self.assertIn("mains-powered", c["detail"])
+
+    def test_known_140w_laptop_passes(self):
+        c = self._check(battery=True, model="Mac15,11", watts=140)
+        self.assertTrue(c["ok"])
+
+    def test_known_sub_140w_laptop_hard_fails(self):
+        c = self._check(battery=True, model="MacBookPro18,3", watts=140)   # 14" M1 Pro, 96 W max
+        self.assertFalse(c["ok"])
+        self.assertEqual(c["severity"], "fail")     # a brick reporting 140 W must NOT save it
+
+    def test_unknown_laptop_falls_back_to_live_wattage(self):
+        ok = self._check(battery=True, model="Mac99,9", watts=140)
+        self.assertTrue(ok["ok"])                   # future Mac: not blocked
+        self.assertIn("isn't in the known", ok["detail"])
+        bad = self._check(battery=True, model="Mac99,9", watts=96)
+        self.assertFalse(bad["ok"])                 # but a small brick still fails
 
 
 class Semantics(unittest.TestCase):

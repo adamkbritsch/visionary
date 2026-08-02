@@ -24,13 +24,20 @@ or password back into the conversation, never commit them, never put them in log
 ### Step 1 — Hardware gate
 Clone, run preflight. Gate on `display`:
 - `display.ok true` → continue.
-- `display.ok false` → **stop the entire setup.** Tell the user plainly: Visionary only
-  works on a 16-inch MacBook Pro — its built-in display (3456×2234) must be the main
-  display, and its 140 W adapter is required to run (the 14-inch MBP's 96 W maximum
-  can't power the Topaz stage). If they're on the right Mac but docked/mirrored, have
-  them undock and re-run.
-- `power_adapter` is a WARN at setup (being unplugged is fine); it just reports whether
-  a ≥140 W brick is connected. The run-time power gate enforces it when the pipeline runs.
+- `display.ok false` → **stop the entire setup.** The MAIN display must render at 2×
+  backing scale — that is the only display requirement, because every click is derived
+  from a template match (screen size is free). Tell the user plainly, with the fix: a
+  built-in Retina panel, a 4K/5K display in its DEFAULT (scaled) HiDPI mode, or a 4K
+  dummy HDMI plug all work; a display set to a 1×/"More Space" mode does not. If they're
+  docked or mirroring to a non-Retina monitor, have them undock and re-run.
+  If the display is at 2× but NOT one of the smoke-tested configs, the check passes and
+  says so — run `python3 engine/preflight.py --smoke` once (with Resolve on the Color
+  page) to confirm the templates actually match there.
+- `power_adapter` severity depends on the machine: a DESKTOP Mac (no battery) always
+  passes — it is mains-powered by definition. A LAPTOP is judged by model: known
+  140 W-class passes, a model known to cap lower (14-inch M1/M2 MBP, any MacBook Air) is
+  a HARD FAIL, and an unrecognised model falls back to the live adapter reading (a WARN
+  when unplugged — the run-time gate enforces it when the pipeline runs).
 
 ### Step 2 — Exact app installs (USER does these)
 Watch `resolve_version` + `topaz_version`. Both must report the exact pins

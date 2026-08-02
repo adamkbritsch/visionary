@@ -96,6 +96,47 @@ def power_adequate_now() -> bool:
     return bool(r.external_connected) and not is_draining_on_ac(r)
 
 
+_HAS_BATTERY = None            # a Mac never grows a battery — probe once, reuse (this is
+                               # polled every 2 s by the power monitor)
+
+
+def has_battery() -> bool:
+    """Does this Mac have an internal battery? The laptop/desktop discriminator.
+
+    LOAD-BEARING: every power rule here is about a battery draining under a hours-long
+    GPU load. A desktop Mac (mini/Studio/iMac) is mains-powered by definition, and it has
+    no AppleSmartBattery — so `read_power()` reports external_connected=False and the run
+    gate would otherwise pause it FOREVER "waiting for the 140 W adapter". Fails SAFE:
+    if the probe itself errors we assume a battery (the stricter laptop path)."""
+    global _HAS_BATTERY
+    if _HAS_BATTERY is not None:
+        return _HAS_BATTERY
+    try:
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return True                       # probe failed → assume the STRICTER laptop path,
+                                          # and don't cache a guess
+    _HAS_BATTERY = "InternalBattery" in out
+    return _HAS_BATTERY
+
+
+def model_id() -> str:
+    """This Mac's hardware identifier, e.g. 'Mac15,11' (16-inch M3 Max). '' if unreadable."""
+    try:
+        return subprocess.run(["sysctl", "-n", "hw.model"], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def power_class() -> tuple:
+    """(kind, model, watts) — ONE place both preflight and the run gate consult, so the
+    setup check and the live check can never disagree. kind is 'desktop' (no battery →
+    mains-powered, no wattage rule) or 'laptop' (the 140 W rule applies)."""
+    return ("laptop" if has_battery() else "desktop", model_id(), adapter_watts())
+
+
 def adapter_watts():
     """The connected power adapter's wattage (int), or None if on battery / unknown.
     The Topaz stage needs >= ~140 W or an M3-Max encode drains the battery."""

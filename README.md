@@ -18,27 +18,35 @@ Arm it in the evening; wake up to finished episodes.
 >
 > | Requirement | Exactly |
 > |---|---|
-> | Mac | **16-inch MacBook Pro** (Apple Silicon) on its **140 W power adapter**, with a verified main display: the **built-in panel** (3456×2234) — or a **4K dummy HDMI plug** (3840×2160 @2×) to run **lid-closed** |
+> | Mac | Any Apple Silicon Mac that sustains **140 W** — a **140 W-class MacBook Pro** (16-inch) on its own adapter, or **any desktop Mac** (mains-powered) — with a main display at **2× backing scale**: a built-in Retina panel, a **4K display**, or a **4K dummy HDMI plug** to run **lid-closed** |
 > | DaVinci Resolve | **Studio 18.6.0** (build 18.6.00009) — the paid Studio edition, this exact build |
 > | Topaz Video AI | **7.0.1** — this exact build |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
 >
-> Why the 16-inch specifically — two independent reasons:
-> 1. **The display.** The Resolve stage drives the *real* Resolve UI by screen-capture
->    template matching and synthetic clicks (Dolby Vision's "Analyze All Shots" has no
->    scripting API). The templates were cropped from this exact Resolve build, and they
->    only match when the UI renders at the same **pixel scale** — so the main display must
->    be one of the verified configurations in `engine/versions.py` (`SUPPORTED_DISPLAYS`):
->    the built-in panel, or a 4K dummy HDMI plug at 2× for **lid-closed (clamshell)** runs.
->    Screen *size* is free (every click is derived from a template match, never a fixed
->    coordinate); the 2× backing scale is not. Adding a display means passing
->    `preflight --smoke` on it, not editing the check.
+> Two independent requirements — and what each actually constrains:
+> 1. **The display: 2× backing scale.** The Resolve stage drives the *real* Resolve UI by
+>    screen-capture template matching and synthetic clicks (Dolby Vision's "Analyze All
+>    Shots" has no scripting API). Every click is *derived from a template match* — there
+>    is not one fixed coordinate in the shim — so a template lands whenever the UI renders
+>    at the same **pixel size**. That makes the **2× scale** the only thing that matters;
+>    screen size and shape are free. Measured proof: the 16-inch panel's templates matched
+>    a 3840×2160 dummy plug at **≥0.96** (palette 1.000) with no recalibration. So a
+>    built-in Retina panel, a 4K/5K display in its default HiDPI mode, or a 4K dummy HDMI
+>    plug (for **lid-closed / clamshell** running) all qualify. A display set to a
+>    **1× "More Space"-style mode is refused** — the UI would render at half the templates'
+>    size. Only the built-in panel and the 4K dummy have been *smoke-tested* end to end;
+>    anything else is admitted by the rule, so run `preflight --smoke` on it once
+>    (`GET /api/shim-smoke` while running) to confirm the templates land.
 >
-> 2. **The power.** The Topaz stage runs the GPU flat-out for hours and needs the 16-inch
->    model's full **140 W** power envelope. The 14-inch MacBook Pro tops out at a 96 W
->    adapter — the pipeline's power gate would hold forever (and on a lesser brick the
->    battery drains mid-encode).
+> 2. **The power: a sustained 140 W.** The Topaz stage runs the GPU flat-out for hours.
+>    A **desktop Mac** (mini/Studio/iMac) has no battery, is mains-powered by definition,
+>    and always satisfies this. A **laptop** is judged by its model, not its brick — a
+>    140 W adapter plugged into a 96 W-max machine still *reports* 140 W, so wattage alone
+>    can't tell you what the machine can draw. Known 140 W-class models pass; models known
+>    to cap lower (the 14-inch M1/M2 MacBook Pro, every MacBook Air) are refused; a model
+>    newer than `engine/versions.py` isn't blocked — it falls back to the live adapter
+>    reading and warns, so the list can be extended.
 >
 > The app checks versions, display, and power at launch and will not arm on a mismatch.
 >
@@ -63,10 +71,10 @@ git clone https://github.com/adamkbritsch/visionary.git
 cd visionary && python3 engine/preflight.py
 ```
 
-If the `display` check fails, **stop here** — the main display isn't one of the verified
-configurations (see the requirements box above). Nothing you install later will change
-that, though plugging in a supported 4K dummy HDMI plug (and closing the lid) is one way
-to reach a verified config.
+If the `display` check fails, **stop here** — the main display isn't running at 2× backing
+scale (see the requirements box above). Nothing you install later will change that. Common
+fixes: set a 4K display to its default (scaled) HiDPI mode rather than a 1× "More Space"
+mode, or plug in a 4K dummy HDMI plug and close the lid for clamshell running.
 
 ### 2. Install the two apps — exact versions&nbsp;&nbsp;<picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/pirate-ship-white-v2.png"><img src="docs/assets/pirate-ship-v2.png" alt="" height="59" align="middle"></picture>
 
