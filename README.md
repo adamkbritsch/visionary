@@ -13,42 +13,32 @@ Arm it in the evening; wake up to finished episodes.
 <p align="center"><sub><b>Two episodes in flight at once</b> — S07E21 upscaling in Topaz while S07E20's Dolby Vision remux runs beside it, each with its own segmented, resumable progress.</sub></p>
 
 > [!IMPORTANT]
-> **Visionary is built for one exact hardware + software combination and refuses to run
-> on anything else:**
+> **Visionary drives the DaVinci Resolve interface by looking at the screen, and runs the
+> GPU flat out for hours.** It checks your hardware at launch and won't start if it can't
+> work properly. What it needs:
 >
-> | Requirement | Exactly |
+> | Requirement | What works |
 > |---|---|
-> | Mac | Any Apple Silicon Mac that sustains **140 W** — a **140 W-class MacBook Pro** (16-inch) on its own adapter, or **any desktop Mac** (mains-powered) — with a main display at **2× backing scale**: a built-in Retina panel, a **4K display**, or a **4K dummy HDMI plug** to run **lid-closed** |
+> | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro or a MacBook Air can't sustain the power draw and is refused. |
+> | Display | Any **Retina / HiDPI** screen: a Mac laptop's built-in panel, or a **4K or 5K monitor** on its normal (scaled) setting. A **4K dummy HDMI plug** also counts — that's how you run it with the lid closed. A monitor switched to "More Space" is refused. |
 > | DaVinci Resolve | **Studio 18.6.0** (build 18.6.00009) — the paid Studio edition, this exact build |
 > | Topaz Video AI | **7.0.1** — this exact build |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
 >
-> Two independent requirements — and what each actually constrains:
-> 1. **The display: 2× backing scale.** The Resolve stage drives the *real* Resolve UI by
->    screen-capture template matching and synthetic clicks (Dolby Vision's "Analyze All
->    Shots" has no scripting API). Every click is *derived from a template match* — there
->    is not one fixed coordinate in the shim — so a template lands whenever the UI renders
->    at the same **pixel size**. That makes the **2× scale** the only thing that matters;
->    screen size and shape are free. Measured proof: the 16-inch panel's templates matched
->    a 3840×2160 dummy plug at **≥0.96** (palette 1.000) with no recalibration. So a
->    built-in Retina panel, a 4K/5K display in its default HiDPI mode, or a 4K dummy HDMI
->    plug (for **lid-closed / clamshell** running) all qualify. A display set to a
->    **1× "More Space"-style mode is refused** — the UI would render at half the templates'
->    size. Only the built-in panel and the 4K dummy have been *smoke-tested* end to end;
->    anything else is admitted by the rule, so run `preflight --smoke` on it once
->    (`GET /api/shim-smoke` while running) to confirm the templates land.
+> **Why the display rule?** Dolby Vision's "Analyze All Shots" button can't be clicked by
+> script, so Visionary finds it by matching a picture of the button against the screen.
+> Every Retina screen draws that button at the same size, so it works on any of them and
+> the monitor's size and shape don't matter. A non-Retina mode draws everything at half
+> size, and nothing matches. Only the 16-inch built-in panel and a 4K dummy plug have been
+> tested end to end — on any other screen, run `python3 engine/preflight.py --smoke` once
+> to confirm Visionary can see Resolve's buttons.
 >
-> 2. **The power: a sustained 140 W.** The Topaz stage runs the GPU flat-out for hours.
->    A **desktop Mac** (mini/Studio/iMac) has no battery, is mains-powered by definition,
->    and always satisfies this. A **laptop** is judged by its model, not its brick — a
->    140 W adapter plugged into a 96 W-max machine still *reports* 140 W, so wattage alone
->    can't tell you what the machine can draw. Known 140 W-class models pass; models known
->    to cap lower (the 14-inch M1/M2 MacBook Pro, every MacBook Air) are refused; a model
->    newer than `engine/versions.py` isn't blocked — it falls back to the live adapter
->    reading and warns, so the list can be extended.
->
-> The app checks versions, display, and power at launch and will not arm on a mismatch.
+> **Why the power rule?** Topaz pushes the GPU for hours. A desktop Mac is plugged into the
+> wall, so it always qualifies. A laptop is judged by its model rather than by the charger
+> you plugged in — because a 140 W charger connected to a laptop that can only draw 96 W
+> still reports "140 W". A laptop too new to be on the list isn't blocked: Visionary falls
+> back to checking the charger, and warns.
 >
 > Resolve Studio and Topaz Video AI are commercial products — bring your own licenses.
 
@@ -71,10 +61,10 @@ git clone https://github.com/adamkbritsch/visionary.git
 cd visionary && python3 engine/preflight.py
 ```
 
-If the `display` check fails, **stop here** — the main display isn't running at 2× backing
-scale (see the requirements box above). Nothing you install later will change that. Common
-fixes: set a 4K display to its default (scaled) HiDPI mode rather than a 1× "More Space"
-mode, or plug in a 4K dummy HDMI plug and close the lid for clamshell running.
+If the `display` check fails, **stop here** — your main screen isn't a Retina/HiDPI one
+(see the box above). Nothing you install later will change that. The usual fixes: switch a
+4K monitor from "More Space" back to its normal scaled setting, or plug in a 4K dummy HDMI
+plug and close the lid.
 
 ### 2. Install the two apps — exact versions&nbsp;&nbsp;<picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/pirate-ship-white-v2.png"><img src="docs/assets/pirate-ship-v2.png" alt="" height="59" align="middle"></picture>
 
