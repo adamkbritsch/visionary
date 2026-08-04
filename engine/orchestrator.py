@@ -38,6 +38,8 @@ import power
 import scratch
 import series
 import settings
+import eta as eta_math
+import eta_model
 import transfer
 import youtube
 
@@ -651,7 +653,9 @@ class Orchestrator:
                                                # back into _finish_q/_in_finisher by _finisher_reconcile.
         self._cadence_advanced = set()         # items whose HAND-OFF already advanced the cadence —
                                                # loaded below with the counters (survives restarts)
-        self._fin2_eta_anchor = None           # lane 2's own ETA anchor (lane 1 keeps _fin_eta_anchor)
+        self._fin2_eta_anchor = None           # (legacy) superseded by _lane_books; see _lane_eta
+        self._lane_books = {}                  # lane -> eta.RateBook: per-REGIME (frames, seconds)
+        self._lane_ticks = {}                  # lane -> (stage, frames, monotonic) of the last tick
         self._fin_eta_anchor = None            # (stage, monotonic0, frames0) of THIS attempt — the
                                                # lane ETA must use the live rate, never the
                                                # accumulated elapsed (it spans killed attempts)
@@ -2236,6 +2240,74 @@ class Orchestrator:
         self.state.update(stage=None, progress=None, stage_active=False,
             message=f"{transfer.display_name(p.ep)} → finisher (remux/upload continue in the background)")
 
+    def _lane_eta(self, lane: int, info: dict, stage):
+        """Seconds left for a finisher lane — the TWO-REGIME estimate (see engine/eta.py).
+
+        The old estimator extrapolated the whole remainder at whatever rate it was currently
+        measuring, which is why a remux read ~4h46m while Topaz ran and only became honest once
+        Topaz ended: roughly 70% of the remaining work actually runs SOLO, after the run thread
+        parks at the Resolve gate waiting for this very remux.
+
+            ETA = min(E_self, E_other) + max(0, E_self - E_other) / k
+
+        Returns None until the current regime has been measured enough to be worth showing."""
+        frames, total = info.get("frames"), info.get("total")
+        book_key = (lane, stage, id(self))
+        prev = self._lane_ticks.get(lane)
+        now = time.monotonic()
+        # A new stage or a restart starts a fresh book: rates from a different stage (or a
+        # different attempt's replayed frames) are not evidence about this one.
+        if prev is None or prev[0] != stage or (frames is not None and frames < prev[1]):
+            self._lane_books[lane] = eta_math.RateBook()
+            self._lane_ticks[lane] = (stage, frames if frames is not None else 0, now)
+            return None
+        if frames is None or not total:
+            return None
+
+        run_stage = self.state.get("stage")
+        run_active = bool(self.state.get("stage_active"))
+        regime = eta_math.regime_of(run_stage=run_stage, run_active=run_active)
+        book = self._lane_books.setdefault(lane, eta_math.RateBook())
+        # The gate inside tick() is what keeps the resume REPLAY BURST out of the window — on
+        # every restart dvcap re-fires one callback per finished segment, and the old estimator
+        # swallowed that into its rate and read ~45x too low for hours afterwards.
+        book.tick(regime, frames - prev[1], now - prev[2])
+        self._lane_ticks[lane] = (stage, frames, now)
+
+        rate = book.rate(regime)
+        if rate is None or rate <= 0:
+            return None
+        e_self = (total - frames) / rate            # this regime's honest extrapolation
+        if regime != eta_math.CONTENDED or not eta_math.correction_applies(
+                run_stage=run_stage, run_active=run_active):
+            return round(e_self, 1)                 # solo, or Resolve about to preempt us
+
+        # Prefer THIS item's own measured ratio the moment it exists — a same-item comparison
+        # cancels the scene-complexity confound that makes cross-item ratios noisy.
+        k = book.k_observed() or self._eta_k()
+        other = (self.state.get("progress") or {}).get("eta_secs")
+        return round(eta_math.two_phase_eta(e_self, other, eta_math.clamp_k(k)), 1)
+
+    def _eta_k(self) -> float:
+        """The learned solo/contended speed-up, shrunk toward the physical prior."""
+        try:
+            return eta_math.shrink_k(eta_model.load().get("k_samples") or [])
+        except Exception:
+            return eta_math.K_PRIOR
+
+    def _record_k(self, lane: int):
+        """Bank this item's own observed k when its lane finishes, if it is trustworthy.
+
+        Every remux gets a solo phase before it ends (the Resolve gate holds the next Resolve
+        until it completes), so in steady state each item contributes one clean sample."""
+        try:
+            book = self._lane_books.get(lane)
+            k = book.k_observed() if book else None
+            if k is not None:
+                eta_model.add_k_sample(eta_math.clamp_k(k))
+        except Exception:
+            pass
+
     def _set_finishing_progress(self, info):
         """The finisher's own progress surface (state['finishing']) — NEVER _set_progress, whose
         ETA window state is single-slot and belongs to the run thread."""
@@ -2250,28 +2322,11 @@ class Orchestrator:
         # ETA from THIS attempt's live rate. The elapsed stopwatch deliberately ACCUMULATES
         # across killed attempts (user-dictated), so elapsed×remaining/pct read ~38 h after a
         # remux restart; anchoring frames/time at attempt start gives the real number.
-        # CONTENTION-AWARE ETA: the remux runs SLOW while topaz shares the machine and SPEEDS UP the
-        # instant topaz ends (and vice versa). Drop the anchor on that transition so the rate window
-        # re-measures from the new regime instead of blending the contended and solo rates.
-        if info.get("stage") == "remux":
-            topaz_on = (self.state.get("stage") == "topaz")
-            if topaz_on != self._fin_contended:
-                self._fin_contended = topaz_on
-                self._fin_eta_anchor = None
-        frames, total = info.get("frames"), info.get("total")
-        if frames is not None and total:
-            a = self._fin_eta_anchor
-            if a is None or a[0] != f.get("stage") or frames < a[2]:
-                self._fin_eta_anchor = (f.get("stage"), time.monotonic(), frames)
-                f.pop("eta_secs", None)     # re-anchored (new stage / restart): the carried-over
-                                            # dict's ETA was measured on the OLD run — drop it
-                                            # rather than show a stale number until the new
-                                            # window is wide enough to replace it.
-            else:
-                span = time.monotonic() - a[1]
-                donef = frames - a[2]
-                if span >= 15 and donef >= 30:
-                    f["eta_secs"] = round((total - frames) * span / donef, 1)
+        e = self._lane_eta(1, info, f.get("stage"))
+        if e is None:
+            f.pop("eta_secs", None)
+        else:
+            f["eta_secs"] = e
         self.state["finishing"] = f
         mono = time.monotonic()
         if self._fin_el_key and mono - self._fin_el_save > 30:   # crash-checkpoint, like the run thread's
@@ -2289,17 +2344,11 @@ class Orchestrator:
                   "frames": info.get("frames"), "total": info.get("total"),
                   "notches": info.get("notches"), "seg_done": info.get("seg_done"),
                   "seg_total": info.get("seg_total")})
-        frames, total = info.get("frames"), info.get("total")
-        if frames is not None and total:
-            a = self._fin2_eta_anchor
-            if a is None or a[0] != f.get("stage") or frames < a[2]:   # new stage, or a restart
-                self._fin2_eta_anchor = (f.get("stage"), time.monotonic(), frames)
-                f.pop("eta_secs", None)     # see lane 1: never carry an ETA across a re-anchor
-            else:
-                span = time.monotonic() - a[1]
-                donef = frames - a[2]
-                if span >= 15 and donef >= 30:      # same floor as lane 1: don't extrapolate off noise
-                    f["eta_secs"] = round((total - frames) * span / donef, 1)
+        e = self._lane_eta(2, info, f.get("stage"))
+        if e is None:
+            f.pop("eta_secs", None)
+        else:
+            f["eta_secs"] = e
         self.state["finishing2"] = f
 
     def _finisher(self):
@@ -2338,6 +2387,7 @@ class Orchestrator:
                     with self._finisher_lock:
                         self._in_finisher.discard(self._skip_key(p))
                         self._in_finisher_movies.discard(self._skip_key(p))
+                    self._record_k(1)   # bank this item's own solo/contended ratio
                     self.state["finishing"] = None
 
     def _finisher2(self):
@@ -2369,6 +2419,7 @@ class Orchestrator:
                     with self._finisher_lock:
                         self._in_finisher.discard(self._skip_key(p))
                         self._in_finisher_movies.discard(self._skip_key(p))
+                    self._record_k(2)   # bank this item's own solo/contended ratio
                     self.state["finishing2"] = None
                     self._fin2_eta_anchor = None    # next item must not extrapolate off this one's rate
 

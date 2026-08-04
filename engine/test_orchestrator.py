@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import os
+import eta as eta_math
 import orchestrator as orch
 from orchestrator import episode_paths, youtube_paths
 
@@ -817,14 +818,14 @@ class Lane2Eta(unittest.TestCase):
 
     def test_lane2_reports_an_eta_once_the_window_is_wide_enough(self):
         o = orch.Orchestrator()
-        self.assertIsNone(self._feed(o, 100, 1000, 0.0).get("eta_secs"))   # anchors, no estimate yet
-        f = self._feed(o, 200, 1000, 20.0)          # 100 frames in 20 s -> 800 left -> 160 s
-        self.assertAlmostEqual(f["eta_secs"], 160.0, delta=1.0)
+        self.assertIsNone(self._feed(o, 1000, 10_000, 0.0).get("eta_secs"))  # first tick: no estimate
+        f = self._feed(o, 2000, 10_000, 200.0)      # 1000 frames in 200 s = 5 fps -> 8000 left
+        self.assertAlmostEqual(f["eta_secs"], 1600.0, delta=10.0)
 
     def test_lane2_does_not_extrapolate_off_noise(self):
         o = orch.Orchestrator()
-        self._feed(o, 100, 1000, 0.0)
-        self.assertIsNone(self._feed(o, 110, 1000, 5.0).get("eta_secs"))   # span<15s and <30 frames
+        self._feed(o, 1000, 10_000, 0.0)
+        self.assertIsNone(self._feed(o, 1010, 10_000, 5.0).get("eta_secs"))   # far below the gate
 
     def test_lane2_reanchors_on_a_restart(self):
         o = orch.Orchestrator()
@@ -1627,18 +1628,31 @@ class ContentionETA(unittest.TestCase):
     machine and speeds up the instant topaz ends (and vice versa). Each stage's ETA window must
     RE-ANCHOR on that transition so it tracks the new rate instead of blending both regimes."""
 
-    def test_remux_eta_reanchors_when_topaz_ends(self):
+    def _tick(self, o, t, frames, total=200_000):
+        with mock.patch.object(orch.time, "monotonic", return_value=t):
+            o._set_finishing_progress({"stage": "remux", "pct": 100.0 * frames / total,
+                                       "frames": frames, "total": total})
+        return o.state["finishing"]
+
+    def test_remux_keeps_the_two_regimes_apart(self):
+        # The old code THREW AWAY its window on every flip to avoid blending. The book keeps a
+        # bucket per regime instead, so an hour of contended measurement survives topaz ending —
+        # and the item's own solo/contended ratio falls out of it.
         o = orch.Orchestrator()
-        o.state["stage"] = "topaz"                         # topaz running → remux is contended
-        o._set_finishing_progress({"stage": "remux", "pct": 10, "frames": 100, "total": 1000})
-        self.assertTrue(o._fin_contended)
-        a1 = o._fin_eta_anchor
-        o._set_finishing_progress({"stage": "remux", "pct": 12, "frames": 120, "total": 1000})
-        self.assertEqual(o._fin_eta_anchor[1], a1[1])      # topaz still on → same window, no re-anchor
-        o.state["stage"] = None                            # topaz ENDS → remux now solo
-        o._set_finishing_progress({"stage": "remux", "pct": 13, "frames": 130, "total": 1000})
-        self.assertFalse(o._fin_contended)
-        self.assertEqual(o._fin_eta_anchor[2], 130)        # re-anchored at the current frame (fresh rate)
+        o.state.update(stage="topaz", stage_active=True)   # contended
+        t, fr = 0.0, 0
+        self._tick(o, t, fr)
+        for _ in range(30):
+            t += 30.0; fr += 90                            # 3 fps
+            self._tick(o, t, fr)
+        o.state.update(stage=None, stage_active=False)     # topaz ENDS → solo
+        for _ in range(30):
+            t += 30.0; fr += 180                           # 6 fps
+            self._tick(o, t, fr)
+        book = o._lane_books[1]
+        self.assertAlmostEqual(book.rate(eta_math.CONTENDED), 3.0, delta=0.05)
+        self.assertAlmostEqual(book.rate(eta_math.SOLO), 6.0, delta=0.05)
+        self.assertAlmostEqual(book.k_observed(), 2.0, delta=0.05)   # this item measured its own k
 
     def test_topaz_eta_reanchors_when_remux_ends(self):
         o = orch.Orchestrator()
@@ -1650,13 +1664,36 @@ class ContentionETA(unittest.TestCase):
         self.assertFalse(o._run_contended)
         self.assertEqual(o._progress_start_pct, 12)        # window re-anchored at the current %
 
-    def test_no_reanchor_without_a_contention_change(self):
+    def test_a_stale_stage_is_not_treated_as_contention(self):
+        # `stage` lingers after a failure and through a power hold. Only stage_active is truthful;
+        # trusting `stage` would file solo work into the contended bucket and poison k.
         o = orch.Orchestrator()
-        o.state["stage"] = None                            # no topaz → remux uncontended throughout
-        o._set_finishing_progress({"stage": "remux", "pct": 10, "frames": 100, "total": 1000})
-        a1 = o._fin_eta_anchor
-        o._set_finishing_progress({"stage": "remux", "pct": 20, "frames": 200, "total": 1000})
-        self.assertEqual(o._fin_eta_anchor[1], a1[1])      # steady state → anchor holds (real ETA accrues)
+        o.state.update(stage="topaz", stage_active=False)  # named, but nothing executing
+        t, fr = 0.0, 0
+        self._tick(o, t, fr)
+        for _ in range(20):
+            t += 30.0; fr += 90
+            self._tick(o, t, fr)
+        self.assertIsNone(o._lane_books[1].rate(eta_math.CONTENDED))
+        self.assertIsNotNone(o._lane_books[1].rate(eta_math.SOLO))
+
+    def test_the_resume_replay_burst_cannot_poison_the_rate(self):
+        # REGRESSION: on restart dvcap re-fires one callback per finished segment ~1 s apart, so
+        # frames leap by thousands per second. The old estimator banked that and read ~45x too low.
+        o = orch.Orchestrator()
+        o.state.update(stage=None, stage_active=False)
+        t = 0.0
+        self._tick(o, t, 2163)
+        for f in (5507, 8345, 10527):                      # the replay burst
+            t += 1.0
+            self._tick(o, t, f)
+        fr = 10527
+        for _ in range(20):                                # then real encoding at 3 fps
+            t += 30.0; fr += 90
+            self._tick(o, t, fr)
+        self.assertAlmostEqual(o._lane_books[1].rate(eta_math.SOLO), 3.0, delta=0.1)
+        eta_secs = (o.state["finishing"] or {}).get("eta_secs")
+        self.assertAlmostEqual(eta_secs, (200_000 - fr) / 3.0, delta=200)
 
 
 class CadenceOncePerItem(unittest.TestCase):
@@ -1911,11 +1948,11 @@ class FinisherEta(unittest.TestCase):
         clk = {"t": 100.0}                          # deterministic clock, any call count
         with mock.patch.object(orch.time, "monotonic", side_effect=lambda: clk["t"]):
             o._set_finishing_progress({"stage": "remux", "frames": 0, "total": 41071, "pct": 0})
-            clk["t"] = 200.0                        # +100 s, +1000 frames → 10 fps live
-            o._set_finishing_progress({"stage": "remux", "frames": 1000, "total": 41071, "pct": 2.4})
+            clk["t"] = 350.0                        # +250 s, +2500 frames → 10 fps live
+            o._set_finishing_progress({"stage": "remux", "frames": 2500, "total": 41071, "pct": 6.1})
         eta = (o.state["finishing"] or {}).get("eta_secs")
         self.assertIsNotNone(eta)
-        self.assertAlmostEqual(eta, (41071 - 1000) * 100 / 1000, delta=1)   # ~4007 s, NOT 38 h
+        self.assertAlmostEqual(eta, (41071 - 2500) / 10.0, delta=1)   # ~3857 s, NOT 38 h
 
     def test_no_eta_until_warmup(self):
         o = orch.Orchestrator()
