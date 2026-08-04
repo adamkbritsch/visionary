@@ -30,6 +30,26 @@ PROFILES_FILE = os.path.join(CONFIG_DIR, "show_profiles.json")
 # already running must not silently drop one (see series.max_active / get_active_series).
 MAX_ACTIVE_CEILING = 4
 
+# Longest Screen Control may be switched off for. It is a TIMED pause, never a latch:
+# while it is off, items hold before Resolve and their ~140 GB Topaz intermediates pile up
+# against the min_free_gb floor, so a forgotten "off" stalls the run on low disk instead of
+# doing anything useful. Four hours is about where the buffer runs out (2-3 items at
+# 1-2 h of Topaz each), so that is the ceiling — and every pause self-cancels.
+MAX_QUIET_SECONDS = 4 * 3600
+MIN_QUIET_SECONDS = 60
+
+
+def clamp_quiet_seconds(v) -> int:
+    """Seconds a Screen Control pause may last: 0 (turn it straight back on) or a value
+    inside [MIN_QUIET_SECONDS, MAX_QUIET_SECONDS]. Junk becomes the 1 h default."""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 3600
+    if n <= 0:
+        return 0
+    return max(MIN_QUIET_SECONDS, min(MAX_QUIET_SECONDS, n))
+
 # Global, user-adjustable — everything here is UNIVERSAL (per-show options live in
 # show_profiles.json). The block after `youtube_every_tv_episodes` are SCHEDULING/CAPACITY
 # knobs that used to be hardcoded constants in orchestrator.py / series.py; each defaults to
@@ -39,6 +59,12 @@ DEFAULT_SETTINGS = {
     "activated": False,         # APPLIANCE mode: persisted arm state. While True the app runs
                                 # whenever it can — the server re-enables the orchestrator on
                                 # launch (see server._rearm_loop). A run ends only on a manual stop.
+    "quiet_until": 0,           # SCREEN CONTROL is only ever turned off TEMPORARILY: this is the epoch
+                                # second it comes back on by itself (0 = not currently timed). Holding
+                                # items before Resolve piles up ~140 GB ProRes intermediates against the
+                                # min_free_gb floor, so an indefinite "off" would quietly stall the run
+                                # on low disk — hence MAX_QUIET_SECONDS. The expiry is enforced in the
+                                # ENGINE (orchestrator._quiet_mode), so it survives an app relaunch.
     "quiet_mode": False,        # QUIET MODE: keep download+topaz running but DEFER each item before the
                                 # screen-invasive Resolve stage, so the laptop stays usable. Items pile up
                                 # (no drain to remux/upload/cleanup) → the run pauses on low disk until off.

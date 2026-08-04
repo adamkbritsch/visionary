@@ -194,6 +194,7 @@ struct YTConnectDTO: Codable {            // /api/youtube-connect
 struct SettingsDTO: Codable {
     var activated: Bool?        // appliance mode: persisted arm state (survives stops/relaunches)
     var quiet_mode: Bool?       // QUIET MODE: defer the screen-invasive Resolve stage so the laptop stays usable
+    var quiet_until: Int?       // epoch second quiet_mode lifts by itself (0/absent = not paused)
     var poll_minutes: Int?
     var dim_after_minutes: Int?           // idle this long → backlight 0 (0 = Off); no auto-restore
     var max_peak_mbps: Int?               // hard 1-second peak-bitrate ceiling on every shipped master

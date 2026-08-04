@@ -91,9 +91,23 @@ final class AppStore: ObservableObject {
         await post("/api/automation", ["enabled": !activated])
         await refresh()
     }
+    // SCREEN CONTROL. quietMode == true means the pipeline is NOT using the screen.
+    // Turning it off is always a TIMED pause — the engine restores it at `quietUntil`
+    // even if the app never reopens, so it can't be left off until the disk fills.
     var quietMode: Bool { state?.settings?.quiet_mode ?? false }
-    func toggleQuietMode() async {
-        await post("/api/quiet-mode", ["enabled": !quietMode])   // persists + reclaims the screen if turning ON
+    /// When the pause self-cancels, or nil when screen control is on.
+    var quietUntil: Date? {
+        guard quietMode, let t = state?.settings?.quiet_until, t > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(t))
+    }
+    /// Stop the pipeline using the screen for `seconds` (engine clamps to 4 h).
+    func pauseScreenControl(seconds: Int) async {
+        await post("/api/quiet-mode", ["enabled": true, "seconds": seconds])
+        await refresh()
+    }
+    /// Hand the screen back to the pipeline now, cancelling any pause.
+    func resumeScreenControl() async {
+        await post("/api/quiet-mode", ["enabled": false])
         await refresh()
     }
     func saveSettings(_ body: [String: Any]) async {

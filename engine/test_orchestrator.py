@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import time
 import unittest
 from unittest import mock
 
@@ -700,6 +701,49 @@ class ElapsedAccumulator(unittest.TestCase):
             o._elapsed_begin("Z|topaz")                          # topaz starts FRESH at 0
             self.assertAlmostEqual(o._elapsed_value(), 5.0)
         self.assertAlmostEqual(orch._elapsed_map()["Z|download"], 30.0)  # download's total untouched
+
+
+class QuietModeExpiry(unittest.TestCase):
+    """Screen Control off is a TIMED pause. The deadline is enforced in the ENGINE so it lifts
+    even if the app was never reopened — left on indefinitely it would buffer items before
+    Resolve until the disk floor stalled the run."""
+
+    def _quiet(self, **s):
+        o = orch.Orchestrator()
+        saved = {}
+        with mock.patch.object(orch.settings, "get_settings", return_value=s), \
+             mock.patch.object(orch.settings, "set_settings",
+                               side_effect=lambda d: saved.update(d)):
+            return o._quiet_mode(), saved
+
+    def test_off_is_off(self):
+        self.assertEqual(self._quiet(quiet_mode=False, quiet_until=0)[0], False)
+
+    def test_paused_before_the_deadline_stays_paused(self):
+        on, wrote = self._quiet(quiet_mode=True, quiet_until=int(time.time()) + 600)
+        self.assertTrue(on)
+        self.assertEqual(wrote, {})                     # nothing rewritten while still pausing
+
+    def test_past_the_deadline_it_turns_itself_back_on(self):
+        on, wrote = self._quiet(quiet_mode=True, quiet_until=int(time.time()) - 1)
+        self.assertFalse(on)                            # the pipeline may use the screen again
+        self.assertEqual(wrote, {"quiet_mode": False, "quiet_until": 0})   # and it is persisted
+
+    def test_a_paused_state_with_no_deadline_still_pauses(self):
+        # Back-compat: a settings.json written before quiet_until existed has no deadline.
+        # It must not be treated as instantly expired (that would ignore a deliberate pause).
+        on, wrote = self._quiet(quiet_mode=True, quiet_until=0)
+        self.assertTrue(on)
+        self.assertEqual(wrote, {})
+
+    def test_the_pause_length_is_capped(self):
+        import settings as st
+        self.assertEqual(st.clamp_quiet_seconds(99999), st.MAX_QUIET_SECONDS)
+        self.assertEqual(st.clamp_quiet_seconds(5), st.MIN_QUIET_SECONDS)
+        self.assertEqual(st.clamp_quiet_seconds(0), 0)          # 0 = don't pause at all
+        self.assertEqual(st.clamp_quiet_seconds(-10), 0)        # a past deadline = don't pause
+        self.assertEqual(st.clamp_quiet_seconds("junk"), 3600)  # unparseable = the 1 h default
+        self.assertLessEqual(st.MAX_QUIET_SECONDS, 4 * 3600)
 
 
 class QuietMode(unittest.TestCase):

@@ -1876,9 +1876,27 @@ class Orchestrator:
 
     def _quiet_mode(self) -> bool:
         """QUIET MODE (read live): hold items before the screen-invasive Resolve stage so the laptop
-        stays usable. download+topaz still run; nothing takes over the display."""
+        stays usable. download+topaz still run; nothing takes over the display.
+
+        Screen Control off is always a TIMED pause: `quiet_until` is the epoch second it comes
+        back by itself. Expiry is enforced HERE rather than in the app, so the pause still ends
+        on its own if the app was relaunched (or never reopened) while it was running — a
+        forgotten 'off' otherwise buffers items until the disk floor stops the run. Clearing it
+        is what lets _maybe_resume_deferred pick the held items back up."""
         try:
-            return bool(settings.get_settings().get("quiet_mode", False))
+            s = settings.get_settings()
+            on = bool(s.get("quiet_mode", False))
+            if not on:
+                return False
+            until = int(s.get("quiet_until", 0) or 0)
+            if until and time.time() >= until:
+                # Expired — turn Screen Control back on. This write also clears the flag, so
+                # the hot path only ever performs it once.
+                settings.set_settings({"quiet_mode": False, "quiet_until": 0})
+                print("[screen] Screen Control pause expired — the pipeline may use the screen again",
+                      flush=True)
+                return False
+            return True
         except (TypeError, ValueError):
             return False
 

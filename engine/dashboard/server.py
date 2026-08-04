@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -763,12 +764,27 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/settings":
             self._json({"settings": settings.set_settings(body or {})})
         elif path == "/api/quiet-mode":
-            # QUIET MODE toggle: persist it (the orchestrator reads it live to defer the Resolve stage),
-            # and when turning it ON, reclaim the screen NOW by aborting any in-flight Resolve.
+            # SCREEN CONTROL. `enabled` = quiet mode ON = the pipeline stops using the screen.
+            # That is only ever TEMPORARY: `seconds` (or an `until` epoch) sets when it comes
+            # back by itself, clamped to settings.MAX_QUIET_SECONDS — an indefinite pause would
+            # buffer items until the disk floor stalls the run. Turning it back ON clears both.
             on = bool(body.get("enabled"))
-            settings.set_settings({"quiet_mode": on})
-            if on:
-                orchestrator.ORCH.reclaim_screen()
+            if not on:
+                settings.set_settings({"quiet_mode": False, "quiet_until": 0})
+            else:
+                secs = body.get("seconds")
+                if secs is None and body.get("until") is not None:
+                    try:
+                        secs = int(body["until"]) - int(time.time())
+                    except (TypeError, ValueError):
+                        secs = None
+                secs = settings.clamp_quiet_seconds(3600 if secs is None else secs)
+                if secs <= 0:                      # a past/zero deadline means "don't pause at all"
+                    settings.set_settings({"quiet_mode": False, "quiet_until": 0})
+                else:
+                    settings.set_settings({"quiet_mode": True,
+                                           "quiet_until": int(time.time()) + secs})
+                    orchestrator.ORCH.reclaim_screen()   # abort any in-flight Resolve NOW
             self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/next-up":
             # Per-slot follow-up: the show that takes this slot the moment `show` finishes.

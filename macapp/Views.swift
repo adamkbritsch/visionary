@@ -284,14 +284,16 @@ struct HeaderBar: View {
             }
             Spacer()
             StatusPuck()
-            ScreenControlButton()
             PowerPill()
             Button(action: { showSettings.toggle() }) {
                 // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
-                // giving it a button chrome made it compete with Activate.
+                // giving it a button chrome made it compete with Activate. Screen Control lives
+                // inside the popup now, so the gear carries its one at-a-glance signal: it goes
+                // red while the pipeline is holding off the screen, since that state pauses
+                // Resolve and is easy to forget about.
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(DS.steel)
+                    .foregroundStyle(store.quietMode ? DS.quietRedLight : DS.steel)
                     .contentShape(Rectangle())           // keep the whole glyph box clickable
             }
             .buttonStyle(.plain)
@@ -311,6 +313,7 @@ struct HeaderBar: View {
             .buttonStyle(SteelButtonStyle(lit: on))
             .help(on ? "Deactivate — stop running and stay idle until you activate again"
                      : "Activate — run whenever possible (re-arms itself after stops and relaunches)")
+            .accessibilityIdentifier("activate")
         }
         .padding(.leading, 84).padding(.trailing, 20).padding(.vertical, 13)
         .frame(maxWidth: .infinity)
@@ -394,34 +397,125 @@ struct PowerPill: View {
     }
 }
 
-/// "Screen Control" — toggles whether the pipeline may take over the screen (run the DaVinci Resolve
-/// stage). Sized to the PowerPill so it doesn't outshout the neighbouring cards. SAME neutral plate in
-/// both states; when it is NOT controlling the screen (Quiet Mode on) it gets a muted-red glowing rim.
-/// Turning it back on drains the Topaz-done backlog straight to Resolve.
-struct ScreenControlButton: View {
+/// SCREEN CONTROL, now a Settings row rather than a header button.
+///
+/// It can only be switched off for a WHILE — a duration or a clock time, never indefinitely.
+/// Holding items before Resolve buffers their ~140 GB Topaz intermediates against the disk
+/// floor, so a forgotten "off" doesn't keep the Mac free, it quietly stalls the run. The
+/// engine owns the deadline (`quiet_until`), so the pause still lifts if the app is closed.
+struct ScreenControlSection: View {
     @EnvironmentObject var store: AppStore
+    @State private var untilTime = Date().addingTimeInterval(3600)
+    @State private var now = Date()
+
+    // Mirrors settings.MAX_QUIET_SECONDS — the UI can't offer a pause the engine would clamp.
+    private static let maxSeconds = 4 * 3600
+    private static let presets: [(String, Int)] = [
+        ("30m", 1800), ("1h", 3600), ("2h", 7200), ("4h", 14400),
+    ]
+
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private func remaining(_ until: Date) -> String {
+        let s = max(0, Int(until.timeIntervalSince(now)))
+        return s >= 3600 ? "\(s / 3600)h \((s % 3600) / 60)m" : "\(max(1, s / 60))m"
+    }
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none; return f
+    }()
+
     var body: some View {
-        let off = store.quietMode          // Quiet Mode ON ⇒ the pipeline is NOT controlling the screen
-        Button(action: { Task { await store.toggleQuietMode() } }) {
-            Text("Screen Control")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(DS.steelBright)                     // same text colour in both states
-                .padding(.horizontal, 11).padding(.vertical, 6)      // same height as the PowerPill (140 W) card
-                .background(Capsule().fill(Color.white.opacity(0.07)))
-                .overlay {                                           // rim: a muted-red laser outline when NOT
-                    if off {                                          // controlling the screen, else the quiet bevel
-                        Capsule().strokeBorder(DS.quietRedLight, lineWidth: 1)
-                            .shadow(color: DS.quietRedLight.opacity(0.7), radius: 2)
-                            .shadow(color: DS.quietRedDark.opacity(0.6), radius: 1)
-                            .opacity(0.8)                             // 80% of the previous rim strength
-                    } else {
-                        Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Screen control").font(.system(size: 13, weight: .medium))
+                    Text(store.quietMode
+                         ? "Paused — the pipeline is leaving the screen alone."
+                         : "The pipeline may take the screen to run Dolby Vision.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 10)
+                Text(store.quietMode ? "Paused" : "On")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(store.quietMode ? DS.quietRedLight : DS.steel)
+            }
+
+            if let until = store.quietUntil {
+                // PAUSED: say exactly when it comes back, and offer the way out.
+                HStack(spacing: 8) {
+                    Text("Back on at \(Self.clock.string(from: until)) · \(remaining(until)) left")
+                        .font(.system(size: 11)).foregroundStyle(DS.steel).monospacedDigit()
+                    Spacer()
+                    Button("Resume now") { Task { await store.resumeScreenControl() } }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(DS.steelBright)
+                        .padding(.horizontal, 9).padding(.vertical, 4)
+                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
+                }
+            } else {
+                // ON: the only way to switch it off is to say for how long.
+                HStack(spacing: 6) {
+                    Text("Pause for").font(.system(size: 11)).foregroundStyle(.secondary)
+                    ForEach(Self.presets, id: \.0) { label, secs in
+                        Button(label) { Task { await store.pauseScreenControl(seconds: secs) } }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(DS.steelBright)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
                     }
                 }
+                HStack(spacing: 6) {
+                    Text("or until").font(.system(size: 11)).foregroundStyle(.secondary)
+                    DatePicker("", selection: $untilTime, displayedComponents: .hourAndMinute)
+                        .labelsHidden().datePickerStyle(.field).fixedSize()
+                    // Show what the picked time actually BUYS, so the 4 h clamp is visible
+                    // rather than silent — picking a time already gone today would otherwise
+                    // look like it did nothing in particular.
+                    Text(durationLabel(secondsUntilChosenTime()))
+                        .font(.system(size: 11)).monospacedDigit()
+                        .foregroundStyle(secondsUntilChosenTime() >= Self.maxSeconds
+                                         ? DS.quietRedLight : DS.steel)
+                    Button("Set") {
+                        Task { await store.pauseScreenControl(seconds: secondsUntilChosenTime()) }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(DS.steelBright)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
+                    Spacer()
+                }
+                Text("Longest pause is 4 hours — beyond that, held items fill the disk and the run stalls.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .buttonStyle(.plain)
-        .help(off ? "Screen control OFF — the pipeline won't run Resolve or take the screen (drains when you turn it back on)"
-                  : "Screen control ON — the pipeline may run Resolve. Click to stop it taking the screen while you work.")
+        .onReceive(tick) { now = $0 }
+    }
+
+    /// "→ 1h 30m", or "→ 4h (max)" when the pick was long enough to be clamped.
+    private func durationLabel(_ secs: Int) -> String {
+        let h = secs / 3600, m = (secs % 3600) / 60
+        let body = h > 0 ? (m > 0 ? "\(h)h \(m)m" : "\(h)h") : "\(m)m"
+        return secs >= Self.maxSeconds ? "→ \(body) (max)" : "→ \(body)"
+    }
+
+    /// The picker gives an hour+minute; resolve it to the NEXT time that clock reads (so
+    /// 1 AM chosen at 11 PM means tonight's 1 AM, not this morning's) and cap at 4 h out.
+    private func secondsUntilChosenTime() -> Int {
+        let cal = Calendar.current
+        let c = cal.dateComponents([.hour, .minute], from: untilTime)
+        let n = Date()
+        var target = cal.date(bySettingHour: c.hour ?? 0, minute: c.minute ?? 0, second: 0, of: n) ?? n
+        if target <= n { target = cal.date(byAdding: .day, value: 1, to: target) ?? target }
+        return min(Int(target.timeIntervalSince(n)), Self.maxSeconds)
     }
 }
 
@@ -1930,6 +2024,9 @@ struct SettingsPopover: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Settings").font(.system(size: 15, weight: .semibold))
+
+                ScreenControlSection()
+                Divider()
 
                 SettingRow(title: "Required adapter",
                            blurb: "Below this, everything pauses and the screen sleeps.",
