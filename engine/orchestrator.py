@@ -767,14 +767,23 @@ class Orchestrator:
         if self._fin_el_key == key:
             self._fin_el_key = None; self._fin_el_anchor = None
 
-    def _hold(self, code, message, **detail):
+    def _hold(self, code, message, *, keep_stage=False, **detail):
         """The run thread is deliberately NOT executing a stage. Publishes a structured
         `hold` code beside the prose so the UI can label the state without pattern-matching
         English — there are ~29 message forms, several with interpolated values and one
         (the stage-result line) that can carry a raw ffmpeg stderr tail. The prose is
-        unchanged; anything already reading `message` is unaffected."""
-        self.state.update(stage=None, progress=None, stage_active=False,
-                          message=message, hold={"code": code, **detail})
+        unchanged; anything already reading `message` is unaffected.
+
+        `keep_stage` is for a hold that FREEZES an item mid-stage rather than sitting between
+        items: the work is still there, just stopped. Clearing `stage`/`progress` in that case
+        makes the UI forget what is waiting and drop its percentage — which is exactly what a
+        power pause did until this flag existed."""
+        upd = {"stage_active": False,          # nothing is EXECUTING either way
+               "message": message, "hold": {"code": code, **detail}}
+        if not keep_stage:
+            upd["stage"] = None
+            upd["progress"] = None
+        self.state.update(upd)
 
     def _clear_hold(self):
         self.state["hold"] = None
@@ -1363,7 +1372,9 @@ class Orchestrator:
                 self._power_paused = (pstatus == "pause")        # let the prefetcher back off too
                 if pstatus == "pause":
                     self._stop_caffeinate()                      # don't hold the display/system awake
-                    self._hold("power", pmsg)                    # all night while waiting on power
+                    # keep_stage: the item is FROZEN mid-stage, not abandoned. Without it the
+                    # pipeline card forgot which item was waiting and lost its percentage.
+                    self._hold("power", pmsg, keep_stage=True)   # all night while waiting on power
                     self._sleep(DRAIN_POLL_SECONDS); continue    # re-check soon to resume on recovery
                 if self._caffeinate is None:                     # resumed from a power pause → re-hold
                     self._start_caffeinate()

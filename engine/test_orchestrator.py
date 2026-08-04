@@ -763,6 +763,25 @@ class HoldCodes(unittest.TestCase):
         # ...but the PROSE is untouched, so anything already reading `message` still works
         self.assertIn("holding before Resolve", o.state["message"])
 
+    def test_a_power_pause_keeps_the_frozen_item_on_screen(self):
+        # REGRESSION: a power pause FREEZES an item mid-stage — it is not a between-items
+        # state. Clearing stage/progress made the pipeline card forget which item was waiting
+        # and drop its percentage, so on battery it showed one lane instead of two.
+        o = orch.Orchestrator()
+        o.state.update(stage="topaz", stage_active=True, progress={"stage": "topaz", "pct": 25})
+        o._hold("power", "paused — on battery (waiting for the 140 W adapter)", keep_stage=True)
+        self.assertEqual(o.state["stage"], "topaz")               # still shows WHAT is waiting
+        self.assertEqual(o.state["progress"]["pct"], 25)          # ...and how far it got
+        self.assertFalse(o.state["stage_active"])                 # but nothing is executing
+        self.assertEqual(o.state["hold"]["code"], "power")
+
+    def test_a_between_items_hold_still_clears(self):
+        o = orch.Orchestrator()
+        o.state.update(stage="topaz", stage_active=True, progress={"pct": 25})
+        o._hold("backlog", "holding the next item — finisher backlog")
+        self.assertIsNone(o.state["stage"])
+        self.assertIsNone(o.state["progress"])
+
     def test_hold_detail_rides_along(self):
         o = orch.Orchestrator()
         o._hold("stall", "Resolve stalled — 3 waiting", held=3)
