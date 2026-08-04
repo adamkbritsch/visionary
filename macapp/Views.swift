@@ -377,6 +377,11 @@ enum MachineState {
         }
     }
     var pulses: Bool { self == .working }
+
+    /// The dot is a SECONDARY indicator — the row text already carries the state colour — so it
+    /// sits back from it rather than matching. Same size, just quieter. `.fault` is the one that
+    /// still shouts: it is the only state that needs to be noticed from across the room.
+    var dotTint: Color { self == .fault ? DS.fault : tint.opacity(0.55) }
 }
 
 /// Everything the puck displays, derived in one pure place so the views stay dumb.
@@ -535,26 +540,33 @@ private struct PuckRow: View {
     let lead: String
     let pct: String?
     let trail: String?
+    /// Whether the CHIP is showing that column at all — reserved when EITHER row has a value,
+    /// so the two rows line up as a table and neither ends ragged. When no row has one, the
+    /// column vanishes entirely and the chip shrinks.
+    let hasPct: Bool
+    let hasEta: Bool
     let size: CGFloat
     let weight: Font.Weight
     let tint: Color
 
-    // Worst-case widths at 12pt with monospaced digits, shared by both rows so their columns
-    // line up: "100%" and "~12h 59m" (a Topaz stage can genuinely run that long).
-    private static let pctSlot: CGFloat = 32
-    private static let etaSlot: CGFloat = 58
+    // Worst case at 12pt with monospaced digits, including the separator: "· 100%" and
+    // "· ~12h 59m" (a Topaz stage can genuinely run that long).
+    private static let pctSlot: CGFloat = 42
+    private static let etaSlot: CGFloat = 68
+
+    /// The separator lives INSIDE the slot and right-aligns with its value, so a short value
+    /// never strands its dot several points away — the slack falls between columns, where it
+    /// reads as spacing rather than as a gap.
+    private func cell(_ v: String?) -> Text {
+        guard let v else { return Text("") }
+        return Text("· ").foregroundColor(tint.opacity(0.45)) + Text(v)
+    }
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 4) {
             Text(lead).lineLimit(1).truncationMode(.tail)
-            if let pct {
-                Text("·").opacity(0.45)
-                Text(pct).frame(width: Self.pctSlot, alignment: .trailing)
-            }
-            if let trail {
-                Text("·").opacity(0.45)
-                Text(trail).frame(width: Self.etaSlot, alignment: .trailing)
-            }
+            if hasPct { cell(pct).frame(width: Self.pctSlot, alignment: .trailing) }
+            if hasEta { cell(trail).frame(width: Self.etaSlot, alignment: .trailing) }
         }
         .font(.system(size: size, weight: weight))
         .monospacedDigit()
@@ -572,14 +584,19 @@ struct StatusPuck: View {
             // the ETA to a far edge — so the chip is only ever as wide as what it is showing.
             HStack(spacing: 7) {
                 if m.machine.pulses {
-                    PulseDot(color: m.machine.tint)
+                    PulseDot(color: m.machine.dotTint)
                 } else {
-                    Circle().fill(m.machine.tint).frame(width: 7, height: 7)
+                    Circle().fill(m.machine.dotTint).frame(width: 7, height: 7)
                 }
                 VStack(alignment: .leading, spacing: 1) {
+                    // A column exists if EITHER row has a value for it, so the rows align.
+                    let hasPct = m.rowAPct != nil || m.rowBPct != nil
+                    let hasEta = m.rowATrail != nil || m.rowBTrail != nil
                     PuckRow(lead: m.rowALead, pct: m.rowAPct, trail: m.rowATrail,
+                            hasPct: hasPct, hasEta: hasEta,
                             size: 12, weight: .medium, tint: m.machine.tint)
                     PuckRow(lead: m.rowBLead, pct: m.rowBPct, trail: m.rowBTrail,
+                            hasPct: hasPct, hasEta: hasEta,
                             size: 11, weight: .regular,
                             tint: m.rowBDim ? DS.steelDim : DS.steel)
                 }
@@ -590,7 +607,10 @@ struct StatusPuck: View {
                 // deterministic rather than a layout side effect.
                 .fixedSize(horizontal: true, vertical: false)
             }
-            .padding(.horizontal, 11).padding(.vertical, 5)
+            // Optically balanced, not numerically equal: the dot sits inside the left padding, so
+            // matching numbers make the right edge look tight against the text. A few extra points
+            // on the trailing side evens it out.
+            .padding(.leading, 11).padding(.trailing, 19).padding(.vertical, 5)
             .background(Capsule().fill(m.machine.tint.opacity(0.08)))
             .overlay(Capsule().strokeBorder(m.machine.tint.opacity(0.22), lineWidth: 0.8))
             .contentShape(Capsule())
