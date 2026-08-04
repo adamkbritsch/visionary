@@ -29,6 +29,9 @@ struct ProgressDTO: Codable {
     var seg_done: Int?        // topaz: fully-encoded segment count (drives the tiny flash)
     var seg_total: Int?
     var seg_eta_secs: Double? // topaz: eta for the CURRENT segment (windowed rate)
+    var seg_secs: Double?     // topaz: that segment's PROJECTED TOTAL = time already spent in it +
+                              // its remaining eta. Gating on this instead of the remainder keeps the
+                              // countdown from vanishing exactly as the segment finishes.
     var avg_seg_secs: Double? // topaz: projected average time per segment (gates showing seg eta)
     var preset: String?
     var pct: Int?
@@ -237,6 +240,8 @@ struct SettingsDTO: Codable {
     var prefetch_cap_gb: Int?             // download-ahead buffer ceiling (0 = off)
     var max_episode_fails: Int?           // failures of one episode before it's parked
     var unplug_grace_seconds: Int?        // power-blip tolerance mid-stage
+    var seg_eta_after_minutes: Int?       // show the current segment's ETA while THAT segment has
+                                          // more than this left (a readout threshold, not behaviour)
     // NOTE: max_peak_mbps + audio_target_lufs stay in the DTO (the state poll carries them) but
     // deliberately have NO control — they dictate the output bytes. Everything above decides
     // only what runs, when, and what qualifies.
@@ -263,6 +268,7 @@ extension SettingsDTO {
         case "prefetch_cap_gb":           return prefetch_cap_gb
         case "max_episode_fails":         return max_episode_fails
         case "unplug_grace_seconds":      return unplug_grace_seconds
+        case "seg_eta_after_minutes":     return seg_eta_after_minutes
         default:                          return nil
         }
     }

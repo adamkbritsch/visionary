@@ -530,27 +530,31 @@ struct StatusPuck: View {
     var body: some View {
         let m = PuckModel.make(store)
         Button { showDetail.toggle() } label: {
-            HStack(spacing: 8) {
+            // BARE, like its neighbours. The power readout and the gear both had their plates
+            // stripped; a filled+outlined capsule made the puck the only chromed thing left on
+            // the bar and it read as heavy. The dot carries the state, so the plate earned
+            // nothing. Hugging the content also closes the dead gulf a fixed width opened up
+            // between the stage name and its ETA.
+            HStack(spacing: 7) {
                 if m.machine.pulses {
                     PulseDot(color: m.machine.tint)
                 } else {
                     Circle().fill(m.machine.tint).frame(width: 7, height: 7)
                 }
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2) {
                     PuckRow(lead: m.rowALead, trail: m.rowATrail,
-                            size: 12, weight: .medium, tint: m.machine.tint)
+                            size: 11, weight: .medium, tint: m.machine.tint)
                     PuckRow(lead: m.rowBLead, trail: m.rowBTrail,
-                            size: 10, weight: .regular,
-                            // never below DS.steel for content that matters — steelDim at 10pt
-                            // on this background fails AA
-                            tint: m.rowBDim ? DS.steel.opacity(0.75) : DS.steel)
+                            size: 11, weight: .regular,
+                            // rows are peers, not a headline and a footnote — same size, and the
+                            // hierarchy comes from weight + tint alone
+                            tint: m.rowBDim ? DS.steelDim : DS.steel)
                 }
+                // The bar right-aligns everything after its Spacer, so the puck's TRAILING edge
+                // is fixed even as it hugs — which is what keeps the ETA column from sliding.
+                .frame(minWidth: 150, maxWidth: 300, alignment: .leading)
             }
-            .padding(.horizontal, 10)
-            .frame(width: 264, height: 32, alignment: .leading)
-            .background(Capsule().fill(m.machine.tint.opacity(0.08)))
-            .overlay(Capsule().strokeBorder(m.machine.tint.opacity(0.22), lineWidth: 0.8))
-            .contentShape(Capsule())
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .focusable(false)
@@ -1133,11 +1137,16 @@ struct StageProgress: View {
                         .font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
                     if let d = pr.seg_done, let t = pr.seg_total, t > 0 {
                         Spacer()
-                        // Slow content (segments averaging >15 min): the stage eta alone reads
-                        // as "hours away", so show the CURRENT segment's eta for near-term motion.
+                        // The stage eta alone reads as "hours away", so show the CURRENT segment's
+                        // countdown for near-term motion. Gated on that segment's projected TOTAL
+                        // (time spent in it + what's left) against 'seg_eta_after_minutes' — judged
+                        // on the segment itself rather than an average across segments, and on its
+                        // total rather than its remainder, so the number stays put for the whole
+                        // segment instead of disappearing right as it counts down to zero.
+                        let segGate = Double(store.state?.settings?.seg_eta_after_minutes ?? 15) * 60
                         let segEta: String = {
-                            guard (pr.avg_seg_secs ?? 0) > 900, let e = pr.seg_eta_secs, e > 0
-                            else { return "" }
+                            guard (pr.seg_secs ?? 0) > segGate,
+                                  let e = pr.seg_eta_secs, e > 0 else { return "" }
                             return etaSuffix(e).replacingOccurrences(of: " left", with: "")
                         }()
                         Text("\(min(d + 1, t))/\(t)\(segEta)")
@@ -2390,6 +2399,12 @@ struct SettingsPopover: View {
                                    blurb: "How long a power blip is tolerated mid-stage before the stage is abandoned.",
                                    key: "unplug_grace_seconds", fallback: 60,
                                    range: 0...600, step: 15, unit: "s")
+
+                        SettingsGroupLabel(text: "Readouts").padding(.top, 4)
+                        SettingRow(title: "Segment ETA after",
+                                   blurb: "Show the current segment's countdown while that segment still has longer than this to run. A segment about to finish doesn't need its own number.",
+                                   key: "seg_eta_after_minutes", fallback: 15,
+                                   range: 1...120, unit: "min")
 
                         SettingsGroupLabel(text: "What qualifies").padding(.top, 4)
                         OptionalSettingRow(title: "4K fast path",

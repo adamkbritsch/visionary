@@ -112,6 +112,13 @@ DEFAULT_SETTINGS = {
                                 # item only when it's needed).
     "max_episode_fails": 5,     # GIVE-UP THRESHOLD (was orchestrator.MAX_EPISODE_FAILS): consecutive
                                 # genuine failures of ONE episode before it's parked and the run moves on.
+    "seg_eta_after_minutes": 15,  # SEGMENT-ETA GATE (was a hardcoded 900 s in the app): Topaz shows
+                                # the CURRENT segment's eta beside the segment counter only while
+                                # THAT segment still has longer than this left to run — judged on
+                                # the segment itself, not on a projected average across segments.
+                                # The stage eta alone reads as "hours away", so this is the
+                                # near-term number; a segment about to finish doesn't need one.
+                                # Purely a readout threshold — changes nothing the pipeline does.
     "unplug_grace_seconds": 60, # POWER-BLIP GRACE (was orchestrator.UNPLUG_GRACE_SECONDS): unplugged
                                 # mid-stage, wait this long for the power to come back before abandoning
                                 # the stage. 0 = abandon immediately.
@@ -136,6 +143,8 @@ LIMITS = {
     "prefetch_cap_gb": (25, 500),
     "max_episode_fails": (1, 20),
     "unplug_grace_seconds": (0, 600),
+    "seg_eta_after_minutes": (1, 120),   # 1 = effectively always (a Topaz segment never encodes
+                                         # in under a minute); high = effectively never
 }
 ZERO_IS_OFF = {"audio_target_lufs", "passthrough_min_mbps", "prefetch_cap_gb"}
 

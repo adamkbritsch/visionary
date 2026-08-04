@@ -618,6 +618,8 @@ class Orchestrator:
         self._plex_errs = 0                    # consecutive Plex-check failures (tolerate a couple of blips)
         self._stage_active = False             # True only while a heavy stage is executing
         self._progress_key = None              # (stage, ep) the current progress belongs to
+        self._seg_anchor = None                # (seg_done, monotonic) when the CURRENT segment began —
+                                               # the only source of time-spent-in-THIS-segment
         self._progress_start = 0.0             # when the CURRENT ETA window began
         self._progress_start_pct = 0.0         # the % already done when that window began (0 on a fresh stage)
         self._run_contended = False            # was the finisher's remux running at topaz's last tick?
@@ -795,6 +797,9 @@ class Orchestrator:
             self._progress_key = key
             self._progress_start = now
             self._progress_start_pct = pct
+            self._seg_anchor = None            # new stage/item, or a resume: this segment's clock
+                                               # restarts (a resumed segment under-counts by
+                                               # whatever ran before the interruption)
         self._progress_last = now
         elapsed = now - self._progress_start
         advanced = pct - self._progress_start_pct
@@ -826,6 +831,16 @@ class Orchestrator:
                 info["seg_eta_secs"] = elapsed * rem / advanced
             if info.get("seg_total"):
                 info["avg_seg_secs"] = (elapsed / advanced) * (100 / info["seg_total"])
+        # This segment's PROJECTED TOTAL = time already spent in it + what it has left. The UI
+        # gates the per-segment countdown on this rather than on the remaining time, so the
+        # number doesn't vanish just as the segment finishes; and on the segment ITSELF rather
+        # than a projected average, so one slow segment is judged on its own.
+        sd = info.get("seg_done")
+        if sd is not None:
+            if self._seg_anchor is None or self._seg_anchor[0] != sd:
+                self._seg_anchor = (sd, now)               # a segment boundary just passed
+            if (se := info.get("seg_eta_secs")) is not None:
+                info["seg_secs"] = (now - self._seg_anchor[1]) + se
         if self._elapsed_anchor is not None:    # accumulated real time in THIS stage of THIS item
             info["elapsed_secs"] = self._elapsed_value()
             mono = time.monotonic()

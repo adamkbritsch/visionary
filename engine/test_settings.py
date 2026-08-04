@@ -327,6 +327,16 @@ class Tunables(unittest.TestCase):
                           s["prefetch_cap_gb"], s["max_episode_fails"], s["unplug_grace_seconds"]),
                          (1, 1, 250, 50, 2, 0))
 
+    def test_segment_eta_gate_range_allows_always_but_not_zero(self):
+        # The gate is "show the segment ETA once segments average longer than N minutes".
+        # 1 is the floor and means effectively-always (a Topaz segment never encodes in under
+        # a minute); 0 is NOT offered, because a zero here would read as "off" like the other
+        # ZERO_IS_OFF keys while actually meaning the opposite.
+        self.assertEqual(settings.DEFAULT_SETTINGS["seg_eta_after_minutes"], 15)
+        self.assertNotIn("seg_eta_after_minutes", settings.ZERO_IS_OFF)
+        self.assertEqual(settings.set_settings({"seg_eta_after_minutes": 0})["seg_eta_after_minutes"], 1)
+        self.assertEqual(settings.set_settings({"seg_eta_after_minutes": 999})["seg_eta_after_minutes"], 120)
+
     def test_max_active_cannot_exceed_the_hard_ceiling(self):
         self.assertEqual(settings.set_settings({"max_active_shows": 99})["max_active_shows"],
                          settings.MAX_ACTIVE_CEILING)
