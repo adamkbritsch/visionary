@@ -284,8 +284,8 @@ struct HeaderBar: View {
             }
             Spacer()
             StatusPuck()
-            PowerPill()
             ScreenControlButton()
+            PowerPill()
             Button(action: { showSettings.toggle() }) {
                 // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
                 // giving it a button chrome made it compete with Activate.
