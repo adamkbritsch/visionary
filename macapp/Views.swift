@@ -326,6 +326,17 @@ struct HeaderBar: View {
 // steel = armed/paused (+ the orchestrator message), dim = idle.
 private let PUCK_MAX = 46      // character budget, so the puck hugs its content
 
+// The engine's status messages usually lead with the episode code ("S02E14: holding before
+// Resolve — …"). The puck deliberately no longer shows an episode tag, so strip that lead-in
+// from the message too — otherwise the tag just reappears whenever the puck falls back to a
+// message. Only a LEADING code is removed; one mentioned mid-sentence is part of the sentence.
+private func stripEpisodeLead(_ s: String) -> String {
+    guard let r = s.range(of: #"^[Ss]\d{1,2}[Ee]\d{1,3}\s*[:\u{2013}\u{2014}-]?\s*"#,
+                          options: .regularExpression) else { return s }
+    let rest = String(s[r.upperBound...])
+    return rest.isEmpty ? s : rest        // a message that is ONLY a code keeps it
+}
+
 struct StatusPuck: View {
     @EnvironmentObject var store: AppStore
     var body: some View {
@@ -343,9 +354,10 @@ struct StatusPuck: View {
                 if let st = (p?.stage ?? o?.stage), !st.isEmpty { parts.append(st.capitalized) }
                 if let pc = p?.pct { parts.append("\(pc)%") }
                 if let m = minutes(p?.eta_secs), m > 0 { parts.append("~\(m)m") }
-                return parts.isEmpty ? (o?.message ?? "Running") : parts.joined(separator: " · ")
+                if parts.isEmpty { return stripEpisodeLead(o?.message ?? "Running") }
+                return parts.joined(separator: " · ")
             }
-            return on ? (o?.message ?? "Armed") : "Idle"
+            return on ? stripEpisodeLead(o?.message ?? "Armed") : "Idle"
         }()
         let shown = text.count > PUCK_MAX ? String(text.prefix(PUCK_MAX - 1)) + "…" : text
         HStack(spacing: 6) {
