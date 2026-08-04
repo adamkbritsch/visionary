@@ -106,9 +106,9 @@ There is no time window and no stop-time — only power.
   whole test: **battery drain on a big brick is normal under load and does NOT pause
   the run**. A lesser brick (hub / monitor USB-PD) or battery is insufficient; a Mac
   with **no battery** is mains-powered and always passes.
-  *(`gate_state` and `drain_gate` are pure, unit-tested helpers that are no longer on
-  the live path — `gate_state`'s only wrapper, `_gate()`, has no callers, and
-  `drain_gate` has none outside its test. Change `_power_ok()`, not those.)*
+  *(Two pure helpers used to shadow this — `gate_state` and `drain_gate`, the latter
+  implementing a >5%-battery-drain pause. Both were deleted once they had no callers:
+  their rules are now asserted directly against `_power_ok`.)*
 - Lose power mid-stage and a countdown starts (`unplug_grace_seconds`, default 60);
   if the adapter is back before it expires nothing is lost, otherwise the stage is
   abandoned and the run pauses. Topaz and the remux honour `abort` and resume from

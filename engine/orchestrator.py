@@ -1,20 +1,22 @@
-"""Overnight orchestrator — runs the selected series episode-by-episode:
+"""Overnight orchestrator — round-robins the active shows, item by item:
 
     download -> topaz -> resolve -> remux -> upload -> cleanup
 
 Design guarantees (per the user's spec):
   * ONE download, REUSED. The source is fetched once to scratch; Topaz AND the
-    remux both read that same local file — never re-downloaded.
+    remux both read from it — never re-downloaded.
   * Every stage is RESUMABLE. A stage's output is validated, so an interrupted
-    stage (e.g. stopped at the stop-time mid-Topaz) simply re-runs from its start
-    when restarted — it picks up at the stage it was in, not the whole pipeline.
+    stage picks up where it left off rather than the whole pipeline restarting.
+    Topaz and the remux are SEGMENTED, so a kill loses at most one segment.
   * Topaz -> Resolve is WIRED: the ProRes output is the Resolve stage's input.
-  * Per-show Topaz PROFILE: the Topaz stage uses the selected show's saved upscale
-    profile (settings.show_profile_or_default) — configured once per show in the UI.
+  * Per-show Topaz PROFILE: the Topaz stage resolves the show's chosen preset via
+    settings.show_topaz_params(series, res) — the preset is picked once, as a step
+    when the series is selected (see stages.py).
   * CLEANUP on success. After a verified upload+replace, ALL local working files
-    for the episode are deleted, so the process runs indefinitely.
-  * You press START any time; it runs on adequate AC and auto-STOPS at the next
-    stop-time (default 9 AM, adjustable in Settings) — no fixed start window.
+    for the item are deleted, so the process runs indefinitely.
+  * APPLIANCE mode: Activate once and the arm state persists across launches. There
+    is no stop-time — a run ends only on a manual stop. It runs whenever the power
+    is adequate (>= min_adapter_watts); no fixed start window.
 
 The heavy stage runners call the real implementations (transfer/topaz/resolve/
 remux); the pure planning logic (paths, stage-done detection, gating) is unit-tested.
@@ -59,7 +61,6 @@ OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/u
                              # for the NEXT item's own intermediate. Room for one movie ProRes + margin.
 STATE_FILE = os.path.expanduser("~/.topaz-pipeline/run-state.json")
 DIM_IDLE_MINUTES_DEFAULT = 15   # fallback for the 'dim_after_minutes' setting (idle this long → backlight 0)
-DRAIN_PCT_THRESHOLD = 5      # pause once the battery drains more than this % below where draining began
 DRAIN_POLL_SECONDS = 30      # how often to re-check while paused for power
 UNPLUG_GRACE_SECONDS = 60    # DEFAULT for the 'unplug_grace_seconds' setting (read via
                              # _unplug_grace()): unplugged mid-stage (ANY stage, incl. remux), wait this long for the
@@ -419,35 +420,13 @@ def relabel_container(p: EpisodePaths, ext: str) -> EpisodePaths:
     return p
 
 
-# ---- pure: gating + stop-time --------------------------------------------
-
-def gate_state(reading, now_time=None, *, watts=None, min_watts=140) -> dict:
-    """Power gating only (pure). Sufficiency = THE POWER BRICK: connected to an adapter of
-    at least `min_watts` (the 140 W MacBook brick) → sufficient, full stop — battery drain
-    on a big brick is normal under load and does NOT pause. A lesser brick (hub/monitor
-    USB-PD) or battery → insufficient. The time bound is the stop-time, handled per-run."""
-    on_ac = bool(reading.external_connected)
-    adequate = on_ac and (watts or 0) >= min_watts
-    return {"on_ac": on_ac, "adequate": adequate, "runnable": adequate}
-
-
-def drain_gate(*, on_ac, draining, battery_pct, baseline, pause_on_drain=True,
-               threshold=DRAIN_PCT_THRESHOLD):
-    """PURE (unit-tested). Pause only after the battery drains MORE than `threshold`
-    percent (default 5) below the level where the current drain began, while on AC.
-    Charging — or merely holding steady, INCLUDING macOS smart-charging capping at
-    80% — resets the baseline to the current level, so sitting at the 80% cap is never
-    read as a drain. `draining` is the amperage-based discharge flag; `battery_pct` is
-    the current charge. Returns (status, baseline): status 'run' or 'pause'; baseline
-    is the charge level the current drain episode started from (None when not draining)."""
-    if not on_ac:
-        return "pause", None
-    if not draining or not pause_on_drain:
-        return "run", battery_pct          # charging / holding (e.g. 80% cap) → reset baseline
-    base = battery_pct if baseline is None else baseline
-    if base - battery_pct > threshold:
-        return "pause", base
-    return "run", base                      # draining but ≤ threshold so far — keep running
+# ---- pure: gating ---------------------------------------------------------
+# The live power gate is Orchestrator._power_ok() / _min_watts() — NOT a pure helper.
+# Two former pure gates were deleted here once they had no callers left: `gate_state`
+# (superseded by _power_ok; its only wrapper _gate() was itself uncalled, and passed no
+# `watts`, so it could only ever report "inadequate") and `drain_gate` (the >5%-drain
+# rule, retired with the `pause_on_battery_drain` setting — a battery dipping under load
+# on a 140 W brick is normal and must not pause). Their rules now live as _power_ok tests.
 
 
 def unplug_decision(*, on_ac, stage_active, unplug_since, now,
@@ -1191,9 +1170,6 @@ class Orchestrator:
         return dict(self.state)
 
     # ---- loop ----
-    def _gate(self):
-        return gate_state(power.read_power())
-
     def _power_ok(self):
         """Returns (status, message); status is 'run' or 'pause'. Sufficiency = the POWER
         BRICK, nothing else: on the >= min_adapter_watts (140 W) adapter → run, even if the

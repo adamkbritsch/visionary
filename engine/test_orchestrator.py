@@ -5,7 +5,7 @@ from unittest import mock
 
 import os
 import orchestrator as orch
-from orchestrator import episode_paths, gate_state, youtube_paths
+from orchestrator import episode_paths, youtube_paths
 
 SRC = "The Office  Superfan Episodes S02e10 Christmas Party (Extended Cut).mp4"
 
@@ -117,36 +117,58 @@ class YouTubePaths(unittest.TestCase):
 
 
 class Gate(unittest.TestCase):
-    """Power sufficiency = THE BRICK: >= min_watts adapter connected → adequate, full stop."""
+    """Power sufficiency = THE BRICK: an adapter of >= min_adapter_watts → run, full stop.
+
+    These assert against `_power_ok`, the LIVE gate. They used to test a pure `gate_state`
+    helper that nothing called — so the rules were green while the shipping path was
+    uncovered. `has_battery` is mocked in every case because _power_ok short-circuits to
+    "run" on a battery-less Mac, which would otherwise make these pass for the wrong
+    reason on a desktop."""
     class R:
         def __init__(self, ext): self.external_connected = ext
 
-    def test_the_140w_brick_is_sufficient(self):
-        self.assertTrue(gate_state(self.R(True), watts=140)["runnable"])
-        self.assertTrue(gate_state(self.R(True), watts=140)["adequate"])
+    def _ok(self, *, ext=True, watts=140, battery=True):
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.power, "has_battery", return_value=battery), \
+             mock.patch.object(orch.power, "read_power", return_value=self.R(ext)), \
+             mock.patch.object(orch.power, "adapter_watts", return_value=watts), \
+             mock.patch.object(orch.settings, "get_settings", return_value={}):
+            return o._power_ok()
 
-    def test_a_lesser_brick_or_battery_is_not(self):
-        self.assertFalse(gate_state(self.R(True), watts=96)["adequate"])    # monitor/hub PD
-        self.assertFalse(gate_state(self.R(True), watts=None)["adequate"])  # unknown wattage
-        self.assertFalse(gate_state(self.R(False), watts=140)["adequate"])  # battery (stale watts)
+    def test_the_140w_brick_is_sufficient(self):
+        self.assertEqual(self._ok(watts=140)[0], "run")
+
+    def test_a_lesser_brick_pauses_and_names_the_wattage(self):
+        st, msg = self._ok(watts=65)                     # monitor/hub USB-PD
+        self.assertEqual(st, "pause"); self.assertIn("65 W", msg)
+
+    def test_unknown_wattage_pauses(self):
+        st, msg = self._ok(watts=None)
+        self.assertEqual(st, "pause"); self.assertIn("unknown", msg)
+
+    def test_on_battery_pauses_even_with_stale_watts(self):
+        st, msg = self._ok(ext=False, watts=140)
+        self.assertEqual(st, "pause"); self.assertIn("battery", msg)
 
     def test_drain_is_irrelevant_on_the_big_brick(self):
-        # "connected to a 140 W adapter at all → sufficient" — draining under load must NOT pause
+        # "connected to a >=140 W adapter at all → sufficient" — a battery dipping under
+        # load must NOT pause. This is the rule the deleted `drain_gate` used to encode.
         with mock.patch.object(orch.power, "is_draining_on_ac", return_value=True):
-            self.assertTrue(gate_state(self.R(True), watts=140)["runnable"])
+            self.assertEqual(self._ok(watts=140)[0], "run")
 
-    def test_power_ok_uses_the_brick_rule(self):
+    def test_no_battery_machine_always_runs(self):
+        # A desktop Mac reports external_connected=False and has no wattage; without the
+        # short-circuit it would pause forever waiting for an adapter it can't report.
+        self.assertEqual(self._ok(ext=False, watts=None, battery=False)[0], "run")
+
+    def test_the_threshold_follows_the_setting(self):
         o = orch.Orchestrator()
-        r = self.R(True)
-        with mock.patch.object(orch.power, "read_power", return_value=r), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=140), \
-             mock.patch.object(orch.settings, "get_settings", return_value={}):
-            self.assertEqual(o._power_ok()[0], "run")
-        with mock.patch.object(orch.power, "read_power", return_value=r), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=65), \
-             mock.patch.object(orch.settings, "get_settings", return_value={}):
-            st, msg = o._power_ok()
-            self.assertEqual(st, "pause"); self.assertIn("65 W", msg)
+        with mock.patch.object(orch.power, "has_battery", return_value=True), \
+             mock.patch.object(orch.power, "read_power", return_value=self.R(True)), \
+             mock.patch.object(orch.power, "adapter_watts", return_value=96), \
+             mock.patch.object(orch.settings, "get_settings",
+                               return_value={"min_adapter_watts": 90}):
+            self.assertEqual(o._power_ok()[0], "run")    # 96 clears a lowered 90 W bar
 
 
 class SkipCurrent(unittest.TestCase):
