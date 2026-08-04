@@ -570,8 +570,6 @@ class SegmentETA(unittest.TestCase):
                 o._set_progress(info)
         # rate = 0.05 %/s → 2.0% remaining in this segment ≈ 40s
         self.assertAlmostEqual(info["seg_eta_secs"], 40, delta=8)
-        # average segment = (100%/25)/0.05%/s = 80s
-        self.assertAlmostEqual(info["avg_seg_secs"], 80, delta=10)
 
     def test_no_segment_fields_no_eta(self):
         o = orch.Orchestrator()
@@ -581,7 +579,7 @@ class SegmentETA(unittest.TestCase):
             with mock.patch.object(orch.time, "time", return_value=float(t)):
                 o._set_progress(info)
         self.assertNotIn("seg_eta_secs", info)
-        self.assertNotIn("avg_seg_secs", info)
+        self.assertNotIn("seg_secs", info)
 
 
 class PlexFailsafe(unittest.TestCase):

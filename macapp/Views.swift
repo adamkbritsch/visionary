@@ -383,24 +383,35 @@ enum MachineState {
 struct PuckModel {
     var machine: MachineState = .idle
     var rowALead: String = "Idle"
+    var rowAPct: String? = nil      // its own FIXED slot — see PuckRow
     var rowATrail: String? = nil
     var rowBLead: String = ""
+    var rowBPct: String? = nil
     var rowBTrail: String? = nil
     var rowBDim: Bool = true        // row B is secondary unless it carries a live lane
     var tooltip: String = ""
 
+    /// What the chip's WIDTH depends on. The percent and ETA live in FIXED-WIDTH slots, so their
+    /// VALUES never move the edge — only whether each slot is present at all, plus the label's
+    /// length. That is exactly what should animate: a piece appearing, never a digit ticking.
+    var widthKey: Int {
+        max(rowALead.count, rowBLead.count) * 4
+            + (rowAPct != nil || rowBPct != nil ? 2 : 0)
+            + (rowATrail != nil || rowBTrail != nil ? 1 : 0)
+    }
+
     /// A lane is "live" for display purposes if it exists at all — a held lane still occupies
     /// the machine and still has work outstanding.
-    private static func laneText(_ f: FinishingDTO?) -> (String, String?)? {
+    private static func laneText(_ f: FinishingDTO?) -> (String, String?, String?)? {
         guard let f, let st = f.stage, !st.isEmpty else { return nil }
         if f.holding != nil {
             // Don't render a frozen percentage as if it were progressing. Keep the last-known
             // number (the engine now preserves it across the hold) but say why it is still.
-            if let pc = f.pct { return ("\(st.capitalized) · \(Int(pc))% · held", nil) }
-            return ("\(st.capitalized) · held for Resolve", nil)
+            if let pc = f.pct { return ("\(st.capitalized) · held", "\(Int(pc))%", nil) }
+            return ("\(st.capitalized) · held for Resolve", nil, nil)
         }
-        guard let pc = f.pct else { return ("\(st.capitalized) · starting…", nil) }
-        return ("\(st.capitalized) · \(Int(pc))%", shortLeft(f.eta_secs))
+        guard let pc = f.pct else { return ("\(st.capitalized) · starting…", nil, nil) }
+        return (st.capitalized, "\(Int(pc))%", shortLeft(f.eta_secs))
     }
 
     /// "~28m" / "~4h 16m" / "~45s" — the `finLeft` wording without its " left" suffix, so the
@@ -435,12 +446,20 @@ struct PuckModel {
         }
     }
 
+    /// Free-form engine prose is the only thing here that can be arbitrarily long (one message
+    /// can carry a raw ffmpeg stderr tail). Clamp it HERE, so the chip hugs its content and the
+    /// header can never be shoved around by a status string. Nothing is lost — the untruncated
+    /// text is in the tooltip and the popover.
+    private static func clamp(_ s: String, _ n: Int = 42) -> String {
+        s.count <= n ? s : String(s.prefix(n - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
     @MainActor static func make(_ store: AppStore) -> PuckModel {
         var m = PuckModel()
         let s = store.state
         let o = s?.orchestrator
         let armed = s?.automation_enabled ?? false
-        let message = stripEpisodeLead(o?.message ?? "")
+        let message = clamp(stripEpisodeLead(o?.message ?? ""))
 
         // LIVENESS: `stage` is stale by design (set at stage start, never cleared), so trust
         // `stage_active`. A nil value means an older engine — fall back to the old heuristic
@@ -451,7 +470,8 @@ struct PuckModel {
 
         // ---- ROW A: the run thread ----
         if runLive, let st = (p?.stage ?? o?.stage), !st.isEmpty {
-            m.rowALead = p?.pct.map { "\(st.capitalized) · \($0)%" } ?? "\(st.capitalized) · starting…"
+            m.rowALead = p?.pct == nil ? "\(st.capitalized) · starting…" : st.capitalized
+            m.rowAPct = p?.pct.map { "\($0)%" }
             m.rowATrail = shortLeft(p?.eta_secs)
             m.machine = .working
         } else if let (label, state) = holdLabel(o?.hold, message: message) {
@@ -474,13 +494,16 @@ struct PuckModel {
         // ---- ROW B: the other lane, or why nothing is happening ----
         if lanes.count >= 2 {
             // Never two identical "Remux" rows — collapse to one, with the slower lane's ETA.
+            // Two lanes share ONE row (never two identical "Remux" lines). Their percents go in
+            // the label rather than the fixed slot — "3% / 41%" is a pair, not a single number.
             let pcts = lanes.map { $0.pct.map { "\(Int($0))%" } ?? "—" }.joined(separator: " / ")
             let name = (lanes[0].stage ?? "Remux").capitalized
             m.rowBLead = "\(name) ×\(lanes.count) · \(pcts)"
             m.rowBTrail = shortLeft(lanes.compactMap { $0.eta_secs }.max())
             m.rowBDim = false
-        } else if let one = lanes.first, let (lead, trail) = Self.laneText(one) {
+        } else if let one = lanes.first, let (lead, pct, trail) = Self.laneText(one) {
             m.rowBLead = lead
+            m.rowBPct = pct
             m.rowBTrail = trail
             m.rowBDim = false
         } else if !armed {
@@ -495,31 +518,46 @@ struct PuckModel {
             m.machine = .working
         }
 
+        // The tooltip carries the UNCLAMPED message — that is what makes clamping the face safe.
+        let full = stripEpisodeLead(o?.message ?? "")
         var tip = [m.rowALead, m.rowBLead].filter { !$0.isEmpty }.joined(separator: "\n")
-        if !message.isEmpty && message != m.rowBLead { tip += "\n\n" + message }
+        if !full.isEmpty && full != m.rowBLead { tip += "\n\n" + full }
         m.tooltip = tip
         return m
     }
 }
 
-/// One line: lead text that truncates, and an ETA that never does.
+/// One line, built from three parts. The percent and the ETA each occupy a FIXED-WIDTH slot
+/// sized to their worst case ("100%", "~12h 59m"), so their values can change freely without
+/// moving the chip's edge — the width reacts only to a slot appearing or disappearing, which
+/// is the one change worth animating. The label hugs, so the chip is never wider than it needs.
 private struct PuckRow: View {
     let lead: String
+    let pct: String?
     let trail: String?
     let size: CGFloat
     let weight: Font.Weight
     let tint: Color
+
+    // Worst-case widths at 12pt with monospaced digits, shared by both rows so their columns
+    // line up: "100%" and "~12h 59m" (a Topaz stage can genuinely run that long).
+    private static let pctSlot: CGFloat = 32
+    private static let etaSlot: CGFloat = 58
+
     var body: some View {
-        HStack(spacing: 0) {
-            Text(lead).font(.system(size: size, weight: weight))
-                .lineLimit(1).truncationMode(.tail)
-            Spacer(minLength: 6)
+        HStack(spacing: 5) {
+            Text(lead).lineLimit(1).truncationMode(.tail)
+            if let pct {
+                Text("·").opacity(0.45)
+                Text(pct).frame(width: Self.pctSlot, alignment: .trailing)
+            }
             if let trail {
-                // .fixedSize sets the priority: the stage name loses characters before the time
-                // does, because the time is the reason you looked.
-                Text(trail).font(.system(size: size, weight: weight)).monospacedDigit().fixedSize()
+                Text("·").opacity(0.45)
+                Text(trail).frame(width: Self.etaSlot, alignment: .trailing)
             }
         }
+        .font(.system(size: size, weight: weight))
+        .monospacedDigit()
         .foregroundStyle(tint)
     }
 }
@@ -530,35 +568,42 @@ struct StatusPuck: View {
     var body: some View {
         let m = PuckModel.make(store)
         Button { showDetail.toggle() } label: {
-            // BARE, like its neighbours. The power readout and the gear both had their plates
-            // stripped; a filled+outlined capsule made the puck the only chromed thing left on
-            // the bar and it read as heavy. The dot carries the state, so the plate earned
-            // nothing. Hugging the content also closes the dead gulf a fixed width opened up
-            // between the stage name and its ETA.
+            // The capsule stays. It sizes to its CONTENT — no fixed width, no Spacer pushing
+            // the ETA to a far edge — so the chip is only ever as wide as what it is showing.
             HStack(spacing: 7) {
                 if m.machine.pulses {
                     PulseDot(color: m.machine.tint)
                 } else {
                     Circle().fill(m.machine.tint).frame(width: 7, height: 7)
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    PuckRow(lead: m.rowALead, trail: m.rowATrail,
-                            size: 11, weight: .medium, tint: m.machine.tint)
-                    PuckRow(lead: m.rowBLead, trail: m.rowBTrail,
+                VStack(alignment: .leading, spacing: 1) {
+                    PuckRow(lead: m.rowALead, pct: m.rowAPct, trail: m.rowATrail,
+                            size: 12, weight: .medium, tint: m.machine.tint)
+                    PuckRow(lead: m.rowBLead, pct: m.rowBPct, trail: m.rowBTrail,
                             size: 11, weight: .regular,
-                            // rows are peers, not a headline and a footnote — same size, and the
-                            // hierarchy comes from weight + tint alone
                             tint: m.rowBDim ? DS.steelDim : DS.steel)
                 }
-                // The bar right-aligns everything after its Spacer, so the puck's TRAILING edge
-                // is fixed even as it hugs — which is what keeps the ETA column from sliding.
-                .frame(minWidth: 150, maxWidth: 300, alignment: .leading)
+                // HUG. `frame(maxWidth:)` is the wrong tool here — inside an HStack it makes the
+                // stack GREEDY up to that width, which is what left a slab of dead capsule to the
+                // right of the text. fixedSize gives the rows their ideal width instead; the
+                // length ceiling is enforced on the STRINGS in PuckModel, where it is
+                // deterministic rather than a layout side effect.
+                .fixedSize(horizontal: true, vertical: false)
             }
-            .contentShape(Rectangle())
+            .padding(.horizontal, 11).padding(.vertical, 5)
+            .background(Capsule().fill(m.machine.tint.opacity(0.08)))
+            .overlay(Capsule().strokeBorder(m.machine.tint.opacity(0.22), lineWidth: 0.8))
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .focusable(false)
         .help(m.tooltip)
+        // Animate the RESIZE when a piece appears or leaves (an ETA arriving, a lane starting).
+        // Keyed on the rendered LENGTH, not the content: the digits tick every poll and the
+        // font is monospacedDigit, so "21%"->"22%" is the same width and must not animate —
+        // otherwise the chip would twitch once a second forever. Length changes are exactly
+        // the changes that move the edge.
+        .animation(.easeOut(duration: 0.28), value: m.widthKey)
         .animation(.easeOut(duration: 0.25), value: m.machine)   // tint only — NOT row content,
         .popover(isPresented: $showDetail, arrowEdge: .bottom) { // or rows pop on every poll
             PuckDetail().environmentObject(store)

@@ -32,7 +32,6 @@ struct ProgressDTO: Codable {
     var seg_secs: Double?     // topaz: that segment's PROJECTED TOTAL = time already spent in it +
                               // its remaining eta. Gating on this instead of the remainder keeps the
                               // countdown from vanishing exactly as the segment finishes.
-    var avg_seg_secs: Double? // topaz: projected average time per segment (gates showing seg eta)
     var preset: String?
     var pct: Int?
     var ep_secs_done: Double?

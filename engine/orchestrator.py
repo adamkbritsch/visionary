@@ -822,15 +822,12 @@ class Orchestrator:
                 elapsed, advanced = 0.0, 0.0
         if advanced > 0 and elapsed > 8:        # let a few seconds of real progress accrue first
             info["eta_secs"] = elapsed * (100 - pct) / advanced
-            # Per-SEGMENT eta (topaz): same windowed rate applied to the current segment's
-            # remainder, plus the projected average time per segment — the UI shows the
-            # segment eta only when segments average >15 min (slow 4K content), where the
+            # Per-SEGMENT eta (topaz): the same windowed rate applied to the current segment's
+            # remainder. The UI shows it only for a long segment (see seg_secs below), where the
             # stage-level eta alone reads as "hours away" with no sense of near-term motion.
             rem = info.get("seg_rem_pct")
             if rem is not None:
                 info["seg_eta_secs"] = elapsed * rem / advanced
-            if info.get("seg_total"):
-                info["avg_seg_secs"] = (elapsed / advanced) * (100 / info["seg_total"])
         # This segment's PROJECTED TOTAL = time already spent in it + what it has left. The UI
         # gates the per-segment countdown on this rather than on the remaining time, so the
         # number doesn't vanish just as the segment finishes; and on the segment ITSELF rather
