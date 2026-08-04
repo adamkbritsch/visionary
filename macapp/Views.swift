@@ -287,9 +287,14 @@ struct HeaderBar: View {
             PowerPill()
             ScreenControlButton()
             Button(action: { showSettings.toggle() }) {
-                Image(systemName: "gearshape.fill").font(.system(size: 12, weight: .semibold))
+                // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
+                // giving it a button chrome made it compete with Activate.
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(DS.steel)
+                    .contentShape(Rectangle())           // keep the whole glyph box clickable
             }
-            .buttonStyle(SteelButtonStyle(lit: false))   // quiet next to Activate — it's never the action
+            .buttonStyle(.plain)
             .help("Settings")
             .popover(isPresented: $showSettings, arrowEdge: .bottom) {
                 SettingsPopover().environmentObject(store)
@@ -319,6 +324,8 @@ struct HeaderBar: View {
 // The header status "puck" — a compact, glanceable replacement for the old status banner.
 // Monochrome steel: state is BRIGHTNESS + pulse — bright silver pulsing = running, mid
 // steel = armed/paused (+ the orchestrator message), dim = idle.
+private let PUCK_MAX = 46      // character budget, so the puck hugs its content
+
 struct StatusPuck: View {
     @EnvironmentObject var store: AppStore
     var body: some View {
@@ -330,8 +337,9 @@ struct StatusPuck: View {
         let tint: Color = running ? DS.steelBright : (on ? DS.steel : DS.steelDim)
         let text: String = {
             if running {
+                // PROGRESS ONLY — no item identity. The episode code that used to lead here said
+                // nothing at a glance, and what's running is already named in the pipeline card.
                 var parts: [String] = []
-                if let ep = o?.episode, !ep.isEmpty { parts.append(ep) }
                 if let st = (p?.stage ?? o?.stage), !st.isEmpty { parts.append(st.capitalized) }
                 if let pc = p?.pct { parts.append("\(pc)%") }
                 if let m = minutes(p?.eta_secs), m > 0 { parts.append("~\(m)m") }
@@ -339,7 +347,7 @@ struct StatusPuck: View {
             }
             return on ? (o?.message ?? "Armed") : "Idle"
         }()
-        let shown = text.count > 46 ? String(text.prefix(45)) + "…" : text   // cap so the puck hugs content
+        let shown = text.count > PUCK_MAX ? String(text.prefix(PUCK_MAX - 1)) + "…" : text
         HStack(spacing: 6) {
             if running {
                 PulseDot(color: tint).frame(width: 8, height: 8)
