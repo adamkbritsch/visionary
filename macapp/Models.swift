@@ -194,8 +194,6 @@ struct YTConnectDTO: Codable {            // /api/youtube-connect
 struct SettingsDTO: Codable {
     var activated: Bool?        // appliance mode: persisted arm state (survives stops/relaunches)
     var quiet_mode: Bool?       // QUIET MODE: defer the screen-invasive Resolve stage so the laptop stays usable
-    var pause_on_battery_drain: Bool?
-    var topaz_min_watts: Int?
     var poll_minutes: Int?
     var dim_after_minutes: Int?           // idle this long → backlight 0 (0 = Off); no auto-restore
     var max_peak_mbps: Int?               // hard 1-second peak-bitrate ceiling on every shipped master
@@ -203,6 +201,44 @@ struct SettingsDTO: Codable {
     var max_youtube_minutes: Int?
     var youtube_every_tv_episodes: Int?   // serve 1 YouTube video per this many TV episodes
     var min_adapter_watts: Int?           // power sufficiency = a brick of at least this wattage
+    var passthrough_min_mbps: Int?        // 4K fast path: a 4K source at/above this skips Topaz (0 = off)
+
+    // Scheduling / capacity — universal, and none of them change how a file is encoded.
+    var max_active_shows: Int?            // how many shows share the round-robin
+    var finisher_lanes: Int?              // max concurrent remuxes (1 = a quieter machine)
+    var min_free_gb: Int?                 // disk floor that must stay free before an item may start
+    var prefetch_cap_gb: Int?             // download-ahead buffer ceiling (0 = off)
+    var max_episode_fails: Int?           // failures of one episode before it's parked
+    var unplug_grace_seconds: Int?        // power-blip tolerance mid-stage
+    // NOTE: max_peak_mbps + audio_target_lufs stay in the DTO (the state poll carries them) but
+    // deliberately have NO control — they dictate the output bytes. Everything above decides
+    // only what runs, when, and what qualifies.
+}
+
+extension SettingsDTO {
+    /// Read one Int setting by its engine key, so the Settings popup can render every numeric
+    /// knob with ONE row component instead of a bespoke Binding per field. Keys are exactly the
+    /// ones in engine/settings.py DEFAULT_SETTINGS — an unknown key reads nil and the row falls
+    /// back to its own default, so a typo degrades to "shows the default" rather than crashing.
+    subscript(int key: String) -> Int? {
+        switch key {
+        case "poll_minutes":              return poll_minutes
+        case "dim_after_minutes":         return dim_after_minutes
+        case "max_peak_mbps":             return max_peak_mbps
+        case "audio_target_lufs":         return audio_target_lufs
+        case "max_youtube_minutes":       return max_youtube_minutes
+        case "youtube_every_tv_episodes": return youtube_every_tv_episodes
+        case "min_adapter_watts":         return min_adapter_watts
+        case "passthrough_min_mbps":      return passthrough_min_mbps
+        case "max_active_shows":          return max_active_shows
+        case "finisher_lanes":            return finisher_lanes
+        case "min_free_gb":               return min_free_gb
+        case "prefetch_cap_gb":           return prefetch_cap_gb
+        case "max_episode_fails":         return max_episode_fails
+        case "unplug_grace_seconds":      return unplug_grace_seconds
+        default:                          return nil
+        }
+    }
 }
 
 struct PresetDTO: Codable, Identifiable {

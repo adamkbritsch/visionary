@@ -271,6 +271,7 @@ struct DolbyMark: View {
 
 struct HeaderBar: View {
     @EnvironmentObject var store: AppStore
+    @State private var showSettings = false
     var body: some View {
         let on = store.activated          // appliance: the persisted arm state, not the transient run
         HStack(spacing: 14) {
@@ -285,6 +286,14 @@ struct HeaderBar: View {
             StatusPuck()
             PowerPill()
             ScreenControlButton()
+            Button(action: { showSettings.toggle() }) {
+                Image(systemName: "gearshape.fill").font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(SteelButtonStyle(lit: false))   // quiet next to Activate — it's never the action
+            .help("Settings")
+            .popover(isPresented: $showSettings, arrowEdge: .bottom) {
+                SettingsPopover().environmentObject(store)
+            }
             Button(action: { Task { await store.toggleAutomation() } }) {
                 HStack(spacing: 7) {
                     // APPLIANCE toggle: Activate arms the standing mode (the engine then runs
@@ -963,8 +972,10 @@ private struct TVMode: View {
             ForEach(Array(shows.enumerated()), id: \.element.id) { i, show in
                 showBlock(index: i, show: show, active: active, catalog: catalog)
             }
-            // The next empty slot is just a search bar — to pick the first show, or add the 2nd/3rd.
-            if active.count < 3 {
+            // The next empty slot is just a search bar — to pick the first show, or add another.
+            // The width is the 'max_active_shows' setting (Settings ▸ Advanced ▸ Shows at once);
+            // lowering it below the running count hides the bar rather than dropping a show.
+            if active.count < (s?.settings?.max_active_shows ?? 3) {
                 seriesPicker(index: active.count, active: active, catalog: catalog)
             }
             // (the shared queue renders once in SeriesCard, below every mode)
@@ -1794,51 +1805,178 @@ private struct QueueProgress: View {
 
 // MARK: - settings + per-show preset
 
-struct SettingsCard: View {
+// MARK: - Settings (header gear popover)
+
+// One settings row: title, one-line explanation, live value, stepper. Every numeric range here
+// MIRRORS engine/settings.py's LIMITS table, so the UI can never offer a value the engine would
+// silently rewrite on save.
+private struct SettingRow: View {
     @EnvironmentObject var store: AppStore
+    let title: String
+    let blurb: String
+    let key: String
+    let fallback: Int
+    let range: ClosedRange<Int>
+    var step: Int = 1
+    var unit: String = ""
+    var zeroLabel: String? = nil          // shown instead of "0 <unit>" when the value is 0
+
+    private var value: Int { store.state?.settings?[int: key] ?? fallback }
+
     var body: some View {
-        let st = store.state?.settings
-        Card(title: "Settings", systemImage: "slider.horizontal.3") {
-            VStack(alignment: .leading, spacing: 14) {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                Text(blurb).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 10)
+            Text(value == 0 ? (zeroLabel ?? "0\(unit.isEmpty ? "" : " " + unit)")
+                            : "\(value)\(unit.isEmpty ? "" : " " + unit)")
+                .font(.system(size: 13, weight: .medium)).monospacedDigit()
+                .foregroundStyle(DS.steel)
+            Stepper(value: Binding(get: { value },
+                                   set: { n in Task { await store.saveSettings([key: n]) } }),
+                    in: range, step: step) { EmptyView() }
+                .labelsHidden().fixedSize()
+        }
+    }
+}
+
+// A knob whose 0 means OFF: the stepper can't express the jump from its floor to 0, so the
+// toggle owns on/off and the stepper is HIDDEN (not disabled) while off — a control that does
+// nothing in the current context shouldn't be on screen.
+private struct OptionalSettingRow: View {
+    @EnvironmentObject var store: AppStore
+    let title: String
+    let blurb: String
+    let key: String
+    let fallback: Int                     // the value restored when it's switched back on
+    let range: ClosedRange<Int>
+    var step: Int = 1
+    var unit: String = ""
+
+    private var value: Int { store.state?.settings?[int: key] ?? fallback }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 13, weight: .medium))
+                    Text(blurb).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 10)
+                Toggle("", isOn: Binding(get: { value != 0 },
+                                         set: { on in
+                                             Task { await store.saveSettings([key: on ? fallback : 0]) }
+                                         }))
+                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
+            }
+            if value != 0 {
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Required adapter").font(.system(size: 13, weight: .medium))
-                        Text("Below this, everything pauses and the screen sleeps.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
                     Spacer()
-                    Text("\(st?.min_adapter_watts ?? 140) W")
+                    Text("\(value)\(unit.isEmpty ? "" : " " + unit)")
                         .font(.system(size: 13, weight: .medium)).monospacedDigit()
                         .foregroundStyle(DS.steel)
-                    Stepper(value: Binding(get: { st?.min_adapter_watts ?? 140 },
-                                           set: { n in Task { await store.saveSettings(["min_adapter_watts": n]) } }),
-                            in: 100...500, step: 10) { EmptyView() }
+                    Stepper(value: Binding(get: { value },
+                                           set: { n in Task { await store.saveSettings([key: n]) } }),
+                            in: range, step: step) { EmptyView() }
                         .labelsHidden().fixedSize()
                 }
-                // Re-check interval: engine setting only (poll_minutes, default 30 — the idle
-                // re-poll when the series is complete/unselected). Label was stale ("while
-                // paused" — power pauses use their own cadence); declutter pass 2026-07-06.
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Dim screen after").font(.system(size: 13, weight: .medium))
-                        Text("Idle this long → screen off. Tap the brightness key to bring it back.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text((st?.dim_after_minutes ?? 15) == 0 ? "Off" : "\(st?.dim_after_minutes ?? 15) min")
-                        .font(.system(size: 13, weight: .medium)).monospacedDigit()
-                        .foregroundStyle(DS.steel)
-                    Stepper(value: Binding(get: { st?.dim_after_minutes ?? 15 },
-                                           set: { n in Task { await store.saveSettings(["dim_after_minutes": n]) } }),
-                            in: 0...240, step: 5) { EmptyView() }
-                        .labelsHidden().fixedSize()
-                }
-                // Audio loudness target: engine setting only (audio_target_lufs, default -16) —
-                // deliberately NOT surfaced in Settings (same call as the peak cap: plumbing).
-                // Peak bitrate cap: engine setting only (max_peak_mbps, default 50) — deliberately
-                // NOT surfaced in Settings (user 2026-07-06: plumbing, not a knob).
             }
         }
+    }
+}
+
+private struct SettingsGroupLabel: View {
+    let text: String
+    var body: some View {
+        Text(text.uppercased())
+            .font(.system(size: 10, weight: .semibold)).tracking(0.6)
+            .foregroundStyle(.tertiary)
+    }
+}
+
+// The header gear's popup. Everything in it is UNIVERSAL — per-show options (preset, normalize
+// audio, replaces source, unwatched first, featurettes last, up next) live on each show's block.
+// Nothing here changes how a file is ENCODED: the loudness target and the peak bitrate cap stay
+// engine-only on purpose. These knobs decide what runs, when, how much at once, and what qualifies.
+struct SettingsPopover: View {
+    @EnvironmentObject var store: AppStore
+    @State private var advanced = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Settings").font(.system(size: 15, weight: .semibold))
+
+                SettingRow(title: "Required adapter",
+                           blurb: "Below this, everything pauses and the screen sleeps.",
+                           key: "min_adapter_watts", fallback: 140,
+                           range: 100...500, step: 10, unit: "W")
+                SettingRow(title: "Dim screen after",
+                           blurb: "Idle this long → screen off. Tap the brightness key to bring it back.",
+                           key: "dim_after_minutes", fallback: 15,
+                           range: 0...240, step: 5, unit: "min", zeroLabel: "Off")
+
+                Divider()
+
+                DisclosureGroup(isExpanded: $advanced) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        SettingsGroupLabel(text: "Scheduling").padding(.top, 6)
+                        SettingRow(title: "Shows at once",
+                                   blurb: "How many shows share the rotation, one episode from each in turn.",
+                                   key: "max_active_shows", fallback: 3, range: 1...4)
+                        SettingRow(title: "Parallel remuxes",
+                                   blurb: "1 keeps the machine quieter and leaves Topaz the whole GPU.",
+                                   key: "finisher_lanes", fallback: 2, range: 1...2)
+                        SettingRow(title: "Re-check interval",
+                                   blurb: "How often to look again when there's nothing to do.",
+                                   key: "poll_minutes", fallback: 30,
+                                   range: 1...1440, step: 5, unit: "min")
+
+                        SettingsGroupLabel(text: "Disk").padding(.top, 4)
+                        SettingRow(title: "Keep free",
+                                   blurb: "Space that must stay free before an item may start. One episode needs about 140 GB while it upscales.",
+                                   key: "min_free_gb", fallback: 400,
+                                   range: 200...2000, step: 25, unit: "GB")
+                        OptionalSettingRow(title: "Download ahead",
+                                           blurb: "Stage upcoming sources early so the GPU never waits on a download. Off fetches each one when its turn comes.",
+                                           key: "prefetch_cap_gb", fallback: 100,
+                                           range: 25...500, step: 25, unit: "GB")
+
+                        SettingsGroupLabel(text: "When things go wrong").padding(.top, 4)
+                        SettingRow(title: "Retries before skipping",
+                                   blurb: "How many times one episode may fail before it's set aside and the run moves on.",
+                                   key: "max_episode_fails", fallback: 5, range: 1...20)
+                        SettingRow(title: "Unplug grace",
+                                   blurb: "How long a power blip is tolerated mid-stage before the stage is abandoned.",
+                                   key: "unplug_grace_seconds", fallback: 60,
+                                   range: 0...600, step: 15, unit: "s")
+
+                        SettingsGroupLabel(text: "What qualifies").padding(.top, 4)
+                        OptionalSettingRow(title: "4K fast path",
+                                           blurb: "A 4K source at or above this bitrate skips Topaz — it's already sharp enough to go straight to Dolby Vision.",
+                                           key: "passthrough_min_mbps", fallback: 12,
+                                           range: 5...200, unit: "Mbps")
+                        SettingRow(title: "YouTube length cap",
+                                   blurb: "The limit applied to channels that have their length cap switched on.",
+                                   key: "max_youtube_minutes", fallback: 20,
+                                   range: 1...600, step: 5, unit: "min")
+                    }
+                } label: {
+                    Text("Advanced settings").font(.system(size: 13, weight: .medium))
+                }
+
+                Divider()
+                Text("These apply to everything. Per-show options live on each show.")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+            }
+            .padding(16)
+        }
+        .frame(width: 430)
+        .frame(maxHeight: 560)
     }
 }
 
@@ -2127,7 +2265,7 @@ struct RootView: View {
                     GrantsCard()
                     PipelineCard()
                     SeriesCard()
-                    SettingsCard()
+                    // (Settings moved to the header gear — see HeaderBar / SettingsPopover.)
                     HStack(alignment: .top, spacing: 16) { ScratchPowerCard(); ScratchContentsCard() }
                     FooterBar()
                 }

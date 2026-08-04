@@ -302,17 +302,38 @@ def _read_selection_file() -> dict:
         return {}
 
 
-MAX_ACTIVE = 3   # round-robin across at most this many series at once
+MAX_ACTIVE = 3   # DEFAULT round-robin width; the live value is the 'max_active_shows' setting
+
+
+def max_active() -> int:
+    """How many shows the user wants in the round-robin. Consulted ONLY when ADDING a show —
+    never when reading the active list. Lowering this while three shows are running must not
+    silently drop one, so reads truncate at settings.MAX_ACTIVE_CEILING instead and the extra
+    slots simply drain away naturally as their shows finish."""
+    try:
+        import settings
+        return settings.tunable("max_active_shows")
+    except Exception:
+        return MAX_ACTIVE
+
+
+def _ceiling() -> int:
+    try:
+        import settings
+        return settings.MAX_ACTIVE_CEILING
+    except Exception:
+        return MAX_ACTIVE
 
 
 def get_active_series() -> list:
-    """The active series (1..MAX_ACTIVE, ordered) — the round-robin set: one episode is taken
-    from each in turn, looping back to the first. Index 0 is the 'primary'. Migrates the legacy
-    single `series` field so old selection.json files keep working. Empty = nothing selected."""
+    """The active series (ordered) — the round-robin set: one episode is taken from each in
+    turn, looping back to the first. Index 0 is the 'primary'. Migrates the legacy single
+    `series` field so old selection.json files keep working. Empty = nothing selected.
+    Truncates at the hard CEILING, not at `max_active()` — see that function."""
     d = _read_selection_file()
     a = d.get("active")
     if isinstance(a, list):
-        return [s for s in a if isinstance(s, str) and s][:MAX_ACTIVE]
+        return [s for s in a if isinstance(s, str) and s][:_ceiling()]
     s = d.get("series")                              # legacy single-series field
     return [s] if isinstance(s, str) and s else []
 
@@ -333,7 +354,7 @@ def _write_selection_file(d: dict) -> dict:
 
 
 def _write_active(active, rotation=None) -> list:
-    active = [s for s in active if s][:MAX_ACTIVE]
+    active = [s for s in active if s][:_ceiling()]   # ceiling, not max_active() — see max_active
     d = _read_selection_file()
     d["active"] = active
     d["series"] = active[0] if active else None      # keep the legacy field in sync
@@ -438,9 +459,9 @@ def promote_finished_slots() -> list:
 
 
 def add_series(name) -> list:
-    """Add a series to the round-robin set (no dups, capped at MAX_ACTIVE)."""
+    """Add a series to the round-robin set (no dups, capped at the 'max_active_shows' setting)."""
     a = get_active_series()
-    if name and name not in a and len(a) < MAX_ACTIVE:
+    if name and name not in a and len(a) < max_active():
         a.append(name)
         _write_active(a)
     return a
@@ -465,7 +486,7 @@ def set_series_at(index, name) -> list:
         return a
     if 0 <= index < len(a):
         a[index] = name
-    elif len(a) < MAX_ACTIVE:
+    elif len(a) < max_active():
         a.append(name)
     seen, out = set(), []
     for s in a:                       # dedup, keeping the slot we just set/added

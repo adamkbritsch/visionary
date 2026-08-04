@@ -46,7 +46,8 @@ STAGES = ["download", "topaz", "resolve", "remux", "upload", "cleanup"]
 # runs WHILE item N+1 downloads/upscales — the peak-cap re-encode costs ~zero wall-clock.
 RUN_STAGES = ["download", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
-FINISHER_LANES = 2           # max concurrent remuxes. The 2nd lane runs whenever >=2 topaz-done items need
+FINISHER_LANES = 2           # DEFAULT max concurrent remuxes ('finisher_lanes' setting — read via
+                             # _finisher_lanes()). The 2nd lane runs whenever >=2 topaz-done items need
                              # finishing at once (an item queued behind a busy lane 1 — a re-picked movie
                              # whose GPU stages were already done, or a Resolve-stall drain, where Resolve
                              # is also let 2 items ahead). Normal runs stay 1-at-a-time: the resolve gate
@@ -60,14 +61,17 @@ STATE_FILE = os.path.expanduser("~/.topaz-pipeline/run-state.json")
 DIM_IDLE_MINUTES_DEFAULT = 15   # fallback for the 'dim_after_minutes' setting (idle this long → backlight 0)
 DRAIN_PCT_THRESHOLD = 5      # pause once the battery drains more than this % below where draining began
 DRAIN_POLL_SECONDS = 30      # how often to re-check while paused for power
-UNPLUG_GRACE_SECONDS = 60    # unplugged mid-stage (ANY stage, incl. remux): wait this long for the
+UNPLUG_GRACE_SECONDS = 60    # DEFAULT for the 'unplug_grace_seconds' setting (read via
+                             # _unplug_grace()): unplugged mid-stage (ANY stage, incl. remux), wait this long for the
                              # adapter to return before pausing. The remux used to get a 30-min
                              # cushion because its x265 pass wasn't resumable — now it's segmented +
                              # on the durable work-list, so a kill loses ≤1 short segment and resumes,
                              # exactly like topaz. So it pauses at the same 60 s cutoff (user-dictated).
 YT_REFRESH_SECONDS = 300     # re-scan youtarr's staging this often mid-run → new downloads join the
                              # upscale queue live (the queue keeps growing while the user is away)
-MIN_FREE_GB = 400            # floor kept free before starting an item + by the prefetcher. The topaz
+MIN_FREE_GB = 400            # DEFAULT for the 'min_free_gb' setting — ALWAYS read via _min_free_gb(),
+                             # never this constant, or a change in the UI won't take effect until relaunch.
+                             # Floor kept free before starting an item + by the prefetcher. The topaz
                              # ProRes intermediate is now DROPPED at hand-off — right after Resolve's
                              # export (_drop_topaz_intermediates) — so only ONE item's intermediate is
                              # ever on disk at a time; the previous item, now remuxing, holds ~10 GB.
@@ -96,12 +100,17 @@ FINISHER_FILE = os.path.expanduser("~/.topaz-pipeline/finisher_queue.json")
                               # RESUMES that remux on its own thread, concurrently with the run thread's
                               # topaz ("resume with both") — see _finisher_reconcile.
 PREFETCH_NEXT_UP_EPISODES = 2   # how many episodes of an ARMED follow-up show to pre-stage
-PREFETCH_HARD_CAP_GB = 100   # HARD ceiling on the prefetch buffer's total size — never stage more than
-                             # this much queued content (the soft limit — _reclaim_for_pipeline purging
-                             # the buffer when the pipeline needs disk — still applies on top of it)
-PREFETCH_GATE_GB = MIN_FREE_GB + 30   # prefetch a source only while free stays above this (small margin
-                             # over the floor so prefetched sources never eat into the intermediate reserve)
-MAX_EPISODE_FAILS = 5        # consecutive GENUINE failures of one episode → park it, move on
+PREFETCH_HARD_CAP_GB = 100   # DEFAULT for the 'prefetch_cap_gb' setting (read via _prefetch_cap_gb();
+                             # 0 = prefetching off). HARD ceiling on the prefetch buffer's total size —
+                             # never stage more than this much queued content (the soft limit —
+                             # _reclaim_for_pipeline purging the buffer when the pipeline needs disk —
+                             # still applies on top of it)
+PREFETCH_GATE_MARGIN_GB = 30 # prefetch a source only while free stays this far ABOVE the disk floor (so
+                             # prefetched sources never eat into the intermediate reserve). Was a
+                             # module-level PREFETCH_GATE_GB = MIN_FREE_GB + 30, which froze the gate at
+                             # IMPORT time — now _prefetch_gate_gb() derives it from the live floor.
+MAX_EPISODE_FAILS = 5        # DEFAULT for the 'max_episode_fails' setting (read via _max_episode_fails()):
+                             # consecutive GENUINE failures of one episode → park it, move on
 MOVIE_SIZED_BYTES = 150e9    # a non-movie item whose topaz working set exceeds this is treated as
                              # movie-sized by the finisher's disk gate (feature-length YouTube videos)
 
@@ -128,6 +137,38 @@ STALL_MAX_ITEM_RETRIES = 12   # one item failing Resolve this many times TOTAL =
                               # (Resolve works for others but not this file) → park it so it can't loop
                               # forever. Comfortably above STALL_TRIGGER_ATTEMPTS so the item that first
                               # detected a real stall is never parked while the prompt is simply still up.
+
+
+# ---- live tunables ---------------------------------------------------------------------------
+# Each of these WAS one of the constants above. They're read at USE time (never at import, never
+# cached on the instance) so moving a control in the app changes the next decision the run makes
+# instead of waiting for a relaunch. settings.tunable() clamps, and falls back to the same
+# constant when the key is missing — so an untouched install behaves exactly as before.
+
+def _min_free_gb() -> int:
+    return settings.tunable("min_free_gb")
+
+
+def _prefetch_gate_gb() -> int:
+    """Free space the prefetcher must leave — the live floor plus a small margin."""
+    return _min_free_gb() + PREFETCH_GATE_MARGIN_GB
+
+
+def _prefetch_cap_gb() -> int:
+    """Prefetch buffer ceiling; 0 = prefetching disabled entirely."""
+    return settings.tunable("prefetch_cap_gb")
+
+
+def _finisher_lanes() -> int:
+    return settings.tunable("finisher_lanes")
+
+
+def _max_episode_fails() -> int:
+    return settings.tunable("max_episode_fails")
+
+
+def _unplug_grace() -> int:
+    return settings.tunable("unplug_grace_seconds")
 
 
 # ---- pure: file/path plan for one episode --------------------------------
@@ -1219,7 +1260,7 @@ class Orchestrator:
 
     def _power_monitor(self):
         """Watch for the AC being UNPLUGGED while a stage is running. Don't pause
-        instantly — announce a live countdown (UNPLUG_GRACE_SECONDS) so a brief
+        instantly — announce a live countdown ('unplug_grace_seconds') so a brief
         unplug/re-plug doesn't abort the stage. If still unplugged when it expires,
         abort the stage so the run pauses (it never runs on battery). Reconnecting
         cancels the countdown and restores the stage's message."""
@@ -1241,7 +1282,7 @@ class Orchestrator:
             action, unplug_since, remaining = unplug_decision(
                 on_ac=sufficient, stage_active=any_active,
                 unplug_since=unplug_since, now=time.time(),
-                grace=UNPLUG_GRACE_SECONDS)      # same 60 s cutoff for every stage, remux included
+                grace=_unplug_grace())     # the same cutoff for every stage, remux included
             if action == "clear":
                 if held_msg is not None:
                     self.state["message"] = held_msg
@@ -1490,18 +1531,22 @@ class Orchestrator:
             return None
         if self._quiet_mode():
             phys = scratch.physical_free_gb()
-            if phys is not None and phys < MIN_FREE_GB:
+            if phys is not None and phys < _min_free_gb():
                 return f"paused — low disk ({phys} GB): turn off Quiet Mode to drain items through Resolve"
         if self._in_finisher_keys():
             # OVERLAP: an item is finishing in the background (remux/upload). Its topaz ProRes was
             # dropped at hand-off so it's small (~10 GB), but available_gb still counts scratch as
             # reclaimable → gate the next item's start on RAW physical free (after offering the
             # prefetch buffer up) so the next item's own intermediate has guaranteed room. (Since the
-            # drop, a finishing MOVIE no longer holds its ProRes, so both demands converge to the
-            # floor — the fin_movie branch is a harmless legacy knob while MIN_FREE_GB == OVERLAP.)
+            # drop, a finishing MOVIE no longer holds its ProRes, so both demands converge whenever
+            # the floor is at or below OVERLAP_MIN_PHYS_GB — i.e. at every shipped default.)
             with self._finisher_lock:
                 fin_movie = bool(self._in_finisher_movies)
-            need = MIN_FREE_GB if fin_movie else OVERLAP_MIN_PHYS_GB
+            floor = _min_free_gb()
+            # A finishing MOVIE gets the full floor; a TV episode's overlap demand is the measured
+            # OVERLAP_MIN_PHYS_GB. Both are CAPPED BY the live floor, so lowering the setting on a
+            # smaller disk actually lowers this gate instead of pausing the run at a stale 400.
+            need = floor if fin_movie else min(OVERLAP_MIN_PHYS_GB, floor)
             self._reclaim_for_pipeline(need_gb=need)
             phys = scratch.physical_free_gb()
             if phys is not None and phys < need:
@@ -1510,8 +1555,9 @@ class Orchestrator:
             return None                       # physical headroom confirmed — don't double-gate on
                                               # available_gb (it can't see the finisher's footprint)
         free = self._free_scratch_gb()
-        if free is not None and free < MIN_FREE_GB:
-            return f"paused — low disk: {free} GB free (need ~{MIN_FREE_GB} GB)"
+        floor = _min_free_gb()
+        if free is not None and free < floor:
+            return f"paused — low disk: {free} GB free (need ~{floor} GB)"
         return None
 
     def _refresh_youtube(self):
@@ -1680,12 +1726,15 @@ class Orchestrator:
                 pass
         return n
 
-    def _reclaim_for_pipeline(self, need_gb: int = MIN_FREE_GB):
+    def _reclaim_for_pipeline(self, need_gb: int | None = None):
         """PIPELINE > QUEUE: the active item's working files take priority over the prefetch buffer.
-        If RAW physical free has fallen below `need_gb`, purge the whole prefetch buffer to reclaim
+        If RAW physical free has fallen below `need_gb` (default: the live disk floor — NOT a default
+        argument, which would bind the floor at import time), purge the whole prefetch buffer to reclaim
         real space (those queued items re-download when their turn comes). This makes available_gb()'s
         'the buffer counts as available' assumption actually true, so a full queue can never starve —
         and truncate — the in-flight ProRes segments or the DV master write. Returns free GB after."""
+        if need_gb is None:
+            need_gb = _min_free_gb()
         phys = scratch.physical_free_gb()
         if phys is None or phys >= need_gb:
             return phys
@@ -1705,6 +1754,9 @@ class Orchestrator:
         disk gate so prefetched sources never eat the in-flight/tail intermediate reserve."""
         while self._enabled:
             did = False
+            cap = _prefetch_cap_gb()
+            if cap <= 0:                                          # 'prefetch_cap_gb' = 0 → downloading
+                self._sleep(60); continue                         # ahead is off; each item pulls in turn
             if self._power_paused:                                # run is battery/power-paused → don't
                 self._sleep(30); continue                         # burn CPU on CFR encodes either
             if self._plex_playing:                                # FAILSAFE: a Plex stream is live → keep the
@@ -1723,10 +1775,10 @@ class Orchestrator:
                     if stage_done("download", p):                 # already claimed/processing, or already
                         continue                                  # prefetched (in the buffer)
                     free = scratch.physical_free_gb()             # gate on RAW free — the buffer is what we
-                    if free is None or free < PREFETCH_GATE_GB:   # fill, so it can't count as 'available' to
-                        break                                     # itself (else the buffer overcommits disk)
-                    if scratch.folder_used_gb(scratch.prefetch_dir()) >= PREFETCH_HARD_CAP_GB:
-                        break                                     # HARD CAP: queued content ≤ 100 GB
+                    if free is None or free < _prefetch_gate_gb():  # fill, so it can't count as 'available'
+                        break                                     # to itself (else it overcommits disk)
+                    if scratch.folder_used_gb(scratch.prefetch_dir()) >= cap:
+                        break                                     # HARD CAP: queued content ≤ cap GB
 
                     if self._plex_started_now():                  # FRESH check at the decision point: never
                         break                                     # even START a pull if a stream just began
@@ -1979,7 +2031,7 @@ class Orchestrator:
                     return
                 n = self._fail_counts.get(self._skip_key(p), 0) + 1
                 self._fail_counts[self._skip_key(p)] = n
-                if n >= MAX_EPISODE_FAILS:
+                if n >= _max_episode_fails():
                     self._park_item(p, ep_disp, n, st, msg)   # movies key on basename (see _skip_key)
                     self._sleep(5)
                     return
@@ -2000,10 +2052,10 @@ class Orchestrator:
     def _resolve_should_hold(self) -> bool:
         """Should the run thread HOLD an item at the Resolve doorstep? Normally yes while the previous
         item's remux runs (user-dictated 1-at-a-time timing). But while DRAINING a Resolve-stall backlog
-        of >=2 items, let Resolve get up to FINISHER_LANES items ahead so a 2nd remux can run — hold only
-        once both lanes are full."""
+        of >=2 items, let Resolve get up to 'finisher_lanes' items ahead so a 2nd remux can run — hold
+        only once every lane is full."""
         if len(self._draining) >= 2:
-            return len(self._in_finisher_keys()) >= FINISHER_LANES
+            return len(self._in_finisher_keys()) >= _finisher_lanes()
         return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize(),
                                  self.state.get("finishing2"))
 
@@ -2025,7 +2077,10 @@ class Orchestrator:
         resolve GATE keeps the queue empty — so this only ever fires on a genuine backlog of >=2
         topaz-done items (a re-picked movie whose GPU stages were already done, a Resolve-stall
         drain), never in the user-dictated 1-at-a-time steady state. A lone item is never split:
-        with lane 1 idle it declines, and the primary picks it up."""
+        with lane 1 idle it declines, and the primary picks it up. At 'finisher_lanes' = 1 the lane is
+        switched off entirely — the backlog simply drains through the primary, one remux at a time."""
+        if _finisher_lanes() < 2:
+            return False
         return self.state.get("finishing") is not None and self._finish_q.qsize() >= 1
 
     def _dual_remux_live(self) -> bool:
@@ -2326,7 +2381,7 @@ class Orchestrator:
                     return                                # stop/pause abort — not an episode failure
                 n = self._fail_counts.get(self._skip_key(p), 0) + 1
                 self._fail_counts[self._skip_key(p)] = n
-                if n >= MAX_EPISODE_FAILS:
+                if n >= _max_episode_fails():
                     self._parked.add(self._skip_key(p))
                     self._fail_counts.pop(self._skip_key(p), None)
                     self._draining.discard(self._skip_key(p))   # left the backlog (parked)

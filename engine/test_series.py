@@ -162,6 +162,51 @@ class ActiveSeries(unittest.TestCase):
         self.assertEqual(series.get_active_series(), ["C", "D"])
 
 
+class MaxActiveSetting(unittest.TestCase):
+    """'max_active_shows' governs ADDING a show, never reading the active list."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = mock.patch.object(series, "SELECTION_FILE", os.path.join(self.d, "selection.json"))
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def _at(self, n):
+        return mock.patch.object(series, "max_active", return_value=n)
+
+    def test_setting_caps_how_many_can_be_added(self):
+        with self._at(1):
+            series.add_series("A"); series.add_series("B")
+            self.assertEqual(series.get_active_series(), ["A"])       # B rejected at a width of 1
+        with self._at(4):
+            for n in ("B", "C", "D"):
+                series.add_series(n)
+            self.assertEqual(series.get_active_series(), ["A", "B", "C", "D"])
+
+    def test_lowering_it_never_drops_a_running_show(self):
+        # THE reason reads truncate at the ceiling instead: three shows are mid-run and the
+        # user drops the width to 1. Nothing may disappear — the extra slots drain naturally.
+        with self._at(3):
+            for n in ("A", "B", "C"):
+                series.add_series(n)
+        with self._at(1):
+            self.assertEqual(series.get_active_series(), ["A", "B", "C"])
+            series.advance_rotation("A")                              # a write path runs...
+            self.assertEqual(series.get_active_series(), ["A", "B", "C"])   # ...still all three
+            series.add_series("D")                                    # but no NEW show gets in
+            self.assertEqual(series.get_active_series(), ["A", "B", "C"])
+            series.remove_series("B")                                 # they drain by finishing
+            self.assertEqual(series.get_active_series(), ["A", "C"])
+
+    def test_reads_truncate_at_the_hard_ceiling(self):
+        import settings
+        with open(series.SELECTION_FILE, "w") as f:                   # hand-edited overfull file
+            json.dump({"active": [f"S{i}" for i in range(10)]}, f)
+        self.assertEqual(len(series.get_active_series()), settings.MAX_ACTIVE_CEILING)
+
+
 if __name__ == "__main__":
     unittest.main()
 

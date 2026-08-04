@@ -256,3 +256,77 @@ class FastPathGate(unittest.TestCase):
             self.assertEqual(s.set_settings({"passthrough_min_mbps": 999})["passthrough_min_mbps"], 200)
             self.assertEqual(s.set_settings({"passthrough_min_mbps": 0})["passthrough_min_mbps"], 0)
             self.assertEqual(s.set_settings({"passthrough_min_mbps": 12})["passthrough_min_mbps"], 12)
+
+
+class Tunables(unittest.TestCase):
+    """The scheduling/capacity settings that replaced hardcoded engine constants.
+
+    Two properties matter more than any individual range: an untouched install must behave
+    EXACTLY as it did when these were constants, and a hand-edited settings.json must never
+    hand the engine a value the UI could not have produced."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = mock.patch.object(settings, "SETTINGS_FILE", os.path.join(self.d, "settings.json"))
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_dead_battery_drain_key_is_gone(self):
+        # It had ZERO engine consumers (the adapter-wattage gate replaced it); a setting that
+        # does nothing is worse than no setting.
+        self.assertNotIn("pause_on_battery_drain", settings.DEFAULT_SETTINGS)
+        self.assertNotIn("pause_on_battery_drain", settings.set_settings({"pause_on_battery_drain": True}))
+
+    def test_defaults_match_the_constants_they_replaced(self):
+        # THE compatibility guarantee: a fresh install runs on exactly the old numbers.
+        import orchestrator as o
+        import series
+        self.assertEqual(settings.DEFAULT_SETTINGS["min_free_gb"], o.MIN_FREE_GB)
+        self.assertEqual(settings.DEFAULT_SETTINGS["prefetch_cap_gb"], o.PREFETCH_HARD_CAP_GB)
+        self.assertEqual(settings.DEFAULT_SETTINGS["finisher_lanes"], o.FINISHER_LANES)
+        self.assertEqual(settings.DEFAULT_SETTINGS["max_episode_fails"], o.MAX_EPISODE_FAILS)
+        self.assertEqual(settings.DEFAULT_SETTINGS["unplug_grace_seconds"], o.UNPLUG_GRACE_SECONDS)
+        self.assertEqual(settings.DEFAULT_SETTINGS["max_active_shows"], series.MAX_ACTIVE)
+
+    def test_tunable_returns_the_default_when_the_key_is_absent(self):
+        for key, default in settings.DEFAULT_SETTINGS.items():
+            if key in settings.LIMITS:
+                self.assertEqual(settings.tunable(key), default, key)
+
+    def test_tunable_clamps_a_hand_edited_file(self):
+        for key, (lo, hi) in settings.LIMITS.items():
+            settings.set_settings({})                       # materialize the file
+            with mock.patch.object(settings, "get_settings", return_value={key: hi + 10_000}):
+                self.assertEqual(settings.tunable(key), hi, key)
+            with mock.patch.object(settings, "get_settings", return_value={key: lo - 10_000}):
+                self.assertEqual(settings.tunable(key), lo, key)
+            with mock.patch.object(settings, "get_settings", return_value={key: "garbage"}):
+                self.assertEqual(settings.tunable(key), settings.DEFAULT_SETTINGS[key], key)
+
+    def test_zero_is_off_only_where_it_means_off(self):
+        # 0 disables the feature for these; everywhere else it must clamp UP to the floor
+        # rather than quietly turning something off.
+        self.assertEqual(settings.set_settings({"prefetch_cap_gb": 0})["prefetch_cap_gb"], 0)
+        self.assertEqual(settings.set_settings({"min_free_gb": 0})["min_free_gb"], 200)
+        self.assertEqual(settings.set_settings({"finisher_lanes": 0})["finisher_lanes"], 1)
+
+    def test_false_is_not_a_numeric_zero(self):
+        # bool is an int subclass — without the _is_zero guard, a stray False would read as a
+        # deliberate "off" for a ZERO_IS_OFF key. It must clamp like any other junk number
+        # instead, so prefetching stays ON.
+        self.assertEqual(settings.set_settings({"prefetch_cap_gb": False})["prefetch_cap_gb"],
+                         settings.LIMITS["prefetch_cap_gb"][0])
+
+    def test_new_keys_round_trip_in_range(self):
+        s = settings.set_settings({"max_active_shows": 1, "finisher_lanes": 1, "min_free_gb": 250,
+                                   "prefetch_cap_gb": 50, "max_episode_fails": 2,
+                                   "unplug_grace_seconds": 0})
+        self.assertEqual((s["max_active_shows"], s["finisher_lanes"], s["min_free_gb"],
+                          s["prefetch_cap_gb"], s["max_episode_fails"], s["unplug_grace_seconds"]),
+                         (1, 1, 250, 50, 2, 0))
+
+    def test_max_active_cannot_exceed_the_hard_ceiling(self):
+        self.assertEqual(settings.set_settings({"max_active_shows": 99})["max_active_shows"],
+                         settings.MAX_ACTIVE_CEILING)

@@ -25,7 +25,16 @@ CONFIG_DIR = os.path.expanduser("~/.topaz-pipeline")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 PROFILES_FILE = os.path.join(CONFIG_DIR, "show_profiles.json")
 
-# Global, user-adjustable. pause_on_battery_drain = pause if the battery drains >5% on AC.
+# HARD ceiling on the round-robin, independent of the `max_active_shows` setting. Reads of the
+# active list truncate at THIS, never at the setting: lowering the setting while shows are
+# already running must not silently drop one (see series.max_active / get_active_series).
+MAX_ACTIVE_CEILING = 4
+
+# Global, user-adjustable — everything here is UNIVERSAL (per-show options live in
+# show_profiles.json). The block after `youtube_every_tv_episodes` are SCHEDULING/CAPACITY
+# knobs that used to be hardcoded constants in orchestrator.py / series.py; each defaults to
+# the exact constant it replaced, so an untouched install behaves identically. They decide
+# what runs and how much at once — never how a file is encoded.
 DEFAULT_SETTINGS = {
     "activated": False,         # APPLIANCE mode: persisted arm state. While True the app runs
                                 # whenever it can — the server re-enables the orchestrator on
@@ -33,7 +42,6 @@ DEFAULT_SETTINGS = {
     "quiet_mode": False,        # QUIET MODE: keep download+topaz running but DEFER each item before the
                                 # screen-invasive Resolve stage, so the laptop stays usable. Items pile up
                                 # (no drain to remux/upload/cleanup) → the run pauses on low disk until off.
-    "pause_on_battery_drain": True,
     "min_adapter_watts": 140,   # power SUFFICIENCY = the brick: >= this wattage adapter → run;
                                 # anything less (hub/monitor PD, battery) → full passive pause
     "poll_minutes": 30,
@@ -62,7 +70,48 @@ DEFAULT_SETTINGS = {
                                 # episodes (was: a ~max_youtube_minutes batch every turn). Throttles the
                                 # slow 4K-SDR YouTube upscales so they don't crowd out TV. If TV runs out,
                                 # YouTube drains freely regardless of N.
+
+    # --- scheduling / capacity (was: hardcoded constants; read via tunable()) ---
+    "max_active_shows": 3,      # ROUND-ROBIN WIDTH (was series.MAX_ACTIVE): how many shows share the
+                                # rotation, one episode taken from each in turn. 1 = finish a show before
+                                # starting the next. Governs only ADDING a show — see series.max_active().
+    "finisher_lanes": 2,        # PARALLEL REMUXES (was orchestrator.FINISHER_LANES): how many topaz-done
+                                # items may remux at once. 1 = a quieter machine and the whole GPU for
+                                # Topaz; 2 = the current throughput (Resolve gets 2 items ahead).
+    "min_free_gb": 400,         # DISK FLOOR (was orchestrator.MIN_FREE_GB): free space that must remain
+                                # before an item may START, and the base of the prefetch gate. A Topaz
+                                # ProRes working set is ~140 GB per episode, ~245 GB for a feature.
+    "prefetch_cap_gb": 100,     # DOWNLOAD-AHEAD BUFFER (was orchestrator.PREFETCH_HARD_CAP_GB): hard
+                                # ceiling on the total size of pre-staged sources. 0 = off (fetch each
+                                # item only when it's needed).
+    "max_episode_fails": 5,     # GIVE-UP THRESHOLD (was orchestrator.MAX_EPISODE_FAILS): consecutive
+                                # genuine failures of ONE episode before it's parked and the run moves on.
+    "unplug_grace_seconds": 60, # POWER-BLIP GRACE (was orchestrator.UNPLUG_GRACE_SECONDS): unplugged
+                                # mid-stage, wait this long for the power to come back before abandoning
+                                # the stage. 0 = abandon immediately.
 }
+
+# Clamp table — the ONE source of truth for every numeric setting's range, used on write
+# (set_settings) AND on read (tunable). Keeping them together is what stops a hand-edited
+# settings.json from feeding the engine a value the UI could never produce.
+# key -> (lo, hi); a key in ZERO_IS_OFF may additionally be exactly 0.
+LIMITS = {
+    "poll_minutes": (1, 1440),
+    "dim_after_minutes": (0, 240),          # 0 = Off (never dim)
+    "max_peak_mbps": (20, 100),
+    "audio_target_lufs": (-24, -10),
+    "min_adapter_watts": (1, 500),
+    "passthrough_min_mbps": (5, 200),
+    "max_youtube_minutes": (1, 600),
+    "youtube_every_tv_episodes": (1, 50),
+    "max_active_shows": (1, MAX_ACTIVE_CEILING),
+    "finisher_lanes": (1, 2),
+    "min_free_gb": (200, 2000),
+    "prefetch_cap_gb": (25, 500),
+    "max_episode_fails": (1, 20),
+    "unplug_grace_seconds": (0, 600),
+}
+ZERO_IS_OFF = {"audio_target_lufs", "passthrough_min_mbps", "prefetch_cap_gb"}
 
 # --- the Topaz preset catalog: ALL SDR ProRes; content-type × resolution ----
 # Each parent preset (content type) carries a tuned param set for EACH source resolution.
@@ -163,28 +212,36 @@ def _clamp(v, lo, hi, default):
         return default
 
 
+def _is_zero(v) -> bool:
+    """True only for a real numeric zero — a bad type ('', None, 'off') is NOT 'off', it's
+    garbage, and must fall through to the clamp's default instead of disabling a feature."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0
+
+
+def clamp_setting(key: str, v):
+    """Coerce one setting to its legal value: the LIMITS range, plus an exact 0 for the
+    ZERO_IS_OFF keys. Anything unparseable becomes the default."""
+    lo, hi = LIMITS[key]
+    if key in ZERO_IS_OFF and _is_zero(v):
+        return 0
+    return _clamp(v, lo, hi, DEFAULT_SETTINGS[key])
+
+
+def tunable(key: str) -> int:
+    """READ side of a numeric setting — the live value, clamped, with the shipped default as
+    the fallback. Engine code calls this at USE time (never at import) so a change in the UI
+    takes effect on the next decision rather than the next relaunch."""
+    return clamp_setting(key, get_settings().get(key, DEFAULT_SETTINGS[key]))
+
+
 def set_settings(updates: dict) -> dict:
     with _WRITE_LOCK:                    # atomic read-modify-write (see _WRITE_LOCK)
         s = get_settings()
         for k, v in (updates or {}).items():
             if k in DEFAULT_SETTINGS:
                 s[k] = v
-        s["poll_minutes"] = _clamp(s.get("poll_minutes"), 1, 1440, DEFAULT_SETTINGS["poll_minutes"])
-        s["dim_after_minutes"] = _clamp(s.get("dim_after_minutes"), 0, 240,   # 0 = Off (never dim)
-                                        DEFAULT_SETTINGS["dim_after_minutes"])
-        s["max_peak_mbps"] = _clamp(s.get("max_peak_mbps"), 20, 100, DEFAULT_SETTINGS["max_peak_mbps"])
-        if s.get("audio_target_lufs") != 0:   # 0 = boost off; else clamp to a sane loudness window
-            s["audio_target_lufs"] = _clamp(s.get("audio_target_lufs"), -24, -10,
-                                            DEFAULT_SETTINGS["audio_target_lufs"])
-        s["min_adapter_watts"] = _clamp(s.get("min_adapter_watts"), 1, 500,
-                                        DEFAULT_SETTINGS["min_adapter_watts"])
-        if s.get("passthrough_min_mbps") != 0:   # 0 = fast path off; else keep the floor sane
-            s["passthrough_min_mbps"] = _clamp(s.get("passthrough_min_mbps"), 5, 200,
-                                               DEFAULT_SETTINGS["passthrough_min_mbps"])
-        s["max_youtube_minutes"] = _clamp(s.get("max_youtube_minutes"), 1, 600,
-                                          DEFAULT_SETTINGS["max_youtube_minutes"])
-        s["youtube_every_tv_episodes"] = _clamp(s.get("youtube_every_tv_episodes"), 1, 50,
-                                                DEFAULT_SETTINGS["youtube_every_tv_episodes"])
+        for k in LIMITS:                 # one table, applied on write and on read (tunable)
+            s[k] = clamp_setting(k, s.get(k))
         _save(SETTINGS_FILE, s)
         return s
 

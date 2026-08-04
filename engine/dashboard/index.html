@@ -339,11 +339,6 @@
       <input class="inp" type="time" id="setStop" value="09:00" onchange="saveStop()" style="margin-top:9px">
     </div>
     <div class="set-item">
-      <div class="set-lbl">Pause if battery drains on AC</div>
-      <div class="set-sub">Hold off when the power brick can&rsquo;t keep up under load.</div>
-      <label class="tog"><input type="checkbox" id="setDrain" onchange="saveDrain()"><span>Enabled</span></label>
-    </div>
-    <div class="set-item">
       <div class="set-lbl">Re-check interval</div>
       <div class="set-sub">How often to retry while paused (no power / no episode).</div>
       <div class="inp-row"><input class="inp" type="number" id="setPoll" min="1" max="120" onchange="savePoll()"><span class="set-unit">min</span></div>
@@ -589,7 +584,6 @@ async function loadSettings(){
   document.getElementById('setAuto').checked = on;
   document.getElementById('setStop').value = String(st.stop_hour).padStart(2,'0')+':'+String(st.stop_minute).padStart(2,'0');
   document.getElementById('setStop').disabled = !on;
-  document.getElementById('setDrain').checked = !!st.pause_on_battery_drain;
   document.getElementById('setPoll').value = st.poll_minutes;
 }
 async function postSettings(obj){ try{ await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }catch(e){} }
@@ -624,7 +618,6 @@ function renderActiveStage(armed, o){
     box.style.display = 'none';
   }
 }
-async function saveDrain(){ await postSettings({pause_on_battery_drain:document.getElementById('setDrain').checked}); }
 async function savePoll(){ await postSettings({poll_minutes:parseInt(document.getElementById('setPoll').value)||30}); }
 // ---- per-show topaz profile ----
 let PRESET_CATALOG = [];
