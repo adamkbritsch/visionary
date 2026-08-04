@@ -324,11 +324,6 @@ struct HeaderBar: View {
     }
 }
 
-// The header status "puck" — a compact, glanceable replacement for the old status banner.
-// Monochrome steel: state is BRIGHTNESS + pulse — bright silver pulsing = running, mid
-// steel = armed/paused (+ the orchestrator message), dim = idle.
-private let PUCK_MAX = 46      // character budget, so the puck hugs its content
-
 // The engine's status messages usually lead with the episode code ("S02E14: holding before
 // Resolve — …"). The puck deliberately no longer shows an episode tag, so strip that lead-in
 // from the message too — otherwise the tag just reappears whenever the puck falls back to a
@@ -340,41 +335,357 @@ private func stripEpisodeLead(_ s: String) -> String {
     return rest.isEmpty ? s : rest        // a message that is ONLY a code keeps it
 }
 
+// ============================================================================================
+// THE HEADER STATUS PUCK
+//
+// The pipeline's normal steady state is TWO things at once — the run thread (download/topaz/
+// resolve) and a finisher lane (remux/upload/cleanup). The old puck read only the run thread,
+// so it would show "Download · 21% · ~12m" while a remux sat at 3% with 4h16m left, hiding the
+// longer job entirely. Worse, whenever the run thread was HELD (the majority of non-encoding
+// wall time) it fell through to a prose sentence clipped at 46 characters.
+//
+// The organising rule:
+//     ROW A = what the run thread is doing.
+//     ROW B = what else is happening, or why nothing is.
+// Row B is never empty, so a fixed height is always earned and the header never reflows.
+//
+// The single dot belongs to the MACHINE, not a row — it spans both, which keeps the old
+// silhouette and guarantees exactly one pulsing element (two PulseDots would beat against each
+// other, since each starts its repeatForever on its own onAppear with no phase lock).
+//
+// The right-aligned monospaced ETA column is the actual fix: ~12m sits directly above ~4h 16m,
+// so the comparison is made by the layout instead of by the reader.
+// ============================================================================================
+
+enum MachineState {
+    case working      // something is genuinely progressing
+    case attention    // paused / stalled — needs a human
+    case held         // deliberate backpressure; normal, no action needed
+    case armed        // activated, nothing to do right now
+    case idle         // not activated
+    case fault        // parked item, or the loop crashed
+
+    // The DS law: state is BRIGHTNESS + PULSE, never hue. `.working` and `.attention` share a
+    // brightness and differ only by the pulse, so "happening" and "needs you" separate without
+    // reaching for colour. DS.fault is the single documented exception.
+    var tint: Color {
+        switch self {
+        case .working, .attention: return DS.steelBright
+        case .held, .armed:        return DS.steel
+        case .idle:                return DS.steelDim
+        case .fault:               return DS.fault
+        }
+    }
+    var pulses: Bool { self == .working }
+}
+
+/// Everything the puck displays, derived in one pure place so the views stay dumb.
+struct PuckModel {
+    var machine: MachineState = .idle
+    var rowALead: String = "Idle"
+    var rowATrail: String? = nil
+    var rowBLead: String = ""
+    var rowBTrail: String? = nil
+    var rowBDim: Bool = true        // row B is secondary unless it carries a live lane
+    var tooltip: String = ""
+
+    /// A lane is "live" for display purposes if it exists at all — a held lane still occupies
+    /// the machine and still has work outstanding.
+    private static func laneText(_ f: FinishingDTO?) -> (String, String?)? {
+        guard let f, let st = f.stage, !st.isEmpty else { return nil }
+        if f.holding != nil {
+            // Don't render a frozen percentage as if it were progressing. Keep the last-known
+            // number (the engine now preserves it across the hold) but say why it is still.
+            if let pc = f.pct { return ("\(st.capitalized) · \(Int(pc))% · held", nil) }
+            return ("\(st.capitalized) · held for Resolve", nil)
+        }
+        guard let pc = f.pct else { return ("\(st.capitalized) · starting…", nil) }
+        return ("\(st.capitalized) · \(Int(pc))%", shortLeft(f.eta_secs))
+    }
+
+    /// "~28m" / "~4h 16m" / "~45s" — the `finLeft` wording without its " left" suffix, so the
+    /// column stays narrow enough to never truncate.
+    private static func shortLeft(_ secs: Double?) -> String? {
+        guard let s = secs, s > 0 else { return nil }
+        let t = Int(s.rounded())
+        if t < 90 { return "~\(t)s" }
+        if t < 5400 { return "~\(Int((s / 60).rounded()))m" }
+        return "~\(t / 3600)h \((t % 3600) / 60)m"
+    }
+
+    /// Maps a structured hold code to a short label. Falls back to the prose only for a code
+    /// this build doesn't know — so a newer engine degrades gracefully instead of blanking.
+    private static func holdLabel(_ h: HoldDTO?, message: String) -> (String, MachineState)? {
+        guard let h, let code = h.code else { return nil }
+        switch code {
+        case "power":        return ("Paused · power", .attention)
+        case "power-grace":  return ("Pausing in \(h.secs ?? 0)s · power", .attention)
+        case "disk":         return ("Paused · low disk", .attention)
+        case "backlog":      return ("Held · finisher backlog", .held)
+        case "resolve-gate": return ("Held · previous remux", .held)
+        case "dual-remux":   return ("Held · two remuxes", .held)
+        case "quiet":        return ("Held · Screen Control off", .held)
+        case "stall":        return ("Held · Resolve stalled", .attention)
+        case "retry":        return ("Retrying · Resolve \(h.attempt ?? 1)/\(h.of ?? 5)", .attention)
+        case "nas":          return ("NAS unreachable", .attention)
+        case "empty":        return ("No series selected", .idle)
+        case "done":         return ("Series complete", .armed)
+        case "parked":       return ("Item parked", .fault)
+        default:             return (stripEpisodeLead(message), .held)
+        }
+    }
+
+    @MainActor static func make(_ store: AppStore) -> PuckModel {
+        var m = PuckModel()
+        let s = store.state
+        let o = s?.orchestrator
+        let armed = s?.automation_enabled ?? false
+        let message = stripEpisodeLead(o?.message ?? "")
+
+        // LIVENESS: `stage` is stale by design (set at stage start, never cleared), so trust
+        // `stage_active`. A nil value means an older engine — fall back to the old heuristic
+        // rather than to false, which would claim nothing is running mid-encode.
+        let runLive = o?.stage_active ?? (o?.progress != nil)
+        let p = o?.progress
+        let lanes = [o?.finishing, o?.finishing2].compactMap { $0 }.filter { $0.stage?.isEmpty == false }
+
+        // ---- ROW A: the run thread ----
+        if runLive, let st = (p?.stage ?? o?.stage), !st.isEmpty {
+            m.rowALead = p?.pct.map { "\(st.capitalized) · \($0)%" } ?? "\(st.capitalized) · starting…"
+            m.rowATrail = shortLeft(p?.eta_secs)
+            m.machine = .working
+        } else if let (label, state) = holdLabel(o?.hold, message: message) {
+            m.rowALead = label
+            m.machine = state
+        } else if (o?.ended_reason ?? "").hasPrefix("loop crashed") {
+            m.rowALead = "Loop crashed"
+            m.machine = .fault
+        } else if !armed {
+            m.rowALead = "Idle"
+            m.machine = .idle
+        } else if o?.running == true {
+            m.rowALead = message.isEmpty ? "Working" : message
+            m.machine = .held
+        } else {
+            m.rowALead = "Armed"
+            m.machine = .armed
+        }
+
+        // ---- ROW B: the other lane, or why nothing is happening ----
+        if lanes.count >= 2 {
+            // Never two identical "Remux" rows — collapse to one, with the slower lane's ETA.
+            let pcts = lanes.map { $0.pct.map { "\(Int($0))%" } ?? "—" }.joined(separator: " / ")
+            let name = (lanes[0].stage ?? "Remux").capitalized
+            m.rowBLead = "\(name) ×\(lanes.count) · \(pcts)"
+            m.rowBTrail = shortLeft(lanes.compactMap { $0.eta_secs }.max())
+            m.rowBDim = false
+        } else if let one = lanes.first, let (lead, trail) = Self.laneText(one) {
+            m.rowBLead = lead
+            m.rowBTrail = trail
+            m.rowBDim = false
+        } else if !armed {
+            m.rowBLead = "Activate to start"
+        } else {
+            m.rowBLead = message
+        }
+
+        // A lane progressing means the machine IS working, even when the run thread is held —
+        // which is exactly the case the old puck rendered as a bare sentence.
+        if m.machine == .held, lanes.contains(where: { $0.holding == nil && $0.pct != nil }) {
+            m.machine = .working
+        }
+
+        var tip = [m.rowALead, m.rowBLead].filter { !$0.isEmpty }.joined(separator: "\n")
+        if !message.isEmpty && message != m.rowBLead { tip += "\n\n" + message }
+        m.tooltip = tip
+        return m
+    }
+}
+
+/// One line: lead text that truncates, and an ETA that never does.
+private struct PuckRow: View {
+    let lead: String
+    let trail: String?
+    let size: CGFloat
+    let weight: Font.Weight
+    let tint: Color
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(lead).font(.system(size: size, weight: weight))
+                .lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 6)
+            if let trail {
+                // .fixedSize sets the priority: the stage name loses characters before the time
+                // does, because the time is the reason you looked.
+                Text(trail).font(.system(size: size, weight: weight)).monospacedDigit().fixedSize()
+            }
+        }
+        .foregroundStyle(tint)
+    }
+}
+
 struct StatusPuck: View {
     @EnvironmentObject var store: AppStore
+    @State private var showDetail = false
     var body: some View {
-        let s = store.state
-        let on = s?.automation_enabled ?? false
-        let o = s?.orchestrator
-        let running = o?.running ?? false
-        let p = o?.progress
-        let tint: Color = running ? DS.steelBright : (on ? DS.steel : DS.steelDim)
-        let text: String = {
-            if running {
-                // PROGRESS ONLY — no item identity. The episode code that used to lead here said
-                // nothing at a glance, and what's running is already named in the pipeline card.
-                var parts: [String] = []
-                if let st = (p?.stage ?? o?.stage), !st.isEmpty { parts.append(st.capitalized) }
-                if let pc = p?.pct { parts.append("\(pc)%") }
-                if let m = minutes(p?.eta_secs), m > 0 { parts.append("~\(m)m") }
-                if parts.isEmpty { return stripEpisodeLead(o?.message ?? "Running") }
-                return parts.joined(separator: " · ")
+        let m = PuckModel.make(store)
+        Button { showDetail.toggle() } label: {
+            HStack(spacing: 8) {
+                if m.machine.pulses {
+                    PulseDot(color: m.machine.tint)
+                } else {
+                    Circle().fill(m.machine.tint).frame(width: 7, height: 7)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    PuckRow(lead: m.rowALead, trail: m.rowATrail,
+                            size: 12, weight: .medium, tint: m.machine.tint)
+                    PuckRow(lead: m.rowBLead, trail: m.rowBTrail,
+                            size: 10, weight: .regular,
+                            // never below DS.steel for content that matters — steelDim at 10pt
+                            // on this background fails AA
+                            tint: m.rowBDim ? DS.steel.opacity(0.75) : DS.steel)
+                }
             }
-            return on ? stripEpisodeLead(o?.message ?? "Armed") : "Idle"
-        }()
-        let shown = text.count > PUCK_MAX ? String(text.prefix(PUCK_MAX - 1)) + "…" : text
-        HStack(spacing: 6) {
-            if running {
-                PulseDot(color: tint).frame(width: 8, height: 8)
-            } else {
-                Circle().fill(tint).frame(width: 7, height: 7)
-            }
-            Text(shown).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                .foregroundStyle(tint)
+            .padding(.horizontal, 10)
+            .frame(width: 264, height: 32, alignment: .leading)
+            .background(Capsule().fill(m.machine.tint.opacity(0.08)))
+            .overlay(Capsule().strokeBorder(m.machine.tint.opacity(0.22), lineWidth: 0.8))
+            .contentShape(Capsule())
         }
-        .padding(.horizontal, 10).padding(.vertical, 5)
-        .background(Capsule().fill(tint.opacity(0.08)))
-        .overlay(Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 0.8))
+        .buttonStyle(.plain)
+        .focusable(false)
+        .help(m.tooltip)
+        .animation(.easeOut(duration: 0.25), value: m.machine)   // tint only — NOT row content,
+        .popover(isPresented: $showDetail, arrowEdge: .bottom) { // or rows pop on every poll
+            PuckDetail().environmentObject(store)
+        }
+    }
+}
+
+/// The puck's detail popover. This is where everything the 264pt face can't hold goes — and,
+/// because `IssuesBanner` is never mounted anywhere in RootView, it is the ONLY place in the app
+/// where the recent-issues log and a full (untruncated, selectable) status message can be read.
+struct PuckDetail: View {
+    @EnvironmentObject var store: AppStore
+
+    private struct Lane: Identifiable {
+        let id: Int
+        let title: String, item: String?
+        let pct: Double?, notches: [Double], segDone: Int?, segTotal: Int?
+        let elapsed: Double?, eta: Double?, holding: String?
+    }
+
+    private var lanes: [Lane] {
+        let o = store.state?.orchestrator
+        var out: [Lane] = []
+        // The run thread. Identity IS allowed here — the no-episode-codes rule is about the
+        // header face, and PipelineCard already names items a few hundred points below.
+        let runLive = o?.stage_active ?? (o?.progress != nil)
+        if runLive, let p = o?.progress, let st = (p.stage ?? o?.stage), !st.isEmpty {
+            out.append(Lane(id: 0, title: st.capitalized, item: runItemLabel(o?.current),
+                            pct: p.pct.map(Double.init), notches: p.notches ?? [],
+                            segDone: p.seg_done, segTotal: p.seg_total,
+                            elapsed: p.elapsed_secs, eta: p.eta_secs, holding: nil))
+        }
+        for (i, f) in [o?.finishing, o?.finishing2].compactMap({ $0 }).enumerated()
+        where f.stage?.isEmpty == false {
+            out.append(Lane(id: 1 + i, title: (f.stage ?? "").capitalized, item: f.ep,
+                            pct: f.pct, notches: f.notches ?? [],
+                            segDone: f.seg_done, segTotal: f.seg_total,
+                            elapsed: f.elapsed_secs, eta: f.eta_secs, holding: f.holding))
+        }
+        return out
+    }
+
+    private func runItemLabel(_ it: UpNextDTO?) -> String? {
+        guard let it else { return nil }
+        switch it.kind {
+        case "movie":   return store.movieTitle(it.name, it.title)
+        case "youtube": return (it.title?.isEmpty == false) ? it.title : it.name
+        default:        return it.ep
+        }
+    }
+
+    var body: some View {
+        let o = store.state?.orchestrator
+        let log = (store.state?.log ?? []).suffix(6)
+        // Honest floor, not a promise: the engine estimates per-STAGE time only, never the
+        // remaining stages of an item, so this is a lower bound and is labelled as one.
+        let busy = lanes.compactMap { $0.eta }.max()
+        VStack(alignment: .leading, spacing: 14) {
+            if lanes.isEmpty {
+                Text(stripEpisodeLead(o?.message ?? "Nothing running"))
+                    .font(.system(size: 12)).foregroundStyle(DS.steel)
+            }
+            ForEach(lanes) { l in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text(l.title).font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(DS.steelBright)
+                        if let it = l.item {
+                            Text(it).font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if let h = l.holding {
+                            Text(h).font(.system(size: 10)).foregroundStyle(DS.quietRedLight)
+                        }
+                    }
+                    let frac = (l.pct ?? 0) / 100
+                    SteelBar(completed: segFrac(l) ?? frac, live: frac, notches: l.notches,
+                             flashKey: l.segDone ?? 0)
+                    HStack(spacing: 10) {
+                        if let pc = l.pct {
+                            Text("\(Int(pc))%").font(.system(size: 12, weight: .semibold))
+                                .monospacedDigit().foregroundStyle(DS.steelBright)
+                        }
+                        if let d = l.segDone, let t = l.segTotal, t > 0 {
+                            Text("seg \(min(d + 1, t))/\(t)").font(.system(size: 11))
+                                .monospacedDigit().foregroundStyle(DS.steelDim)
+                        }
+                        Spacer()
+                        if let e = finHMS(l.elapsed) {
+                            Text(e).font(.system(size: 11)).monospacedDigit()
+                                .foregroundStyle(DS.steelDim)
+                        }
+                        if let left = finLeft(l.eta) {
+                            Text(left).font(.system(size: 11)).monospacedDigit()
+                                .foregroundStyle(DS.steel)
+                        }
+                    }
+                }
+            }
+            if let b = busy, let label = finLeft(b) {
+                Divider()
+                Text("Machine busy at least \(label)")
+                    .font(.system(size: 11)).foregroundStyle(DS.steelDim)
+            }
+            if let msg = o?.message, !msg.isEmpty {
+                Divider()
+                Text(msg).font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(DS.steel).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !log.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("RECENT ISSUES").font(.system(size: 10, weight: .semibold))
+                        .tracking(0.6).foregroundStyle(.tertiary)
+                    Text(log.joined(separator: "\n"))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(DS.fault).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 360)
+    }
+
+    /// The bright fill tracks the last COMPLETED segment; the shadow fill tracks live progress.
+    private func segFrac(_ l: Lane) -> Double? {
+        guard let d = l.segDone, let t = l.segTotal, t > 0 else { return nil }
+        if !l.notches.isEmpty, d > 0, d <= l.notches.count { return l.notches[d - 1] }
+        return Double(d) / Double(t)
     }
 }
 

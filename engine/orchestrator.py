@@ -649,6 +649,7 @@ class Orchestrator:
                                                # back into _finish_q/_in_finisher by _finisher_reconcile.
         self._cadence_advanced = set()         # items whose HAND-OFF already advanced the cadence —
                                                # loaded below with the counters (survives restarts)
+        self._fin2_eta_anchor = None           # lane 2's own ETA anchor (lane 1 keeps _fin_eta_anchor)
         self._fin_eta_anchor = None            # (stage, monotonic0, frames0) of THIS attempt — the
                                                # lane ETA must use the live rate, never the
                                                # accumulated elapsed (it spans killed attempts)
@@ -690,6 +691,13 @@ class Orchestrator:
         self.state = {"enabled": False, "running": False, "episode": None,
                       "stage": None, "message": "idle", "ended_reason": None,
                       "progress": None, "current": None, "plex_playing": False,
+                      "stage_active": False,  # a heavy stage is EXECUTING right now. `stage` alone can't
+                                              # say: it is set when a stage starts and never cleared on
+                                              # completion, so it still names a stage for the 60 s after a
+                                              # failure. Mirrors self._stage_active for the UI.
+                      "hold": None,        # {"code": ..., **detail} while the run thread is deliberately
+                                           # holding — so the UI reads a CODE instead of pattern-matching
+                                           # the prose in `message` (which has ~29 forms, one unbounded).
                       "finishing": None,   # {"ep","stage","pct",...} while the finisher works an item
                       "finishing2": None}  # the 2nd remux lane (only while draining a Resolve-stall backlog)
 
@@ -756,6 +764,18 @@ class Orchestrator:
                 del m[key]; _elapsed_write(m)
         if self._fin_el_key == key:
             self._fin_el_key = None; self._fin_el_anchor = None
+
+    def _hold(self, code, message, **detail):
+        """The run thread is deliberately NOT executing a stage. Publishes a structured
+        `hold` code beside the prose so the UI can label the state without pattern-matching
+        English — there are ~29 message forms, several with interpolated values and one
+        (the stage-result line) that can carry a raw ffmpeg stderr tail. The prose is
+        unchanged; anything already reading `message` is unaffected."""
+        self.state.update(stage=None, progress=None, stage_active=False,
+                          message=message, hold={"code": code, **detail})
+
+    def _clear_hold(self):
+        self.state["hold"] = None
 
     def _set_progress(self, info):
         """Live sub-stage progress for the dashboard, plus an ETA (seconds left). The ETA is a
@@ -1240,7 +1260,7 @@ class Orchestrator:
         unplug/re-plug doesn't abort the stage. If still unplugged when it expires,
         abort the stage so the run pauses (it never runs on battery). Reconnecting
         cancels the countdown and restores the stage's message."""
-        unplug_since, held_msg = None, None
+        unplug_since, held_msg, held_hold = None, None, None
         while self._enabled:
             time.sleep(2)
             fin = self.state.get("finishing") or {}
@@ -1262,14 +1282,18 @@ class Orchestrator:
             if action == "clear":
                 if held_msg is not None:
                     self.state["message"] = held_msg
-                    held_msg = None
+                    self.state["hold"] = held_hold      # restore, don't wipe: the run thread may be
+                    held_msg = held_hold = None         # legitimately holding for its own reason
             elif action == "count":
                 if held_msg is None:
                     held_msg = self.state.get("message")
+                    held_hold = self.state.get("hold")
                 self.state["message"] = (f"Insufficient power — pausing in {grace_label(remaining)} "
                                          "unless the 140 W adapter returns")
+                self.state["hold"] = {"code": "power-grace", "secs": int(remaining or 0)}
             else:  # pause
                 self.state["message"] = "paused — insufficient power (needs the 140 W adapter)"
+                self.state["hold"] = {"code": "power"}
                 self._abort.set()
                 self._finish_abort.set()       # never keep an x265/upload burning battery either
                 held_msg = None
@@ -1327,18 +1351,19 @@ class Orchestrator:
                 self._power_paused = (pstatus == "pause")        # let the prefetcher back off too
                 if pstatus == "pause":
                     self._stop_caffeinate()                      # don't hold the display/system awake
-                    self.state["message"] = pmsg                 # all night while waiting on power
+                    self._hold("power", pmsg)                    # all night while waiting on power
                     self._sleep(DRAIN_POLL_SECONDS); continue    # re-check soon to resume on recovery
                 if self._caffeinate is None:                     # resumed from a power pause → re-hold
                     self._start_caffeinate()
                 if (dmsg := self._low_disk_pause()) is not None:   # not enough room to start an item
-                    self.state.update(stage=None, message=dmsg)
+                    self._hold("disk", dmsg)
                     self._sleep(DRAIN_POLL_SECONDS); continue
                 if self._finisher_backlogged():   # BACKPRESSURE: 2+ items already wait behind the one
                     # the finisher is working — only then does starting another risk stacking working sets
                     fin = self.state.get("finishing") or {}
-                    self.state.update(stage=None, current=None,
-                        message=f"holding the next item — finisher backlog ({fin.get('ep') or 'queued'} still finishing)")
+                    self.state["current"] = None
+                    self._hold("backlog",
+                        f"holding the next item — finisher backlog ({fin.get('ep') or 'queued'} still finishing)")
                     self._sleep(15); continue
                 self._refresh_youtube()                         # pick up whatever youtarr downloaded since
                 ep, why = self._next_episode()
@@ -1358,14 +1383,16 @@ class Orchestrator:
                                        f"on the NAS (retrying)")
                         except Exception:
                             pass
-                        self.state.update(episode=None, stage=None, message=msg)
+                        self.state["episode"] = None
+                        self._hold("nas", msg)
                         self._sleep(DRAIN_POLL_SECONDS)
                     elif why == "no-series":
-                        self.state.update(episode=None, stage=None, message="no series selected")
+                        self.state["episode"] = None
+                        self._hold("empty", "no series selected")
                         self._sleep(self._retry_seconds())
                     else:                        # genuinely complete (incl. all-parked)
-                        self.state.update(episode=None, stage=None,
-                                          message="series complete — nothing left to upscale")
+                        self.state["episode"] = None
+                        self._hold("done", "series complete — nothing left to upscale")
                         self._sleep(self._retry_seconds())
                     continue
                 if self._stall_active and not stage_done("topaz", ep) \
@@ -1376,22 +1403,25 @@ class Orchestrator:
                     reserve = STALL_MOVIE_RESERVE_GB if (ep.movie or ep.youtube) else STALL_ITEM_RESERVE_GB
                     phys = scratch.physical_free_gb()
                     if phys is not None and phys < STALL_FLOOR_GB + reserve:
-                        self.state.update(stage=None, current=None,
-                            message=f"Resolve stalled — upscale buffer full ({phys} GB free); dismiss "
-                                    f"Resolve's update prompt to drain {len(self._resolve_stall)} held item(s)")
+                        self.state["current"] = None
+                        self._hold("stall",
+                            f"Resolve stalled — upscale buffer full ({phys} GB free); dismiss "
+                            f"Resolve's update prompt to drain {len(self._resolve_stall)} held item(s)",
+                            held=len(self._resolve_stall))
                         self._sleep(DRAIN_POLL_SECONDS); continue
                 if self._dual_remux_pauses_topaz(ep):
                     # 2 remuxes have the machine — hold fresh Topaz until a lane frees (already-
                     # upscaled items still flow through Resolve to feed the lanes).
-                    self.state.update(stage=None, current=None,
-                        message="two remuxes running — Topaz paused until a lane frees")
+                    self.state["current"] = None
+                    self._hold("dual-remux", "two remuxes running — Topaz paused until a lane frees")
                     self._sleep(DRAIN_POLL_SECONDS); continue
                 self._process(ep)
         except Exception as e:                       # never die silently — leave a trace
             logbook.exception("orchestrator loop", e)
             self.state["ended_reason"] = f"loop crashed: {e.__class__.__name__}: {e}"
         finally:
-            self.state.update(running=False, stage=None, current=None)
+            self.state.update(running=False, stage=None, current=None,
+                              stage_active=False, hold=None)
             self.state["message"] = self.state.get("ended_reason") or "stopped"
 
     def _sleep(self, seconds):
@@ -1423,8 +1453,9 @@ class Orchestrator:
                 self._save_cadence()
         logbook.failure(f"{p.ep}: parked after {n} failures at {st} — skipping so the "
                         f"series keeps moving (last: {' '.join(str(last_msg).split())[-120:]})")
-        self.state.update(stage=None,
-            message=f"{ep_disp} parked after {n} failures at {st} — moving to the next episode")
+        self._hold("parked",
+            f"{ep_disp} parked after {n} failures at {st} — moving to the next episode",
+            fails=n, at=st)
 
     def _on_resolve_failure(self, p, ep_disp, last_msg):
         """A Resolve ATTEMPT failed. A single failure can be a FLUKE, so until a stall is confirmed we
@@ -1445,8 +1476,9 @@ class Orchestrator:
             return
         if not self._stall_active and n < STALL_TRIGGER_ATTEMPTS:
             # not a confirmed stall yet — could be a fluke that clears on retry. Retry the SAME item.
-            self.state.update(stage=None, progress=None,
-                message=f"{ep_disp}: resolve failed (attempt {n}/{STALL_TRIGGER_ATTEMPTS}) — retrying (could be a fluke)")
+            self._hold("retry",
+                f"{ep_disp}: resolve failed (attempt {n}/{STALL_TRIGGER_ATTEMPTS}) — retrying (could be a fluke)",
+                attempt=n, of=STALL_TRIGGER_ATTEMPTS)
             self._sleep(60)
             return
         if not self._stall_active:                      # STALL_TRIGGER_ATTEMPTS reached → confirmed stall
@@ -1454,18 +1486,21 @@ class Orchestrator:
             self._stall_retry_at = time.monotonic() + STALL_RETRY_SECONDS
             logbook.event(f"resolve stalled after {n} attempts on {p.ep} — buffering topaz ahead")
         self._resolve_stall.add(key)
-        self.state.update(stage=None, progress=None, current=None,
-            message=f"{ep_disp}: Resolve stalled (dismiss its update prompt) — held; "
-                    f"buffering the next upscale ahead ({len(self._resolve_stall)} waiting)")
+        self.state["current"] = None
+        self._hold("stall",
+            f"{ep_disp}: Resolve stalled (dismiss its update prompt) — held; "
+            f"buffering the next upscale ahead ({len(self._resolve_stall)} waiting)",
+            held=len(self._resolve_stall))
 
     def _hold_before_stalled_resolve(self, p, ep_disp):
         """Resolve is already known-stalled, so a freshly-upscaled item is HELD without attempting
         Resolve (a blocked attempt can hang for up to RESOLVE_TIMEOUT). No fail count — it never
         actually failed; only the periodic probe re-tests Resolve."""
         self._resolve_stall.add(self._skip_key(p))
-        self.state.update(stage=None, progress=None, current=None,
-            message=f"{ep_disp}: Resolve stalled — held, buffering the next upscale "
-                    f"({len(self._resolve_stall)} waiting)")
+        self.state["current"] = None
+        self._hold("stall",
+            f"{ep_disp}: Resolve stalled — held, buffering the next upscale "
+            f"({len(self._resolve_stall)} waiting)", held=len(self._resolve_stall))
 
     def _resolve_recovered(self):
         """A Resolve render SUCCEEDED while items were held before a stalled Resolve → the update prompt
@@ -1907,8 +1942,9 @@ class Orchestrator:
         dual-system resolve GATE, whose hold can span the whole previous remux (a live toggle there
         used to slip through and launch Resolve anyway)."""
         self._resolve_deferred.add(self._skip_key(p))
-        self.state.update(stage=None, progress=None, current=None,
-            message=f"{ep_disp}: Screen Control off — deferred before Resolve (screen stays yours)")
+        self.state["current"] = None
+        self._hold("quiet",
+            f"{ep_disp}: Screen Control off — deferred before Resolve (screen stays yours)")
 
     # Two shows both have an "S01E01", so a bare episode key COLLIDES across the
     # round-robin: one show's in-flight/parked episode silently suppressed the other's
@@ -1968,18 +2004,19 @@ class Orchestrator:
                 if self._quiet_mode():                     # Screen Control turned OFF mid-hold (this gate
                     self._defer_resolve(p, ep_disp); return   # can span the whole previous remux) → defer
                 fin = self.state.get("finishing") or {}
-                self.state.update(stage=None, progress=None,
-                    message=f"{ep_disp}: holding before Resolve — finishing "
-                            f"{fin.get('ep') or 'the previous item'}'s remux first")
+                self._hold("resolve-gate",
+                    f"{ep_disp}: holding before Resolve — finishing "
+                    f"{fin.get('ep') or 'the previous item'}'s remux first")
                 time.sleep(10)
             if st == "resolve" and self._quiet_mode():     # flipped OFF in the instant the gate cleared —
                 self._defer_resolve(p, ep_disp); return    # never launch Resolve with Screen Control off
-            self.state.update(stage=st, message=f"{ep_disp}: {st}", progress=None)
+            self.state.update(stage=st, message=f"{ep_disp}: {st}", progress=None, hold=None)
             self._reclaim_for_pipeline()   # pipeline > queue: purge the prefetch buffer if raw free is
                                            # low, so this stage's write can't be starved/truncated
             ekey = p.source_basename + "|" + st      # per-(item, stage) elapsed key
             self._elapsed_begin(ekey)                # RESUMES this stage's clock if it ran before
             self._stage_active = True
+            self.state["stage_active"] = True      # published: `stage` alone is stale (never cleared)
             if st == "resolve":
                 # Resolve gets the WHOLE machine (user-dictated: it must finish ASAP —
                 # it holds the screen and can't be paced): both remux lanes hold/yield
@@ -1995,6 +2032,7 @@ class Orchestrator:
                 if st == "resolve":
                     self._resolve_active.clear()
             self._stage_active = False
+            self.state["stage_active"] = False
             if ok:  self._elapsed_done(ekey)         # stage complete → reset its timer for any re-run
             else:   self._elapsed_pause()            # interrupted/failed → persist so it RESUMES from here
             # one-line message — a stage's msg can carry an ffmpeg stderr tail with newlines,
@@ -2011,8 +2049,9 @@ class Orchestrator:
                 # return without a fail count — the run loop's dual gate holds this item until a
                 # lane frees, then it's re-selected and topaz resumes from its completed segments.
                 if str(msg).startswith("paused:"):
-                    self.state.update(stage=None, progress=None, current=None,
-                        message=f"{ep_disp}: topaz paused at a segment boundary — two remuxes running")
+                    self.state["current"] = None
+                    self._hold("dual-remux",
+                        f"{ep_disp}: topaz paused at a segment boundary — two remuxes running")
                     return
                 # A stop/pause abort isn't an episode FAILURE — don't count it toward parking
                 # and don't sit in the 60s retry; let the loop re-evaluate (power/stop) at once.
@@ -2171,7 +2210,7 @@ class Orchestrator:
             self._finisher_persisted[self._desc_cid(d)] = d   # mid-remux RESUMES it (see _finisher_reconcile)
             self._save_finisher_persisted_locked()
         self._finish_q.put(p)
-        self.state.update(stage=None, progress=None,
+        self.state.update(stage=None, progress=None, stage_active=False,
             message=f"{transfer.display_name(p.ep)} → finisher (remux/upload continue in the background)")
 
     def _set_finishing_progress(self, info):
@@ -2201,6 +2240,10 @@ class Orchestrator:
             a = self._fin_eta_anchor
             if a is None or a[0] != f.get("stage") or frames < a[2]:
                 self._fin_eta_anchor = (f.get("stage"), time.monotonic(), frames)
+                f.pop("eta_secs", None)     # re-anchored (new stage / restart): the carried-over
+                                            # dict's ETA was measured on the OLD run — drop it
+                                            # rather than show a stale number until the new
+                                            # window is wide enough to replace it.
             else:
                 span = time.monotonic() - a[1]
                 donef = frames - a[2]
@@ -2215,12 +2258,25 @@ class Orchestrator:
 
     def _set_finishing2_progress(self, info):
         """The 2nd remux lane's progress surface (state['finishing2']) — a lightweight mirror of
-        _set_finishing_progress WITHOUT the single-slot elapsed/ETA machinery, which belongs to lane 1."""
+        _set_finishing_progress. It keeps its OWN eta anchor (`_fin2_eta_anchor`); the elapsed
+        bookkeeping stays single-slot on lane 1. Without an ETA here the UI could only ever say
+        "Remux x2 - 3% / 41%" with no time against the slower lane."""
         f = dict(self.state.get("finishing2") or {})
         f.update({"stage": info.get("stage") or f.get("stage"), "pct": info.get("pct"),
                   "frames": info.get("frames"), "total": info.get("total"),
                   "notches": info.get("notches"), "seg_done": info.get("seg_done"),
                   "seg_total": info.get("seg_total")})
+        frames, total = info.get("frames"), info.get("total")
+        if frames is not None and total:
+            a = self._fin2_eta_anchor
+            if a is None or a[0] != f.get("stage") or frames < a[2]:   # new stage, or a restart
+                self._fin2_eta_anchor = (f.get("stage"), time.monotonic(), frames)
+                f.pop("eta_secs", None)     # see lane 1: never carry an ETA across a re-anchor
+            else:
+                span = time.monotonic() - a[1]
+                donef = frames - a[2]
+                if span >= 15 and donef >= 30:      # same floor as lane 1: don't extrapolate off noise
+                    f["eta_secs"] = round((total - frames) * span / donef, 1)
         self.state["finishing2"] = f
 
     def _finisher(self):
@@ -2291,6 +2347,7 @@ class Orchestrator:
                         self._in_finisher.discard(self._skip_key(p))
                         self._in_finisher_movies.discard(self._skip_key(p))
                     self.state["finishing2"] = None
+                    self._fin2_eta_anchor = None    # next item must not extrapolate off this one's rate
 
     def _finish_item(self, p: EpisodePaths, run_stage, lane=1):
         ep_disp = transfer.display_name(p.ep)
@@ -2327,8 +2384,13 @@ class Orchestrator:
                 while True:
                     while (self._resolve_active.is_set() and self._enabled
                            and not self._finish_abort.is_set()):
-                        self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None,
-                                               "fast": fast, "holding": "Resolve has the machine"}
+                        # MERGE, never replace. Replacing dropped series/source/movie/youtube, and
+                        # abandon_series matches lanes on exactly those keys — so abandoning a show
+                        # whose remux was held here silently failed to abort the lane or sweep its
+                        # scratch. Keeping them also lets the UI show the last-known % while held.
+                        self.state[fin_key] = {**(self.state.get(fin_key) or {}),
+                                               "ep": ep_disp, "stage": st, "fast": fast,
+                                               "holding": "Resolve has the machine"}
                         time.sleep(5)
                     if not self._enabled or self._finish_abort.is_set():
                         return

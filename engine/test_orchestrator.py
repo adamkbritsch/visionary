@@ -703,6 +703,74 @@ class ElapsedAccumulator(unittest.TestCase):
         self.assertAlmostEqual(orch._elapsed_map()["Z|download"], 30.0)  # download's total untouched
 
 
+class HoldCodes(unittest.TestCase):
+    """The run thread publishes a structured `hold` code beside the prose, so the UI can label
+    a hold without pattern-matching ~29 English message strings (one of which can carry a raw
+    ffmpeg stderr tail)."""
+
+    def test_hold_sets_code_and_clears_the_stage(self):
+        o = orch.Orchestrator()
+        o.state.update(stage="topaz", stage_active=True, progress={"pct": 12})
+        o._hold("resolve-gate", "S01E01: holding before Resolve — finishing S01E02's remux first")
+        self.assertEqual(o.state["hold"]["code"], "resolve-gate")
+        self.assertIsNone(o.state["stage"])          # nothing is executing...
+        self.assertIsNone(o.state["progress"])
+        self.assertFalse(o.state["stage_active"])
+        # ...but the PROSE is untouched, so anything already reading `message` still works
+        self.assertIn("holding before Resolve", o.state["message"])
+
+    def test_hold_detail_rides_along(self):
+        o = orch.Orchestrator()
+        o._hold("stall", "Resolve stalled — 3 waiting", held=3)
+        self.assertEqual(o.state["hold"], {"code": "stall", "held": 3})
+
+    def test_a_hold_is_cleared_when_a_stage_starts(self):
+        # The UI must not show "Held · previous remux" over a live Topaz percentage.
+        o = orch.Orchestrator()
+        o._hold("resolve-gate", "holding")
+        o.state.update(stage="topaz", message="S01E01: topaz", progress=None, hold=None)
+        self.assertIsNone(o.state["hold"])
+
+    def test_stage_active_is_published_and_distinct_from_stage(self):
+        # `stage` is STALE by design — set at stage start, never cleared on completion, so it
+        # still names a stage for the 60 s retry window after a failure. stage_active is the
+        # truthful liveness flag.
+        o = orch.Orchestrator()
+        self.assertFalse(o.state["stage_active"])
+        o.state.update(stage="topaz", stage_active=True)
+        o.state["stage_active"] = False               # stage ended; `stage` deliberately lingers
+        self.assertEqual(o.state["stage"], "topaz")
+        self.assertFalse(o.state["stage_active"])
+
+
+class Lane2Eta(unittest.TestCase):
+    """Lane 2 had no ETA at all, so a two-lane remux could only ever show percentages."""
+
+    def _feed(self, o, frames, total, t):
+        with mock.patch.object(orch.time, "monotonic", return_value=t):
+            o._set_finishing2_progress({"stage": "remux", "pct": 100.0 * frames / total,
+                                        "frames": frames, "total": total})
+        return o.state["finishing2"]
+
+    def test_lane2_reports_an_eta_once_the_window_is_wide_enough(self):
+        o = orch.Orchestrator()
+        self.assertIsNone(self._feed(o, 100, 1000, 0.0).get("eta_secs"))   # anchors, no estimate yet
+        f = self._feed(o, 200, 1000, 20.0)          # 100 frames in 20 s -> 800 left -> 160 s
+        self.assertAlmostEqual(f["eta_secs"], 160.0, delta=1.0)
+
+    def test_lane2_does_not_extrapolate_off_noise(self):
+        o = orch.Orchestrator()
+        self._feed(o, 100, 1000, 0.0)
+        self.assertIsNone(self._feed(o, 110, 1000, 5.0).get("eta_secs"))   # span<15s and <30 frames
+
+    def test_lane2_reanchors_on_a_restart(self):
+        o = orch.Orchestrator()
+        self._feed(o, 500, 1000, 0.0)
+        self._feed(o, 600, 1000, 20.0)
+        f = self._feed(o, 10, 1000, 40.0)           # frames went BACKWARDS = a fresh attempt
+        self.assertIsNone(f.get("eta_secs"))        # must not report the old rate
+
+
 class QuietModeExpiry(unittest.TestCase):
     """Screen Control off is a TIMED pause. The deadline is enforced in the ENGINE so it lifts
     even if the app was never reopened — left on indefinitely it would buffer items before
@@ -1889,6 +1957,21 @@ class AbandonSeries(unittest.TestCase):
             res = o.abandon_series("Old")
         self.assertTrue(res["aborted_finisher"])
         self.assertTrue(o._finish_abort.is_set())
+
+    def test_aborts_a_lane_HELD_for_resolve(self):
+        # REGRESSION: the Resolve-preemption hold used to REPLACE the lane dict, dropping
+        # series/source/movie/youtube. abandon_series matches on exactly those, so abandoning a
+        # show whose remux was held silently left the lane running and never swept its scratch.
+        o = self._orch()
+        o.state["finishing"] = {"ep": "S01E01", "stage": "remux", "series": "Old",
+                                "source": "Old.S01E01.mkv", "movie": False, "youtube": False,
+                                "pct": 47.0, "holding": "Resolve has the machine"}
+        with mock.patch.object(orch.threading, "Thread") as T:
+            res = o.abandon_series("Old")
+        self.assertTrue(res["aborted_finisher"])
+        self.assertTrue(o._finish_abort.is_set())
+        # its scratch is queued for the delayed sweep (dispatched on a background thread)
+        self.assertIn("Old.S01E01.mkv", T.call_args.kwargs["args"][0])
 
     def test_does_not_abort_a_lane_working_another_show(self):
         o = self._orch()

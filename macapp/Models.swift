@@ -38,17 +38,36 @@ struct ProgressDTO: Codable {
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
 }
 
+struct HoldDTO: Codable {
+    var code: String?           // "power"|"power-grace"|"disk"|"backlog"|"resolve-gate"|"dual-remux"
+                                // |"quiet"|"stall"|"retry"|"nas"|"empty"|"done"|"parked"
+    var secs: Int?              // power-grace: seconds until the run pauses
+    var held: Int?              // stall: items waiting behind the stalled Resolve
+    var attempt: Int?           // retry: which attempt this is...
+    var of: Int?                // ...out of how many before it counts as a real stall
+    var fails: Int?             // parked: consecutive failures that gave up on the item
+    var at: String?             // parked: the stage it kept failing at
+}
+
 struct OrchestratorDTO: Codable {
     var enabled: Bool?
     var running: Bool?
     var episode: String?
-    var stage: String?
+    var stage: String?          // STALE BY DESIGN: set at stage start, never cleared on completion,
+                                // so it still names a stage during the 60 s retry after a failure.
+                                // Use `stage_active` for liveness — never this.
+    var stage_active: Bool?     // a heavy stage is EXECUTING right now. nil = an older engine; fall
+                                // back to `progress != nil`, never to false (that would claim
+                                // nothing is running mid-encode on a version skew).
+    var hold: HoldDTO?          // set while the run thread is deliberately not executing a stage
     var message: String?
     var ended_reason: String?
     var progress: ProgressDTO?
     var current: UpNextDTO?     // the item ACTUALLY processing (so the header shows a YouTube video
                                // as channel+title, not the next TV episode inferred from up-next)
     var finishing: FinishingDTO?   // the item the FINISHER thread is draining (remux/upload/cleanup)
+    var finishing2: FinishingDTO?  // the 2nd remux lane (backlog drain only — usually nil)
+    var plex_playing: Bool?        // a Plex client is streaming → the prefetcher is standing down
 }
 
 struct FinishingDTO: Codable {
@@ -62,6 +81,13 @@ struct FinishingDTO: Codable {
     var notches: [Double]?      // remux: segment boundaries as 0..1 fractions (same bar as topaz)
     var seg_done: Int?          // remux: fully-encoded segment count (drives the flash + counter)
     var seg_total: Int?
+    var holding: String?        // non-nil while this lane is preempted (Resolve has the machine)
+    var fast: Bool?             // the 4K fast path (no Topaz) — a much shorter remux
+    // Identity — `abandon_series` matches lanes on exactly these, and the puck labels with them.
+    var series: String?
+    var movie: Bool?
+    var youtube: Bool?
+    var source: String?
 }
 
 struct QueueNextDTO: Codable {
