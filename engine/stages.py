@@ -563,6 +563,13 @@ def _cleanup(p, abort, progress=None):
             os.remove(p.final + ".inject.hevc")
         if os.path.exists(mezzanine_path(p.source)):    # fast-path Resolve-compat mezzanine
             os.remove(mezzanine_path(p.source))
+        # A hard kill during the mux can strand remux.mp4box_safe_input's hardlink — and a
+        # leftover link keeps the multi-GB transient it points at ALIVE (second reference
+        # to the same inode), so sweep any that share this item's directory.
+        import glob
+        for stray in glob.glob(os.path.join(os.path.dirname(p.final) or ".", "_mp4box_*")):
+            try: os.remove(stray)
+            except OSError: pass
     except OSError:
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)

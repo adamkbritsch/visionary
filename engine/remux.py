@@ -27,6 +27,7 @@ the CFR file; subtitles from the ORIGINAL download (the CFR pass no longer carri
 them — they don't need frame-rate re-timing).
 """
 from __future__ import annotations
+import contextlib
 import json
 import os
 import re
@@ -167,6 +168,39 @@ def build_mux_command(mp4box: str, dv_video: str, tracks: str, output: str,
     the structural repair the Subler optimize already did to the DV video (see optimize_dv)."""
     return [mp4box, "-add", dv_video, "-add", tracks,
             "-inter", str(interleave_ms), "-new", output]
+
+
+# MP4Box's `-add` parser mangles some characters in the INPUT path. A "+" makes it fail
+# with "Requested URL is not valid or cannot be found" — live-caught 2026-08-03 on
+# "Lost (2004) - S02E12 - Fire + Water", which parked after 5 identical failures.
+# Backslash-escaping does NOT help (verified); the OUTPUT path is unaffected (verified).
+# So hand MP4Box a HARDLINK with a sanitised name instead: same directory, so always the
+# same filesystem, instant and no extra bytes.
+_MP4BOX_UNSAFE = re.compile(r"[+#:,@]")
+
+
+@contextlib.contextmanager
+def mp4box_safe_input(path: str):
+    """Yield a path MP4Box's `-add` can definitely open — `path` itself when it's already
+    safe, else a temporary hardlink beside it. The link is ALWAYS removed: a leftover
+    would keep the (huge) transient alive by holding a second reference to its inode."""
+    base = os.path.basename(path)
+    if not _MP4BOX_UNSAFE.search(base):
+        yield path
+        return
+    safe = os.path.join(os.path.dirname(path) or ".", "_mp4box_" + _MP4BOX_UNSAFE.sub("_", base))
+    try:
+        if os.path.exists(safe):
+            os.remove(safe)
+        os.link(path, safe)
+    except OSError:
+        yield path            # couldn't link — try the real path rather than fail outright
+        return
+    try:
+        yield safe
+    finally:
+        try: os.remove(safe)
+        except OSError: pass
 
 
 def build_capped_mux_command(mp4box: str, hevc_es: str, fps: str, tracks: str, output: str,
@@ -419,7 +453,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             if output.lower().endswith(".mkv"):
                 # wrap the ES in a video-only MP4 (writes the dvcC), then one ffmpeg copy-mux to MKV
                 dv_mp4 = output + ".dv.mp4"
-                vx = subprocess.run(build_capped_video_mux_command(mp4box, hevc, info["fps"], dv_mp4),
+                with mp4box_safe_input(hevc) as _hevc_in:
+                    vx = subprocess.run(build_capped_video_mux_command(mp4box, _hevc_in, info["fps"], dv_mp4),
                                     capture_output=True, text=True, timeout=timeout)
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
@@ -428,7 +463,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 if mx.returncode != 0:
                     return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
             else:
-                mx = subprocess.run(build_capped_mux_command(mp4box, hevc, info["fps"], tracks, output),
+                with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
+                    mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output),
                                     capture_output=True, text=True, timeout=timeout)
                 if mx.returncode != 0:
                     return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
@@ -528,7 +564,8 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
         audio_note = ""
         if output.lower().endswith(".mkv"):
             dv_mp4 = output + ".dv.mp4"
-            vx = subprocess.run(build_capped_video_mux_command(mp4box, inj_es, info["fps"], dv_mp4),
+            with mp4box_safe_input(inj_es) as _es_in:
+                vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
                                 capture_output=True, text=True, timeout=timeout)
             if vx.returncode != 0:
                 return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
@@ -565,7 +602,8 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
             audio_note += subs_note
-            mx = subprocess.run(build_capped_mux_command(mp4box, inj_es, info["fps"], tracks, output),
+            with mp4box_safe_input(inj_es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
+                mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
                                 capture_output=True, text=True, timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))

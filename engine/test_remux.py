@@ -344,3 +344,45 @@ class InjectPath(unittest.TestCase):
             self.assertFalse(res.ok)
             self.assertIn("frame count changed", res.reason)
             self.assertFalse(os.path.exists(out + ".inject.hevc"))   # transients swept on failure too
+
+
+class MP4BoxSafeInput(unittest.TestCase):
+    """MP4Box's -add parser mangles characters in the INPUT path: a "+" fails with
+    "Requested URL is not valid or cannot be found" (live-caught on "Lost - S02E12 -
+    Fire + Water", parked after 5 identical failures). Backslash-escaping does not help,
+    so a sanitised HARDLINK is handed to MP4Box instead."""
+
+    def test_safe_name_is_passed_through_untouched(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        p = _os.path.join(d, "Plain Name HDR10 DV upscaled.mkv.capped.hevc")
+        open(p, "wb").write(b"x")
+        with remux.mp4box_safe_input(p) as got:
+            self.assertEqual(got, p)                       # no link created for a safe name
+            self.assertEqual(len(_os.listdir(d)), 1)
+
+    def test_plus_gets_a_sanitised_hardlink_that_is_removed(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        p = _os.path.join(d, "Fire + Water HDR10 DV upscaled.mkv.capped.hevc")
+        open(p, "wb").write(b"payload")
+        with remux.mp4box_safe_input(p) as got:
+            self.assertNotEqual(got, p)
+            self.assertNotIn("+", _os.path.basename(got))
+            self.assertTrue(_os.path.exists(got))
+            self.assertEqual(open(got, "rb").read(), b"payload")     # same inode, same bytes
+            self.assertEqual(_os.stat(got).st_ino, _os.stat(p).st_ino)
+        self.assertFalse(_os.path.exists(got))             # ALWAYS removed — a leftover
+        self.assertTrue(_os.path.exists(p))                # hardlink would pin the transient
+
+    def test_link_is_removed_even_when_the_mux_raises(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        p = _os.path.join(d, "A + B.hevc")
+        open(p, "wb").write(b"x")
+        seen = {}
+        with self.assertRaises(RuntimeError):
+            with remux.mp4box_safe_input(p) as got:
+                seen["path"] = got
+                raise RuntimeError("MP4Box blew up")
+        self.assertFalse(_os.path.exists(seen["path"]))
