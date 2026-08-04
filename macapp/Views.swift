@@ -387,20 +387,25 @@ struct PowerPill: View {
         let lead = leadStage
         // BARE TEXT — no capsule, no rim. This is a readout, not a control, and a plate made it
         // read as a button next to Activate. Attention is brightness, never hue.
-        HStack(spacing: 5) {
+        // Grouping by SPACING rather than by separators: each icon sits tight against the number
+        // it belongs to (4pt), and the groups are held apart by a wide gap (14pt). The gap does
+        // the work the "·" was doing, without adding marks to a bar that is already dense.
+        HStack(spacing: 14) {
             Text(label)
             if let cap {
-                Text("·").opacity(0.45)
-                Image(systemName: batterySymbol(cap, charging: p?.charging ?? false))
-                    .font(.system(size: 11))
-                Text("\(cap)%").monospacedDigit()
-                    .frame(width: 32, alignment: .trailing)   // fixed: 9%→10% must not shift
+                HStack(spacing: 4) {
+                    Image(systemName: batterySymbol(cap, charging: p?.charging ?? false))
+                        .font(.system(size: 11))
+                    Text("\(cap)%").monospacedDigit()
+                        .frame(width: 32, alignment: .trailing)   // fixed: 9%→10% must not shift
+                }
             }
             if let lead {
-                Text("·").opacity(0.45)
-                Image(systemName: lead.1).font(.system(size: 11))
-                Text("\(lead.2)%").monospacedDigit()
-                    .frame(width: 32, alignment: .trailing)
+                HStack(spacing: 4) {
+                    Image(systemName: lead.1).font(.system(size: 11))
+                    Text("\(lead.2)%").monospacedDigit()
+                        .frame(width: 32, alignment: .trailing)
+                }
             }
         }
         .font(.system(size: 12, weight: .medium))
@@ -2053,10 +2058,16 @@ struct SettingsPopover: View {
                 ScreenControlSection()
                 Divider()
 
-                SettingRow(title: "Required adapter",
-                           blurb: "Below this, everything pauses and the screen sleeps.",
-                           key: "min_adapter_watts", fallback: 140,
-                           range: 100...500, step: 10, unit: "W")
+                // The basics are the ones you actually reach for: what the run is chewing
+                // through, how much of the machine it takes, and the screen. Everything that is
+                // set once and forgotten — the hardware pins, the disk floors, the failure
+                // thresholds — sits under Advanced.
+                SettingRow(title: "Shows at once",
+                           blurb: "How many shows share the rotation, one episode from each in turn.",
+                           key: "max_active_shows", fallback: 3, range: 1...4)
+                SettingRow(title: "Parallel remuxes",
+                           blurb: "1 keeps the machine quieter and leaves Topaz the whole GPU.",
+                           key: "finisher_lanes", fallback: 2, range: 1...2)
                 SettingRow(title: "Dim screen after",
                            blurb: "Idle this long → screen off. Tap the brightness key to bring it back.",
                            key: "dim_after_minutes", fallback: 15,
@@ -2066,13 +2077,17 @@ struct SettingsPopover: View {
 
                 DisclosureGroup(isExpanded: $advanced) {
                     VStack(alignment: .leading, spacing: 14) {
-                        SettingsGroupLabel(text: "Scheduling").padding(.top, 6)
-                        SettingRow(title: "Shows at once",
-                                   blurb: "How many shows share the rotation, one episode from each in turn.",
-                                   key: "max_active_shows", fallback: 3, range: 1...4)
-                        SettingRow(title: "Parallel remuxes",
-                                   blurb: "1 keeps the machine quieter and leaves Topaz the whole GPU.",
-                                   key: "finisher_lanes", fallback: 2, range: 1...2)
+                        SettingsGroupLabel(text: "Power").padding(.top, 6)
+                        SettingRow(title: "Required adapter",
+                                   blurb: "Below this, everything pauses and the screen sleeps. A hardware fact — set it once.",
+                                   key: "min_adapter_watts", fallback: 140,
+                                   range: 100...500, step: 10, unit: "W")
+                        SettingRow(title: "Unplug grace",
+                                   blurb: "How long a power blip is tolerated mid-stage before the stage is abandoned.",
+                                   key: "unplug_grace_seconds", fallback: 60,
+                                   range: 0...600, step: 15, unit: "s")
+
+                        SettingsGroupLabel(text: "Scheduling").padding(.top, 4)
                         SettingRow(title: "Re-check interval",
                                    blurb: "How often to look again when there's nothing to do.",
                                    key: "poll_minutes", fallback: 30,
@@ -2092,10 +2107,6 @@ struct SettingsPopover: View {
                         SettingRow(title: "Retries before skipping",
                                    blurb: "How many times one episode may fail before it's set aside and the run moves on.",
                                    key: "max_episode_fails", fallback: 5, range: 1...20)
-                        SettingRow(title: "Unplug grace",
-                                   blurb: "How long a power blip is tolerated mid-stage before the stage is abandoned.",
-                                   key: "unplug_grace_seconds", fallback: 60,
-                                   range: 0...600, step: 15, unit: "s")
 
                         SettingsGroupLabel(text: "Readouts").padding(.top, 4)
                         SettingRow(title: "Segment ETA after",
