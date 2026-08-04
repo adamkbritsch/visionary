@@ -391,9 +391,17 @@ struct PowerPill: View {
             if let w = watts { return ok ? "\(w) W" : "\(w) W — needs 140 W" }
             return "Wall power"
         }()
-        Pill(systemImage: ac ? "powerplug.fill" : "battery.50",
-             text: label + (cap != nil ? " · \(cap!)%" : ""),
-             tint: ok ? DS.steel : DS.steelBright)   // attention = bright; the icon/wording carries meaning
+        // BARE TEXT — no capsule, no rim. This is a readout, not a control, and the plate
+        // made it read as a button next to Activate. The wording carries the whole meaning
+        // on its own ("On battery" / "140 W" / "140 W — needs 140 W"), so the plug/battery
+        // glyph went with the chrome. Attention is still brightness, not colour.
+        // NB: the shared `Pill` is deliberately untouched — 10 other call sites still use it.
+        Text(label + (cap != nil ? " · \(cap!)%" : ""))
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(ok ? DS.steel : DS.steelBright)
+            .lineLimit(1)
+            .help(ac ? "Adapter wattage and battery level"
+                     : "Running on battery — the pipeline pauses until the adapter is back")
     }
 }
 
