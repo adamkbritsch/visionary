@@ -314,7 +314,7 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless, so while an item is
-  being upscaled it holds about **130 GB of scratch** — **~160× the ~0.8 GB source** (a
+  being upscaled it holds about **140 GB of scratch** — **~175× the ~0.8 GB source** (a
   feature film's intermediate can reach ~245 GB). That intermediate is **deleted the
   moment Resolve finishes its export** — the remux only needs the DV render plus the
   original — so the item being remuxed alongside the next upscale carries just ~10 GB, and
