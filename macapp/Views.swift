@@ -1142,9 +1142,10 @@ private struct TVMode: View {
             if !locked { seriesPicker(index: index, active: active, catalog: catalog) }
             HStack(spacing: 12) {
                 Label(store.seriesTitle(name), systemImage: "tv").font(.system(size: 13, weight: .medium)).lineLimit(1)
-                if index == 0 && locked {
-                    Pill(systemImage: "lock.fill", text: "Locked — stop the run to change", tint: DS.steelBright, iconOnly: true)
-                } else if index == 0 && !store.seriesReachable {
+                // No lock pill: armed, the controls it warned about are simply gone (the
+                // search bar disappears and the settings collapse to one line), so the badge
+                // was labelling an absence.
+                if index == 0 && !store.seriesReachable {
                     Pill(systemImage: "wifi.slash", text: "NAS unreachable", tint: DS.steelBright, iconOnly: true)
                 }
                 Spacer()
