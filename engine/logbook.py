@@ -8,10 +8,20 @@ uncaught error (with traceback). `tail()` feeds the dashboard's recent-issues vi
 from __future__ import annotations
 import datetime
 import os
+import sys
+import tempfile
 import threading
 import traceback
 
-LOG_DIR = os.path.expanduser("~/.topaz-pipeline/logs")
+# A TEST RUN MUST NOT WRITE HERE. The suite exercises real failure paths, so running it
+# injected fabricated FAIL lines into the user's live log — which the app's Recent Issues
+# reads back as if they were real. Caught for real: fourteen
+# "HOST_UNAVAILABLE uuid:HDMI not attached" entries, from a unit-test fixture display key
+# that does not exist on any machine, sitting in the log during a live diagnosis.
+_TESTING = bool(os.environ.get("VISIONARY_TEST_LOG_DIR")) or "unittest" in sys.modules
+LOG_DIR = (os.environ.get("VISIONARY_TEST_LOG_DIR")
+           or (os.path.join(tempfile.gettempdir(), "visionary-test-logs") if _TESTING
+               else os.path.expanduser("~/.topaz-pipeline/logs")))
 LOG_FILE = os.path.join(LOG_DIR, "upscaler.log")
 MAX_BYTES = 3_000_000
 _LOCK = threading.Lock()

@@ -110,6 +110,23 @@ def _clear_project(proj):
         pass
 
 
+def _place_now():
+    """Move Resolve to the pinned display, if one is set. Idempotent, and non-fatal HERE:
+    goto_dolby_vision re-asserts it before any template is matched, and that call is the
+    one allowed to fail the stage. Failing setup on a placement hiccup would throw away
+    the whole import for a window-position problem."""
+    try:
+        import dv_shim
+        host = dv_shim.get_host()
+        if not host:
+            return
+        dv_shim.place_on_host(host)
+        print(f"[{time.strftime('%H:%M:%S')}] Resolve moved to {host.get('key')}", flush=True)
+    except Exception as e:
+        print(f"placement at setup deferred ({e.__class__.__name__}: {e}) — "
+              "the DV step will retry", flush=True)
+
+
 def setup(segdir, mode=MODE_DV1000):
     print(f"[{time.strftime('%H:%M:%S')}] launching Resolve… (mode={mode})", flush=True)
     resolve = connect(launch=True)
@@ -136,6 +153,12 @@ def setup(segdir, mode=MODE_DV1000):
         return 1
     pm.LoadProject(want)
     proj = pm.GetCurrentProject()
+    # ONTO THE PINNED DISPLAY NOW, not when the DV step starts. Everything below —
+    # clearing the project, importing the chunks, building and validating the timeline —
+    # is a minute or more of Resolve sitting in front of whatever the user is doing. This
+    # is also the EARLIEST it CAN move: the Project Manager window refuses to be
+    # positioned at all, so there is nothing to move until a project is open.
+    _place_now()
     _clear_project(proj)
     mp = proj.GetMediaPool()
     # Topaz now outputs SCENE-CUT CHUNKS (+ a manifest), not one giant file. Assemble them
@@ -272,6 +295,12 @@ def setup_single(video, mode=MODE_DV2000):
         return 1
     pm.LoadProject(want)
     proj = pm.GetCurrentProject()
+    # ONTO THE PINNED DISPLAY NOW, not when the DV step starts. Everything below —
+    # clearing the project, importing the chunks, building and validating the timeline —
+    # is a minute or more of Resolve sitting in front of whatever the user is doing. This
+    # is also the EARLIEST it CAN move: the Project Manager window refuses to be
+    # positioned at all, so there is nothing to move until a project is open.
+    _place_now()
     _clear_project(proj)
     mp = proj.GetMediaPool()
     clips = mp.ImportMedia([video])

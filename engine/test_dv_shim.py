@@ -509,3 +509,23 @@ class PointerRelease(unittest.TestCase):
                 dv_shim.run_dv_ui()
         self.assertEqual(released.get("saved"), (50.0, 50.0),
                          "a failed takeover must still hand the mouse back")
+
+
+class LogIsolation(unittest.TestCase):
+    """Running the suite must never write into the user's live log. It exercises real
+    failure paths, so it was injecting fabricated FAIL lines that the app's Recent Issues
+    read back as real — fourteen "HOST_UNAVAILABLE uuid:HDMI not attached" entries from a
+    unit-test fixture key that exists on no machine, found sitting in the live log during
+    a diagnosis."""
+
+    def test_the_log_is_redirected_while_testing(self):
+        import logbook
+        self.assertNotIn(os.path.expanduser("~/.topaz-pipeline/logs"), logbook.LOG_DIR)
+
+    def test_a_failure_written_now_does_not_touch_the_real_log(self):
+        import logbook
+        real = os.path.expanduser("~/.topaz-pipeline/logs/upscaler.log")
+        before = os.path.getsize(real) if os.path.exists(real) else 0
+        logbook.failure("test-only line that must never reach the user's log")
+        after = os.path.getsize(real) if os.path.exists(real) else 0
+        self.assertEqual(before, after)
