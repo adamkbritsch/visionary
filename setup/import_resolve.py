@@ -36,10 +36,10 @@ SETTINGS_DIR = os.path.expanduser(
     "~/Library/Application Support/Blackmagic Design/DaVinci Resolve/"
     "Resolve Project Library/Resolve Projects/Settings")
 DELIVER_PRESETS = os.path.join(SETTINGS_DIR, "DeliverPresetList.xml")
-SDR_CANDIDATES = ("Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler")
-HDR_CANDIDATES = ("Visionary HDR", "Overnight Upscaler HDR")
-# The true-SDR OUTPUT project (no Dolby Vision). Note the two above are named for the INTAKE
-# range and both emit DV; this one is named for what it produces.
+# Kept in step with engine/resolve_pipeline.py — all three named for what they PRODUCE.
+DV1000_CANDIDATES = ("Visionary DV1000 Output",
+                     "Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler")
+DV2000_CANDIDATES = ("Visionary DV2000 Output", "Visionary HDR", "Overnight Upscaler HDR")
 SDR_OUT_CANDIDATES = ("Visionary SDR Output", "Overnight Upscaler SDR Output")
 
 
@@ -107,19 +107,19 @@ def import_projects(dry_run=False):
     # Discover the bundled projects by SDR/HDR marker in the filename — robust to whichever
     # name they shipped under (the engine's candidate lists accept legacy + "Visionary *").
     all_drps = sorted(f for f in os.listdir(BUNDLE) if f.endswith(".drp")) if os.path.isdir(BUNDLE) else []
+    # Match each bundled .drp by its STEM against the candidate lists — filenames are exported
+    # as "<project name>.drp". The old substring test ("SDR" in filename) was fragile: the list
+    # is sorted, so "Visionary SDR Output.drp" sorted last and silently overwrote the DV-1000
+    # entry, which would have imported the wrong project under the wrong name on a new machine.
     drps = {}
     for f in all_drps:
-        u = f.upper()
-        # ORDER MATTERS: "SDR OUTPUT" also contains "SDR", and all_drps is sorted, so a plain
-        # substring test let the SDR-output project overwrite the 1000-nit DV one and get
-        # imported under the wrong name.
-        if "SDR OUTPUT" in u:
-            drps["SDR_OUT"] = os.path.join(BUNDLE, f)
-        elif "SDR" in u:
-            drps["SDR"] = os.path.join(BUNDLE, f)
-        elif "HDR" in u:
-            drps["HDR"] = os.path.join(BUNDLE, f)
-    missing = [m for m in ("SDR", "HDR") if m not in drps]   # SDR_OUT is optional (newer bundle)
+        stem = f[:-4]
+        for mode, cands in (("DV1000", DV1000_CANDIDATES), ("DV2000", DV2000_CANDIDATES),
+                            ("SDR_OUT", SDR_OUT_CANDIDATES)):
+            if stem in cands:
+                drps[mode] = os.path.join(BUNDLE, f)
+                break
+    missing = [m for m in ("DV1000", "DV2000") if m not in drps]   # SDR_OUT is optional
     if missing:
         return [_result("project_import", False,
                         f"bundled .drp missing for: {', '.join(missing)} (found: {all_drps})")]
@@ -135,7 +135,7 @@ def import_projects(dry_run=False):
     pm = r.GetProjectManager()
     pm.GotoRootFolder()
     existing = set(pm.GetProjectListInCurrentFolder() or [])
-    modes = [("SDR", SDR_CANDIDATES), ("HDR", HDR_CANDIDATES)]
+    modes = [("DV1000", DV1000_CANDIDATES), ("DV2000", DV2000_CANDIDATES)]
     if "SDR_OUT" in drps:
         modes.append(("SDR_OUT", SDR_OUT_CANDIDATES))
     for mode, cands in modes:

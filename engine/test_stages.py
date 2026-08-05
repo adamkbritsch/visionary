@@ -350,7 +350,8 @@ class FastPathDispatch(unittest.TestCase):
         self.assertIn("single", cmd)
         self.assertIn(p.source, cmd)                      # the ORIGINAL file, not the segdir
         self.assertNotIn(p.segdir, cmd)
-        self.assertEqual(cmd[cmd.index("single") + 3], "hdr")
+        # Modes are named for the OUTPUT now: an HDR intake still masters to 2000-nit DV.
+        self.assertEqual(cmd[cmd.index("single") + 3], "dv2000")
         self.assertEqual(cmd[-1], str(stages.EXPORT_BITRATE_FLOOR_KBPS))   # render video discarded
 
     def test_resolve_only_uses_source_bitrate_floor_max(self):
@@ -367,7 +368,7 @@ class FastPathDispatch(unittest.TestCase):
             stages.run_stage("resolve", p)
         cmd = seen["cmd"]
         self.assertIn("single", cmd)
-        self.assertEqual(cmd[cmd.index("single") + 3], "sdr")
+        self.assertEqual(cmd[cmd.index("single") + 3], "dv1000")   # SDR intake -> 1000-nit DV
         self.assertEqual(cmd[-1], "90000")                # conversion IS the ship — match intake
 
     def test_remux_dispatches_to_inject_for_rpu_only(self):
@@ -560,3 +561,36 @@ class MezzanineFallback(unittest.TestCase):
         ok, _msg = stages.run_stage("cleanup", p)
         self.assertTrue(ok)
         self.assertFalse(os.path.exists(mezz))
+
+
+class OutputModeOverride(unittest.TestCase):
+    """The per-item override picks the Resolve project. "auto" must keep the long-standing
+    rule exactly; the three explicit values pin it regardless of what the source is."""
+
+    def _mode(self, override, is_hdr):
+        import settings, plan, stages
+        with mock.patch.object(settings, "get_show_output_mode", return_value=override):
+            # mirrors the resolution in stages._resolve
+            return override if override in ("sdr", "dv1000", "dv2000") else (
+                "dv2000" if is_hdr else "dv1000")
+
+    def test_auto_is_unchanged_behaviour(self):
+        self.assertEqual(self._mode("auto", is_hdr=False), "dv1000")
+        self.assertEqual(self._mode("auto", is_hdr=True), "dv2000")
+
+    def test_an_override_wins_over_the_source(self):
+        # Deliberately contradictory: an SDR source pinned to 2000-nit, an HDR source to SDR.
+        self.assertEqual(self._mode("dv2000", is_hdr=False), "dv2000")
+        self.assertEqual(self._mode("sdr", is_hdr=True), "sdr")
+
+    def test_the_sdr_mode_is_the_only_headless_one(self):
+        import resolve_pipeline as RP
+        self.assertFalse(RP.is_dv_mode("sdr"))       # no DV -> no Analyze All -> no screen
+        self.assertTrue(RP.is_dv_mode("dv1000"))
+        self.assertTrue(RP.is_dv_mode("dv2000"))
+
+    def test_each_mode_resolves_to_a_distinct_project_list(self):
+        import resolve_pipeline as RP
+        lists = [RP.SDR_OUT_PROJECTS, RP.DV1000_PROJECTS, RP.DV2000_PROJECTS]
+        firsts = [l[0] for l in lists]
+        self.assertEqual(len(set(firsts)), 3)        # no two modes prefer the same project

@@ -29,17 +29,32 @@ FFPROBE = "/opt/homebrew/bin/ffprobe"
 # Candidate project names per intake range, in preference order. We match whatever the
 # project is ACTUALLY named in Resolve (the API can't rename), so a rename — e.g. to the
 # new "Visionary …" app name — won't break the pipeline. First existing one wins.
-SDR_PROJECTS = ["Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler"]
-HDR_PROJECTS = ["Visionary HDR", "Overnight Upscaler HDR"]
-# A THIRD project for a true Rec.709 SDR master — no Dolby Vision at all. Note the two above
-# are named for the INTAKE range and BOTH output DV; this one is named for its OUTPUT.
-SDR_OUT_PROJECTS = ["Visionary SDR Output", "Overnight Upscaler SDR Output"]
+# Three persistent projects, named for what they PRODUCE. The old names described the INTAKE
+# range on two of them ("SDR"/"HDR") and the output on the third, which made them unreadable:
+# an "SDR" project that emitted Dolby Vision. Legacy names stay in each list as fallbacks so a
+# machine that has not re-imported the bundle keeps working. First existing one wins.
+DV1000_PROJECTS = ["Visionary DV1000 Output",                       # 1000-nit Dolby Vision
+                   "Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler"]
+DV2000_PROJECTS = ["Visionary DV2000 Output",                       # 2000-nit Dolby Vision
+                   "Visionary HDR", "Overnight Upscaler HDR"]
+SDR_OUT_PROJECTS = ["Visionary SDR Output",                         # true Rec.709, NO Dolby Vision
+                    "Overnight Upscaler SDR Output"]
+
+# Output modes, named the same way. These are the values that travel between stages.py and this
+# module, and they match the per-item `output_mode` setting one-for-one.
+MODE_DV1000, MODE_DV2000, MODE_SDR = "dv1000", "dv2000", "sdr"
 
 
 def is_dv_mode(mode) -> bool:
     """False only for the true-SDR output. This is what makes that mode headless: with no DV
     there is no Analyze All, so dv_shim (and the screen, and cliclick) is never touched."""
-    return mode != "sdr_out"
+    return mode != MODE_SDR
+
+
+def target_nits(mode) -> int:
+    return 2000 if mode == MODE_DV2000 else 1000
+
+
 DV_PRESET = "OvernightDV"        # global render preset carrying DV Profile 8.1 (survives Resolve quits)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import resolve as R  # noqa: E402
@@ -52,8 +67,8 @@ def project_for(pm, mode):
     projects in Resolve doesn't break anything. Returns (name, exists) — name is the
     preferred candidate when none exist (for the 'missing project' message)."""
     projects = pm.GetProjectListInCurrentFolder() or []
-    candidates = (SDR_OUT_PROJECTS if mode == "sdr_out"
-                  else HDR_PROJECTS if mode == "hdr" else SDR_PROJECTS)
+    candidates = (SDR_OUT_PROJECTS if mode == MODE_SDR
+                  else DV2000_PROJECTS if mode == MODE_DV2000 else DV1000_PROJECTS)
     for name in candidates:
         if name in projects:
             return name, True
@@ -96,7 +111,7 @@ def _clear_project(proj):
         pass
 
 
-def setup(segdir, mode="sdr"):
+def setup(segdir, mode=MODE_DV1000):
     print(f"[{time.strftime('%H:%M:%S')}] launching Resolve… (mode={mode})", flush=True)
     resolve = connect(launch=True)
     if not resolve:
@@ -113,7 +128,7 @@ def setup(segdir, mode="sdr"):
     if not exists:
         print(f"MISSING PROJECT '{want}' (mode={mode}): configure it ONCE in Resolve "
               f"(color management to HDR PQ + DV Profile 8.1 + "
-              f"{'2000' if mode == 'hdr' else '1000'}-nit Target Display), then re-run. "
+              f"{target_nits(mode)}-nit Target Display), then re-run. "
               f"The pipeline inherits those and will not create a blank project.")
         return 1
     pm.LoadProject(want)
@@ -175,7 +190,7 @@ def setup(segdir, mode="sdr"):
     return 0
 
 
-def render(out, mode="sdr", bitrate=60000):
+def render(out, mode=MODE_DV1000, bitrate=60000):
     resolve = connect()
     if not resolve:
         print("CONNECT FAILED"); return 1
@@ -233,7 +248,7 @@ def render(out, mode="sdr", bitrate=60000):
     return 0
 
 
-def setup_single(video, mode="hdr"):
+def setup_single(video, mode=MODE_DV2000):
     """Single-file variant of setup() for the HIGH-BITRATE 4K FAST PATH: the ORIGINAL source
     goes on the timeline as ONE clip (no topaz segments exist — the source picture is the
     deliverable; Resolve runs only to produce the DV analysis/conversion). Same persistent
@@ -249,7 +264,7 @@ def setup_single(video, mode="hdr"):
     if not exists:
         print(f"MISSING PROJECT '{want}' (mode={mode}): configure it ONCE in Resolve "
               f"(color management to HDR PQ + DV Profile 8.1 + "
-              f"{'2000' if mode == 'hdr' else '1000'}-nit Target Display), then re-run. "
+              f"{target_nits(mode)}-nit Target Display), then re-run. "
               f"The pipeline inherits those and will not create a blank project.")
         return 1
     pm.LoadProject(want)
@@ -288,7 +303,7 @@ def setup_single(video, mode="hdr"):
     return 0
 
 
-def single(video, out, mode="hdr", bitrate=60000):
+def single(video, out, mode=MODE_DV2000, bitrate=60000):
     """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
     (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
     rc = setup_single(video, mode)
@@ -299,7 +314,7 @@ def single(video, out, mode="hdr", bitrate=60000):
         return render(out, mode, bitrate)
     import dv_shim
     try:
-        if not dv_shim.run_dv_ui(expect_nit=(2000 if mode == "hdr" else 1000)):
+        if not dv_shim.run_dv_ui(expect_nit=target_nits(mode)):
             print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
             return 2
     except Exception as e:
@@ -308,7 +323,7 @@ def single(video, out, mode="hdr", bitrate=60000):
     return render(out, mode, bitrate)
 
 
-def episode(segdir, out, mode="sdr", bitrate=60000):
+def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
     """The WHOLE resolve stage in one process: setup (assemble the Topaz chunks on the
     timeline) -> DV Analyze All (UI shim) -> render. Run as a SUBPROCESS so a hung
     fusionscript call (Resolve unresponsive) can be killed from outside.
@@ -325,7 +340,7 @@ def episode(segdir, out, mode="sdr", bitrate=60000):
         return render(out, mode, bitrate)
     import dv_shim
     try:
-        if not dv_shim.run_dv_ui(expect_nit=(2000 if mode == "hdr" else 1000)):
+        if not dv_shim.run_dv_ui(expect_nit=target_nits(mode)):
             print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
             return 2
     except Exception as e:
@@ -338,13 +353,13 @@ if __name__ == "__main__":
     phase = sys.argv[1] if len(sys.argv) > 1 else ""
     a = sys.argv[2:]
     if phase == "setup":
-        sys.exit(setup(a[0], a[1] if len(a) > 1 else "sdr"))
+        sys.exit(setup(a[0], a[1] if len(a) > 1 else MODE_DV1000))
     elif phase == "render":
-        sys.exit(render(a[0], a[1] if len(a) > 1 else "sdr", int(a[2]) if len(a) > 2 else 60000))
+        sys.exit(render(a[0], a[1] if len(a) > 1 else MODE_DV1000, int(a[2]) if len(a) > 2 else 60000))
     elif phase == "episode":
-        sys.exit(episode(a[0], a[1], a[2] if len(a) > 2 else "sdr", int(a[3]) if len(a) > 3 else 60000))
+        sys.exit(episode(a[0], a[1], a[2] if len(a) > 2 else MODE_DV1000, int(a[3]) if len(a) > 3 else 60000))
     elif phase == "single":
-        sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else "hdr", int(a[3]) if len(a) > 3 else 60000))
+        sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else MODE_DV2000, int(a[3]) if len(a) > 3 else 60000))
     else:
         print("usage: resolve_pipeline.py setup <src> [mode] | render <out> [mode] [kbps] "
               "| episode <prores> <out> [mode] [kbps] | single <video> <out> [mode] [kbps]")

@@ -393,8 +393,11 @@ def _resolve(p, abort, progress=None):
     # stage needs no screen automation at all.
     import settings as _st
     override = _st.get_show_output_mode(p.series)
-    mode = {"sdr": "sdr_out", "dv1000": "sdr", "dv2000": "hdr"}.get(
-        override, "hdr" if pl.get("is_hdr") else "sdr")
+    # The setting's values ARE the Resolve modes now ("sdr" / "dv1000" / "dv2000"), so there is
+    # no translation table to get wrong. "auto" keeps the long-standing rule: an HDR intake
+    # masters to 2000 nits, anything else to 1000.
+    mode = override if override in ("sdr", "dv1000", "dv2000") else (
+        "dv2000" if pl.get("is_hdr") else "dv1000")
     fast = pl.get("topaz") in ("rpu-only", "resolve-only")
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In
