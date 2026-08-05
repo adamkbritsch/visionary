@@ -22,6 +22,7 @@ lanczos fit (down for 720p's 2880, up for 480p's 1920); 1080p×2 hits 2160 exact
 """
 from __future__ import annotations
 import json
+import os
 import subprocess
 
 FFPROBE = "/opt/homebrew/bin/ffprobe"
@@ -180,8 +181,56 @@ def passthrough_min_kbps() -> int:
         return 0
 
 
+# What ffprobe ACTUALLY found, remembered per source basename so the app can stop guessing.
+# The display reads a filename; this reads the file. A source named like HDR that is really
+# SDR (or the reverse) otherwise leaves the row disagreeing with the engine forever — and a
+# wrong suggestion is not harmless, because a user may PIN it, and a pin does take effect.
+PROBE_CACHE = os.path.expanduser("~/.topaz-pipeline/probe_cache.json")
+PROBE_CACHE_KEEP = 400
+
+
+def _remember_probe(path, info):
+    """Best-effort: record {basename: is_hdr}. Never raises — a cache miss just means the
+    display falls back to the filename guess, which is where it started."""
+    try:
+        base = os.path.basename(path or "")
+        if not base or info.get("transfer") in (None, ""):
+            return                       # nothing was actually read; don't record a guess
+        try:
+            with open(PROBE_CACHE) as f:
+                book = json.load(f)
+            if not isinstance(book, dict):
+                book = {}
+        except Exception:
+            book = {}
+        book[base] = {"is_hdr": bool(info.get("is_hdr")),
+                      "transfer": info.get("transfer")}
+        if len(book) > PROBE_CACHE_KEEP:          # ring: drop the oldest insertions
+            for k in list(book)[:len(book) - PROBE_CACHE_KEEP]:
+                book.pop(k, None)
+        os.makedirs(os.path.dirname(PROBE_CACHE), exist_ok=True)
+        tmp = PROBE_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(book, f)
+        os.replace(tmp, PROBE_CACHE)
+    except Exception:
+        pass
+
+
+def probed_is_hdr(name):
+    """True/False if this basename has ever been probed, else None ('we don't know')."""
+    try:
+        with open(PROBE_CACHE) as f:
+            book = json.load(f)
+        e = book.get(os.path.basename(str(name or "")))
+        return bool(e["is_hdr"]) if isinstance(e, dict) and "is_hdr" in e else None
+    except Exception:
+        return None
+
+
 def plan_for(path: str) -> dict:
     info = probe_input(path)
     p = choose_plan(info, passthrough_min_kbps=passthrough_min_kbps())
     p["input"] = info
+    _remember_probe(path, info)
     return p

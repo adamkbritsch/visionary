@@ -420,3 +420,54 @@ class HdrFilenameGuess(unittest.TestCase):
     def test_DVDRip_is_still_not_dolby_vision(self):
         import settings as s
         self.assertFalse(s.looks_hdr("Movie.2019.1080p.DVDRip.x264.mkv"))
+
+
+class ProbeBeatsTheFilename(unittest.TestCase):
+    """The display used to read only the filename, so a mislabelled source disagreed with the
+    engine FOREVER. That is not merely cosmetic: a wrong suggestion can tempt a wrong pin, and
+    a pin does take effect (stages.py picks the override over the source range)."""
+
+    LIAR = "Some.Movie.2019.2160p.UHD.BluRay.HDR10.REMUX.HEVC.mkv"   # named HDR, actually SDR
+    QUIET = "Movie.2022.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.mkv"  # says nothing, is HDR
+
+    def setUp(self):
+        import plan, tempfile, os
+        self._real = plan.PROBE_CACHE
+        plan.PROBE_CACHE = os.path.join(tempfile.mkdtemp(), "probe_cache.json")
+
+    def tearDown(self):
+        import plan
+        plan.PROBE_CACHE = self._real
+
+    def test_without_a_probe_it_falls_back_to_the_name(self):
+        import settings as s
+        self.assertTrue(s.source_is_hdr(self.LIAR))      # the guess, and it is wrong
+        self.assertTrue(s.source_is_hdr(self.QUIET))     # the UHD-disc inference
+
+    def test_the_probe_overrides_a_filename_that_lies_HDR(self):
+        import plan, settings as s
+        plan._remember_probe("/x/" + self.LIAR, {"is_hdr": False, "transfer": "bt709"})
+        self.assertFalse(s.source_is_hdr(self.LIAR))
+        self.assertEqual(s.effective_output_mode("unpinned", s.source_is_hdr(self.LIAR)),
+                         "dv1000")
+
+    def test_the_probe_overrides_a_filename_that_lies_SDR(self):
+        import plan, settings as s
+        name = "Movie.2019.2160p.WEB-DL.SDR.mkv"
+        self.assertFalse(s.source_is_hdr(name))
+        plan._remember_probe("/x/" + name, {"is_hdr": True, "transfer": "smpte2084"})
+        self.assertTrue(s.source_is_hdr(name))
+
+    def test_an_unreadable_probe_is_never_recorded_as_a_guess(self):
+        # transfer missing means ffprobe told us nothing; recording False there would turn a
+        # non-answer into a confident wrong answer that outranks the filename.
+        import plan, settings as s
+        plan._remember_probe("/x/" + self.QUIET, {"is_hdr": False, "transfer": None})
+        self.assertIsNone(plan.probed_is_hdr(self.QUIET))
+        self.assertTrue(s.source_is_hdr(self.QUIET))     # still the filename inference
+
+    def test_a_missing_cache_never_raises(self):
+        import plan
+        plan.PROBE_CACHE = "/nonexistent/dir/probe_cache.json"
+        self.assertIsNone(plan.probed_is_hdr("anything.mkv"))
+        plan._remember_probe("/x/a.mkv", {"is_hdr": True, "transfer": "smpte2084"})  # no raise

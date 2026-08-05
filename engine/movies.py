@@ -321,8 +321,10 @@ def selected_view(skip=()) -> dict:
               "replace_source": settings.get_show_replace_source(i.get("title") or ""),
               "output_mode": settings.get_show_output_mode(i.get("title") or ""),
               # a movie's own filename is the evidence for which DV ceiling "auto" picks
+              # Prefers the real probe once the file has been through the pipeline; falls
+              # back to the filename before that.
               "output_mode_effective": settings.effective_output_mode(
-                  i.get("title") or "", settings.looks_hdr(i.get("name") or ""))}
+                  i.get("title") or "", settings.source_is_hdr(i.get("name") or ""))}
              for i in get_selected()]
     nextable = [i for i in items if i.get("name") not in skip]
     nx = nextable[0] if nextable else None

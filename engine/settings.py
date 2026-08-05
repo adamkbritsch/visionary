@@ -475,6 +475,21 @@ _DISC_SOURCE = re.compile(
     re.IGNORECASE)
 
 
+def source_is_hdr(name) -> bool:
+    """Is this source HDR? Prefers what ffprobe ACTUALLY found, falling back to the filename.
+
+    Once an item has been through plan_for, its real color transfer is on record, so the row
+    stops guessing — which matters in both directions: an HDR file whose name says nothing
+    (the case that started this), and an SDR file NAMED like HDR, where the guess would
+    otherwise disagree with the engine forever and could tempt a wrong pin."""
+    try:
+        import plan
+        known = plan.probed_is_hdr(name)
+    except Exception:
+        known = None
+    return looks_hdr(name) if known is None else known
+
+
 def looks_hdr(name) -> bool:
     """Best-effort HDR guess from a FILENAME. A guess is all this is — see
     effective_output_mode; the authoritative answer is ffprobe's color transfer at stage time

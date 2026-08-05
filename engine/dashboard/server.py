@@ -371,6 +371,14 @@ def _hdr_hint(name) -> bool:
     I/O and caching an empty queue under a movie key. A movie has no episode list, so its own
     filename is the evidence; a show takes the majority of its remaining sources so one
     oddly-named file can't flip the whole show."""
+    known = None
+    try:
+        import plan as _plan
+        known = _plan.probed_is_hdr(name)
+    except Exception:
+        pass
+    if known is not None:
+        return known                       # ffprobe beat the filename to it
     if name and settings.looks_hdr(name):
         return True                        # the item's own name already says so (movie case)
     try:
