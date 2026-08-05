@@ -177,17 +177,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
-    /// LITERAL centre of the screen — equal glass on all four sides, measured against the full
-    /// `frame`, not `visibleFrame`. NSWindow.center() is not this (it centres horizontally but
-    /// seats the window high, a third of the slack above it), and visibleFrame is not this
-    /// either: excluding the menu bar and the Dock pushes the window off true centre by the
-    /// difference between them. The window is far shorter than the screen, so nothing can end
-    /// up under the menu bar or behind the Dock.
+    /// Halfway between the two centres worth having. LITERAL centres on the whole screen
+    /// (`frame`) — equal glass top and bottom, but it reads slightly low because the menu bar
+    /// eats the top. USABLE centres on `visibleFrame`, which excludes the menu bar and the
+    /// Dock — optically balanced, but measurably above true centre. The midpoint of the two
+    /// origins splits the difference. Horizontally they agree, so x is unaffected.
+    /// (NSWindow.center() is neither: it seats the window a third of the slack from the top.)
     static func centreOnScreen(_ w: NSWindow) {
-        guard let sf = (w.screen ?? NSScreen.main)?.frame else { return }
+        guard let sc = w.screen ?? NSScreen.main else { return }
         let f = w.frame
-        w.setFrameOrigin(NSPoint(x: (sf.midX - f.width / 2).rounded(),
-                                 y: (sf.midY - f.height / 2).rounded()))
+        let literal = NSPoint(x: sc.frame.midX - f.width / 2,
+                              y: sc.frame.midY - f.height / 2)
+        let usable = NSPoint(x: sc.visibleFrame.midX - f.width / 2,
+                             y: sc.visibleFrame.midY - f.height / 2)
+        w.setFrameOrigin(NSPoint(x: ((literal.x + usable.x) / 2).rounded(),
+                                 y: ((literal.y + usable.y) / 2).rounded()))
     }
 }
 
