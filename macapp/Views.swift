@@ -1078,6 +1078,9 @@ private struct TVMode: View {
             // The next empty slot is just a search bar — to pick the first show, or add another.
             // The width is the 'max_active_shows' setting (Settings ▸ Advanced ▸ Shows at once);
             // lowering it below the running count hides the bar rather than dropping a show.
+            // This one stays LIVE while the pipeline is armed: appending to the rotation drops
+            // nothing, so no in-flight item is abandoned, and the run picks the new show up on
+            // its next turn. Only REPLACING a slot is locked.
             if active.count < (s?.settings?.max_active_shows ?? 3) {
                 seriesPicker(index: active.count, active: active, catalog: catalog)
             }
@@ -1101,7 +1104,7 @@ private struct TVMode: View {
                              options: store.seriesOptions
                                  .filter { nm in !active.enumerated().contains { $0.offset != index && $0.element == nm } }
                                  .map { PickOption(id: $0, label: store.seriesTitle($0)) },
-                             disabled: locked || !store.seriesReachable) { id in
+                             disabled: !store.seriesReachable) { id in
                 Task {
                     let prof = await store.profileFor(id)
                     if prof?.configured == true {
@@ -1133,7 +1136,10 @@ private struct TVMode: View {
         let key = show.preset ?? ""
         if index > 0 { Divider().padding(.vertical, 1) }
         VStack(alignment: .leading, spacing: 10) {
-            seriesPicker(index: index, active: active, catalog: catalog)
+            // Armed, a filled slot loses its search bar (the show can't be swapped mid-run), so
+            // nothing renders here — the library refresh that shared that row moves up into the
+            // title row instead of being left behind on a line of its own.
+            if !locked { seriesPicker(index: index, active: active, catalog: catalog) }
             HStack(spacing: 12) {
                 Label(store.seriesTitle(name), systemImage: "tv").font(.system(size: 13, weight: .medium)).lineLimit(1)
                 if index == 0 && locked {
@@ -1143,6 +1149,9 @@ private struct TVMode: View {
                 }
                 Spacer()
                 QueueCounts(q: show.queue)
+                // Refresh still works mid-run, and it is what keeps the add-a-show picker below
+                // current — so it survives the search bar it used to sit beside.
+                if index == 0 && locked { LibraryRefreshButton { await store.refreshLibrary() } }
                 if index > 0 && !locked {
                     Button { Task { await store.removeSeries(name) } } label: {
                         Image(systemName: "xmark.circle.fill").font(.system(size: 13)).foregroundStyle(.secondary)
