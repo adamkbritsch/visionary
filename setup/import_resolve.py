@@ -38,6 +38,9 @@ SETTINGS_DIR = os.path.expanduser(
 DELIVER_PRESETS = os.path.join(SETTINGS_DIR, "DeliverPresetList.xml")
 SDR_CANDIDATES = ("Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler")
 HDR_CANDIDATES = ("Visionary HDR", "Overnight Upscaler HDR")
+# The true-SDR OUTPUT project (no Dolby Vision). Note the two above are named for the INTAKE
+# range and both emit DV; this one is named for what it produces.
+SDR_OUT_CANDIDATES = ("Visionary SDR Output", "Overnight Upscaler SDR Output")
 
 
 def _result(step, ok, detail):
@@ -106,11 +109,17 @@ def import_projects(dry_run=False):
     all_drps = sorted(f for f in os.listdir(BUNDLE) if f.endswith(".drp")) if os.path.isdir(BUNDLE) else []
     drps = {}
     for f in all_drps:
-        if "SDR" in f.upper():
+        u = f.upper()
+        # ORDER MATTERS: "SDR OUTPUT" also contains "SDR", and all_drps is sorted, so a plain
+        # substring test let the SDR-output project overwrite the 1000-nit DV one and get
+        # imported under the wrong name.
+        if "SDR OUTPUT" in u:
+            drps["SDR_OUT"] = os.path.join(BUNDLE, f)
+        elif "SDR" in u:
             drps["SDR"] = os.path.join(BUNDLE, f)
-        elif "HDR" in f.upper():
+        elif "HDR" in u:
             drps["HDR"] = os.path.join(BUNDLE, f)
-    missing = [m for m in ("SDR", "HDR") if m not in drps]
+    missing = [m for m in ("SDR", "HDR") if m not in drps]   # SDR_OUT is optional (newer bundle)
     if missing:
         return [_result("project_import", False,
                         f"bundled .drp missing for: {', '.join(missing)} (found: {all_drps})")]
@@ -126,7 +135,10 @@ def import_projects(dry_run=False):
     pm = r.GetProjectManager()
     pm.GotoRootFolder()
     existing = set(pm.GetProjectListInCurrentFolder() or [])
-    for mode, cands in (("SDR", SDR_CANDIDATES), ("HDR", HDR_CANDIDATES)):
+    modes = [("SDR", SDR_CANDIDATES), ("HDR", HDR_CANDIDATES)]
+    if "SDR_OUT" in drps:
+        modes.append(("SDR_OUT", SDR_OUT_CANDIDATES))
+    for mode, cands in modes:
         have = [c for c in cands if c in existing]
         if have:
             out.append(_result(f"project_{mode.lower()}", True,
