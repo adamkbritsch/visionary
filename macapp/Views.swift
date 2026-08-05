@@ -1149,26 +1149,35 @@ private struct TVMode: View {
                     }.buttonStyle(.plain).help("Remove from round-robin")
                 }
             }
-            HStack(spacing: 8) {
-                Image(systemName: "cpu").font(.system(size: 12)).foregroundStyle(DS.steelDim)
-                Text(catalog.first { $0.key == key }?.label ?? (key.isEmpty ? "—" : key))
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
-                    .help("Topaz preset")
-                if !(show.configured ?? false) {
-                    Text("(default)").font(.system(size: 11)).foregroundStyle(.tertiary)
-                }
-                if !locked {
+            // While the run holds these four, every Change button is gone and the rows are
+            // four lines of static text — so they collapse into one readable line instead.
+            if locked {
+                LockedSettingsLine(
+                    preset: catalog.first { $0.key == key }?.label ?? (key.isEmpty ? "—" : key),
+                    isDefaultPreset: !(show.configured ?? false),
+                    output: show.output_mode_effective ?? "dv1000",
+                    normalized: show.normalize_audio ?? true,
+                    replaces: show.replace_source ?? true)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "cpu").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+                    Text(catalog.first { $0.key == key }?.label ?? (key.isEmpty ? "—" : key))
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                        .help("Topaz preset")
+                    if !(show.configured ?? false) {
+                        Text("(default)").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    }
                     Button("Change") { store.seriesPick = key.isEmpty ? (catalog.first?.key ?? "") : key
                                        store.pendingSeriesSlot = nil; store.pendingSeries = name }
                         .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
+                    Spacer()
                 }
-                Spacer()
+                OutputModeRow(key: name, effective: show.output_mode_effective ?? "dv1000")
+                NormalizeAudioRow(key: name, on: show.normalize_audio ?? true)
+                ReplaceSourceRow(key: name, on: show.replace_source ?? true)
             }
-            OutputModeRow(key: name, effective: show.output_mode_effective ?? "dv1000", locked: locked)
-            NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
-            ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
             if (show.queue?.featurette_count ?? 0) > 0 {
                 FeaturettesLastRow(key: name, on: show.featurettes_last ?? true,
                                    count: show.queue?.featurette_count ?? 0)
@@ -1181,6 +1190,55 @@ private struct TVMode: View {
         }
     }
 
+}
+
+// The four per-show settings on ONE line, for a show the run has locked. Nothing here is
+// actionable while the pipeline is armed (every Change button is hidden), so four stacked
+// rows are four lines of dead weight — this says the same thing in one, in pipeline order:
+// what Topaz does, what Resolve masters, what the remux does to audio, what the upload does
+// to the source. Same glyphs as the expanded rows, so it reads as the same information.
+private struct LockedSettingsLine: View {
+    let preset: String
+    let isDefaultPreset: Bool
+    let output: String            // the RESOLVED range (dv1000 / dv2000 / sdr)
+    let normalized: Bool
+    let replaces: Bool
+
+    private var outputLabel: String {
+        switch output {
+        case "sdr":    return "SDR"
+        case "dv2000": return "Dolby Vision 2000 nits"
+        default:       return "Dolby Vision 1000 nits"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            item("cpu", preset + (isDefaultPreset ? " (default)" : ""))
+            dot
+            item("wand.and.stars", outputLabel)
+            dot
+            item("square.stack.3d.up", normalized ? "Normalized audio" : "Original audio")
+            dot
+            item("arrow.up.circle", replaces ? "Replaces source" : "Keeps source")
+            Spacer(minLength: 0)
+        }
+        .lineLimit(1)
+        .help("Locked while the run is armed — Topaz preset, what Resolve masters, the remux's "
+              + "audio, and the upload's source policy. Stop the run to change any of them.")
+    }
+
+    private var dot: some View {
+        Circle().fill(DS.steelDim.opacity(0.45)).frame(width: 2.5, height: 2.5)
+    }
+
+    private func item(_ symbol: String, _ text: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol).font(.system(size: 11)).foregroundStyle(DS.steelDim)
+            Text(text).font(.system(size: 12)).foregroundStyle(DS.steel)
+        }
+        .fixedSize()
+    }
 }
 
 // Compact per-show checkbox — under each show's preset so it's set per show, not global.
@@ -1228,7 +1286,6 @@ private struct NormalizeAudioRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
     let on: Bool
-    var locked: Bool = false          // hides Change (TV passes the run-lock; movies/channels false)
     @State private var confirming = false
     var body: some View {
         HStack(spacing: 8) {
@@ -1238,10 +1295,8 @@ private struct NormalizeAudioRow: View {
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.07)))
                 .help("Remux audio: normalized = quiet audio boosted to the loudness target; original = bit-exact copy")
-            if !locked {
-                Button("Change") { confirming = true }
-                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
-            }
+            Button("Change") { confirming = true }
+                .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
             Spacer()
         }
         .confirmationDialog("Switch to \(on ? "original (bit-exact)" : "normalized") audio?",
@@ -1388,7 +1443,6 @@ private struct ReplaceSourceRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
     let on: Bool
-    var locked: Bool = false          // hides Change (TV passes the run-lock; movies false)
     @State private var confirming = false
     var body: some View {
         HStack(spacing: 8) {
@@ -1398,10 +1452,8 @@ private struct ReplaceSourceRow: View {
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.07)))
                 .help("Upload policy: replace = delete the source once the 4K master is verified on the NAS; keep = Plex serves both versions and the source stays for a future re-run")
-            if !locked {
-                Button("Change") { confirming = true }
-                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
-            }
+            Button("Change") { confirming = true }
+                .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
             Spacer()
         }
         .confirmationDialog("Switch to \(on ? "keeping" : "replacing") the source?",
@@ -1431,7 +1483,6 @@ private struct OutputModeRow: View {
     /// What the item will ACTUALLY master as — the engine already resolved "automatic"
     /// against the source range, so the row never shows a word the user has to translate.
     let effective: String
-    var locked: Bool = false          // hides Change (TV passes the run-lock)
     @State private var confirming = false
 
     private static let modes = ["dv1000", "dv2000", "sdr"]
@@ -1456,10 +1507,8 @@ private struct OutputModeRow: View {
                 .help("What Resolve masters this as. Left alone it follows the source — an SDR "
                       + "source to 1000 nits, an HDR source to 2000 — and it is always Dolby "
                       + "Vision. SDR is a manual choice only.")
-            if !locked {
-                Button("Change") { confirming = true }
-                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
-            }
+            Button("Change") { confirming = true }
+                .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
             Spacer()
         }
         .confirmationDialog("Output range", isPresented: $confirming, titleVisibility: .visible) {
