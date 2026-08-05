@@ -258,3 +258,33 @@ class ConfigCheck(unittest.TestCase):
             c = preflight.check_config(network=True)
         self.assertFalse(c["ok"])                           # configured but unreachable = real failure
         self.assertIn("Plex:", c["detail"])
+
+
+class ResolveProcessMatch(unittest.TestCase):
+    """`pgrep -x "DaVinci Resolve"` never matches: that is the APP name, while the
+    executable is "Resolve". Every guard built on it silently reported "not running" —
+    --smoke always skipped, and setup/import_resolve's never-merge-while-Resolve-is-open
+    rule never fired even though Resolve rewrites the preset file on exit."""
+
+    def test_the_pattern_matches_the_executable_not_the_app_name(self):
+        pat = preflight.RESOLVE_PGREP
+        self.assertEqual(pat[1], "-f", "-x matches the executable name, which is 'Resolve'")
+        self.assertTrue(pat[2].endswith("/Resolve"),
+                        "must match the real executable at the end of the bundle path")
+        self.assertIn("DaVinci Resolve.app", pat[2],
+                      "and stay anchored to the bundle so it can't match an unrelated 'Resolve'")
+
+    def test_no_caller_still_uses_the_broken_form(self):
+        import glob, os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(preflight.__file__)))
+        bad = []
+        for f in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
+            # Source tree only — Visionary.app is build output and carries a copy of the
+            # engine that is stale until the next build.
+            if os.path.basename(f).startswith("test_") or ".app/" in f:
+                continue
+            with open(f) as fh:
+                body = fh.read()
+            if '"-x", "DaVinci Resolve"' in body:
+                bad.append(os.path.relpath(f, root))
+        self.assertEqual(bad, [], "these still use a pgrep pattern that can never match")

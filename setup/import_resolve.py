@@ -48,7 +48,11 @@ def _result(step, ok, detail):
 
 
 def resolve_running() -> bool:
-    return subprocess.run(["pgrep", "-x", "DaVinci Resolve"],
+    # "DaVinci Resolve" is the APP; the EXECUTABLE is "Resolve", so `pgrep -x "DaVinci
+    # Resolve"` never matched and this guard always said "not running" — meaning the
+    # never-merge-while-Resolve-is-open rule was not actually being enforced. Resolve
+    # rewrites DeliverPresetList.xml on exit, so a merge behind its back is lost.
+    return subprocess.run(["pgrep", "-f", "DaVinci Resolve.app/Contents/MacOS/Resolve"],
                           capture_output=True).returncode == 0
 
 

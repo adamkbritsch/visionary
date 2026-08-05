@@ -451,6 +451,11 @@ def check_config(network=False):
                   "Plex — the URL/token in ~/.topaz-pipeline/config.json are right.")
 
 
+# "DaVinci Resolve" is the APP; the executable is "Resolve", so `pgrep -x "DaVinci Resolve"`
+# never matches and every guard built on it silently reported "not running". Match the full
+# bundle path instead — unambiguous, and the same thing stages.py's pkill -f already uses.
+RESOLVE_PGREP = ["pgrep", "-f", "DaVinci Resolve.app/Contents/MacOS/Resolve"]
+
 SMOKE_FILE = os.path.expanduser("~/.topaz-pipeline/display_smoke.json")
 SMOKE_PASS = 0.9      # a hosting display must clear this on at least one template
 
@@ -471,7 +476,7 @@ def shim_smoke_scores(display_key=None):
            "display_key": (target or {}).get("key") if target else None,
            "display_name": None,
            "screen_locked": dv_shim.screen_locked(), "error": None}
-    out["resolve_running"] = subprocess.run(["pgrep", "-x", "DaVinci Resolve"],
+    out["resolve_running"] = subprocess.run(RESOLVE_PGREP,
                                             capture_output=True).returncode == 0
     if display_key and not target:
         out["error"] = "display not attached: %s" % display_key
@@ -602,7 +607,7 @@ def check_shim_smoke():
     """OPTIONAL (--smoke): with Resolve running, prove the full chain — screencapture works
     AND EVERY dv_shim template matches this screen (not just the palette). The per-template
     scores are what diagnose a display/Resolve-build mismatch."""
-    if subprocess.run(["pgrep", "-x", "DaVinci Resolve"], capture_output=True).returncode != 0:
+    if subprocess.run(RESOLVE_PGREP, capture_output=True).returncode != 0:
         return _check("shim_smoke", True, "warn", "skipped — DaVinci Resolve is not running", "")
     fixit = ("Open Resolve full-screen on the Color page with the Dolby Vision palette "
              "visible and re-run --smoke. A persistently low score for a template means "
