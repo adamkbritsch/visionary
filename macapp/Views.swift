@@ -1419,8 +1419,9 @@ private struct ReplaceSourceRow: View {
 }
 
 // Per-item "Output range" row (shows, movies, YouTube channels): what Resolve DELIVERS.
-// AUTO is the long-standing rule and stays the default — an SDR source becomes 1000-nit
-// Dolby Vision, an already-HDR source becomes 2000-nit. The other three PIN it regardless
+// AUTO is the long-standing rule and stays the default, and it ALWAYS produces Dolby Vision:
+// an SDR source becomes 1000-nit DV, an already-HDR source 2000-nit. It never yields a non-DV
+// master — that is a manual choice only. The other three PIN the output regardless
 // of what came in, so a show that grades badly at 2000 nits can be forced to 1000, and one
 // you'd rather keep flat can skip Dolby Vision entirely. Same preset-style shape as the
 // rows above; a 4-way choice, so the confirm sheet lists the three you aren't on.
@@ -1437,7 +1438,11 @@ private struct OutputModeRow: View {
         case "sdr":    return "SDR"
         case "dv1000": return "Dolby Vision 1000 nits"
         case "dv2000": return "Dolby Vision 2000 nits"
-        default:       return "Matches the source"
+        // NOT "matches the source" — that reads as SDR in, SDR out, which is the exact
+        // OPPOSITE of what happens. Automatically the output is ALWAYS Dolby Vision; the
+        // source only chooses the mastering ceiling, and it does so per episode (from that
+        // file's color transfer), so no single nits number is honest here.
+        default:       return "Automatic Dolby Vision"
         }
     }
     private var current: String { Self.modes.contains(mode) ? mode : "auto" }
@@ -1451,8 +1456,9 @@ private struct OutputModeRow: View {
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.07)))
-                .help("What Resolve outputs. Matching the source gives an SDR source 1000-nit "
-                      + "Dolby Vision and an HDR source 2000-nit; the others pin every item here.")
+                .help("What Resolve outputs. Automatic is always Dolby Vision — an SDR source "
+                      + "masters to 1000 nits, an HDR source to 2000, decided per episode. The "
+                      + "other three pin every item here, whatever the source is.")
             if !locked {
                 Button("Change") { confirming = true }
                     .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
@@ -1465,10 +1471,11 @@ private struct OutputModeRow: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Matching the source is the normal behaviour: SDR in becomes 1000-nit Dolby "
-                 + "Vision, HDR in becomes 2000-nit. Pinning overrides that for everything "
-                 + "here. SDR masters are named differently from Dolby Vision ones, so "
-                 + "anything already finished keeps the range it shipped with.")
+            Text("Automatic is the normal behaviour and always produces Dolby Vision: an SDR "
+                 + "source masters to 1000 nits, an HDR source to 2000. Pinning overrides that "
+                 + "for everything here — SDR is only ever a manual choice. SDR masters are "
+                 + "named differently from Dolby Vision ones, so anything already finished "
+                 + "keeps the range it shipped with.")
         }
     }
 }
