@@ -977,11 +977,17 @@ struct FinisherProgress: View {
     /// usually nil, in which case this renders exactly what it always did.
     var body: some View {
         let o = store.state?.orchestrator
+        // pct-gated, as it always was: a claimed-but-not-yet-encoding lane has no progress
+        // to draw, and an empty bar reads as "running at 0%".
+        let l1 = (o?.finishing?.pct != nil) ? o?.finishing : nil
+        let l2 = (o?.finishing2?.pct != nil) ? o?.finishing2 : nil
+        // With BOTH rows up, each must name its own episode. The card's top-right says "x2"
+        // then, so it can no longer carry lane 1's — which left the first row anonymous
+        // while the second was labelled.
+        let dual = (l1 != nil && l2 != nil)
         VStack(alignment: .leading, spacing: 7) {
-            // pct-gated, as it always was: a claimed-but-not-yet-encoding lane has no
-            // progress to draw, and an empty bar reads as "running at 0%".
-            if let f = o?.finishing, f.pct != nil { LaneProgress(f: f, primary: true) }
-            if let f2 = o?.finishing2, f2.pct != nil { LaneProgress(f: f2, primary: false) }
+            if let f = l1 { LaneProgress(f: f, primary: true, showEpisode: dual) }
+            if let f2 = l2 { LaneProgress(f: f2, primary: false, showEpisode: true) }
         }
         .padding(.top, 3)
     }
@@ -999,6 +1005,9 @@ struct FinisherProgress: View {
 private struct LaneProgress: View {
     let f: FinishingDTO
     let primary: Bool
+    /// Label the row with its episode. False for a lone lane, whose identity is already in
+    /// the card's top-right; true whenever two rows are up and that slot reads "x2".
+    var showEpisode: Bool = false
 
     // Fixed slots, sized to their worst cases ("100%", "~12h 59m left"), so a changing
     // digit never moves the container edge and lane 2's eta sits directly under lane 1's —
@@ -1020,8 +1029,7 @@ private struct LaneProgress: View {
         let completed: Double = notches.isEmpty ? live
             : (done >= notches.count ? 1.0 : (done > 0 ? notches[done - 1] : 0))
         VStack(alignment: .leading, spacing: 4) {
-            if !primary, let ep = f.ep, !ep.isEmpty {
-                // Lane 1's identity is the card's own top-right label; lane 2 needs its own.
+            if showEpisode, let ep = f.ep, !ep.isEmpty {
                 Text(ep).font(.system(size: 11, weight: .medium)).monospacedDigit()
                     .foregroundStyle(DS.steel).lineLimit(1)
             }
