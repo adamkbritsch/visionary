@@ -291,3 +291,93 @@ class WaitForAnalysisFocus(unittest.TestCase):
              mock.patch.object(dv_shim, "activate",
                                mock.Mock(side_effect=AssertionError("must not steal focus"))):
             self.assertFalse(dv_shim.wait_for_analysis(abort=ab, poll=0))
+
+
+class HostTargeting(unittest.TestCase):
+    """Unpinned behaviour must be BYTE-identical to before the host existed — that is the
+    property that lets this land while the feature is off."""
+
+    HDMI = {"key": "uuid:HDMI", "origin": (1728.0, 1117.0), "size_pt": (1920, 1080),
+            "scale": 2.0}
+
+    def tearDown(self):
+        dv_shim.set_host(None)
+
+    def test_unpinned_capture_passes_no_R_flag(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return mock.Mock(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(dv_shim.subprocess, "run", fake_run), \
+             mock.patch.object(dv_shim.os.path, "exists", return_value=True), \
+             mock.patch.object(dv_shim.os.path, "getsize", return_value=99):
+            dv_shim.screenshot("/tmp/x.png")
+        self.assertEqual(seen["cmd"], ["screencapture", "-x", "/tmp/x.png"])
+
+    def test_pinned_capture_selects_the_host_rect_in_global_points(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return mock.Mock(returncode=0, stderr="", stdout="")
+
+        dv_shim.set_host(self.HDMI)
+        with mock.patch.object(dv_shim, "host_view",
+                               return_value=(1728.0, 1117.0, 2.0, 1920.0, 1080.0)), \
+             mock.patch.object(dv_shim.subprocess, "run", fake_run), \
+             mock.patch.object(dv_shim.os.path, "exists", return_value=True), \
+             mock.patch.object(dv_shim.os.path, "getsize", return_value=99):
+            dv_shim.screenshot("/tmp/x.png")
+        self.assertIn("-R", seen["cmd"])
+        self.assertEqual(seen["cmd"][seen["cmd"].index("-R") + 1], "1728,1117,1920,1080")
+
+    @unittest.skipIf(dv_shim.cv2 is None, "cv2 not installed")
+    def test_the_origin_shifts_matches_by_exactly_the_host_origin(self):
+        import numpy as np, cv2, tempfile, os as _os
+        d = tempfile.mkdtemp()
+        shot = _os.path.join(d, "s.png"); tmpl = _os.path.join(d, "t.png")
+        # The patch must have VARIANCE — a solid block has none and TM_CCOEFF_NORMED is
+        # undefined on it, which silently matches at (0, 0).
+        rng = np.random.default_rng(7)
+        img = rng.integers(0, 60, (400, 600, 3), dtype=np.uint8)
+        img[100:140, 200:260] = rng.integers(0, 255, (40, 60, 3), dtype=np.uint8)
+        cv2.imwrite(shot, img)
+        cv2.imwrite(tmpl, img[100:140, 200:260])
+        at_main, _ = dv_shim.match_template(shot, tmpl, scale=2.0, origin=(0.0, 0.0))
+        at_hdmi, _ = dv_shim.match_template(shot, tmpl, scale=2.0, origin=(1728.0, 1117.0))
+        self.assertAlmostEqual(at_hdmi[0] - at_main[0], 1728.0, places=6)
+        self.assertAlmostEqual(at_hdmi[1] - at_main[1], 1117.0, places=6)
+        # and the unpinned answer is the pre-host formula, unchanged
+        self.assertAlmostEqual(at_main[0], (200 + 60 / 2) / 2.0, places=6)
+
+    def test_click_refuses_a_point_outside_the_driven_display(self):
+        # An origin or scale bug otherwise clicks REAL coordinates on the user's screen.
+        with mock.patch.object(dv_shim, "host_view",
+                               return_value=(1728.0, 1117.0, 2.0, 1920.0, 1080.0)), \
+             mock.patch.object(dv_shim, "_diag", lambda *a, **k: ""), \
+             mock.patch.object(dv_shim.subprocess, "run",
+                               mock.Mock(side_effect=AssertionError("must not click"))):
+            with self.assertRaises(RuntimeError) as cm:
+                dv_shim.click(300, 300)          # a main-display point while pinned to HDMI
+        self.assertIn("outside the display being driven", str(cm.exception))
+
+    def test_click_allows_a_point_on_the_driven_display_and_restores_the_pointer(self):
+        seen = {}
+        with mock.patch.object(dv_shim, "host_view",
+                               return_value=(1728.0, 1117.0, 2.0, 1920.0, 1080.0)), \
+             mock.patch.object(dv_shim.subprocess, "run",
+                               lambda cmd, **kw: seen.update(cmd=cmd)):
+            dv_shim.click(2000, 1500)
+        self.assertIn("-r", seen["cmd"])         # pointer goes back where the user left it
+        self.assertEqual(seen["cmd"][-1], "c:2000,1500")
+
+    def test_unpinned_clicks_are_still_allowed_across_the_main_display(self):
+        seen = {}
+        with mock.patch.object(dv_shim, "host_view",
+                               return_value=(0.0, 0.0, 2.0, 1728.0, 1117.0)), \
+             mock.patch.object(dv_shim.subprocess, "run",
+                               lambda cmd, **kw: seen.update(cmd=cmd)):
+            dv_shim.click(864, 558)
+        self.assertEqual(seen["cmd"][-1], "c:864,558")

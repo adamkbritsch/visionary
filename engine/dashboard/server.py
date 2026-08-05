@@ -380,6 +380,18 @@ def _show_hdr_hint(name) -> bool:
         return False
 
 
+def displays_view() -> dict:
+    """Every attached screen, whether it can host Resolve, and the saved priority."""
+    import displays as _dsp        # noqa: F401  (imported for the side of a clear error)
+    host, why = preflight.chosen_host()
+    return {"displays": preflight.eligible_displays(),
+            "priority": settings.get_display_priority(),
+            "enabled": bool(settings.get_settings().get("resolve_host_pinning")),
+            "fallback_main": bool(settings.get_settings().get("resolve_host_fallback_main")),
+            "warning_seconds": settings.tunable("resolve_takeover_warning_seconds"),
+            "host": host, "host_reason": why}
+
+
 def show_settings_view(name) -> dict:
     """The per-show settings that can be set for ANY show — active or merely queued as a
     slot's follow-up (all three live in show_profiles.json keyed by show name)."""
@@ -698,10 +710,21 @@ class Handler(BaseHTTPRequestHandler):
             # Recording grant (a plain shell's screencapture returns "could not create
             # image from display"), so remote debugging of the DV automation has to come
             # from here. Localhost-only, like the rest of the API.
+            # ?display=<key> captures a NON-main screen. Once Resolve can be hosted
+            # elsewhere, a debugger that always shows the built-in is worse than useless.
             try:
-                import tempfile, dv_shim
-                png = os.path.join(tempfile.gettempdir(), "_api_screen.png")
-                dv_shim.screenshot(png)
+                import tempfile, dv_shim, displays
+                key = (parse_qs(urlparse(self.path).query).get("display") or [None])[0]
+                target = displays.find(key) if key else None
+                if key and not target:
+                    self._json({"error": "display not attached: %s" % key}, code=404); return
+                prev = dv_shim.get_host()
+                try:
+                    dv_shim.set_host(target)
+                    png = os.path.join(tempfile.gettempdir(), "_api_screen.png")
+                    dv_shim.screenshot(png)
+                finally:
+                    dv_shim.set_host(prev)
                 with open(png, "rb") as f:
                     self._send(200, f.read(), "image/png")
             except Exception as e:
@@ -710,7 +733,13 @@ class Handler(BaseHTTPRequestHandler):
             # Per-template match scores against the LIVE screen + display/lock context —
             # the acceptance gate for a display config and the first thing to check when
             # the Resolve stage misbehaves on a screen nobody can see.
-            self._json(preflight.shim_smoke_scores())
+            key = (parse_qs(urlparse(self.path).query).get("display") or [None])[0]
+            self._json(preflight.shim_smoke_scores(key))
+        elif path == "/api/displays":
+            # Every attached screen + whether it could host Resolve + the saved priority.
+            # NOT folded into /api/state: that polls every 1.5 s and re-enumerating
+            # displays at that rate is pointless work.
+            self._json(displays_view())
         elif path == "/api/request-accessibility":
             self._json(request_accessibility())
         elif path == "/oauth/youtube":
@@ -791,6 +820,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/settings":
             self._json({"settings": settings.set_settings(body or {})})
+        elif path == "/api/displays":
+            # Reorder the priority list / flip the master switch. The priority list is
+            # validated in settings (VALIDATORS) rather than here, so a hand-edited
+            # settings.json is held to the same rule as the UI.
+            upd = {}
+            for k in ("resolve_host_pinning", "resolve_host_fallback_main"):
+                if k in body:
+                    upd[k] = bool(body.get(k))
+            if "priority" in body:
+                upd["resolve_host_displays"] = body.get("priority")
+            if "warning_seconds" in body:
+                upd["resolve_takeover_warning_seconds"] = body.get("warning_seconds")
+            if upd:
+                settings.set_settings(upd)
+            self._json(displays_view())
+        elif path == "/api/display-smoke":
+            # Score every template against ONE display and remember the result. This is
+            # what a screen must pass before it is allowed to host Resolve.
+            key = body.get("display")
+            res = preflight.shim_smoke_scores(key)
+            preflight.record_display_smoke(key, res)
+            self._json({"result": res, "displays": displays_view()})
         elif path == "/api/quiet-mode":
             # SCREEN CONTROL. `enabled` = quiet mode ON = the pipeline stops using the screen.
             # That is only ever TEMPORARY: `seconds` (or an `until` epoch) sets when it comes

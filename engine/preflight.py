@@ -25,6 +25,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import versions  # noqa: E402
@@ -450,20 +451,42 @@ def check_config(network=False):
                   "Plex — the URL/token in ~/.topaz-pipeline/config.json are right.")
 
 
-def shim_smoke_scores():
-    """Match EVERY dv_shim template against the live screen -> {template: score} plus
+SMOKE_FILE = os.path.expanduser("~/.topaz-pipeline/display_smoke.json")
+SMOKE_PASS = 0.9      # a hosting display must clear this on at least one template
+
+
+def shim_smoke_scores(display_key=None):
+    """Match EVERY dv_shim template against a live screen -> {template: score} plus
     context. The acceptance gate for calling a display configuration supported: a
     template only matches when the UI renders at the same backing-pixel size, so this is
     what proves a new display (e.g. the clamshell dummy) is really usable. Also the
-    remote debugging entry point (GET /api/shim-smoke) when nobody can see the screen."""
-    import tempfile, cv2, dv_shim
-    out = {"scores": {}, "resolve_running": False, "display": dv_shim.main_display_geometry(),
+    remote debugging entry point (GET /api/shim-smoke) when nobody can see the screen.
+
+    `display_key` scores a NON-main display. That is the point of the whole exercise:
+    before any click is ever sent to a screen, prove the templates match on it."""
+    import tempfile, cv2, dv_shim, displays as _dsp
+    target = _dsp.find(display_key) if display_key else None
+    out = {"scores": {}, "resolve_running": False,
+           "display": dv_shim.main_display_geometry(),
+           "display_key": (target or {}).get("key") if target else None,
+           "display_name": None,
            "screen_locked": dv_shim.screen_locked(), "error": None}
     out["resolve_running"] = subprocess.run(["pgrep", "-x", "DaVinci Resolve"],
                                             capture_output=True).returncode == 0
+    if display_key and not target:
+        out["error"] = "display not attached: %s" % display_key
+        return out
+    if target:
+        d = match_display(target["backing"][0], target["backing"][1],
+                          target["scale"], target["builtin"])
+        out["display_name"] = (d or {}).get("name")
+    prev = dv_shim.get_host()
     try:
+        dv_shim.set_host(target)
         png = os.path.join(tempfile.gettempdir(), "_preflight_smoke.png")
-        subprocess.run(["screencapture", "-x", png], timeout=15, check=True)
+        # Through dv_shim.screenshot, not a bare screencapture: that is the ONLY capture
+        # path that targets a display and that retries through a display-set transition.
+        dv_shim.screenshot(png)
         for name in sorted(os.listdir(TEMPLATES_DIR)):
             if not name.endswith(".png") or name.startswith("_"):
                 continue
@@ -471,7 +494,108 @@ def shim_smoke_scores():
             out["scores"][name] = round(score, 4)
     except Exception as e:
         out["error"] = f"{e.__class__.__name__}: {e}"
+    finally:
+        dv_shim.set_host(prev)
+    out["best"] = max(out["scores"].values()) if out["scores"] else 0.0
+    out["pass"] = bool(out["best"] >= SMOKE_PASS and not out["error"])
     return out
+
+
+def load_display_smoke() -> dict:
+    """{display_key: {best, pass, when, scores}} — which screens have been PROVEN to
+    render Resolve the way the templates expect. A display cannot be chosen to host
+    Resolve without a record here: driving a screen nobody is looking at raises the cost
+    of a bad match from a loud failure to silent wrong clicks."""
+    try:
+        with open(SMOKE_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def record_display_smoke(display_key, result) -> dict:
+    """Persist one display's smoke result. Returns the whole book."""
+    book = load_display_smoke()
+    if display_key:
+        book[display_key] = {"best": result.get("best", 0.0),
+                             "pass": bool(result.get("pass")),
+                             "scores": result.get("scores", {}),
+                             "when": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        try:
+            os.makedirs(os.path.dirname(SMOKE_FILE), exist_ok=True)
+            tmp = SMOKE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(book, f, indent=1)
+            os.replace(tmp, SMOKE_FILE)
+        except Exception:
+            pass
+    return book
+
+
+def eligible_displays() -> list:
+    """Every attached display, annotated with whether it could host Resolve. The
+    eligibility RULE is match_display, unchanged — this only applies it to each screen
+    instead of only to the main one, and adds the two host-specific exclusions."""
+    import displays as _dsp
+    book = load_display_smoke()
+    out = []
+    for d in _dsp.enumerate_displays():
+        desc = match_display(d["backing"][0], d["backing"][1], d["scale"], d["builtin"])
+        smoke = book.get(d["key"]) or {}
+        why = None
+        if d["mirror_slave"]:
+            why = "mirrors another display — it has no framebuffer of its own"
+        elif not desc:
+            why = ("renders at %.2gx — the shim's templates only match at %gx"
+                   % (d["scale"], versions.REQUIRED_BACKING_SCALE))
+        out.append({**d,
+                    "name": (desc or {}).get("name") or
+                            ("%dx%d @%.2gx" % (d["backing"][0], d["backing"][1], d["scale"])),
+                    "eligible": bool(desc) and not d["mirror_slave"],
+                    "verified": bool(desc) and bool(desc.get("backing")),
+                    "why_not": why,
+                    "smoke_pass": bool(smoke.get("pass")),
+                    "smoke_best": smoke.get("best"),
+                    "smoke_when": smoke.get("when")})
+    return out
+
+
+def chosen_host():
+    """(descriptor | None, reason). None means "drive the main display", which is what
+    every code path did before this feature and what it still does unless ALL of these
+    hold: pinning is on, the display is in the priority list, it is attached, it is
+    eligible under match_display, and it has a recorded template-smoke pass.
+
+    That last gate is deliberate and is not just belt-and-braces: driving a screen nobody
+    is looking at turns a bad template match from a loud failure into silent wrong clicks,
+    so a display has to be PROVEN before it is trusted."""
+    try:
+        import settings
+        if not settings.get_settings().get("resolve_host_pinning"):
+            return None, "pinning off"
+        prio = settings.get_display_priority()
+        if not prio:
+            return None, "no display chosen"
+        by_key = {d["key"]: d for d in eligible_displays()}
+        missing = []
+        for key in prio:
+            d = by_key.get(key)
+            if d is None:
+                missing.append("not attached")
+                continue
+            if d["main"]:
+                return None, "chosen display is the main one"
+            if not d["eligible"]:
+                missing.append(d.get("why_not") or "not eligible")
+                continue
+            if not d["smoke_pass"]:
+                missing.append("templates not proven on it yet")
+                continue
+            return d, "pinned"
+        return None, "; ".join(missing) or "no usable display"
+    except Exception as e:
+        return None, "%s: %s" % (e.__class__.__name__, e)
 
 
 def check_shim_smoke():

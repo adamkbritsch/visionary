@@ -76,6 +76,51 @@ def main_display_geometry():
         return None
 
 
+# --- HOST DISPLAY ----------------------------------------------------------------
+# The display this shim drives. None = the main display, which is what every existing
+# caller gets and which reproduces the old behaviour exactly (origin (0,0), main's scale).
+# Set ONCE per process by set_host() before any capture: this module runs in a dedicated
+# per-episode subprocess, so a value fixed at entry is as deterministic as a parameter
+# without threading one through a dozen call sites — and a settings change mid-episode
+# must not move the target under a shim that is already matching against it.
+_HOST = None
+
+
+def set_host(d):
+    """`d` is a displays.enumerate_displays() descriptor, or None for the main display."""
+    global _HOST
+    _HOST = d or None
+
+
+def get_host():
+    return _HOST
+
+
+def host_view():
+    """(origin_x, origin_y, scale, w_pt, h_pt) of the display being driven, in GLOBAL
+    logical points — the space cliclick clicks in and `screencapture -R` selects in.
+
+    Re-resolved from the live display list on every call rather than cached: a display
+    that sleeps drops out of the active list, and a user rearranging displays moves every
+    origin. A stale origin here means clicking confident coordinates on the wrong screen.
+
+    Falls back to the main display's real geometry, and finally to today's constants."""
+    if _HOST is not None:
+        try:
+            import displays
+            live = displays.find(_HOST.get("key")) or _HOST
+            ox, oy = live["origin"]
+            w, h = live["size_pt"]
+            return (float(ox), float(oy), float(live["scale"]) or 2.0, float(w), float(h))
+        except Exception:
+            pass
+    g = main_display_geometry()
+    scale = float(g[2]) if (g and g[2]) else 2.0
+    w = (g[0] / scale) if g else 0.0
+    h = (g[1] / scale) if g else 0.0
+    return (0.0, 0.0, scale, w, h)
+
+
 def screen_locked():
     """True if the login window/lock screen is up — then EVERY template match fails and
     the failure looks inexplicable. caffeinate -d blocks the screensaver but NOT this."""
@@ -107,10 +152,10 @@ def screen_locked():
 
 
 def retina_scale() -> float:
-    """screencapture pixels per cliclick logical point — READ from the main display
-    (every SUPPORTED_DISPLAYS config is 2.0; falls back to 2.0 if unreadable)."""
-    g = main_display_geometry()
-    return float(g[2]) if (g and g[2]) else 2.0
+    """screencapture pixels per cliclick logical point, for the display being DRIVEN —
+    which is the display the pixels actually came from (every SUPPORTED_DISPLAYS config
+    is 2.0; falls back to 2.0 if unreadable)."""
+    return host_view()[2]
 
 
 def _diag(what: str, shot_path: str | None = None, **facts) -> str:
@@ -127,7 +172,13 @@ def _diag(what: str, shot_path: str | None = None, **facts) -> str:
             _sh.copy2(shot_path, base + ".png")
         g = main_display_geometry()
         with open(base + ".json", "w") as f:
+            hv = host_view()
             json.dump({"what": what, "when": stamp, "display": g,
+                       # WHICH screen was being driven. A lid-closed failure on the HDMI
+                       # filed under the built-in's geometry is worse than no forensics.
+                       "host": (_HOST or {}).get("key") if _HOST else "main",
+                       "host_view": {"origin": [hv[0], hv[1]], "scale": hv[2],
+                                     "size_pt": [hv[3], hv[4]]},
                        "screen_locked": screen_locked(), **facts}, f, indent=1)
         olds = sorted(glob.glob(os.path.join(DIAG_DIR, "*.json")))[:-DIAG_KEEP]
         for j in olds:                      # ring-buffer: drop the oldest pairs
@@ -147,7 +198,8 @@ def find_button(screenshot_path: str, template_path: str, *,
     confidence < threshold. Robust to where the button sits on screen — the
     whole reason we template-match instead of using fixed coordinates.
     """
-    pos, score = match_template(screenshot_path, template_path, scale=scale)
+    ox, oy, _s, _w, _h = host_view()
+    pos, score = match_template(screenshot_path, template_path, scale=scale, origin=(ox, oy))
     if pos is None or score < threshold:
         # A MISS is the failure mode nobody can see with the lid closed — preserve it.
         _diag("miss-" + os.path.splitext(os.path.basename(template_path))[0],
@@ -157,7 +209,8 @@ def find_button(screenshot_path: str, template_path: str, *,
     return pos
 
 
-def match_template(screenshot_path: str, template_path: str, *, scale: float | None = None):
+def match_template(screenshot_path: str, template_path: str, *, scale: float | None = None,
+                   origin: tuple | None = None):
     """((x, y) logical points | None, best_score). Same matcher as find_button without
     the threshold — used by the smoke test so every template reports a SCORE, making a
     drifting match visible BEFORE it drops under the threshold mid-run."""
@@ -169,7 +222,12 @@ def match_template(screenshot_path: str, template_path: str, *, scale: float | N
     _minv, maxv, _minl, maxloc = cv2.minMaxLoc(res)
     h, w = tmpl.shape[:2]
     s = scale if scale is not None else retina_scale()
-    return ((maxloc[0] + w / 2) / s, (maxloc[1] + h / 2) / s), float(maxv)
+    # THE load-bearing line. The match is in CAPTURE-LOCAL pixels; cliclick wants GLOBAL
+    # logical points. Unpinned the origin is (0, 0) and this is arithmetically identical
+    # to what it always was. Pinned, dropping the origin would click real, confident
+    # coordinates on the WRONG screen — a silent, destructive failure, unlike a miss.
+    ox, oy = (0.0, 0.0) if origin is None else origin
+    return (ox + (maxloc[0] + w / 2) / s, oy + (maxloc[1] + h / 2) / s), float(maxv)
 
 
 def found(screenshot_path: str, template_path: str, *, threshold: float = 0.8) -> bool:
@@ -263,9 +321,19 @@ def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
     lid closing/opening (clamshell switch) tears the old display down and a single-shot
     capture fails (live-caught 2026-07-17 the instant the lid shut). A few retries ride
     that out; a persistent failure still raises, so a real grant/lock problem is loud."""
+    ox, oy, _scale, w_pt, h_pt = host_view()
+    # -R takes GLOBAL POINTS and renders at the TARGET display's backing scale (verified:
+    # -R 1728,1117,1920,1080 produced a 3840x2160 PNG). Preferred over -D <n>, whose
+    # ordinal has no documented mapping to CGDirectDisplayID and is ambiguous between two
+    # identical panels. Unpinned we pass no -R at all, so the command is byte-identical
+    # to what it has always been.
+    cmd = ["screencapture", "-x"]
+    if _HOST is not None and w_pt > 0 and h_pt > 0:
+        cmd += ["-R", "%d,%d,%d,%d" % (round(ox), round(oy), round(w_pt), round(h_pt))]
+    cmd.append(path)
     last = None
     for i in range(attempts):
-        r = subprocess.run(["screencapture", "-x", path], capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
             return path
         last = (r.stderr or r.stdout or "").strip()
@@ -275,7 +343,22 @@ def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
 
 
 def click(x, y):
-    subprocess.run([CLICLICK, f"c:{int(round(x))},{int(round(y))}"], check=True)
+    """Click a GLOBAL logical point, then put the pointer back where the user left it.
+
+    The bounds check is not defensive padding — it is the only thing standing between an
+    origin/scale bug and a confident click at real coordinates on whatever the user has
+    open. A template MISS is loud (it raises, with a diag PNG); a wrong-screen click is
+    silent and does something arbitrary. Better a hard failure."""
+    ox, oy, _s, w_pt, h_pt = host_view()
+    if w_pt > 0 and h_pt > 0 and not (ox - 1 <= x <= ox + w_pt + 1 and
+                                      oy - 1 <= y <= oy + h_pt + 1):
+        _diag("click-out-of-bounds", None, point=[x, y],
+              host=[ox, oy, w_pt, h_pt])
+        raise RuntimeError("refusing to click (%.0f, %.0f) — outside the display being "
+                           "driven (%.0f, %.0f %.0fx%.0f)" % (x, y, ox, oy, w_pt, h_pt))
+    # -r restores the pointer afterwards, so a run does not park the user's cursor on
+    # whatever it just clicked.
+    subprocess.run([CLICLICK, "-r", f"c:{int(round(x))},{int(round(y))}"], check=True)
 
 
 def _t(name):

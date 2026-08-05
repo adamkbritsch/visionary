@@ -123,6 +123,23 @@ DEFAULT_SETTINGS = {
     "unplug_grace_seconds": 60, # POWER-BLIP GRACE (was orchestrator.UNPLUG_GRACE_SECONDS): unplugged
                                 # mid-stage, wait this long for the power to come back before abandoning
                                 # the stage. 0 = abandon immediately.
+
+    # --- WHICH SCREEN RESOLVE RUNS ON (all default to today's behaviour) -------------
+    "resolve_host_pinning": False,   # MASTER SWITCH. Off = Resolve runs wherever it opens (the
+                                # main display), exactly as it always has. On = it is moved to the
+                                # highest-priority attached display that is eligible AND has a
+                                # recorded template-smoke pass.
+    "resolve_host_displays": [],  # ordered display keys, highest priority first. The ONLY
+                                # non-scalar setting — see VALIDATORS.
+    "resolve_host_fallback_main": False,  # host unavailable -> fall back to the main display?
+                                # Off (default) is the FAIL-SAFE: the item defers instead, so a
+                                # yanked cable stalls the run rather than seizing the screen the
+                                # user was told would be left alone.
+    "resolve_takeover_warning_seconds": 0,  # hold this long, showing a warning on the main
+                                # display, before the shim takes the screen and the mouse. 0 = no
+                                # hold (today's behaviour). There is no free lead time to spend:
+                                # the stage flips to "resolve" seconds before Resolve launches, so
+                                # a real warning has to be PAID FOR in pipeline time.
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -144,7 +161,8 @@ LIMITS = {
     "prefetch_cap_gb": (25, 500),
     "max_episode_fails": (1, 20),
     "unplug_grace_seconds": (0, 600),
-    "seg_eta_after_minutes": (1, 120),   # 1 = effectively always (a Topaz segment never encodes
+    "seg_eta_after_minutes": (1, 120),
+    "resolve_takeover_warning_seconds": (0, 300),   # 1 = effectively always (a Topaz segment never encodes
                                          # in under a minute); high = effectively never
 }
 ZERO_IS_OFF = {"audio_target_lufs", "passthrough_min_mbps", "prefetch_cap_gb"}
@@ -270,6 +288,23 @@ def tunable(key: str) -> int:
     return clamp_setting(key, get_settings().get(key, DEFAULT_SETTINGS[key]))
 
 
+def _valid_display_list(v):
+    """A hand-edited settings.json must not be able to feed the engine garbage. LIMITS
+    covers numbers; this covers the one list-valued setting."""
+    if not isinstance(v, list):
+        return []
+    out = []
+    for item in v:
+        if isinstance(item, str) and 0 < len(item) <= 128 and item not in out:
+            out.append(item)
+    return out[:8]
+
+
+# Non-numeric settings need their own validation — LIMITS is a numeric clamp table and
+# silently passes anything it has no entry for.
+VALIDATORS = {"resolve_host_displays": _valid_display_list}
+
+
 def set_settings(updates: dict) -> dict:
     with _WRITE_LOCK:                    # atomic read-modify-write (see _WRITE_LOCK)
         s = get_settings()
@@ -278,8 +313,14 @@ def set_settings(updates: dict) -> dict:
                 s[k] = v
         for k in LIMITS:                 # one table, applied on write and on read (tunable)
             s[k] = clamp_setting(k, s.get(k))
+        for k, fn in VALIDATORS.items():
+            s[k] = fn(s.get(k, DEFAULT_SETTINGS[k]))
         _save(SETTINGS_FILE, s)
         return s
+
+
+def get_display_priority() -> list:
+    return _valid_display_list(get_settings().get("resolve_host_displays", []))
 
 
 # ---- Topaz preset catalog -------------------------------------------------
