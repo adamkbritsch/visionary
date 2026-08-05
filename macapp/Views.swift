@@ -371,8 +371,15 @@ struct PowerPill: View {
         if o?.stage_active ?? (o?.progress != nil) {
             consider(o?.progress?.stage ?? o?.stage, o?.progress?.pct)
         }
-        consider(o?.finishing?.stage, o?.finishing?.pct.map { Int($0) })
-        consider(o?.finishing2?.stage, o?.finishing2?.pct.map { Int($0) })
+        // Same "actually working" rule the pipeline card uses. A lane suspended for Resolve
+        // keeps its last-known percentage, and reporting it here while the card shows Remux
+        // as inactive would have the header and the card contradicting each other.
+        if PipelineCard.laneLive(o?.finishing) {
+            consider(o?.finishing?.stage, o?.finishing?.pct.map { Int($0) })
+        }
+        if PipelineCard.laneLive(o?.finishing2) {
+            consider(o?.finishing2?.stage, o?.finishing2?.pct.map { Int($0) })
+        }
         return best
     }
 
@@ -720,7 +727,13 @@ struct PipelineCard: View {
         // The two independently-active stages under the topaz/remux overlap: the RUN thread's
         // stage (download/topaz/resolve) and the FINISHER thread's stage (remux/upload/cleanup).
         let runStage = running ? o?.stage : nil
-        let finStage = o?.finishing?.stage
+        // A lane counts as LIVE only when it is actually working. `finishing` is set the
+        // moment the finisher CLAIMS an item — before any encoding — and it keeps its
+        // last-known percentage while suspended for Resolve. Keying the card on its mere
+        // presence opened Remux the instant you hit Activate, looking exactly like work in
+        // progress, and left it open beside an active Resolve that had just frozen it.
+        let finStage = PipelineCard.laneLive(o?.finishing) ? o?.finishing?.stage
+            : (PipelineCard.laneLive(o?.finishing2) ? o?.finishing2?.stage : nil)
         let twoUp = (runStage != nil) && (finStage != nil) && (runStage != finStage)
         // The current-episode name MOVES into each active card's top-right (below). The header
         // hint is only the idle next-up preview now — nil while anything is processing.
@@ -757,6 +770,16 @@ struct PipelineCard: View {
         }
     }
 
+    /// Is this lane doing work right now? Not merely claimed, and not frozen.
+    ///  * `holding` set  -> suspended for Resolve; Resolve is the live stage, not this.
+    ///  * `pct` nil      -> claimed but nothing encoded yet (the state at Activate).
+    static func laneLive(_ f: FinishingDTO?) -> Bool {
+        guard let f, f.stage?.isEmpty == false else { return false }
+        if f.holding != nil { return false }
+        // upload/cleanup report no percentage but ARE running; only remux has one to wait for.
+        return f.stage != "remux" || f.pct != nil
+    }
+
     // The concise episode token shown in an active card's top-right.
     func episodeLabel(_ role: StageRole) -> String? {
         let o = store.state?.orchestrator
@@ -764,7 +787,7 @@ struct PipelineCard: View {
         case .finisher:
             // With both lanes live a single episode in the top-right is a lie by omission —
             // the per-row labels carry identity instead, so this just says how many.
-            if o?.finishing2 != nil { return "\u{00D7}2" }
+            if PipelineCard.laneLive(o?.finishing2) { return "\u{00D7}2" }
             return o?.finishing?.ep                                   // already a display string
         case .run:      return runEpisodeShort(o?.current)
         case .inactive: return nil
@@ -932,8 +955,10 @@ struct FinisherProgress: View {
     var body: some View {
         let o = store.state?.orchestrator
         VStack(alignment: .leading, spacing: 7) {
-            if let f = o?.finishing { LaneProgress(f: f, primary: true) }
-            if let f2 = o?.finishing2 { LaneProgress(f: f2, primary: false) }
+            // pct-gated, as it always was: a claimed-but-not-yet-encoding lane has no
+            // progress to draw, and an empty bar reads as "running at 0%".
+            if let f = o?.finishing, f.pct != nil { LaneProgress(f: f, primary: true) }
+            if let f2 = o?.finishing2, f2.pct != nil { LaneProgress(f: f2, primary: false) }
         }
         .padding(.top, 3)
     }
@@ -979,7 +1004,7 @@ private struct LaneProgress: View {
             }
             SteelBar(completed: completed, live: live, notches: notches, flashKey: done)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(f.pct == nil ? "—" : String(format: "%.0f%%", pct))
+                Text(String(format: "%.0f%%", pct))
                     .font(.system(size: primary ? 17 : 13, weight: .semibold)).monospacedDigit()
                     .foregroundStyle(held == nil ? DS.steelBright : DS.steelDim)
                     .frame(width: primary ? nil : Self.pctSlot, alignment: .leading)
