@@ -196,6 +196,22 @@ def check_display():
         except Exception as e:
             return _check("display", False, "fail", f"could not read display geometry: {e}", fix)
     cfg = match_display(px_w, px_h, scale, builtin)
+    which = "main display"
+    # Judge the display that will ACTUALLY be driven. With Resolve pinned to another
+    # screen, main's verdict is the wrong question in BOTH directions: a 1x main would
+    # refuse to arm a rig whose host is perfectly good, and a 2x main would happily arm
+    # one whose host is not. Unpinned, or when the pinned display is not attached, this
+    # is exactly the old check on main.
+    try:
+        host, _why = chosen_host()
+    except Exception:
+        host = None
+    if host:
+        px_w, px_h = host["backing"]
+        scale, builtin = host["scale"], host["builtin"]
+        cfg = match_display(px_w, px_h, scale, builtin)
+        which = "host display %s" % host.get("name", host.get("key"))
+        via += " (pinned)"
     note = ""
     if cfg:
         note = f"matched: {cfg['name']}"
@@ -204,7 +220,7 @@ def check_display():
     else:
         note = f"require {versions.REQUIRED_BACKING_SCALE:g}x backing scale (verified: {verified})"
     return _check("display", cfg is not None, "fail",
-                  f"main display {px_w}x{px_h} builtin={builtin}"
+                  f"{which} {px_w}x{px_h} builtin={builtin}"
                   + (f" scale={scale:g}" if scale is not None else "") + f" (via {via}); "
                   + note, fix)
 

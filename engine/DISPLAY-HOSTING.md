@@ -81,9 +81,11 @@ analyze_modal.png          0.570      no analysis running, correctly absent
 target_1000nit.png         0.551      only visible with the palette open
 ```
 
-The one template that *should* be visible in that state matched comfortably. No second
-template set is needed for this display. (Consistent with the CLAUDE.md note that this
-dummy matched every template at >=0.96.)
+The one template that *should* be visible in that state matched comfortably. Later, with a
+project loaded and the palette OPEN, the full recorded smoke scored `dolby_vision_palette`
+1.0, `analyze_all` 0.9735, `target_1000nit` 0.9601 and `analyze_modal` 0.5696 (correctly
+absent — no analysis was running). So the Color page lays out identically at 3840x2160 @2x
+and **no second template set is needed for this display**.
 
 ## Placement does not persist — redo it every episode
 
@@ -99,12 +101,47 @@ Two consequences:
 - Nothing leaks. A spike, or an aborted run, cannot strand Resolve on a display the shim
   is not watching.
 
+## Supported combinations
+
+Both of these work, in either role and any arrangement:
+
+- **16-inch MacBook Pro Retina panel + a 4K display.** Either may be main. Pinning the
+  display that *is* main simply drives main (there is nowhere else to go), so that is a
+  no-op rather than an error.
+- **A 4K display on its own** (desktop Mac, or a clamshell laptop). One display is always
+  main, so hosting does not apply and everything behaves exactly as it did before this
+  feature existed.
+
+A 4K panel driven at **1x** ("More Space") is refused, by the same backing-scale invariant
+that has always applied to the main display — the templates only match at 2x. The refusal
+now names the reason on the display row instead of failing mysteriously later.
+
+`check_display` (the arm gate) judges **the display that will actually be driven**, not
+main. With Resolve pinned elsewhere, main's verdict is the wrong question in both
+directions: a 1x main would refuse to arm a rig whose host is fine, and a 2x main would
+happily arm one whose host is not. Unpinned — or when the pinned display is unplugged —
+it is exactly the old check on main.
+
+### Arrangement, including negative origins
+
+A display left of or above main has a **negative** origin. Verified live by temporarily
+moving the 4K to (-1920, -400) with `CGConfigureDisplayOrigin` and restoring afterwards:
+
+```
+screencapture -x -R -1920,-400,1920,1080   ->  rc 0, a 3840x2160 PNG
+dv_shim.host_view()                        ->  (-1920.0, -400.0, 2.0, 1920.0, 1080.0)
+```
+
+So `-R` accepts negative global points and still renders at the target's own scale. The
+five layouts (4K right / left / above / below / diagonally-negative of the built-in) are
+covered by `test_display_combos.py`, which drives the real matcher and the real bounds
+check rather than restating the arithmetic.
+
 ## What is still unverified
 
-- Whether Resolve's Color page **lays out identically** at 3840x2160 @2x with a project
-  loaded and the palette open. Only the palette icon was scored here. If the layout
-  differs, per CLAUDE.md the answer is a **second** template set beside the existing one —
-  never an edit to `dv_shim_templates/`.
-- `screencapture -R` at **negative origins** (a display arranged left of or above main).
-  The current arrangement is all-positive and cannot exercise it.
-- Behaviour when the host display sleeps or is unplugged mid-analysis.
+- Behaviour when the host display **sleeps or is unplugged mid-analysis**. A 4K dummy plug
+  rarely vanishes; a real monitor that sleeps does leave `CGGetActiveDisplayList`. Bounds
+  are re-read on every capture rather than cached at stage start, which is the mitigation,
+  but the mid-analysis case has not been exercised.
+- Two **identical** 4K panels. They are distinguished by ColorSync UUID, which they do
+  have; only the vendor/model/serial fallback would collide.
