@@ -729,6 +729,40 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, f.read(), "image/png")
             except Exception as e:
                 self._json({"error": f"screenshot failed: {e.__class__.__name__}: {e}"}, code=500)
+        elif path == "/api/resolve-preview.jpg":
+            # A small live frame of the screen the RESOLVE stage is driving, for the
+            # pipeline card. Downscaled and JPEG-encoded server-side: the host is 3840x2160
+            # and shipping full frames over the loopback several times a minute would cost
+            # far more than the capture itself. Only meaningful while resolve is running;
+            # the app only asks then.
+            try:
+                import tempfile, cv2, dv_shim
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    want_w = max(160, min(960, int((q.get("w") or ["420"])[0])))
+                except ValueError:
+                    want_w = 420
+                host, _why = preflight.chosen_host()
+                prev = dv_shim.get_host()
+                png = os.path.join(tempfile.gettempdir(), "_api_preview.png")
+                try:
+                    dv_shim.set_host(host)
+                    dv_shim.screenshot(png, attempts=1)
+                finally:
+                    dv_shim.set_host(prev)
+                img = cv2.imread(png)
+                if img is None:
+                    self._json({"error": "capture unreadable"}, code=503); return
+                h, w = img.shape[:2]
+                scale = want_w / float(w)
+                small = cv2.resize(img, (want_w, max(1, int(round(h * scale)))),
+                                   interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if not ok:
+                    self._json({"error": "encode failed"}, code=500); return
+                self._send(200, buf.tobytes(), "image/jpeg")
+            except Exception as e:
+                self._json({"error": f"{e.__class__.__name__}: {e}"}, code=500)
         elif path == "/api/shim-smoke":
             # Per-template match scores against the LIVE screen + display/lock context —
             # the acceptance gate for a display config and the first thing to check when

@@ -822,6 +822,12 @@ struct StageView: View {
                 if isActive {
                     VStack(alignment: .leading, spacing: 7) {
                         Text(info.how).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                        // Resolve is the one stage whose work is INVISIBLE from here — it is
+                        // driving a real UI, possibly on a screen you are not looking at. A
+                        // live frame of that screen is the only honest progress indicator it
+                        // has, and it is how you see a wrong-screen or stuck-dialog failure
+                        // without going to look.
+                        if info.key == "resolve" { ResolvePreview() }
                         if role == .finisher { FinisherProgress() }    // reads orchestrator.finishing
                         else { StageProgress(stageKey: info.key) }     // reads orchestrator.progress
                     }
@@ -838,6 +844,57 @@ struct StageView: View {
             }
             .help("\(info.desc)  (\(info.how))")
             .animation(.easeInOut(duration: 0.22), value: isActive)
+        }
+    }
+}
+
+/// A live frame of the screen the Resolve stage is driving, inside its pipeline card.
+///
+/// Polled rather than streamed: each frame is a real `screencapture` of a 3840x2160 panel,
+/// so the cadence is deliberately slow — this is a "what is it doing" window, not a video
+/// feed, and the machine is busy rendering. The server downscales and JPEG-encodes so the
+/// loopback isn't carrying full frames.
+struct ResolvePreview: View {
+    @EnvironmentObject var store: AppStore
+    @State private var frame: NSImage?
+    @State private var failed = false
+    private let tick = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Group {
+            if let img = frame {
+                Image(nsImage: img)
+                    .resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+                    .help("Live view of the screen Resolve is running on")
+            } else if !failed {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+                    .frame(height: 96)
+                    .overlay(ProgressView().controlSize(.small))
+            }
+        }
+        .onReceive(tick) { _ in Task { await load() } }
+        .task { await load() }
+    }
+
+    private func load() async {
+        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg?w=420") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200, let img = NSImage(data: data) else {
+                failed = true; return
+            }
+            frame = img
+            failed = false
+        } catch {
+            failed = true
         }
     }
 }
