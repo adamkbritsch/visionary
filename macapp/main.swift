@@ -30,11 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "Visionary"
         window.collectionBehavior = [.fullScreenNone]        // hard-block fullscreen/tiling
         window.standardWindowButton(.zoomButton)?.isHidden = true
-        // Dead centre, every launch. Deliberately NO setFrameAutosaveName: restoring the saved
-        // frame is what used to override the centring (the autosave restore runs when the name
-        // is set, i.e. after center()), so the window reappeared wherever it was last dragged.
-        window.setContentSize(NSSize(width: 1080, height: 620))   // size FIRST — centring uses it
-        Self.centreOnScreen(window)
+        // Deliberately NO setFrameAutosaveName: restoring the saved frame is what used to
+        // override the centring (the restore runs when the name is SET, right after center()),
+        // so the window reappeared wherever it was last dragged.
+        window.setContentSize(NSSize(width: 1080, height: 620))
         window.styleMask.insert(.fullSizeContentView)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden          // the HeaderBar is the title bar
@@ -42,6 +41,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = NSHostingView(rootView: RootView().environmentObject(store))
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
+        // Centre LAST, once the frame has stopped moving. Doing it earlier measured wrong:
+        // inserting .fullSizeContentView re-derives the frame from the content rect (the
+        // titlebar stops counting), which shifted an already-centred window by the titlebar's
+        // height. With every mutation done, what we centre is what is shown.
+        Self.centreOnScreen(window)
         NSApp.activate(ignoringOtherApps: true)
 
         store.start()
