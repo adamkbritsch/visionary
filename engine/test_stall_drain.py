@@ -155,3 +155,51 @@ class TruncatedRender(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DrainConvertsEverythingFirst(unittest.TestCase):
+    """User-dictated priority: with several Topaz exports waiting, push ALL of them through
+    Resolve first, THEN let the two remux lanes run.
+
+    The arithmetic backs it: Resolve is the serial bottleneck, and each conversion drops a
+    ~190 GiB ProRes while adding a ~18 GiB render — about +172 GiB freed per item. Holding
+    Resolve behind a remux keeps those intermediates on disk for a ~75-minute encode each.
+    """
+
+    def _orch(self, backlog, *, qsize=0, finishing=None, finishing2=None, lanes=2):
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._drain_backlog = lambda: backlog
+        o.state = {"finishing": finishing, "finishing2": finishing2}
+        o._finish_q = mock.Mock(qsize=lambda: qsize)
+        o._in_finisher = set()
+        o._finisher_lock = mock.MagicMock()
+        o._finisher_lock.__enter__ = lambda *_a: None
+        o._finisher_lock.__exit__ = lambda *_a: None
+        return o
+
+    def test_resolve_never_waits_while_a_backlog_exists(self):
+        o = self._orch(3, finishing={"stage": "remux"}, finishing2={"stage": "remux"})
+        with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
+            self.assertFalse(o._resolve_should_hold(),
+                             "both lanes full must NOT stop the conversions that free the disk")
+
+    def test_the_run_thread_is_not_backpressured_while_draining(self):
+        # The queued items are ~18 GiB each; the ones still to convert are ~190 GiB each.
+        # Holding here would keep the big things to avoid accumulating the small ones.
+        o = self._orch(3, qsize=5)
+        self.assertFalse(o._finisher_backlogged())
+
+    def test_normal_one_at_a_time_timing_is_untouched(self):
+        # No backlog -> exactly the old behaviour, both gates intact.
+        o = self._orch(1, finishing={"stage": "remux"})
+        self.assertTrue(o._resolve_should_hold())
+        o = self._orch(1, qsize=2)
+        self.assertTrue(o._finisher_backlogged())
+        o = self._orch(1, qsize=1)
+        self.assertFalse(o._finisher_backlogged())
+
+    def test_a_lone_leftover_item_is_not_treated_as_a_backlog(self):
+        # One segdir is the ordinary steady state, not a stall buffer.
+        o = self._orch(1, finishing={"stage": "remux"}, finishing2={"stage": "remux"})
+        with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
+            self.assertTrue(o._resolve_should_hold())

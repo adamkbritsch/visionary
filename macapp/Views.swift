@@ -337,10 +337,12 @@ struct HeaderBar: View {
 struct PowerPill: View {
     @EnvironmentObject var store: AppStore
 
-    /// (pipeline index, SF Symbol, percent) for the most-downstream stage actually executing.
-    private var leadStage: (Int, String, Int)? {
+    /// (pipeline index, SF Symbol, percent, second percent) for the most-downstream stage
+    /// actually executing. The 4th element is non-nil only when BOTH remux lanes are live at
+    /// that same stage — their pipeline indexes tie, so one number cannot represent them.
+    private var leadStage: (Int, String, Int, Int?)? {
         let o = store.state?.orchestrator
-        var best: (Int, String, Int)? = nil
+        var best: (Int, String, Int, Int?)? = nil
         func consider(_ stage: String?, _ pct: Int?) {
             guard let stage, !stage.isEmpty, let pct else { return }
             // `cleanup` has no PIPELINE card; it is past upload, so it sorts last and borrows
@@ -348,7 +350,11 @@ struct PowerPill: View {
             let idx = PIPELINE.firstIndex { $0.key == stage } ?? (stage == "cleanup" ? PIPELINE.count : -1)
             guard idx >= 0 else { return }
             let sym = PIPELINE.indices.contains(idx) ? PIPELINE[idx].symbol : PIPELINE.last!.symbol
-            if best == nil || idx > best!.0 { best = (idx, sym, pct) }
+            if let b = best, idx == b.0, b.3 == nil {
+                best = (b.0, b.1, b.2, pct)      // a tie IS the two-lane case — keep both
+            } else if best == nil || idx > best!.0 {
+                best = (idx, sym, pct, nil)
+            }
         }
         // The run thread — gated on stage_active, NEVER on `stage` alone: `stage` is stale by
         // design (set at stage start, never cleared) and would name a dead lane for a full
@@ -403,8 +409,13 @@ struct PowerPill: View {
             if let lead {
                 HStack(spacing: 4) {
                     Image(systemName: lead.1).font(.system(size: 11))
-                    Text("\(lead.2)%").monospacedDigit()
-                        .frame(width: 32, alignment: .trailing)
+                    // Two lanes -> "41% / 3%", in LANE ORDER, never sorted: a sorted pair
+                    // swaps position the instant one lane overtakes the other, which makes a
+                    // glanceable readout jitter for no information gained. The slot widens
+                    // rather than the numbers moving.
+                    Text(lead.3 == nil ? "\(lead.2)%" : "\(lead.2)% / \(lead.3!)%")
+                        .monospacedDigit()
+                        .frame(width: lead.3 == nil ? 32 : 74, alignment: .trailing)
                 }
             }
         }
@@ -415,7 +426,10 @@ struct PowerPill: View {
             var t = ac ? "Adapter wattage and battery level"
                        : "Running on battery — the pipeline pauses until the adapter is back"
             if let lead, PIPELINE.indices.contains(lead.0) {
-                t += "\n\(PIPELINE[lead.0].name) \(lead.2)% — the item closest to shipping"
+                t += lead.3 == nil
+                    ? "\n\(PIPELINE[lead.0].name) \(lead.2)% — the item closest to shipping"
+                    : "\n\(PIPELINE[lead.0].name) \u{00D7}2 — two items running at "
+                      + "\(lead.2)% and \(lead.3!)%"
             }
             return t
         }())
@@ -742,7 +756,11 @@ struct PipelineCard: View {
     func episodeLabel(_ role: StageRole) -> String? {
         let o = store.state?.orchestrator
         switch role {
-        case .finisher: return o?.finishing?.ep                       // already a display string
+        case .finisher:
+            // With both lanes live a single episode in the top-right is a lie by omission —
+            // the per-row labels carry identity instead, so this just says how many.
+            if o?.finishing2 != nil { return "\u{00D7}2" }
+            return o?.finishing?.ep                                   // already a display string
         case .run:      return runEpisodeShort(o?.current)
         case .inactive: return nil
         }
@@ -903,40 +921,88 @@ struct ResolvePreview: View {
 // orchestrator.finishing (its OWN pct/elapsed/eta), never orchestrator.progress (the run stage).
 struct FinisherProgress: View {
     @EnvironmentObject var store: AppStore
+
+    /// Both remux lanes, stacked. Lane 2 only exists while a Resolve-stall backlog drains —
+    /// usually nil, in which case this renders exactly what it always did.
     var body: some View {
-        if let f = store.state?.orchestrator?.finishing, let pct = f.pct {
-            let live = min(1, max(0, pct / 100))
-            // Same notched segment bar as Topaz — the remux is segmented too (dvcap ~5-min chunks):
-            // bright fill = completed segments (snaps to the last finished boundary + a flash when
-            // one lands), dark shadow = live progress through the current segment. Non-segmented
-            // finisher stages (upload) send no notches → a plain single bar, unchanged.
-            let notches = f.notches ?? []
-            let done = f.seg_done ?? 0
-            let completed: Double = notches.isEmpty ? live
-                : (done >= notches.count ? 1.0 : (done > 0 ? notches[done - 1] : 0))
-            VStack(alignment: .leading, spacing: 5) {
-                SteelBar(completed: completed, live: live, notches: notches, flashKey: done)
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(String(format: "%.0f%%", pct))
-                        .font(.system(size: 17, weight: .semibold)).monospacedDigit()
-                        .foregroundStyle(DS.steelBright)
-                    if let c = finHMS(f.elapsed_secs) {
-                        Text(c).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
-                    }
-                    if let e = finLeft(f.eta_secs) {
-                        Text(e).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
-                    }
-                    if let d = f.seg_done, let t = f.seg_total, t > 0 {
-                        Spacer()
-                        Text("\(min(d + 1, t))/\(t)")
-                            .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
-                    }
-                }
-            }
-            .padding(.top, 3)
+        let o = store.state?.orchestrator
+        VStack(alignment: .leading, spacing: 7) {
+            if let f = o?.finishing { LaneProgress(f: f, primary: true) }
+            if let f2 = o?.finishing2 { LaneProgress(f: f2, primary: false) }
         }
+        .padding(.top, 3)
     }
 }
+
+/// ONE remux lane. Extracted from FinisherProgress so the second lane can reuse it
+/// verbatim — the two lanes must not drift into two renderings of the same thing.
+///
+/// Two asymmetries are deliberate, not oversights:
+///  * Lane 2 carries NO elapsed clock. _set_finishing2_progress does not publish
+///    elapsed_secs ("the elapsed bookkeeping stays single-slot on lane 1"), so finHMS would
+///    be nil anyway. Showing a true-but-partial row beats inventing a number to match.
+///  * Only the CARD pulses, never a row. Two PulseDots beat against each other — each
+///    starts its own repeatForever on its own onAppear with no phase lock.
+private struct LaneProgress: View {
+    let f: FinishingDTO
+    let primary: Bool
+
+    // Fixed slots, sized to their worst cases ("100%", "~12h 59m left"), so a changing
+    // digit never moves the container edge and lane 2's eta sits directly under lane 1's —
+    // the layout makes the comparison instead of the reader.
+    private static let pctSlot: CGFloat = 46
+    private static let etaSlot: CGFloat = 96
+
+    private var held: String? { f.holding }
+
+    var body: some View {
+        let pct = f.pct ?? 0
+        let live = min(1, max(0, pct / 100))
+        // Same notched segment bar as Topaz — the remux is segmented too (dvcap ~5-min chunks):
+        // bright fill = completed segments (snaps to the last finished boundary + a flash when
+        // one lands), dark shadow = live progress through the current segment. Non-segmented
+        // finisher stages (upload) send no notches → a plain single bar, unchanged.
+        let notches = f.notches ?? []
+        let done = f.seg_done ?? 0
+        let completed: Double = notches.isEmpty ? live
+            : (done >= notches.count ? 1.0 : (done > 0 ? notches[done - 1] : 0))
+        VStack(alignment: .leading, spacing: 4) {
+            if !primary, let ep = f.ep, !ep.isEmpty {
+                // Lane 1's identity is the card's own top-right label; lane 2 needs its own.
+                Text(ep).font(.system(size: 11, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(DS.steel).lineLimit(1)
+            }
+            SteelBar(completed: completed, live: live, notches: notches, flashKey: done)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(f.pct == nil ? "—" : String(format: "%.0f%%", pct))
+                    .font(.system(size: primary ? 17 : 13, weight: .semibold)).monospacedDigit()
+                    .foregroundStyle(held == nil ? DS.steelBright : DS.steelDim)
+                    .frame(width: primary ? nil : Self.pctSlot, alignment: .leading)
+                if primary, let c = finHMS(f.elapsed_secs) {
+                    Text(c).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                // HELD, not stalled. A lane paused because Resolve took the machine keeps its
+                // last-known percentage on purpose; without saying so it reads as a hung encode.
+                if let h = held {
+                    Text("held").font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary).help(h)
+                } else if let e = finLeft(f.eta_secs) {
+                    Text(e).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: primary ? nil : Self.etaSlot, alignment: .leading)
+                }
+                if let d = f.seg_done, let t = f.seg_total, t > 0 {
+                    Spacer()
+                    Text("\(min(d + 1, t))/\(t)")
+                        .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .opacity(held == nil ? 1 : 0.65)
+    }
+}
+
 
 struct StageProgress: View {
     let stageKey: String

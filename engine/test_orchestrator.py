@@ -1150,12 +1150,17 @@ class DoubleRemux(unittest.TestCase):
         o.state["finishing"] = None
         self.assertFalse(o._resolve_should_hold())         # nothing remuxing, queue empty → proceed
 
-    def test_resolve_gate_lets_two_ahead_while_draining(self):
+    def test_resolve_converts_the_whole_backlog_before_yielding(self):
+        # POLICY CHANGE (user-dictated): with several Topaz exports waiting, ALL of them go
+        # through Resolve first; the remuxes run two-wide behind that. It used to let Resolve
+        # get exactly `finisher_lanes` ahead and then hold — which left ~190 GiB ProRes
+        # intermediates parked on disk for a ~75-minute encode each, while Resolve, the actual
+        # serial bottleneck, sat idle. Each conversion frees about +172 GiB net.
         o = orch.Orchestrator(); o._drain_backlog = lambda: 3
-        with mock.patch.object(o, "_in_finisher_keys", return_value={"A"}):
-            self.assertFalse(o._resolve_should_hold())     # only 1 in finisher → room for the 2nd remux
-        with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
-            self.assertTrue(o._resolve_should_hold())      # both lanes full → hold
+        for busy in ({"A"}, {"A", "B"}):
+            with mock.patch.object(o, "_in_finisher_keys", return_value=busy):
+                self.assertFalse(o._resolve_should_hold(),
+                                 f"must keep converting with lanes={busy}")
 
     def test_lane2_helps_any_item_queued_behind_a_busy_primary(self):
         # GENERAL dual-remux (user-widened from drain-only): any queued finisher item is by

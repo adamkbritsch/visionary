@@ -2246,8 +2246,18 @@ class Orchestrator:
         item's remux runs (user-dictated 1-at-a-time timing). But while DRAINING a Resolve-stall backlog
         of >=2 items, let Resolve get up to 'finisher_lanes' items ahead so a 2nd remux can run — hold
         only once every lane is full."""
+        # DRAINING: never hold. Convert the WHOLE backlog through Resolve first, then let the
+        # remuxes run two-wide behind it (user-dictated).
+        #
+        # The arithmetic is decisive rather than a preference. Resolve is the serial
+        # bottleneck — one at a time, and it takes the screen — while each conversion DROPS a
+        # ~190 GiB ProRes segdir and adds only a ~18 GiB render: about +172 GiB of free space
+        # per item. Holding Resolve behind the remuxes leaves those enormous intermediates on
+        # disk for the length of a ~75-minute x265 encode each. Converting first frees the
+        # disk fastest and leaves a queue of SMALL items that two lanes can then chew through
+        # in parallel — which is the whole point of having two lanes.
         if self._drain_backlog() >= 2:
-            return len(self._in_finisher_keys()) >= _finisher_lanes()
+            return False
         return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize(),
                                  self.state.get("finishing2"))
 
@@ -2261,6 +2271,14 @@ class Orchestrator:
         finisher item holds only ~10 GB post-drop, the resolve gate already holds the NEXT item at
         the resolve doorstep while anything is queued, and the disk gates guard raw free — so one
         waiter is safe to overlap; two says the finisher is genuinely behind."""
+        # ...EXCEPT while draining a Resolve-stall backlog, where the backpressure is exactly
+        # backwards. A queued finisher item is already past hand-off, so its ProRes is gone
+        # and it costs ~18 GiB; the items still waiting to convert cost ~190 GiB EACH. Holding
+        # the run thread here to avoid "stacking working sets" would keep the big things on
+        # disk to avoid accumulating the small ones — and it would stop the very Resolve
+        # conversions that free the space.
+        if self._drain_backlog() >= 2:
+            return False
         return self._finish_q.qsize() >= 2
 
     def _lane2_should_help(self) -> bool:
