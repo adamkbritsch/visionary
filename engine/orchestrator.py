@@ -620,14 +620,11 @@ class Orchestrator:
         self._plex_errs = 0                    # consecutive Plex-check failures (tolerate a couple of blips)
         self._stage_active = False             # True only while a heavy stage is executing
         self._progress_key = None              # (stage, ep) the current progress belongs to
-        self._seg_anchor = None                # (seg_done, monotonic) when the CURRENT segment began —
-                                               # the only source of time-spent-in-THIS-segment
         self._progress_start = 0.0             # when the CURRENT ETA window began
         self._progress_start_pct = 0.0         # the % already done when that window began (0 on a fresh stage)
         self._run_contended = False            # was the finisher's remux running at topaz's last tick?
-        self._fin_contended = False            # was the run thread's topaz running at the remux's last tick?
-                                               # (both: overlap changes the shared-power rate → re-anchor
-                                               #  the surviving stage's ETA window when the other ends/starts)
+                                               # (the run thread still re-anchors on that flip; the
+                                               #  finisher uses per-regime books instead — see _lane_eta)
         # per-(item, stage) elapsed accumulator (survives stop / turn / pause / restart — see _elapsed_*)
         self._elapsed_key = None               # f"{source_basename}|{stage}" of the running stage, or None
         self._elapsed_base = 0.0               # accumulated seconds BEFORE the current interval
@@ -653,10 +650,8 @@ class Orchestrator:
                                                # back into _finish_q/_in_finisher by _finisher_reconcile.
         self._cadence_advanced = set()         # items whose HAND-OFF already advanced the cadence —
                                                # loaded below with the counters (survives restarts)
-        self._fin2_eta_anchor = None           # (legacy) superseded by _lane_books; see _lane_eta
         self._lane_books = {}                  # lane -> eta.RateBook: per-REGIME (frames, seconds)
         self._lane_ticks = {}                  # lane -> (stage, frames, monotonic) of the last tick
-        self._fin_eta_anchor = None            # (stage, monotonic0, frames0) of THIS attempt — the
                                                # lane ETA must use the live rate, never the
                                                # accumulated elapsed (it spans killed attempts)
         self._cadence_lock = threading.Lock()  # cadence counters + CADENCE_FILE writes: the run thread
@@ -810,9 +805,6 @@ class Orchestrator:
             self._progress_key = key
             self._progress_start = now
             self._progress_start_pct = pct
-            self._seg_anchor = None            # new stage/item, or a resume: this segment's clock
-                                               # restarts (a resumed segment under-counts by
-                                               # whatever ran before the interruption)
         self._progress_last = now
         elapsed = now - self._progress_start
         advanced = pct - self._progress_start_pct
@@ -834,7 +826,15 @@ class Orchestrator:
                 self._progress_start, self._progress_start_pct = now, pct
                 elapsed, advanced = 0.0, 0.0
         if advanced > 0 and elapsed > 8:        # let a few seconds of real progress accrue first
-            info["eta_secs"] = elapsed * (100 - pct) / advanced
+            e_self = elapsed * (100 - pct) / advanced
+            # SYMMETRIC correction (see engine/eta.py): each job speeds up when the other ends,
+            # so whichever would finish SECOND spans two regimes. Usually that is the remux and
+            # topaz needs no correction — but near the end of a long remux the roles swap, and
+            # then topaz's own estimate is the one extrapolating the wrong regime.
+            if self._run_contended:
+                other = (self.state.get("finishing") or {}).get("eta_secs")
+                e_self = eta_math.two_phase_eta(e_self, other, eta_math.clamp_k(self._eta_k()))
+            info["eta_secs"] = e_self
             # Per-SEGMENT eta (topaz): the same windowed rate applied to the current segment's
             # remainder. The UI shows it only for a long segment (see seg_secs below), where the
             # stage-level eta alone reads as "hours away" with no sense of near-term motion.
@@ -845,12 +845,20 @@ class Orchestrator:
         # gates the per-segment countdown on this rather than on the remaining time, so the
         # number doesn't vanish just as the segment finishes; and on the segment ITSELF rather
         # than a projected average, so one slow segment is judged on its own.
-        sd = info.get("seg_done")
-        if sd is not None:
-            if self._seg_anchor is None or self._seg_anchor[0] != sd:
-                self._seg_anchor = (sd, now)               # a segment boundary just passed
-            if (se := info.get("seg_eta_secs")) is not None:
-                info["seg_secs"] = (now - self._seg_anchor[1]) + se
+        # Derived from the segment's OWN SPAN rather than a wall clock: `notches` already carries
+        # every boundary as a fraction of the stage, so the current segment's width is exactly
+        # notches[sd] - notches[sd-1]. Span / rate is its projected total no matter WHEN we
+        # started watching -- which is what a wall-clock anchor could not do, since a segment
+        # resumed mid-way (a deploy, a power blip) restarted the clock and under-counted by
+        # however much had already run.
+        if advanced > 0 and elapsed > 8:
+            sd, notches = info.get("seg_done"), info.get("notches")
+            if sd is not None and notches:
+                lo = notches[sd - 1] if sd > 0 else 0.0
+                hi = notches[sd] if sd < len(notches) else 1.0
+                span_pct = max(0.0, (hi - lo)) * 100.0
+                if span_pct > 0:
+                    info["seg_secs"] = span_pct * (elapsed / advanced)
         if self._elapsed_anchor is not None:    # accumulated real time in THIS stage of THIS item
             info["elapsed_secs"] = self._elapsed_value()
             mono = time.monotonic()
@@ -2274,19 +2282,25 @@ class Orchestrator:
         book.tick(regime, frames - prev[1], now - prev[2])
         self._lane_ticks[lane] = (stage, frames, now)
 
+        # The post-encode tail (concat, mux, verify, peak-measure) is invisible to progress, so
+        # it is added to every estimate -- otherwise the countdown reaches 0 with minutes of real
+        # work left, which is the most obviously wrong thing an ETA can do.
+        tail = eta_math.tail_estimate(total) if stage == "remux" else 0.0
         rate = book.rate(regime)
         if rate is None or rate <= 0:
             return None
+        if frames >= total:                         # encoding done; only the tail remains
+            return round(tail, 1)
         e_self = (total - frames) / rate            # this regime's honest extrapolation
         if regime != eta_math.CONTENDED or not eta_math.correction_applies(
                 run_stage=run_stage, run_active=run_active):
-            return round(e_self, 1)                 # solo, or Resolve about to preempt us
+            return round(e_self + tail, 1)          # solo, or Resolve about to preempt us
 
         # Prefer THIS item's own measured ratio the moment it exists — a same-item comparison
         # cancels the scene-complexity confound that makes cross-item ratios noisy.
         k = book.k_observed() or self._eta_k()
         other = (self.state.get("progress") or {}).get("eta_secs")
-        return round(eta_math.two_phase_eta(e_self, other, eta_math.clamp_k(k)), 1)
+        return round(eta_math.two_phase_eta(e_self, other, eta_math.clamp_k(k)) + tail, 1)
 
     def _eta_k(self) -> float:
         """The learned solo/contended speed-up, shrunk toward the physical prior."""
@@ -2336,7 +2350,7 @@ class Orchestrator:
 
     def _set_finishing2_progress(self, info):
         """The 2nd remux lane's progress surface (state['finishing2']) — a lightweight mirror of
-        _set_finishing_progress. It keeps its OWN eta anchor (`_fin2_eta_anchor`); the elapsed
+        _set_finishing_progress. It keeps its own RateBook (see _lane_eta); the elapsed
         bookkeeping stays single-slot on lane 1. Without an ETA here the UI could only ever say
         "Remux x2 - 3% / 41%" with no time against the slower lane."""
         f = dict(self.state.get("finishing2") or {})
@@ -2421,7 +2435,6 @@ class Orchestrator:
                         self._in_finisher_movies.discard(self._skip_key(p))
                     self._record_k(2)   # bank this item's own solo/contended ratio
                     self.state["finishing2"] = None
-                    self._fin2_eta_anchor = None    # next item must not extrapolate off this one's rate
 
     def _finish_item(self, p: EpisodePaths, run_stage, lane=1):
         ep_disp = transfer.display_name(p.ep)

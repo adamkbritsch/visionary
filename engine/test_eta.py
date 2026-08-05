@@ -136,6 +136,20 @@ class LearningK(unittest.TestCase):
         self.assertEqual(eta.clamp_k(99), eta.K_MAX)
 
 
+class Tail(unittest.TestCase):
+    """After the last frame the remux still owes concat, mux, verify and a full peak measure —
+    all invisible to progress, which is why the countdown used to reach 0 with work left."""
+
+    def test_it_scales_with_the_output(self):
+        self.assertAlmostEqual(eta.tail_estimate(67_000), 268.0, delta=1.0)   # ~4.5 min
+        self.assertGreater(eta.tail_estimate(150_000), eta.tail_estimate(67_000))
+
+    def test_it_never_reports_zero_while_work_remains(self):
+        self.assertGreaterEqual(eta.tail_estimate(0), eta.TAIL_MIN_SECS)
+        self.assertGreaterEqual(eta.tail_estimate(None), eta.TAIL_MIN_SECS)
+        self.assertGreaterEqual(eta.tail_estimate("junk"), eta.TAIL_MIN_SECS)
+
+
 class Regimes(unittest.TestCase):
     def test_a_live_topaz_or_download_means_contended(self):
         self.assertEqual(eta.regime_of(run_stage="topaz", run_active=True), eta.CONTENDED)

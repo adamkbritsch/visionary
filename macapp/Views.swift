@@ -2422,6 +2422,9 @@ struct RootView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     GrantsCard()
+                    // Faults had NO surface in the app: this was defined but never mounted, and
+                    // state.log is read nowhere else. It renders nothing while the log is empty.
+                    IssuesBanner()
                     PipelineCard()
                     SeriesCard()
                     // (Settings moved to the header gear — see HeaderBar / SettingsPopover.)

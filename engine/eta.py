@@ -61,6 +61,23 @@ K_SAMPLE_CAP = 30
 CONTENDED = "contended"
 SOLO = "solo"
 
+# After the last frame is encoded the remux is FAR from finished: concat of the whole elementary
+# stream, LUFS measure, audio/subtitle extract, MP4Box mux, verify, and a full packet-level peak
+# measurement of the shipped 4K file. All of it is invisible to progress, so the countdown used to
+# reach 0 with many minutes left. Every one of those terms is linear in output size, so the tail
+# is modelled per 1000 frames and learned from what actually happens.
+TAIL_SECS_PER_KFRAME = 4.0        # prior: ~4.5 min on a ~67k-frame episode
+TAIL_MIN_SECS = 20.0              # never show 0 while a process is alive
+
+
+def tail_estimate(total_frames, secs_per_kframe: float = TAIL_SECS_PER_KFRAME) -> float:
+    """Seconds of post-encode work still owed once the last frame lands."""
+    try:
+        t = max(0.0, float(total_frames or 0))
+    except (TypeError, ValueError):
+        return TAIL_MIN_SECS
+    return max(TAIL_MIN_SECS, (t / 1000.0) * float(secs_per_kframe))
+
 
 def accept_sample(df, dt, max_fps: float = R_MAX_FPS) -> bool:
     """Is this (frames, seconds) interval real encoding evidence?

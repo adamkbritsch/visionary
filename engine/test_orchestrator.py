@@ -703,49 +703,65 @@ class ElapsedAccumulator(unittest.TestCase):
 
 
 class SegmentTotal(unittest.TestCase):
-    """`seg_secs` = time already spent in THIS segment + what it has left. The UI gates the
-    per-segment countdown on it, so the number must not shrink as the segment progresses —
-    gating on the remainder made it vanish exactly as it counted down to zero."""
+    """`seg_secs` = this segment's PROJECTED TOTAL, used to gate the per-segment countdown.
 
-    # _set_progress reads time.time(), and re-anchors its whole window on a >30 s gap between
-    # ticks (that is how it survives a stop/resume) — so the ticks here stay inside that.
-    # Times are offset off zero: _set_progress guards its gap check with `if self._progress_last`,
-    # so a literal 0.0 timestamp reads as falsy and re-anchors the window on the next tick.
+    Derived from the segment's own SPAN (notches already carry every boundary as a fraction of
+    the stage) divided by the current rate — never from a wall clock. That is what makes it
+    resume-proof: a segment interrupted mid-way and picked back up must still report its whole
+    length, not just the part we happened to watch."""
+
     T0 = 10_000.0
+    NOTCHES = [round(0.1 * i, 4) for i in range(1, 11)]      # ten equal 10% segments
 
-    def _tick(self, o, t, pct, seg_done, seg_rem_pct):
+    def _tick(self, o, t, pct, seg_done=0, rem=None):
         with mock.patch.object(orch.time, "time", return_value=self.T0 + t):
             o._set_progress({"stage": "topaz", "ep": "S01E01", "pct": pct,
-                             "seg_done": seg_done, "seg_total": 10, "seg_rem_pct": seg_rem_pct})
+                             "seg_done": seg_done, "seg_total": 10,
+                             "notches": self.NOTCHES,
+                             "seg_rem_pct": rem if rem is not None else 0.0})
         return o.state["progress"]
 
-    def test_total_is_elapsed_in_segment_plus_its_remaining(self):
+    def test_total_is_the_segments_span_over_the_current_rate(self):
         o = orch.Orchestrator()
-        self._tick(o, 0.0, 0, 0, 20.0)              # anchors the window and the segment
-        p = self._tick(o, 20.0, 10, 0, 10.0)        # 10% in 20 s -> 2 s per %
-        self.assertAlmostEqual(p["seg_eta_secs"], 20.0, delta=1.0)   # 10% left -> 20 s
-        self.assertAlmostEqual(p["seg_secs"], 40.0, delta=1.0)       # 20 s spent + 20 s left
+        self._tick(o, 0.0, 0)
+        p = self._tick(o, 20.0, 10)          # 10% in 20 s -> 2 s/%; a 10% segment -> 20 s
+        self.assertAlmostEqual(p["seg_secs"], 20.0, delta=0.5)
 
     def test_the_total_does_not_shrink_while_the_segment_runs(self):
-        # THE POINT: the remaining time falls, the total holds — so a gate on the total keeps
-        # the countdown on screen for the whole segment instead of dropping it at the end.
+        # THE POINT: the remaining time falls, the total holds, so a gate on the total keeps the
+        # countdown on screen for the whole segment instead of dropping it at the end.
         o = orch.Orchestrator()
-        self._tick(o, 0.0, 0, 0, 20.0)
-        a = self._tick(o, 20.0, 10, 0, 10.0)
-        b = self._tick(o, 30.0, 15, 0, 5.0)
+        self._tick(o, 0.0, 0)
+        a = self._tick(o, 20.0, 10, rem=10.0)
+        b = self._tick(o, 30.0, 15, rem=5.0)
         self.assertLess(b["seg_eta_secs"], a["seg_eta_secs"])            # remaining falls...
-        self.assertAlmostEqual(b["seg_secs"], a["seg_secs"], delta=2.0)  # ...total holds steady
+        self.assertAlmostEqual(b["seg_secs"], a["seg_secs"], delta=0.5)  # ...total holds
 
-    def test_a_new_segment_restarts_the_segment_clock(self):
-        # A slower rate than the tests above: >0.5 %/s trips the topaz replay-leap guard, which
-        # re-anchors the whole window and suppresses the estimate.
+    def test_it_is_RESUME_PROOF(self):
+        # REGRESSION: the wall-clock version restarted its clock on a resume, so a segment picked
+        # back up half-done reported only the half we watched. Two runs at the same rate — one
+        # watching from the segment's start, one joining midway — must agree on its total.
+        whole = orch.Orchestrator()                             # ticks < 30 s apart: a wider gap
+        self._tick(whole, 0.0, 0)                               # reads as a resume and re-anchors
+        self._tick(whole, 20.0, 10)
+        a = self._tick(whole, 40.0, 20, seg_done=1, rem=5.0)    # 2 s/%, inside segment 2
+
+        joined = orch.Orchestrator()                            # a fresh process, mid-segment
+        self._tick(joined, 0.0, 15, seg_done=1)
+        b = self._tick(joined, 10.0, 20, seg_done=1, rem=5.0)   # same 2 s/%
+        self.assertAlmostEqual(a["seg_secs"], b["seg_secs"], delta=0.5)
+
+    def test_a_wider_segment_reports_a_longer_total(self):
         o = orch.Orchestrator()
-        self._tick(o, 0.0, 0, 0, 20.0)
-        self._tick(o, 20.0, 6, 0, 14.0)
-        p = self._tick(o, 25.0, 8, 1, 18.0)         # seg_done advanced -> a boundary passed
-        # the new segment has only just begun, so its total is ~its remaining — NOT the 25 s
-        # already spent on the previous one plus the new remainder
-        self.assertLess(p["seg_secs"], 25.0 + p["seg_eta_secs"] - 1)
+        o_notches = [0.05, 0.40, 1.0]                          # 5%, then a fat 35% segment
+        with mock.patch.object(orch.time, "time", return_value=self.T0):
+            o._set_progress({"stage": "topaz", "ep": "E", "pct": 5, "seg_done": 1,
+                             "seg_total": 3, "notches": o_notches, "seg_rem_pct": 35.0})
+        with mock.patch.object(orch.time, "time", return_value=self.T0 + 20.0):
+            o._set_progress({"stage": "topaz", "ep": "E", "pct": 15, "seg_done": 1,
+                             "seg_total": 3, "notches": o_notches, "seg_rem_pct": 25.0})
+        p = o.state["progress"]
+        self.assertAlmostEqual(p["seg_secs"], 35.0 * 2.0, delta=1.0)     # 35% span at 2 s/%
 
 
 class HoldCodes(unittest.TestCase):
@@ -820,7 +836,7 @@ class Lane2Eta(unittest.TestCase):
         o = orch.Orchestrator()
         self.assertIsNone(self._feed(o, 1000, 10_000, 0.0).get("eta_secs"))  # first tick: no estimate
         f = self._feed(o, 2000, 10_000, 200.0)      # 1000 frames in 200 s = 5 fps -> 8000 left
-        self.assertAlmostEqual(f["eta_secs"], 1600.0, delta=10.0)
+        self.assertAlmostEqual(f["eta_secs"], 1600.0 + eta_math.tail_estimate(10_000), delta=10.0)
 
     def test_lane2_does_not_extrapolate_off_noise(self):
         o = orch.Orchestrator()
@@ -1693,7 +1709,9 @@ class ContentionETA(unittest.TestCase):
             self._tick(o, t, fr)
         self.assertAlmostEqual(o._lane_books[1].rate(eta_math.SOLO), 3.0, delta=0.1)
         eta_secs = (o.state["finishing"] or {}).get("eta_secs")
-        self.assertAlmostEqual(eta_secs, (200_000 - fr) / 3.0, delta=200)
+        # + the post-encode tail (concat/mux/verify/peak-measure), which is invisible to progress
+        expect = (200_000 - fr) / 3.0 + eta_math.tail_estimate(200_000)
+        self.assertAlmostEqual(eta_secs, expect, delta=200)
 
 
 class CadenceOncePerItem(unittest.TestCase):
@@ -1952,7 +1970,8 @@ class FinisherEta(unittest.TestCase):
             o._set_finishing_progress({"stage": "remux", "frames": 2500, "total": 41071, "pct": 6.1})
         eta = (o.state["finishing"] or {}).get("eta_secs")
         self.assertIsNotNone(eta)
-        self.assertAlmostEqual(eta, (41071 - 2500) / 10.0, delta=1)   # ~3857 s, NOT 38 h
+        expect = (41071 - 2500) / 10.0 + eta_math.tail_estimate(41071)
+        self.assertAlmostEqual(eta, expect, delta=1)                  # ~4021 s, NOT 38 h
 
     def test_no_eta_until_warmup(self):
         o = orch.Orchestrator()
