@@ -266,8 +266,15 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
   parallel** on a second lane (Topaz pauses until a lane frees, so the two x265 encodes
   get the machine). High-bitrate fast-path items don't serialize either: while one is
   remuxing, the next item starts — its Resolve included, fast-path or full pipeline.
-  Resolve always gets the whole machine (the in-flight remux pauses at its next ~5-min
-  segment and resumes losslessly after), and simultaneous remuxes stay capped at two.
+  Resolve always gets the whole machine: the in-flight remuxes are **suspended outright**
+  the instant it starts (SIGSTOP, so they use no CPU) and resume exactly where they were —
+  no lost work, and no waiting for a segment boundary. Simultaneous remuxes stay capped at
+  two.
+
+<p align="center">
+  <img src="docs/assets/dual-remux.png" alt="The pipeline card with two remux lanes running at once, and the header showing both percentages" width="900">
+</p>
+<p align="center"><sub><b>Both remux lanes live</b> — each names its own episode and carries its own progress, segment counter and ETA; the header readout shows both at once. Lane 2 shows no elapsed clock because the engine keeps that bookkeeping on lane 1 only.</sub></p>
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K
