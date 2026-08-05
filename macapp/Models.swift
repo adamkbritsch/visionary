@@ -120,6 +120,7 @@ struct ShowSettingsDTO: Codable {
     var normalize_audio: Bool?
     var replace_source: Bool?
     var output_mode: String?      // "auto" | "sdr" | "dv1000" | "dv2000"
+    var output_mode_effective: String?   // what it will ACTUALLY master as (auto already resolved)
 }
 
 struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (all rendered the same)
@@ -131,6 +132,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var normalize_audio: Bool?    // per-show loudness-boost gate (default on)
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
     var output_mode: String?      // what Resolve OUTPUTS: auto | sdr | dv1000 | dv2000
+    var output_mode_effective: String?   // auto already resolved against the source range
     var next_up: String?          // show queued to take this slot when this one finishes
     var next_up_armed: Bool?      // <10% left -> the follow-up is locked in + pre-downloading
     var near_done: Bool?          // >=90% done -> only then is "queue a follow-up" offered
@@ -157,6 +159,7 @@ struct MovieItemDTO: Codable, Identifiable {
     var normalize_audio: Bool?   // per-movie loudness-boost gate (keyed by title, like preset)
     var replace_source: Bool?    // per-movie upload policy (keyed by title, like preset)
     var output_mode: String?     // per-movie output range (keyed by title, like preset)
+    var output_mode_effective: String?  // auto already resolved against the source range
     var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
     var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
     var id: String { name ?? title ?? "" }
@@ -193,6 +196,7 @@ struct YouTubeChannelDTO: Codable, Identifiable {   // a queued channel (standin
     var preset: String?       // per-channel Topaz preset (keyed by folder)
     var normalize_audio: Bool?   // per-channel loudness-boost gate (keyed by folder, like preset)
     var output_mode: String?  // per-channel output range (keyed by folder, like preset)
+    var output_mode_effective: String?   // auto already resolved (youtarr sources are SDR)
     var pending: Int?         // videos to upscale (within cap + scope, not done)
     var downloaded: Int?      // videos youtarr has on disk
     var id: String { channelId ?? title ?? "" }
@@ -292,6 +296,7 @@ struct ShowProfileDTO: Codable {
     var normalize_audio: Bool?
     var replace_source: Bool?
     var output_mode: String?
+    var output_mode_effective: String?
     var catalog: [PresetDTO]?
 }
 

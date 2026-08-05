@@ -681,6 +681,8 @@ def queue_view() -> dict:
                       "normalize_audio": settings.get_show_normalize_audio(folder or ""),
                       # per-channel output range (auto / sdr / dv1000 / dv2000), same key
                       "output_mode": settings.get_show_output_mode(folder or ""),
+                      # youtarr's downloads are SDR, so auto always means the 1000-nit ceiling
+                      "output_mode_effective": settings.effective_output_mode(folder or "", False),
                       "pending": len(channel_pending(e)), "downloaded": len(cached_videos(folder))})
     return {"items": items, "count": len(items), "connected": _connected()}
 

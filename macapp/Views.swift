@@ -1166,7 +1166,7 @@ private struct TVMode: View {
                 }
                 Spacer()
             }
-            OutputModeRow(key: name, mode: show.output_mode ?? "auto", locked: locked)
+            OutputModeRow(key: name, effective: show.output_mode_effective ?? "dv1000", locked: locked)
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
             if (show.queue?.featurette_count ?? 0) > 0 {
@@ -1311,7 +1311,7 @@ private struct NextUpRow: View {
                         .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
                         Spacer()
                     }
-                    OutputModeRow(key: n, mode: profile?.output_mode ?? "auto")
+                    OutputModeRow(key: n, effective: profile?.output_mode_effective ?? "dv1000")
                     NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
                     if profile?.has_featurettes == true {
@@ -1428,24 +1428,21 @@ private struct ReplaceSourceRow: View {
 private struct OutputModeRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
-    let mode: String
+    /// What the item will ACTUALLY master as — the engine already resolved "automatic"
+    /// against the source range, so the row never shows a word the user has to translate.
+    let effective: String
     var locked: Bool = false          // hides Change (TV passes the run-lock)
     @State private var confirming = false
 
-    private static let modes = ["auto", "sdr", "dv1000", "dv2000"]
+    private static let modes = ["dv1000", "dv2000", "sdr"]
     private static func label(_ m: String) -> String {
         switch m {
         case "sdr":    return "SDR"
-        case "dv1000": return "Dolby Vision 1000 nits"
         case "dv2000": return "Dolby Vision 2000 nits"
-        // NOT "matches the source" — that reads as SDR in, SDR out, which is the exact
-        // OPPOSITE of what happens. Automatically the output is ALWAYS Dolby Vision; the
-        // source only chooses the mastering ceiling, and it does so per episode (from that
-        // file's color transfer), so no single nits number is honest here.
-        default:       return "Automatic Dolby Vision"
+        default:       return "Dolby Vision 1000 nits"
         }
     }
-    private var current: String { Self.modes.contains(mode) ? mode : "auto" }
+    private var current: String { Self.modes.contains(effective) ? effective : "dv1000" }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1456,9 +1453,9 @@ private struct OutputModeRow: View {
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.07)))
-                .help("What Resolve outputs. Automatic is always Dolby Vision — an SDR source "
-                      + "masters to 1000 nits, an HDR source to 2000, decided per episode. The "
-                      + "other three pin every item here, whatever the source is.")
+                .help("What Resolve masters this as. Left alone it follows the source — an SDR "
+                      + "source to 1000 nits, an HDR source to 2000 — and it is always Dolby "
+                      + "Vision. SDR is a manual choice only.")
             if !locked {
                 Button("Change") { confirming = true }
                     .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
@@ -1466,16 +1463,19 @@ private struct OutputModeRow: View {
             Spacer()
         }
         .confirmationDialog("Output range", isPresented: $confirming, titleVisibility: .visible) {
+            // The CURRENT value first and as the default action, so the highlighted button is
+            // what the item is on now — not whatever happened to sort first.
+            Button(Self.label(current) + " (current)") {}
+                .keyboardShortcut(.defaultAction)
             ForEach(Self.modes.filter { $0 != current }, id: \.self) { m in
                 Button(Self.label(m)) { Task { await store.setOutputMode(key, m) } }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Automatic is the normal behaviour and always produces Dolby Vision: an SDR "
-                 + "source masters to 1000 nits, an HDR source to 2000. Pinning overrides that "
-                 + "for everything here — SDR is only ever a manual choice. SDR masters are "
-                 + "named differently from Dolby Vision ones, so anything already finished "
-                 + "keeps the range it shipped with.")
+            Text("Left alone, an item follows its source and is always Dolby Vision: an SDR "
+                 + "source masters to 1000 nits, an HDR source to 2000. Picking a value pins it "
+                 + "whatever the source is. SDR masters are named differently from Dolby Vision "
+                 + "ones, so anything already finished keeps the range it shipped with.")
         }
     }
 }
@@ -1585,7 +1585,7 @@ private struct MovieRow: View {
             .help("Tap to change this movie's Topaz preset")
             // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
             // Change buttons must not trigger it. Keyed by TITLE (the movie's settings key).
-            OutputModeRow(key: m.title ?? m.name ?? "", mode: m.output_mode ?? "auto")
+            OutputModeRow(key: m.title ?? m.name ?? "", effective: m.output_mode_effective ?? "dv1000")
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
             NormalizeAudioRow(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
@@ -1817,7 +1817,7 @@ private struct ChannelRow: View {
             .contentShape(Rectangle())
             // Under the channel's control row; keyed by FOLDER (the channel's settings key).
             // Dimmed with the row's other controls while paused (it sits outside their Group).
-            OutputModeRow(key: ch.folder_name ?? "", mode: ch.output_mode ?? "auto")
+            OutputModeRow(key: ch.folder_name ?? "", effective: ch.output_mode_effective ?? "dv1000")
                 .disabled(paused).opacity(paused ? 0.35 : 1)
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)

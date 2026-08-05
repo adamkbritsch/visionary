@@ -13,6 +13,7 @@ decided by the input plan (2× for 1080p, 1× for already-4K). See plan.py.
 """
 from __future__ import annotations
 import json
+import re
 import os
 import threading
 
@@ -407,6 +408,29 @@ def set_show_output_mode(key: str, value) -> str:
     v = value if value in OUTPUT_MODES else "auto"
     _update_show(key, output_mode=v)
     return v
+
+
+# Filename evidence that a SOURCE is already HDR. Token-bounded so "DVDRip" is not read as
+# Dolby Vision and "SDR" is not read as HDR. This is only ever used to DISPLAY what "auto"
+# will do — the real decision still comes from ffprobe's color transfer at stage time.
+_HDR_TOKENS = re.compile(
+    r"(?<![A-Za-z0-9])(HDR10\+?|HDR|HLG|PQ|DV|DoVi|Dolby[ ._-]?Vision)(?![A-Za-z0-9])",
+    re.IGNORECASE)
+
+
+def looks_hdr(name) -> bool:
+    return bool(name) and bool(_HDR_TOKENS.search(str(name)))
+
+
+def effective_output_mode(key: str, hdr_source: bool = False) -> str:
+    """What the item will ACTUALLY be mastered as — a pin if there is one, otherwise the
+    automatic rule resolved against the source range. Automatic is always Dolby Vision:
+    1000 nits from an SDR source, 2000 from an HDR one. This is what the app displays, so
+    the row never shows an abstract "auto" the user has to translate."""
+    m = get_show_output_mode(key)
+    if m in ("sdr", "dv1000", "dv2000"):
+        return m
+    return "dv2000" if hdr_source else "dv1000"
 
 
 def is_sdr_output(key: str) -> bool:

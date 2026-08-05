@@ -165,6 +165,9 @@ def series_info():
                       "normalize_audio": settings.get_show_normalize_audio(nm),
                       "replace_source": settings.get_show_replace_source(nm),
                       "output_mode": settings.get_show_output_mode(nm),
+                      # what it will ACTUALLY master as — the app shows this, not "auto"
+                      "output_mode_effective": settings.effective_output_mode(
+                          nm, _show_hdr_hint(nm)),
                       "next_up": nu,
                       "next_up_armed": series.next_up_armed(nm),
                       # ≥90% done — the UI only offers "queue a follow-up" from here
@@ -358,6 +361,25 @@ def api_mode(mode):
     return out
 
 
+def _show_hdr_hint(name) -> bool:
+    """Filename evidence that a show's SOURCES are HDR — used only to display which ceiling
+    "auto" will pick. Reads the CACHED queue (no network), and takes the majority of the
+    remaining sources so one oddly-named file can't flip the whole show."""
+    try:
+        q = series.cached_queue(name) or {}
+        names = [i.get("source_name") for i in (q.get("remaining_items") or [])][:40]
+        nxt = (q.get("next") or {}).get("source_name")
+        if nxt and nxt not in names:
+            names.append(nxt)
+        names = [n for n in names if n]
+        if not names:
+            return False
+        hdr = sum(1 for n in names if settings.looks_hdr(n))
+        return hdr * 2 > len(names)
+    except Exception:
+        return False
+
+
 def show_settings_view(name) -> dict:
     """The per-show settings that can be set for ANY show — active or merely queued as a
     slot's follow-up (all three live in show_profiles.json keyed by show name)."""
@@ -369,7 +391,8 @@ def show_settings_view(name) -> dict:
             "has_featurettes": int((series.cached_queue(name) or {}).get("featurette_count", 0)) > 0,
             "normalize_audio": settings.get_show_normalize_audio(name),
             "replace_source": settings.get_show_replace_source(name),
-            "output_mode": settings.get_show_output_mode(name)}
+            "output_mode": settings.get_show_output_mode(name),
+            "output_mode_effective": settings.effective_output_mode(name, _show_hdr_hint(name))}
 
 
 def api_series():
@@ -422,6 +445,8 @@ def show_profile_info(show=None):
             "normalize_audio": settings.get_show_normalize_audio(target) if target else True,
             "replace_source": settings.get_show_replace_source(target) if target else True,
             "output_mode": settings.get_show_output_mode(target) if target else "auto",
+            "output_mode_effective": (settings.effective_output_mode(target, _show_hdr_hint(target))
+                                      if target else "dv1000"),
             "catalog": settings.preset_catalog()}
 
 
