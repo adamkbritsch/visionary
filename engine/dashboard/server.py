@@ -380,6 +380,62 @@ def _show_hdr_hint(name) -> bool:
         return False
 
 
+# --- RESOLVE SCREEN PREVIEW ----------------------------------------------------------------
+# One capture at a time, shared by every request. A capture of the 4K host measured 1.9-9.9 s
+# under load, so the endpoint must never do it inline.
+_PREVIEW = {"jpg": None, "at": 0.0, "busy": False}
+_PREVIEW_LOCK = threading.Lock()
+PREVIEW_MAX_AGE = 1.0        # refresh if the newest frame is older than this
+PREVIEW_STALE = 15.0         # ...and stop serving one this old entirely
+
+
+def _preview_capture():
+    """Capture + downscale + JPEG-encode one frame of the display the resolve stage drives."""
+    try:
+        import tempfile, cv2, dv_shim
+        png = os.path.join(tempfile.gettempdir(), "_api_preview.png")
+        host, _why = preflight.chosen_host()
+        prev = dv_shim.get_host()
+        try:
+            dv_shim.set_host(host)
+            dv_shim.screenshot(png, attempts=1)
+        finally:
+            dv_shim.set_host(prev)
+        img = cv2.imread(png)
+        if img is None:
+            return
+        h, w = img.shape[:2]
+        want_w = 420
+        small = cv2.resize(img, (want_w, max(1, int(round(h * (want_w / float(w)))))),
+                           interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if ok:
+            with _PREVIEW_LOCK:
+                _PREVIEW["jpg"] = buf.tobytes()
+                _PREVIEW["at"] = time.time()
+    except Exception:
+        pass
+    finally:
+        with _PREVIEW_LOCK:
+            _PREVIEW["busy"] = False
+
+
+def _preview_frame():
+    """The newest frame, kicking off a refresh when it is getting old. Never blocks."""
+    now = time.time()
+    with _PREVIEW_LOCK:
+        jpg, at, busy = _PREVIEW["jpg"], _PREVIEW["at"], _PREVIEW["busy"]
+        due = (now - at) > PREVIEW_MAX_AGE
+        if due and not busy:
+            _PREVIEW["busy"] = True
+            start = True
+        else:
+            start = False
+    if start:
+        threading.Thread(target=_preview_capture, daemon=True).start()
+    return jpg if (jpg is not None and (now - at) < PREVIEW_STALE) else None
+
+
 def displays_view() -> dict:
     """Every attached screen, whether it can host Resolve, and the saved priority."""
     import displays as _dsp        # noqa: F401  (imported for the side of a clear error)
@@ -674,10 +730,12 @@ def current_state():
 # ---- HTTP -----------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -730,39 +788,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"error": f"screenshot failed: {e.__class__.__name__}: {e}"}, code=500)
         elif path == "/api/resolve-preview.jpg":
-            # A small live frame of the screen the RESOLVE stage is driving, for the
-            # pipeline card. Downscaled and JPEG-encoded server-side: the host is 3840x2160
-            # and shipping full frames over the loopback several times a minute would cost
-            # far more than the capture itself. Only meaningful while resolve is running;
-            # the app only asks then.
-            try:
-                import tempfile, cv2, dv_shim
-                q = parse_qs(urlparse(self.path).query)
-                try:
-                    want_w = max(160, min(960, int((q.get("w") or ["420"])[0])))
-                except ValueError:
-                    want_w = 420
-                host, _why = preflight.chosen_host()
-                prev = dv_shim.get_host()
-                png = os.path.join(tempfile.gettempdir(), "_api_preview.png")
-                try:
-                    dv_shim.set_host(host)
-                    dv_shim.screenshot(png, attempts=1)
-                finally:
-                    dv_shim.set_host(prev)
-                img = cv2.imread(png)
-                if img is None:
-                    self._json({"error": "capture unreadable"}, code=503); return
-                h, w = img.shape[:2]
-                scale = want_w / float(w)
-                small = cv2.resize(img, (want_w, max(1, int(round(h * scale)))),
-                                   interpolation=cv2.INTER_AREA)
-                ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                if not ok:
-                    self._json({"error": "encode failed"}, code=500); return
-                self._send(200, buf.tobytes(), "image/jpeg")
-            except Exception as e:
-                self._json({"error": f"{e.__class__.__name__}: {e}"}, code=500)
+            # Serve the LATEST captured frame immediately and refresh in the background.
+            #
+            # Capturing per request does not work: measured at 1.9 s, 9.9 s and 3.7 s for one
+            # frame of a 3840x2160 panel while Resolve has the machine. A 2 s client poll
+            # therefore queued requests faster than they completed — every frame arrived
+            # stale, and overlapping requests raced on one shared temp file. Decoupling the
+            # two means the client always gets the freshest frame that EXISTS, at whatever
+            # rate captures actually manage, and never waits on one.
+            frame = _preview_frame()
+            if frame is None:
+                self._send(204, b"", "image/jpeg")     # nothing captured yet — try again
+            else:
+                self._send(200, frame, "image/jpeg")
         elif path == "/api/shim-smoke":
             # Per-template match scores against the LIVE screen + display/lock context —
             # the acceptance gate for a display config and the first thing to check when

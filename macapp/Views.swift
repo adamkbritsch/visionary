@@ -904,7 +904,7 @@ struct ResolvePreview: View {
     @EnvironmentObject var store: AppStore
     @State private var frame: NSImage?
     @State private var failed = false
-    private let tick = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
+
 
     var body: some View {
         Group {
@@ -923,24 +923,39 @@ struct ResolvePreview: View {
                     .overlay(ProgressView().controlSize(.small))
             }
         }
-        .onReceive(tick) { _ in Task { await load() } }
-        .task { await load() }
+        // THE FREEZE. This used to drive itself off a stored
+        // `Timer.publish(...).autoconnect()`. A stored property is rebuilt every time the
+        // view is re-initialised, and the pipeline card re-renders on every 1.5 s state
+        // poll — so the 2 s timer was reset before it could ever fire, `load()` ran exactly
+        // once from `.task`, and the preview sat on that first frame forever. It showed the
+        // desktop because that is what the screen looked like before Resolve had opened.
+        //
+        // A `.task` loop is tied to the view's IDENTITY, not to its re-initialisation, so it
+        // survives the re-renders and keeps running.
+        .task {
+            while !Task.isCancelled {
+                await load()
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+        }
     }
 
     private func load() async {
-        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg?w=420") else { return }
+        // Sequential by construction now — the loop awaits each load before sleeping — so no
+        // in-flight guard is needed and requests cannot pile up.
+        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg") else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
         req.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200, let img = NSImage(data: data) else {
-                failed = true; return
-            }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            // 204 = the server has no frame yet; keep whatever is on screen and keep asking.
+            guard code == 200, !data.isEmpty, let img = NSImage(data: data) else { return }
             frame = img
             failed = false
         } catch {
-            failed = true
+            if frame == nil { failed = true }    // only give up the placeholder if never loaded
         }
     }
 }
