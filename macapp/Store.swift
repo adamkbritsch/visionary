@@ -124,8 +124,15 @@ final class AppStore: ObservableObject {
     /// About to take the screen and mouse — roughly ten seconds of real setup work still to
     /// run. Deliberately not a countdown: see ProgressDTO.takeover_soon.
     var takeoverSoon: Bool { state?.orchestrator?.progress?.takeover_soon == true }
-    /// True while the pipeline actually HAS the screen and mouse (not merely about to).
-    var takeoverActive: Bool { state?.orchestrator?.progress?.takeover_active == true }
+    /// True only while the pipeline is ACTUALLY moving the pointer — within
+    /// MOUSE_IN_USE_SECONDS of the last click. Self-expiring: recomputed against `now` on
+    /// every poll, so nothing is left on screen if a stage dies mid-way, and the hour of
+    /// screenshot-only analysis after the clicks does not keep it up.
+    static let mouseInUseWindow: TimeInterval = 10
+    var takeoverActive: Bool {
+        guard let at = state?.orchestrator?.progress?.mouse_at, at > 0 else { return false }
+        return Date().timeIntervalSince1970 - TimeInterval(at) < AppStore.mouseInUseWindow
+    }
 
     func runSelftest() async {
         if let t: SelftestDTO = await get("/api/selftest") { self.selftest = t }

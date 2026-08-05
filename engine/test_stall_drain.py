@@ -203,3 +203,186 @@ class DrainConvertsEverythingFirst(unittest.TestCase):
         o = self._orch(1, finishing={"stage": "remux"}, finishing2={"stage": "remux"})
         with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
             self.assertTrue(o._resolve_should_hold())
+
+
+class NoRemuxingDuringResolve(unittest.TestCase):
+    """User-dictated: nothing remuxes while Resolve is working. Gating on `_resolve_active`
+    alone was not enough — it goes false in the gap between two back-to-back conversions, so
+    a lane would start a fresh ~7-minute x265 segment into that gap and be encoding again the
+    instant the next Resolve began."""
+
+    def _orch(self, *, resolve_active, backlog, resolve_age=0.0):
+        import threading, time
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._resolve_active = threading.Event()
+        if resolve_active:
+            o._resolve_active.set()
+        o._drain_backlog = lambda: backlog
+        o._last_resolve_at = time.time() - resolve_age
+        return o
+
+    def test_it_waits_while_resolve_runs(self):
+        self.assertTrue(self._orch(resolve_active=True, backlog=1)._remux_must_wait())
+
+    def test_it_keeps_waiting_in_the_gap_between_two_conversions(self):
+        # THE case the old gate missed: Resolve is momentarily between items, but there is
+        # still a backlog to convert. Starting a segment here defeats the whole point.
+        self.assertTrue(self._orch(resolve_active=False, backlog=3)._remux_must_wait())
+
+    def test_it_runs_once_the_backlog_is_converted(self):
+        self.assertFalse(self._orch(resolve_active=False, backlog=1)._remux_must_wait())
+        self.assertFalse(self._orch(resolve_active=False, backlog=0)._remux_must_wait())
+
+    def test_the_ordinary_overlap_is_untouched(self):
+        # No drain, no Resolve → remux runs alongside download/topaz exactly as before.
+        self.assertFalse(self._orch(resolve_active=False, backlog=1)._remux_must_wait())
+
+    def test_the_backlog_wait_is_BOUNDED(self):
+        """Segdirs orphaned by a crash or an abandoned show satisfy the backlog test
+        forever. Waiting on the count alone froze the finisher permanently with nothing
+        actually being converted — it hung the test suite exactly that way."""
+        stale = self._orch(resolve_active=False, backlog=5,
+                           resolve_age=orch.BACKLOG_WAIT_GRACE_SECONDS + 60)
+        self.assertFalse(stale._remux_must_wait(),
+                         "a backlog nobody is converting must not hold the lanes forever")
+
+    def test_it_still_covers_the_gap_between_two_conversions(self):
+        # Resolve finished seconds ago and there is more to convert — keep standing down.
+        fresh = self._orch(resolve_active=False, backlog=5, resolve_age=5)
+        self.assertTrue(fresh._remux_must_wait())
+
+    def test_the_same_predicate_gates_the_hold_AND_the_in_flight_yield(self):
+        # Two call sites, one rule — if they drift, a lane can be held at the door while an
+        # in-flight encode keeps running, or vice versa.
+        import inspect
+        src = inspect.getsource(orch.Orchestrator._finish_item)
+        self.assertIn("self._remux_must_wait()", src)          # the hold loop
+        self.assertIn("should_pause=self._remux_must_wait", src)  # the in-flight yield
+        self.assertNotIn("should_pause=self._resolve_active.is_set", src)
+
+
+class ResolveGetsTheWholeMachine(unittest.TestCase):
+    """Yielding at a segment boundary was not enough, and the gap is measurable: a segment
+    is 5 minutes of VIDEO but ~7 minutes of wall clock, so an encode caught mid-segment kept
+    running through most of Resolve's ~19-minute pass. Observed live — four minutes into
+    Resolve, both lanes were still on the same seg_done and still burning CPU.
+
+    SIGSTOP instead of killing: no work lost, no segment-granularity rounding."""
+
+    def setUp(self):
+        import dvcap
+        dvcap._LIVE_ENCODERS.clear()
+        dvcap._ENCODERS_SUSPENDED = False
+
+    tearDown = setUp
+
+    def _fake_pair(self):
+        import dvcap
+        sent = []
+        procs = []
+        for _ in range(2):
+            p = mock.Mock()
+            p.poll.return_value = None                 # still running
+            p.send_signal = lambda sig, _p=None: sent.append(sig)
+            procs.append(p)
+        pair = tuple(procs)
+        dvcap._LIVE_ENCODERS.add(pair)
+        return pair, sent
+
+    def test_suspend_stops_BOTH_ends_of_the_pipe(self):
+        # Stopping only x265 would leave ffmpeg spinning until the pipe filled.
+        import dvcap, signal
+        _pair, sent = self._fake_pair()
+        self.assertEqual(dvcap.suspend_encoders(), 1)
+        self.assertEqual(sent, [signal.SIGSTOP, signal.SIGSTOP])
+
+    def test_resume_restarts_them(self):
+        import dvcap, signal
+        _pair, sent = self._fake_pair()
+        dvcap.suspend_encoders(); sent.clear()
+        dvcap.resume_encoders()
+        self.assertEqual(sent, [signal.SIGCONT, signal.SIGCONT])
+        self.assertFalse(dvcap.encoders_suspended())
+
+    def test_a_segment_spawned_DURING_a_suspension_starts_stopped(self):
+        # Otherwise the next segment begins the moment the previous one ends and runs free
+        # for the rest of Resolve's pass — the exact hole the boundary-yield left.
+        import dvcap
+        dvcap.suspend_encoders()
+        self.assertTrue(dvcap.encoders_suspended())
+
+    def test_a_finished_pair_is_never_left_frozen(self):
+        # A SIGSTOPped process cannot exit; if _encode_pipe returned without resuming it,
+        # its lane would stall forever and nothing else would ever send SIGCONT.
+        import inspect, dvcap
+        src = inspect.getsource(dvcap._encode_pipe)
+        self.assertIn("finally:", src)
+        self.assertIn("_LIVE_ENCODERS.discard(pair)", src)
+        self.assertIn("SIGCONT", src)
+
+    def test_the_orchestrator_suspends_and_ALWAYS_resumes(self):
+        import inspect
+        src = inspect.getsource(orch.Orchestrator._process)
+        self.assertIn("self._suspend_remuxes()", src)
+        # The resume must be in the finally, not the happy path — a failed or aborted
+        # Resolve must not leave the encoders stopped.
+        after = src[src.index("finally:"):]
+        self.assertIn("self._resume_remuxes()", after)
+
+    def test_stopping_the_run_also_unfreezes(self):
+        for fn in (orch.Orchestrator.enable, orch.Orchestrator.disable):
+            import inspect
+            self.assertIn("_resume_remuxes", inspect.getsource(fn),
+                          f"{fn.__name__} must not leave encoders frozen")
+
+    def test_it_really_stops_a_real_process(self):
+        """The load-bearing behaviour, against actual processes rather than mocks."""
+        import dvcap, subprocess, sys, time
+        procs = [subprocess.Popen([sys.executable, "-c",
+                                   "import time\nwhile True: sum(range(20000))"])
+                 for _ in range(2)]
+        pair = tuple(procs)
+        dvcap._LIVE_ENCODERS.add(pair)
+        try:
+            def state(p):
+                return subprocess.run(["ps", "-o", "state=", "-p", str(p.pid)],
+                                      capture_output=True, text=True).stdout.strip()
+            time.sleep(0.3)
+            dvcap.suspend_encoders()
+            time.sleep(0.3)
+            self.assertTrue(all(state(p).startswith("T") for p in procs),
+                            "SIGSTOP did not actually stop the encoders")
+            dvcap.resume_encoders()
+            time.sleep(0.3)
+            self.assertFalse(any(state(p).startswith("T") for p in procs))
+        finally:
+            for p in procs:
+                p.kill()
+
+
+class NeverLeaveEncodersFrozen(unittest.TestCase):
+    """A SIGSTOPped x265 cannot exit and cannot be resumed by anything that does not know
+    its pid. If one is left behind, its lane stalls forever and deploy-now.sh waits out its
+    full timeout and then relaunches on top of it. Every exit path must unfreeze."""
+
+    def test_resume_also_sweeps_orphans_from_a_previous_process(self):
+        # dvcap's registry only knows encoders THIS run started.
+        ran = []
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o.state = {}
+        with mock.patch.object(orch.subprocess, "run",
+                               lambda cmd, **kw: ran.append(cmd)):
+            o._resume_remuxes()
+        self.assertTrue(any("-CONT" in c and "x265" in c for c in ran),
+                        "must SIGCONT any orphaned x265, not just its own")
+
+    def test_the_deploy_script_unfreezes_before_waiting(self):
+        # It waits for x265 to EXIT; a stopped one never will.
+        import os
+        sh = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(orch.__file__))), "deploy-now.sh")).read()
+        cont = sh.index("pkill -CONT -x x265")
+        wait = sh.index('pgrep -x x265 | wc -l | tr -d \' \'", "0"'.replace('", "0"', ''))
+        self.assertLess(cont, sh.rindex("pgrep -x x265"),
+                        "the unfreeze must come BEFORE the wait-for-exit loop")
+        del wait

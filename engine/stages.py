@@ -456,12 +456,19 @@ def _resolve(p, abort, progress=None):
                 if progress and line.startswith("SCREEN_TAKEOVER_SOON"):
                     progress({"stage": "resolve", "ep": p.ep,
                               "takeover_soon": True, "takeover_active": False})
-                elif progress and line.startswith("SCREEN_TAKEOVER_BEGIN"):
+                elif progress and line.startswith("MOUSE_IN_USE"):
+                    # A timestamp, not a flag: the app shows the notice while this is fresh,
+                    # so it tracks real pointer use and expires by itself. The mouse is only
+                    # busy in short click bursts — the hour of wait_for_analysis that follows
+                    # is screenshots only.
+                    try:
+                        at = int(line.strip().split()[1])
+                    except (IndexError, ValueError):
+                        at = int(time.time())
                     progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_soon": False, "takeover_active": True})
+                              "takeover_soon": False, "mouse_at": at})
                 elif progress and line.startswith("SCREEN_TAKEOVER_END"):
-                    progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_soon": False, "takeover_active": False})
+                    progress({"stage": "resolve", "ep": p.ep, "takeover_soon": False})
         threading.Thread(target=_reader, daemon=True).start()
         deadline = time.time() + RESOLVE_TIMEOUT
         while proc.poll() is None:

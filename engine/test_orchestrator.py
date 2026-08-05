@@ -1180,7 +1180,8 @@ class DoubleRemux(unittest.TestCase):
     def test_lane2_finish_uses_its_own_slot_and_leaves_the_backlog(self):
         o = orch.Orchestrator(); o._enabled = True
         p = episode_paths("The Office", "S02E10", SRC)
-        o._drain_backlog = lambda: 2
+        o._drain_backlog = lambda: 0     # irrelevant here, and a standing backlog would
+                                         # (correctly) hold the lane at its door
         seen = []
         with mock.patch.object(orch, "stage_done", return_value=False), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \

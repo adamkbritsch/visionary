@@ -80,6 +80,12 @@ s=$(snap); IFS='|' read -r stage tseg running fin rseg <<< "$s"
 case "$fin" in upload|cleanup) say "GAVE UP: deadline hit but finisher=$fin — NOT deploying"; exit 2 ;; esac
 case "$stage" in resolve|upload) say "GAVE UP: deadline hit but stage=$stage — NOT deploying"; exit 2 ;; esac
 
+# A remux SUSPENDED for Resolve (SIGSTOP) can never exit, so the wait below would sit out its
+# full 30 s and then relaunch on top of frozen encoders. SIGCONT is a no-op on a running
+# process, so this is unconditional and safe.
+pkill -CONT -x x265 2>/dev/null
+pkill -CONT -f "/opt/homebrew/bin/ffmpeg" 2>/dev/null
+
 say "graceful stop + relaunch"
 WAS_ARMED=$(armed_now)   # capture the USER's arm state at this exact moment, before OUR stop
 curl -s --max-time 8 -X POST "$API/api/automation" -H 'Content-Type: application/json' -d '{"enabled":false}' >/dev/null

@@ -239,12 +239,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bg.layer?.cornerRadius = 14
         bg.layer?.masksToBounds = true
 
-        let title = NSTextField(labelWithString: live ? "Visionary is using the screen"
+        let title = NSTextField(labelWithString: live ? "Visionary is using the mouse"
                                                      : "Visionary needs the screen")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.frame = NSRect(x: 16, y: h - 34, width: w - 32, height: 18)
         let label = NSTextField(labelWithString: live
-            ? "Resolve has the mouse — it will be handed back"
+            ? "It will be handed back in a moment"
             : "About to take the screen and mouse")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor

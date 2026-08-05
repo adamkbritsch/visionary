@@ -43,7 +43,10 @@ struct ProgressDTO: Codable {
     // start plus a 20-chunk import), so the number hit zero and then sat at "now..." for
     // minutes. Two plain states instead.
     var takeover_soon: Bool?    // about to take the screen + mouse (~10 s of real work left)
-    var takeover_active: Bool?  // the pipeline HAS the screen and mouse right now
+    var mouse_at: Int?          // epoch of the last CLICK. The notice shows while this is
+                                // fresh, so it tracks real pointer use and expires by
+                                // itself — the mouse is busy only in short click bursts,
+                                // and the hour of analysis that follows is screenshots only.
 }
 
 struct HoldDTO: Codable {

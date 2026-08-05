@@ -147,6 +147,10 @@ RESOLVE_DRAIN_MIN_GB = 80     # DRAIN gate: raw physical free needed to advance 
                               # the stall deliberately fills TO that floor, so any drain gate above
                               # it is unsatisfiable by a full buffer BY CONSTRUCTION — which is
                               # exactly how the old 400 blocked the drain it was meant to allow.
+BACKLOG_WAIT_GRACE_SECONDS = 180  # how long after a Resolve pass the remux lanes keep standing
+                              # down for a still-unconverted backlog. Bounds the wait: orphaned
+                              # segdirs (a crash, an abandoned show) must never freeze the
+                              # finisher forever with nothing actually being converted.
 STALL_RETRY_SECONDS = 300     # while stalled, release ONE held item this often to re-probe Resolve
                               # (only the probe attempts Resolve — a blocked attempt can hang for up to
                               # RESOLVE_TIMEOUT, so we never spend one per buffered item)
@@ -721,6 +725,7 @@ class Orchestrator:
         self._finish_q = queue.Queue()         # EpisodePaths handed off after their resolve completes
         self._finish_abort = threading.Event() # aborts the finisher's CURRENT stage (disable / power pause)
         self._resolve_active = threading.Event()   # run thread's Resolve is live → remux lanes HOLD/yield
+        self._last_resolve_at = 0.0                # when Resolve last ran; bounds the backlog wait
                                                # (user-dictated: Resolve gets the whole machine; a remux
                                                # pauses at its next ~5-min segment and resumes after)
         self._in_finisher = set()              # _skip_key(p) of queued+in-flight finisher items — excluded
@@ -1283,6 +1288,7 @@ class Orchestrator:
             # caffeinate keeps the display logically ON so the resolve stage's screencapture still works.
             self._finish_abort.clear()
             self._resolve_active.clear()       # fresh run: never inherit a stale Resolve hold
+            self._resume_remuxes()             # nor a stale SIGSTOP from a previous run
             self.state["finishing"] = None
             # RESUME BOTH: re-queue any item whose remux was interrupted mid-flight (durable work-list)
             # onto the finisher BEFORE the run thread starts, so selection already excludes it and the
@@ -1300,6 +1306,7 @@ class Orchestrator:
             self._abort.set()
             self._finish_abort.set()           # the finisher's in-flight remux/upload stops too
             self._resolve_active.clear()       # never leave the remux lanes held by a dead run
+            self._resume_remuxes()             # ...nor frozen by one
             self._stop_caffeinate()            # let the display sleep again
             self.state.update(enabled=False, ended_reason=reason)
         try:
@@ -2153,9 +2160,18 @@ class Orchestrator:
             self.state["stage_active"] = True      # published: `stage` alone is stale (never cleared)
             if st == "resolve":
                 # Resolve gets the WHOLE machine (user-dictated: it must finish ASAP —
-                # it holds the screen and can't be paced): both remux lanes hold/yield
-                # for its duration and resume losslessly from their segdirs after.
+                # it holds the screen and can't be paced).
+                #
+                # `should_pause` alone was not enough and the difference is measurable: it
+                # is polled BETWEEN segments, and a segment is 5 minutes of video but ~7
+                # minutes of wall clock, so an encode caught mid-segment kept running for
+                # most of Resolve's ~19-minute pass (observed live — 4 minutes in, both
+                # lanes were still on the same seg_done and still burning CPU). SIGSTOP
+                # freezes them the instant Resolve starts, costs no work, and they resume
+                # exactly where they were.
                 self._resolve_active.set()
+                self._last_resolve_at = time.time()
+                self._suspend_remuxes()
             try:
                 if st == "download":          # per-source lock: the prefetcher may already be pulling
                     ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
@@ -2165,6 +2181,8 @@ class Orchestrator:
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
+                    self._last_resolve_at = time.time()   # the grace window starts HERE
+                    self._resume_remuxes()
             self._stage_active = False
             self.state["stage_active"] = False
             if ok:  self._elapsed_done(ekey)         # stage complete → reset its timer for any re-run
@@ -2292,6 +2310,73 @@ class Orchestrator:
         if _finisher_lanes() < 2:
             return False
         return self.state.get("finishing") is not None and self._finish_q.qsize() >= 1
+
+    def _suspend_remuxes(self):
+        """Freeze every in-flight remux encode, and say so in the UI."""
+        try:
+            import dvcap
+            n = dvcap.suspend_encoders()
+        except Exception as e:
+            logbook.event(f"could not suspend remuxes for Resolve: {e}")
+            return
+        if n:
+            logbook.event(f"Resolve has the machine — {n} remux encode(s) suspended")
+        for key in ("finishing", "finishing2"):
+            f = self.state.get(key)
+            if f and f.get("stage") == "remux":
+                # MERGE: series/source/movie/youtube are what abandon_series matches lanes
+                # on, and the last-known pct is what the UI keeps showing while frozen.
+                self.state[key] = {**f, "holding": "Resolve has the machine"}
+
+    def _resume_remuxes(self):
+        """Unfreeze them. Runs in a finally — a stopped x265 left behind stalls its lane
+        forever, because nothing else would ever send it SIGCONT."""
+        try:
+            import dvcap
+            dvcap.resume_encoders()
+        except Exception as e:
+            logbook.exception("resuming remuxes after Resolve", e)
+        # ...and anything ORPHANED by a previous process. dvcap's registry only knows the
+        # encoders this run started, so an x265 left stopped by a crash or a hard kill would
+        # never be resumed by it — and it can never exit on its own either. SIGCONT is a
+        # no-op on a running process, so this is safe to fire unconditionally.
+        try:
+            subprocess.run(["pkill", "-CONT", "-x", "x265"], check=False,
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+        for key in ("finishing", "finishing2"):
+            f = self.state.get(key)
+            if f and f.get("holding"):
+                f = dict(f)
+                f.pop("holding", None)
+                self.state[key] = f
+
+    def _remux_must_wait(self) -> bool:
+        """Should a remux lane stand down? True while Resolve is actually running, AND for
+        the whole of a stall drain's conversion phase.
+
+        The second half is the user-dictated part: with several Topaz exports waiting,
+        convert them ALL through Resolve first and only then let the remuxes run. Gating on
+        `_resolve_active` alone was not enough — it goes false in the gap between two
+        back-to-back conversions, so a lane would start a fresh ~7-minute x265 segment into
+        that gap and then be encoding again the moment the next Resolve began. Holding for
+        the whole phase is what "not while it's doing the resolve stuff" actually means.
+
+        Outside a drain this is exactly the old behaviour: Resolve gets the machine while it
+        runs, and the ordinary remux/download/topaz overlap is untouched.
+
+        The backlog half is deliberately BOUNDED by recency. Waiting on the segdir count
+        alone is unbounded: segdirs orphaned by a crash, or by a show abandoned mid-flight,
+        would satisfy it forever and freeze the finisher permanently with nothing left to
+        convert. Tying it to "Resolve actually ran in the last few minutes" covers the gaps
+        BETWEEN back-to-back conversions — which is all it was ever for — and self-releases
+        the moment conversions stop happening."""
+        if self._resolve_active.is_set():
+            return True
+        if self._drain_backlog() < 2:
+            return False
+        return (time.time() - self._last_resolve_at) < BACKLOG_WAIT_GRACE_SECONDS
 
     def _dual_remux_live(self) -> bool:
         """Both remux lanes actually working right now."""
@@ -2611,7 +2696,7 @@ class Orchestrator:
                 # in-flight x265 yields at its next ~5-min segment (should_pause) with every
                 # finished segment kept. When Resolve ends, the retry resumes in place.
                 while True:
-                    while (self._resolve_active.is_set() and self._enabled
+                    while (self._remux_must_wait() and self._enabled
                            and not self._finish_abort.is_set()):
                         # MERGE, never replace. Replacing dropped series/source/movie/youtube, and
                         # abandon_series matches lanes on exactly those keys — so abandoning a show
@@ -2619,7 +2704,10 @@ class Orchestrator:
                         # scratch. Keeping them also lets the UI show the last-known % while held.
                         self.state[fin_key] = {**(self.state.get(fin_key) or {}),
                                                "ep": ep_disp, "stage": st, "fast": fast,
-                                               "holding": "Resolve has the machine"}
+                                               "holding": ("Resolve has the machine"
+                                                           if self._resolve_active.is_set()
+                                                           else "waiting for Resolve to "
+                                                                "convert the backlog")}
                         time.sleep(5)
                     if not self._enabled or self._finish_abort.is_set():
                         return
@@ -2628,7 +2716,7 @@ class Orchestrator:
                                    "series": p.series, "source": p.source_basename,
                                    "movie": bool(p.movie), "youtube": bool(p.youtube)}
                     ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog,
-                                        should_pause=self._resolve_active.is_set)
+                                        should_pause=self._remux_must_wait)
                     if not ok and str(msg).startswith("paused:"):
                         continue               # benign yield to Resolve — go back to the hold
                     break

@@ -499,7 +499,7 @@ def click(x, y):
               host=[ox, oy, w_pt, h_pt])
         raise RuntimeError("refusing to click (%.0f, %.0f) — outside the display being "
                            "driven (%.0f, %.0f %.0fx%.0f)" % (x, y, ox, oy, w_pt, h_pt))
-    _announce_takeover()          # the first click is the moment the mouse is taken
+    _announce_mouse_use()         # each click refreshes the "using the mouse" notice
     # -r restores the pointer afterwards, so a run does not park the user's cursor on
     # whatever it just clicked.
     subprocess.run([CLICLICK, "-r", f"c:{int(round(x))},{int(round(y))}"], check=True)
@@ -631,9 +631,12 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
         time.sleep(poll)
 
 
-# Has the mouse actually been taken yet this process? The first click is the moment, and
-# announcing it there is exact — no prediction involved.
-_TAKEOVER_ANNOUNCED = False
+# How long after a click the mouse still counts as "in use". Clicks come in short bursts
+# (open the palette, verify the target, hit Analyze All); between them — and for the whole
+# hour of wait_for_analysis afterwards — the shim only takes screenshots and the pointer is
+# the user's again. So the indicator is driven by the LAST CLICK and expires on its own,
+# rather than being bracketed around the whole stage.
+MOUSE_IN_USE_SECONDS = 10
 
 
 def warn_takeover_soon():
@@ -659,12 +662,11 @@ def warn_takeover_soon():
     print("SCREEN_TAKEOVER_SOON", flush=True)
 
 
-def _announce_takeover():
-    """Called from the first click: the mouse is now genuinely taken."""
-    global _TAKEOVER_ANNOUNCED
-    if not _TAKEOVER_ANNOUNCED:
-        _TAKEOVER_ANNOUNCED = True
-        print("SCREEN_TAKEOVER_BEGIN", flush=True)
+def _announce_mouse_use():
+    """Stamp the moment of a click. The app shows "using the mouse" while the stamp is less
+    than MOUSE_IN_USE_SECONDS old, so the notice tracks actual pointer use and clears itself
+    — no end marker to lose, and nothing left on screen if a stage dies mid-way."""
+    print("MOUSE_IN_USE %d" % round(time.time()), flush=True)
 
 
 def run_dv_ui(abort=None, expect_nit=1000) -> bool:
@@ -693,8 +695,6 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
         _diag("session-locked")
         raise RuntimeError("the session is LOCKED — screencapture only sees the lock screen, "
                            "so no template can match. Disable the screen lock for lid-closed runs.")
-    global _TAKEOVER_ANNOUNCED
-    _TAKEOVER_ANNOUNCED = False
     warn_takeover_soon()          # ~10 s of real work still to do before the first click
     # Remember where the user had the pointer, and hand it back when the takeover ends —
     # however it ends. In `finally`, so a raised template failure, a wrong-target refusal
@@ -721,7 +721,7 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     finally:
         if release_pointer_to_main(saved_pointer):
             print("dv_ui: pointer returned to the main display", flush=True)
-        print("SCREEN_TAKEOVER_END", flush=True)
+        print("SCREEN_TAKEOVER_END", flush=True)   # clears the "about to" notice if it is still up
 
 
 def capture_reference():

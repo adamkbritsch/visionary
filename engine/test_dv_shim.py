@@ -393,9 +393,6 @@ class TakeoverNotice(unittest.TestCase):
     still has to run before the first click, and the BEGIN marker comes from the click
     itself rather than from a prediction."""
 
-    def setUp(self):
-        dv_shim._TAKEOVER_ANNOUNCED = False
-
     def test_the_notice_costs_no_time(self):
         printed = []
         with mock.patch("settings.get_settings", return_value={"resolve_takeover_warn": True}), \
@@ -412,19 +409,29 @@ class TakeoverNotice(unittest.TestCase):
             dv_shim.warn_takeover_soon()
         self.assertEqual(printed, [])
 
-    def test_the_takeover_is_announced_by_the_FIRST_CLICK_not_a_guess(self):
+    def test_every_click_stamps_the_mouse_as_in_use(self):
+        """The notice tracks REAL pointer use. Clicks come in short bursts; the hour of
+        wait_for_analysis that follows them is screenshots only, and the mouse is the
+        user's again throughout it. So each click refreshes a timestamp and the notice
+        expires on its own, rather than being bracketed around the whole stage."""
         printed = []
         with mock.patch.object(dv_shim, "host_view", return_value=(0.0, 0.0, 2.0, 1728.0, 1117.0)), \
              mock.patch.object(dv_shim.subprocess, "run", lambda *a, **k: None), \
+             mock.patch.object(dv_shim.time, "time", return_value=1_700_000_000.4), \
              mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))):
             dv_shim.click(100, 100)
             dv_shim.click(200, 200)
-        self.assertEqual([l for l in printed if "BEGIN" in l].__len__(), 1,
-                         "exactly one BEGIN, on the first click")
+        stamps = [l for l in printed if l.startswith("MOUSE_IN_USE")]
+        self.assertEqual(len(stamps), 2, "every click refreshes it, not just the first")
+        self.assertEqual(stamps[0], "MOUSE_IN_USE 1700000000")
+
+    def test_the_in_use_window_is_short(self):
+        # "No more than 10 seconds at a time" — the notice must not outlive real use.
+        self.assertLessEqual(dv_shim.MOUSE_IN_USE_SECONDS, 10)
 
     def test_no_countdown_machinery_survives(self):
         for gone in ("arm_takeover_warning", "_warn_before_takeover", "_TAKEOVER_DEADLINE",
-                     "TAKEOVER_ACK"):
+                     "TAKEOVER_ACK", "_TAKEOVER_ANNOUNCED"):
             self.assertFalse(hasattr(dv_shim, gone), f"{gone} should be gone")
 
 

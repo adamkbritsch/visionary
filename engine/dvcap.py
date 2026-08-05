@@ -24,6 +24,8 @@ import json
 import os
 import re
 import shutil
+import signal
+import threading
 import subprocess
 from fractions import Fraction
 
@@ -469,11 +471,67 @@ def count_hevc_frames(path: str, ffprobe: str = FFPROBE) -> int:
         return 0
 
 
+# --- SUSPENDING A REMUX SO RESOLVE GETS THE WHOLE MACHINE ---------------------------------
+# Yielding at a segment boundary is not enough. A segment is 5 minutes of VIDEO but ~7
+# minutes of wall clock, so an encode that is mid-segment when Resolve starts keeps running
+# for most of Resolve's ~19-minute pass — measured live: 4 minutes in, both lanes were still
+# at the same seg_done and still burning CPU.
+#
+# SIGSTOP is the right tool rather than killing: the encode freezes immediately, uses no CPU
+# while stopped, and resumes exactly where it was — no lost work and no segment-granularity
+# rounding. Both ends of the pipe are stopped; stopping only x265 would leave ffmpeg spinning
+# until the pipe filled.
+_LIVE_ENCODERS = set()                  # {(dec, enc)} currently encoding
+_ENCODER_LOCK = threading.Lock()
+_ENCODERS_SUSPENDED = False             # so a pair spawned DURING a suspension starts stopped
+
+
+def _signal_pair(pair, sig):
+    for proc in pair:
+        try:
+            if proc.poll() is None:
+                proc.send_signal(sig)
+        except Exception:
+            pass
+
+
+def suspend_encoders() -> int:
+    """Freeze every in-flight remux encode. Returns how many pairs were stopped."""
+    global _ENCODERS_SUSPENDED
+    with _ENCODER_LOCK:
+        _ENCODERS_SUSPENDED = True
+        for pair in _LIVE_ENCODERS:
+            _signal_pair(pair, signal.SIGSTOP)
+        return len(_LIVE_ENCODERS)
+
+
+def resume_encoders() -> int:
+    """Unfreeze them. MUST be called from a finally — a stopped x265 left behind would
+    stall its lane forever, and nothing else would ever resume it."""
+    global _ENCODERS_SUSPENDED
+    with _ENCODER_LOCK:
+        _ENCODERS_SUSPENDED = False
+        for pair in _LIVE_ENCODERS:
+            _signal_pair(pair, signal.SIGCONT)
+        return len(_LIVE_ENCODERS)
+
+
+def encoders_suspended() -> bool:
+    return _ENCODERS_SUSPENDED
+
+
 def _encode_pipe(dec_cmd, enc_cmd, out_hevc, abort, on_frame):
     """Decode|x265 pipe for ONE segment. Returns (frames|None, reason, tail)."""
     dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     enc = subprocess.Popen(enc_cmd, stdin=dec.stdout, stderr=subprocess.PIPE, text=True)
     dec.stdout.close()
+    pair = (dec, enc)
+    with _ENCODER_LOCK:
+        _LIVE_ENCODERS.add(pair)
+        # Spawned while Resolve already holds the machine — start stopped, or this segment
+        # would run free for the rest of Resolve's pass.
+        if _ENCODERS_SUSPENDED:
+            _signal_pair(pair, signal.SIGSTOP)
     tail = []
     try:
         for line in enc.stderr:
@@ -491,6 +549,12 @@ def _encode_pipe(dec_cmd, enc_cmd, out_hevc, abort, on_frame):
     except Exception as e:
         dec.kill(); enc.kill()
         return None, f"pipe error: {e}", tail
+    finally:
+        with _ENCODER_LOCK:
+            _LIVE_ENCODERS.discard(pair)
+        # A process that is SIGSTOPped cannot be killed cleanly and cannot exit; make sure
+        # nothing leaves this function frozen.
+        _signal_pair(pair, signal.SIGCONT)
     if enc.returncode != 0 or not os.path.exists(out_hevc) or os.path.getsize(out_hevc) == 0:
         return None, "x265 rc=%s: %s" % (enc.returncode, " / ".join(tail[-4:])), tail
     return parse_x265_encoded("\n".join(tail)), "ok", tail
