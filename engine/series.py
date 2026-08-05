@@ -27,7 +27,18 @@ _EPX = re.compile(r"\b(\d{1,2})x(\d{2,3})\b")   # the '9x01' naming convention (
 # so support all common video inputs, not just the mp4/mkv the library mostly holds.
 _VID = (".mp4", ".mkv", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".avi", ".wmv",
         ".webm", ".mpg", ".mpeg", ".vob", ".flv", ".ogv", ".m2v", ".divx", ".mpv")
-_DV_MARK = "hdr10 dv"   # the finished-master naming convention
+# Marks that identify a FINISHED master. A file carrying either is done; anything else in the
+# show folder is an un-upscaled source. Getting this wrong is not cosmetic: an unrecognised
+# master is classified as a source and fed back through the pipeline — and with replace_source
+# on (the default) the real source is already gone, so it would upscale its own output forever.
+_DV_MARK = "hdr10 dv"        # Dolby Vision masters (the long-standing convention)
+_SDR_MARK = "sdr upscaled"   # non-DV masters, from an item pinned to SDR output
+MASTER_MARKS = (_DV_MARK, _SDR_MARK)
+
+
+def is_master_name(name: str) -> bool:
+    n = (name or "").lower()
+    return any(m in n for m in MASTER_MARKS)
 
 
 # ---- pure logic (unit-tested) ---------------------------------------------
@@ -55,7 +66,7 @@ def parse_episodes(names, dv_map=None, watched_map=None) -> list:
         key = f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
         e = eps.setdefault(key, {"ep": key, "has_source": False,
                                  "has_dv": False, "source_name": None, "watched": False})
-        file_has_dv = (_DV_MARK in n.lower())
+        file_has_dv = is_master_name(n)
         if dv_map is not None:
             file_has_dv = file_has_dv or bool(dv_map.get(n))
         if file_has_dv:

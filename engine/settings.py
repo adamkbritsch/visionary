@@ -390,6 +390,31 @@ def set_show_featurettes_last(key: str, value) -> bool:
     return bool(value)
 
 
+# What the Resolve stage should OUTPUT for an item. "auto" keeps the long-standing rule —
+# SDR intake -> 1000-nit Dolby Vision, HDR intake -> 2000-nit — and is the default. The other
+# three pin it regardless of the source. "sdr" is the only one that produces a non-DV master,
+# and the only one whose Resolve stage needs no screen automation at all (no DV analyze).
+OUTPUT_MODES = ("auto", "sdr", "dv1000", "dv2000")
+
+
+def get_show_output_mode(key: str) -> str:
+    """Per-item (TV show / movie title / channel folder — the same key the preset uses)."""
+    v = _show_entry(key).get("output_mode")
+    return v if v in OUTPUT_MODES else "auto"
+
+
+def set_show_output_mode(key: str, value) -> str:
+    v = value if value in OUTPUT_MODES else "auto"
+    _update_show(key, output_mode=v)
+    return v
+
+
+def is_sdr_output(key: str) -> bool:
+    """True only when the item is PINNED to a non-DV SDR master. 'auto' is never SDR — the
+    automatic rule has always produced Dolby Vision."""
+    return get_show_output_mode(key) == "sdr"
+
+
 def get_show_replace_source(key: str) -> bool:
     """Per-item (TV show / movie title): after the 4K master is VERIFIED on the NAS,
     delete the superseded source (True, default — the output replaces its input) or

@@ -56,6 +56,44 @@ class Queue(unittest.TestCase):
         self.assertEqual(q["remaining"], [])
 
 
+class MasterMarks(unittest.TestCase):
+    """A shipped master MUST be recognised as finished. If it is not, it is classified as a
+    source and fed back through the pipeline — and with replace_source on (the default) the real
+    source is already deleted, so the run would upscale its own output forever, degrading each
+    pass. That failure mode is why the SDR mark exists at all."""
+
+    SRC = "Lost (2004) - S02E19 - S.O.S. (1080p BluRay x265 Silence).mkv"
+    DV  = "Lost (2004) - S02E18 - Dave (2160p x265 HDR10 DV upscaled).mp4"
+    SDR = "Lost (2004) - S02E17 - Lockdown (2160p x265 SDR upscaled).mp4"
+
+    def _by_ep(self, names):
+        return {e["ep"]: e for e in series.parse_episodes(names)}
+
+    def test_a_dolby_vision_master_is_done(self):
+        e = self._by_ep([self.DV])["S02E18"]
+        self.assertTrue(e["has_dv"]); self.assertFalse(e["has_source"])
+
+    def test_an_SDR_master_is_ALSO_done(self):
+        # The regression: without the SDR mark this reads as a source and re-enters the queue.
+        e = self._by_ep([self.SDR])["S02E17"]
+        self.assertTrue(e["has_dv"]); self.assertFalse(e["has_source"])
+
+    def test_a_real_source_is_still_a_source(self):
+        # The mark must not be so loose that ordinary files match it.
+        e = self._by_ep([self.SRC])["S02E19"]
+        self.assertFalse(e["has_dv"]); self.assertTrue(e["has_source"])
+
+    def test_neither_mark_matches_an_ordinary_name(self):
+        self.assertFalse(series.is_master_name("Some.Show.S01E01.1080p.BluRay.x264.mkv"))
+        self.assertFalse(series.is_master_name(""))
+        self.assertFalse(series.is_master_name(None))
+
+    def test_an_SDR_master_is_never_queued(self):
+        q = series.build_queue([self.SDR, self.DV])
+        self.assertIsNone(q["next"])
+        self.assertEqual(q["done_count"], 2)
+
+
 class Watched(unittest.TestCase):
     def test_unwatched_first_then_watched_each_numeric(self):
         # e01 watched, e03 + e10 unwatched -> unwatched group (numeric) then watched

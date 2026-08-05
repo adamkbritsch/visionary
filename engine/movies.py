@@ -16,7 +16,7 @@ import os
 import re
 
 from transfer import connect as ftp_connect, ftp_listdir, NAS_FTP_MOVIES_ROOT, NAS_FTP_MOVIES_ROOTS
-from series import MANIFEST_DIR, _DV_MARK
+from series import MANIFEST_DIR, _DV_MARK, is_master_name as series_mod_is_master
 
 # Any container ffmpeg can decode is fine — the pipeline re-encodes to a CFR intermediate first.
 _VID = (".mp4", ".mkv", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".avi", ".wmv",
@@ -91,7 +91,7 @@ def parse_movies(entries, dv_map=None, watched_map=None) -> list:
     out = []
     for e in entries:
         n = e["name"]
-        has_dv = (_DV_MARK in n.lower())
+        has_dv = series_mod_is_master(n)
         if dv_map is not None:
             has_dv = has_dv or bool(dv_map.get(n))
         tags = release_tags(n)
