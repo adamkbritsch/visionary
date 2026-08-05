@@ -1166,9 +1166,9 @@ private struct TVMode: View {
                 }
                 Spacer()
             }
+            OutputModeRow(key: name, mode: show.output_mode ?? "auto", locked: locked)
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
-            OutputModeRow(key: name, mode: show.output_mode ?? "auto", locked: locked)
             if (show.queue?.featurette_count ?? 0) > 0 {
                 FeaturettesLastRow(key: name, on: show.featurettes_last ?? true,
                                    count: show.queue?.featurette_count ?? 0)
@@ -1311,9 +1311,9 @@ private struct NextUpRow: View {
                         .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
                         Spacer()
                     }
+                    OutputModeRow(key: n, mode: profile?.output_mode ?? "auto")
                     NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
-                    OutputModeRow(key: n, mode: profile?.output_mode ?? "auto")
                     if profile?.has_featurettes == true {
                         FeaturettesLastRow(key: n, on: profile?.featurettes_last ?? true, count: 0)
                     }
@@ -1444,7 +1444,9 @@ private struct OutputModeRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "sun.max").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            // The same glyph the RESOLVE stage carries in the timeline — this is a Resolve
+            // setting, and the row sits in pipeline order between Topaz and the remux.
+            Image(systemName: "wand.and.stars").font(.system(size: 12)).foregroundStyle(DS.steelDim)
             Text(Self.label(current))
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
@@ -1576,13 +1578,13 @@ private struct MovieRow: View {
             .help("Tap to change this movie's Topaz preset")
             // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
             // Change buttons must not trigger it. Keyed by TITLE (the movie's settings key).
-            NormalizeAudioRow(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
+            OutputModeRow(key: m.title ?? m.name ?? "", mode: m.output_mode ?? "auto")
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            ReplaceSourceRow(key: m.title ?? m.name ?? "", on: m.replace_source ?? true)
+            NormalizeAudioRow(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
                 .padding(.horizontal, 10).padding(.top, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            OutputModeRow(key: m.title ?? m.name ?? "", mode: m.output_mode ?? "auto")
+            ReplaceSourceRow(key: m.title ?? m.name ?? "", on: m.replace_source ?? true)
                 .padding(.horizontal, 10).padding(.bottom, 7).padding(.top, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
@@ -1808,11 +1810,11 @@ private struct ChannelRow: View {
             .contentShape(Rectangle())
             // Under the channel's control row; keyed by FOLDER (the channel's settings key).
             // Dimmed with the row's other controls while paused (it sits outside their Group).
-            NormalizeAudioRow(key: ch.folder_name ?? "", on: ch.normalize_audio ?? true)
+            OutputModeRow(key: ch.folder_name ?? "", mode: ch.output_mode ?? "auto")
                 .disabled(paused).opacity(paused ? 0.35 : 1)
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            OutputModeRow(key: ch.folder_name ?? "", mode: ch.output_mode ?? "auto")
+            NormalizeAudioRow(key: ch.folder_name ?? "", on: ch.normalize_audio ?? true)
                 .disabled(paused).opacity(paused ? 0.35 : 1)
                 .padding(.horizontal, 10).padding(.bottom, 7).padding(.top, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
