@@ -525,20 +525,14 @@ struct ResolveHostSection: View {
     }
 
     @ViewBuilder private var warningRow: some View {
-        let secs = d?.warning_seconds ?? 0
         VStack(alignment: .leading, spacing: 4) {
-            Stepper(value: Binding(get: { secs },
-                                   set: { v in Task { await store.setTakeoverWarning(v) } }),
-                    in: 0...120, step: 15) {
-                Text(secs == 0 ? "Warn before taking the screen: off"
-                               : "Warn before taking the screen: \(secs)s")
-                    .font(.system(size: 12))
+            Toggle(isOn: Binding(get: { d?.warn_takeover ?? true },
+                                 set: { v in Task { await store.setTakeoverWarning(v) } })) {
+                Text("Warn before taking the screen").font(.system(size: 12))
             }
-            Text(secs == 0
-                 ? "The pipeline takes the screen and mouse with no warning."
-                 : "A \(secs)s countdown appears on this screen before the pipeline takes "
-                   + "the screen and mouse. It starts while Resolve is still loading, so it "
-                   + "normally costs no time at all.")
+            Text("A notice appears here just before the pipeline takes the screen and mouse "
+                 + "— roughly ten seconds of Resolve setup still runs after it, so it costs "
+                 + "no time. Not a countdown: the exact moment isn't predictable.")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
             Text("The mouse pointer is shared by every screen — moving Resolve stops it "
                  + "covering your work, but the pipeline still borrows the pointer to click.")

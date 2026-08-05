@@ -388,7 +388,7 @@ def displays_view() -> dict:
             "priority": settings.get_display_priority(),
             "enabled": bool(settings.get_settings().get("resolve_host_pinning")),
             "fallback_main": bool(settings.get_settings().get("resolve_host_fallback_main")),
-            "warning_seconds": settings.tunable("resolve_takeover_warning_seconds"),
+            "warn_takeover": bool(settings.get_settings().get("resolve_takeover_warn")),
             "host": host, "host_reason": why}
 
 
@@ -864,20 +864,11 @@ class Handler(BaseHTTPRequestHandler):
                     upd[k] = bool(body.get(k))
             if "priority" in body:
                 upd["resolve_host_displays"] = body.get("priority")
-            if "warning_seconds" in body:
-                upd["resolve_takeover_warning_seconds"] = body.get("warning_seconds")
+            if "warn_takeover" in body:
+                upd["resolve_takeover_warn"] = bool(body.get("warn_takeover"))
             if upd:
                 settings.set_settings(upd)
             self._json(displays_view())
-        elif path == "/api/takeover-ack":
-            # "Go ahead" on the warning panel: drop the file the shim's countdown polls.
-            try:
-                import dv_shim
-                os.makedirs(os.path.dirname(dv_shim.TAKEOVER_ACK), exist_ok=True)
-                open(dv_shim.TAKEOVER_ACK, "w").close()
-                self._json({"ok": True})
-            except Exception as e:
-                self._json({"error": str(e)}, code=500)
         elif path == "/api/display-smoke":
             # Score every template against ONE display and remember the result. This is
             # what a screen must pass before it is allowed to host Resolve.

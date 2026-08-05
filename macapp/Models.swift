@@ -38,11 +38,12 @@ struct ProgressDTO: Codable {
     var ep_secs_total: Double?
     var eta_secs: Double?
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
-    var takeover_in: Int?     // the countdown's LENGTH, for context only
+    // No timer. A countdown has to start somewhere, and the only place with slack is the
+    // top of the stage — but the takeover lands whenever setup() finishes (Resolve's cold
+    // start plus a 20-chunk import), so the number hit zero and then sat at "now..." for
+    // minutes. Two plain states instead.
+    var takeover_soon: Bool?    // about to take the screen + mouse (~10 s of real work left)
     var takeover_active: Bool?  // the pipeline HAS the screen and mouse right now
-    var takeover_at: Int?     // epoch when the screen + mouse will be taken. Absolute so the
-                              // app ticks its own countdown rather than showing whichever
-                              // number the last 1.5s poll caught. 0 = taken/cancelled.
 }
 
 struct HoldDTO: Codable {
@@ -327,7 +328,7 @@ struct DisplaysDTO: Codable {
     var priority: [String]?      // ordered keys, highest first
     var enabled: Bool?           // the master switch (default off)
     var fallback_main: Bool?
-    var warning_seconds: Int?
+    var warn_takeover: Bool?
     var host: DisplayDTO?        // what would actually be driven right now
     var host_reason: String?
 }

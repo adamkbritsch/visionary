@@ -338,9 +338,6 @@ def setup_single(video, mode=MODE_DV2000):
 def single(video, out, mode=MODE_DV2000, bitrate=60000):
     """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
     (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
-    if is_dv_mode(mode):
-        import dv_shim as _sh
-        _sh.arm_takeover_warning()      # countdown overlaps setup, same as episode()
     rc = setup_single(video, mode)
     if rc != 0:
         return rc
@@ -370,12 +367,6 @@ def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
     `mode` ('dv1000'|'dv2000'|'sdr') selects the project + the DV analyze target ceiling
     ('sdr' has no DV stage at all, so the whole run is headless); `bitrate`
     (Kb/s) is the export bitrate (already max'd against the intake by the caller)."""
-    if is_dv_mode(mode):
-        # Start the countdown BEFORE setup: Resolve's launch + timeline assembly is the
-        # lead time, so the warning costs nothing. SDR output never touches the screen,
-        # so it is never armed there.
-        import dv_shim as _sh
-        _sh.arm_takeover_warning()
     rc = setup(segdir, mode)
     if rc != 0:
         return rc

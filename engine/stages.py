@@ -450,26 +450,18 @@ def _resolve(p, abort, progress=None):
                 # lead time that exists — the stage flips to "resolve" seconds before
                 # Resolve launches, so the warning window is the deliberate hold the shim
                 # takes, and this is what tells the app to draw the notice.
-                t = re.match(r"SCREEN_TAKEOVER_AT (\d+) IN (\d+)", line.strip())
-                if t and progress:
-                    # An ABSOLUTE deadline, not a duration: the app ticks its own countdown
-                    # from this, instead of showing whichever number the last 1.5s poll
-                    # happened to catch.
+                # Three states, no timer. SOON = about to (roughly ten seconds of real
+                # setup work still to run), BEGIN = the first click has landed and the mouse
+                # is genuinely taken, END = handed back.
+                if progress and line.startswith("SCREEN_TAKEOVER_SOON"):
                     progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_at": int(t.group(1)),
-                              "takeover_in": int(t.group(2))})
+                              "takeover_soon": True, "takeover_active": False})
                 elif progress and line.startswith("SCREEN_TAKEOVER_BEGIN"):
-                    # It is happening NOW — the countdown is over and the app switches
-                    # from "about to" to a live indicator.
-                    progress({"stage": "resolve", "ep": p.ep, "takeover_at": 0,
-                              "takeover_in": 0, "takeover_active": True})
-                elif progress and line.startswith("SCREEN_TAKEOVER_END"):
-                    progress({"stage": "resolve", "ep": p.ep, "takeover_at": 0,
-                              "takeover_in": 0, "takeover_active": False})
-                elif progress and line.startswith(("SCREEN_TAKEOVER_NOW",
-                                                   "SCREEN_TAKEOVER_ACK")):
                     progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_at": 0, "takeover_in": 0})
+                              "takeover_soon": False, "takeover_active": True})
+                elif progress and line.startswith("SCREEN_TAKEOVER_END"):
+                    progress({"stage": "resolve", "ep": p.ep,
+                              "takeover_soon": False, "takeover_active": False})
         threading.Thread(target=_reader, daemon=True).start()
         deadline = time.time() + RESOLVE_TIMEOUT
         while proc.poll() is None:

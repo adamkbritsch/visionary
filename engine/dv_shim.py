@@ -499,6 +499,7 @@ def click(x, y):
               host=[ox, oy, w_pt, h_pt])
         raise RuntimeError("refusing to click (%.0f, %.0f) — outside the display being "
                            "driven (%.0f, %.0f %.0fx%.0f)" % (x, y, ox, oy, w_pt, h_pt))
+    _announce_takeover()          # the first click is the moment the mouse is taken
     # -r restores the pointer afterwards, so a run does not park the user's cursor on
     # whatever it just clicked.
     subprocess.run([CLICLICK, "-r", f"c:{int(round(x))},{int(round(y))}"], check=True)
@@ -630,62 +631,40 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
         time.sleep(poll)
 
 
-TAKEOVER_ACK = os.path.expanduser("~/.topaz-pipeline/takeover_ack")
-
-# When the screen/mouse will actually be seized. Set by arm_takeover_warning() at the START
-# of the resolve stage; _warn_before_takeover() then waits only whatever is LEFT of it.
-_TAKEOVER_DEADLINE = None
+# Has the mouse actually been taken yet this process? The first click is the moment, and
+# announcing it there is exact — no prediction involved.
+_TAKEOVER_ANNOUNCED = False
 
 
-def arm_takeover_warning():
-    """Start the countdown NOW — while Resolve is still launching and the timeline is still
-    being assembled, which is 30-200s of real work before anything is clicked.
+def warn_takeover_soon():
+    """Say the screen and mouse are ABOUT to be taken. No countdown, and no waiting.
 
-    This is the difference between a countdown and a delay. Sleeping for N seconds at the
-    moment of the takeover would buy the warning by making every episode N seconds longer;
-    starting the clock here spends the lead time that the stage was going to burn anyway,
-    so in the normal case the deadline has already passed by the time the shim is ready to
-    click and NOTHING is added.
+    A countdown was tried and was dishonest. It has to start somewhere, and the only place
+    with slack is the top of the resolve stage — but the takeover then happens whenever
+    setup() finishes, which is Resolve's cold start plus a 20-chunk import: anywhere from
+    30 seconds to several minutes. The number hit zero and then sat at "now..." for
+    minutes, which is worse than no number at all.
 
-    Publishes an absolute deadline rather than a duration so the app can tick smoothly on
-    its own instead of re-rendering whatever number happened to land in the last poll."""
-    global _TAKEOVER_DEADLINE
+    So this is a plain notice, fired where roughly ten seconds of REAL work still separate
+    it from the first click: goto_dolby_vision has to switch to the Color page, activate
+    Resolve, place it on the pinned display, enter full screen (~3 s settle) and take a
+    screenshot before it clicks anything. That lead is free — it is work the stage was
+    going to do anyway — and it is approximately right rather than precisely wrong."""
     try:
         import settings
-        secs = int(settings.tunable("resolve_takeover_warning_seconds"))
+        if not settings.get_settings().get("resolve_takeover_warn", True):
+            return
     except Exception:
-        secs = 0
-    if secs <= 0:
-        _TAKEOVER_DEADLINE = None
-        return
-    try:
-        os.remove(TAKEOVER_ACK)
-    except OSError:
         pass
-    _TAKEOVER_DEADLINE = time.time() + secs
-    print("SCREEN_TAKEOVER_AT %d IN %d" % (round(_TAKEOVER_DEADLINE), secs), flush=True)
+    print("SCREEN_TAKEOVER_SOON", flush=True)
 
 
-def _warn_before_takeover(abort=None):
-    """Wait out whatever REMAINS of the armed countdown. Usually nothing: the stage's own
-    setup work outlasts it. Ends early on an ack or an abort."""
-    global _TAKEOVER_DEADLINE
-    if _TAKEOVER_DEADLINE is None:
-        return
-    while True:
-        left = _TAKEOVER_DEADLINE - time.time()
-        if left <= 0:
-            break
-        if abort is not None and getattr(abort, "is_set", lambda: False)():
-            _TAKEOVER_DEADLINE = None
-            return
-        if os.path.exists(TAKEOVER_ACK):
-            print("SCREEN_TAKEOVER_ACK", flush=True)
-            _TAKEOVER_DEADLINE = None
-            return
-        time.sleep(min(0.5, left))
-    print("SCREEN_TAKEOVER_NOW", flush=True)
-    _TAKEOVER_DEADLINE = None
+def _announce_takeover():
+    """Called from the first click: the mouse is now genuinely taken."""
+    global _TAKEOVER_ANNOUNCED
+    if not _TAKEOVER_ANNOUNCED:
+        _TAKEOVER_ANNOUNCED = True
+        print("SCREEN_TAKEOVER_BEGIN", flush=True)
 
 
 def run_dv_ui(abort=None, expect_nit=1000) -> bool:
@@ -714,7 +693,9 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
         _diag("session-locked")
         raise RuntimeError("the session is LOCKED — screencapture only sees the lock screen, "
                            "so no template can match. Disable the screen lock for lid-closed runs.")
-    _warn_before_takeover(abort)
+    global _TAKEOVER_ANNOUNCED
+    _TAKEOVER_ANNOUNCED = False
+    warn_takeover_soon()          # ~10 s of real work still to do before the first click
     # Remember where the user had the pointer, and hand it back when the takeover ends —
     # however it ends. In `finally`, so a raised template failure, a wrong-target refusal
     # or a stop-time abort all release the mouse too; those are exactly the paths where
@@ -723,7 +704,6 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     # BEGIN/END bracket the period the pipeline actually holds the screen and mouse. The
     # countdown says it is coming; this says it is happening, which is the part the user
     # is living through.
-    print("SCREEN_TAKEOVER_BEGIN", flush=True)
     try:
         import resolve
         r = resolve.connect()

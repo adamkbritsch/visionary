@@ -135,11 +135,13 @@ DEFAULT_SETTINGS = {
                                 # Off (default) is the FAIL-SAFE: the item defers instead, so a
                                 # yanked cable stalls the run rather than seizing the screen the
                                 # user was told would be left alone.
-    "resolve_takeover_warning_seconds": 0,  # hold this long, showing a warning on the main
-                                # display, before the shim takes the screen and the mouse. 0 = no
-                                # hold (today's behaviour). There is no free lead time to spend:
-                                # the stage flips to "resolve" seconds before Resolve launches, so
-                                # a real warning has to be PAID FOR in pipeline time.
+    "resolve_takeover_warn": True,   # show a notice on the main display just before the pipeline
+                                # takes the screen and mouse. NOT a countdown and NOT a delay: it
+                                # fires from run_dv_ui, where ~10 s of real setup work (Color page,
+                                # activate, placement, full screen, screenshot) still has to run
+                                # before the first click. A timer was tried and removed — it had to
+                                # start at the top of the stage, but the takeover lands whenever
+                                # setup() finishes, so it hit zero and sat at "now..." for minutes.
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -162,7 +164,6 @@ LIMITS = {
     "max_episode_fails": (1, 20),
     "unplug_grace_seconds": (0, 600),
     "seg_eta_after_minutes": (1, 120),
-    "resolve_takeover_warning_seconds": (0, 300),   # 1 = effectively always (a Topaz segment never encodes
                                          # in under a minute); high = effectively never
 }
 ZERO_IS_OFF = {"audio_target_lufs", "passthrough_min_mbps", "prefetch_cap_gb"}

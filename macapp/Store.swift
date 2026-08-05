@@ -108,9 +108,8 @@ final class AppStore: ObservableObject {
     func setDisplayPriority(_ keys: [String]) async {
         await post("/api/displays", ["priority": keys]); await fetchDisplays()
     }
-    func setTakeoverWarning(_ seconds: Int) async {
-        await post("/api/displays", ["warning_seconds": max(0, min(300, seconds))])
-        await fetchDisplays()
+    func setTakeoverWarning(_ on: Bool) async {
+        await post("/api/displays", ["warn_takeover": on]); await fetchDisplays()
     }
     /// Score every template against one screen and remember the result. A display cannot
     /// host Resolve until this passes — driving a screen nobody is watching turns a bad
@@ -122,18 +121,11 @@ final class AppStore: ObservableObject {
         await fetchDisplays()
     }
 
-    /// When the pipeline will seize the screen and mouse, or nil when it is not about to.
-    /// An absolute deadline, so the panel can tick its own countdown between the 1.5 s
-    /// polls instead of freezing on whichever number the last one happened to carry.
-    var takeoverAt: Date? {
-        guard let t = state?.orchestrator?.progress?.takeover_at, t > 0 else { return nil }
-        let d = Date(timeIntervalSince1970: TimeInterval(t))
-        return d.timeIntervalSinceNow > -2 ? d : nil     // stale marker → gone
-    }
+    /// About to take the screen and mouse — roughly ten seconds of real setup work still to
+    /// run. Deliberately not a countdown: see ProgressDTO.takeover_soon.
+    var takeoverSoon: Bool { state?.orchestrator?.progress?.takeover_soon == true }
     /// True while the pipeline actually HAS the screen and mouse (not merely about to).
     var takeoverActive: Bool { state?.orchestrator?.progress?.takeover_active == true }
-    /// "Go ahead" — take the screen now instead of waiting out the countdown.
-    func ackTakeover() async { await post("/api/takeover-ack", [:]) }
 
     func runSelftest() async {
         if let t: SelftestDTO = await get("/api/selftest") { self.selftest = t }

@@ -195,55 +195,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // It also cannot carry a live countdown. This needs no entitlement and always shows.
     private var takeoverPanel: NSPanel?
     private var takeoverLabel: NSTextField?
-    private var takeoverDeadline: Date?
-    private var takeoverTicker: Timer?
-    private var takeoverLive = false        // false = countdown, true = happening now
+    private var takeoverLive = false        // false = about to, true = happening now
 
     private func updateTakeoverWarning() {
-        // Two states, one panel: "about to take the screen" (a countdown you can defer or
-        // wave through) and "using the screen right now" (a live indicator you can end).
-        if store.takeoverActive {
-            takeoverDeadline = nil
-            showTakeoverWarning(live: true)
-            return
-        }
-        guard let at = store.takeoverAt else { hideTakeoverWarning(); return }
-        takeoverDeadline = at
-        showTakeoverWarning(live: false)
+        // Two states, one panel, NO timer: "about to take the screen" and "using it right
+        // now". A countdown was tried and removed — it had to start at the top of the stage,
+        // but the takeover lands whenever setup() finishes, so it hit zero and then sat at
+        // "now..." for minutes.
+        if store.takeoverActive { showTakeoverWarning(live: true); return }
+        if store.takeoverSoon { showTakeoverWarning(live: false); return }
+        hideTakeoverWarning()
     }
 
     private func hideTakeoverWarning() {
-        takeoverTicker?.invalidate(); takeoverTicker = nil
-        takeoverDeadline = nil
         takeoverLive = false
         takeoverPanel?.orderOut(nil)
         takeoverPanel = nil
         takeoverLabel = nil
     }
 
-    /// Seconds left, from the DEADLINE — not from a number the engine sent. The engine
-    /// starts the clock while Resolve is still launching, so the count runs down through
-    /// real work and the poll cadence never shows through.
-    private func takeoverRemaining() -> Int {
-        guard let d = takeoverDeadline else { return 0 }
-        return max(0, Int(d.timeIntervalSinceNow.rounded(.up)))
-    }
-
-    private func tickTakeover() {
-        guard takeoverPanel != nil else { return }
-        if takeoverLive {
-            takeoverLabel?.stringValue = "Resolve has the mouse — it will be handed back"
-            return
-        }
-        let left = takeoverRemaining()
-        takeoverLabel?.stringValue = left > 0
-            ? "Taking the screen in \(left)s"
-            : "Taking the screen now…"
-    }
-
     private func showTakeoverWarning(live: Bool) {
-        // Rebuild when the MODE changes — the buttons and wording differ between them.
-        if takeoverPanel != nil && takeoverLive == live { tickTakeover(); return }
+        // Rebuild when the MODE changes — the wording and buttons differ between them.
+        if takeoverPanel != nil && takeoverLive == live { return }
         if takeoverPanel != nil { hideTakeoverWarning() }
         takeoverLive = live
         let w: CGFloat = 380, h: CGFloat = 96
@@ -272,7 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         title.frame = NSRect(x: 16, y: h - 34, width: w - 32, height: 18)
         let label = NSTextField(labelWithString: live
             ? "Resolve has the mouse — it will be handed back"
-            : "Taking the screen in \(takeoverRemaining())s")
+            : "About to take the screen and mouse")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
         label.frame = NSRect(x: 16, y: h - 56, width: w - 32, height: 16)
@@ -288,15 +261,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stop.frame = NSRect(x: w - 146, y: 12, width: 130, height: 24)
             controls.append(stop)
         } else {
+            // No "Go ahead": with no countdown there is nothing to wave through. The only
+            // useful action is still to push it away.
             let later = FirstMouseButton(title: "Not now (30m)", target: self,
                                          action: #selector(takeoverDefer))
             later.bezelStyle = .rounded
-            later.frame = NSRect(x: 16, y: 12, width: 130, height: 24)
-            let go = FirstMouseButton(title: "Go ahead", target: self,
-                                      action: #selector(takeoverAck))
-            go.bezelStyle = .rounded
-            go.frame = NSRect(x: w - 116, y: 12, width: 100, height: 24)
-            controls += [later, go]
+            later.frame = NSRect(x: w - 146, y: 12, width: 130, height: 24)
+            controls.append(later)
         }
 
         for v in controls { bg.addSubview(v) }
@@ -310,17 +281,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         takeoverLabel = label
         // Tick locally every second — the poll is 1.5 s, so a poll-driven countdown would
         // visibly stutter and skip numbers.
-        takeoverTicker?.invalidate(); takeoverTicker = nil
-        if !live {
-            takeoverTicker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.tickTakeover() }
-            }
-        }
-    }
-
-    @objc private func takeoverAck() {
-        hideTakeoverWarning()
-        Task { await store.ackTakeover() }
     }
 
     @objc private func takeoverDefer() {
