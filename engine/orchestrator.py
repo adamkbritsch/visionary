@@ -2501,7 +2501,13 @@ class Orchestrator:
 
         run_stage = self.state.get("stage")
         run_active = bool(self.state.get("stage_active"))
-        regime = eta_math.regime_of(run_stage=run_stage, run_active=run_active)
+        # Is the OTHER lane encoding right now? Two x265 runs halve each other, and calling
+        # that "solo" banks the halved rate as this lane's best case.
+        other = self.state.get("finishing2" if lane == 1 else "finishing") or {}
+        other_live = (other.get("stage") == "remux" and other.get("pct") is not None
+                      and not other.get("holding"))
+        regime = eta_math.regime_of(run_stage=run_stage, run_active=run_active,
+                                    other_lane_live=other_live)
         book = self._lane_books.setdefault(lane, eta_math.RateBook())
         # The gate inside tick() is what keeps the resume REPLAY BURST out of the window — on
         # every restart dvcap re-fires one callback per finished segment, and the old estimator

@@ -83,13 +83,24 @@ def accept_sample(df, dt, max_fps: float = R_MAX_FPS) -> bool:
     """Is this (frames, seconds) interval real encoding evidence?
 
     Rejects: a backwards or zero clock, frames going backwards (a restart), a physically
-    impossible rate (the resume replay burst), and a long stall (a hold, not slow encoding)."""
+    impossible rate (the resume replay burst), and a long stall (a hold, not slow encoding).
+
+    THE LONG-INTERVAL RULE APPLIES WHATEVER df IS. It used to only fire when df was exactly
+    zero, which missed the case that matters most: a lane SUSPENDED for Resolve stops
+    reporting progress entirely, and the first callback after it resumes carries a handful of
+    frames against the whole suspension — twenty minutes of wall clock for twelve frames.
+    That is not slow encoding, it is a hold with an encoding sample stapled to the end of it,
+    and one such tick measured a healthy 2.50 fps lane at 1.04 (a 2.4x ETA inflation). Several
+    Resolve passes compounded it to the 5x seen live. Any interval this long contains a hold;
+    drop it and re-anchor rather than averaging it in."""
     if dt is None or df is None:
         return False
     if dt <= 0 or df < 0:
         return False
+    if dt > MAX_IDLE_TICK:
+        return False
     if df == 0:
-        return dt <= MAX_IDLE_TICK
+        return True
     return (df / dt) <= max_fps
 
 
@@ -177,12 +188,21 @@ def shrink_k(samples, prior: float = K_PRIOR, n0: int = K_PRIOR_WEIGHT) -> float
     return clamp_k(math.exp((n * med + n0 * math.log(prior)) / (n + n0)))
 
 
-def regime_of(*, run_stage: str | None, run_active: bool) -> str:
+def regime_of(*, run_stage: str | None, run_active: bool,
+              other_lane_live: bool = False) -> str:
     """Which regime a FINISHER lane is encoding in right now.
 
     Keys off `stage_active`, never `stage` alone -- `stage` is stale by design (set at stage
     start, never cleared) so it names a dead stage for the whole 60 s retry after a failure, and
-    a power hold keeps it set on purpose. Trusting it would label a solo machine 'contended'."""
+    a power hold keeps it set on purpose. Trusting it would label a solo machine 'contended'.
+
+    THE OTHER REMUX LANE COUNTS AS CONTENTION. Two x265 encodes on one machine roughly halve
+    each other; calling that 'solo' banks the halved rate as this lane's best case and then
+    predicts no speed-up for when the other lane finishes -- so the estimate stays pessimistic
+    for the whole remainder. It is the same two-phase shape the model already exists for, just
+    with the other lane playing the part Topaz usually plays."""
+    if other_lane_live:
+        return CONTENDED
     if run_active and run_stage in ("download", "topaz"):
         return CONTENDED
     return SOLO

@@ -55,9 +55,12 @@ class RateEstimator(unittest.TestCase):
         # 6 fps: the honest answer for "how long will N frames take" is the HARMONIC mean, 3.0.
         # Averaging fps per-frame gives 4.0 -> a permanent 33% underestimate at every tick.
         b = eta.RateBook()
-        frames = 600
-        b.tick(eta.CONTENDED, frames, frames / 2.0)        # 600 frames at 2 fps = 300 s
-        b.tick(eta.CONTENDED, frames, frames / 6.0)        # 600 frames at 6 fps = 100 s
+        # Equal FRAMES at each rate is what makes the harmonic mean the right answer. Interval
+        # lengths kept under MAX_IDLE_TICK — an interval longer than that is treated as
+        # containing a hold and is dropped, which is a different rule being tested elsewhere.
+        frames = 200
+        b.tick(eta.CONTENDED, frames, frames / 2.0)        # 200 frames at 2 fps = 100 s
+        b.tick(eta.CONTENDED, frames, frames / 6.0)        # 200 frames at 6 fps = 33.3 s
         self.assertAlmostEqual(b.rate(eta.CONTENDED), 3.0, places=6)
         self.assertNotAlmostEqual(b.rate(eta.CONTENDED), 4.0, places=1)
 
@@ -173,3 +176,48 @@ class Regimes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuspensionPoisoning(unittest.TestCase):
+    """A lane SUSPENDED for Resolve stops reporting progress entirely, and the first callback
+    after it resumes carries a few frames against the whole suspension — twenty minutes of
+    wall clock for a dozen frames. That is a hold with an encoding sample stapled to the end,
+    not slow encoding. One such tick measured a healthy 2.50 fps lane at 1.04 (2.4x ETA
+    inflation); several Resolve passes compounded it to the 5x seen live."""
+
+    def test_a_hold_spanning_interval_is_rejected_even_with_frames(self):
+        self.assertFalse(eta.accept_sample(12, eta.MAX_IDLE_TICK + 1))
+        self.assertFalse(eta.accept_sample(12, 1140.0))     # a 19-minute suspension
+
+    def test_it_no_longer_drags_the_measured_rate_down(self):
+        b = eta.RateBook()
+        for _ in range(200):
+            b.tick(eta.SOLO, 10, 4.0)                       # a healthy 2.5 fps
+        before = b.rate(eta.SOLO)
+        b.tick(eta.SOLO, 12, 1140.0)                        # resume after a suspension
+        self.assertAlmostEqual(b.rate(eta.SOLO), before, places=6)
+
+    def test_ordinary_ticks_and_short_idles_still_count(self):
+        self.assertTrue(eta.accept_sample(10, 4.0))
+        self.assertTrue(eta.accept_sample(0, 30.0))         # a brief gap is still evidence
+        self.assertFalse(eta.accept_sample(5000, 1.0))      # the replay burst, still rejected
+
+
+class TwoLaneContention(unittest.TestCase):
+    """Two x265 encodes roughly halve each other. Calling that 'solo' banks the halved rate as
+    the lane's BEST case and predicts no speed-up for when the other lane finishes, so the
+    estimate stays pessimistic for the whole remainder."""
+
+    def test_the_other_lane_is_contention(self):
+        self.assertEqual(eta.regime_of(run_stage=None, run_active=False,
+                                       other_lane_live=True), eta.CONTENDED)
+
+    def test_a_lone_lane_on_an_idle_machine_is_solo(self):
+        self.assertEqual(eta.regime_of(run_stage=None, run_active=False,
+                                       other_lane_live=False), eta.SOLO)
+
+    def test_topaz_still_counts_as_contention(self):
+        self.assertEqual(eta.regime_of(run_stage="topaz", run_active=True), eta.CONTENDED)
+
+    def test_the_default_keeps_every_existing_caller_unchanged(self):
+        self.assertEqual(eta.regime_of(run_stage="resolve", run_active=True), eta.SOLO)

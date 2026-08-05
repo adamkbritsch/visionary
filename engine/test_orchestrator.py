@@ -835,6 +835,9 @@ class Lane2Eta(unittest.TestCase):
     def test_lane2_reports_an_eta_once_the_window_is_wide_enough(self):
         o = orch.Orchestrator()
         self.assertIsNone(self._feed(o, 1000, 10_000, 0.0).get("eta_secs"))  # first tick: no estimate
+        # Fed in ticks under MAX_IDLE_TICK — a longer interval is treated as containing a
+        # hold and dropped, which is a separate rule. Same 5 fps, same 8000 frames left.
+        self._feed(o, 1500, 10_000, 100.0)
         f = self._feed(o, 2000, 10_000, 200.0)      # 1000 frames in 200 s = 5 fps -> 8000 left
         self.assertAlmostEqual(f["eta_secs"], 1600.0 + eta_math.tail_estimate(10_000), delta=10.0)
 
@@ -1990,8 +1993,12 @@ class FinisherEta(unittest.TestCase):
         clk = {"t": 100.0}                          # deterministic clock, any call count
         with mock.patch.object(orch.time, "monotonic", side_effect=lambda: clk["t"]):
             o._set_finishing_progress({"stage": "remux", "frames": 0, "total": 41071, "pct": 0})
-            clk["t"] = 350.0                        # +250 s, +2500 frames → 10 fps live
-            o._set_finishing_progress({"stage": "remux", "frames": 2500, "total": 41071, "pct": 6.1})
+            # 2500 frames over 250 s = 10 fps live, fed as ticks under MAX_IDLE_TICK (a
+            # longer interval is treated as spanning a hold and dropped).
+            for t, fr in ((200.0, 1000), (300.0, 2000), (350.0, 2500)):
+                clk["t"] = t
+                o._set_finishing_progress({"stage": "remux", "frames": fr,
+                                           "total": 41071, "pct": 100.0 * fr / 41071})
         eta = (o.state["finishing"] or {}).get("eta_secs")
         self.assertIsNotNone(eta)
         expect = (41071 - 2500) / 10.0 + eta_math.tail_estimate(41071)
