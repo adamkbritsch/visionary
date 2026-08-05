@@ -409,22 +409,30 @@ struct PowerPill: View {
         let lead = leadStage
         // BARE TEXT — no capsule, no rim. This is a readout, not a control, and a plate made it
         // read as a button next to Activate. Attention is brightness, never hue.
-        // Grouping by SPACING rather than by separators: each icon sits tight against the number
-        // it belongs to (4pt), and the groups are held apart by a wide gap (14pt). The gap does
-        // the work the "·" was doing, without adding marks to a bar that is already dense.
-        HStack(spacing: 14) {
+        //
+        // Grouping is done with SPACING, not separators: an icon sits tight against the number
+        // it belongs to, and the groups are held apart by a wide gap. The gap does the work a
+        // "·" would, without adding marks to a bar that is already dense.
+        //
+        // The slots stay fixed-width so a changing digit never shifts anything downstream, but
+        // they are aligned LEADING. Trailing alignment put the slack INSIDE the group — a short
+        // value like "92%" was pushed to the right edge of its box, stranding it several points
+        // from its own icon and breaking the very pairing the spacing is there to create. Now
+        // the slack falls on the outside, where it just reads as more space between groups.
+        HStack(spacing: 13) {
             Text(label)
             if let cap {
-                HStack(spacing: 4) {
+                HStack(spacing: 3) {
                     Image(systemName: batterySymbol(cap, charging: p?.charging ?? false))
                         .font(.system(size: 11))
                     Text("\(cap)%").monospacedDigit()
-                        // Fixed slot so 9%→10%→100% never shifts the group.
-                        .frame(width: Self.pctSlot, alignment: .trailing)
+                        // Fixed slot so 9%→10%→100% never shifts anything downstream; LEADING
+                        // so the number stays welded to its icon whatever its width.
+                        .frame(width: Self.pctSlot, alignment: .leading)
                 }
             }
             if let lead {
-                HStack(spacing: 4) {
+                HStack(spacing: 3) {
                     Image(systemName: lead.1).font(.system(size: 11))
                     // Two lanes -> "41% / 3%", in LANE ORDER, never sorted: a sorted pair
                     // swaps position the instant one lane overtakes the other, which makes a
@@ -433,7 +441,7 @@ struct PowerPill: View {
                     Text(lead.3 == nil ? "\(lead.2)%" : "\(lead.2)% / \(lead.3!)%")
                         .monospacedDigit()
                         .frame(width: lead.3 == nil ? Self.pctSlot : Self.dualPctSlot,
-                               alignment: .trailing)
+                               alignment: .leading)
                 }
             }
         }
