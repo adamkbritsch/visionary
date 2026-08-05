@@ -740,12 +740,19 @@ struct PipelineCard: View {
         // last-known percentage while suspended for Resolve. Keying the card on its mere
         // presence opened Remux the instant you hit Activate, looking exactly like work in
         // progress, and left it open beside an active Resolve that had just frozen it.
-        let finStage = PipelineCard.laneLive(o?.finishing) ? o?.finishing?.stage
-            : (PipelineCard.laneLive(o?.finishing2) ? o?.finishing2?.stage : nil)
-        let twoUp = (runStage != nil) && (finStage != nil) && (runStage != finStage)
+        // EVERY live lane's stage, not just the first one's. The two lanes are independent and
+        // routinely sit in DIFFERENT stages — lane 1 uploading while lane 2 is still remuxing.
+        // Collapsing them to one stage put both lanes' rows inside whichever card happened to
+        // win, so a still-remuxing lane 2 was drawn under UPLOAD, segment counter and all,
+        // reading as if two episodes were being uploaded at once. Nothing was: the engine had
+        // them on separate stages and _upload_lock serializes NAS pushes anyway.
+        let finStages: Set<String> = Set([o?.finishing, o?.finishing2]
+            .compactMap { PipelineCard.laneLive($0) ? $0?.stage : nil })
+        let activeCount = (runStage != nil ? 1 : 0) + finStages.subtracting([runStage ?? ""]).count
+        let twoUp = activeCount >= 2
         // The current-episode name MOVES into each active card's top-right (below). The header
         // hint is only the idle next-up preview now — nil while anything is processing.
-        let headerHint: String? = (runStage != nil || finStage != nil) ? nil : nowProcessing
+        let headerHint: String? = (runStage != nil || !finStages.isEmpty) ? nil : nowProcessing
         Card(title: "The pipeline", systemImage: "arrow.triangle.branch", hint: headerHint,
              accessory: skippable ? AnyView(
                 Button { confirmingSkip = true } label: {
@@ -766,9 +773,9 @@ struct PipelineCard: View {
             HStack(alignment: .top, spacing: 6) {
                 ForEach(Array(PIPELINE.enumerated()), id: \.offset) { i, st in
                     let role: StageRole = (st.key == runStage) ? .run
-                        : (st.key == finStage) ? .finisher : .inactive
+                        : finStages.contains(st.key) ? .finisher : .inactive
                     StageView(index: i + 1, info: st, role: role, twoUp: twoUp,
-                              episode: episodeLabel(role))
+                              episode: episodeLabel(role, stageKey: st.key))
                     if i < PIPELINE.count - 1 {
                         Image(systemName: "chevron.right").font(.system(size: 11)).foregroundStyle(.tertiary)
                             .padding(.top, 21)
@@ -789,14 +796,17 @@ struct PipelineCard: View {
     }
 
     // The concise episode token shown in an active card's top-right.
-    func episodeLabel(_ role: StageRole) -> String? {
+    func episodeLabel(_ role: StageRole, stageKey: String) -> String? {
         let o = store.state?.orchestrator
         switch role {
         case .finisher:
-            // With both lanes live a single episode in the top-right is a lie by omission —
-            // the per-row labels carry identity instead, so this just says how many.
-            if PipelineCard.laneLive(o?.finishing2) { return "\u{00D7}2" }
-            return o?.finishing?.ep                                   // already a display string
+            // Only the lanes in THIS stage. "x2" is a lie unless both are actually here.
+            let mine = [o?.finishing, o?.finishing2].compactMap { f -> FinishingDTO? in
+                guard let f, f.stage == stageKey, PipelineCard.laneLive(f) else { return nil }
+                return f
+            }
+            if mine.count > 1 { return "\u{00D7}2" }
+            return mine.first?.ep                                     // already a display string
         case .run:      return runEpisodeShort(o?.current)
         case .inactive: return nil
         }
@@ -882,7 +892,7 @@ struct StageView: View {
                         // has, and it is how you see a wrong-screen or stuck-dialog failure
                         // without going to look.
                         if info.key == "resolve" { ResolvePreview() }
-                        if role == .finisher { FinisherProgress() }    // reads orchestrator.finishing
+                        if role == .finisher { FinisherProgress(stageKey: info.key) }
                         else { StageProgress(stageKey: info.key) }     // reads orchestrator.progress
                     }
                 }
@@ -973,21 +983,28 @@ struct ResolvePreview: View {
 struct FinisherProgress: View {
     @EnvironmentObject var store: AppStore
 
-    /// Both remux lanes, stacked. Lane 2 only exists while a Resolve-stall backlog drains —
-    /// usually nil, in which case this renders exactly what it always did.
+    /// The lanes CURRENTLY IN THIS STAGE, stacked. Filtering by stage is the whole point: the
+    /// two lanes are independent and routinely differ — lane 1 uploading while lane 2 still
+    /// remuxes — and drawing both in one card put a remux's progress, segment counter and all,
+    /// under the Upload heading.
+    let stageKey: String
+
     var body: some View {
         let o = store.state?.orchestrator
         // pct-gated, as it always was: a claimed-but-not-yet-encoding lane has no progress
         // to draw, and an empty bar reads as "running at 0%".
-        let l1 = (o?.finishing?.pct != nil) ? o?.finishing : nil
-        let l2 = (o?.finishing2?.pct != nil) ? o?.finishing2 : nil
+        let mine = [o?.finishing, o?.finishing2].compactMap { f -> FinishingDTO? in
+            guard let f, f.stage == stageKey, f.pct != nil else { return nil }
+            return f
+        }
         // With BOTH rows up, each must name its own episode. The card's top-right says "x2"
-        // then, so it can no longer carry lane 1's — which left the first row anonymous
-        // while the second was labelled.
-        let dual = (l1 != nil && l2 != nil)
+        // then, so it can no longer carry the first one's — which left it anonymous while the
+        // second was labelled.
+        let dual = mine.count > 1
         VStack(alignment: .leading, spacing: 7) {
-            if let f = l1 { LaneProgress(f: f, primary: true, showEpisode: dual) }
-            if let f2 = l2 { LaneProgress(f: f2, primary: false, showEpisode: true) }
+            ForEach(Array(mine.enumerated()), id: \.offset) { i, f in
+                LaneProgress(f: f, primary: i == 0, showEpisode: dual)
+            }
         }
         .padding(.top, 3)
     }
