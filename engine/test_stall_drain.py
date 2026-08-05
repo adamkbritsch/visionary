@@ -386,3 +386,47 @@ class NeverLeaveEncodersFrozen(unittest.TestCase):
         self.assertLess(cont, sh.rindex("pgrep -x x265"),
                         "the unfreeze must come BEFORE the wait-for-exit loop")
         del wait
+
+
+class RemuxRunsDuringAnUpload(unittest.TestCase):
+    """User-dictated and already true, pinned so it stays true: an upload on one lane must
+    never stop the other lane remuxing.
+
+    Uploads are I/O to the NAS and remuxes are CPU, so serialising them wastes the machine.
+    Only uploads serialise against EACH OTHER, via _upload_lock — one NAS push at a time.
+    """
+
+    def _orch(self, lane1_stage, queued=2, backlog=1):
+        import threading
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o.state = {"finishing": {"ep": "A", "stage": lane1_stage, "pct": 60},
+                   "finishing2": None}
+        o._finish_q = mock.Mock(qsize=lambda: queued)
+        o._resolve_active = threading.Event()
+        o._drain_backlog = lambda: backlog
+        o._last_resolve_at = 0.0
+        return o
+
+    def test_lane2_may_take_work_while_lane1_uploads(self):
+        o = self._orch("upload")
+        with mock.patch.object(orch, "_finisher_lanes", return_value=2):
+            self.assertTrue(o._lane2_should_help())
+
+    def test_an_upload_does_not_make_a_remux_stand_down(self):
+        # _remux_must_wait exists for RESOLVE, which needs the whole machine. An upload does
+        # not — it is network I/O.
+        self.assertFalse(self._orch("upload")._remux_must_wait())
+
+    def test_resolve_still_does_make_it_stand_down(self):
+        o = self._orch("upload")
+        o._resolve_active.set()
+        self.assertTrue(o._remux_must_wait())
+
+    def test_uploads_still_serialise_against_each_other(self):
+        # The one thing that must NOT overlap: two NAS pushes.
+        import inspect
+        src = inspect.getsource(orch.Orchestrator._finish_item)
+        self.assertIn("_upload_lock", src)
+        i = src.index('st == "upload"')
+        self.assertIn("_upload_lock", src[i:i + 400],
+                      "the upload branch must still take the single-push lock")
