@@ -321,30 +321,81 @@ def analyzing_in_progress() -> bool:
     return found(screenshot(), _t("analyze_modal.png"))
 
 
+# Templates that prove RESOLVE IS ON SCREEN in a capture, regardless of what it is doing.
+# The palette icon lives in the Color page toolbar whether the palette is open or shut; the
+# Analyze All button is there whenever it IS open. Either one is a witness.
+_ONSCREEN_WITNESSES = ("analyze_all.png", "dolby_vision_palette.png")
+
+BLIND_POLLS_BEFORE_FORCING = 3
+
+
+def resolve_on_screen(shot_path: str) -> bool:
+    """True when this capture actually contains Resolve's Color page. Distinguishes 'the
+    analyze modal closed because analysis finished' from 'the modal is not in frame because
+    Resolve is not the thing being displayed' — which look identical otherwise, and one of
+    them silently ships an UNANALYSED timeline."""
+    return any(found(shot_path, _t(n)) for n in _ONSCREEN_WITNESSES)
+
+
 def wait_for_analysis(*, abort=None, poll: float = 10.0,
                       appear_timeout: float = 150.0, max_seconds: float = 3600.0) -> bool:
     """Block until Analyze All Shots truly finishes. Tracks the analyze MODAL: wait
     for it to APPEAR (analysis started) then DISAPPEAR (done). The old region-hash
     approach false-fired — the Min/Max/Avg strip reads 0.000 the whole analysis and
     looks 'stable' once the initial UI transient settles, so it returned in ~55 s
-    while the analyze was still at 52%. Honours `abort` (stop-time)."""
+    while the analyze was still at 52%. Honours `abort` (stop-time).
+
+    FOCUS. This used to `activate()` on EVERY poll — up to 360 focus steals per episode,
+    an hour of having the keyboard yanked away every ten seconds. It doesn't need to:
+    `screencapture` reads whatever the display is showing, frontmost or not, so a Resolve
+    that is simply sitting there is perfectly readable without being raised. Focus is now
+    taken ONLY when a capture fails to show Resolve at all — i.e. something genuinely moved
+    it out of frame and it has to be brought back before the next poll can mean anything.
+    Leave it alone and this never fires; on a display of its own it should never fire at all.
+
+    SAFETY. A poll that cannot see Resolve must never count toward completion — otherwise
+    switching Spaces would read as "the modal went away, we're done" and render an
+    unanalysed master. Such a poll advances nothing. And if Resolve stays unfindable even
+    after activating, the loop reverts to raising it every poll (exactly the old behaviour),
+    so the worst case here is what the code did before, not a hang."""
     start = time.time()
     saw_modal = False
     gone = 0
+    blind = 0
+    force_activate = False
     while True:
         if abort is not None and abort.is_set():
             return False
-        activate()                            # keep Resolve frontmost for the screenshot
-        present = analyzing_in_progress()
+        if force_activate:
+            activate()
+        shot = screenshot()
+        present = found(shot, _t("analyze_modal.png"))
+        onscreen = present or resolve_on_screen(shot)
+        if not onscreen and not force_activate:
+            # The one place focus is taken: the screen is not showing Resolve, so bring it
+            # back and look again. Everything else in this loop is passive.
+            activate()
+            shot = screenshot()
+            present = found(shot, _t("analyze_modal.png"))
+            onscreen = present or resolve_on_screen(shot)
         elapsed = time.time() - start
         if present:
-            saw_modal, gone = True, 0
-        elif saw_modal:
-            gone += 1
-            if gone >= 2:                     # modal closed (2 polls) → analysis complete
-                return True
-        elif elapsed > appear_timeout:        # modal never showed — click missed / no grants
-            return False
+            saw_modal, gone, blind = True, 0, 0
+        elif onscreen:
+            blind = 0
+            if saw_modal:
+                gone += 1
+                if gone >= 2:                 # modal closed (2 polls) → analysis complete
+                    return True
+            elif elapsed > appear_timeout:    # modal never showed — click missed / no grants
+                return False
+        else:
+            # Could not get eyes on Resolve even after raising it. Advance NOTHING.
+            blind += 1
+            if blind >= BLIND_POLLS_BEFORE_FORCING and not force_activate:
+                force_activate = True
+                print("dv_ui: Resolve not visible in %d polls — reverting to raising it "
+                      "every poll" % blind, flush=True)
         if elapsed >= max_seconds:
             return saw_modal                  # timed out — accept only if it actually ran
         time.sleep(poll)

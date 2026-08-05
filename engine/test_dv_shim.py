@@ -182,3 +182,112 @@ class InheritNotSet(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitForAnalysisFocus(unittest.TestCase):
+    """The loop used to raise Resolve on every poll — up to 360 focus steals an episode.
+    It now only does so when a capture cannot see Resolve at all. The safety property that
+    makes that sound: a poll with no eyes on Resolve must advance NOTHING, or switching
+    Spaces reads as "analysis finished" and ships an unanalysed master."""
+
+    MODAL = "analyze_modal.png"
+
+    def _run(self, frames, **kw):
+        """`frames` is a list of what each successive screenshot 'contains':
+        'modal' | 'resolve' | 'nothing'. Returns (result, activate_count, polls_used)."""
+        seq = list(frames)
+        calls = {"activate": 0, "shots": 0}
+
+        def fake_screenshot(*a, **k):
+            calls["shots"] += 1
+            return seq[min(calls["shots"] - 1, len(seq) - 1)]
+
+        def fake_found(shot, template, **k):
+            name = os.path.basename(template)
+            if name == self.MODAL:
+                return shot == "modal"
+            return shot in ("modal", "resolve")      # the on-screen witnesses
+
+        def fake_activate():
+            calls["activate"] += 1
+            # Raising it works: every capture after this shows Resolve.
+            for i in range(calls["shots"], len(seq)):
+                if seq[i] == "nothing":
+                    seq[i] = "resolve"
+
+        with mock.patch.object(dv_shim, "screenshot", fake_screenshot), \
+             mock.patch.object(dv_shim, "found", fake_found), \
+             mock.patch.object(dv_shim, "activate", fake_activate), \
+             mock.patch.object(dv_shim.time, "sleep", lambda *_a: None):
+            res = dv_shim.wait_for_analysis(poll=0, **kw)
+        return res, calls["activate"], calls["shots"]
+
+    def test_a_visible_resolve_is_never_raised(self):
+        # modal appears, runs, then closes with Resolve still on screen -> done, no focus taken
+        res, activates, _ = self._run(["modal", "modal", "resolve", "resolve"])
+        self.assertTrue(res)
+        self.assertEqual(activates, 0, "focus was taken while Resolve was plainly visible")
+
+    def test_focus_is_taken_only_when_resolve_is_not_in_frame(self):
+        res, activates, _ = self._run(["modal", "nothing", "resolve", "resolve"])
+        self.assertTrue(res)
+        self.assertEqual(activates, 1)
+
+    def test_a_blind_poll_never_counts_as_completion(self):
+        """THE regression this exists to prevent. The modal is out of frame only because
+        Resolve is not being displayed. The OLD loop would count two such polls as
+        'modal closed -> analysis complete' and return True, rendering an unanalysed
+        master. The new one must keep waiting."""
+        calls = {"activate": 0, "shots": 0}
+
+        def fake_screenshot(*a, **k):
+            calls["shots"] += 1
+            return "modal" if calls["shots"] == 1 else "nothing"
+
+        def fake_found(shot, template, **k):
+            if os.path.basename(template) == self.MODAL:
+                return shot == "modal"
+            return shot in ("modal", "resolve")
+
+        # activate() cannot help — Resolve stays out of frame no matter what.
+        with mock.patch.object(dv_shim, "screenshot", fake_screenshot), \
+             mock.patch.object(dv_shim, "found", fake_found), \
+             mock.patch.object(dv_shim, "activate",
+                               lambda: calls.__setitem__("activate", calls["activate"] + 1)), \
+             mock.patch.object(dv_shim.time, "sleep", lambda *_a: None), \
+             mock.patch.object(dv_shim.time, "time",
+                               mock.Mock(side_effect=[0] + [i * 10 for i in range(1, 60)])):
+            res = dv_shim.wait_for_analysis(poll=0, appear_timeout=1e9, max_seconds=300)
+
+        # It ran the clock out instead of returning early off the blind polls: the old code
+        # would have returned after the 3rd screenshot.
+        self.assertGreater(calls["shots"], 8,
+                           "it returned early — blind polls were counted as completion")
+        # saw_modal was true, so the TIMEOUT (not the blind polls) accepts the analysis.
+        self.assertTrue(res)
+
+    def test_it_falls_back_to_the_old_behaviour_when_resolve_stays_invisible(self):
+        # Worst case must be "what it did before", not a new hang: after a few blind polls
+        # it reverts to raising Resolve every single poll.
+        calls = {"activate": 0, "shots": 0}
+
+        def fake_found(shot, template, **k):
+            return False                       # nothing is ever visible
+
+        with mock.patch.object(dv_shim, "screenshot", lambda *a, **k: "nothing"), \
+             mock.patch.object(dv_shim, "found", fake_found), \
+             mock.patch.object(dv_shim, "activate", lambda: calls.__setitem__("activate", calls["activate"] + 1)), \
+             mock.patch.object(dv_shim.time, "sleep", lambda *_a: None), \
+             mock.patch.object(dv_shim.time, "time", mock.Mock(side_effect=[0] + [i * 10 for i in range(1, 40)])):
+            dv_shim.wait_for_analysis(poll=0, appear_timeout=1e9, max_seconds=200)
+        self.assertGreaterEqual(calls["activate"], 3,
+                                "it must revert to raising Resolve when it stays invisible")
+
+    def test_abort_still_wins_before_anything_is_touched(self):
+        ab = mock.Mock()
+        ab.is_set.return_value = True
+        with mock.patch.object(dv_shim, "screenshot",
+                               mock.Mock(side_effect=AssertionError("must not capture"))), \
+             mock.patch.object(dv_shim, "activate",
+                               mock.Mock(side_effect=AssertionError("must not steal focus"))):
+            self.assertFalse(dv_shim.wait_for_analysis(abort=ab, poll=0))
