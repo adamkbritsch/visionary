@@ -133,6 +133,15 @@ STALL_ITEM_RESERVE_GB = 150   # a TV-episode ProRes intermediate needs ~140 GB (
                               # a fresh upscale during a stall unless raw free ≥ FLOOR + this (so the
                               # last one that starts lands near the floor, never past it)
 STALL_MOVIE_RESERVE_GB = 260  # a feature ProRes can reach ~245 GB — a movie needs this much headroom
+RESOLVE_DRAIN_MIN_GB = 80     # DRAIN gate: raw physical free needed to advance an ALREADY-UPSCALED
+                              # item through Resolve while a remux runs. The normal overlap gate
+                              # (OVERLAP_MIN_PHYS_GB) reserves room for the next item's own ~190 GiB
+                              # ProRes — a topaz-DONE item needs none of that, only room for the DV
+                              # render (~18 GiB for a 43-min episode) plus both remux lanes'
+                              # transients (~20 GiB each) and margin. MUST stay <= STALL_FLOOR_GB:
+                              # the stall deliberately fills TO that floor, so any drain gate above
+                              # it is unsatisfiable by a full buffer BY CONSTRUCTION — which is
+                              # exactly how the old 400 blocked the drain it was meant to allow.
 STALL_RETRY_SECONDS = 300     # while stalled, release ONE held item this often to re-probe Resolve
                               # (only the probe attempts Resolve — a blocked attempt can hang for up to
                               # RESOLVE_TIMEOUT, so we never spend one per buffered item)
@@ -525,6 +534,53 @@ def _has_audio(streams) -> bool:
     return any(s.get("codec_type") == "audio" for s in streams or [])
 
 
+RENDER_SHORT_TOLERANCE = 0.995   # a render this fraction of the source's frames is complete
+
+
+def _nb_frames(path):
+    """Frame count of a file's video stream, or None. Counts PACKETS when the container has
+    no nb_frames — accurate and still cheap, since it reads the index, not the pixels."""
+    if not (path and os.path.exists(path)):
+        return None
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets,nb_frames", "-of", "json", path],
+            capture_output=True, text=True, timeout=300).stdout
+        st = (json.loads(out).get("streams") or [{}])[0]
+        for k in ("nb_read_packets", "nb_frames"):
+            v = st.get(k)
+            if v not in (None, "", "N/A"):
+                n = int(v)
+                if n > 0:
+                    return n
+    except Exception:
+        return None
+    return None
+
+
+def render_is_complete(p) -> bool:
+    """Is the Resolve render the WHOLE episode, not a truncated one?
+
+    This is the pipeline's one silent-data-loss hole and it has to be closed before the
+    disk gates are relaxed. _is_dv81 reads only the DOVI configuration record — a render
+    that died at 60% still carries a valid one, so it read as DONE. That hand-off then
+    rmtree'd the ~190 GiB Topaz ProRes, after which stage_done("topaz") returns True purely
+    BECAUSE a "valid" dv_render exists, so the upscale can never be re-derived without a
+    fresh 2-hour Topaz run. The remux's checks are internal-consistency only (its encode vs
+    its own RPU), so a short episode remuxes cleanly, uploads, and — with replace_source on
+    — the 1080p original is deleted after a size-verify that compares the master to the
+    remote MASTER and never to the source.
+
+    Compares against the CFR source, which is what Resolve ingested. Unknown on either side
+    means "don't judge" — this must never fail a good render on a probe hiccup."""
+    want = _nb_frames(getattr(p, "source_cfr", None))
+    got = _nb_frames(getattr(p, "dv_render", None))
+    if not want or not got:
+        return True
+    return got >= want * RENDER_SHORT_TOLERANCE
+
+
 # ---- stage-done detection (resume) ---------------------------------------
 
 def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
@@ -541,11 +597,12 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         # hand-off to free ~120-300 GB, so an item whose remux later aborts must resume at
         # remux, not re-upscale for 2 h (live-hit: S06E03, 2026-07-06 14:56).
         import topaz
-        if _is_dv81(_vstream(p.dv_render)):
+        if _is_dv81(_vstream(p.dv_render)) and render_is_complete(p):
             return True
         return topaz.segments_complete(p.segdir)
     if stage == "resolve":
-        return _is_dv81(_vstream(p.dv_render))
+        # DV profile AND length: a truncated render carries a perfectly valid DOVI record.
+        return _is_dv81(_vstream(p.dv_render)) and render_is_complete(p)
     if stage == "remux":
         s = _vstream(p.final)
         return _is_dv81(s) and _has_audio(s)
@@ -696,7 +753,12 @@ class Orchestrator:
         self._stall_probe = None               # the ONE held item _maybe_retry_stall released to re-test
                                                # Resolve (only it attempts Resolve; the rest stay held)
         self._stall_retry_at = 0.0             # monotonic time to release the next probe (set on first hold)
-        self._draining = set()                 # _skip_key(p) of items released from a Resolve-stall buffer and
+        # NO _draining set. It was write-only in practice: filled only by _resolve_recovered
+        # (which needs _stall_active true) and cleared by enable() — the manual Start the user
+        # is told to press after dismissing Resolve's prompt — so the drain state was destroyed
+        # by the exact recovery gesture, and by every deploy and relaunch besides. The backlog
+        # is DERIVED from the scratch now; see _drain_backlog().
+        self._draining_removed = True          # (marker: see _drain_backlog)
                                                # not yet finished. While >=2 remain, the 2nd remux lane runs +
                                                # Resolve is let 2 items ahead so the backlog clears ~2x faster.
         self._upload_lock = threading.Lock()   # one NAS push at a time even when 2 remux lanes run concurrently
@@ -964,7 +1026,7 @@ class Orchestrator:
             for p in result["dropped"]:
                 k = self._skip_key(p)
                 if k not in keep_keys:
-                    for st in (self._in_finisher, self._in_finisher_movies, self._draining,
+                    for st in (self._in_finisher, self._in_finisher_movies,
                                self._resolve_stall, self._resolve_deferred, self._parked):
                         st.discard(k)
                     self._fail_counts.pop(self._skip_key(p), None)
@@ -1202,7 +1264,6 @@ class Orchestrator:
             self._resolve_stall.clear()
             self._resolve_fails.clear()
             self._stall_probe = None
-            self._draining.clear()
             self._yt_refresh_at = 0.0           # fresh run: re-scan staging + refresh popular sets at once
             self._yt_meta_done = False
             # _tv_since_yt deliberately NOT reset — it's processing HISTORY
@@ -1566,7 +1627,6 @@ class Orchestrator:
         is gone. Release the whole held buffer so every waiting item drains through Resolve."""
         held = len(self._resolve_stall)
         self._stall_active = False
-        self._draining |= self._resolve_stall   # track the freed backlog: while >=2 remain, run 2 remux lanes
         self._resolve_stall.clear()
         self._stall_probe = None
         logbook.event(f"resolve recovered — draining {held} held item(s)")
@@ -1617,7 +1677,17 @@ class Orchestrator:
             # OVERLAP_MIN_PHYS_GB. Both are CAPPED BY the live floor, so lowering the setting on a
             # smaller disk actually lowers this gate instead of pausing the run at a stale 400.
             need = floor if fin_movie else min(OVERLAP_MIN_PHYS_GB, floor)
-            self._reclaim_for_pipeline(need_gb=need)
+            # DRAINING a stall buffer: the waiting items are already upscaled, so the
+            # reserve this gate exists for — room for the NEXT item's own ProRes — is not
+            # needed. Without this the drain cannot start: the buffer fills toward
+            # STALL_FLOOR_GB=100, which is below the 400 gate, so the run thread holds on
+            # "disk" and never selects the very items that would free the space. Movies keep
+            # the full floor — no movie DV render has ever been measured.
+            drain = (not fin_movie) and self._drain_backlog() >= 2
+            if drain:
+                need = min(need, RESOLVE_DRAIN_MIN_GB)
+            self._reclaim_for_pipeline(need_gb=(floor if fin_movie
+                                                else min(OVERLAP_MIN_PHYS_GB, floor)))
             phys = scratch.physical_free_gb()
             if phys is not None and phys < need:
                 return (f"paused — low disk ({phys} GB) while an item finishes in the background "
@@ -2141,12 +2211,37 @@ class Orchestrator:
         with self._finisher_lock:
             return set(self._in_finisher)
 
+    def _drain_backlog(self) -> int:
+        """How many topaz-done items are waiting on the scratch — DERIVED from the disk, not
+        remembered.
+
+        This replaces the in-memory `_draining` set, which never worked. `_draining` is only
+        ever filled by _resolve_recovered(), which only runs while `_stall_active` is true —
+        and enable() (a manual Start) clears BOTH. Since the documented way to recover from
+        Resolve's update prompt is "dismiss it, then Start", the very gesture the user is
+        told to perform destroyed the state the drain depends on. It also died on every
+        deploy and relaunch. Measured over the whole log: the second remux lane had never
+        run, not once.
+
+        Counting segdirs is exact rather than approximate, because outside a stall the code
+        already guarantees AT MOST ONE exists — _drop_topaz_intermediates rmtree's each at
+        hand-off. So >= 2 segdirs IS the stall buffer, by the pipeline's own invariant."""
+        try:
+            base = scratch.default_scratch()
+            n = 0
+            for name in os.listdir(base):
+                if name.endswith(".segments") and os.path.isdir(os.path.join(base, name)):
+                    n += 1
+            return n
+        except OSError:
+            return 0
+
     def _resolve_should_hold(self) -> bool:
         """Should the run thread HOLD an item at the Resolve doorstep? Normally yes while the previous
         item's remux runs (user-dictated 1-at-a-time timing). But while DRAINING a Resolve-stall backlog
         of >=2 items, let Resolve get up to 'finisher_lanes' items ahead so a 2nd remux can run — hold
         only once every lane is full."""
-        if len(self._draining) >= 2:
+        if self._drain_backlog() >= 2:
             return len(self._in_finisher_keys()) >= _finisher_lanes()
         return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize(),
                                  self.state.get("finishing2"))
@@ -2190,7 +2285,7 @@ class Orchestrator:
         selection-time gate can't see a stage that already started)."""
         if stage_done("topaz", ep):
             return False
-        return self._dual_remux_live() or len(self._draining) >= 2
+        return self._dual_remux_live() or self._drain_backlog() >= 2
 
     def _advance_cadence_at_handoff(self, p: EpisodePaths):
         """Scheduling FAIRNESS (cadence counters + round-robin) advances the moment an item's
@@ -2551,7 +2646,6 @@ class Orchestrator:
                 if n >= _max_episode_fails():
                     self._parked.add(self._skip_key(p))
                     self._fail_counts.pop(self._skip_key(p), None)
-                    self._draining.discard(self._skip_key(p))   # left the backlog (parked)
                     with self._cadence_lock:       # finisher thread — never race the run thread
                         self._cadence_advanced.discard(p.source_basename)   # parked: turn spent, done
                         if p.youtube:
@@ -2569,7 +2663,6 @@ class Orchestrator:
         # left a window where a deactivate/relaunch between upload and cleanup dropped the item, so
         # cleanup never re-ran on resume and its ~250-350 GB working set leaked (review-caught).
         self._finisher_persist_remove(p)
-        self._draining.discard(self._skip_key(p))   # fully done → left the stall-drain backlog
 
 
 # module-level singleton the dashboard server drives

@@ -1119,23 +1119,39 @@ class DoubleRemux(unittest.TestCase):
     """Backlog-scoped 2nd remux lane: while DRAINING a Resolve-stall buffer (>=2 finished-topaz items),
     let Resolve get 2 items ahead and run 2 remuxes at once; revert to 1-at-a-time below 2."""
 
-    def test_recovery_moves_the_held_buffer_into_the_drain_backlog(self):
+    def test_recovery_clears_the_stall_and_the_backlog_is_read_from_disk(self):
+        # The backlog is no longer REMEMBERED. It used to live in an in-memory _draining set
+        # filled only here — and cleared by enable(), the manual Start the user is told to
+        # press after dismissing Resolve's prompt. So the recovery gesture itself destroyed
+        # the drain state, and the second lane never ran once in the whole log.
         o = orch.Orchestrator()
         o._stall_active = True; o._resolve_stall = {"A", "B", "C"}
         o._resolve_recovered()
-        self.assertEqual(o._draining, {"A", "B", "C"})     # tracked as the backlog to double-remux
         self.assertEqual(o._resolve_stall, set())
         self.assertFalse(o._stall_active)
+        self.assertFalse(hasattr(o, "_draining"), "the dead in-memory backlog must be gone")
+
+    def test_the_backlog_survives_the_restart_that_used_to_erase_it(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        for i in range(3):
+            _os.makedirs(_os.path.join(d, f"X S01E{i}_prob4_upscaled.segments"))
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
+            self.assertEqual(o._drain_backlog(), 3)
+            o.enable()                       # the "dismiss the prompt, press Start" gesture
+            self.assertEqual(o._drain_backlog(), 3, "Start must no longer erase the backlog")
+            o.disable()
 
     def test_resolve_gate_keeps_single_timing_when_not_draining(self):
-        o = orch.Orchestrator(); o._draining = set()
+        o = orch.Orchestrator(); o._drain_backlog = lambda: 1
         o.state["finishing"] = {"stage": "remux"}
         self.assertTrue(o._resolve_should_hold())          # normal: hold while the one remux runs
         o.state["finishing"] = None
         self.assertFalse(o._resolve_should_hold())         # nothing remuxing, queue empty → proceed
 
     def test_resolve_gate_lets_two_ahead_while_draining(self):
-        o = orch.Orchestrator(); o._draining = {"A", "B", "C"}
+        o = orch.Orchestrator(); o._drain_backlog = lambda: 3
         with mock.patch.object(o, "_in_finisher_keys", return_value={"A"}):
             self.assertFalse(o._resolve_should_hold())     # only 1 in finisher → room for the 2nd remux
         with mock.patch.object(o, "_in_finisher_keys", return_value={"A", "B"}):
@@ -1159,7 +1175,7 @@ class DoubleRemux(unittest.TestCase):
     def test_lane2_finish_uses_its_own_slot_and_leaves_the_backlog(self):
         o = orch.Orchestrator(); o._enabled = True
         p = episode_paths("The Office", "S02E10", SRC)
-        o._draining = {o._skip_key(p), "B"}
+        o._drain_backlog = lambda: 2
         seen = []
         with mock.patch.object(orch, "stage_done", return_value=False), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
@@ -1170,18 +1186,16 @@ class DoubleRemux(unittest.TestCase):
             o._finish_item(p, lambda st, *a, **k: seen.append(st) or (True, "ok"), lane=2)
         self.assertEqual(seen, ["remux", "upload", "cleanup"])
         self.assertIsNone(o.state["finishing"])              # lane-1 slot untouched by lane 2
-        self.assertNotIn(o._skip_key(p), o._draining)        # completed → left the backlog
-        self.assertIn("B", o._draining)                      # the other item still pending
 
     def test_topaz_pauses_for_a_fresh_item_while_two_remuxes_drain(self):
         o = orch.Orchestrator()
         fresh = episode_paths("The Office", "S02E10", SRC)
-        o._draining = {"A", "B"}
+        o._drain_backlog = lambda: 2
         with mock.patch.object(orch, "stage_done", return_value=False):     # fresh: not yet upscaled
             self.assertTrue(o._dual_remux_pauses_topaz(fresh))               # → hold Topaz
         with mock.patch.object(orch, "stage_done", return_value=True):      # already upscaled → resolve it
             self.assertFalse(o._dual_remux_pauses_topaz(fresh))              # (feeds the remux lanes)
-        o._draining = {"A"}
+        o._drain_backlog = lambda: 1
         with mock.patch.object(orch, "stage_done", return_value=False):     # backlog < 2 → Topaz resumes
             self.assertFalse(o._dual_remux_pauses_topaz(fresh))
 
@@ -1223,6 +1237,10 @@ class DoubleRemux(unittest.TestCase):
     def test_topaz_pauses_whenever_both_remux_lanes_are_live(self):
         # The general case (no stall drain): two lanes actually running → fresh Topaz waits.
         o = orch.Orchestrator()
+        o._drain_backlog = lambda: 1        # no backlog — this test is about the LANES.
+                                            # Without this the assertion reads the real
+                                            # scratch and passes or fails by what happens
+                                            # to be on the dev machine's disk.
         fresh = episode_paths("The Office", "S02E10", SRC)
         o.state["finishing"] = {"stage": "remux"}; o.state["finishing2"] = {"stage": "remux"}
         with mock.patch.object(orch, "stage_done", return_value=False):

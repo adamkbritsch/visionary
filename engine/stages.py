@@ -482,7 +482,16 @@ def _resolve(p, abort, progress=None):
             time.sleep(5)
         out = "".join(out_lines)
         tail = " ".join(out.strip().splitlines()[-1:])[:180]
-        ok = _is_dv81(_vstream(p.dv_render))
+        dv = _is_dv81(_vstream(p.dv_render))
+        # LENGTH too. A render that died partway still carries a valid DOVI record, and
+        # accepting it drops the ~190 GiB ProRes that is the only way to redo the upscale.
+        from orchestrator import render_is_complete, _nb_frames
+        whole = render_is_complete(p) if dv else True
+        ok = dv and whole
+        if dv and not whole:
+            logbook.failure(f"resolve {p.ep}: TRUNCATED render "
+                            f"({_nb_frames(p.dv_render)} of {_nb_frames(p.source_cfr)} frames)")
+            return False, out, "resolve produced a SHORT render — not accepting it"
         if not ok:
             logbook.failure(f"resolve {p.ep}: rc={proc.returncode} :: {tail}")
         return ok, out, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -107,10 +108,21 @@ PREFETCH_SUBDIR = "prefetch"      # where the prefetcher stages upcoming downloa
                                   # OUT of the "scratch contents" preview (promoted into scratch on process).
 
 
+_TEST_SCRATCH = (os.path.join(tempfile.gettempdir(), "visionary-test-scratch")
+                 if "unittest" in sys.modules else None)
+
+
 def default_scratch() -> str:
-    """Reliable scratch dir on the internal SSD (always mounted, no cycling)."""
-    os.makedirs(INTERNAL_SCRATCH, exist_ok=True)
-    return INTERNAL_SCRATCH
+    """Reliable scratch dir on the internal SSD (always mounted, no cycling).
+
+    UNDER TESTS this is a temp dir, never the real one. A unit test that reads the
+    developer's actual scratch passes or fails by what happens to be on disk that day —
+    which is not a test. This bit three times in one session: _drain_backlog() counts
+    segdirs there, so ResolveGate and the disk-gate tests silently started asserting
+    against a live 3-item stall buffer. Same reasoning as logbook's test redirect."""
+    base = _TEST_SCRATCH or INTERNAL_SCRATCH
+    os.makedirs(base, exist_ok=True)
+    return base
 
 
 def prefetch_dir() -> str:
