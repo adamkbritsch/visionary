@@ -14,6 +14,19 @@
 # The stop waits for BOTH encoders (topaz tvai + remux x265) to exit before relaunching, so a resumed
 # stage can never collide with a still-dying old one on the same segdir.
 ROOT="${VISIONARY_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
+# ONE WAITER AT A TIME. A deploy can wait a long time for a safe boundary, so it is easy to
+# queue several by accident — and they would then all stop and relaunch the app on top of
+# each other. A newer request supersedes an older one: the old waiter is killed, since the
+# build it was going to install has already been replaced on disk by this one's.
+LOCK="$ROOT/.deploy-now.pid"
+if [ -f "$LOCK" ]; then
+  old_pid=$(cat "$LOCK" 2>/dev/null)
+  if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ] && kill -0 "$old_pid" 2>/dev/null; then
+    kill "$old_pid" 2>/dev/null
+  fi
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
 APP="$ROOT/Visionary.app"
 LOG="$ROOT/.deploy-dockbar.log"
 BIN="Visionary.app/Contents/MacOS/Visionary"
@@ -26,10 +39,12 @@ is_num(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 # and the remux now report seg_done, so we can deploy at whichever hits a segment boundary FIRST.
 snap(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
 try:
- d=json.load(sys.stdin);o=d.get('orchestrator') or {};p=o.get('progress') or {};fi=o.get('finishing') or {}
- print('%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'), fi.get('stage') or 'none', fi.get('seg_done')))
+ d=json.load(sys.stdin);o=d.get('orchestrator') or {};p=o.get('progress') or {}
+ fi=o.get('finishing') or {};f2=o.get('finishing2') or {}
+ print('%s|%s|%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'),
+       fi.get('stage') or 'none', fi.get('seg_done'), f2.get('stage') or 'none', f2.get('seg_done')))
 except Exception:
- print('down|None|down|none|None')" 2>/dev/null; }
+ print('down|None|down|none|None|none|None')" 2>/dev/null; }
 running_now(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
 try: print((json.load(sys.stdin).get('orchestrator') or {}).get('running'))
 except Exception: print('down')" 2>/dev/null; }
@@ -44,12 +59,13 @@ except Exception: print('down')" 2>/dev/null; }
 say "deploy requested — holding for the first segment boundary (topaz OR remux; the other resumes; never resolve/upload)"
 deadline=$(( $(date +%s) + 10800 ))  # 3 h ceiling. Rarely bites now — only outlasts a resolve/upload
                                      # the deploy is briefly waiting out.
-tseg0=""; rseg0=""
+tseg0=""; rseg0=""; rseg20=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  s=$(snap); IFS='|' read -r stage tseg running fin rseg <<< "$s"
+  s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 <<< "$s"
   # Non-resumable / partial-risk stages → wait them out; reset the segment baselines.
-  case "$fin" in
-    upload|cleanup) say "waiting: finisher=$fin (short, not cleanly resumable)"; tseg0=""; rseg0=""; sleep 5; continue ;;
+  case "$fin$fin2" in
+    *upload*|*cleanup*) say "waiting: finisher=$fin/$fin2 (short, not cleanly resumable)"
+                        tseg0=""; rseg0=""; rseg20=""; sleep 5; continue ;;
   esac
   case "$stage" in
     resolve|upload) say "waiting: stage=$stage (never interrupt — not resumable)"; tseg0=""; rseg0=""; sleep 5; continue ;;
@@ -66,8 +82,15 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   if [ "$fin" = "remux" ] && [ "$xenc" != "0" ] && is_num "$rseg"; then
     watching=1
-    if [ -z "$rseg0" ]; then rseg0="$rseg"; say "watching remux at segment_done=$rseg"
-    elif [ "$rseg" -gt "$rseg0" ]; then say "REMUX segment boundary ($rseg0 -> $rseg) — deploying (topaz, if any, resumes)"; break; fi
+    if [ -z "$rseg0" ]; then rseg0="$rseg"; say "watching remux lane 1 at segment_done=$rseg"
+    elif [ "$rseg" -gt "$rseg0" ]; then say "REMUX lane 1 boundary ($rseg0 -> $rseg) — deploying"; break; fi
+  fi
+  # LANE 2 counts too. Watching only lane 1 idled for a whole ~7-minute segment while the
+  # other lane crossed a boundary that is exactly as safe to deploy at.
+  if [ "$fin2" = "remux" ] && [ "$xenc" != "0" ] && is_num "$rseg2"; then
+    watching=1
+    if [ -z "$rseg20" ]; then rseg20="$rseg2"; say "watching remux lane 2 at segment_done=$rseg2"
+    elif [ "$rseg2" -gt "$rseg20" ]; then say "REMUX lane 2 boundary ($rseg20 -> $rseg2) — deploying"; break; fi
   fi
   if [ "$watching" = "0" ]; then say "stage=$stage finisher=$fin — nothing segmenting; safe to deploy"; break; fi
   sleep 5
@@ -76,7 +99,7 @@ done
 # deadline fall-through guard (review-caught): if we got here by TIMEOUT while the pipeline is
 # still in an un-interruptible stage, GIVE UP instead of deploying into it — the built app stays
 # on disk and deploys on the next natural relaunch or re-run of this script.
-s=$(snap); IFS='|' read -r stage tseg running fin rseg <<< "$s"
+s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 <<< "$s"
 case "$fin" in upload|cleanup) say "GAVE UP: deadline hit but finisher=$fin — NOT deploying"; exit 2 ;; esac
 case "$stage" in resolve|upload) say "GAVE UP: deadline hit but stage=$stage — NOT deploying"; exit 2 ;; esac
 
