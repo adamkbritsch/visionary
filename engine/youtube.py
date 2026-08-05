@@ -679,6 +679,8 @@ def queue_view() -> dict:
                       # per-channel loudness-boost gate — keyed by FOLDER like the preset
                       # (= p.series at the remux stage for YouTube items)
                       "normalize_audio": settings.get_show_normalize_audio(folder or ""),
+                      # per-channel output range (auto / sdr / dv1000 / dv2000), same key
+                      "output_mode": settings.get_show_output_mode(folder or ""),
                       "pending": len(channel_pending(e)), "downloaded": len(cached_videos(folder))})
     return {"items": items, "count": len(items), "connected": _connected()}
 

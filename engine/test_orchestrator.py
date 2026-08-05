@@ -2007,6 +2007,30 @@ class MasterNaming(unittest.TestCase):
         self.assertEqual(orch.master_stem("Show.S01E01.1080p.x264-AVCHDTeam.mkv"),
                          "Show.S01E01.2160p.x265-AVCHDTeam")
 
+    def test_an_sdr_pinned_item_never_gets_retagged_to_hdr(self):
+        # The master really IS SDR — rewriting the source's "SDR" token to "HDR" would be a lie,
+        # and the name is what done-detection reads.
+        self.assertEqual(orch.master_stem("Doc S01E01 480i XviD SDR.avi", sdr=True),
+                         "Doc S01E01 2160p x265 SDR")
+        # everything else still retags
+        self.assertEqual(orch.master_stem("Show.S02E03.720p.WEB-DL.h264.8bit-GRP.mkv", sdr=True),
+                         "Show.S02E03.2160p.WEB-DL.x265.10bit-GRP")
+
+    def test_an_sdr_pinned_show_ships_under_the_sdr_tag(self):
+        import settings, series
+        with mock.patch.object(settings, "is_sdr_output", side_effect=lambda k: k == "Show"):
+            p = episode_paths("Show", "S01E01", "Show.S01E01.1080p.BluRay.x264-BiA.mkv",
+                              scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+            other = episode_paths("Other", "S01E01", "Other.S01E01.1080p.BluRay.x264-BiA.mkv",
+                                  scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+        self.assertTrue(p.final.endswith(" SDR upscaled.mp4"), p.final)
+        self.assertTrue(other.final.endswith(" HDR10 DV upscaled.mp4"), other.final)
+        # THE load-bearing round trip: an SDR master must be recognised as DONE. If it is not,
+        # it is re-classified as a source and re-upscaled forever — and with replace_source on,
+        # the real source is already gone.
+        self.assertTrue(series.is_master_name(os.path.basename(p.final)))
+        self.assertTrue(series.is_master_name(os.path.basename(other.final)))
+
     def test_deliverable_uses_the_retagged_stem_source_does_not(self):
         p = episode_paths("Show", "S01E01", "Show.S01E01.1080p.BluRay.x264-BiA.mkv",
                           scratch_dir="/tmp", nas_tv_root="/Vol/TV")

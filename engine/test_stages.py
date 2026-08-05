@@ -567,21 +567,45 @@ class OutputModeOverride(unittest.TestCase):
     """The per-item override picks the Resolve project. "auto" must keep the long-standing
     rule exactly; the three explicit values pin it regardless of what the source is."""
 
+    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False)
+
     def _mode(self, override, is_hdr):
-        import settings, plan, stages
-        with mock.patch.object(settings, "get_show_output_mode", return_value=override):
-            # mirrors the resolution in stages._resolve
-            return override if override in ("sdr", "dv1000", "dv2000") else (
-                "dv2000" if is_hdr else "dv1000")
+        """Drive the REAL resolve stage and read back the mode argv it hands
+        resolve_pipeline.py — mirroring the branch here would test nothing."""
+        import plan, settings
+        pl = dict(self.RES_PLAN, is_hdr=is_hdr)
+        calls = []
+        def fake_popen(cmd, **kw):
+            calls.append(cmd)
+            return _FakeResolveProc(["render exploded\n"], 1)   # fail fast; argv is the point
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(settings, "get_show_output_mode", return_value=override), \
+             mock.patch.object(plan, "plan_for", return_value=pl), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.threading, "Thread", _InlineThread), \
+             mock.patch.object(stages.time, "sleep"), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", return_value=False), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
+            stages.run_stage("resolve", p)
+        self.assertTrue(calls, "the resolve stage never spawned resolve_pipeline")
+        # argv: [python, resolve_pipeline.py, episode|single, in, out, MODE, bitrate]
+        return calls[0][5]
 
     def test_auto_is_unchanged_behaviour(self):
         self.assertEqual(self._mode("auto", is_hdr=False), "dv1000")
         self.assertEqual(self._mode("auto", is_hdr=True), "dv2000")
 
+    def test_an_unset_override_is_also_auto(self):
+        self.assertEqual(self._mode("", is_hdr=True), "dv2000")
+        self.assertEqual(self._mode(None, is_hdr=False), "dv1000")
+
     def test_an_override_wins_over_the_source(self):
         # Deliberately contradictory: an SDR source pinned to 2000-nit, an HDR source to SDR.
         self.assertEqual(self._mode("dv2000", is_hdr=False), "dv2000")
         self.assertEqual(self._mode("sdr", is_hdr=True), "sdr")
+        self.assertEqual(self._mode("dv1000", is_hdr=True), "dv1000")
 
     def test_the_sdr_mode_is_the_only_headless_one(self):
         import resolve_pipeline as RP

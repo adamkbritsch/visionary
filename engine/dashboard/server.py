@@ -164,6 +164,7 @@ def series_info():
                       "featurettes_last": settings.get_show_featurettes_last(nm),
                       "normalize_audio": settings.get_show_normalize_audio(nm),
                       "replace_source": settings.get_show_replace_source(nm),
+                      "output_mode": settings.get_show_output_mode(nm),
                       "next_up": nu,
                       "next_up_armed": series.next_up_armed(nm),
                       # ≥90% done — the UI only offers "queue a follow-up" from here
@@ -367,7 +368,8 @@ def show_settings_view(name) -> dict:
             # only shows the toggle when the show actually HAS season-00 specials
             "has_featurettes": int((series.cached_queue(name) or {}).get("featurette_count", 0)) > 0,
             "normalize_audio": settings.get_show_normalize_audio(name),
-            "replace_source": settings.get_show_replace_source(name)}
+            "replace_source": settings.get_show_replace_source(name),
+            "output_mode": settings.get_show_output_mode(name)}
 
 
 def api_series():
@@ -419,6 +421,7 @@ def show_profile_info(show=None):
             "unwatched_first": settings.get_show_unwatched_first(target) if target else True,
             "normalize_audio": settings.get_show_normalize_audio(target) if target else True,
             "replace_source": settings.get_show_replace_source(target) if target else True,
+            "output_mode": settings.get_show_output_mode(target) if target else "auto",
             "catalog": settings.preset_catalog()}
 
 
@@ -819,6 +822,12 @@ class Handler(BaseHTTPRequestHandler):
                 # Per-item upload policy (shows + movies): replace the source with the
                 # verified master (default) vs keep both. No queue refresh needed.
                 settings.set_show_replace_source(show, bool(body.get("replace_source")))
+            if "output_mode" in body:
+                # What Resolve should OUTPUT for this item: auto (the long-standing rule) or a
+                # pinned sdr / dv1000 / dv2000. Changing it changes the DELIVERABLE'S NAME too
+                # (SDR masters carry a different done-mark), so it only affects items not yet
+                # shipped — anything already finished keeps the name it was shipped under.
+                settings.set_show_output_mode(show, body.get("output_mode"))
             self._json(show_profile_info(show))
         else:
             self._send(404, b"not found", "text/plain")

@@ -1168,6 +1168,7 @@ private struct TVMode: View {
             }
             NormalizeAudioRow(key: name, on: show.normalize_audio ?? true, locked: locked)
             ReplaceSourceRow(key: name, on: show.replace_source ?? true, locked: locked)
+            OutputModeRow(key: name, mode: show.output_mode ?? "auto", locked: locked)
             if (show.queue?.featurette_count ?? 0) > 0 {
                 FeaturettesLastRow(key: name, on: show.featurettes_last ?? true,
                                    count: show.queue?.featurette_count ?? 0)
@@ -1312,6 +1313,7 @@ private struct NextUpRow: View {
                     }
                     NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
+                    OutputModeRow(key: n, mode: profile?.output_mode ?? "auto")
                     if profile?.has_featurettes == true {
                         FeaturettesLastRow(key: n, on: profile?.featurettes_last ?? true, count: 0)
                     }
@@ -1412,6 +1414,59 @@ private struct ReplaceSourceRow: View {
             Text("Replacing permanently deletes each source after its 4K master is verified — "
                  + "a future re-run with better upscale models needs the source again. Keeping "
                  + "both costs the source's size and shows one item with two versions in Plex.")
+        }
+    }
+}
+
+// Per-item "Output range" row (shows, movies, YouTube channels): what Resolve DELIVERS.
+// AUTO is the long-standing rule and stays the default — an SDR source becomes 1000-nit
+// Dolby Vision, an already-HDR source becomes 2000-nit. The other three PIN it regardless
+// of what came in, so a show that grades badly at 2000 nits can be forced to 1000, and one
+// you'd rather keep flat can skip Dolby Vision entirely. Same preset-style shape as the
+// rows above; a 4-way choice, so the confirm sheet lists the three you aren't on.
+private struct OutputModeRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let mode: String
+    var locked: Bool = false          // hides Change (TV passes the run-lock)
+    @State private var confirming = false
+
+    private static let modes = ["auto", "sdr", "dv1000", "dv2000"]
+    private static func label(_ m: String) -> String {
+        switch m {
+        case "sdr":    return "SDR"
+        case "dv1000": return "Dolby Vision 1000 nits"
+        case "dv2000": return "Dolby Vision 2000 nits"
+        default:       return "Matches the source"
+        }
+    }
+    private var current: String { Self.modes.contains(mode) ? mode : "auto" }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sun.max").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            Text(Self.label(current))
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .help("What Resolve outputs. Matching the source gives an SDR source 1000-nit "
+                      + "Dolby Vision and an HDR source 2000-nit; the others pin every item here.")
+            if !locked {
+                Button("Change") { confirming = true }
+                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
+            }
+            Spacer()
+        }
+        .confirmationDialog("Output range", isPresented: $confirming, titleVisibility: .visible) {
+            ForEach(Self.modes.filter { $0 != current }, id: \.self) { m in
+                Button(Self.label(m)) { Task { await store.setOutputMode(key, m) } }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Matching the source is the normal behaviour: SDR in becomes 1000-nit Dolby "
+                 + "Vision, HDR in becomes 2000-nit. Pinning overrides that for everything "
+                 + "here. SDR masters are named differently from Dolby Vision ones, so "
+                 + "anything already finished keeps the range it shipped with.")
         }
     }
 }
@@ -1525,6 +1580,9 @@ private struct MovieRow: View {
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
             ReplaceSourceRow(key: m.title ?? m.name ?? "", on: m.replace_source ?? true)
+                .padding(.horizontal, 10).padding(.top, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            OutputModeRow(key: m.title ?? m.name ?? "", mode: m.output_mode ?? "auto")
                 .padding(.horizontal, 10).padding(.bottom, 7).padding(.top, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
@@ -1752,7 +1810,11 @@ private struct ChannelRow: View {
             // Dimmed with the row's other controls while paused (it sits outside their Group).
             NormalizeAudioRow(key: ch.folder_name ?? "", on: ch.normalize_audio ?? true)
                 .disabled(paused).opacity(paused ? 0.35 : 1)
-                .padding(.horizontal, 10).padding(.bottom, 7)
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            OutputModeRow(key: ch.folder_name ?? "", mode: ch.output_mode ?? "auto")
+                .disabled(paused).opacity(paused ? 0.35 : 1)
+                .padding(.horizontal, 10).padding(.bottom, 7).padding(.top, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
         }

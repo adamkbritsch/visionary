@@ -165,6 +165,14 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": key, "replace_source": on]); await refresh()
     }
 
+    /// What Resolve should OUTPUT for this item. "auto" keeps the long-standing rule (SDR
+    /// intake -> 1000-nit Dolby Vision, HDR intake -> 2000-nit); the rest pin it. Note "sdr"
+    /// also changes the master's FILENAME, so it only affects items not yet shipped.
+    func setOutputMode(_ key: String, _ mode: String) async {
+        guard !key.isEmpty else { return }
+        await post("/api/show-profile", ["show": key, "output_mode": mode]); await refresh()
+    }
+
     // Per-slot "Up next": the show that takes this slot when the current one finishes.
     // Allowed WHILE THE PIPELINE RUNS — it only records a future intent (pass "" to clear).
     func setNextUp(_ show: String, _ next: String) async {
