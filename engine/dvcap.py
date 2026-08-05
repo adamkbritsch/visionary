@@ -130,7 +130,7 @@ def build_decode_command(ffmpeg: str, src: str) -> list:
 
 def build_x265_command(x265: str, rpu: str, out_hevc: str, cap_mbps: int,
                        master_display: str = None, max_cll: str = None,
-                       crf: float = X265_CRF, preset: str = X265_PRESET) -> list:
+                       crf: float = X265_CRF, preset: str = X265_PRESET, dv: bool = True) -> list:
     """x265 native-DV encode: CRF quality + a HARD VBV ceiling; x265 interleaves the RPU NALs.
     repeat-headers/aud/hrd are DV conformance requirements (x265 enforces them with a DV
     profile, listed explicitly so the intent is visible)."""
@@ -138,11 +138,18 @@ def build_x265_command(x265: str, rpu: str, out_hevc: str, cap_mbps: int,
     cmd = [x265, "--y4m", "-", "--output", out_hevc,
            "--preset", preset, "--crf", str(crf), "--output-depth", "10",
            "--vbv-maxrate", str(cap_kbps), "--vbv-bufsize", str(cap_kbps),
-           "--dolby-vision-profile", "8.1", "--dolby-vision-rpu", rpu,
-           "--repeat-headers", "--aud", "--hrd",
-           "--range", "limited", "--colorprim", "bt2020",
-           "--transfer", "smpte2084", "--colormatrix", "bt2020nc",
-           "--master-display", master_display or FALLBACK_MASTER_DISPLAY]
+           "--repeat-headers", "--aud", "--hrd"]
+    if not dv:
+        # TRUE SDR master: no RPU, no PQ, no mastering-display metadata — Rec.709 throughout.
+        # The VBV cap stays: it is a player-glitch guard on the peak bitrate, nothing to do
+        # with Dolby Vision. --aud stays too; count_hevc_frames relies on access-unit
+        # delimiters to count coded frames.
+        return cmd + ["--range", "limited", "--colorprim", "bt709",
+                      "--transfer", "bt709", "--colormatrix", "bt709"]
+    cmd += ["--dolby-vision-profile", "8.1", "--dolby-vision-rpu", rpu,
+            "--range", "limited", "--colorprim", "bt2020",
+            "--transfer", "smpte2084", "--colormatrix", "bt2020nc",
+            "--master-display", master_display or FALLBACK_MASTER_DISPLAY]
     if max_cll:
         cmd += ["--max-cll", max_cll]
     return cmd

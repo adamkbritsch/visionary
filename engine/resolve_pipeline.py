@@ -31,6 +31,15 @@ FFPROBE = "/opt/homebrew/bin/ffprobe"
 # new "Visionary …" app name — won't break the pipeline. First existing one wins.
 SDR_PROJECTS = ["Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler"]
 HDR_PROJECTS = ["Visionary HDR", "Overnight Upscaler HDR"]
+# A THIRD project for a true Rec.709 SDR master — no Dolby Vision at all. Note the two above
+# are named for the INTAKE range and BOTH output DV; this one is named for its OUTPUT.
+SDR_OUT_PROJECTS = ["Visionary SDR Output", "Overnight Upscaler SDR Output"]
+
+
+def is_dv_mode(mode) -> bool:
+    """False only for the true-SDR output. This is what makes that mode headless: with no DV
+    there is no Analyze All, so dv_shim (and the screen, and cliclick) is never touched."""
+    return mode != "sdr_out"
 DV_PRESET = "OvernightDV"        # global render preset carrying DV Profile 8.1 (survives Resolve quits)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import resolve as R  # noqa: E402
@@ -43,7 +52,8 @@ def project_for(pm, mode):
     projects in Resolve doesn't break anything. Returns (name, exists) — name is the
     preferred candidate when none exist (for the 'missing project' message)."""
     projects = pm.GetProjectListInCurrentFolder() or []
-    candidates = HDR_PROJECTS if mode == "hdr" else SDR_PROJECTS
+    candidates = (SDR_OUT_PROJECTS if mode == "sdr_out"
+                  else HDR_PROJECTS if mode == "hdr" else SDR_PROJECTS)
     for name in candidates:
         if name in projects:
             return name, True
@@ -284,6 +294,9 @@ def single(video, out, mode="hdr", bitrate=60000):
     rc = setup_single(video, mode)
     if rc != 0:
         return rc
+    if not is_dv_mode(mode):
+        print("SDR output — skipping DV analyze (headless render)", flush=True)
+        return render(out, mode, bitrate)
     import dv_shim
     try:
         if not dv_shim.run_dv_ui(expect_nit=(2000 if mode == "hdr" else 1000)):
@@ -304,6 +317,12 @@ def episode(segdir, out, mode="sdr", bitrate=60000):
     rc = setup(segdir, mode)
     if rc != 0:
         return rc
+    if not is_dv_mode(mode):
+        # TRUE SDR: no Dolby Vision, so no Analyze All, so no screen automation. The whole
+        # stage is headless — it never takes the display, never needs cliclick or the
+        # Screen Recording grant, and cannot be blocked by Screen Control.
+        print("SDR output — skipping DV analyze (headless render)", flush=True)
+        return render(out, mode, bitrate)
     import dv_shim
     try:
         if not dv_shim.run_dv_ui(expect_nit=(2000 if mode == "hdr" else 1000)):

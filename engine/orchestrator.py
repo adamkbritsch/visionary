@@ -231,7 +231,23 @@ _MASTER_RETAG = (
 )
 
 
-def master_stem(source_basename: str) -> str:
+DV_TAG = " HDR10 DV upscaled"     # Dolby Vision masters (the long-standing convention)
+SDR_TAG = " SDR upscaled"         # an item PINNED to non-DV SDR output
+
+
+def master_tag(key) -> str:
+    """The deliverable's name tag for this item. series.is_master_name() keys done-detection on
+    exactly these two strings, so an item shipped under the wrong one is read back as an
+    un-upscaled SOURCE — see the note on series.MASTER_MARKS. Falls back to DV on any error:
+    a mislabelled DV master is cosmetic, a mislabelled SDR one re-enters the queue forever."""
+    try:
+        import settings
+        return SDR_TAG if settings.is_sdr_output(key) else DV_TAG
+    except Exception:
+        return DV_TAG
+
+
+def master_stem(source_basename: str, *, sdr: bool = False) -> str:
     """The DELIVERABLE's stem: the source stem with now-inaccurate encoding terms retagged
     to what the master actually is (x264 -> x265, 1080p -> 2160p, 8bit -> 10bit, SDR -> HDR).
     Everything else — including the SxxExx key the queue parses and the `hdr10 dv` mark that
@@ -239,6 +255,8 @@ def master_stem(source_basename: str) -> str:
     youtarr's exact stem so its copied .nfo/.jpg/.srt sidecars still match."""
     stem = os.path.splitext(source_basename)[0]
     for pat, rep in _MASTER_RETAG:
+        if sdr and rep == "HDR":
+            continue          # the master really IS SDR — rewriting it to HDR would be a lie
         stem = pat.sub(rep, stem)
     return stem
 
@@ -248,7 +266,8 @@ def episode_paths(series_name, ep, source_basename, *,
     scratch_dir = scratch_dir or scratch.default_scratch()
     nas_tv_root = nas_tv_root or transfer.NAS_FTP_TV_ROOT
     stem = os.path.splitext(source_basename)[0]          # "...(Extended Cut)"
-    mstem = master_stem(source_basename)                 # deliverable: stale codec/res retagged
+    tag = master_tag(series_name)                        # DV or SDR — done-detection keys on it
+    mstem = master_stem(source_basename, sdr=(tag == SDR_TAG))
     # The season folder is the one the file ACTUALLY sits in (learned during the episode
     # walk). Season dirs are NOT reliably `S01` — real libraries carry `Season 1` or
     # `Arrested Development Season 2 S02 1080p BluRay x264-BiA`, and synthesizing the path
@@ -271,11 +290,11 @@ def episode_paths(series_name, ep, source_basename, *,
         # match on it, so it must remain.
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),   # Topaz chunks + manifest live here
-        dv_render=j(stem + " HDR10 DV upscaled.mov"),
-        final=j(mstem + " HDR10 DV upscaled.mp4"),
+        dv_render=j(stem + DV_TAG + ".mov"),      # local intermediate; tag is cosmetic here
+        final=j(mstem + tag + ".mp4"),
         nas_dir=nas_dir,
         nas_source=f"{nas_dir}/{source_basename}",
-        nas_final=f"{nas_dir}/{mstem} HDR10 DV upscaled.mp4",
+        nas_final=f"{nas_dir}/{mstem}{tag}.mp4",
     )
 
 
@@ -288,7 +307,8 @@ def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None) -> Ep
     scratch_dir = scratch_dir or scratch.default_scratch()
     stem = os.path.splitext(source_basename)[0]
     nas_dir = nas_dir.rstrip("/")
-    mstem = master_stem(source_basename)                 # deliverable: stale codec/res retagged
+    tag = master_tag(title or os.path.splitext(source_basename)[0])
+    mstem = master_stem(source_basename, sdr=(tag == SDR_TAG))
     j = lambda n: os.path.join(scratch_dir, n)
     return EpisodePaths(
         series=(title or stem), ep=stem, source_basename=source_basename,
@@ -297,11 +317,11 @@ def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None) -> Ep
         source_cfr=j(stem + "_cfr.mp4"),
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),
-        dv_render=j(stem + " HDR10 DV upscaled.mov"),
-        final=j(mstem + " HDR10 DV upscaled.mp4"),
+        dv_render=j(stem + DV_TAG + ".mov"),
+        final=j(mstem + tag + ".mp4"),
         nas_dir=nas_dir,
         nas_source=nas_dir + "/" + source_basename,
-        nas_final=nas_dir + "/" + mstem + " HDR10 DV upscaled.mp4",
+        nas_final=nas_dir + "/" + mstem + tag + ".mp4",
         movie=True,
         title=(title or stem),
     )
@@ -318,6 +338,7 @@ def youtube_paths(channel, video_path, title=None, *, scratch_dir=None) -> Episo
     scratch_dir = scratch_dir or scratch.default_scratch()
     source_basename = os.path.basename(video_path)
     stem = os.path.splitext(source_basename)[0]
+    tag = master_tag(channel)
     src_dir = os.path.dirname(video_path)          # the video's STAGING subfolder
     staging_root = NAS_FTP_YOUTUBE_STAGING.rstrip("/")
     rel = src_dir[len(staging_root):].lstrip("/") if src_dir.startswith(staging_root) else os.path.basename(src_dir)
@@ -329,8 +350,8 @@ def youtube_paths(channel, video_path, title=None, *, scratch_dir=None) -> Episo
         source_cfr=j(stem + "_cfr.mp4"),
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),
-        dv_render=j(stem + " HDR10 DV upscaled.mov"),
-        final=j(stem + " HDR10 DV upscaled.mp4"),    # LOCAL master name — youtarr's stem
+        dv_render=j(stem + DV_TAG + ".mov"),
+        final=j(stem + tag + ".mp4"),                # LOCAL master name — youtarr's stem
                                                      # (no retag: the .nfo/.jpg/.srt must match)
         nas_dir=plex_dir,                           # publish INTO the Plex library
         nas_source=video_path,                      # raw source in STAGING
@@ -372,10 +393,12 @@ def discard_workfiles(source_basename: str) -> None:
     stem = os.path.splitext(source_basename)[0]
     names = _buffer_names(source_basename) | {
         stem + "_prob4_upscaled.mov",
-        stem + " HDR10 DV upscaled.mov",
-    } | {                       # BOTH stems: the deliverable is retagged (x264 -> x265 ...),
-        m + " HDR10 DV upscaled" + e            # and a pre-retag leftover must still be swept
-        for m in {stem, master_stem(source_basename)} for e in (".mp4", ".mkv")
+        stem + DV_TAG + ".mov",
+    } | {                       # BOTH stems AND both tags: the deliverable is retagged
+        m + t + e               # (x264 -> x265 ...), a pre-retag leftover must still be
+        for m in {stem, master_stem(source_basename),           # swept, and an SDR-pinned
+                  master_stem(source_basename, sdr=True)}       # item ships under SDR_TAG
+        for t in (DV_TAG, SDR_TAG) for e in (".mp4", ".mkv")
     }
     main = scratch.default_scratch()
     for d in (main, scratch.prefetch_dir()):
@@ -411,14 +434,15 @@ def relabel_container(p: EpisodePaths, ext: str) -> EpisodePaths:
     stem = os.path.splitext(p.source_basename)[0]
     # The DELIVERABLE carries the retagged stem (x264 -> x265, 1080p -> 2160p, ...), except
     # for YouTube, which keeps youtarr's exact stem so the copied sidecars still match.
-    mstem = stem if p.youtube else master_stem(p.source_basename)
+    tag = master_tag(p.series)
+    mstem = stem if p.youtube else master_stem(p.source_basename, sdr=(tag == SDR_TAG))
     d = os.path.dirname(p.source)
     p.source_cfr = os.path.join(d, stem + "_cfr" + ext)
-    p.final = os.path.join(d, mstem + " HDR10 DV upscaled" + ext)
+    p.final = os.path.join(d, mstem + tag + ext)
     if p.youtube:                                   # keep youtarr's stem so the copied .nfo matches
         p.nas_final = f"{p.nas_dir}/{stem}{ext}"
     else:
-        p.nas_final = f"{p.nas_dir}/{mstem} HDR10 DV upscaled{ext}"
+        p.nas_final = f"{p.nas_dir}/{mstem}{tag}{ext}"
     return p
 
 

@@ -387,7 +387,14 @@ def _resolve(p, abort, progress=None):
     pl = plan.plan_for(p.source)   # ORIGINAL: CFR re-encode strips DV side data (skip-detection)
     if pl.get("resolve") == "skip":
         return False, "source is already Dolby Vision — nothing for Resolve to do"
-    mode = "hdr" if pl.get("is_hdr") else "sdr"   # HDR intake → 2000-nit HDR project
+    # OUTPUT MODE. "auto" is the long-standing rule — SDR intake -> the 1000-nit DV project,
+    # HDR intake -> the 2000-nit one. A per-item override pins it regardless of the source;
+    # "sdr" is the only value that produces a non-DV master, and the only one whose Resolve
+    # stage needs no screen automation at all.
+    import settings as _st
+    override = _st.get_show_output_mode(p.series)
+    mode = {"sdr": "sdr_out", "dv1000": "sdr", "dv2000": "hdr"}.get(
+        override, "hdr" if pl.get("is_hdr") else "sdr")
     fast = pl.get("topaz") in ("rpu-only", "resolve-only")
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In

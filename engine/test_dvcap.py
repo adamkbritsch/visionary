@@ -556,3 +556,35 @@ class InjectBuilders(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-i") + 1], "src.hevc")
         self.assertEqual(cmd[cmd.index("--rpu-in") + 1], "r.bin")
         self.assertEqual(cmd[cmd.index("-o") + 1], "inj.hevc")
+
+
+class SdrEncode(unittest.TestCase):
+    """A true-SDR master carries no Dolby Vision. The encode must drop the RPU and the PQ/2020
+    metadata — but keep the VBV cap (a player-glitch guard, unrelated to DV) and --aud (which
+    count_hevc_frames relies on to count coded frames)."""
+
+    def _cmd(self, dv):
+        return dvcap.build_x265_command("x265", "rpu.bin", "out.hevc", cap_mbps=50, dv=dv)
+
+    def test_sdr_drops_every_dolby_vision_flag(self):
+        c = self._cmd(False)
+        self.assertNotIn("--dolby-vision-rpu", c)
+        self.assertNotIn("--dolby-vision-profile", c)
+        self.assertNotIn("--master-display", c)   # mastering metadata is meaningless in SDR
+
+    def test_sdr_is_rec709_not_pq(self):
+        c = self._cmd(False)
+        self.assertIn("bt709", c)
+        self.assertNotIn("smpte2084", c)
+        self.assertNotIn("bt2020", c)
+
+    def test_dv_is_unchanged(self):
+        c = self._cmd(True)
+        self.assertIn("--dolby-vision-rpu", c)
+        self.assertIn("smpte2084", c)
+
+    def test_both_keep_the_peak_cap_and_aud(self):
+        for dv in (True, False):
+            c = self._cmd(dv)
+            self.assertIn("--vbv-maxrate", c)     # the peak cap is not a DV feature
+            self.assertIn("--aud", c)             # count_hevc_frames needs access-unit delimiters

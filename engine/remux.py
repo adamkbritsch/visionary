@@ -293,13 +293,18 @@ def parse_streams(probe_json: str) -> dict:
     return counts
 
 
-def verify_remux(probe_json: str, min_audio: int = 1):
+def verify_remux(probe_json: str, min_audio: int = 1, require_dv: bool = True):
+    """`require_dv=False` for an item PINNED to SDR output: that master legitimately carries no
+    DOVI record, so the DV assertion would fail a perfectly good file. Everything else (audio
+    presence, and the hvc1 + peak checks at the call site) still applies — only the Dolby
+    Vision claim is relaxed, and only when the item asked for no Dolby Vision."""
     s = parse_streams(probe_json)
-    if not s["dovi_profile"]:
+    if require_dv and not s["dovi_profile"]:
         return False, "no Dolby Vision RPU in output (DOVI configuration record missing)"
     if s["audio"] < min_audio:
         return False, f"no audio tracks (need >= {min_audio})"
-    return True, f"DV {s['dovi_profile']} · {s['audio']} audio · {s['subtitle']} sub"
+    kind = f"DV {s['dovi_profile']}" if s["dovi_profile"] else "SDR"
+    return True, f"{kind} · {s['audio']} audio · {s['subtitle']} sub"
 
 
 @dataclass
