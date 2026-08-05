@@ -720,6 +720,10 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     # or a stop-time abort all release the mouse too; those are exactly the paths where
     # leaving the pointer stranded on Resolve's screen would be most annoying.
     saved_pointer = pointer_position()
+    # BEGIN/END bracket the period the pipeline actually holds the screen and mouse. The
+    # countdown says it is coming; this says it is happening, which is the part the user
+    # is living through.
+    print("SCREEN_TAKEOVER_BEGIN", flush=True)
     try:
         import resolve
         r = resolve.connect()
@@ -737,6 +741,7 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     finally:
         if release_pointer_to_main(saved_pointer):
             print("dv_ui: pointer returned to the main display", flush=True)
+        print("SCREEN_TAKEOVER_END", flush=True)
 
 
 def capture_reference():

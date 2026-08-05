@@ -130,6 +130,8 @@ final class AppStore: ObservableObject {
         let d = Date(timeIntervalSince1970: TimeInterval(t))
         return d.timeIntervalSinceNow > -2 ? d : nil     // stale marker → gone
     }
+    /// True while the pipeline actually HAS the screen and mouse (not merely about to).
+    var takeoverActive: Bool { state?.orchestrator?.progress?.takeover_active == true }
     /// "Go ahead" — take the screen now instead of waiting out the countdown.
     func ackTakeover() async { await post("/api/takeover-ack", [:]) }
 

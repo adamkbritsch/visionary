@@ -458,6 +458,14 @@ def _resolve(p, abort, progress=None):
                     progress({"stage": "resolve", "ep": p.ep,
                               "takeover_at": int(t.group(1)),
                               "takeover_in": int(t.group(2))})
+                elif progress and line.startswith("SCREEN_TAKEOVER_BEGIN"):
+                    # It is happening NOW — the countdown is over and the app switches
+                    # from "about to" to a live indicator.
+                    progress({"stage": "resolve", "ep": p.ep, "takeover_at": 0,
+                              "takeover_in": 0, "takeover_active": True})
+                elif progress and line.startswith("SCREEN_TAKEOVER_END"):
+                    progress({"stage": "resolve", "ep": p.ep, "takeover_at": 0,
+                              "takeover_in": 0, "takeover_active": False})
                 elif progress and line.startswith(("SCREEN_TAKEOVER_NOW",
                                                    "SCREEN_TAKEOVER_ACK")):
                     progress({"stage": "resolve", "ep": p.ep,

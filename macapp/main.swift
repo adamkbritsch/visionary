@@ -8,6 +8,14 @@ import Combine
 // SwiftUI interface that polls the loopback API. No WebView anywhere.
 // Appliance model: the app opens at login, can't be closed — only minimized — and while
 // ACTIVATED the engine runs whenever it can (the server re-arms it by itself).
+/// A button that works in a NON-ACTIVATING panel. The warning panel deliberately never
+/// takes focus, so every click on it arrives as a "first mouse" event — and NSButton
+/// swallows those by default, treating the click as "activate my app" and firing no
+/// action. Without this override the panel's buttons look normal and do nothing.
+final class FirstMouseButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
@@ -189,16 +197,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var takeoverLabel: NSTextField?
     private var takeoverDeadline: Date?
     private var takeoverTicker: Timer?
+    private var takeoverLive = false        // false = countdown, true = happening now
 
     private func updateTakeoverWarning() {
+        // Two states, one panel: "about to take the screen" (a countdown you can defer or
+        // wave through) and "using the screen right now" (a live indicator you can end).
+        if store.takeoverActive {
+            takeoverDeadline = nil
+            showTakeoverWarning(live: true)
+            return
+        }
         guard let at = store.takeoverAt else { hideTakeoverWarning(); return }
         takeoverDeadline = at
-        showTakeoverWarning()
+        showTakeoverWarning(live: false)
     }
 
     private func hideTakeoverWarning() {
         takeoverTicker?.invalidate(); takeoverTicker = nil
         takeoverDeadline = nil
+        takeoverLive = false
         takeoverPanel?.orderOut(nil)
         takeoverPanel = nil
         takeoverLabel = nil
@@ -214,16 +231,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func tickTakeover() {
         guard takeoverPanel != nil else { return }
+        if takeoverLive {
+            takeoverLabel?.stringValue = "Resolve has the mouse — it will be handed back"
+            return
+        }
         let left = takeoverRemaining()
         takeoverLabel?.stringValue = left > 0
             ? "Taking the screen in \(left)s"
             : "Taking the screen now…"
-        if left <= 0 { takeoverTicker?.invalidate(); takeoverTicker = nil }
     }
 
-    private func showTakeoverWarning() {
-        let secs = takeoverRemaining()
-        if takeoverLabel != nil { tickTakeover(); return }
+    private func showTakeoverWarning(live: Bool) {
+        // Rebuild when the MODE changes — the buttons and wording differ between them.
+        if takeoverPanel != nil && takeoverLive == live { tickTakeover(); return }
+        if takeoverPanel != nil { hideTakeoverWarning() }
+        takeoverLive = live
         let w: CGFloat = 380, h: CGFloat = 96
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                             styleMask: [.borderless, .nonactivatingPanel],
@@ -244,23 +266,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bg.layer?.cornerRadius = 14
         bg.layer?.masksToBounds = true
 
-        let title = NSTextField(labelWithString: "Visionary needs the screen")
+        let title = NSTextField(labelWithString: live ? "Visionary is using the screen"
+                                                     : "Visionary needs the screen")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.frame = NSRect(x: 16, y: h - 34, width: w - 32, height: 18)
-        let label = NSTextField(labelWithString: "Taking the screen in \(secs)s")
+        let label = NSTextField(labelWithString: live
+            ? "Resolve has the mouse — it will be handed back"
+            : "Taking the screen in \(takeoverRemaining())s")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
         label.frame = NSRect(x: 16, y: h - 56, width: w - 32, height: 16)
 
-        let later = NSButton(title: "Not now (30m)", target: self,
-                             action: #selector(takeoverDefer))
-        later.bezelStyle = .rounded
-        later.frame = NSRect(x: 16, y: 12, width: 130, height: 24)
-        let go = NSButton(title: "Go ahead", target: self, action: #selector(takeoverAck))
-        go.bezelStyle = .rounded
-        go.frame = NSRect(x: w - 116, y: 12, width: 100, height: 24)
+        var controls: [NSView] = [title, label]
+        if live {
+            // Mid-takeover the only useful action is to END it. Screen Control off already
+            // calls orchestrator.reclaim_screen(), which aborts the Resolve pass within
+            // ~5 s — proven machinery, not a second cancellation path.
+            let stop = FirstMouseButton(title: "Give it back", target: self,
+                                        action: #selector(takeoverDefer))
+            stop.bezelStyle = .rounded
+            stop.frame = NSRect(x: w - 146, y: 12, width: 130, height: 24)
+            controls.append(stop)
+        } else {
+            let later = FirstMouseButton(title: "Not now (30m)", target: self,
+                                         action: #selector(takeoverDefer))
+            later.bezelStyle = .rounded
+            later.frame = NSRect(x: 16, y: 12, width: 130, height: 24)
+            let go = FirstMouseButton(title: "Go ahead", target: self,
+                                      action: #selector(takeoverAck))
+            go.bezelStyle = .rounded
+            go.frame = NSRect(x: w - 116, y: 12, width: 100, height: 24)
+            controls += [later, go]
+        }
 
-        for v in [title, label, later, go] as [NSView] { bg.addSubview(v) }
+        for v in controls { bg.addSubview(v) }
         panel.contentView = bg
         if let sf = NSScreen.main?.frame {
             panel.setFrameOrigin(NSPoint(x: (sf.midX - w / 2).rounded(),
@@ -271,9 +310,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         takeoverLabel = label
         // Tick locally every second — the poll is 1.5 s, so a poll-driven countdown would
         // visibly stutter and skip numbers.
-        takeoverTicker?.invalidate()
-        takeoverTicker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tickTakeover() }
+        takeoverTicker?.invalidate(); takeoverTicker = nil
+        if !live {
+            takeoverTicker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.tickTakeover() }
+            }
         }
     }
 
