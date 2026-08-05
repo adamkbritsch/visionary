@@ -129,7 +129,12 @@ STALL_TRIGGER_ATTEMPTS = 5    # a Resolve failure could be a FLUKE — retry the
                               # (like a normal stage failure) before concluding Resolve is really stalled
                               # and switching to buffer-ahead mode
 STALL_FLOOR_GB = 100          # free space to preserve while buffering topaz ahead of a stalled Resolve
-STALL_ITEM_RESERVE_GB = 150   # a TV-episode ProRes intermediate needs ~140 GB (measured) — don't START
+STALL_ITEM_RESERVE_GB = 200   # a TV-episode ProRes intermediate needs ~190 GiB (re-measured 2026-08-05:
+                              # three live buffered segdirs at 191.9 / 187.7 / 185.1 GiB). The old 150
+                              # came from a ~140 GB measurement that no longer holds, and it was UNSAFE:
+                              # at 250 GB free the gate below admitted a fresh upscale that then landed
+                              # at ~58 GiB — past the very floor it exists to protect. Raising it makes
+                              # the buffer stop one item earlier, which is strictly safer. Don't START
                               # a fresh upscale during a stall unless raw free ≥ FLOOR + this (so the
                               # last one that starts lands near the floor, never past it)
 STALL_MOVIE_RESERVE_GB = 260  # a feature ProRes can reach ~245 GB — a movie needs this much headroom
