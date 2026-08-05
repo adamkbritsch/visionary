@@ -187,23 +187,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // It also cannot carry a live countdown. This needs no entitlement and always shows.
     private var takeoverPanel: NSPanel?
     private var takeoverLabel: NSTextField?
+    private var takeoverDeadline: Date?
+    private var takeoverTicker: Timer?
 
     private func updateTakeoverWarning() {
-        guard let secs = store.takeoverIn else { hideTakeoverWarning(); return }
-        showTakeoverWarning(secs)
+        guard let at = store.takeoverAt else { hideTakeoverWarning(); return }
+        takeoverDeadline = at
+        showTakeoverWarning()
     }
 
     private func hideTakeoverWarning() {
+        takeoverTicker?.invalidate(); takeoverTicker = nil
+        takeoverDeadline = nil
         takeoverPanel?.orderOut(nil)
         takeoverPanel = nil
         takeoverLabel = nil
     }
 
-    private func showTakeoverWarning(_ secs: Int) {
-        if let l = takeoverLabel {
-            l.stringValue = "Taking the screen in \(secs)s"
-            return
-        }
+    /// Seconds left, from the DEADLINE — not from a number the engine sent. The engine
+    /// starts the clock while Resolve is still launching, so the count runs down through
+    /// real work and the poll cadence never shows through.
+    private func takeoverRemaining() -> Int {
+        guard let d = takeoverDeadline else { return 0 }
+        return max(0, Int(d.timeIntervalSinceNow.rounded(.up)))
+    }
+
+    private func tickTakeover() {
+        guard takeoverPanel != nil else { return }
+        let left = takeoverRemaining()
+        takeoverLabel?.stringValue = left > 0
+            ? "Taking the screen in \(left)s"
+            : "Taking the screen now…"
+        if left <= 0 { takeoverTicker?.invalidate(); takeoverTicker = nil }
+    }
+
+    private func showTakeoverWarning() {
+        let secs = takeoverRemaining()
+        if takeoverLabel != nil { tickTakeover(); return }
         let w: CGFloat = 380, h: CGFloat = 96
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                             styleMask: [.borderless, .nonactivatingPanel],
@@ -249,6 +269,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.orderFrontRegardless()
         takeoverPanel = panel
         takeoverLabel = label
+        // Tick locally every second — the poll is 1.5 s, so a poll-driven countdown would
+        // visibly stutter and skip numbers.
+        takeoverTicker?.invalidate()
+        takeoverTicker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tickTakeover() }
+        }
     }
 
     @objc private func takeoverAck() {

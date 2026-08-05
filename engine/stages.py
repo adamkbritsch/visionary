@@ -450,13 +450,18 @@ def _resolve(p, abort, progress=None):
                 # lead time that exists — the stage flips to "resolve" seconds before
                 # Resolve launches, so the warning window is the deliberate hold the shim
                 # takes, and this is what tells the app to draw the notice.
-                t = re.match(r"SCREEN_TAKEOVER_IN (\d+)", line.strip())
+                t = re.match(r"SCREEN_TAKEOVER_AT (\d+) IN (\d+)", line.strip())
                 if t and progress:
+                    # An ABSOLUTE deadline, not a duration: the app ticks its own countdown
+                    # from this, instead of showing whichever number the last 1.5s poll
+                    # happened to catch.
                     progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_in": int(t.group(1))})
+                              "takeover_at": int(t.group(1)),
+                              "takeover_in": int(t.group(2))})
                 elif progress and line.startswith(("SCREEN_TAKEOVER_NOW",
                                                    "SCREEN_TAKEOVER_ACK")):
-                    progress({"stage": "resolve", "ep": p.ep, "takeover_in": 0})
+                    progress({"stage": "resolve", "ep": p.ep,
+                              "takeover_at": 0, "takeover_in": 0})
         threading.Thread(target=_reader, daemon=True).start()
         deadline = time.time() + RESOLVE_TIMEOUT
         while proc.poll() is None:

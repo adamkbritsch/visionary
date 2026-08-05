@@ -122,12 +122,13 @@ final class AppStore: ObservableObject {
         await fetchDisplays()
     }
 
-    /// Seconds until the pipeline seizes the screen and mouse, or nil when it is not
-    /// about to. Only ever non-nil during the deliberate warning hold — there is no other
-    /// lead time in the sequence to read.
-    var takeoverIn: Int? {
-        guard let n = state?.orchestrator?.progress?.takeover_in, n > 0 else { return nil }
-        return n
+    /// When the pipeline will seize the screen and mouse, or nil when it is not about to.
+    /// An absolute deadline, so the panel can tick its own countdown between the 1.5 s
+    /// polls instead of freezing on whichever number the last one happened to carry.
+    var takeoverAt: Date? {
+        guard let t = state?.orchestrator?.progress?.takeover_at, t > 0 else { return nil }
+        let d = Date(timeIntervalSince1970: TimeInterval(t))
+        return d.timeIntervalSinceNow > -2 ? d : nil     // stale marker → gone
     }
     /// "Go ahead" — take the screen now instead of waiting out the countdown.
     func ackTakeover() async { await post("/api/takeover-ack", [:]) }

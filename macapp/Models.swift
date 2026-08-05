@@ -38,8 +38,10 @@ struct ProgressDTO: Codable {
     var ep_secs_total: Double?
     var eta_secs: Double?
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
-    var takeover_in: Int?     // seconds until the pipeline takes the screen + mouse. Only
-                              // non-nil during the deliberate warning hold; 0 = taking it now.
+    var takeover_in: Int?     // the countdown's LENGTH, for context only
+    var takeover_at: Int?     // epoch when the screen + mouse will be taken. Absolute so the
+                              // app ticks its own countdown rather than showing whichever
+                              // number the last 1.5s poll caught. 0 = taken/cancelled.
 }
 
 struct HoldDTO: Codable {

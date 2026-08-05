@@ -522,8 +522,9 @@ struct ResolveHostSection: View {
             }
             Text(secs == 0
                  ? "The pipeline takes the screen and mouse with no warning."
-                 : "The pipeline waits \(secs)s, showing a notice on this screen, before it "
-                   + "takes the screen and mouse. That wait is added to every episode.")
+                 : "A \(secs)s countdown appears on this screen before the pipeline takes "
+                   + "the screen and mouse. It starts while Resolve is still loading, so it "
+                   + "normally costs no time at all.")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
             Text("The mouse pointer is shared by every screen — moving Resolve stops it "
                  + "covering your work, but the pipeline still borrows the pointer to click.")

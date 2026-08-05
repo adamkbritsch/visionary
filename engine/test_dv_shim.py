@@ -383,6 +383,74 @@ class HostTargeting(unittest.TestCase):
         self.assertEqual(seen["cmd"][-1], "c:864,558")
 
 
+class TakeoverCountdown(unittest.TestCase):
+    """A COUNTDOWN, not a delay. The clock starts at the top of the resolve stage, while
+    Resolve is still launching and the timeline is still being assembled — so in the
+    normal case it has already run out by the time anything is clicked, and the episode
+    is not one second longer."""
+
+    def setUp(self):
+        dv_shim._TAKEOVER_DEADLINE = None
+        try:
+            os.remove(dv_shim.TAKEOVER_ACK)
+        except OSError:
+            pass
+
+    tearDown = setUp
+
+    def test_arming_publishes_an_absolute_deadline(self):
+        printed = []
+        with mock.patch("settings.tunable", return_value=20), \
+             mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))), \
+             mock.patch.object(dv_shim.time, "time", return_value=1000.0):
+            dv_shim.arm_takeover_warning()
+        self.assertEqual(dv_shim._TAKEOVER_DEADLINE, 1020.0)
+        self.assertIn("SCREEN_TAKEOVER_AT 1020 IN 20", printed[0])
+
+    def test_zero_seconds_arms_nothing(self):
+        with mock.patch("settings.tunable", return_value=0):
+            dv_shim.arm_takeover_warning()
+        self.assertIsNone(dv_shim._TAKEOVER_DEADLINE)
+
+    def test_a_countdown_that_elapsed_during_setup_adds_NO_delay(self):
+        # THE point of the change: the stage's own work outlasted the countdown, so the
+        # wait at the takeover is zero.
+        dv_shim._TAKEOVER_DEADLINE = 100.0
+        slept = []
+        with mock.patch.object(dv_shim.time, "time", return_value=500.0), \
+             mock.patch.object(dv_shim.time, "sleep", lambda s: slept.append(s)):
+            dv_shim._warn_before_takeover()
+        self.assertEqual(slept, [], "it must not sleep for a countdown that already ran out")
+
+    def test_only_the_REMAINDER_is_waited_out(self):
+        dv_shim._TAKEOVER_DEADLINE = 1000.0
+        now = [997.0]
+        slept = []
+
+        def fake_sleep(s):
+            slept.append(s)
+            now[0] += s
+
+        with mock.patch.object(dv_shim.time, "time", lambda: now[0]), \
+             mock.patch.object(dv_shim.time, "sleep", fake_sleep):
+            dv_shim._warn_before_takeover()
+        self.assertAlmostEqual(sum(slept), 3.0, places=6)   # 3s left of a longer countdown
+
+    def test_an_ack_ends_the_countdown_early(self):
+        dv_shim._TAKEOVER_DEADLINE = 9e12
+        open(dv_shim.TAKEOVER_ACK, "w").close()
+        with mock.patch.object(dv_shim.time, "sleep", lambda *_a: None):
+            dv_shim._warn_before_takeover()
+        self.assertIsNone(dv_shim._TAKEOVER_DEADLINE)
+
+    def test_an_abort_ends_the_countdown(self):
+        dv_shim._TAKEOVER_DEADLINE = 9e12
+        ab = mock.Mock(); ab.is_set.return_value = True
+        with mock.patch.object(dv_shim.time, "sleep", lambda *_a: None):
+            dv_shim._warn_before_takeover(abort=ab)
+        self.assertIsNone(dv_shim._TAKEOVER_DEADLINE)
+
+
 class PointerRelease(unittest.TestCase):
     """When a takeover ends the mouse goes back to the main screen — however long it ran,
     and however it ended (success, raise, or abort)."""

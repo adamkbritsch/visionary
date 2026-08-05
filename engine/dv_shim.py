@@ -632,37 +632,60 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
 
 TAKEOVER_ACK = os.path.expanduser("~/.topaz-pipeline/takeover_ack")
 
+# When the screen/mouse will actually be seized. Set by arm_takeover_warning() at the START
+# of the resolve stage; _warn_before_takeover() then waits only whatever is LEFT of it.
+_TAKEOVER_DEADLINE = None
 
-def _warn_before_takeover(abort=None):
-    """Announce the screen/mouse takeover and WAIT, so a warning is actually possible.
 
-    There is no free lead time to spend: the orchestrator flips stage to "resolve" seconds
-    before Resolve is launched, and the app only learns state on a 1.5 s poll. So a real
-    warning has to be paid for in pipeline time — this hold IS the warning window. Default
-    0 (no hold, exactly the old behaviour); the app draws its panel off the marker line.
+def arm_takeover_warning():
+    """Start the countdown NOW — while Resolve is still launching and the timeline is still
+    being assembled, which is 30-200s of real work before anything is clicked.
 
-    Ends early if the user acks (the app touches TAKEOVER_ACK) or the stage aborts."""
+    This is the difference between a countdown and a delay. Sleeping for N seconds at the
+    moment of the takeover would buy the warning by making every episode N seconds longer;
+    starting the clock here spends the lead time that the stage was going to burn anyway,
+    so in the normal case the deadline has already passed by the time the shim is ready to
+    click and NOTHING is added.
+
+    Publishes an absolute deadline rather than a duration so the app can tick smoothly on
+    its own instead of re-rendering whatever number happened to land in the last poll."""
+    global _TAKEOVER_DEADLINE
     try:
         import settings
         secs = int(settings.tunable("resolve_takeover_warning_seconds"))
     except Exception:
         secs = 0
     if secs <= 0:
+        _TAKEOVER_DEADLINE = None
         return
     try:
         os.remove(TAKEOVER_ACK)
     except OSError:
         pass
-    print("SCREEN_TAKEOVER_IN %d" % secs, flush=True)
-    end = time.time() + secs
-    while time.time() < end:
+    _TAKEOVER_DEADLINE = time.time() + secs
+    print("SCREEN_TAKEOVER_AT %d IN %d" % (round(_TAKEOVER_DEADLINE), secs), flush=True)
+
+
+def _warn_before_takeover(abort=None):
+    """Wait out whatever REMAINS of the armed countdown. Usually nothing: the stage's own
+    setup work outlasts it. Ends early on an ack or an abort."""
+    global _TAKEOVER_DEADLINE
+    if _TAKEOVER_DEADLINE is None:
+        return
+    while True:
+        left = _TAKEOVER_DEADLINE - time.time()
+        if left <= 0:
+            break
         if abort is not None and getattr(abort, "is_set", lambda: False)():
+            _TAKEOVER_DEADLINE = None
             return
         if os.path.exists(TAKEOVER_ACK):
             print("SCREEN_TAKEOVER_ACK", flush=True)
+            _TAKEOVER_DEADLINE = None
             return
-        time.sleep(0.5)
+        time.sleep(min(0.5, left))
     print("SCREEN_TAKEOVER_NOW", flush=True)
+    _TAKEOVER_DEADLINE = None
 
 
 def run_dv_ui(abort=None, expect_nit=1000) -> bool:
