@@ -176,7 +176,13 @@ def match_display(px_w, px_h, scale, builtin):
             "verified": False}
 
 
-def check_display():
+_UNSET = object()
+
+
+def check_display(host=_UNSET):
+    """`host` is injectable so a unit test can ask about a specific display without the
+    answer depending on what this machine happens to have pinned right now. Left alone it
+    resolves the pinned host itself."""
     verified = " or ".join(f"{c['name']} ({c['backing'][0]}x{c['backing'][1]})"
                            for c in versions.SUPPORTED_DISPLAYS)
     fix = (f"Visionary's Resolve automation needs the MAIN display to render at "
@@ -202,10 +208,11 @@ def check_display():
     # refuse to arm a rig whose host is perfectly good, and a 2x main would happily arm
     # one whose host is not. Unpinned, or when the pinned display is not attached, this
     # is exactly the old check on main.
-    try:
-        host, _why = chosen_host()
-    except Exception:
-        host = None
+    if host is _UNSET:
+        try:
+            host, _why = chosen_host()
+        except Exception:
+            host = None
     if host:
         px_w, px_h = host["backing"]
         scale, builtin = host["scale"], host["builtin"]

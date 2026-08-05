@@ -59,14 +59,14 @@ class DisplayCheck(unittest.TestCase):
         w, h = versions.DISPLAY_PIXELS
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(w, h, versions.RETINA_SCALE, True)):
-            c = preflight.check_display()
+            c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
         self.assertTrue(c["ok"]); self.assertIn("built-in", c["detail"])
 
     def test_clamshell_dummy_passes_by_name(self):
         # LID-CLOSED: the 4K dummy plug is the main display and is NOT builtin
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(3840, 2160, 2.0, False)):
-            c = preflight.check_display()
+            c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
         self.assertTrue(c["ok"]); self.assertIn("clamshell", c["detail"])
 
     def test_other_2x_displays_pass_generically(self):
@@ -74,7 +74,7 @@ class DisplayCheck(unittest.TestCase):
         for geom, builtin in (((3024, 1964), True), ((5120, 2880), False), ((2560, 1600), False)):
             with mock.patch.object(preflight, "_display_via_coregraphics",
                                    return_value=(geom[0], geom[1], 2.0, builtin)):
-                c = preflight.check_display()
+                c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
             self.assertTrue(c["ok"], geom)
             self.assertIn("@2x", c["detail"])
             self.assertIn("--smoke", c["detail"])      # says it is unverified, run the smoke test
@@ -84,13 +84,13 @@ class DisplayCheck(unittest.TestCase):
         for scale in (1.0, 1.5, 3.0):
             with mock.patch.object(preflight, "_display_via_coregraphics",
                                    return_value=(3840, 2160, scale, False)):
-                self.assertFalse(preflight.check_display()["ok"], scale)
+                self.assertFalse(preflight.check_display(host=None)["ok"], scale)
 
     def test_absurdly_small_2x_display_fails(self):
         # 1920x1080 BACKING at 2x is 960x540 points — Resolve's Color page cannot lay out
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                return_value=(1920, 1080, 2.0, False)):
-            self.assertFalse(preflight.check_display()["ok"])
+            self.assertFalse(preflight.check_display(host=None)["ok"])
 
     def test_match_display_is_pure(self):
         self.assertIsNotNone(preflight.match_display(3456, 2234, 2.0, True))
@@ -107,13 +107,13 @@ class DisplayCheck(unittest.TestCase):
                                side_effect=RuntimeError("no CG")), \
              mock.patch.object(preflight, "_display_via_system_profiler",
                                return_value=(w, h, None, True)):
-            c = preflight.check_display()
+            c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
         self.assertTrue(c["ok"]); self.assertIn("system_profiler", c["detail"])
         with mock.patch.object(preflight, "_display_via_coregraphics",
                                side_effect=RuntimeError("no CG")), \
              mock.patch.object(preflight, "_display_via_system_profiler",
                                return_value=(5120, 2880, None, False)):
-            self.assertFalse(preflight.check_display()["ok"])
+            self.assertFalse(preflight.check_display(host=None)["ok"])
 
 
 class PowerRule(unittest.TestCase):

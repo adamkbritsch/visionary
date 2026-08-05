@@ -381,3 +381,63 @@ class HostTargeting(unittest.TestCase):
                                lambda cmd, **kw: seen.update(cmd=cmd)):
             dv_shim.click(864, 558)
         self.assertEqual(seen["cmd"][-1], "c:864,558")
+
+
+class PointerRelease(unittest.TestCase):
+    """When a takeover ends the mouse goes back to the main screen — however long it ran,
+    and however it ended (success, raise, or abort)."""
+
+    MAIN = (0.0, 0.0, 1728.0, 1117.0)
+
+    def test_a_pointer_left_on_the_other_screen_comes_back(self):
+        moved = {}
+        with mock.patch.object(dv_shim, "main_display_bounds", return_value=self.MAIN), \
+             mock.patch.object(dv_shim, "pointer_position", return_value=(2500.0, 1500.0)), \
+             mock.patch.object(dv_shim, "warp_pointer",
+                               lambda x, y: moved.update(to=(x, y)) or True):
+            self.assertTrue(dv_shim.release_pointer_to_main(saved=(400.0, 300.0)))
+        self.assertEqual(moved["to"], (400.0, 300.0), "prefers where the user had it")
+
+    def test_it_falls_back_to_the_centre_of_main(self):
+        moved = {}
+        with mock.patch.object(dv_shim, "main_display_bounds", return_value=self.MAIN), \
+             mock.patch.object(dv_shim, "pointer_position", return_value=(2500.0, 1500.0)), \
+             mock.patch.object(dv_shim, "warp_pointer",
+                               lambda x, y: moved.update(to=(x, y)) or True):
+            # saved position was ALSO off-main (or unknown) -> centre of main
+            dv_shim.release_pointer_to_main(saved=(3000.0, 1800.0))
+            self.assertEqual(moved["to"], (864.0, 558.5))
+            moved.clear()
+            dv_shim.release_pointer_to_main(saved=None)
+            self.assertEqual(moved["to"], (864.0, 558.5))
+
+    def test_a_pointer_already_on_main_is_left_alone(self):
+        # An hour-long analysis: if the user has been working, their cursor is where they
+        # want it. Yanking it to a position remembered from an hour ago is its own
+        # interruption.
+        with mock.patch.object(dv_shim, "main_display_bounds", return_value=self.MAIN), \
+             mock.patch.object(dv_shim, "pointer_position", return_value=(900.0, 600.0)), \
+             mock.patch.object(dv_shim, "warp_pointer",
+                               mock.Mock(side_effect=AssertionError("must not move it"))):
+            self.assertFalse(dv_shim.release_pointer_to_main(saved=(10.0, 10.0)))
+
+    def test_it_never_raises_since_it_runs_in_a_finally(self):
+        with mock.patch.object(dv_shim, "main_display_bounds",
+                               mock.Mock(side_effect=RuntimeError("boom"))):
+            self.assertFalse(dv_shim.release_pointer_to_main(saved=(1.0, 1.0)))
+
+    def test_the_pointer_is_released_even_when_the_takeover_FAILS(self):
+        released = {}
+        with mock.patch.object(dv_shim, "_warn_before_takeover", lambda *a: None), \
+             mock.patch.object(dv_shim, "pointer_position", return_value=(50.0, 50.0)), \
+             mock.patch.object(dv_shim, "release_pointer_to_main",
+                               lambda saved=None: released.update(saved=saved) or True), \
+             mock.patch.object(dv_shim, "screen_locked", return_value=False), \
+             mock.patch.object(dv_shim, "main_display_geometry", return_value=(3456, 2234, 2.0, True)), \
+             mock.patch.object(dv_shim, "host_view", return_value=(0.0, 0.0, 2.0, 1728.0, 1117.0)), \
+             mock.patch.dict("sys.modules", {"resolve": mock.Mock(connect=lambda: object())}), \
+             mock.patch.object(dv_shim, "goto_dolby_vision", return_value=False):
+            with self.assertRaises(RuntimeError):
+                dv_shim.run_dv_ui()
+        self.assertEqual(released.get("saved"), (50.0, 50.0),
+                         "a failed takeover must still hand the mouse back")

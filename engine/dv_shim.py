@@ -422,6 +422,69 @@ def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
     raise RuntimeError(f"screencapture failed after {attempts} attempts: {last}")
 
 
+def pointer_position():
+    """(x, y) of the mouse in global logical points, or None."""
+    try:
+        r = subprocess.run([CLICLICK, "p"], capture_output=True, text=True, timeout=5)
+        parts = (r.stdout or "").strip().split(",")
+        return (float(parts[0]), float(parts[1])) if len(parts) >= 2 else None
+    except Exception:
+        return None
+
+
+def warp_pointer(x, y) -> bool:
+    try:
+        subprocess.run([CLICLICK, f"m:{int(round(x))},{int(round(y))}"],
+                       check=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def main_display_bounds():
+    """(ox, oy, w_pt, h_pt) of the MAIN display in global points. Main is always at the
+    global origin, but read it rather than assume so a future change can't silently break
+    the containment test below."""
+    try:
+        import displays
+        m = displays.main_display()
+        if m:
+            return (float(m["origin"][0]), float(m["origin"][1]),
+                    float(m["size_pt"][0]), float(m["size_pt"][1]))
+    except Exception:
+        pass
+    g = main_display_geometry()
+    scale = float(g[2]) if (g and g[2]) else 2.0
+    return (0.0, 0.0, (g[0] / scale) if g else 0.0, (g[1] / scale) if g else 0.0)
+
+
+def release_pointer_to_main(saved=None) -> bool:
+    """END OF A TAKEOVER: put the mouse back on the main screen.
+
+    Only moves it when the pointer is NOT already on main. That distinction matters: a DV
+    analysis can run for an hour, and if the user has been working in the meantime their
+    pointer is on the main display exactly where they want it — yanking it to a remembered
+    position from an hour ago would be its own interruption. But if the pipeline's clicking
+    left the pointer on the host display, it comes back.
+
+    Returns True if it moved the pointer. Never raises — this runs in a `finally`."""
+    try:
+        ox, oy, w, h = main_display_bounds()
+        if w <= 0 or h <= 0:
+            return False
+        pos = pointer_position()
+        if pos is not None and (ox <= pos[0] <= ox + w and oy <= pos[1] <= oy + h):
+            return False                      # already on main — leave the user's cursor alone
+        # Prefer where the pointer was BEFORE the takeover, when that was on main.
+        if saved is not None and (ox <= saved[0] <= ox + w and oy <= saved[1] <= oy + h):
+            target = saved
+        else:
+            target = (ox + w / 2, oy + h / 2)
+        return warp_pointer(*target)
+    except Exception:
+        return False
+
+
 def click(x, y):
     """Click a GLOBAL logical point, then put the pointer back where the user left it.
 
@@ -629,19 +692,28 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
         raise RuntimeError("the session is LOCKED — screencapture only sees the lock screen, "
                            "so no template can match. Disable the screen lock for lid-closed runs.")
     _warn_before_takeover(abort)
-    import resolve
-    r = resolve.connect()
-    if not goto_dolby_vision(r):
-        raise RuntimeError("Dolby Vision palette did not open (see ~/.topaz-pipeline/diag)")
-    if expect_nit == 1000 and not verify_target_display():
-        _diag("wrong-target-display", expect_nit=expect_nit)
-        raise RuntimeError("Target Display Output is not the 1000-nit ST.2084 entry — "
-                           "refusing to analyze against the wrong (likely 100-nit SDR) target")
-    click_analyze_all()
-    ok = wait_for_analysis(abort=abort)
-    if not ok:
-        _diag("analysis-incomplete", expect_nit=expect_nit)
-    return ok
+    # Remember where the user had the pointer, and hand it back when the takeover ends —
+    # however it ends. In `finally`, so a raised template failure, a wrong-target refusal
+    # or a stop-time abort all release the mouse too; those are exactly the paths where
+    # leaving the pointer stranded on Resolve's screen would be most annoying.
+    saved_pointer = pointer_position()
+    try:
+        import resolve
+        r = resolve.connect()
+        if not goto_dolby_vision(r):
+            raise RuntimeError("Dolby Vision palette did not open (see ~/.topaz-pipeline/diag)")
+        if expect_nit == 1000 and not verify_target_display():
+            _diag("wrong-target-display", expect_nit=expect_nit)
+            raise RuntimeError("Target Display Output is not the 1000-nit ST.2084 entry — "
+                               "refusing to analyze against the wrong (likely 100-nit SDR) target")
+        click_analyze_all()
+        ok = wait_for_analysis(abort=abort)
+        if not ok:
+            _diag("analysis-incomplete", expect_nit=expect_nit)
+        return ok
+    finally:
+        if release_pointer_to_main(saved_pointer):
+            print("dv_ui: pointer returned to the main display", flush=True)
 
 
 def capture_reference():

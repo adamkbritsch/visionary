@@ -341,7 +341,9 @@ class FastPathDispatch(unittest.TestCase):
         def boom(cmd, **kw):
             seen["cmd"] = cmd
             raise RuntimeError("stop here")
+        import preflight
         with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             ok, msg = stages.run_stage("resolve", p)
@@ -363,7 +365,9 @@ class FastPathDispatch(unittest.TestCase):
         def boom(cmd, **kw):
             seen["cmd"] = cmd
             raise RuntimeError("stop here")
-        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+        import preflight
+        with mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
              mock.patch.object(stages, "_source_video_kbps", return_value=90000), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):

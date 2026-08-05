@@ -198,3 +198,35 @@ class EitherPanelCanBeMain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestsMustNotDependOnLivePinning(unittest.TestCase):
+    """check_display reaches for chosen_host(), which reads the REAL settings file. That
+    made five display tests pass or fail depending on what THIS machine had pinned at the
+    time — they broke the moment the feature was switched on for real. `host` is injectable
+    for exactly that reason; this asserts the seam still exists."""
+
+    def test_check_display_accepts_an_injected_host(self):
+        import inspect
+        self.assertIn("host", inspect.signature(preflight.check_display).parameters)
+
+    def test_an_injected_none_judges_main_even_while_something_is_pinned(self):
+        hdmi = disp(UHD4K, "uuid:4K", (1728.0, 0.0))
+        with mock.patch.object(preflight, "chosen_host",
+                               mock.Mock(side_effect=AssertionError("must not be consulted"))), \
+             mock.patch.object(preflight, "_display_via_coregraphics",
+                               return_value=(3456, 2234, 2.0, True)):
+            c = preflight.check_display(host=None)
+        self.assertTrue(c["ok"])
+        self.assertIn("main display", c["detail"])
+        del hdmi
+
+    def test_an_injected_host_is_the_one_judged(self):
+        hdmi = disp(UHD4K, "uuid:4K", (1728.0, 0.0))
+        hdmi["name"] = "4K dummy HDMI (clamshell)"
+        with mock.patch.object(preflight, "_display_via_coregraphics",
+                               return_value=(3456, 2234, 2.0, True)):
+            c = preflight.check_display(host=hdmi)
+        self.assertTrue(c["ok"])
+        self.assertIn("host display", c["detail"])
+        self.assertIn("3840x2160", c["detail"])
