@@ -337,6 +337,15 @@ struct HeaderBar: View {
 struct PowerPill: View {
     @EnvironmentObject var store: AppStore
 
+    // MEASURED, not eyeballed — NSFont.systemFont(12, .medium) with monospaced digits:
+    //   "9%" 19.3   "80%" 27.1   "100%" 34.8   "41% / 3%" 56.7   "100% / 100%" 80.0
+    // The old 32 was sized so "9%→10%" wouldn't shift and never accounted for a THIRD digit,
+    // so a full battery truncated to "10…" — and idle is exactly when it tops off, which is
+    // why it showed up with the pipeline deactivated. The dual slot had the same hole at
+    // 100% / 100%. Both now clear their worst case with a little air.
+    private static let pctSlot: CGFloat = 36
+    private static let dualPctSlot: CGFloat = 84
+
     /// (pipeline index, SF Symbol, percent, second percent) for the most-downstream stage
     /// actually executing. The 4th element is non-nil only when BOTH remux lanes are live at
     /// that same stage — their pipeline indexes tie, so one number cannot represent them.
@@ -403,7 +412,8 @@ struct PowerPill: View {
                     Image(systemName: batterySymbol(cap, charging: p?.charging ?? false))
                         .font(.system(size: 11))
                     Text("\(cap)%").monospacedDigit()
-                        .frame(width: 32, alignment: .trailing)   // fixed: 9%→10% must not shift
+                        // Fixed slot so 9%→10%→100% never shifts the group.
+                        .frame(width: Self.pctSlot, alignment: .trailing)
                 }
             }
             if let lead {
@@ -415,7 +425,8 @@ struct PowerPill: View {
                     // rather than the numbers moving.
                     Text(lead.3 == nil ? "\(lead.2)%" : "\(lead.2)% / \(lead.3!)%")
                         .monospacedDigit()
-                        .frame(width: lead.3 == nil ? 32 : 74, alignment: .trailing)
+                        .frame(width: lead.3 == nil ? Self.pctSlot : Self.dualPctSlot,
+                               alignment: .trailing)
                 }
             }
         }
