@@ -379,7 +379,9 @@ def _resolve(p, abort, progress=None):
     unresponsive — in-process that wedges the entire orchestrator (the exact bug
     that froze the app mid-run). As a child process it's killable on timeout/abort,
     so a Resolve hang fails this stage cleanly and the orchestrator keeps breathing.
-    ONE project handles SDR and HDR input (the ProRes color tags pick the range).
+    The OUTPUT MODE picks the Resolve project. Automatically that is only ever one of
+    the two Dolby Vision projects (SDR intake -> 1000-nit, HDR intake -> 2000-nit);
+    the non-DV SDR project is reachable ONLY through an explicit per-item override.
     When the stage finishes (any outcome) Resolve is quit and the app refocused.
     FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
     nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""

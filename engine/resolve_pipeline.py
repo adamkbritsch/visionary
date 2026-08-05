@@ -24,9 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from versions import RESOLVE_APP  # noqa: E402 — exact-version pin (versions.py); preflight gates on it
 LIB = RESOLVE_APP + "/Contents/Libraries/Fusion/fusionscript.so"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
-# Two persistent projects, picked by the intake range so each can carry the right DV
-# mastering ceiling: SDR intake → 1000-nit Target Display; HDR intake → 2000-nit.
-# Candidate project names per intake range, in preference order. We match whatever the
+# Candidate project names per OUTPUT MODE, in preference order. We match whatever the
 # project is ACTUALLY named in Resolve (the API can't rename), so a rename — e.g. to the
 # new "Visionary …" app name — won't break the pipeline. First existing one wins.
 # Three persistent projects, named for what they PRODUCE. The old names described the INTAKE
@@ -61,9 +59,10 @@ import resolve as R  # noqa: E402
 
 
 def project_for(pm, mode):
-    """Pick the persistent project for the intake range, matching whatever it's ACTUALLY
-    named in Resolve. mode 'hdr' → the HDR (2000-nit) project; else the SDR (1000-nit)
-    one. Tries the candidates in order and returns the first that exists, so renaming the
+    """Pick the persistent project for the OUTPUT MODE, matching whatever it's ACTUALLY
+    named in Resolve. 'dv2000' → the 2000-nit DV project, 'sdr' → the true-Rec.709 one,
+    anything else → 1000-nit DV (the default, and what an unpinned SDR intake gets).
+    Tries the candidates in order and returns the first that exists, so renaming the
     projects in Resolve doesn't break anything. Returns (name, exists) — name is the
     preferred candidate when none exist (for the 'missing project' message)."""
     projects = pm.GetProjectListInCurrentFolder() or []
@@ -118,9 +117,13 @@ def setup(segdir, mode=MODE_DV1000):
         print("CONNECT FAILED"); return 1
     print(f"[{time.strftime('%H:%M:%S')}] connected: {resolve.GetVersionString()}", flush=True)
     pm = resolve.GetProjectManager()
-    # Use the app's PERSISTENT project. The user configures it ONCE (color management
-    # that maps SDR *and* HDR input to HDR PQ output, DV Profile 8.1, 1000-nit Target
-    # Display) and the pipeline INHERITS all of it. We NEVER recreate it (that would
+    # Use the app's PERSISTENT project for this mode. The user configures each ONCE (color
+    # management, DV Profile 8.1, and its Target Display ceiling — 1000 or 2000 nits; the
+    # SDR one carries Rec.709 Gamma 2.4 and no Dolby Vision at all) and the pipeline
+    # INHERITS all of it. Both DV projects map SDR *and* HDR intake to HDR PQ output — the
+    # intake range only chooses BETWEEN them, and never selects the SDR project, which is
+    # reachable solely through an explicit per-item override.
+    # We NEVER recreate a project (that would
     # wipe the setup), NEVER set color ourselves, and NEVER create a fresh one
     # silently — a blank project renders SDR with no Dolby Vision, and DV Profile 8.1
     # can't be re-set via the API. If it's missing, STOP and tell the user.
@@ -327,7 +330,8 @@ def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
     """The WHOLE resolve stage in one process: setup (assemble the Topaz chunks on the
     timeline) -> DV Analyze All (UI shim) -> render. Run as a SUBPROCESS so a hung
     fusionscript call (Resolve unresponsive) can be killed from outside.
-    `mode` ('sdr'|'hdr') selects the project + the DV analyze target ceiling; `bitrate`
+    `mode` ('dv1000'|'dv2000'|'sdr') selects the project + the DV analyze target ceiling
+    ('sdr' has no DV stage at all, so the whole run is headless); `bitrate`
     (Kb/s) is the export bitrate (already max'd against the intake by the caller)."""
     rc = setup(segdir, mode)
     if rc != 0:

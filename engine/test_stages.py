@@ -607,6 +607,16 @@ class OutputModeOverride(unittest.TestCase):
         self.assertEqual(self._mode("sdr", is_hdr=True), "sdr")
         self.assertEqual(self._mode("dv1000", is_hdr=True), "dv1000")
 
+    def test_the_automatic_rule_can_never_pick_sdr(self):
+        """User-dictated invariant: automatically it is ALWAYS Dolby Vision — 1000-nit for
+        an SDR intake, 2000-nit for an HDR one. A non-DV master is a manual choice only, so
+        no source, and no junk left in the setting, may fall through to it."""
+        for stored in ("auto", "", None, "SDR", "sdr ", "hdr", "dv3000", 0, True):
+            for is_hdr in (False, True):
+                got = self._mode(stored, is_hdr=is_hdr)
+                self.assertNotEqual(got, "sdr", f"{stored!r}/is_hdr={is_hdr} fell through to SDR")
+                self.assertEqual(got, "dv2000" if is_hdr else "dv1000")
+
     def test_the_sdr_mode_is_the_only_headless_one(self):
         import resolve_pipeline as RP
         self.assertFalse(RP.is_dv_mode("sdr"))       # no DV -> no Analyze All -> no screen
