@@ -182,6 +182,44 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the source (de
                        both makes Plex serve them as one item with two versions
 ```
 
+### Which path a source takes
+
+Every source is ffprobed first (`engine/plan.py`), and the measurements — not the filename —
+decide the route. The filename is only ever used for the *suggestion* shown in the app before
+a file has been downloaded.
+
+```mermaid
+flowchart TD
+    S["source on the NAS"] --> DV{"already<br/>Dolby Vision?"}
+    DV -->|yes| SKIP["skip<br/>not processed"]
+    DV -->|no| FOURK{"4K?"}
+    FOURK -->|no| UPS["upscale"]
+    FOURK -->|yes| CFR{"constant<br/>frame rate?"}
+    CFR -->|no| CLEAN["clean"]
+    CFR -->|yes| RPU{"PQ + HEVC + 10-bit?<br/>can it carry a DV RPU"}
+    RPU -->|yes| INJ["rpu-only"]
+    RPU -->|no| BR{"bitrate at least<br/>12 Mbps?"}
+    BR -->|yes| CONV["resolve-only"]
+    BR -->|no| CLEAN
+
+    INJ --> INJ2["Topaz skipped<br/>Resolve does DV analysis only<br/>video stream-copied, RPU injected<br/>no re-encode, no peak cap"]
+    CONV --> CONV2["Topaz skipped<br/>Resolve converts and adds DV<br/>capped x265 remux"]
+    CLEAN --> CLEAN2["Topaz 1x clean pass<br/>Resolve converts and adds DV<br/>capped x265 remux"]
+    UPS --> UPS2["Topaz upscales to 4K<br/>Resolve converts and adds DV<br/>capped x265 remux"]
+```
+
+| source | Topaz | Resolve | remux | video re-encoded? |
+|---|---|---|---|---|
+| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 2000 nits | RPU injected onto the original | **no — bit-identical** |
+| 4K HDR · HLG/AV1/H.264/8-bit ≥ 12 Mbps | skipped | converts + DV, 2000 nits | capped x265 | yes — DV 8.1 needs an HEVC PQ base |
+| 4K SDR ≥ 12 Mbps | skipped | adds HDR + DV, 1000 nits | capped x265 | yes |
+| 4K, VFR or under threshold | 1× clean pass | adds HDR + DV | capped x265 | yes |
+| 1080p and below | upscale to 4K | adds HDR + DV, 1000 nits | capped x265 | yes |
+| already Dolby Vision | — | — | — | not processed at all |
+
+The nit ceiling follows the **intake range**, not the path: an HDR intake masters to 2000, an
+SDR intake to 1000. Both are overridable per show, movie or channel.
+
 <p align="center">
   <img src="docs/assets/before-after-4k.png" alt="Before/after: a 1080p source frame vs Visionary's 4K upscale, cropped equally" width="880">
 </p>
@@ -198,14 +236,24 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the source (de
   an **HDR** input to **2000 nits** — so each gets the right DV target-display ceiling for how
   bright it was meant to go. Both export HDR10 + Dolby Vision Profile 8.1.
 
-- **High-bitrate 4K fast path**: a 4K CFR source whose video bitrate is already healthy
-  (≥ the `passthrough_min_mbps` setting, default **12 Mbps**) skips Topaz entirely — its
-  picture is the deliverable. Eligibility is purely measured (nothing is excluded by
-  provenance — a 4K YouTube VP9 qualifies on its numbers). Two tiers by what the stream can
-  technically carry: an **HDR10/HEVC** source keeps its **original bits untouched** and gets
-  Resolve's Dolby Vision RPU injected onto it (no re-encode, no peak cap — those peaks were
-  already direct-playing); everything else ships Resolve's HDR+DV conversion through the
-  normal capped remux. Either way a movie lands in **~2.5× its runtime** instead of ~5×.
+- **4K fast paths**: a 4K CFR source skips Topaz entirely — its picture is already the
+  deliverable. Two tiers, decided by what the stream can technically carry:
+
+  **HDR10 is never re-encoded.** A 4K PQ / HEVC / 10-bit source keeps its **original video
+  bits**, and Resolve runs purely as a Dolby Vision analyser: its render is discarded and
+  only the RPU is injected onto the original with `dovi_tool`. No x265, no peak cap, at any
+  bitrate and any 4K geometry (2.39:1 scope and DCI 4K included). The coded pictures come
+  out bit-identical; only the container and NAL scaffolding are rebuilt.
+
+  **Everything else 4K** at or above the `passthrough_min_mbps` setting (default **12 Mbps**)
+  ships Resolve's HDR+DV conversion through the normal capped remux. Eligibility there is
+  purely measured — nothing is excluded by provenance, so a 4K YouTube VP9 qualifies on its
+  numbers. Either way a movie lands in **~2.5× its runtime** instead of ~5×.
+
+  An HDR source that *cannot* carry an RPU — HLG, AV1, H.264 or 8-bit — has to be converted
+  to gain Dolby Vision at all, since DV 8.1 requires an HEVC PQ 10-bit base layer. That is
+  the one case where HDR material is re-encoded, and the plan says which property forced it
+  rather than doing it silently.
 
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
