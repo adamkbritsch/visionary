@@ -290,15 +290,28 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
   pauses on battery and dims the screen after idle. **Screen Control** holds the
   screen-invasive Resolve stage so it never grabs your Mac while you're using it — the
-  other stages keep running. Separately, it pauses its NAS precaching whenever a Plex
-  stream is live, so pulling ahead can't stutter playback.
+  other stages keep running. If you have a second display, Resolve can be sent to it
+  instead, so the stage stops covering your work at all; the pointer is still borrowed
+  for a few seconds per episode, and a notice on your main screen says so before it
+  happens. Separately, it pauses its NAS precaching whenever a Plex stream is live, so
+  pulling ahead can't stutter playback.
 
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
 | Round-robin queue | Guardrails |
 |:---:|:---:|
-| <img src="docs/assets/app-queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine episodes lined up" width="420"> | <img src="docs/assets/app-power.png" alt="Settings and scratch: the 140 W power gate, screen dimming, live per-episode scratch usage" width="420"> |
-| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. Movie search shows each title's <b>routing tags</b> (4K/1080p · HDR/DV · codec) with an approximate duration hint.</sub> | <sub>The <b>140 W power gate</b> and idle screen-off, plus live per-episode scratch usage (Topaz segments, DV render, remux segments).</sub> |
+| <img src="docs/assets/queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine items lined up" width="420"> | <img src="docs/assets/scratch.png" alt="Scratch and power: the 140 W gate, free space, live per-episode scratch usage" width="420"> |
+| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. While the pipeline is armed the per-item settings condense to <b>one line</b> — they can't change mid-run — but you can still queue more work, and drag a movie to whichever slot you want it to run in.</sub> | <sub>The <b>140 W power gate</b> and free-space headroom, plus live per-episode scratch usage broken out by artefact (Topaz segments, DV render, CFR source, source).</sub> |
+
+| Movies | YouTube |
+|:---:|:---:|
+| <img src="docs/assets/movies.png" alt="Movies tab: a queued movie showing its resolved output mode, audio and source-fate settings" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
+| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — an HDR10 source lands on <b>2000 nits</b> and is never re-encoded, an SDR source on 1000. The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence (<b>1 per 3 TV episodes</b>), with per-channel length and age filters. Channels can be paused individually.</sub> |
+
+<p align="center">
+  <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">
+</p>
+<p align="center"><sub><b>Settings.</b> Screen Control can be paused for a fixed span or until a wall-clock time (4 hours max — past that the scratch disk fills and the run stalls). <b>Run Resolve on another screen</b> lists every display that can host it, ranked, with the smoke-tested match score for each.</sub></p>
 
 ## Configuration
 
