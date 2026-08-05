@@ -337,7 +337,8 @@ struct StateDTO: Codable {
     var orchestrator: OrchestratorDTO?
     var settings: SettingsDTO?
     var show_profile: ShowProfileDTO?
-    var log: [String]?
+    var log: [String]?          // Recent failures. Surfaced ONLY inside Settings > Advanced --
+                                // never on the main page, where it was an unwanted banner.
 }
 
 struct SeriesListDTO: Codable {

@@ -544,47 +544,6 @@ struct ScreenControlSection: View {
     }
 }
 
-// MARK: - issues banner
-
-struct IssuesBanner: View {
-    @EnvironmentObject var store: AppStore
-    var body: some View {
-        let lines = (store.state?.log ?? []).suffix(6)
-        if !lines.isEmpty {
-            // THE one hue exception in the monochrome scheme: genuine faults stay red so an
-            // overnight failure is unmissable at a glance — but on the glass plate recipe.
-            HStack(alignment: .top, spacing: 14) {
-                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 16))
-                    .frame(width: 40, height: 40)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(DS.fault.opacity(0.16)))
-                    .foregroundStyle(DS.fault)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Recent issues").font(.system(size: 14, weight: .semibold))
-                    Text(lines.joined(separator: "\n"))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
-            }
-            .padding(13)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background {
-                let shape = RoundedRectangle(cornerRadius: DS.radiusCard, style: .continuous)
-                ZStack {
-                    shape.fill(Color.black.opacity(0.18))
-                    shape.fill(DS.fault.opacity(0.10))
-                }
-                .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
-            }
-            .overlay(RoundedRectangle(cornerRadius: DS.radiusCard, style: .continuous)
-                .strokeBorder(LinearGradient(colors: [DS.fault.opacity(0.55), DS.fault.opacity(0.15)],
-                                             startPoint: .top, endPoint: .bottom), lineWidth: 1))
-        }
-    }
-}
-
 // MARK: - pipeline
 
 // Monochrome steel: stages carry no per-stage hue — they differ by symbol, name, and
@@ -2114,6 +2073,19 @@ struct SettingsPopover: View {
                                    key: "seg_eta_after_minutes", fallback: 15,
                                    range: 1...120, unit: "min")
 
+                        // Recent failures live HERE and nowhere else — tucked behind Advanced,
+                        // not on the page. Absent entirely when there is nothing to report, so
+                        // it never occupies space just to say "no issues".
+                        if let lines = store.state?.log, !lines.isEmpty {
+                            SettingsGroupLabel(text: "Recent issues").padding(.top, 4)
+                            Text(lines.suffix(6).joined(separator: "\n"))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(DS.fault)
+                                .textSelection(.enabled)          // copyable — the point of showing it
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
                         SettingsGroupLabel(text: "What qualifies").padding(.top, 4)
                         OptionalSettingRow(title: "4K fast path",
                                            blurb: "A 4K source at or above this bitrate skips Topaz — it's already sharp enough to go straight to Dolby Vision.",
@@ -2422,9 +2394,6 @@ struct RootView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     GrantsCard()
-                    // Faults had NO surface in the app: this was defined but never mounted, and
-                    // state.log is read nowhere else. It renders nothing while the log is empty.
-                    IssuesBanner()
                     PipelineCard()
                     SeriesCard()
                     // (Settings moved to the header gear — see HeaderBar / SettingsPopover.)
