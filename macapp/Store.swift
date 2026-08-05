@@ -72,11 +72,25 @@ final class AppStore: ObservableObject {
         await refresh()                 // state now carries the fresh {dir: title} map
     }
     // A show's display name = its Plex title, falling back to the (prettified) NAS folder.
-    func seriesTitle(_ dir: String) -> String { state?.series?.titles?[dir] ?? pretty(dir) }
+    func seriesTitle(_ dir: String) -> String {
+        AppStore.withYear(state?.series?.titles?[dir] ?? pretty(dir), from: dir)
+    }
     // A movie's Plex title (matched by file basename), falling back to its filename-derived title.
     func movieTitle(_ name: String?, _ fallback: String?) -> String {
-        if let n = name, let t = state?.movies?.titles?[n] { return t }
-        return fallback ?? ""
+        let t = (name.flatMap { state?.movies?.titles?[$0] }) ?? fallback ?? ""
+        return AppStore.withYear(t, from: name ?? fallback ?? "")
+    }
+
+    /// Release year in parentheses after the name. Plex titles usually drop the year ("Lost"),
+    /// while the thing it came from carries it ("Lost (2004)", "Movie.2019.1080p...") — so the
+    /// year is lifted from the SOURCE string and appended when the title has none of its own.
+    /// A title that already ends in a year is returned untouched, so nothing doubles up.
+    static func withYear(_ title: String, from source: String) -> String {
+        let t = title.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, t.range(of: "\\((19|20)\\d\\d\\)$", options: .regularExpression) == nil,
+              let r = source.range(of: "(?<![0-9])(19|20)\\d\\d(?![0-9])", options: .regularExpression)
+        else { return t }
+        return "\(t) (\(source[r]))"
     }
     func runSelftest() async {
         if let t: SelftestDTO = await get("/api/selftest") { self.selftest = t }

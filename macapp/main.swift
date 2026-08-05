@@ -30,9 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "Visionary"
         window.collectionBehavior = [.fullScreenNone]        // hard-block fullscreen/tiling
         window.standardWindowButton(.zoomButton)?.isHidden = true
-        window.center()
-        window.setFrameAutosaveName("MainWindow")            // position persists; size is fixed
-        window.setContentSize(NSSize(width: 1080, height: 620))   // normalize any old saved size
+        // Dead centre, every launch. Deliberately NO setFrameAutosaveName: restoring the saved
+        // frame is what used to override the centring (the autosave restore runs when the name
+        // is set, i.e. after center()), so the window reappeared wherever it was last dragged.
+        window.setContentSize(NSSize(width: 1080, height: 620))   // size FIRST — centring uses it
+        Self.centreOnScreen(window)
         window.styleMask.insert(.fullSizeContentView)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden          // the HeaderBar is the title bar
@@ -164,8 +166,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
     // Clicking the Dock icon of a minimized appliance brings the window back.
     func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { window?.makeKeyAndOrderFront(nil); window?.deminiaturize(nil) }
+        if !flag {
+            if let w = window { Self.centreOnScreen(w) }   // back from the Dock: centred again
+            window?.makeKeyAndOrderFront(nil); window?.deminiaturize(nil)
+        }
         return true
+    }
+
+    /// LITERAL centre of the screen — equal glass on all four sides, measured against the full
+    /// `frame`, not `visibleFrame`. NSWindow.center() is not this (it centres horizontally but
+    /// seats the window high, a third of the slack above it), and visibleFrame is not this
+    /// either: excluding the menu bar and the Dock pushes the window off true centre by the
+    /// difference between them. The window is far shorter than the screen, so nothing can end
+    /// up under the menu bar or behind the Dock.
+    static func centreOnScreen(_ w: NSWindow) {
+        guard let sf = (w.screen ?? NSScreen.main)?.frame else { return }
+        let f = w.frame
+        w.setFrameOrigin(NSPoint(x: (sf.midX - f.width / 2).rounded(),
+                                 y: (sf.midY - f.height / 2).rounded()))
     }
 }
 
