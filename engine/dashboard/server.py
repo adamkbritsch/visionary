@@ -835,6 +835,15 @@ class Handler(BaseHTTPRequestHandler):
             if upd:
                 settings.set_settings(upd)
             self._json(displays_view())
+        elif path == "/api/takeover-ack":
+            # "Go ahead" on the warning panel: drop the file the shim's countdown polls.
+            try:
+                import dv_shim
+                os.makedirs(os.path.dirname(dv_shim.TAKEOVER_ACK), exist_ok=True)
+                open(dv_shim.TAKEOVER_ACK, "w").close()
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"error": str(e)}, code=500)
         elif path == "/api/display-smoke":
             # Score every template against ONE display and remember the result. This is
             # what a screen must pass before it is allowed to host Resolve.

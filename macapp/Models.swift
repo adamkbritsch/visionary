@@ -38,6 +38,8 @@ struct ProgressDTO: Codable {
     var ep_secs_total: Double?
     var eta_secs: Double?
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
+    var takeover_in: Int?     // seconds until the pipeline takes the screen + mouse. Only
+                              // non-nil during the deliberate warning hold; 0 = taking it now.
 }
 
 struct HoldDTO: Codable {
@@ -298,6 +300,33 @@ struct ShowProfileDTO: Codable {
     var output_mode: String?
     var output_mode_effective: String?
     var catalog: [PresetDTO]?
+}
+
+struct DisplayDTO: Codable, Identifiable {
+    var key: String?
+    var name: String?
+    var main: Bool?
+    var builtin: Bool?
+    var eligible: Bool?          // passes the SAME rule preflight has always used
+    var why_not: String?         // plain-language reason when it can't host
+    var smoke_pass: Bool?        // templates PROVEN to match on this screen
+    var smoke_best: Double?
+    var smoke_when: String?
+    var scale: Double?
+    var backing: [Int]?
+    var size_pt: [Int]?
+    var origin: [Double]?
+    var id: String { key ?? "" }
+}
+
+struct DisplaysDTO: Codable {
+    var displays: [DisplayDTO]?
+    var priority: [String]?      // ordered keys, highest first
+    var enabled: Bool?           // the master switch (default off)
+    var fallback_main: Bool?
+    var warning_seconds: Int?
+    var host: DisplayDTO?        // what would actually be driven right now
+    var host_reason: String?
 }
 
 struct DetectPresetDTO: Codable {   // /api/detect-preset → an auto-detected key, or nil = ask

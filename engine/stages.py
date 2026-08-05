@@ -400,6 +400,16 @@ def _resolve(p, abort, progress=None):
     # masters to 2000 nits, anything else to 1000.
     mode = override if override in ("sdr", "dv1000", "dv2000") else (
         "dv2000" if pl.get("is_hdr") else "dv1000")
+    # WHICH SCREEN. Resolved ONCE here, before the subprocess spawns, so an unplugged or
+    # unproven display is a clean stage-level decision with a log line — not a surprise
+    # 200 seconds into a Resolve cold start.
+    try:
+        import preflight as _pf
+        host, host_why = _pf.chosen_host()
+    except Exception as e:
+        host, host_why = None, "%s: %s" % (e.__class__.__name__, e)
+    if host:
+        print(f"resolve: hosting on {host.get('name')} ({host.get('key')})", flush=True)
     fast = pl.get("topaz") in ("rpu-only", "resolve-only")
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In
@@ -414,7 +424,10 @@ def _resolve(p, abort, progress=None):
         reason is None on a hard kill/abort/launch failure (no retry on those)."""
         cmd = [sys.executable, os.path.join(ENGINE_DIR, "resolve_pipeline.py"),
                ("single" if fast else "episode"),
-               (video_in if fast else p.segdir), p.dv_render, mode, str(bitrate)]
+               (video_in if fast else p.segdir), p.dv_render, mode, str(bitrate),
+               # 6th arg: the display to drive. "-" = the main display (every older
+               # behaviour). Both files deploy together, so argv lockstep is fine.
+               (host.get("key") if host else "-")]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
@@ -432,6 +445,18 @@ def _resolve(p, abort, progress=None):
                 m = re.match(r"RENDER_PCT (\d+)", line.strip())
                 if m and progress:
                     progress({"stage": "resolve", "ep": p.ep, "pct": int(m.group(1))})
+                    continue
+                # The screen/mouse takeover is about to happen. This marker is the ONLY
+                # lead time that exists — the stage flips to "resolve" seconds before
+                # Resolve launches, so the warning window is the deliberate hold the shim
+                # takes, and this is what tells the app to draw the notice.
+                t = re.match(r"SCREEN_TAKEOVER_IN (\d+)", line.strip())
+                if t and progress:
+                    progress({"stage": "resolve", "ep": p.ep,
+                              "takeover_in": int(t.group(1))})
+                elif progress and line.startswith(("SCREEN_TAKEOVER_NOW",
+                                                   "SCREEN_TAKEOVER_ACK")):
+                    progress({"stage": "resolve", "ep": p.ep, "takeover_in": 0})
         threading.Thread(target=_reader, daemon=True).start()
         deadline = time.time() + RESOLVE_TIMEOUT
         while proc.poll() is None:
@@ -451,6 +476,14 @@ def _resolve(p, abort, progress=None):
 
     try:
         ok, out, reason = _run(p.source)
+        # A PINNED display that is unplugged, asleep or unmovable must not silently become
+        # "drive the main display" — that is the one outcome hosting exists to prevent. The
+        # item defers instead, so a yanked cable stalls the run rather than surprising the
+        # user, and it does not burn one of max_episode_fails on a cable.
+        if not ok and "HOST_UNAVAILABLE" in out:
+            line = next((l.strip() for l in out.splitlines() if "HOST_UNAVAILABLE" in l), "")
+            return False, "host-display: %s" % (line.replace("HOST_UNAVAILABLE", "").strip()
+                                                or "pinned display unavailable")
         if ok or not fast or not any(mk in out for mk in _MEZZ_MARKERS):
             return ok, reason
         # Fast-path ingest failure — Resolve can't decode this source (VP9/AV1). Build the

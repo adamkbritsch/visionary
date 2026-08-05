@@ -422,6 +422,116 @@ struct PowerPill: View {
     }
 }
 
+/// WHICH SCREEN RESOLVE RUNS ON.
+///
+/// Sits with Screen Control because it is the same subject: what the pipeline does to the
+/// machine you are sitting at. Off by default — Resolve opens wherever it opens (the main
+/// display), exactly as it always has.
+///
+/// A display has to be PROVEN before it can be chosen. Driving a screen nobody is looking
+/// at turns a bad template match from a loud failure into silent wrong clicks, so "Test"
+/// scores every template against that screen and the result is remembered.
+///
+/// Honest about what this does NOT fix, in the copy as well as here: the mouse pointer is
+/// one object shared by every display. Hosting Resolve elsewhere stops it covering your
+/// work; it cannot give the pipeline a cursor of its own.
+struct ResolveHostSection: View {
+    @EnvironmentObject var store: AppStore
+
+    private var d: DisplaysDTO? { store.displays }
+    private var hostable: [DisplayDTO] { (d?.displays ?? []).filter { !($0.main ?? false) } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(isOn: Binding(get: { d?.enabled ?? false },
+                                 set: { v in Task { await store.setDisplayPinning(v) } })) {
+                Text("Run Resolve on another screen").font(.system(size: 12))
+            }
+            .help("Off: Resolve opens on the main display, as it always has. On: it is moved "
+                  + "to the highest-priority screen below that is eligible and proven.")
+
+            if hostable.isEmpty {
+                Text("No second screen attached.")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+            } else {
+                ForEach(hostable) { disp in row(disp) }
+                if (d?.enabled ?? false) {
+                    Text(hostLine).font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+            }
+
+            Divider().padding(.vertical, 2)
+            warningRow
+        }
+        .task { await store.fetchDisplays() }
+    }
+
+    private var hostLine: String {
+        if let h = d?.host, let n = h.name { return "Resolve will run on \(n)." }
+        return "Resolve will run on the main display — \(d?.host_reason ?? "no screen chosen")."
+    }
+
+    @ViewBuilder private func row(_ disp: DisplayDTO) -> some View {
+        let key = disp.key ?? ""
+        let chosen = (d?.priority ?? []).contains(key)
+        HStack(spacing: 8) {
+            Image(systemName: "display").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(disp.name ?? key).font(.system(size: 12)).foregroundStyle(DS.steel)
+                Text(subtitle(disp)).font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+            Spacer()
+            if disp.eligible == true {
+                if store.smokeRunning == key {
+                    ProgressView().controlSize(.small)
+                } else if disp.smoke_pass == true {
+                    Button(chosen ? "Chosen" : "Choose") {
+                        Task { await store.setDisplayPriority(chosen ? [] : [key]) }
+                    }
+                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(chosen ? DS.steel : Color.brand)
+                } else {
+                    Button("Test") { Task { await store.runDisplaySmoke(key) } }
+                        .buttonStyle(.plain).font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.brand)
+                        .help("Open Resolve full-screen on that display first, then Test — it "
+                              + "scores every template against it.")
+                }
+            }
+        }
+    }
+
+    private func subtitle(_ disp: DisplayDTO) -> String {
+        if disp.eligible != true { return disp.why_not ?? "can't host Resolve" }
+        if disp.smoke_pass == true {
+            let best = disp.smoke_best.map { String(format: "%.2f", $0) } ?? "-"
+            return "proven (best template \(best))"
+        }
+        return "not tested yet — Resolve's templates haven't been checked on this screen"
+    }
+
+    @ViewBuilder private var warningRow: some View {
+        let secs = d?.warning_seconds ?? 0
+        VStack(alignment: .leading, spacing: 4) {
+            Stepper(value: Binding(get: { secs },
+                                   set: { v in Task { await store.setTakeoverWarning(v) } }),
+                    in: 0...120, step: 15) {
+                Text(secs == 0 ? "Warn before taking the screen: off"
+                               : "Warn before taking the screen: \(secs)s")
+                    .font(.system(size: 12))
+            }
+            Text(secs == 0
+                 ? "The pipeline takes the screen and mouse with no warning."
+                 : "The pipeline waits \(secs)s, showing a notice on this screen, before it "
+                   + "takes the screen and mouse. That wait is added to every episode.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+            Text("The mouse pointer is shared by every screen — moving Resolve stops it "
+                 + "covering your work, but the pipeline still borrows the pointer to click.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+        }
+    }
+}
+
 /// SCREEN CONTROL, now a Settings row rather than a header button.
 ///
 /// It can only be switched off for a WHILE — a duration or a clock time, never indefinitely.
@@ -2145,6 +2255,7 @@ struct SettingsPopover: View {
                 Text("Settings").font(.system(size: 15, weight: .semibold))
 
                 ScreenControlSection()
+                ResolveHostSection()
                 Divider()
 
                 // The basics are the ones you actually reach for: what the run is chewing

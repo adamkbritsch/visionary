@@ -321,6 +321,11 @@ def single(video, out, mode=MODE_DV2000, bitrate=60000):
             print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
             return 2
     except Exception as e:
+        if e.__class__.__name__ == "HostUnavailable":
+            # NOT a render failure: the pinned display could not be used. The stage turns
+            # this into a deferral rather than falling back to seizing the main screen.
+            print(f"HOST_UNAVAILABLE {e}", flush=True)
+            return 3
         print(f"DV_UI_EXC: {e.__class__.__name__}: {e}", flush=True)
         return 2
     return render(out, mode, bitrate)
@@ -348,9 +353,32 @@ def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
             print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
             return 2
     except Exception as e:
+        if e.__class__.__name__ == "HostUnavailable":
+            # NOT a render failure: the pinned display could not be used. The stage turns
+            # this into a deferral rather than falling back to seizing the main screen.
+            print(f"HOST_UNAVAILABLE {e}", flush=True)
+            return 3
         print(f"DV_UI_EXC: {e.__class__.__name__}: {e}", flush=True)
         return 2
     return render(out, mode, bitrate)
+
+
+def _set_host_from_argv(key):
+    """Point dv_shim at the pinned display, or leave it on the main one."""
+    if not key or key == "-":
+        return
+    try:
+        import displays, dv_shim
+        d = displays.find(key)
+        if d is None:
+            # NOT a silent fall back to main: that would seize the very screen the user
+            # pinned Resolve away from. The stage turns this marker into a deferral.
+            print(f"HOST_UNAVAILABLE {key} not attached", flush=True)
+            return "missing"
+        dv_shim.set_host(d)
+        print(f"host display: {key} origin={d['origin']} size_pt={d['size_pt']}", flush=True)
+    except Exception as e:
+        print(f"HOST DISPLAY ERROR: {e.__class__.__name__}: {e}", flush=True)
 
 
 if __name__ == "__main__":
@@ -360,10 +388,17 @@ if __name__ == "__main__":
         sys.exit(setup(a[0], a[1] if len(a) > 1 else MODE_DV1000))
     elif phase == "render":
         sys.exit(render(a[0], a[1] if len(a) > 1 else MODE_DV1000, int(a[2]) if len(a) > 2 else 60000))
-    elif phase == "episode":
-        sys.exit(episode(a[0], a[1], a[2] if len(a) > 2 else MODE_DV1000, int(a[3]) if len(a) > 3 else 60000))
-    elif phase == "single":
-        sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else MODE_DV2000, int(a[3]) if len(a) > 3 else 60000))
+    elif phase in ("episode", "single"):
+        # 5th positional arg (index 4) = the display key to drive, "-" for the main one.
+        # Set BEFORE any capture: dv_shim fixes its target once per process on purpose, so
+        # a settings change mid-episode cannot move the screen under a running match.
+        if _set_host_from_argv(a[4] if len(a) > 4 else "-") == "missing":
+            sys.exit(3)                    # distinct rc: the display, not the render
+        if phase == "episode":
+            sys.exit(episode(a[0], a[1], a[2] if len(a) > 2 else MODE_DV1000,
+                             int(a[3]) if len(a) > 3 else 60000))
+        sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else MODE_DV2000,
+                        int(a[3]) if len(a) > 3 else 60000))
     else:
         print("usage: resolve_pipeline.py setup <src> [mode] | render <out> [mode] [kbps] "
               "| episode <prores> <out> [mode] [kbps] | single <video> <out> [mode] [kbps]")

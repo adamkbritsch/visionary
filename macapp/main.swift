@@ -54,7 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Fires on every ~1.5 s poll; the draw is cheap and no-ops when the % is unchanged.
         store.$state
             .receive(on: RunLoop.main)
-            .sink { [weak self] s in self?.updateDockProgress(s) }
+            .sink { [weak self] s in
+                self?.updateDockProgress(s)
+                self?.updateTakeoverWarning()
+            }
             .store(in: &cancellables)
     }
 
@@ -175,6 +178,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window?.makeKeyAndOrderFront(nil); window?.deminiaturize(nil)
         }
         return true
+    }
+
+    // --- SCREEN TAKEOVER WARNING ------------------------------------------------------
+    // A borderless panel on the MAIN display, not a notification. UNUserNotificationCenter
+    // would need a new framework, an authorization prompt, and — decisively — is SUPPRESSED
+    // under Focus / Do Not Disturb, which is exactly the state an overnight machine is in.
+    // It also cannot carry a live countdown. This needs no entitlement and always shows.
+    private var takeoverPanel: NSPanel?
+    private var takeoverLabel: NSTextField?
+
+    private func updateTakeoverWarning() {
+        guard let secs = store.takeoverIn else { hideTakeoverWarning(); return }
+        showTakeoverWarning(secs)
+    }
+
+    private func hideTakeoverWarning() {
+        takeoverPanel?.orderOut(nil)
+        takeoverPanel = nil
+        takeoverLabel = nil
+    }
+
+    private func showTakeoverWarning(_ secs: Int) {
+        if let l = takeoverLabel {
+            l.stringValue = "Taking the screen in \(secs)s"
+            return
+        }
+        let w: CGFloat = 380, h: CGFloat = 96
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.level = .screenSaver
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        // Must NEVER take focus — a warning that interrupts you is its own interruption.
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 14
+        bg.layer?.masksToBounds = true
+
+        let title = NSTextField(labelWithString: "Visionary needs the screen")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.frame = NSRect(x: 16, y: h - 34, width: w - 32, height: 18)
+        let label = NSTextField(labelWithString: "Taking the screen in \(secs)s")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.frame = NSRect(x: 16, y: h - 56, width: w - 32, height: 16)
+
+        let later = NSButton(title: "Not now (30m)", target: self,
+                             action: #selector(takeoverDefer))
+        later.bezelStyle = .rounded
+        later.frame = NSRect(x: 16, y: 12, width: 130, height: 24)
+        let go = NSButton(title: "Go ahead", target: self, action: #selector(takeoverAck))
+        go.bezelStyle = .rounded
+        go.frame = NSRect(x: w - 116, y: 12, width: 100, height: 24)
+
+        for v in [title, label, later, go] as [NSView] { bg.addSubview(v) }
+        panel.contentView = bg
+        if let sf = NSScreen.main?.frame {
+            panel.setFrameOrigin(NSPoint(x: (sf.midX - w / 2).rounded(),
+                                         y: (sf.maxY - h - 60).rounded()))
+        }
+        panel.orderFrontRegardless()
+        takeoverPanel = panel
+        takeoverLabel = label
+    }
+
+    @objc private func takeoverAck() {
+        hideTakeoverWarning()
+        Task { await store.ackTakeover() }
+    }
+
+    @objc private func takeoverDefer() {
+        // Reuses Screen Control's proven deferral: the engine owns the deadline, so the
+        // pause lifts by itself even if the app never reopens.
+        hideTakeoverWarning()
+        Task { await store.pauseScreenControl(seconds: 1800) }
     }
 
     /// Halfway between the two centres worth having. LITERAL centres on the whole screen

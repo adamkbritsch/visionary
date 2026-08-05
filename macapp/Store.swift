@@ -92,6 +92,46 @@ final class AppStore: ObservableObject {
         else { return t }
         return "\(t) (\(source[r]))"
     }
+    // --- WHICH SCREEN RESOLVE RUNS ON -------------------------------------------------
+    // Deliberately NOT part of /api/state: that polls every 1.5 s and re-enumerating
+    // displays at that rate is pointless. Fetched when Settings opens, and when macOS says
+    // the display arrangement changed.
+    @Published var displays: DisplaysDTO?
+    @Published var smokeRunning: String? = nil     // key currently being template-tested
+
+    func fetchDisplays() async {
+        if let d: DisplaysDTO = await get("/api/displays") { self.displays = d }
+    }
+    func setDisplayPinning(_ on: Bool) async {
+        await post("/api/displays", ["resolve_host_pinning": on]); await fetchDisplays()
+    }
+    func setDisplayPriority(_ keys: [String]) async {
+        await post("/api/displays", ["priority": keys]); await fetchDisplays()
+    }
+    func setTakeoverWarning(_ seconds: Int) async {
+        await post("/api/displays", ["warning_seconds": max(0, min(300, seconds))])
+        await fetchDisplays()
+    }
+    /// Score every template against one screen and remember the result. A display cannot
+    /// host Resolve until this passes — driving a screen nobody is watching turns a bad
+    /// template match from a loud failure into silent wrong clicks.
+    func runDisplaySmoke(_ key: String) async {
+        smokeRunning = key
+        await post("/api/display-smoke", ["display": key])
+        smokeRunning = nil
+        await fetchDisplays()
+    }
+
+    /// Seconds until the pipeline seizes the screen and mouse, or nil when it is not
+    /// about to. Only ever non-nil during the deliberate warning hold — there is no other
+    /// lead time in the sequence to read.
+    var takeoverIn: Int? {
+        guard let n = state?.orchestrator?.progress?.takeover_in, n > 0 else { return nil }
+        return n
+    }
+    /// "Go ahead" — take the screen now instead of waiting out the countdown.
+    func ackTakeover() async { await post("/api/takeover-ack", [:]) }
+
     func runSelftest() async {
         if let t: SelftestDTO = await get("/api/selftest") { self.selftest = t }
     }

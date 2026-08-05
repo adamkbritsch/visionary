@@ -315,6 +315,86 @@ def enter_fullscreen(*, attempts: int = 3, settle: float = 2.0) -> bool:
                        "template layout and clicks require it")
 
 
+class HostUnavailable(RuntimeError):
+    """Resolve could not be put on the display the user pinned. Deliberately NOT a
+    generic failure: falling back to the main display would seize the very screen this
+    feature exists to leave alone, so the caller defers the item instead."""
+
+
+def place_on_host(host, *, settle: float = 3.0, attempts: int = 3) -> bool:
+    """Move Resolve's main window onto `host` and full-screen it there. No-op when
+    `host` is None. Returns True when Resolve occupies the host; raises HostUnavailable.
+
+    Everything here was measured on a live rig — see engine/DISPLAY-HOSTING.md:
+
+    * AXPosition DOES NOT WORK. It reads correctly, reports settable=true, osascript
+      exits 0, and the window does not move — not to another display, not 100pt on the
+      same one. AXSize is ignored the same way. The System Events `position` PROPERTY
+      does work. Same object, same process, same permission.
+    * Full screen must be EXITED first: while AXFullScreen is true, AXPosition reports
+      settable=false and nothing moves.
+    * macOS clamps an out-of-range position to the union of the displays WITHOUT error,
+      so the write is meaningless unless it is read back.
+    * Window INDEX is never valid twice (it moved three times in one session), and
+      `count of windows` legitimately reads 0 while Resolve is full-screen on another
+      Space — that means "look again", not "Resolve is gone".
+    * Placement does not survive a quit; stages pkills Resolve every stage, so this runs
+      per episode. The upside is that nothing can strand Resolve on an unwatched screen.
+    """
+    if not host:
+        return True
+    ox, oy = host["origin"]
+    w_pt, h_pt = host["size_pt"]
+    for i in range(attempts):
+        idx, is_fs, name = fullscreen_state()
+        if idx is None:
+            # No window exposes AXFullScreen — a dialog is in front, or the main window is
+            # full-screen on a Space we cannot see. Raise it and look again.
+            activate()
+            time.sleep(settle)
+            continue
+        if is_fs:
+            pos = _window_position(idx)
+            if pos and (ox <= pos[0] < ox + w_pt and oy <= pos[1] < oy + h_pt):
+                return True                       # already full-screen ON the host
+            _osa(f'tell application "System Events" to tell process "{APP}" '
+                 f'to set value of attribute "AXFullScreen" of window {idx} to false')
+            time.sleep(settle)
+            idx, _is_fs, name = fullscreen_state()
+            if idx is None:
+                continue
+        # `position`, NOT AXPosition. Inset so the titlebar is unambiguously on the
+        # target rather than straddling the seam between two displays.
+        _osa(f'tell application "System Events" to tell process "{APP}" '
+             f'to set position of window {idx} to {{{int(ox) + 40}, {int(oy) + 40}}}')
+        time.sleep(1.0)
+        pos = _window_position(idx)
+        if not pos or not (ox <= pos[0] < ox + w_pt and oy <= pos[1] < oy + h_pt):
+            continue                              # clamped back — retry
+        _osa(f'tell application "System Events" to tell process "{APP}" '
+             f'to set value of attribute "AXFullScreen" of window {idx} to true')
+        time.sleep(settle)
+        pos = _window_position(idx)
+        if pos and (ox <= pos[0] < ox + w_pt and oy <= pos[1] < oy + h_pt):
+            return True
+    _diag("host-placement-failed", None, host=host.get("key"),
+          origin=[ox, oy], size_pt=[w_pt, h_pt])
+    raise HostUnavailable(
+        "could not put %s on the pinned display (%s at %.0f,%.0f) — not falling back to "
+        "the main display" % (APP, host.get("key"), ox, oy))
+
+
+def _window_position(idx):
+    """(x, y) of a Resolve window in global points, or None."""
+    _rc, out, _e = _osa(f'tell application "System Events" to tell process "{APP}" '
+                        f'to get value of attribute "AXPosition" of window {idx}')
+    try:
+        parts = [int(float(v)) for v in out.replace(",", " ").split()]
+        return (parts[0], parts[1]) if len(parts) >= 2 else None
+    except Exception:
+        return None
+
+
 def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
     """Capture the main display, RETRYING briefly on failure. `screencapture` returns
     "could not create image from display" while the display set is in transition — the
@@ -373,6 +453,9 @@ def goto_dolby_vision(resolve, *, settle: float = 1.0) -> bool:
     NOT click the icon again (which would close it). Returns True when open."""
     resolve.OpenPage("color")        # page-independent switch to Color
     activate()
+    # Onto the pinned display FIRST (no-op when unpinned) — placement needs the window
+    # out of full screen, so doing it after enter_fullscreen would undo that work.
+    place_on_host(get_host())
     enter_fullscreen()               # deterministic layout before matching
     if found(screenshot(), _t("analyze_all.png")):
         return True                  # palette already open
@@ -484,6 +567,41 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
         time.sleep(poll)
 
 
+TAKEOVER_ACK = os.path.expanduser("~/.topaz-pipeline/takeover_ack")
+
+
+def _warn_before_takeover(abort=None):
+    """Announce the screen/mouse takeover and WAIT, so a warning is actually possible.
+
+    There is no free lead time to spend: the orchestrator flips stage to "resolve" seconds
+    before Resolve is launched, and the app only learns state on a 1.5 s poll. So a real
+    warning has to be paid for in pipeline time — this hold IS the warning window. Default
+    0 (no hold, exactly the old behaviour); the app draws its panel off the marker line.
+
+    Ends early if the user acks (the app touches TAKEOVER_ACK) or the stage aborts."""
+    try:
+        import settings
+        secs = int(settings.tunable("resolve_takeover_warning_seconds"))
+    except Exception:
+        secs = 0
+    if secs <= 0:
+        return
+    try:
+        os.remove(TAKEOVER_ACK)
+    except OSError:
+        pass
+    print("SCREEN_TAKEOVER_IN %d" % secs, flush=True)
+    end = time.time() + secs
+    while time.time() < end:
+        if abort is not None and getattr(abort, "is_set", lambda: False)():
+            return
+        if os.path.exists(TAKEOVER_ACK):
+            print("SCREEN_TAKEOVER_ACK", flush=True)
+            return
+        time.sleep(0.5)
+    print("SCREEN_TAKEOVER_NOW", flush=True)
+
+
 def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     """The full per-episode UI step: open the DV palette, verify the inherited target,
     Analyze All Shots, wait for completion. Everything else (color, DV Profile 8.1,
@@ -502,11 +620,15 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     # blocks the screensaver but NOT the login-window lock).
     g = main_display_geometry()
     locked = screen_locked()
-    print(f"[{time.strftime('%H:%M:%S')}] dv_ui: display={g} locked={locked}", flush=True)
+    hv = host_view()
+    print(f"[{time.strftime('%H:%M:%S')}] dv_ui: display={g} locked={locked} "
+          f"host={(_HOST or {}).get('key') if _HOST else 'main'} "
+          f"host_view={hv}", flush=True)
     if locked:
         _diag("session-locked")
         raise RuntimeError("the session is LOCKED — screencapture only sees the lock screen, "
                            "so no template can match. Disable the screen lock for lid-closed runs.")
+    _warn_before_takeover(abort)
     import resolve
     r = resolve.connect()
     if not goto_dolby_vision(r):

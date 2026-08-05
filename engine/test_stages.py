@@ -352,7 +352,9 @@ class FastPathDispatch(unittest.TestCase):
         self.assertNotIn(p.segdir, cmd)
         # Modes are named for the OUTPUT now: an HDR intake still masters to 2000-nit DV.
         self.assertEqual(cmd[cmd.index("single") + 3], "dv2000")
-        self.assertEqual(cmd[-1], str(stages.EXPORT_BITRATE_FLOOR_KBPS))   # render video discarded
+        # argv: [py, resolve_pipeline.py, phase, in, out, mode, bitrate, host]
+        self.assertEqual(cmd[6], str(stages.EXPORT_BITRATE_FLOOR_KBPS))   # render video discarded
+        self.assertEqual(cmd[7], "-", "unpinned must pass '-' = drive the main display")
 
     def test_resolve_only_uses_source_bitrate_floor_max(self):
         import plan
@@ -369,7 +371,8 @@ class FastPathDispatch(unittest.TestCase):
         cmd = seen["cmd"]
         self.assertIn("single", cmd)
         self.assertEqual(cmd[cmd.index("single") + 3], "dv1000")   # SDR intake -> 1000-nit DV
-        self.assertEqual(cmd[-1], "90000")                # conversion IS the ship — match intake
+        self.assertEqual(cmd[6], "90000")                 # conversion IS the ship — match intake
+        self.assertEqual(cmd[7], "-", "unpinned must pass '-' = drive the main display")
 
     def test_remux_dispatches_to_inject_for_rpu_only(self):
         import plan, remux
@@ -628,3 +631,55 @@ class OutputModeOverride(unittest.TestCase):
         lists = [RP.SDR_OUT_PROJECTS, RP.DV1000_PROJECTS, RP.DV2000_PROJECTS]
         firsts = [l[0] for l in lists]
         self.assertEqual(len(set(firsts)), 3)        # no two modes prefer the same project
+
+
+class HostDisplayFailSafe(unittest.TestCase):
+    """A pinned display that is unplugged, asleep or unmovable must DEFER the item —
+    never quietly fall back to the main display, which is the exact screen the user
+    pinned Resolve away from."""
+
+    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False)
+
+    def _resolve_with_output(self, out_lines, host_key="-"):
+        import plan, preflight
+        p = _paths(tempfile.mkdtemp())
+        host = None if host_key == "-" else {"key": host_key, "name": "HDMI"}
+        calls = []
+
+        def fake_popen(cmd, **kw):
+            calls.append(cmd)
+            return _FakeResolveProc(out_lines, 3)
+
+        with mock.patch.object(plan, "plan_for", return_value=dict(self.RES_PLAN)), \
+             mock.patch.object(preflight, "chosen_host", return_value=(host, "test")), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.threading, "Thread", _InlineThread), \
+             mock.patch.object(stages.time, "sleep"), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", return_value=False), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
+            ok, msg = stages.run_stage("resolve", p)
+        return ok, msg, calls
+
+    def test_an_unavailable_host_defers_rather_than_failing_the_episode(self):
+        ok, msg, _ = self._resolve_with_output(
+            ["HOST_UNAVAILABLE uuid:HDMI not attached\n"], host_key="uuid:HDMI")
+        self.assertFalse(ok)
+        self.assertIn("host-display", msg)
+        self.assertIn("not attached", msg)
+
+    def test_an_ordinary_render_failure_is_still_an_ordinary_failure(self):
+        # The deferral must not swallow real failures — those still count toward the
+        # give-up threshold.
+        ok, msg, _ = self._resolve_with_output(["render exploded at 42%\n"])
+        self.assertFalse(ok)
+        self.assertNotIn("host-display", msg)
+
+    def test_the_chosen_host_key_is_what_reaches_the_subprocess(self):
+        _ok, _msg, calls = self._resolve_with_output(["boom\n"], host_key="uuid:HDMI")
+        self.assertEqual(calls[0][7], "uuid:HDMI")
+
+    def test_unpinned_passes_the_main_display_sentinel(self):
+        _ok, _msg, calls = self._resolve_with_output(["boom\n"])
+        self.assertEqual(calls[0][7], "-")
