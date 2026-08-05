@@ -197,9 +197,9 @@ if __name__ == "__main__":
 
 
 class FastPathGate(unittest.TestCase):
-    """HIGH-BITRATE 4K FAST PATH: exactly-4K HEVC 10-bit CFR at/above the threshold skips
-    Topaz — HDR10 (PQ) keeps the original stream (rpu-only), SDR/HLG ships Resolve's
-    conversion (resolve-only). Every disqualifier falls through to today's plans."""
+    """4K FAST PATH. A 4K HDR10 (PQ/HEVC/Main10) CFR source is NEVER re-encoded — it takes
+    rpu-only at ANY bitrate and ANY 4K geometry. Everything else 4K needs the bitrate
+    threshold and ships Resolve's conversion (resolve-only). Disqualifiers fall through."""
 
     GOOD = dict(is_4k=True, is_hdr=False, is_dv=False, codec="hevc", pix_fmt="yuv420p10le",
                 width=3840, height=2160, is_cfr=True, video_kbps=15000, transfer=None)
@@ -223,15 +223,47 @@ class FastPathGate(unittest.TestCase):
         self.assertEqual(self._plan(video_kbps=12000)["topaz"], "resolve-only")   # == passes
         self.assertEqual(self._plan(video_kbps=11999)["topaz"], "clean")          # below → full path
 
+    def test_hdr10_is_EXEMPT_from_the_bitrate_threshold(self):
+        # User-dictated: a 4K HDR10 source is never re-encoded, whatever its bitrate. The
+        # threshold still governs the OTHER fast tier (above).
+        for kbps in (11999, 6000, 1):
+            pl = self._plan(transfer="smpte2084", is_hdr=True, video_kbps=kbps)
+            self.assertEqual(pl["topaz"], "rpu-only", kbps)
+
+    def test_hdr10_takes_rpu_only_at_ANY_4k_geometry(self):
+        # THE bug this class used to assert the wrong way round. The tier required
+        # width==3840 AND height==2160 exactly, so a 2.39:1 film (3840x1600) — i.e. most
+        # blockbusters — and DCI 4K both fell through to resolve-only and were re-encoded.
+        # Geometry has no bearing on whether an RPU can ride on a stream.
+        for geom in (dict(width=3840, height=1600),      # 2.39:1 scope
+                     dict(width=3840, height=1608),
+                     dict(width=4096, height=2160),      # DCI 4K
+                     dict(width=3840, height=2160)):
+            pl = self._plan(transfer="smpte2084", is_hdr=True, **geom)
+            self.assertEqual(pl["topaz"], "rpu-only", geom)
+
     def test_nothing_is_categorically_excluded(self):
-        # Eligibility is PURELY measured (4K + CFR + bitrate) — codec/bit-depth/geometry only
-        # pick the tier (user-dictated: no carve-outs; e.g. YouTube must not be discounted).
+        # Eligibility is PURELY measured — codec/bit-depth only pick the tier (user-dictated:
+        # no carve-outs; e.g. YouTube must not be discounted). These are all SDR, so they need
+        # the threshold and take resolve-only.
         for kw in (dict(codec="av1"), dict(codec="h264"), dict(pix_fmt="yuv420p"),
                    dict(width=4096), dict(height=2072, width=3840)):
             self.assertEqual(self._plan(**kw)["topaz"], "resolve-only", kw)
         # a PQ source that misses an inject prerequisite still fast-paths via resolve-only
         pl = self._plan(transfer="smpte2084", is_hdr=True, codec="av1")
         self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
+
+    def test_a_re_encode_of_HDR_always_says_why(self):
+        # These three are Dolby Vision 8.1 base-layer requirements, not caution: an RPU cannot
+        # ride on HLG, AV1 or 8-bit, so such a source must be CONVERTED to gain DV at all.
+        # That is the one legitimate HDR re-encode and it must never be silent.
+        for kw, needle in ((dict(transfer="arib-std-b67"), "not PQ"),
+                           (dict(transfer="smpte2084", codec="av1"), "not HEVC"),
+                           (dict(transfer="smpte2084", pix_fmt="yuv420p"), "not 10-bit")):
+            pl = self._plan(is_hdr=True, **kw)
+            self.assertEqual(pl["topaz"], "resolve-only", kw)
+            self.assertIn("re-encoded because", pl["reason"], kw)
+            self.assertIn(needle, pl["reason"], kw)
 
     def test_youtube_profile_qualifies_on_its_numbers(self):
         pl = self._plan(codec="vp9", pix_fmt="yuv420p", video_kbps=20000)   # typical 4K VP9
@@ -246,6 +278,19 @@ class FastPathGate(unittest.TestCase):
 
     def test_threshold_zero_disables_the_gate(self):
         self.assertEqual(self._plan(thresh=0)["topaz"], "clean")
+
+    def test_threshold_zero_does_NOT_force_hdr10_to_re_encode(self):
+        # Turning the knob off must not start re-encoding HDR10 — that setting is about the
+        # SDR/other fast tier, and "never re-encode HDR10" is not a tunable.
+        self.assertEqual(self._plan(thresh=0, transfer="smpte2084", is_hdr=True)["topaz"],
+                         "rpu-only")
+
+    def test_a_1080p_hdr_source_is_still_upscaled(self):
+        # The no-re-encode rule is about sources that do not need upscaling. Upscaling is the
+        # point of the pipeline, and it necessarily re-encodes.
+        pl = self._plan(is_4k=False, width=1920, height=1080,
+                        transfer="smpte2084", is_hdr=True)
+        self.assertEqual(pl["topaz"], "upscale")
 
     def test_settings_clamp_for_the_knob(self):
         import settings as s
@@ -340,3 +385,38 @@ class Tunables(unittest.TestCase):
     def test_max_active_cannot_exceed_the_hard_ceiling(self):
         self.assertEqual(settings.set_settings({"max_active_shows": 99})["max_active_shows"],
                          settings.MAX_ACTIVE_CEILING)
+
+
+class HdrFilenameGuess(unittest.TestCase):
+    """The pre-download suggestion. It is a GUESS — plan.probe_input's color transfer is the
+    real answer and only exists once the file is local — but it must not be wrong on the
+    common case, because it is what the user reads and may pin."""
+
+    def test_a_uhd_disc_source_reads_as_hdr_without_saying_so(self):
+        # THE reported bug. DTS-HD and TrueHD contain "HD", not "HDR", so the token search
+        # found nothing and a certainly-HDR10 film suggested 1000 nits.
+        import settings as s
+        self.assertTrue(s.looks_hdr(
+            "Doctor.Strange.in.the.Multiverse.of.Madness.2022.2160p.BluRay.REMUX.HEVC."
+            "DTS-HD.MA.TrueHD.7.1.Atmos-FGT.mkv"))
+
+    def test_an_explicit_token_still_wins(self):
+        import settings as s
+        for n in ("M.2019.2160p.UHD.BluRay.HDR10.x265.mkv", "M.2005.2160p.UHD.BluRay.DV.mkv"):
+            self.assertTrue(s.looks_hdr(n), n)
+
+    def test_an_explicit_SDR_token_overrides_the_inference(self):
+        import settings as s
+        self.assertFalse(s.looks_hdr("M.2019.2160p.BluRay.REMUX.SDR.mkv"))
+
+    def test_it_does_not_over_reach(self):
+        import settings as s
+        for n in ("Show.S01E01.1080p.BluRay.x265.mkv",      # not 4K
+                  "M.2019.1080p.BluRay.REMUX.AVC.mkv",      # 1080p remux
+                  "M.2019.2160p.WEB-DL.DDP5.1.H.265.mkv",   # 4K but not disc-sourced
+                  "Some.Movie.2019.1080p.DVDRip.x264.mkv"):
+            self.assertFalse(s.looks_hdr(n), n)
+
+    def test_DVDRip_is_still_not_dolby_vision(self):
+        import settings as s
+        self.assertFalse(s.looks_hdr("Movie.2019.1080p.DVDRip.x264.mkv"))

@@ -83,6 +83,23 @@ def probe_input(path: str) -> dict:
     return info
 
 
+def _no_rpu_reason(info) -> str | None:
+    """Why this stream cannot take a Dolby Vision RPU directly, or None if it can.
+
+    These three are format requirements of DV profile 8.1, not caution: the RPU is per-frame
+    metadata riding alongside an HEVC PQ Main10 base layer. HLG, AV1, H.264 and 8-bit simply
+    cannot carry one, so such a source has to be CONVERTED to gain Dolby Vision at all. That
+    is the one case where HDR material is legitimately re-encoded, and the plan says which
+    property failed so it is never silent."""
+    if info.get("transfer") != "smpte2084":
+        return "its transfer is %s, not PQ" % (info.get("transfer") or "unknown")
+    if info.get("codec") != "hevc":
+        return "it is %s, not HEVC" % (info.get("codec") or "unknown")
+    if info.get("pix_fmt") != "yuv420p10le":
+        return "it is %s, not 10-bit 4:2:0" % (info.get("pix_fmt") or "unknown")
+    return None
+
+
 def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
     """Map input characteristics to the path (PURE — unit-tested). Topaz preserves range;
     Resolve adds HDR only for SDR sources. Every sub-4K source upscales to 4K. Returns
@@ -109,21 +126,35 @@ def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
     # (user-dictated: no carve-outs by provenance — a 4K YouTube VP9 at threshold bitrate
     # qualifies the same as a web-DL). The stricter stream properties below only decide WHICH
     # tier, never whether the fast path applies.
+    # A 4K HDR10 source is NEVER re-encoded (user-dictated), so its tier is decided BEFORE
+    # the bitrate threshold and without any geometry requirement. Only the three properties
+    # that Dolby Vision 8.1 physically requires of a base layer are tested.
+    #
+    # The old gate also demanded width==3840 AND height==2160 EXACTLY. A 2.39:1 film is
+    # 3840x1600, so every scope-ratio blockbuster failed it — and DCI 4K (4096 wide) with it
+    # — and fell through to `resolve-only`, which re-encodes the HDR10 through the capped
+    # x265 path. That was the whole bug: the passthrough was working, almost nothing reached
+    # it. Geometry has no bearing on whether an RPU can ride on a stream.
+    if (info.get("is_4k") and info.get("is_cfr")
+            and info.get("transfer") == "smpte2084"           # PQ — DV 8.1 needs an HDR10 base
+            and info.get("codec") == "hevc"                   # ...an HEVC one
+            and info.get("pix_fmt") == "yuv420p10le"):        # ...Main10
+        return {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
+                "resolve": "add_dv", "is_hdr": True,
+                "reason": "4K HDR10 HEVC Main10 (%dx%d @ ~%d Mbps) — original stream kept "
+                          "untouched, Resolve adds the DV layer only"
+                          % (info.get("width") or 0, info.get("height") or 0, kbps // 1000)}
     if (passthrough_min_kbps and info.get("is_4k") and info.get("is_cfr")
             and kbps >= passthrough_min_kbps):
-        if (info.get("transfer") == "smpte2084"               # PQ — DV 8.1 needs an HDR10 base
-                and info.get("codec") == "hevc"               # ...an HEVC one
-                and info.get("pix_fmt") == "yuv420p10le"      # ...Main10
-                and info.get("width") == 3840 and info.get("height") == 2160):
-            return {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
-                    "resolve": "add_dv", "is_hdr": True,
-                    "reason": "4K HDR10 HEVC @ ~%d Mbps ≥ threshold — original stream kept, "
-                              "Resolve adds the DV layer only" % (kbps // 1000)}
+        # 4K, but it cannot carry an RPU on its own stream, so it must be converted. Name the
+        # reason — a re-encode of HDR material should never be silent.
+        why = _no_rpu_reason(info)
         return {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
                 "resolve": resolve, "is_hdr": is_hdr,
-                "reason": "4K %s (%s) @ ~%d Mbps ≥ threshold — no upscale needed, Resolve %s"
+                "reason": "4K %s (%s) @ ~%d Mbps ≥ threshold — no upscale needed, Resolve %s%s"
                           % (rng, info.get("codec") or "?", kbps // 1000,
-                             "adds DV" if is_hdr else "adds HDR + DV")}
+                             "adds DV" if is_hdr else "adds HDR + DV",
+                             ("; re-encoded because " + why) if (is_hdr and why) else "")}
     if info.get("is_4k"):
         return {"topaz": "clean", "scale": 1, "res": "1080p", "fit_height": None,
                 "resolve": resolve, "is_hdr": is_hdr,

@@ -687,3 +687,56 @@ class HostDisplayFailSafe(unittest.TestCase):
     def test_unpinned_passes_the_main_display_sentinel(self):
         _ok, _msg, calls = self._resolve_with_output(["boom\n"])
         self.assertEqual(calls[0][7], "-")
+
+
+class ScopeHdr10IsNeverReEncoded(unittest.TestCase):
+    """END TO END, through the REAL plan: a 2.39:1 HDR10 source must reach remux_inject.
+
+    The tier used to require width==3840 AND height==2160 exactly, so a scope film (3840x1600)
+    — i.e. most blockbusters — fell through to resolve-only and had its HDR10 video re-encoded
+    by the capped x265 path. Composing plan + stages here rather than mocking the plan is the
+    point: the bug lived in the seam between them."""
+
+    SCOPE_HDR10 = dict(is_4k=True, is_hdr=True, is_dv=False, is_cfr=True,
+                       transfer="smpte2084", codec="hevc", pix_fmt="yuv420p10le",
+                       width=3840, height=1600, video_kbps=68000)
+
+    def _real_plan(self, **over):
+        import plan
+        return plan.choose_plan({**self.SCOPE_HDR10, **over}, passthrough_min_kbps=12000)
+
+    def test_the_real_plan_says_rpu_only(self):
+        self.assertEqual(self._real_plan()["topaz"], "rpu-only")
+
+    def test_and_the_remux_stage_injects_instead_of_re_encoding(self):
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self._real_plan()), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as inj, \
+             mock.patch.object(remux, "remux",
+                               side_effect=AssertionError("HDR10 must NOT be re-encoded")):
+            ok, _msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        self.assertEqual(inj.call_args[0], (p.dv_render, p.source_cfr, p.source, p.final))
+
+    def test_a_low_bitrate_scope_hdr10_also_injects(self):
+        # The bitrate threshold must not drag HDR10 back onto the re-encode path.
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self._real_plan(video_kbps=4000)), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")), \
+             mock.patch.object(remux, "remux",
+                               side_effect=AssertionError("HDR10 must NOT be re-encoded")):
+            ok, _msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+
+    def test_topaz_is_skipped_and_never_scene_scans_it(self):
+        import plan
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self._real_plan()), \
+             mock.patch.object(stages, "_plan_fast_path_bounds",
+                               side_effect=AssertionError("rpu-only copies the stream — no segments")):
+            ok, _msg = stages.run_stage("topaz", p)
+        self.assertTrue(ok)

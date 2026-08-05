@@ -167,7 +167,7 @@ def series_info():
                       "output_mode": settings.get_show_output_mode(nm),
                       # what it will ACTUALLY master as — the app shows this, not "auto"
                       "output_mode_effective": settings.effective_output_mode(
-                          nm, _show_hdr_hint(nm)),
+                          nm, _hdr_hint(nm)),
                       "next_up": nu,
                       "next_up_armed": series.next_up_armed(nm),
                       # ≥90% done — the UI only offers "queue a follow-up" from here
@@ -361,10 +361,18 @@ def api_mode(mode):
     return out
 
 
-def _show_hdr_hint(name) -> bool:
-    """Filename evidence that a show's SOURCES are HDR — used only to display which ceiling
-    "auto" will pick. Reads the CACHED queue (no network), and takes the majority of the
-    remaining sources so one oddly-named file can't flip the whole show."""
+def _hdr_hint(name) -> bool:
+    """Filename evidence that an item's SOURCES are HDR — used only to display which ceiling
+    "auto" will pick.
+
+    Works for a TV show OR a movie. It used to be TV-only and was called for movies too,
+    where it FTP-walked /Media/TV-Shows/<movie title> — a directory that cannot exist. That
+    made it a guaranteed False (so every movie displayed 1000 nits), while still doing NAS
+    I/O and caching an empty queue under a movie key. A movie has no episode list, so its own
+    filename is the evidence; a show takes the majority of its remaining sources so one
+    oddly-named file can't flip the whole show."""
+    if name and settings.looks_hdr(name):
+        return True                        # the item's own name already says so (movie case)
     try:
         q = series.cached_queue(name) or {}
         names = [i.get("source_name") for i in (q.get("remaining_items") or [])][:40]
@@ -460,7 +468,7 @@ def show_settings_view(name) -> dict:
             "normalize_audio": settings.get_show_normalize_audio(name),
             "replace_source": settings.get_show_replace_source(name),
             "output_mode": settings.get_show_output_mode(name),
-            "output_mode_effective": settings.effective_output_mode(name, _show_hdr_hint(name))}
+            "output_mode_effective": settings.effective_output_mode(name, _hdr_hint(name))}
 
 
 def api_series():
@@ -513,7 +521,7 @@ def show_profile_info(show=None):
             "normalize_audio": settings.get_show_normalize_audio(target) if target else True,
             "replace_source": settings.get_show_replace_source(target) if target else True,
             "output_mode": settings.get_show_output_mode(target) if target else "auto",
-            "output_mode_effective": (settings.effective_output_mode(target, _show_hdr_hint(target))
+            "output_mode_effective": (settings.effective_output_mode(target, _hdr_hint(target))
                                       if target else "dv1000"),
             "catalog": settings.preset_catalog()}
 

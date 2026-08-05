@@ -460,8 +460,33 @@ _HDR_TOKENS = re.compile(
     re.IGNORECASE)
 
 
+# An explicit SDR token overrides the inference below. master_stem already treats "SDR" as
+# meaningful, so a release that bothers to say it is trusted.
+_SDR_TOKEN = re.compile(r"(?<![A-Za-z0-9])SDR(?![A-Za-z0-9])", re.IGNORECASE)
+# 4K disc-sourced releases are HDR10 in practice — a UHD Blu-ray is HDR10 by specification,
+# and a REMUX is a straight copy of one. The name that prompted this carries no HDR token at
+# all ("...2022.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT"): DTS-HD and TrueHD
+# contain "HD", not "HDR", so the token search found nothing and the row suggested 1000 nits
+# for a film that is certainly HDR10.
+_UHD_DISC = re.compile(
+    r"(?<![A-Za-z0-9])(2160p|4k|uhd)(?![A-Za-z0-9])", re.IGNORECASE)
+_DISC_SOURCE = re.compile(
+    r"(?<![A-Za-z0-9])(remux|bluray|blu-ray|bdrip|bdremux|uhdbd)(?![A-Za-z0-9])",
+    re.IGNORECASE)
+
+
 def looks_hdr(name) -> bool:
-    return bool(name) and bool(_HDR_TOKENS.search(str(name)))
+    """Best-effort HDR guess from a FILENAME. A guess is all this is — see
+    effective_output_mode; the authoritative answer is ffprobe's color transfer at stage time
+    (plan.probe_input), which only exists once the file is local."""
+    n = str(name or "")
+    if not n:
+        return False
+    if _HDR_TOKENS.search(n):
+        return True
+    if _SDR_TOKEN.search(n):
+        return False
+    return bool(_UHD_DISC.search(n) and _DISC_SOURCE.search(n))
 
 
 def effective_output_mode(key: str, hdr_source: bool = False) -> str:
