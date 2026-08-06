@@ -75,18 +75,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// orchestrator keeps `running` true and retains stale `progress` while idle-waiting on
     /// power/disk/NAS, so `running` + a bare `pct` would leave a frozen bar up between jobs).
     private func updateDockProgress(_ s: StateDTO?) {
-        let orch = s?.orchestrator
-        // A SINGLE bar. The REMUX (finisher) WINS whenever it's in flight — so during the dual system
-        // the Dock shows the remux, not topaz. When no remux is running, fall back to the run-thread
-        // stage (download/topaz/resolve) so the icon still shows progress for those. Plain icon when idle.
-        // The run-thread branch gates on progress.stage == the live stage, so a stale `pct` retained
-        // while idle-waiting on power/disk/NAS can't leave a frozen bar up between jobs.
-        var pct: Double? = nil
-        if let f = orch?.finishing?.pct {
-            pct = f                                             // remux/upload in flight → it wins
-        } else if let stage = orch?.stage, let pr = orch?.progress, pr.stage == stage, let p = pr.pct {
-            pct = Double(p)                                     // no finisher → the run-thread stage's bar
-        }
+        // ONE computation, shared with the header readout (PipelineCard.unifiedProgress) —
+        // user-dictated: the header percentage IS this bar, so they must be the same number.
+        // A LIVE finisher lane wins (display order — the earliest episode; a lane suspended
+        // for Resolve no longer freezes the bar, and a lane-2-only remux now shows instead
+        // of nothing), else the run-thread stage's live pct. Plain icon when idle.
+        let pct: Double? = PipelineCard.unifiedProgress(s)?.pct
         if let pct = pct {
             dockProgress.progress = min(1, max(0, pct / 100))
             if NSApp.dockTile.contentView !== dockProgress { NSApp.dockTile.contentView = dockProgress }

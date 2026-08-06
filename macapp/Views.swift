@@ -360,41 +360,16 @@ struct PowerPill: View {
     // why it showed up with the pipeline deactivated. Clears the worst case with a little air.
     private static let pctSlot: CGFloat = 36
 
-    /// (pipeline index, SF Symbol, percent, second percent) for the most-downstream stage
-    /// actually executing. The 4th element is non-nil only when BOTH remux lanes are live at
-    /// that same stage; the visible readout ignores it (first lane's percent alone,
-    /// user-dictated) — it survives solely for the hover tooltip's "×2" line.
-    private var leadStage: (Int, String, Int, Int?)? {
-        let o = store.state?.orchestrator
-        var best: (Int, String, Int, Int?)? = nil
-        func consider(_ stage: String?, _ pct: Int?) {
-            guard let stage, !stage.isEmpty, let pct else { return }
-            // `cleanup` has no PIPELINE card; it is past upload, so it sorts last and borrows
-            // the upload glyph.
-            let idx = PIPELINE.firstIndex { $0.key == stage } ?? (stage == "cleanup" ? PIPELINE.count : -1)
-            guard idx >= 0 else { return }
-            let sym = PIPELINE.indices.contains(idx) ? PIPELINE[idx].symbol : PIPELINE.last!.symbol
-            if let b = best, idx == b.0, b.3 == nil {
-                best = (b.0, b.1, b.2, pct)      // a tie IS the two-lane case — keep both
-            } else if best == nil || idx > best!.0 {
-                best = (idx, sym, pct, nil)
-            }
-        }
-        // The run thread — gated on stage_active, NEVER on `stage` alone: `stage` is stale by
-        // design (set at stage start, never cleared) and would name a dead lane for a full
-        // minute after a failure. nil means an older engine → fall back to progress != nil.
-        if o?.stage_active ?? (o?.progress != nil) {
-            consider(o?.progress?.stage ?? o?.stage, o?.progress?.pct)
-        }
-        // Same "actually working" rule the pipeline card uses. A lane suspended for Resolve
-        // keeps its last-known percentage, and reporting it here while the card shows Remux
-        // as inactive would have the header and the card contradicting each other.
-        // DISPLAY order, not engine order: in the two-lane tie the first pct kept is the
-        // primary, and it must be the same lane the card draws on top (earliest episode).
-        for f in PipelineCard.lanesInDisplayOrder(o) where PipelineCard.laneLive(f) {
-            consider(f.stage, f.pct.map { Int($0) })
-        }
-        return best
+    /// (pipeline index, SF Symbol, percent) — EXACTLY the Dock bar's number in percentage
+    /// form (user-dictated: the header readout IS the bar under the app icon). One shared
+    /// computation, PipelineCard.unifiedProgress, so the two can never disagree.
+    private var leadStage: (Int, String, Int)? {
+        guard let up = PipelineCard.unifiedProgress(store.state) else { return nil }
+        // `cleanup` has no PIPELINE card; it is past upload, so it borrows the upload glyph.
+        let idx = PIPELINE.firstIndex { $0.key == up.stage } ?? (up.stage == "cleanup" ? PIPELINE.count : -1)
+        guard idx >= 0 else { return nil }
+        let sym = PIPELINE.indices.contains(idx) ? PIPELINE[idx].symbol : PIPELINE.last!.symbol
+        return (idx, sym, Int(up.pct))
     }
 
     /// A battery glyph that actually reports the level, rather than a decorative one.
@@ -448,10 +423,9 @@ struct PowerPill: View {
             if let lead {
                 HStack(spacing: 3) {
                     Image(systemName: lead.1).font(.system(size: 11))
-                    // With two remux lanes up this is the FIRST lane's percentage alone
-                    // (user-dictated — the "a% / b%" pair was noise at a glance). "First" =
-                    // display order = the earliest episode, the row the card draws on top.
-                    // The second lane still shows in the card and in this readout's tooltip.
+                    // The Dock bar's number, printed. With two remux lanes up that is the
+                    // first lane in display order — the earliest episode, the row the card
+                    // draws on top; the second lane still shows in the card.
                     Text("\(lead.2)%")
                         .monospacedDigit()
                         .frame(width: Self.pctSlot, alignment: .leading)
@@ -465,10 +439,7 @@ struct PowerPill: View {
             var t = ac ? "Adapter wattage and battery level"
                        : "Running on battery — the pipeline pauses until the adapter is back"
             if let lead, PIPELINE.indices.contains(lead.0) {
-                t += lead.3 == nil
-                    ? "\n\(PIPELINE[lead.0].name) \(lead.2)% — the item closest to shipping"
-                    : "\n\(PIPELINE[lead.0].name) \u{00D7}2 — two items running at "
-                      + "\(lead.2)% and \(lead.3!)%"
+                t += "\n\(PIPELINE[lead.0].name) \(lead.2)% — the same bar the Dock icon shows"
             }
             return t
         }())
@@ -806,6 +777,24 @@ struct PipelineCard: View {
         if f.holding != nil { return false }
         // upload/cleanup report no percentage but ARE running; only remux has one to wait for.
         return f.stage != "remux" || f.pct != nil
+    }
+
+    /// THE one progress number: the Dock bar under the app icon draws it, and the header
+    /// readout prints it as a percentage — one computation, so they can never disagree
+    /// (user-dictated 2026-08-06). A LIVE finisher lane wins (display order — the earliest
+    /// episode, same row the card draws on top); otherwise the run-thread stage's live pct
+    /// (gated on stage_active so a stale pct retained while idle-waiting can't linger).
+    /// nil = nothing actively processing → plain icon, no header number.
+    static func unifiedProgress(_ s: StateDTO?) -> (stage: String, pct: Double)? {
+        let o = s?.orchestrator
+        for f in lanesInDisplayOrder(o) where laneLive(f) {
+            if let st = f.stage, let p = f.pct { return (st, p) }
+        }
+        if o?.stage_active ?? (o?.progress != nil),
+           let pr = o?.progress, let st = pr.stage ?? o?.stage, let p = pr.pct {
+            return (st, Double(p))
+        }
+        return nil
     }
 
     /// Both finisher lanes in DISPLAY order: the earliest episode first (user-dictated —
