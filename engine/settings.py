@@ -303,7 +303,22 @@ def _valid_display_list(v):
 
 # Non-numeric settings need their own validation — LIMITS is a numeric clamp table and
 # silently passes anything it has no entry for.
-VALIDATORS = {"resolve_host_displays": _valid_display_list}
+def _valid_quiet_until(v):
+    """The 4-hour Screen Control cap, enforced at the PERSISTENCE layer. The app's own
+    path (/api/quiet-mode) already clamps via clamp_quiet_seconds, but a raw client
+    writing quiet_until through /api/settings — or a hand-edited settings.json — could
+    park the pipeline for days, which is exactly the stall MAX_QUIET_SECONDS exists to
+    prevent. 0/junk = not paused; a future epoch is capped at now + MAX_QUIET_SECONDS."""
+    import time as _t
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return 0 if n <= 0 else min(n, int(_t.time()) + MAX_QUIET_SECONDS)
+
+
+VALIDATORS = {"resolve_host_displays": _valid_display_list,
+              "quiet_until": _valid_quiet_until}
 
 
 def set_settings(updates: dict) -> dict:

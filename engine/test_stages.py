@@ -341,9 +341,13 @@ class FastPathDispatch(unittest.TestCase):
         def boom(cmd, **kw):
             seen["cmd"] = cmd
             raise RuntimeError("stop here")
-        import preflight
+        import preflight, settings
+        # Deterministic pinning-off: on the maintainer's machine the LIVE settings pin a
+        # display, which would trip the pre-spawn host guard before Popen is reached.
         with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
              mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             ok, msg = stages.run_stage("resolve", p)
@@ -365,8 +369,10 @@ class FastPathDispatch(unittest.TestCase):
         def boom(cmd, **kw):
             seen["cmd"] = cmd
             raise RuntimeError("stop here")
-        import preflight
+        import preflight, settings
         with mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
              mock.patch.object(stages, "_source_video_kbps", return_value=90000), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
@@ -482,7 +488,10 @@ class MezzanineFallback(unittest.TestCase):
             with open(mezz, "w") as fh:
                 fh.write("m")
             return True, mezz
+        import settings
         with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
@@ -545,7 +554,10 @@ class MezzanineFallback(unittest.TestCase):
         def fake_popen(cmd, **kw):
             calls.append(cmd)
             return _FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1)
+        import settings
         with mock.patch.object(plan, "plan_for", return_value=normal), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
@@ -587,6 +599,8 @@ class OutputModeOverride(unittest.TestCase):
             return _FakeResolveProc(["render exploded\n"], 1)   # fail fast; argv is the point
         p = _paths(tempfile.mkdtemp())
         with mock.patch.object(settings, "get_show_output_mode", return_value=override), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(plan, "plan_for", return_value=pl), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
@@ -654,8 +668,11 @@ class HostDisplayFailSafe(unittest.TestCase):
             calls.append(cmd)
             return _FakeResolveProc(out_lines, 3)
 
+        import settings
         with mock.patch.object(plan, "plan_for", return_value=dict(self.RES_PLAN)), \
              mock.patch.object(preflight, "chosen_host", return_value=(host, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
@@ -794,3 +811,53 @@ class DownloadRefusesDolbyVision(unittest.TestCase):
         self.assertFalse(ok)
         fail.assert_not_called()
         ev.assert_called()
+
+
+class ResolveHostPreSpawnGuard(unittest.TestCase):
+    """A PINNED display that is already gone must defer the stage BEFORE the subprocess
+    spawns — never silently drive the main display (the documented fail-safe). The guard
+    is also the consumer of resolve_host_fallback_main: True = proceed on main instead."""
+
+    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False)
+
+    def _run(self, *, pinning, fallback, why="not attached", priority=("uuid:X",)):
+        import plan, preflight, settings
+        p = _paths(tempfile.mkdtemp())
+        s = dict(settings.DEFAULT_SETTINGS,
+                 resolve_host_pinning=pinning, resolve_host_fallback_main=fallback)
+        calls = []
+        def fake_popen(cmd, **kw):
+            calls.append(cmd)
+            raise RuntimeError("stop here")     # argv is the point; fail fast after spawn
+        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, why)), \
+             mock.patch.object(settings, "get_settings", return_value=s), \
+             mock.patch.object(settings, "get_display_priority", return_value=list(priority)), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
+            ok, msg = stages.run_stage("resolve", p)
+        return ok, msg, calls
+
+    def test_unplugged_pinned_display_defers_before_spawn(self):
+        ok, msg, calls = self._run(pinning=True, fallback=False)
+        self.assertFalse(ok)
+        self.assertIn("host-display", msg)                # the retryable-hold reason string
+        self.assertIn("not attached", msg)
+        self.assertEqual(calls, [])                       # never spawned → main never driven
+
+    def test_fallback_main_true_proceeds_on_main(self):
+        _ok, _msg, calls = self._run(pinning=True, fallback=True)
+        self.assertTrue(calls)                            # spawned...
+        self.assertEqual(calls[0][7], "-")                # ...driving the main display
+
+    def test_deliberate_main_choice_is_allowed_through(self):
+        _ok, _msg, calls = self._run(pinning=True, fallback=False,
+                                     why="chosen display is the main one")
+        self.assertTrue(calls)                            # main-as-chosen is not a failure
+        self.assertEqual(calls[0][7], "-")
+
+    def test_pinning_off_never_defers(self):
+        _ok, _msg, calls = self._run(pinning=False, fallback=False)
+        self.assertTrue(calls)
+        self.assertEqual(calls[0][7], "-")

@@ -2372,3 +2372,42 @@ class PermanentRefusal(unittest.TestCase):
              mock.patch.object(orch.logbook, "event"):
             o._park_permanent(v, "T", "download", self.PERM)
         self.assertEqual(o._tv_since_yt, 0)               # spent its turn, same as _park_item
+
+
+class QuietModeLaunchRace(unittest.TestCase):
+    """A Screen Control pause POSTed between the resolve doorstep check and the stage
+    gates being set used to slip through — reclaim_screen saw the gates unset and issued
+    no abort, and Resolve took the screen for its whole pass while the UI said Paused.
+    The final re-check (after stage_active is published) closes the window."""
+
+    def test_pause_landing_after_the_doorstep_is_caught_before_launch(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        ran = []
+        run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
+        quiet = mock.Mock(side_effect=[False, True])   # doorstep passes; final re-check catches
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(orch, "stage_done",
+                                               side_effect=lambda st, _p: st in ("download", "topaz")))
+            es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
+            es.enter_context(mock.patch.object(o, "_claim_prefetched"))
+            es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+            es.enter_context(mock.patch.object(o, "_sleep"))
+            es.enter_context(mock.patch.object(o, "_quiet_mode", quiet))
+            es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
+            es.enter_context(mock.patch("stages.run_stage", side_effect=run))
+            o._process(p)
+        self.assertNotIn("resolve", ran)                       # Resolve never launched
+        self.assertIn(o._skip_key(p), o._resolve_deferred)     # held, resumes on expiry
+        self.assertFalse(o._stage_active)                      # gates rolled back
+        self.assertFalse(o.state.get("stage_active"))
+
+
+class YouTubeMetaInvalidation(unittest.TestCase):
+    def test_refresh_youtube_meta_invalidates_the_once_per_run_refresh(self):
+        # /api/settings calls this when max_youtube_minutes changes: the popular sets
+        # bake the cap in, so raising it must trigger a rebake on the next tick.
+        o = orch.Orchestrator()
+        o._yt_meta_done = True
+        o.refresh_youtube_meta()
+        self.assertFalse(o._yt_meta_done)

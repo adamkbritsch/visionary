@@ -423,6 +423,15 @@ def _resolve(p, abort, progress=None):
         host, host_why = None, "%s: %s" % (e.__class__.__name__, e)
     if host:
         print(f"resolve: hosting on {host.get('name')} ({host.get('key')})", flush=True)
+    elif (_st.get_settings().get("resolve_host_pinning") and _st.get_display_priority()
+            and host_why != "chosen display is the main one"
+            and not _st.get_settings().get("resolve_host_fallback_main")):
+        # A PINNED display that is gone/unproven must not silently become "drive the main
+        # display" — the whole point of pinning is that the main screen belongs to the
+        # user. Same "host-display:" reason as the post-spawn HOST_UNAVAILABLE path, so
+        # the orchestrator's resolve-failure ladder treats it as a retryable hold (plug
+        # the display back in, or set resolve_host_fallback_main to allow main instead).
+        return False, "host-display: %s" % (host_why or "pinned display unavailable")
     fast = pl.get("topaz") in ("rpu-only", "resolve-only")
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In

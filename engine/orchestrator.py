@@ -1524,6 +1524,11 @@ class Orchestrator:
                     self._sleep(DRAIN_POLL_SECONDS); continue    # re-check soon to resume on recovery
                 if self._caffeinate is None:                     # resumed from a power pause → re-hold
                     self._start_caffeinate()
+                    # The dimmer thread loops on `_caffeinate is not None`, so every power
+                    # pause (>=30s) kills it within one 10s tick — restart it with the
+                    # caffeinate or auto-dim AND the "Dim screen after" setting are silently
+                    # dead for the rest of the run. _ensure is idempotent (is_alive check).
+                    self._ensure("dimmer", self._dimmer)
                 if (dmsg := self._low_disk_pause()) is not None:   # not enough room to start an item
                     self._hold("disk", dmsg)
                     self._sleep(DRAIN_POLL_SECONDS); continue
@@ -1559,6 +1564,16 @@ class Orchestrator:
                         self.state["episode"] = None
                         self._hold("empty", "no series selected")
                         self._sleep(self._retry_seconds())
+                    elif self._resolve_deferred:
+                        # NOT complete — every remaining item is just held before Resolve by
+                        # Screen Control. Calling that "series complete" and sleeping the
+                        # poll interval (up to hours) meant "Resume now" — and the pause's own
+                        # expiry — sat unnoticed until the next poll. Short cadence instead:
+                        # _maybe_resume_deferred at the loop top drains within one iteration.
+                        self.state["episode"] = None
+                        self._hold("quiet", f"{len(self._resolve_deferred)} item(s) held "
+                                            "before Resolve — waiting on Screen Control")
+                        self._sleep(DRAIN_POLL_SECONDS)
                     else:                        # genuinely complete (incl. all-parked)
                         self.state["episode"] = None
                         self._hold("done", "series complete — nothing left to upscale")
@@ -1773,6 +1788,14 @@ class Orchestrator:
         if free is not None and free < floor:
             return f"paused — low disk: {free} GB free (need ~{floor} GB)"
         return None
+
+    def refresh_youtube_meta(self):
+        """A setting the baked popular sets depend on changed (max_youtube_minutes):
+        redo the full refresh on the next tick. Without this, RAISING the cap on a
+        capped popular-scope channel did nothing until the next re-arm — the per-call
+        cap check passed, but the video wasn't in the popular set baked with the old
+        cap. Costs one quota-heavy search pass, only when the setting actually changes."""
+        self._yt_meta_done = False
 
     def _refresh_youtube(self):
         """Keep the YouTube upscale queue LIVE during an unattended run: youtarr keeps downloading
@@ -2221,6 +2244,17 @@ class Orchestrator:
             self._elapsed_begin(ekey)                # RESUMES this stage's clock if it ran before
             self._stage_active = True
             self.state["stage_active"] = True      # published: `stage` alone is stale (never cleared)
+            if st == "resolve" and self._quiet_mode():
+                # FINAL doorstep re-check, now that both of reclaim_screen's gates
+                # (_stage_active + stage) are set. A pause POSTed between the check above
+                # and this line used to slip through: reclaim_screen saw the gates unset and
+                # issued no abort, nothing re-checks quiet inside the resolve runner, and
+                # Resolve took the screen for its whole pass while the UI said "Paused".
+                # A pause landing after THIS line is reclaim_screen's to abort.
+                self._stage_active = False
+                self.state["stage_active"] = False
+                self._defer_resolve(p, ep_disp)
+                return
             if st == "resolve":
                 # Resolve gets the WHOLE machine (user-dictated: it must finish ASAP —
                 # it holds the screen and can't be paced).

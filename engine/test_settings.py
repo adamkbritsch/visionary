@@ -471,3 +471,22 @@ class ProbeBeatsTheFilename(unittest.TestCase):
         plan.PROBE_CACHE = "/nonexistent/dir/probe_cache.json"
         self.assertIsNone(plan.probed_is_hdr("anything.mkv"))
         plan._remember_probe("/x/a.mkv", {"is_hdr": True, "transfer": "smpte2084"})  # no raise
+
+
+class QuietUntilValidator(unittest.TestCase):
+    """The 4-hour Screen Control cap, enforced at the PERSISTENCE layer — the app's
+    /api/quiet-mode path already clamps, but /api/settings and a hand-edited file must
+    be held to the same rule (a days-long pause fills the disk and stalls the run)."""
+
+    def test_cap_junk_and_in_range(self):
+        import time as t
+        with mock.patch.object(settings, "SETTINGS_FILE",
+                               os.path.join(tempfile.mkdtemp(), "s.json")):
+            far = int(t.time()) + 10 * 24 * 3600
+            got = settings.set_settings({"quiet_until": far})["quiet_until"]
+            self.assertLessEqual(got, int(t.time()) + settings.MAX_QUIET_SECONDS + 5)
+            self.assertGreater(got, int(t.time()))          # capped, not zeroed
+            self.assertEqual(settings.set_settings({"quiet_until": "junk"})["quiet_until"], 0)
+            self.assertEqual(settings.set_settings({"quiet_until": -5})["quiet_until"], 0)
+            ok = int(t.time()) + 600
+            self.assertEqual(settings.set_settings({"quiet_until": ok})["quiet_until"], ok)

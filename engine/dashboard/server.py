@@ -907,7 +907,15 @@ class Handler(BaseHTTPRequestHandler):
                     orchestrator.ORCH.disable()
             self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/settings":
-            self._json({"settings": settings.set_settings(body or {})})
+            new = settings.set_settings(body or {})
+            if "max_youtube_minutes" in (body or {}):
+                # The popular sets bake this cap in at refresh time — invalidate so the
+                # next _refresh_youtube tick rebuilds them with the new value (otherwise
+                # raising the cap does nothing until the next re-arm). Best-effort, like
+                # the configure_youtarr call on queue edits.
+                try: orchestrator.ORCH.refresh_youtube_meta()
+                except Exception: pass
+            self._json({"settings": new})
         elif path == "/api/displays":
             # Reorder the priority list / flip the master switch. The priority list is
             # validated in settings (VALIDATORS) rather than here, so a hand-edited
