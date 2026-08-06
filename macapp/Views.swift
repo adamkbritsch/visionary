@@ -779,16 +779,17 @@ struct PipelineCard: View {
         return f.stage != "remux" || f.pct != nil
     }
 
-    /// THE one progress number: the Dock bar under the app icon draws it, and the header
-    /// readout prints it as a percentage — one computation, so they can never disagree
-    /// (user-dictated 2026-08-06). A LIVE finisher lane wins (display order — the earliest
-    /// episode, same row the card draws on top); otherwise the run-thread stage's live pct
-    /// (gated on stage_active so a stale pct retained while idle-waiting can't linger).
-    /// nil = nothing actively processing → plain icon, no header number.
+    /// THE Dock bar's number + which pipeline step it belongs to. The header readout is
+    /// DEFINED as this bar in percentage form, with the step's icon (user-dictated
+    /// 2026-08-06) — one computation, so the two can never disagree. The rule is the Dock
+    /// bar's own, unchanged: the finisher wins whenever it has a number — INCLUDING a lane
+    /// suspended for Resolve (its frozen %, exactly what the bar under the icon shows) —
+    /// in display order (two lanes up → the earliest episode, the card's top row); else
+    /// the run-thread stage's live pct. nil = idle → plain icon, no header number.
     static func unifiedProgress(_ s: StateDTO?) -> (stage: String, pct: Double)? {
         let o = s?.orchestrator
-        for f in lanesInDisplayOrder(o) where laneLive(f) {
-            if let st = f.stage, let p = f.pct { return (st, p) }
+        for f in lanesInDisplayOrder(o) {
+            if let st = f.stage, !st.isEmpty, let p = f.pct { return (st, p) }
         }
         if o?.stage_active ?? (o?.progress != nil),
            let pr = o?.progress, let st = pr.stage ?? o?.stage, let p = pr.pct {

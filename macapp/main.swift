@@ -76,10 +76,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// power/disk/NAS, so `running` + a bare `pct` would leave a frozen bar up between jobs).
     private func updateDockProgress(_ s: StateDTO?) {
         // ONE computation, shared with the header readout (PipelineCard.unifiedProgress) —
-        // user-dictated: the header percentage IS this bar, so they must be the same number.
-        // A LIVE finisher lane wins (display order — the earliest episode; a lane suspended
-        // for Resolve no longer freezes the bar, and a lane-2-only remux now shows instead
-        // of nothing), else the run-thread stage's live pct. Plain icon when idle.
+        // user-dictated: the header icon + percentage ARE this bar, so the numbers must
+        // match. The rule is this bar's original one: the finisher wins whenever it has a
+        // number — a lane suspended for Resolve keeps its frozen % up, as it always did —
+        // in display order (a lane-2-only remux now shows instead of nothing), else the
+        // run-thread stage's live pct. Plain icon when idle.
         let pct: Double? = PipelineCard.unifiedProgress(s)?.pct
         if let pct = pct {
             dockProgress.progress = min(1, max(0, pct / 100))
