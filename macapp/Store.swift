@@ -16,6 +16,10 @@ final class AppStore: ObservableObject {
     @Published var ytConnected = false
     @Published var ytConfigured = false                        // Google OAuth client present in config?
     @Published var selftest: SelftestDTO?
+    // UI: the Resolve preview blown up to the full window width (click to toggle). Lives
+    // here, not in view @State — the card and the RootView overlay both need it, and the
+    // pipeline card is re-initialised on every 1.5 s poll.
+    @Published var resolvePreviewExpanded = false
 
     // In-flight ADD state, hoisted OUT of the mode views: the tab views are recreated on
     // every mode switch, so view-local @State silently dropped a pending add (preset

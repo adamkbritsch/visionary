@@ -968,7 +968,23 @@ struct ResolvePreview: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
-                    .help("Live view of the screen Resolve is running on")
+                    // Click-to-expand affordance: quiet corner glyph, always there — a
+                    // hover-only hint is invisible on a machine nobody is sitting at.
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(4)
+                            .background(Circle().fill(Color.black.opacity(0.45)))
+                            .foregroundStyle(.secondary)
+                            .padding(5)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            store.resolvePreviewExpanded = true
+                        }
+                    }
+                    .help("Live view of the screen Resolve is running on — click to expand")
             } else if !failed {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(Color.white.opacity(0.05))
@@ -987,7 +1003,11 @@ struct ResolvePreview: View {
         // survives the re-renders and keeps running.
         .task {
             while !Task.isCancelled {
-                await load()
+                // While the full-width overlay is up, ITS loop owns the polling — two
+                // pollers would double the 4K screencapture load for the same pixels.
+                if !store.resolvePreviewExpanded {
+                    await load()
+                }
                 try? await Task.sleep(nanoseconds: 700_000_000)
             }
         }
@@ -1009,6 +1029,70 @@ struct ResolvePreview: View {
             failed = false
         } catch {
             if frame == nil { failed = true }    // only give up the placeholder if never loaded
+        }
+    }
+}
+
+/// The Resolve preview blown up to the FULL window width (click the card's preview to
+/// open, click anywhere to close). Same polled source as the card — its loop pauses
+/// while this one runs, so the server still captures the 4K panel once per tick.
+/// Auto-collapses when the Resolve stage stops being the active run stage: the frames
+/// go stale the moment the pass ends, and a dead fullscreen frame reads as a hang.
+struct ExpandedResolvePreview: View {
+    @EnvironmentObject var store: AppStore
+    @State private var frame: NSImage?
+
+    private var resolveActive: Bool {
+        let o = store.state?.orchestrator
+        return (o?.stage_active ?? false) && ((o?.progress?.stage ?? o?.stage) == "resolve")
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.72)          // scrim: the app recedes, the screen is the subject
+            VStack(spacing: 10) {
+                if let img = frame {
+                    Image(nsImage: img)
+                        .resizable().aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity)          // the full window width
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
+                } else {
+                    ProgressView().controlSize(.large)
+                }
+                Text("Live view of the screen Resolve is driving — click anywhere to close")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.22)) { store.resolvePreviewExpanded = false }
+        }
+        .task {
+            while !Task.isCancelled {
+                await load()
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+        }
+        .onChange(of: resolveActive) { _, active in
+            if !active {
+                withAnimation(.easeInOut(duration: 0.22)) { store.resolvePreviewExpanded = false }
+            }
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+    }
+
+    private func load() async {
+        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        if let (data, resp) = try? await URLSession.shared.data(for: req),
+           (resp as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty,
+           let img = NSImage(data: data) {
+            frame = img
         }
     }
 }
@@ -2918,6 +3002,14 @@ struct RootView: View {
         .frame(width: 1080, height: 620)     // fixed: fold lands at the Current-series card's end
                                              // with the pipeline stage expanded (settings live below the fold)
         .background(TheatreStage(scrollY: scrollY))
+        .overlay {
+            // The Resolve preview at the FULL window width (click the card's preview to
+            // open). Mounted HERE — the one place that spans the whole window — so the
+            // card's tile can hand off to something genuinely edge to edge.
+            if store.resolvePreviewExpanded {
+                ExpandedResolvePreview()
+            }
+        }
         .tint(Color.brand)   // steel-blue accent app-wide, echoing the Visionary icon
     }
 }
