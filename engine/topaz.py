@@ -347,6 +347,30 @@ def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False):
     ]
 
 
+def build_mezzanine_segment_command(ffmpeg, src, dst, *, start_frame, n, rate,
+                                    color=None, kbps=0):
+    """ONE segment of the Resolve-compat mezzanine (frames [start_frame, start_frame+n)):
+    same encode as build_mezzanine_command, but seekable + bounded so the build is
+    RESUMABLE (user-dictated 2026-08-06 — a killed pass keeps its finished chunks).
+    Input `-ss` = dvcap's proven seek (keyframe seek + decode-to-exact-frame); the
+    caller gates each chunk on an EXACT frame count, so a seek miss fails loudly
+    instead of shipping drift. Inputs are CFR by construction (the fast path requires
+    it; YouTube passes its true-CFR file), which is what makes frame->seconds exact."""
+    import dvcap
+    ss = dvcap.seg_seek_seconds(start_frame, rate)
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.6f}"]
+    rate_flags = ["-r", rate] if rate else []
+    return [*cmd, "-i", src, "-map", "0:v:0", "-an",
+            "-frames:v", str(n),
+            "-c:v", "hevc_videotoolbox", "-b:v", f"{int(kbps)}k",
+            "-pix_fmt", "p010le", "-tag:v", "hvc1", "-allow_sw", "1",
+            *rate_flags, "-fps_mode", "cfr",
+            *color_flags(color),
+            dst]
+
+
 def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
            copy_only=False) -> CfrResult:
     """Give `source` a CONSTANT frame rate in `dst`. If the source is ALREADY CFR (the common

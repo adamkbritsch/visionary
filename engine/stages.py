@@ -387,6 +387,7 @@ def _build_mezzanine(p, abort, progress=None, src=None):
     `src` overrides the input (YouTube passes its TRUE-CFR file so the mezzanine's frame
     count matches what the render-completeness gate counts against)."""
     import topaz
+    import dvcap
     inp = src or p.source
     dst = mezzanine_path(p.source)
     # REUSE a complete mezzanine from an earlier attempt (frame-count-verified against
@@ -396,22 +397,78 @@ def _build_mezzanine(p, abort, progress=None, src=None):
     want = topaz.total_frames(inp) or 0
     if want and os.path.exists(dst) and topaz.total_frames(dst) == want:
         return True, dst
+    if not want:
+        return False, "could not count the input's frames"
+    # SEGMENTED, dvcap-style (user-dictated 2026-08-06): ~5-min chunks with atomic
+    # publish into a manifest-guarded segdir. A kill keeps every finished chunk; the
+    # retry encodes only what's missing, then a stream-copy concat assembles the
+    # mezzanine. ensure_segdir wipes the chunks whenever the INPUT changes.
+    rate = topaz._fps_fraction(inp)
+    color = topaz.source_color(inp)
     kbps = max(4 * _source_video_kbps(p.source), MEZZ_MIN_KBPS)
-    cmd = build_mezzanine_command(topaz.FFMPEG_HB, inp, dst,
-                                  rate=topaz._fps_fraction(inp),
-                                  color=topaz.source_color(inp), kbps=kbps)
-    total = topaz.total_frames(inp) or 0
-    on_prog = None
-    if progress and total:
-        def on_prog(frames):
-            progress({"stage": "resolve", "ep": p.ep, "pct": min(99, round(frames / total * 100))})
-    rc, _frames, aborted, tail = topaz._run_ffmpeg(cmd, os.environ.copy(), abort=abort,
-                                                   on_progress=on_prog, timeout=MEZZ_TIMEOUT)
-    ok = rc == 0 and not aborted and os.path.exists(dst) and os.path.getsize(dst) > 0
-    if not ok:
+    segdir = dst + ".segments"
+    try:
+        st = os.stat(inp)
+        ident = f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        ident = "missing"
+    dvcap.ensure_segdir(segdir, {"mode": "mezz", "src": ident,
+                                 "frames": want, "fps": str(rate), "kbps": int(kbps)})
+    segs = dvcap.plan_segments(want, rate, dvcap.SEG_SECONDS)
+    done = 0
+    seg_files = []
+    for i, (a, b) in enumerate(segs):
+        if abort is not None and abort.is_set():
+            return False, "aborted"
+        n = b - a
+        sf = os.path.join(segdir, f"seg_{i:04d}.mp4")
+        seg_files.append(sf)
+        if dvcap.count_hevc_frames(sf) == n:            # already encoded (resume) → skip
+            done += n
+            if progress:
+                progress({"stage": "resolve", "ep": p.ep, "pct": min(99, round(done / want * 100))})
+            continue
+        part = sf + ".part"
+        for f in (sf, part):                            # partial/stale → redo clean
+            try: os.remove(f)
+            except OSError: pass
+        cmd = topaz.build_mezzanine_segment_command(topaz.FFMPEG_HB, inp, part,
+                                                    start_frame=a, n=n, rate=rate,
+                                                    color=color, kbps=kbps)
+        on_prog = None
+        if progress:
+            base = done
+            def on_prog(frames, _b=base):
+                progress({"stage": "resolve", "ep": p.ep,
+                          "pct": min(99, round((_b + frames) / want * 100))})
+        rc, _frames, aborted, tail = topaz._run_ffmpeg(cmd, os.environ.copy(), abort=abort,
+                                                       on_progress=on_prog, timeout=MEZZ_TIMEOUT)
+        if aborted or rc != 0:
+            try: os.remove(part)
+            except OSError: pass
+            return False, ("aborted" if aborted else (tail or "")[-180:])
+        got = dvcap.count_hevc_frames(part)
+        if got != n:                                    # seek/decode drift → NEVER publish it
+            try: os.remove(part)
+            except OSError: pass
+            return False, f"mezz segment {i + 1}/{len(segs)} frame mismatch: {got} != {n}"
+        os.replace(part, sf)                            # atomic publish, like dvcap's encode
+        done += n
+    # Stream-copy concat of the finished chunks -> the ingest MP4. Identical encodes
+    # (same builder, same params) concat cleanly; the count gate below is the proof.
+    lst = os.path.join(segdir, "concat.txt")
+    with open(lst, "w") as f:
+        for sf in seg_files:
+            f.write("file '%s'\n" % sf.replace("'", "'\\''"))
+    cc = subprocess.run([topaz.FFMPEG_HB, "-hide_banner", "-nostdin", "-y",
+                         "-f", "concat", "-safe", "0", "-i", lst,
+                         "-c", "copy", "-tag:v", "hvc1", "-movflags", "+faststart", dst],
+                        capture_output=True, text=True, timeout=MEZZ_TIMEOUT)
+    if cc.returncode != 0 or topaz.total_frames(dst) != want:
         try: os.remove(dst)
         except OSError: pass
-        return False, ("aborted" if aborted else (tail or "")[-180:])
+        return False, "mezz concat failed: " + (cc.stderr or "")[-180:]
+    shutil.rmtree(segdir, ignore_errors=True)           # SUCCESS: chunks won't be needed again
     return True, dst
 
 
@@ -719,6 +776,10 @@ def _cleanup(p, abort, progress=None):
             os.remove(p.final + ".inject.hevc")
         if os.path.exists(mezzanine_path(p.source)):    # fast-path Resolve-compat mezzanine
             os.remove(mezzanine_path(p.source))
+        if os.path.isdir(mezzanine_path(p.source) + ".segments"):   # its resumable chunk dir
+            shutil.rmtree(mezzanine_path(p.source) + ".segments", ignore_errors=True)
+        if os.path.exists(p.final + ".ship.hevc"):      # ship-render temp: the render's ES
+            os.remove(p.final + ".ship.hevc")
         # A hard kill during the mux can strand remux.mp4box_safe_input's hardlink — and a
         # leftover link keeps the multi-GB transient it points at ALIVE (second reference
         # to the same inode), so sweep any that share this item's directory.

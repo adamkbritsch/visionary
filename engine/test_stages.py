@@ -1128,3 +1128,76 @@ class MezzanineReuse(unittest.TestCase):
             ok, _ = stages._build_mezzanine(p, None)
         rf.assert_called_once()                               # rebuild attempted, no silent reuse
         self.assertFalse(ok)
+
+
+class SegmentedMezzanine(unittest.TestCase):
+    """The mezzanine builds in dvcap-style ~5-min chunks with atomic publish (user-
+    dictated: it must save its progress). A kill keeps finished chunks; the retry
+    encodes only what's missing, then a stream-copy concat assembles the file."""
+
+    def _run(self, p, *, existing_ok=(), runner=None, concat_rc=0, total_ok=True):
+        import topaz, dvcap, types
+        inp = p.source
+        with open(inp, "w") as fh:
+            fh.write("src")
+        segs = [(0, 100), (100, 200)]
+        calls = {"enc": [], "concat": 0}
+        def fake_count(path, *a, **k):
+            base = os.path.basename(str(path))
+            if base in existing_ok:
+                return 100
+            if str(path).endswith(".part"):
+                return 100                              # a fresh encode lands exactly n
+            return 0
+        def fake_run_ffmpeg(cmd, env, **k):
+            calls["enc"].append(cmd)
+            out = cmd[-1]
+            with open(out, "w") as fh:
+                fh.write("seg")
+            return (0, 100, False, "")
+        def fake_subprocess_run(cmd, **k):
+            calls["concat"] += 1
+            with open(cmd[-1], "w") as fh:
+                fh.write("mezz")
+            return types.SimpleNamespace(returncode=concat_rc, stderr="")
+        want_frames = 200
+        def fake_total(path, *a, **k):
+            if path == inp:
+                return want_frames
+            return want_frames if total_ok else 5
+        with mock.patch.object(topaz, "total_frames", side_effect=fake_total), \
+             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run_ffmpeg), \
+             mock.patch.object(dvcap, "plan_segments", return_value=segs), \
+             mock.patch.object(dvcap, "count_hevc_frames", side_effect=fake_count), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+             mock.patch.object(stages.subprocess, "run", side_effect=fake_subprocess_run):
+            ok, out = stages._build_mezzanine(p, None)
+        return ok, out, calls
+
+    def test_fresh_build_encodes_every_chunk_then_concats(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, out, calls = self._run(p)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls["enc"]), 2)
+        self.assertEqual(calls["concat"], 1)
+        self.assertFalse(os.path.isdir(stages.mezzanine_path(p.source) + ".segments"))
+
+    def test_resume_skips_finished_chunks(self):
+        p = _paths(tempfile.mkdtemp())
+        # seg 0 already published from the killed attempt → only seg 1 encodes
+        segdir = stages.mezzanine_path(p.source) + ".segments"
+        os.makedirs(segdir, exist_ok=True)
+        with open(os.path.join(segdir, "seg_0000.mp4"), "w") as fh:
+            fh.write("done")
+        ok, _out, calls = self._run(p, existing_ok=("seg_0000.mp4",))
+        self.assertTrue(ok)
+        self.assertEqual(len(calls["enc"]), 1)          # ONLY the missing chunk
+        self.assertIn("seg_0001.mp4.part", calls["enc"][0][-1])
+
+    def test_short_concat_never_ships(self):
+        p = _paths(tempfile.mkdtemp())
+        ok, _out, _calls = self._run(p, total_ok=False)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(stages.mezzanine_path(p.source)))
