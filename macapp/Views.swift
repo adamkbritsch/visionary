@@ -374,11 +374,10 @@ struct PowerPill: View {
         // Same "actually working" rule the pipeline card uses. A lane suspended for Resolve
         // keeps its last-known percentage, and reporting it here while the card shows Remux
         // as inactive would have the header and the card contradicting each other.
-        if PipelineCard.laneLive(o?.finishing) {
-            consider(o?.finishing?.stage, o?.finishing?.pct.map { Int($0) })
-        }
-        if PipelineCard.laneLive(o?.finishing2) {
-            consider(o?.finishing2?.stage, o?.finishing2?.pct.map { Int($0) })
+        // DISPLAY order, not engine order: in the two-lane tie the first pct kept is the
+        // primary, and it must be the same lane the card draws on top (earliest episode).
+        for f in PipelineCard.lanesInDisplayOrder(o) where PipelineCard.laneLive(f) {
+            consider(f.stage, f.pct.map { Int($0) })
         }
         return best
     }
@@ -795,15 +794,34 @@ struct PipelineCard: View {
         return f.stage != "remux" || f.pct != nil
     }
 
+    /// Both finisher lanes in DISPLAY order: the earliest episode first (user-dictated —
+    /// with two remuxes up, the top row is always the earlier episode), engine order
+    /// (lane 1 first) for ties and for items with no SxxEyy ordinal (movies, YouTube;
+    /// ordinals outrank titles). Explicitly stable — sorted by (ordinal, lane index) —
+    /// because Swift's sort() isn't, and rows must never swap arbitrarily mid-run.
+    /// EVERY place that reads both lanes goes through this, so the card rows and the
+    /// header's dual percentage can never disagree on which lane is which.
+    static func lanesInDisplayOrder(_ o: OrchestratorDTO?) -> [FinishingDTO] {
+        let lanes = [o?.finishing, o?.finishing2].compactMap { $0 }
+        return lanes.enumerated().sorted { a, b in
+            switch (a.element.episodeOrdinal, b.element.episodeOrdinal) {
+            case let (x?, y?): return x == y ? a.offset < b.offset
+                                             : (x.season, x.episode) < (y.season, y.episode)
+            case (_?, nil):    return true
+            case (nil, _?):    return false
+            case (nil, nil):   return a.offset < b.offset
+            }
+        }.map(\.element)
+    }
+
     // The concise episode token shown in an active card's top-right.
     func episodeLabel(_ role: StageRole, stageKey: String) -> String? {
         let o = store.state?.orchestrator
         switch role {
         case .finisher:
             // Only the lanes in THIS stage. "x2" is a lie unless both are actually here.
-            let mine = [o?.finishing, o?.finishing2].compactMap { f -> FinishingDTO? in
-                guard let f, f.stage == stageKey, PipelineCard.laneLive(f) else { return nil }
-                return f
+            let mine = PipelineCard.lanesInDisplayOrder(o).filter {
+                $0.stage == stageKey && PipelineCard.laneLive($0)
             }
             if mine.count > 1 { return "\u{00D7}2" }
             return mine.first?.ep                                     // already a display string
@@ -992,10 +1010,10 @@ struct FinisherProgress: View {
     var body: some View {
         let o = store.state?.orchestrator
         // pct-gated, as it always was: a claimed-but-not-yet-encoding lane has no progress
-        // to draw, and an empty bar reads as "running at 0%".
-        let mine = [o?.finishing, o?.finishing2].compactMap { f -> FinishingDTO? in
-            guard let f, f.stage == stageKey, f.pct != nil else { return nil }
-            return f
+        // to draw, and an empty bar reads as "running at 0%". Rows come pre-ordered:
+        // earliest episode on top (user-dictated), whichever engine lane holds it.
+        let mine = PipelineCard.lanesInDisplayOrder(o).filter {
+            $0.stage == stageKey && $0.pct != nil
         }
         // With BOTH rows up, each must name its own episode. The card's top-right says "x2"
         // then, so it can no longer carry the first one's — which left it anonymous while the
@@ -1017,6 +1035,8 @@ struct FinisherProgress: View {
 ///  * Lane 2 carries NO elapsed clock. _set_finishing2_progress does not publish
 ///    elapsed_secs ("the elapsed bookkeeping stays single-slot on lane 1"), so finHMS would
 ///    be nil anyway. Showing a true-but-partial row beats inventing a number to match.
+///    Rows are ordered by EPISODE (earliest on top), so the clockless row can be either
+///    position — the clock follows the engine lane, not the display slot.
 ///  * Only the CARD pulses, never a row. Two PulseDots beat against each other — each
 ///    starts its own repeatForever on its own onAppear with no phase lock.
 private struct LaneProgress: View {
