@@ -2646,8 +2646,8 @@ struct SettingsPopover: View {
                 SettingRow(title: "Shows at once",
                            blurb: "How many shows share the rotation, one episode from each in turn.",
                            key: "max_active_shows", fallback: 3, range: 1...4)
-                SettingRow(title: "Parallel remuxes",
-                           blurb: "1 keeps the machine quieter and leaves Topaz the whole GPU.",
+                SettingRow(title: "Remux lanes",
+                           blurb: "The second lane opens only when items stack up behind the first — steady state is one remux either way. 1 switches it off and leaves Topaz the whole GPU.",
                            key: "finisher_lanes", fallback: 2, range: 1...2)
                 SettingRow(title: "Dim screen after",
                            blurb: "Idle this long → screen off. Tap the brightness key to bring it back.",
