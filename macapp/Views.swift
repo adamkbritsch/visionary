@@ -338,17 +338,16 @@ struct PowerPill: View {
     @EnvironmentObject var store: AppStore
 
     // MEASURED, not eyeballed — NSFont.systemFont(12, .medium) with monospaced digits:
-    //   "9%" 19.3   "80%" 27.1   "100%" 34.8   "41% / 3%" 56.7   "100% / 100%" 80.0
+    //   "9%" 19.3   "80%" 27.1   "100%" 34.8
     // The old 32 was sized so "9%→10%" wouldn't shift and never accounted for a THIRD digit,
     // so a full battery truncated to "10…" — and idle is exactly when it tops off, which is
-    // why it showed up with the pipeline deactivated. The dual slot had the same hole at
-    // 100% / 100%. Both now clear their worst case with a little air.
+    // why it showed up with the pipeline deactivated. Clears the worst case with a little air.
     private static let pctSlot: CGFloat = 36
-    private static let dualPctSlot: CGFloat = 84
 
     /// (pipeline index, SF Symbol, percent, second percent) for the most-downstream stage
     /// actually executing. The 4th element is non-nil only when BOTH remux lanes are live at
-    /// that same stage — their pipeline indexes tie, so one number cannot represent them.
+    /// that same stage; the visible readout ignores it (first lane's percent alone,
+    /// user-dictated) — it survives solely for the hover tooltip's "×2" line.
     private var leadStage: (Int, String, Int, Int?)? {
         let o = store.state?.orchestrator
         var best: (Int, String, Int, Int?)? = nil
@@ -433,14 +432,13 @@ struct PowerPill: View {
             if let lead {
                 HStack(spacing: 3) {
                     Image(systemName: lead.1).font(.system(size: 11))
-                    // Two lanes -> "41% / 3%", in LANE ORDER, never sorted: a sorted pair
-                    // swaps position the instant one lane overtakes the other, which makes a
-                    // glanceable readout jitter for no information gained. The slot widens
-                    // rather than the numbers moving.
-                    Text(lead.3 == nil ? "\(lead.2)%" : "\(lead.2)% / \(lead.3!)%")
+                    // With two remux lanes up this is the FIRST lane's percentage alone
+                    // (user-dictated — the "a% / b%" pair was noise at a glance). "First" =
+                    // display order = the earliest episode, the row the card draws on top.
+                    // The second lane still shows in the card and in this readout's tooltip.
+                    Text("\(lead.2)%")
                         .monospacedDigit()
-                        .frame(width: lead.3 == nil ? Self.pctSlot : Self.dualPctSlot,
-                               alignment: .leading)
+                        .frame(width: Self.pctSlot, alignment: .leading)
                 }
             }
         }
