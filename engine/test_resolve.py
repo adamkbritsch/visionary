@@ -1,5 +1,7 @@
 import json
+import os
 import unittest
+from unittest import mock
 import resolve
 from resolve import render_preset, hdr_summary, is_hdr10
 
@@ -87,3 +89,101 @@ class RefocusAfterPlacement(unittest.TestCase):
         src = inspect.getsource(resolve_pipeline._place_now)
         self.assertIn('tell application "Visionary" to activate', src)
         self.assertIn("if not host:", src)          # the unpinned early-return guards it
+
+
+class _FakeClip:
+    def __init__(self, path): self._p = path
+    def GetClipProperty(self, k): return self._p
+
+
+class _FakeTL:
+    def __init__(self, frames, items): self._f, self._i = frames, items
+    def GetEndFrame(self): return self._f       # 1-based span: end - start + 1 == frames
+    def GetStartFrame(self): return 1
+    def GetItemListInTrack(self, kind, n): return ["shot"] * self._i
+
+
+class _FakeProj:
+    def __init__(self, clips, timelines, tl):
+        self._c, self._n, self._tl = clips, timelines, tl
+        self.current = None
+    def GetMediaPool(self):
+        proj = self
+        class MP:
+            def GetRootFolder(self):
+                class RF:
+                    def GetClipList(self_rf): return proj._c
+                return RF()
+        return MP()
+    def GetTimelineCount(self): return self._n
+    def GetTimelineByIndex(self, i): return self._tl
+    def SetCurrentTimeline(self, tl): self.current = tl
+
+
+class ResumeValidation(unittest.TestCase):
+    """A killed pass must not lose finished sub-steps (scene cuts, completed analysis) —
+    but resume ONLY when every check proves the persistent project holds OUR state for
+    THIS exact input. Anything off → the fresh path."""
+
+    def setUp(self):
+        import tempfile, resolve_pipeline as rp
+        d = tempfile.mkdtemp()
+        patcher = mock.patch.object(rp, "_RESUME_FILE", os.path.join(d, "r.json"))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def _proj(self, *, clips=None, timelines=1, frames=1000, items=12):
+        clips = clips if clips is not None else [_FakeClip("/scratch/movie.mkv")]
+        return _FakeProj(clips, timelines, _FakeTL(frames, items))
+
+    MARKER = {"ident": "x", "frames": 1000, "scenes": True}
+
+    def test_valid_state_resumes(self):
+        import resolve_pipeline as rp
+        self.assertTrue(rp._validate_resume_single(self._proj(), "/scratch/movie.mkv", self.MARKER))
+
+    def test_every_mismatch_falls_back_to_fresh(self):
+        import resolve_pipeline as rp
+        good = "/scratch/movie.mkv"
+        self.assertFalse(rp._validate_resume_single(self._proj(), good, None))
+        self.assertFalse(rp._validate_resume_single(self._proj(), good,
+                                                    {**self.MARKER, "scenes": False}))
+        self.assertFalse(rp._validate_resume_single(
+            self._proj(clips=[_FakeClip("/scratch/OTHER.mkv")]), good, self.MARKER))
+        self.assertFalse(rp._validate_resume_single(
+            self._proj(clips=[_FakeClip(good), _FakeClip(good)]), good, self.MARKER))
+        self.assertFalse(rp._validate_resume_single(self._proj(timelines=0), good, self.MARKER))
+        self.assertFalse(rp._validate_resume_single(self._proj(frames=999), good, self.MARKER))
+        self.assertFalse(rp._validate_resume_single(self._proj(items=1), good, self.MARKER))
+
+    def test_episode_variant_checks_chunk_counts(self):
+        import resolve_pipeline as rp
+        marker = {"ident": "x", "frames": 1000, "scenes": True, "clips": 3}
+        clips3 = [_FakeClip(f"/s/{i}.mov") for i in range(3)]
+        self.assertTrue(rp._validate_resume_episode(
+            _FakeProj(clips3, 1, _FakeTL(1000, 9)), marker))
+        self.assertFalse(rp._validate_resume_episode(          # a chunk went missing
+            _FakeProj(clips3[:2], 1, _FakeTL(1000, 9)), marker))
+        self.assertFalse(rp._validate_resume_episode(          # items below chunk count
+            _FakeProj(clips3, 1, _FakeTL(1000, 2)), marker))
+
+    def test_book_roundtrip_reset_and_analyzed(self):
+        import resolve_pipeline as rp
+        rp._resume_put("/x/movie.mkv", "dv2000", ident="a", frames=10, scenes=True, analyzed=False)
+        m = rp._resume_get("/x/movie.mkv", "dv2000")
+        self.assertEqual((m["ident"], m["frames"], m["analyzed"]), ("a", 10, False))
+        rp._mark_analyzed("/x/movie.mkv", "dv2000")
+        self.assertTrue(rp._resume_get("/x/movie.mkv", "dv2000")["analyzed"])
+        self.assertIsNone(rp._resume_get("/x/movie.mkv", "dv1000"))     # mode-scoped
+        rp._resume_reset("/x/movie.mkv", "dv2000")
+        self.assertIsNone(rp._resume_get("/x/movie.mkv", "dv2000"))
+
+    def test_fresh_setup_resets_before_clearing(self):
+        # Source-pin: the fresh path must reset the marker BEFORE _clear_project in BOTH
+        # setups — a stale "analyzed" surviving into a cleared project would render an
+        # unanalysed master, the exact regression the blind-poll guard exists to prevent.
+        import inspect, resolve_pipeline as rp
+        for fn in (rp.setup_single, rp.setup):
+            src = inspect.getsource(fn)
+            self.assertLess(src.index("_resume_reset"), src.index("_clear_project(proj)"), fn.__name__)
+        self.assertIn("_mark_analyzed", inspect.getsource(rp.single))
+        self.assertIn("_mark_analyzed", inspect.getsource(rp.episode))

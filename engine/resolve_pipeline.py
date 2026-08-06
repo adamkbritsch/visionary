@@ -92,6 +92,151 @@ def connect(timeout=200, launch=False):
     return None
 
 
+# ---- RESOLVE RESUME BOOK: a killed pass must not lose finished sub-steps -----------------
+# (user-dictated 2026-08-06). The PERSISTENT project still holds the imported clip(s), the
+# timeline, its scene-cut splits and any completed DV analysis after a kill — only this
+# process's memory is gone. Setup therefore validates the project against a durable marker
+# and RESUMES (skip import + DetectSceneCuts, and skip Analyze All when it had completed)
+# instead of blindly clearing. Every check must prove the state is OURS for THIS exact
+# input; anything off falls back to the fresh path. Markers are written only at step
+# COMPLETIONS, so a kill mid-step can never fake a finished one.
+_RESUME_FILE = os.path.expanduser("~/.topaz-pipeline/resolve_resume.json")
+_RESUME_KEEP = 50
+
+
+def _resume_key(src, mode):
+    return os.path.basename(str(src)) + "|" + str(mode)
+
+
+def _src_ident(video):
+    try:
+        st = os.stat(video)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return "missing"
+
+
+def _segdir_ident(seg_paths):
+    try:
+        return f"{len(seg_paths)}:{sum(os.path.getsize(p) for p in seg_paths)}"
+    except OSError:
+        return "missing"
+
+
+def _resume_book() -> dict:
+    try:
+        with open(_RESUME_FILE) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resume_save(book) -> None:
+    try:
+        if len(book) > _RESUME_KEEP:
+            for k in list(book)[:len(book) - _RESUME_KEEP]:
+                book.pop(k, None)
+        os.makedirs(os.path.dirname(_RESUME_FILE), exist_ok=True)
+        tmp = _RESUME_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(book, f)
+        os.replace(tmp, _RESUME_FILE)
+    except OSError:
+        pass
+
+
+def _resume_get(src, mode):
+    return _resume_book().get(_resume_key(src, mode))
+
+
+def _resume_put(src, mode, **fields) -> None:
+    book = _resume_book()
+    book[_resume_key(src, mode)] = {**fields, "at": int(time.time())}
+    _resume_save(book)
+
+
+def _resume_reset(src, mode) -> None:
+    book = _resume_book()
+    if book.pop(_resume_key(src, mode), None) is not None:
+        _resume_save(book)
+
+
+def _mark_analyzed(src, mode) -> None:
+    book = _resume_book()
+    e = book.get(_resume_key(src, mode))
+    if e:
+        e["analyzed"] = True
+        _resume_save(book)
+
+
+def _validate_resume_single(proj, video, marker) -> bool:
+    """PURE-ish (takes any objects with the Resolve API shape — unit-tested on fakes).
+    True only when the project's state is OUR state for THIS exact file."""
+    try:
+        if not (marker and marker.get("scenes")):
+            return False
+        mp = proj.GetMediaPool()
+        clips = mp.GetRootFolder().GetClipList() or []
+        if len(clips) != 1:
+            return False
+        if str(clips[0].GetClipProperty("File Path")) != str(video):
+            return False
+        if (proj.GetTimelineCount() or 0) != 1:
+            return False
+        tl = proj.GetTimelineByIndex(1)
+        frames = tl.GetEndFrame() - tl.GetStartFrame() + 1
+        if frames != int(marker.get("frames") or -1):
+            return False
+        items = tl.GetItemListInTrack("video", 1) or []
+        if len(items) < 2:        # scene cuts leave >=2 shots; a bare clip is not our state
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _validate_resume_episode(proj, marker) -> bool:
+    """Episode variant: the media pool holds exactly the manifest's chunk count, one
+    timeline, the recorded frame total, and at least chunk-count items (cuts only add)."""
+    try:
+        if not (marker and marker.get("scenes")):
+            return False
+        want_clips = int(marker.get("clips") or 0)
+        if want_clips < 1:
+            return False
+        mp = proj.GetMediaPool()
+        clips = mp.GetRootFolder().GetClipList() or []
+        if len(clips) != want_clips:
+            return False
+        if (proj.GetTimelineCount() or 0) != 1:
+            return False
+        tl = proj.GetTimelineByIndex(1)
+        frames = tl.GetEndFrame() - tl.GetStartFrame() + 1
+        if frames != int(marker.get("frames") or -1):
+            return False
+        items = tl.GetItemListInTrack("video", 1) or []
+        if len(items) < want_clips:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _resume_setup(resolve, proj, tl_label, marker_extra="") -> None:
+    """Common resume tail: our timeline current, Color page, the same SETUP_DONE the
+    fresh path prints (the shim keys on it)."""
+    tl = proj.GetTimelineByIndex(1)
+    try:
+        proj.SetCurrentTimeline(tl)
+    except Exception:
+        pass
+    resolve.OpenPage("color")
+    print(f"[{time.strftime('%H:%M:%S')}] RESUME: project intact — {tl_label}"
+          + marker_extra, flush=True)
+    print("SETUP_DONE — Resolve on Color page, ready for DV Analyze All Shots (shim)", flush=True)
+
+
 def _clear_project(proj):
     """Empty the persistent project for a new episode WITHOUT touching its
     settings (color management, etc. are the user's — left exactly as-is)."""
@@ -167,8 +312,6 @@ def setup(segdir, mode=MODE_DV1000):
     # is also the EARLIEST it CAN move: the Project Manager window refuses to be
     # positioned at all, so there is nothing to move until a project is open.
     _place_now()
-    _clear_project(proj)
-    mp = proj.GetMediaPool()
     # Topaz now outputs SCENE-CUT CHUNKS (+ a manifest), not one giant file. Assemble them
     # on the timeline IN ORDER, back-to-back — that's the "concatenation", with no second
     # ~238 GB file. Resolve's own scene detection still runs below (chunks span multiple
@@ -180,6 +323,14 @@ def setup(segdir, mode=MODE_DV1000):
         print("MISSING/EMPTY topaz manifest in", segdir); return 1
     seg_paths = [os.path.join(segdir, s["file"]) for s in man["segments"]]
     fps = man.get("fps")
+    m = _resume_get(segdir, mode)
+    if m and m.get("ident") == _segdir_ident(seg_paths) and _validate_resume_episode(proj, m):
+        _resume_setup(resolve, proj, "chunk import + scene cuts skipped",
+                      ", analysis already complete" if m.get("analyzed") else "")
+        return 0
+    _resume_reset(segdir, mode)         # entering the fresh path: no stale step may survive
+    _clear_project(proj)
+    mp = proj.GetMediaPool()
     proj.SetSetting("timelineFrameRate", str(fps))   # match the source BEFORE the timeline exists
     clips = mp.ImportMedia(seg_paths)
     if not clips or len(clips) < len(seg_paths):
@@ -220,6 +371,12 @@ def setup(segdir, mode=MODE_DV1000):
     shots = tl.GetItemListInTrack("video", 1)
     print(f"[{time.strftime('%H:%M:%S')}] DetectSceneCuts={ok} ({(time.time()-t)/60:.1f}min) "
           f"shots={len(shots) if shots else 0}", flush=True)
+    try:                        # step COMPLETE → durable: a killed pass resumes past it
+        frames = tl.GetEndFrame() - tl.GetStartFrame() + 1
+        _resume_put(segdir, mode, ident=_segdir_ident(seg_paths), frames=int(frames),
+                    clips=len(ordered), scenes=True, analyzed=False)
+    except Exception:
+        pass
     print("SETUP_DONE — Resolve on Color page, ready for DV Analyze All Shots (shim)", flush=True)
     return 0
 
@@ -309,6 +466,12 @@ def setup_single(video, mode=MODE_DV2000, superscale=0):
     # is also the EARLIEST it CAN move: the Project Manager window refuses to be
     # positioned at all, so there is nothing to move until a project is open.
     _place_now()
+    m = _resume_get(video, mode)
+    if m and m.get("ident") == _src_ident(video) and _validate_resume_single(proj, video, m):
+        _resume_setup(resolve, proj, "import + scene cuts skipped",
+                      ", analysis already complete" if m.get("analyzed") else "")
+        return 0
+    _resume_reset(video, mode)          # entering the fresh path: no stale step may survive
     _clear_project(proj)
     mp = proj.GetMediaPool()
     clips = mp.ImportMedia([video])
@@ -352,6 +515,12 @@ def setup_single(video, mode=MODE_DV2000, superscale=0):
     shots = tl.GetItemListInTrack("video", 1)
     print(f"[{time.strftime('%H:%M:%S')}] DetectSceneCuts={ok} ({(time.time()-t)/60:.1f}min) "
           f"shots={len(shots) if shots else 0}", flush=True)
+    try:                        # step COMPLETE → durable: a killed pass resumes past it
+        frames = tl.GetEndFrame() - tl.GetStartFrame() + 1
+        _resume_put(video, mode, ident=_src_ident(video), frames=int(frames),
+                    scenes=True, analyzed=False)
+    except Exception:
+        pass
     print("SETUP_DONE — Resolve on Color page, ready for DV Analyze All Shots (shim)", flush=True)
     return 0
 
@@ -364,6 +533,13 @@ def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0):
         return rc
     if not is_dv_mode(mode):
         print("SDR output — skipping DV analyze (headless render)", flush=True)
+        return render(out, mode, bitrate)
+    m = _resume_get(video, mode)
+    if m and m.get("analyzed") and m.get("ident") == _src_ident(video):
+        # The kill happened AFTER Analyze All completed (during render): the trims are in
+        # the persistent project — only the render needs redoing. The marker can only say
+        # analyzed on the RESUME path (a fresh setup resets it first).
+        print("RESUME: DV analysis already complete — skipping Analyze All Shots", flush=True)
         return render(out, mode, bitrate)
     import dv_shim
     try:
@@ -378,6 +554,7 @@ def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0):
             return 3
         print(f"DV_UI_EXC: {e.__class__.__name__}: {e}", flush=True)
         return 2
+    _mark_analyzed(video, mode)         # step COMPLETE → a kill during render resumes past it
     return render(out, mode, bitrate)
 
 
@@ -397,6 +574,13 @@ def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
         # Screen Recording grant, and cannot be blocked by Screen Control.
         print("SDR output — skipping DV analyze (headless render)", flush=True)
         return render(out, mode, bitrate)
+    m = _resume_get(segdir, mode)
+    if m and m.get("analyzed"):
+        # Killed AFTER Analyze All completed (during render): the trims persist in the
+        # project — only the render needs redoing. Only reachable via the RESUME path
+        # (a fresh setup resets the marker first).
+        print("RESUME: DV analysis already complete — skipping Analyze All Shots", flush=True)
+        return render(out, mode, bitrate)
     import dv_shim
     try:
         if not dv_shim.run_dv_ui(expect_nit=target_nits(mode)):
@@ -410,6 +594,7 @@ def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
             return 3
         print(f"DV_UI_EXC: {e.__class__.__name__}: {e}", flush=True)
         return 2
+    _mark_analyzed(segdir, mode)        # step COMPLETE → a kill during render resumes past it
     return render(out, mode, bitrate)
 
 
