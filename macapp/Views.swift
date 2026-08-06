@@ -334,7 +334,13 @@ struct HeaderBar: View {
                      : "Activate — run whenever possible (re-arms itself after stops and relaunches)")
             .accessibilityIdentifier("activate")
         }
-        .padding(.leading, 84).padding(.trailing, 20).padding(.vertical, 13)
+        // Top tighter than bottom (6 vs 13): the traffic lights overlay this bar
+        // (.fullSizeContentView), and the symmetric padding left them floating in a
+        // visible band of dead space above the elements — pulling the content up puts
+        // it on the lights' visual line. The bottom keeps its full breathing room
+        // against the pipeline card.
+        .padding(.leading, 84).padding(.trailing, 20)
+        .padding(.top, 6).padding(.bottom, 13)
         .frame(maxWidth: .infinity)
         .background(LinearGradient(colors: [DS.bgTop, DS.bgBase],     // graphite glass bar
                                    startPoint: .top, endPoint: .bottom))
