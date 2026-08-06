@@ -632,6 +632,103 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
         _rm(src_es); _rm(inj_es); _rm(tracks); _rm(dv_mp4)
 
 
+def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
+                      cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
+                      abort=None, ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE,
+                      timeout=None) -> RemuxResult:
+    """YOUTUBE FAST REMUX (user-asked 2026-08-06: videos should move through fast). The
+    Resolve render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
+    to force video under the SHIELD peak cap, and a render encoded at the YouTube target
+    bitrate (stages caps it well under the cap) normally measures safe already. So: GATE
+    the render's measured 1-s peak; under → ship its video STREAM-COPIED (ES copy + mux +
+    audio — minutes), over → reason "render-over-cap: ..." and the caller falls back to
+    the normal capped re-encode, ladder and all. Same mux/audio/verify tail as
+    remux_inject; the render↔CFR frame alignment was already gated when the resolve stage
+    accepted the render (render_is_complete). No resume dir — a kill just redoes minutes."""
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    info = dvcap.probe_video(dv_video, ffprobe)
+    if info["frames"] <= 0:
+        return RemuxResult(False, output, reason="could not probe render frame count")
+    mbps = dvcap.video_peak_1s_mbps(dv_video, ffprobe)
+    if not dvcap.peak_ok(mbps, cap_mbps):
+        return RemuxResult(False, output,
+                           reason=f"render-over-cap: {mbps:.1f} Mbps > {cap_mbps} cap — "
+                                  f"using the capped re-encode")
+    es = output + ".ship.hevc"              # transient: the render's ES, RPU already in-band
+    tracks = dv_mp4 = None
+    try:
+        if abort is not None and abort.is_set():
+            return RemuxResult(False, output, reason="aborted")
+        ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, dv_video, es),
+                            capture_output=True, text=True, timeout=timeout)
+        if ex.returncode != 0 or not (os.path.exists(es) and os.path.getsize(es) > 0):
+            return RemuxResult(False, output, reason="render ES extract failed: " + _tail(ex.stderr))
+        audio_note = ""
+        if output.lower().endswith(".mkv"):
+            dv_mp4 = output + ".dv.mp4"
+            with mp4box_safe_input(es) as _es_in:
+                vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
+                                capture_output=True, text=True, timeout=timeout)
+            if vx.returncode != 0:
+                return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
+            mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
+                                capture_output=True, text=True, timeout=timeout)
+            if mx.returncode != 0:
+                return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
+        else:
+            # same audio machinery as the cap/inject paths (boost validated, falls back to copy)
+            gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
+            tracks = output + ".tracks.mp4"
+            subs_note = ""
+            for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
+                ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
+                                                          gain_db=attempt_gain),
+                                    capture_output=True, text=True, timeout=timeout)
+                if ex.returncode != 0:
+                    ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
+                                                              tracks, gain_db=attempt_gain,
+                                                              include_subs=False),
+                                        capture_output=True, text=True, timeout=timeout)
+                    if ex.returncode != 0:
+                        return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
+                    subs_note = " · subs dropped (unconvertible track)"
+                if attempt_gain <= 0:
+                    break
+                landed = measure_lufs(tracks, ffmpeg)
+                want = float(audio_target_lufs)
+                if landed is not None and abs(landed - want) <= 1.5:
+                    audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
+                    break
+                audio_note = " · audio unboosted (landing off target — kept original)"
+            audio_note += subs_note
+            with mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
+                mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
+                                capture_output=True, text=True, timeout=timeout)
+            if mx.returncode != 0:
+                return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+        res = _verify(output, ffprobe)
+        if not res.ok:
+            return res
+        if output.lower().endswith(".mp4"):
+            tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
+            if tag != "hvc1":                          # hev1 masters DON'T direct-play (SHIELD)
+                res.ok = False
+                res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
+                _rm(output)
+                return res
+        shipped = dvcap.video_peak_1s_mbps(output, ffprobe)   # belt: same bits, re-measured
+        if not dvcap.peak_ok(shipped, cap_mbps):
+            _rm(output)
+            return RemuxResult(False, output,
+                               reason=f"render-over-cap: shipped file measured {shipped:.1f} Mbps "
+                                      f"> {cap_mbps} — using the capped re-encode")
+        res.reason += (f" · render shipped as-is (peak {mbps:.1f} ≤ {cap_mbps} Mbps, "
+                       f"no re-encode)") + audio_note
+        return res
+    finally:
+        _rm(es); _rm(tracks); _rm(dv_mp4)
+
+
 def main(argv=None):
     import argparse, sys
     ap = argparse.ArgumentParser(description="Remux original audio+subs onto the mute DV video.")

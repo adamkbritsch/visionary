@@ -386,3 +386,30 @@ class MP4BoxSafeInput(unittest.TestCase):
                 seen["path"] = got
                 raise RuntimeError("MP4Box blew up")
         self.assertFalse(_os.path.exists(seen["path"]))
+
+
+class ShipRender(unittest.TestCase):
+    """YouTube fast remux: a render whose measured 1-s peak is under the cap ships its
+    video STREAM-COPIED; over the cap returns the distinct "render-over-cap" reason the
+    stage keys its fallback on (and only that reason falls back)."""
+
+    def test_over_cap_render_bails_with_the_fallback_reason(self):
+        import dvcap
+        with mock.patch.object(dvcap, "probe_video",
+                               return_value={"frames": 100, "fps": "24000/1001"}), \
+             mock.patch.object(dvcap, "video_peak_1s_mbps", return_value=81.2), \
+             mock.patch.object(remux.subprocess, "run",
+                               side_effect=AssertionError("must bail before any work")):
+            res = remux.remux_ship_render("/dv.mov", "/cfr.mp4", "/orig.mp4",
+                                          "/tmp/out.mp4", cap_mbps=50)
+        self.assertFalse(res.ok)
+        self.assertTrue(res.reason.startswith("render-over-cap"))
+        self.assertIn("81.2", res.reason)
+
+    def test_unprobeable_render_fails_without_the_fallback_reason(self):
+        import dvcap
+        with mock.patch.object(dvcap, "probe_video", return_value={"frames": 0, "fps": ""}):
+            res = remux.remux_ship_render("/dv.mov", "/cfr.mp4", "/orig.mp4",
+                                          "/tmp/out.mp4", cap_mbps=50)
+        self.assertFalse(res.ok)
+        self.assertFalse(res.reason.startswith("render-over-cap"))   # a real failure retries

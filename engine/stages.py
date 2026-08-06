@@ -30,6 +30,11 @@ ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOLVE_TIMEOUT = 120 * 60
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 EXPORT_BITRATE_FLOOR_KBPS = 60000   # render preset's default; the export matches the intake above this
+YOUTUBE_RENDER_KBPS = 35000         # YouTube renders target THIS instead of the floor: comfortably
+                                    # transparent for upscaled web video, and its 1-s peaks land under
+                                    # the 50 Mbps cap — which lets the remux SHIP the render as-is
+                                    # (remux_ship_render) instead of an hour-class x265 re-encode.
+                                    # SHIELD context: single-layer DV stutters above ~60 Mbps.
 
 # TOPAZ→REMUX segment BOUNDARIES: the remux re-encodes at the SAME scene-cut segment boundaries this
 # episode's topaz encode used — the two stages' segments line up (not evenly spaced). Topaz's segdir
@@ -469,6 +474,7 @@ def _resolve(p, abort, progress=None):
     # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
     # (A mezzanine retry keeps this same value — the inflated mezz bitrate is not quality.)
     bitrate = (EXPORT_BITRATE_FLOOR_KBPS if pl.get("topaz") == "rpu-only"
+               else YOUTUBE_RENDER_KBPS if yt
                else max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS))
 
     def _run(video_in):
@@ -605,6 +611,15 @@ def _remux(p, abort, progress=None, should_pause=None):
         res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
                                  audio_target_lufs=lufs, abort=abort)
         return res.ok, res.reason
+    if p.youtube:
+        # FAST YOUTUBE REMUX (user-asked): the render targets a cap-safe bitrate, so ship
+        # its video untouched when the peak gate agrees — minutes instead of an hour.
+        # "render-over-cap" (and only that) falls through to the normal capped re-encode.
+        res = remux.remux_ship_render(p.dv_render, p.source_cfr, p.source, p.final,
+                                      cap_mbps=cap, audio_target_lufs=lufs, abort=abort)
+        if res.ok or not str(res.reason).startswith("render-over-cap"):
+            return res.ok, res.reason
+        logbook.event(f"remux {p.ep}: {res.reason}")
     bounds = _read_topaz_bounds(p.source_basename) or None   # segment at this episode's topaz boundaries
 
     # Same notched segment bar as Topaz: on_plan gives the cumulative segment-end frames once,

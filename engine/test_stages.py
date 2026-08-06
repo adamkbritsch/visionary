@@ -188,7 +188,11 @@ class NormalizeAudioGate(unittest.TestCase):
         def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
             got["lufs"] = audio_target_lufs
             return types.SimpleNamespace(ok=True, reason="ok")
+        # A YouTube item tries the SHIP path first; send it to the capped path so the
+        # gate-under-test is exercised the same way for every kind.
+        ship = types.SimpleNamespace(ok=False, reason="render-over-cap: test")
         with mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(remux, "remux_ship_render", return_value=ship), \
              mock.patch.object(settings, "get_show_normalize_audio", return_value=per_item) as g, \
              mock.patch.object(settings, "get_settings",
                                return_value={"max_peak_mbps": 50, "audio_target_lufs": target}):
@@ -1002,3 +1006,89 @@ class YouTubeSkipsTopaz(unittest.TestCase):
         self.assertIn("episode", cmd)             # Topaz-fed segdir mode, unchanged
         self.assertIn(p.segdir, cmd)
         self.assertEqual(cmd[-1], "-")            # lockstep argv: ss present, none
+
+
+class YouTubeFastRemux(unittest.TestCase):
+    """The remux stage ships the render for YouTube items when the peak gate agrees;
+    ONLY "render-over-cap" falls back to the normal capped re-encode. Non-YouTube items
+    never touch the ship path."""
+
+    def _yt(self):
+        from orchestrator import youtube_paths
+        return youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T",
+                             scratch_dir=tempfile.mkdtemp())
+
+    def _run(self, p, ship_result, expect_fallback):
+        import types, plan, remux, settings
+        calls = {"ship": 0, "cap": 0}
+        def fake_ship(*a, **k):
+            calls["ship"] += 1
+            return ship_result
+        def fake_remux(*a, **k):
+            calls["cap"] += 1
+            return types.SimpleNamespace(ok=True, reason="capped ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(remux, "remux_ship_render", side_effect=fake_ship), \
+             mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, msg = stages.run_stage("remux", p, progress=lambda d: None)
+        self.assertEqual(calls["cap"], 1 if expect_fallback else 0)
+        return ok, msg, calls
+
+    def test_ship_success_never_reencodes(self):
+        import types
+        ok, msg, calls = self._run(self._yt(),
+                                   types.SimpleNamespace(ok=True, reason="shipped as-is"),
+                                   expect_fallback=False)
+        self.assertTrue(ok)
+        self.assertEqual(calls["ship"], 1)
+        self.assertIn("shipped", msg)
+
+    def test_over_cap_falls_back_to_the_capped_path(self):
+        import types
+        ok, msg, _ = self._run(self._yt(),
+                               types.SimpleNamespace(ok=False, reason="render-over-cap: 81 > 50"),
+                               expect_fallback=True)
+        self.assertTrue(ok)
+        self.assertIn("capped ok", msg)
+
+    def test_other_ship_failures_do_not_silently_fall_back(self):
+        import types
+        ok, msg, _ = self._run(self._yt(),
+                               types.SimpleNamespace(ok=False, reason="mux failed: boom"),
+                               expect_fallback=False)
+        self.assertFalse(ok)                        # a genuine failure retries the SHIP path
+
+    def test_tv_episode_never_ships(self):
+        import types, plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        def fake_remux(*a, **k):
+            return types.SimpleNamespace(ok=True, reason="capped ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(remux, "remux_ship_render",
+                               side_effect=AssertionError("TV must use the capped path")), \
+             mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _msg = stages.run_stage("remux", p, progress=lambda d: None)
+        self.assertTrue(ok)
+
+    def test_youtube_render_targets_the_ship_safe_bitrate(self):
+        import plan, preflight, settings
+        p = self._yt()
+        seen = {}
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+        with mock.patch.object(plan, "plan_for",
+                               return_value={"resolve": "run", "topaz": "upscale",
+                                             "is_hdr": False, "input": {"height": 1080}}), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+            stages.run_stage("resolve", p)
+        self.assertEqual(seen["cmd"][6], str(stages.YOUTUBE_RENDER_KBPS))   # 35000, not the 60000 floor
