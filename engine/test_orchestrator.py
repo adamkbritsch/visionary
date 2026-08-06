@@ -2478,3 +2478,147 @@ class RepairKeysReachTheLane(unittest.TestCase):
         f = o.state["finishing2"]
         self.assertIsNone(f["repair_seg"])                 # cleared, not inherited
         self.assertIsNone(f["repair_done"])
+
+
+class FastPathResolveShares(unittest.TestCase):
+    """A fast-path item's Resolve (rpu-only/resolve-only) SHARES the machine: up to
+    `resolve_share_remuxes` lanes keep encoding beside it; extra lanes and every lane
+    under a NON-fast Resolve still stand down. The item then queues for a remux lane
+    like any other (hand-off unchanged)."""
+
+    def _wait(self, o, lane, *, fast, share, active=True):
+        o._resolve_fast = fast
+        (o._resolve_active.set if active else o._resolve_active.clear)()
+        with mock.patch.object(orch.settings, "get_settings",
+                               return_value={"resolve_share_remuxes": share}), \
+             mock.patch.object(o, "_drain_backlog", return_value=0):
+            return o._remux_must_wait(lane)
+
+    def test_fast_resolve_lets_the_shared_lane_run(self):
+        o = orch.Orchestrator()
+        self.assertFalse(self._wait(o, 1, fast=True, share=1))    # lane 1 keeps encoding
+        self.assertTrue(self._wait(o, 2, fast=True, share=1))     # lane 2 yields
+        self.assertFalse(self._wait(o, 2, fast=True, share=2))    # share 2 → both run
+
+    def test_non_fast_resolve_still_takes_the_whole_machine(self):
+        o = orch.Orchestrator()
+        self.assertTrue(self._wait(o, 1, fast=False, share=2))
+        self.assertTrue(self._wait(o, 2, fast=False, share=2))
+
+    def test_share_zero_is_the_old_behavior_even_for_fast(self):
+        o = orch.Orchestrator()
+        self.assertTrue(self._wait(o, 1, fast=True, share=0))
+
+    def test_idle_resolve_gates_nothing(self):
+        o = orch.Orchestrator()
+        self.assertFalse(self._wait(o, 1, fast=False, share=1, active=False))
+
+    def test_fast_resolve_start_skips_the_sigstop(self):
+        # The _process resolve-start branch: fast plan + share>0 → no suspension; a
+        # non-fast plan still freezes the lanes.
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        seen = []
+        run = lambda st, *_a, **_k: (True, "ok")
+        for plan_topaz, expect_suspend in (("rpu-only", False), ("upscale", True)):
+            o._resolve_active.clear(); o._resolve_fast = False
+            with contextlib.ExitStack() as es:
+                es.enter_context(mock.patch.object(orch, "stage_done",
+                                                   side_effect=lambda st, _p: st in ("download", "topaz")))
+                es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
+                es.enter_context(mock.patch.object(o, "_claim_prefetched"))
+                es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+                es.enter_context(mock.patch.object(o, "_sleep"))
+                es.enter_context(mock.patch.object(o, "_quiet_mode", return_value=False))
+                es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
+                sus = es.enter_context(mock.patch.object(o, "_suspend_remuxes"))
+                es.enter_context(mock.patch.object(o, "_resume_remuxes"))
+                es.enter_context(mock.patch.object(orch.settings, "get_settings",
+                                                   return_value={"resolve_share_remuxes": 1}))
+                import plan
+                es.enter_context(mock.patch.object(plan, "plan_for",
+                                                   return_value={"topaz": plan_topaz}))
+                es.enter_context(mock.patch("stages.run_stage", side_effect=run))
+                o._process(p)
+            seen.append((plan_topaz, sus.called))
+            self.assertFalse(o._resolve_fast)              # always cleared in the finally
+        self.assertEqual(seen, [("rpu-only", False), ("upscale", True)])
+
+
+class AbandonMovie(unittest.TestCase):
+    """Cancelling a movie must work MID-PIPELINE (user-dictated 2026-08-06): abort the
+    in-flight run item or lane, drop finisher-queued entries and the durable work-list
+    entry, and leave every other item untouched. Mirror of AbandonSeries, keyed on the
+    movie's source basename."""
+
+    MOVIE = "Big Movie (2020).mkv"
+
+    def _orch(self):
+        o = orch.Orchestrator()
+        o._enabled = True
+        return o
+
+    def _movie(self):
+        return orch.movie_paths(self.MOVIE, "/Media/Movies/Big Movie (2020)", "Big Movie",
+                                scratch_dir="/tmp")
+
+    def test_aborts_the_in_flight_run_item(self):
+        o = self._orch()
+        o._current_paths = self._movie()
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_movie(self.MOVIE)
+        self.assertTrue(res["aborted_run"])
+        self.assertTrue(o._abort.is_set())
+
+    def test_leaves_an_episode_and_other_movies_alone(self):
+        o = self._orch()
+        o._current_paths = episode_paths("Keep", "S01E03", "Keep.S01E03.mkv",
+                                         scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_movie(self.MOVIE)
+        self.assertFalse(res["aborted_run"])
+        self.assertFalse(o._abort.is_set())
+
+    def test_drops_queued_finisher_entries_of_that_movie_only(self):
+        o = self._orch()
+        mine = self._movie()
+        keeper = episode_paths("Keep", "S01E01", "Keep.S01E01.mkv",
+                               scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+        for p in (mine, keeper):
+            o._finish_q.put(p); o._in_finisher.add(o._skip_key(p))
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_movie(self.MOVIE)
+        self.assertEqual(res["dropped"], 1)
+        left = []
+        while not o._finish_q.empty():
+            left.append(o._finish_q.get_nowait())
+        self.assertEqual([p.series for p in left], ["Keep"])
+        self.assertNotIn(o._skip_key(mine), o._in_finisher)
+        self.assertIn(o._skip_key(keeper), o._in_finisher)
+
+    def test_removes_the_durable_worklist_entry(self):
+        o = self._orch()
+        p = self._movie()
+        d = o._finisher_descriptor(p)
+        o._finisher_persisted[o._desc_cid(d)] = d
+        with mock.patch.object(orch.threading, "Thread"):
+            o.abandon_movie(self.MOVIE)
+        self.assertEqual(o._finisher_persisted, {})   # reconcile can't resurrect it
+
+    def test_aborts_a_lane_mid_remux_for_that_movie(self):
+        o = self._orch()
+        o.state["finishing"] = {"ep": "Big Movie", "stage": "remux", "movie": True,
+                                "source": self.MOVIE}
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_movie(self.MOVIE)
+        self.assertTrue(res["aborted_finisher"])
+        self.assertTrue(o._finish_abort.is_set())
+
+    def test_a_tv_lane_is_not_aborted(self):
+        o = self._orch()
+        o.state["finishing"] = {"ep": "S01E01", "stage": "remux", "series": "Keep",
+                                "source": "Keep.S01E01.mkv"}
+        with mock.patch.object(orch.threading, "Thread"):
+            res = o.abandon_movie(self.MOVIE)
+        self.assertFalse(res["aborted_finisher"])
+        self.assertFalse(o._finish_abort.is_set())

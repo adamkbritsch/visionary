@@ -225,11 +225,17 @@ def api_movie_queue(body):
             settings.set_show_preset(title, preset)
     elif action == "remove":
         nm = (body.get("name") or "").strip()
-        movies.remove_selected(nm)
+        movies.remove_selected(nm)           # membership FIRST, so selection can't re-pick it
+        try:
+            orchestrator.ORCH.abandon_movie(nm)   # IN-FLIGHT too (user-dictated): abort the
+        except Exception:                         # run item / lanes, drop the durable entry,
+            pass                                  # sweep scratch once the encoders die
         orchestrator.discard_workfiles(nm)   # a part-processed (turn-deferred) movie's scratch
     elif action == "clear":                  # files would otherwise be orphaned forever
         for it in movies.get_selected():
             if it.get("name"):
+                try: orchestrator.ORCH.abandon_movie(it["name"])
+                except Exception: pass
                 orchestrator.discard_workfiles(it["name"])
         movies.clear_selected()
     return {"selected": movies.selected_view()}

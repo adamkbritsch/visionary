@@ -215,6 +215,7 @@ class NoRemuxingDuringResolve(unittest.TestCase):
         import threading, time
         o = orch.Orchestrator.__new__(orch.Orchestrator)
         o._resolve_active = threading.Event()
+        o._resolve_fast = False               # the whole-machine case these tests pin
         if resolve_active:
             o._resolve_active.set()
         o._drain_backlog = lambda: backlog
@@ -256,8 +257,8 @@ class NoRemuxingDuringResolve(unittest.TestCase):
         # in-flight encode keeps running, or vice versa.
         import inspect
         src = inspect.getsource(orch.Orchestrator._finish_item)
-        self.assertIn("self._remux_must_wait()", src)          # the hold loop
-        self.assertIn("should_pause=self._remux_must_wait", src)  # the in-flight yield
+        self.assertIn("self._remux_must_wait(lane)", src)      # the hold loop
+        self.assertIn("should_pause=lambda: self._remux_must_wait(lane)", src)  # in-flight yield
         self.assertNotIn("should_pause=self._resolve_active.is_set", src)
 
 
@@ -403,6 +404,7 @@ class RemuxRunsDuringAnUpload(unittest.TestCase):
                    "finishing2": None}
         o._finish_q = mock.Mock(qsize=lambda: queued)
         o._resolve_active = threading.Event()
+        o._resolve_fast = False
         o._drain_backlog = lambda: backlog
         o._last_resolve_at = 0.0
         return o

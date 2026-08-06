@@ -733,6 +733,10 @@ class Orchestrator:
         self._finish_q = queue.Queue()         # EpisodePaths handed off after their resolve completes
         self._finish_abort = threading.Event() # aborts the finisher's CURRENT stage (disable / power pause)
         self._resolve_active = threading.Event()   # run thread's Resolve is live → remux lanes HOLD/yield
+        self._resolve_fast = False             # ...unless that Resolve is a FAST-PATH item's (rpu-only/
+                                               # resolve-only): those SHARE the machine — up to
+                                               # `resolve_share_remuxes` lanes keep encoding beside it
+                                               # (user-dictated). Written only by the run thread.
         self._last_resolve_at = 0.0                # when Resolve last ran; bounds the backlog wait
                                                # (user-dictated: Resolve gets the whole machine; a remux
                                                # pauses at its next ~5-min segment and resumes after)
@@ -1081,6 +1085,77 @@ class Orchestrator:
                              daemon=True).start()
         if result["aborted_run"] or result["aborted_finisher"] or result["dropped"]:
             logbook.event(f"abandoned {show}: run={result['aborted_run']} "
+                          f"finisher={result['aborted_finisher']} dropped={result['dropped']}")
+        return result
+
+    def abandon_movie(self, name: str) -> dict:
+        """The user cancelled a MOVIE — including one already IN the pipeline
+        (user-dictated 2026-08-06). Mirror of abandon_series, keyed on the movie's source
+        basename (its skip-key): abort the in-flight run item, drop finisher-queued
+        entries and the durable work-list entry, abort a lane mid-remux/upload, and sweep
+        the scratch once the aborted encoders have died. Queue membership
+        (movies.remove_selected) is the CALLER's job — this only stops the work. Anything
+        already uploaded is untouched."""
+        result = {"movie": name, "aborted_run": False, "aborted_finisher": False, "dropped": 0}
+        if not name:
+            return result
+        sweep = []
+
+        # --- the RUN thread's in-flight item -------------------------------------------
+        cp = self._current_paths
+        if cp is not None and cp.movie and cp.source_basename == name:
+            self._abort.set()           # kills the live download/topaz/resolve within ~0.5 s
+            sweep.append(cp.source_basename)
+            result["aborted_run"] = True
+
+        # --- the finisher: queued items + the durable work-list -------------------------
+        with self._finisher_lock:
+            keep, dropped = [], []
+            while True:
+                try:
+                    p = self._finish_q.get_nowait()
+                except queue.Empty:
+                    break
+                (dropped if (p.movie and p.source_basename == name) else keep).append(p)
+            for p in keep:
+                self._finish_q.put(p)
+            keep_keys = {self._skip_key(p) for p in keep}
+            for p in dropped:
+                k = self._skip_key(p)
+                if k not in keep_keys:
+                    for st in (self._in_finisher, self._in_finisher_movies,
+                               self._resolve_stall, self._resolve_deferred, self._parked):
+                        st.discard(k)
+                    self._fail_counts.pop(k, None)
+                sweep.append(p.source_basename)
+            result["dropped"] = len(dropped)
+            gone = [cid for cid, d in self._finisher_persisted.items()
+                    if d.get("kind") == "movie" and d.get("source_basename") == name]
+            for cid in gone:            # durable list, or _finisher_reconcile re-queues it
+                self._finisher_persisted.pop(cid, None)
+            if gone:
+                self._save_finisher_persisted_locked()
+
+        # --- a lane MID-remux/upload for this movie -------------------------------------
+        for key in ("finishing", "finishing2"):
+            lane = self.state.get(key) or {}
+            if lane.get("movie") and lane.get("source") == name:
+                self._finish_abort.set()        # the x265/upload stops within seconds
+                sweep.append(name)
+                result["aborted_finisher"] = True
+
+        if sweep:
+            # DELAYED, like abandon_series: the aborted ffmpeg/x265 needs a moment to exit,
+            # and discard_workfiles refuses whatever state['current'] still points at.
+            def _sweep_later(names):
+                time.sleep(8)
+                for n in names:
+                    try: discard_workfiles(n)
+                    except Exception: pass
+            threading.Thread(target=_sweep_later, args=(list(dict.fromkeys(sweep)),),
+                             daemon=True).start()
+        if result["aborted_run"] or result["aborted_finisher"] or result["dropped"]:
+            logbook.event(f"cancelled movie {name}: run={result['aborted_run']} "
                           f"finisher={result['aborted_finisher']} dropped={result['dropped']}")
         return result
 
@@ -2272,8 +2347,8 @@ class Orchestrator:
                 self._defer_resolve(p, ep_disp)
                 return
             if st == "resolve":
-                # Resolve gets the WHOLE machine (user-dictated: it must finish ASAP —
-                # it holds the screen and can't be paced).
+                # A NON-fast Resolve gets the WHOLE machine (user-dictated: it must finish
+                # ASAP — it holds the screen and can't be paced).
                 #
                 # `should_pause` alone was not enough and the difference is measurable: it
                 # is polled BETWEEN segments, and a segment is 5 minutes of video but ~7
@@ -2282,9 +2357,23 @@ class Orchestrator:
                 # lanes were still on the same seg_done and still burning CPU). SIGSTOP
                 # freezes them the instant Resolve starts, costs no work, and they resume
                 # exactly where they were.
+                #
+                # A FAST-PATH item's Resolve (rpu-only/resolve-only) SHARES instead
+                # (user-dictated 2026-08-06): up to `resolve_share_remuxes` lanes keep
+                # encoding beside it — its render is a DV analysis of an already-finished
+                # picture, not the pipeline's quality-critical bottleneck — and lanes
+                # above the share yield at their next segment boundary (soft, no SIGSTOP).
+                fast_resolve = False
+                try:
+                    import plan as _plan
+                    fast_resolve = _plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
+                except Exception:
+                    pass
+                self._resolve_fast = fast_resolve
                 self._resolve_active.set()
                 self._last_resolve_at = time.time()
-                self._suspend_remuxes()
+                if not (fast_resolve and self._share_remuxes() > 0):
+                    self._suspend_remuxes()
             try:
                 if st == "download":          # per-source lock: the prefetcher may already be pulling
                     ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
@@ -2294,6 +2383,7 @@ class Orchestrator:
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
+                    self._resolve_fast = False
                     self._last_resolve_at = time.time()   # the grace window starts HERE
                     self._resume_remuxes()
             self._stage_active = False
@@ -2471,9 +2561,22 @@ class Orchestrator:
                 f.pop("holding", None)
                 self.state[key] = f
 
-    def _remux_must_wait(self) -> bool:
+    def _share_remuxes(self) -> int:
+        """How many remux lanes may keep encoding beside a FAST-PATH item's Resolve pass
+        (the `resolve_share_remuxes` setting, re-read live; 0 = never share)."""
+        try:
+            return max(0, min(2, int(settings.get_settings().get("resolve_share_remuxes", 1))))
+        except Exception:
+            return 1
+
+    def _remux_must_wait(self, lane: int = 1) -> bool:
         """Should a remux lane stand down? True while Resolve is actually running, AND for
         the whole of a stall drain's conversion phase.
+
+        FAST-PATH exception (user-dictated 2026-08-06): while the active Resolve belongs to
+        an rpu-only/resolve-only item, lanes up to `resolve_share_remuxes` keep working —
+        that Resolve is a DV analysis of a finished picture, not the quality-critical
+        bottleneck the whole-machine rule exists for. Lanes above the share still yield.
 
         The second half is the user-dictated part: with several Topaz exports waiting,
         convert them ALL through Resolve first and only then let the remuxes run. Gating on
@@ -2492,7 +2595,9 @@ class Orchestrator:
         BETWEEN back-to-back conversions — which is all it was ever for — and self-releases
         the moment conversions stop happening."""
         if self._resolve_active.is_set():
-            return True
+            if not (self._resolve_fast and lane <= self._share_remuxes()):
+                return True
+            return False                    # sharing: this lane keeps working beside Resolve
         if self._drain_backlog() < 2:
             return False
         return (time.time() - self._last_resolve_at) < BACKLOG_WAIT_GRACE_SECONDS
@@ -2829,7 +2934,7 @@ class Orchestrator:
                 # in-flight x265 yields at its next ~5-min segment (should_pause) with every
                 # finished segment kept. When Resolve ends, the retry resumes in place.
                 while True:
-                    while (self._remux_must_wait() and self._enabled
+                    while (self._remux_must_wait(lane) and self._enabled
                            and not self._finish_abort.is_set()):
                         # MERGE, never replace. Replacing dropped series/source/movie/youtube, and
                         # abandon_series matches lanes on exactly those keys — so abandoning a show
@@ -2849,7 +2954,7 @@ class Orchestrator:
                                    "series": p.series, "source": p.source_basename,
                                    "movie": bool(p.movie), "youtube": bool(p.youtube)}
                     ok, msg = run_stage(st, p, abort=self._finish_abort, progress=prog,
-                                        should_pause=self._remux_must_wait)
+                                        should_pause=lambda: self._remux_must_wait(lane))
                     if not ok and str(msg).startswith("paused:"):
                         continue               # benign yield to Resolve — go back to the hold
                     break

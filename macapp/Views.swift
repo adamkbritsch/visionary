@@ -2087,6 +2087,20 @@ private struct MovieRow: View {
     let m: MovieItemDTO
     let catalog: [PresetDTO]
     let onTap: () -> Void
+    @State private var confirmCancel = false
+
+    /// Is this movie actively IN the pipeline (run thread or a finisher lane)? Then the
+    /// ✕ is a real cancel — hours of work discarded — and deserves a confirmation. A
+    /// merely-queued movie removes silently, as it always did.
+    private var inFlight: Bool {
+        let o = store.state?.orchestrator
+        if o?.current?.kind == "movie" && o?.current?.name == m.name { return true }
+        for f in [o?.finishing, o?.finishing2] {
+            if let f, f.movie == true, f.source == m.name { return true }
+        }
+        return false
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
@@ -2097,9 +2111,23 @@ private struct MovieRow: View {
                     .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Capsule().fill(Color.white.opacity(0.07)))
-                Button { if let n = m.name { Task { await store.removeMovie(n) } } } label: {
+                Button {
+                    if inFlight { confirmCancel = true }
+                    else if let n = m.name { Task { await store.removeMovie(n) } }
+                } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                 }.buttonStyle(.plain)
+                .help(inFlight ? "Cancel this movie — it is mid-pipeline" : "Remove from the queue")
+                .confirmationDialog("This movie is mid-pipeline.",
+                                    isPresented: $confirmCancel, titleVisibility: .visible) {
+                    Button("Cancel it and discard its work", role: .destructive) {
+                        if let n = m.name { Task { await store.removeMovie(n) } }
+                    }
+                    Button("Keep processing", role: .cancel) {}
+                } message: {
+                    Text("Its unfinished download, Resolve and remux work is thrown away. "
+                         + "Anything already uploaded to the NAS stays.")
+                }
             }
             .padding(.vertical, 7).padding(.horizontal, 10)
             .contentShape(Rectangle())
@@ -2685,6 +2713,10 @@ struct SettingsPopover: View {
                                            blurb: "A 4K source at or above this bitrate skips Topaz — it's already sharp enough to go straight to Dolby Vision.",
                                            key: "passthrough_min_mbps", fallback: 12,
                                            range: 5...200, unit: "Mbps")
+                        SettingRow(title: "Remuxes beside a fast-path Resolve",
+                                   blurb: "A fast-path title's Resolve pass shares the machine with this many running remuxes. A normal episode's Resolve still takes the whole machine.",
+                                   key: "resolve_share_remuxes", fallback: 1,
+                                   range: 0...2, zeroLabel: "Never")
                         SettingRow(title: "YouTube length cap",
                                    blurb: "The limit applied to channels that have their length cap switched on.",
                                    key: "max_youtube_minutes", fallback: 20,
