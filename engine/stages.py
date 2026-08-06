@@ -258,6 +258,13 @@ def _topaz(p, abort, progress=None, should_pause=None):
         # at scene cuts (rpu-only is exempt — remux_inject copies the stream, no segments).
         note = _plan_fast_path_bounds(p, progress) if pl["topaz"] == "resolve-only" else ""
         return True, pl["reason"] + " — skipping upscale" + note
+    if p.youtube:
+        # YOUTUBE SKIPS TOPAZ (user-dictated 2026-08-06): Resolve does the scaling
+        # instead — SuperScale 2x for 1080p sources (a scripting-API clip property, no
+        # screen navigation), the 4K timeline's plain scaling otherwise. Scene-cut
+        # planning still runs so the capped remux segments at real cuts.
+        note = _plan_fast_path_bounds(p, progress)
+        return True, "YouTube → Resolve scales it (SuperScale for 1080p) — skipping Topaz" + note
     # Per-resolution preset variant: the plan's bucket (from the source height) picks which
     # tuned param set to use; the source can be ANY of 480p/720p/1080p and still reach 4K.
     params = settings.show_topaz_params(p.series, pl.get("res") or "1080p")
@@ -369,16 +376,19 @@ def build_mezzanine_command(ffmpeg, src, dst, *, rate, color=None, kbps=MEZZ_MIN
             dst]
 
 
-def _build_mezzanine(p, abort, progress=None):
-    """Transcode p.source -> the mezzanine via topaz's registered/killable ffmpeg runner
-    (the repo-standard wrapper — no Topaz processing involved). (ok, path_or_tail)."""
+def _build_mezzanine(p, abort, progress=None, src=None):
+    """Transcode the source -> the mezzanine via topaz's registered/killable ffmpeg runner
+    (the repo-standard wrapper — no Topaz processing involved). (ok, path_or_tail).
+    `src` overrides the input (YouTube passes its TRUE-CFR file so the mezzanine's frame
+    count matches what the render-completeness gate counts against)."""
     import topaz
+    inp = src or p.source
     dst = mezzanine_path(p.source)
     kbps = max(4 * _source_video_kbps(p.source), MEZZ_MIN_KBPS)
-    cmd = build_mezzanine_command(topaz.FFMPEG_HB, p.source, dst,
-                                  rate=topaz._fps_fraction(p.source),
-                                  color=topaz.source_color(p.source), kbps=kbps)
-    total = topaz.total_frames(p.source) or 0
+    cmd = build_mezzanine_command(topaz.FFMPEG_HB, inp, dst,
+                                  rate=topaz._fps_fraction(inp),
+                                  color=topaz.source_color(inp), kbps=kbps)
+    total = topaz.total_frames(inp) or 0
     on_prog = None
     if progress and total:
         def on_prog(frames):
@@ -441,6 +451,19 @@ def _resolve(p, abort, progress=None):
         # the display back in, or set resolve_host_fallback_main to allow main instead).
         return False, "host-display: %s" % (host_why or "pinned display unavailable")
     fast = pl.get("topaz") in ("rpu-only", "resolve-only")
+    # YouTube runs single-mode too (no Topaz segdir), but on the TRUE-CFR file — web
+    # sources are routinely VFR, and the render-completeness gate counts frames against
+    # source_cfr. SuperScale 2x only for ~1080p sources (user-dictated).
+    yt = bool(p.youtube)
+    single = fast or yt
+    ss = "-"
+    if yt:
+        try:
+            h = int((pl.get("input") or {}).get("height") or 0)
+        except (TypeError, ValueError):
+            h = 0
+        if 900 <= h <= 1200:
+            ss = "2"
     # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In
     # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
@@ -453,11 +476,12 @@ def _resolve(p, abort, progress=None):
         output (the import-failure markers print mid-stream, not on the last line);
         reason is None on a hard kill/abort/launch failure (no retry on those)."""
         cmd = [sys.executable, os.path.join(ENGINE_DIR, "resolve_pipeline.py"),
-               ("single" if fast else "episode"),
-               (video_in if fast else p.segdir), p.dv_render, mode, str(bitrate),
+               ("single" if single else "episode"),
+               (video_in if single else p.segdir), p.dv_render, mode, str(bitrate),
                # 6th arg: the display to drive. "-" = the main display (every older
-               # behaviour). Both files deploy together, so argv lockstep is fine.
-               (host.get("key") if host else "-")]
+               # behaviour). 7th: SuperScale factor for single mode ("-" = none).
+               # Both files deploy together, so argv lockstep is fine.
+               (host.get("key") if host else "-"), ss]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
@@ -526,7 +550,7 @@ def _resolve(p, abort, progress=None):
         return ok, out, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")
 
     try:
-        ok, out, reason = _run(p.source)
+        ok, out, reason = _run(p.source_cfr if yt else p.source)
         # A PINNED display that is unplugged, asleep or unmovable must not silently become
         # "drive the main display" — that is the one outcome hosting exists to prevent. The
         # item defers instead, so a yanked cable stalls the run rather than surprising the
@@ -535,14 +559,14 @@ def _resolve(p, abort, progress=None):
             line = next((l.strip() for l in out.splitlines() if "HOST_UNAVAILABLE" in l), "")
             return False, "host-display: %s" % (line.replace("HOST_UNAVAILABLE", "").strip()
                                                 or "pinned display unavailable")
-        if ok or not fast or not any(mk in out for mk in _MEZZ_MARKERS):
+        if ok or not single or not any(mk in out for mk in _MEZZ_MARKERS):
             return ok, reason
         # Fast-path ingest failure — Resolve can't decode this source (VP9/AV1). Build the
         # compat mezzanine and retry ONCE; either way the big temp is deleted before return.
         logbook.failure(f"resolve {p.ep}: source not ingestible — building HEVC compat mezzanine")
         if progress:
             progress({"stage": "resolve", "ep": p.ep, "pct": 0})
-        mok, mezz = _build_mezzanine(p, abort, progress)
+        mok, mezz = _build_mezzanine(p, abort, progress, src=(p.source_cfr if yt else None))
         if not mok:
             return False, f"compat mezzanine failed: {mezz}"
         try:

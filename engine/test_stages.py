@@ -481,7 +481,7 @@ class MezzanineFallback(unittest.TestCase):
         def fake_popen(cmd, **kw):
             calls.append(cmd)
             return procs.pop(0)
-        def fake_mezz(pp, abort, progress=None):
+        def fake_mezz(pp, abort, progress=None, src=None):
             mezz_calls.append(pp.source)
             if not mezz_ok:
                 return False, "encode blew up"
@@ -921,3 +921,84 @@ class FastPathSkipsTheCfrReencode(unittest.TestCase):
 
     def test_upscale_still_true_cfr(self):
         self.assertFalse(self._cfr_kwargs("upscale")["copy_only"])
+
+
+class YouTubeSkipsTopaz(unittest.TestCase):
+    """YouTube items skip Topaz entirely (user-dictated 2026-08-06): Resolve scales them —
+    SuperScale 2x for ~1080p sources (a scripting-API clip property, argv 7), the 4K
+    timeline's plain scaling otherwise. Single mode ingests the TRUE-CFR file (web sources
+    are routinely VFR, and the render gate counts frames against source_cfr)."""
+
+    def _yt(self):
+        from orchestrator import youtube_paths
+        return youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T",
+                             scratch_dir=tempfile.mkdtemp())
+
+    def test_topaz_noops_and_plans_scene_cuts(self):
+        import plan
+        p = self._yt()
+        with mock.patch.object(plan, "plan_for",
+                               return_value={"topaz": "upscale", "resolve": "run"}), \
+             mock.patch.object(stages, "_plan_fast_path_bounds",
+                               return_value=" — 3 scene-cut segments planned for the remux") as b:
+            ok, msg = stages.run_stage("topaz", p)
+        self.assertTrue(ok)
+        self.assertIn("skipping Topaz", msg)
+        b.assert_called_once()                    # the capped remux still segments at cuts
+
+    def _resolve_cmd(self, height):
+        import plan, preflight, settings
+        p = self._yt()
+        seen = {}
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+        with mock.patch.object(plan, "plan_for",
+                               return_value={"resolve": "run", "topaz": "upscale",
+                                             "is_hdr": False, "input": {"height": height}}), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+            stages.run_stage("resolve", p)
+        return seen["cmd"], p
+
+    def test_1080p_youtube_gets_superscale_2x(self):
+        cmd, p = self._resolve_cmd(1080)
+        self.assertIn("single", cmd)              # no Topaz segdir — single-clip mode
+        self.assertIn(p.source_cfr, cmd)          # the TRUE-CFR file, not the raw source
+        self.assertNotIn(p.segdir, cmd)
+        self.assertEqual(cmd[-1], "2")            # SuperScale 2x
+
+    def test_720p_youtube_scales_plainly(self):
+        cmd, _p = self._resolve_cmd(720)
+        self.assertIn("single", cmd)
+        self.assertEqual(cmd[-1], "-")            # no SuperScale below ~1080p
+
+    def test_4k_youtube_no_superscale(self):
+        cmd, _p = self._resolve_cmd(2160)
+        self.assertEqual(cmd[-1], "-")
+
+    def test_tv_episode_keeps_the_topaz_path(self):
+        import plan, preflight, settings
+        p = _paths(tempfile.mkdtemp())
+        seen = {}
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+        with mock.patch.object(plan, "plan_for",
+                               return_value={"resolve": "run", "topaz": "upscale",
+                                             "is_hdr": False, "input": {"height": 1080}}), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+            stages.run_stage("resolve", p)
+        cmd = seen["cmd"]
+        self.assertIn("episode", cmd)             # Topaz-fed segdir mode, unchanged
+        self.assertIn(p.segdir, cmd)
+        self.assertEqual(cmd[-1], "-")            # lockstep argv: ss present, none

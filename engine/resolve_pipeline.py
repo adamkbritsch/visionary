@@ -306,6 +306,19 @@ def setup_single(video, mode=MODE_DV2000):
     clips = mp.ImportMedia([video])
     if not clips or len(clips) != 1:
         print(f"IMPORT FAILED: {len(clips) if clips else 0}/1 clips"); return 1
+    if superscale and int(superscale) > 1:
+        # SUPERSCALE — a Media Pool clip PROPERTY, set through the scripting API before
+        # the timeline is built: no screen navigation involved (user-asked 2026-08-06;
+        # 1080p YouTube → 2x = the clip lands native-4K on the 2160 timeline). Studio
+        # feature — present here, since the DV analysis this pipeline exists for already
+        # requires Studio. BEST-EFFORT: a failed set degrades to the timeline's plain
+        # scaling and never fails the pass; the readback line is the proof either way.
+        try:
+            setok = clips[0].SetClipProperty("Super Scale", int(superscale))
+            print(f"SUPERSCALE {superscale}x set={setok} "
+                  f"readback={clips[0].GetClipProperty('Super Scale')!r}", flush=True)
+        except Exception as e:
+            print(f"SUPERSCALE UNAVAILABLE: {e.__class__.__name__}: {e}", flush=True)
     src_fps = clips[0].GetClipProperty("FPS")   # Resolve's own notion (e.g. '23.976') — no
     if not src_fps:                             # fraction-vs-decimal format mismatch possible
         print("FPS UNREADABLE from the imported clip"); return 1
@@ -335,7 +348,7 @@ def setup_single(video, mode=MODE_DV2000):
     return 0
 
 
-def single(video, out, mode=MODE_DV2000, bitrate=60000):
+def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0):
     """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
     (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
     rc = setup_single(video, mode)
@@ -426,8 +439,11 @@ if __name__ == "__main__":
         if phase == "episode":
             sys.exit(episode(a[0], a[1], a[2] if len(a) > 2 else MODE_DV1000,
                              int(a[3]) if len(a) > 3 else 60000))
+        # 6th positional (index 5) = SuperScale factor for single mode; "-" = none.
+        _ss = a[5] if len(a) > 5 else "-"
         sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else MODE_DV2000,
-                        int(a[3]) if len(a) > 3 else 60000))
+                        int(a[3]) if len(a) > 3 else 60000,
+                        superscale=int(_ss) if _ss.isdigit() else 0))
     else:
         print("usage: resolve_pipeline.py setup <src> [mode] | render <out> [mode] [kbps] "
               "| episode <prores> <out> [mode] [kbps] | single <video> <out> [mode] [kbps]")
