@@ -184,9 +184,10 @@ NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the source (de
 
 ### Which path a source takes
 
-Every source is ffprobed first (`engine/plan.py`), and the measurements — not the filename —
-decide the route. The filename is only ever used for the *suggestion* shown in the app before
-a file has been downloaded.
+Every source is ffprobed (`engine/plan.py`), and the measurements — not the filename —
+decide the route. The probe always reads the untouched original, never the CFR intermediate,
+so a VFR source can't sneak into a fast path via its CFR copy. The filename is only ever used
+for the *suggestion* shown in the app before a file has been downloaded.
 
 ```mermaid
 flowchart TD
@@ -213,9 +214,9 @@ flowchart TD
 | 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 2000 nits | RPU injected onto the original | **no — bit-identical** |
 | 4K HDR · HLG/AV1/H.264/8-bit ≥ 12 Mbps | skipped | converts + DV, 2000 nits | capped x265 | yes — DV 8.1 needs an HEVC PQ base |
 | 4K SDR ≥ 12 Mbps | skipped | adds HDR + DV, 1000 nits | capped x265 | yes |
-| 4K, VFR or under threshold | 1× clean pass | adds HDR + DV | capped x265 | yes |
-| 1080p and below | upscale to 4K | adds HDR + DV, 1000 nits | capped x265 | yes |
-| already Dolby Vision | — | — | — | not processed at all |
+| 4K, VFR or under threshold | 1× clean pass | adds (HDR+)DV | capped x265 | yes |
+| 1080p and below | upscale to 4K | adds (HDR+)DV, 1000/2000 by intake | capped x265 | yes |
+| already Dolby Vision | — | — | — | filtered out of the queue up front; a slip-through is refused at the Topaz stage — never mastered or uploaded |
 
 The nit ceiling follows the **intake range**, not the path: an HDR intake masters to 2000, an
 SDR intake to 1000. Both are overridable per show, movie or channel.
