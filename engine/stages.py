@@ -389,6 +389,13 @@ def _build_mezzanine(p, abort, progress=None, src=None):
     import topaz
     inp = src or p.source
     dst = mezzanine_path(p.source)
+    # REUSE a complete mezzanine from an earlier attempt (frame-count-verified against
+    # the input): a lid-close/transient killed pass used to REBUILD the ~10-minute,
+    # ~50 GB encode on every retry (live-caught 2026-08-06). A partial never matches
+    # (unreadable moov / short count); cleanup still sweeps strays.
+    want = topaz.total_frames(inp) or 0
+    if want and os.path.exists(dst) and topaz.total_frames(dst) == want:
+        return True, dst
     kbps = max(4 * _source_video_kbps(p.source), MEZZ_MIN_KBPS)
     cmd = build_mezzanine_command(topaz.FFMPEG_HB, inp, dst,
                                   rate=topaz._fps_fraction(inp),
@@ -530,10 +537,13 @@ def _resolve(p, abort, progress=None):
                 elif progress and line.startswith("SCREEN_TAKEOVER_END"):
                     progress({"stage": "resolve", "ep": p.ep, "takeover_soon": False})
         threading.Thread(target=_reader, daemon=True).start()
-        deadline = time.time() + RESOLVE_TIMEOUT
+        # MONOTONIC: it pauses through a real sleep on macOS, so a laptop that slept
+        # mid-pass wakes with its budget intact instead of a falsely-expired deadline
+        # killing the subprocess ("starting over with resolve", user-caught 2026-08-06).
+        deadline = time.monotonic() + RESOLVE_TIMEOUT
         while proc.poll() is None:
             aborted = abort is not None and abort.is_set()
-            if aborted or time.time() > deadline:
+            if aborted or time.monotonic() > deadline:
                 proc.kill()
                 reason = "aborted (stop-time)" if aborted else "TIMED OUT — Resolve unresponsive"
                 logbook.failure(f"resolve {p.ep}: killed subprocess — {reason}")
@@ -575,12 +585,11 @@ def _resolve(p, abort, progress=None):
         mok, mezz = _build_mezzanine(p, abort, progress, src=(p.source_cfr if yt else None))
         if not mok:
             return False, f"compat mezzanine failed: {mezz}"
-        try:
-            ok, _out, reason = _run(mezz)
-            return ok, (reason + " (via compat mezzanine)" if ok else reason)
-        finally:
-            try: os.remove(mezz)
+        ok, _out, reason = _run(mezz)
+        if ok:                          # keep it on FAILURE — the retry reuses it instead of
+            try: os.remove(mezz)        # re-encoding 10 minutes; cleanup sweeps a stray
             except OSError: pass
+        return ok, (reason + " (via compat mezzanine)" if ok else reason)
     finally:
         _quit_resolve_focus_app()
 

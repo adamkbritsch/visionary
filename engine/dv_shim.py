@@ -395,24 +395,29 @@ def _window_position(idx):
         return None
 
 
-def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=4, delay=1.5) -> str:
+def screenshot(path="/tmp/_dvshim_shot.png", *, attempts=6, delay=2.0) -> str:
     """Capture the main display, RETRYING briefly on failure. `screencapture` returns
     "could not create image from display" while the display set is in transition — the
     lid closing/opening (clamshell switch) tears the old display down and a single-shot
     capture fails (live-caught 2026-07-17 the instant the lid shut). A few retries ride
     that out; a persistent failure still raises, so a real grant/lock problem is loud."""
-    ox, oy, _scale, w_pt, h_pt = host_view()
-    # -R takes GLOBAL POINTS and renders at the TARGET display's backing scale (verified:
-    # -R 1728,1117,1920,1080 produced a 3840x2160 PNG). Preferred over -D <n>, whose
-    # ordinal has no documented mapping to CGDirectDisplayID and is ambiguous between two
-    # identical panels. Unpinned we pass no -R at all, so the command is byte-identical
-    # to what it has always been.
-    cmd = ["screencapture", "-x"]
-    if _HOST is not None and w_pt > 0 and h_pt > 0:
-        cmd += ["-R", "%d,%d,%d,%d" % (round(ox), round(oy), round(w_pt), round(h_pt))]
-    cmd.append(path)
     last = None
     for i in range(attempts):
+        # PER ATTEMPT, not once: a lid close/open mid-pass removes/adds the built-in
+        # display and EVERY global origin shifts — the once-computed rect then pointed at
+        # nothing for all retries ("does not intersect any displays", live-caught
+        # 2026-08-06, killed a movie's whole DV pass). host_view() re-resolves from the
+        # live display list, so attempt 2+ follows the pinned display to its new origin.
+        ox, oy, _scale, w_pt, h_pt = host_view()
+        # -R takes GLOBAL POINTS and renders at the TARGET display's backing scale (verified:
+        # -R 1728,1117,1920,1080 produced a 3840x2160 PNG). Preferred over -D <n>, whose
+        # ordinal has no documented mapping to CGDirectDisplayID and is ambiguous between two
+        # identical panels. Unpinned we pass no -R at all, so the command is byte-identical
+        # to what it has always been.
+        cmd = ["screencapture", "-x"]
+        if _HOST is not None and w_pt > 0 and h_pt > 0:
+            cmd += ["-R", "%d,%d,%d,%d" % (round(ox), round(oy), round(w_pt), round(h_pt))]
+        cmd.append(path)
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
             return path
@@ -588,27 +593,55 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
     unanalysed master. Such a poll advances nothing. And if Resolve stays unfindable even
     after activating, the loop reverts to raising it every poll (exactly the old behaviour),
     so the worst case here is what the code did before, not a hang."""
-    start = time.time()
+    start = time.monotonic()          # monotonic PAUSES through a real sleep — a slept
+                                      # machine must not wake to a falsely-expired budget
     saw_modal = False
     gone = 0
     blind = 0
     force_activate = False
+    capture_dead_at = None
     while True:
         if abort is not None and abort.is_set():
             return False
-        if force_activate:
-            activate()
-        shot = screenshot()
+        # HOLDS, not failures — the analysis runs INSIDE Resolve and doesn't care what the
+        # displays or the login screen are doing; only this WATCHER is blinded. Burn no
+        # budget and count nothing while blinded (live-caught 2026-08-06: a lid close
+        # killed a movie's whole DV pass over a transient the analysis itself survived).
+        if screen_locked():
+            start += poll             # locked (lid reopened onto login): wait it out
+            time.sleep(poll)
+            continue
+        try:
+            if force_activate:
+                activate()
+            shot = screenshot()
+            capture_dead_at = None
+        except RuntimeError as e:
+            if capture_dead_at is None:
+                capture_dead_at = time.monotonic()
+                print(f"dv_ui: capture failing ({e}) — holding for the displays to settle",
+                      flush=True)
+            if time.monotonic() - capture_dead_at > 900:
+                print("dv_ui: displays never settled after 15 min — giving up", flush=True)
+                return False
+            start += poll
+            time.sleep(poll)
+            continue
         present = found(shot, _t("analyze_modal.png"))
         onscreen = present or resolve_on_screen(shot)
         if not onscreen and not force_activate:
             # The one place focus is taken: the screen is not showing Resolve, so bring it
             # back and look again. Everything else in this loop is passive.
             activate()
-            shot = screenshot()
+            try:
+                shot = screenshot()
+            except RuntimeError:
+                start += poll         # transition mid-poll — same hold as above
+                time.sleep(poll)
+                continue
             present = found(shot, _t("analyze_modal.png"))
             onscreen = present or resolve_on_screen(shot)
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
         if present:
             saw_modal, gone, blind = True, 0, 0
         elif onscreen:

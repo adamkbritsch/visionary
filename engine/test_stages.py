@@ -531,7 +531,9 @@ class MezzanineFallback(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(len(calls), 2)                        # never a third attempt
         self.assertEqual(len(mezz_calls), 1)
-        self.assertFalse(os.path.exists(stages.mezzanine_path(p.source)))
+        # KEPT on failure (changed 2026-08-06): the next attempt REUSES it instead of
+        # re-encoding ~10 minutes; cleanup sweeps a stray. Success still deletes it.
+        self.assertTrue(os.path.exists(stages.mezzanine_path(p.source)))
 
     def test_mezz_build_failure_fails_the_stage(self):
         p = _paths(tempfile.mkdtemp())
@@ -1092,3 +1094,37 @@ class YouTubeFastRemux(unittest.TestCase):
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
         self.assertEqual(seen["cmd"][6], str(stages.YOUTUBE_RENDER_KBPS))   # 35000, not the 60000 floor
+
+
+class MezzanineReuse(unittest.TestCase):
+    """A lid-close/transient that kills a Resolve pass used to cost a full ~10-minute
+    mezzanine REBUILD on every retry. A complete mezzanine (frame-count-verified against
+    its input) is now reused; a partial can never match."""
+
+    def test_complete_mezz_is_reused_without_reencoding(self):
+        p = _paths(tempfile.mkdtemp())
+        mezz = stages.mezzanine_path(p.source)
+        with open(mezz, "w") as fh:
+            fh.write("m")
+        import topaz
+        with mock.patch.object(topaz, "total_frames", return_value=1000), \
+             mock.patch.object(topaz, "_run_ffmpeg",
+                               side_effect=AssertionError("a complete mezz must be reused")):
+            ok, path = stages._build_mezzanine(p, None)
+        self.assertTrue(ok)
+        self.assertEqual(path, mezz)
+
+    def test_frame_mismatch_rebuilds(self):
+        p = _paths(tempfile.mkdtemp())
+        mezz = stages.mezzanine_path(p.source)
+        with open(mezz, "w") as fh:
+            fh.write("partial")
+        import topaz
+        counts = {p.source: 1000, mezz: 400}                  # a cut-short partial
+        with mock.patch.object(topaz, "total_frames", side_effect=lambda f: counts.get(f, 0)), \
+             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "_run_ffmpeg", return_value=(1, 0, False, "boom")) as rf:
+            ok, _ = stages._build_mezzanine(p, None)
+        rf.assert_called_once()                               # rebuild attempted, no silent reuse
+        self.assertFalse(ok)

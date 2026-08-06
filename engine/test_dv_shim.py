@@ -218,6 +218,7 @@ class WaitForAnalysisFocus(unittest.TestCase):
         with mock.patch.object(dv_shim, "screenshot", fake_screenshot), \
              mock.patch.object(dv_shim, "found", fake_found), \
              mock.patch.object(dv_shim, "activate", fake_activate), \
+             mock.patch.object(dv_shim, "screen_locked", return_value=False), \
              mock.patch.object(dv_shim.time, "sleep", lambda *_a: None):
             res = dv_shim.wait_for_analysis(poll=0, **kw)
         return res, calls["activate"], calls["shots"]
@@ -252,10 +253,11 @@ class WaitForAnalysisFocus(unittest.TestCase):
         # activate() cannot help — Resolve stays out of frame no matter what.
         with mock.patch.object(dv_shim, "screenshot", fake_screenshot), \
              mock.patch.object(dv_shim, "found", fake_found), \
+             mock.patch.object(dv_shim, "screen_locked", return_value=False), \
              mock.patch.object(dv_shim, "activate",
                                lambda: calls.__setitem__("activate", calls["activate"] + 1)), \
              mock.patch.object(dv_shim.time, "sleep", lambda *_a: None), \
-             mock.patch.object(dv_shim.time, "time",
+             mock.patch.object(dv_shim.time, "monotonic",
                                mock.Mock(side_effect=[0] + [i * 10 for i in range(1, 60)])):
             res = dv_shim.wait_for_analysis(poll=0, appear_timeout=1e9, max_seconds=300)
 
@@ -276,9 +278,10 @@ class WaitForAnalysisFocus(unittest.TestCase):
 
         with mock.patch.object(dv_shim, "screenshot", lambda *a, **k: "nothing"), \
              mock.patch.object(dv_shim, "found", fake_found), \
+             mock.patch.object(dv_shim, "screen_locked", return_value=False), \
              mock.patch.object(dv_shim, "activate", lambda: calls.__setitem__("activate", calls["activate"] + 1)), \
              mock.patch.object(dv_shim.time, "sleep", lambda *_a: None), \
-             mock.patch.object(dv_shim.time, "time", mock.Mock(side_effect=[0] + [i * 10 for i in range(1, 40)])):
+             mock.patch.object(dv_shim.time, "monotonic", mock.Mock(side_effect=[0] + [i * 10 for i in range(1, 40)])):
             dv_shim.wait_for_analysis(poll=0, appear_timeout=1e9, max_seconds=200)
         self.assertGreaterEqual(calls["activate"], 3,
                                 "it must revert to raising Resolve when it stays invisible")
