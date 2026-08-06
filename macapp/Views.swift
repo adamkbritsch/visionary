@@ -154,6 +154,12 @@ struct SteelBar: View {
     let live: Double             // 0...1 — shadow fill (real-time progress)
     var notches: [Double] = []   // interior boundaries (a trailing 1.0 is dropped)
     var flashKey: Int = 0        // increments → brief flash on the bright fill
+    // PEAK REPAIR: the span of the segment being re-encoded is CUT OUT of the bright fill
+    // (its bytes are being replaced — it is no longer done) and refills left-to-right with
+    // the repair encode's real frame progress. nil span = no repair running.
+    var repairLo: Double? = nil
+    var repairHi: Double? = nil
+    var repairFrac: Double = 0
     @State private var flash = false
     var body: some View {
         let bright = min(max(completed, 0), 1)
@@ -174,6 +180,16 @@ struct SteelBar: View {
                     .frame(width: max(6, geo.size.width * bright))
                     .overlay(Capsule().fill(Color.white).opacity(flash ? 0.4 : 0))
                     .animation(.easeOut(duration: 0.55), value: bright)   // the completion sweep
+                if let lo = repairLo, let hi = repairHi, hi > lo {
+                    let span = geo.size.width * (hi - lo)
+                    Rectangle().fill(Color.black.opacity(0.6))            // the cut-out: back to track
+                        .frame(width: span)
+                        .offset(x: geo.size.width * lo)
+                    Rectangle().fill(DS.steel.opacity(0.55))              // ...refilling with REAL frames
+                        .frame(width: max(2, span * min(max(repairFrac, 0), 1)))
+                        .offset(x: geo.size.width * lo)
+                        .animation(.linear(duration: 0.4), value: repairFrac)
+                }
             }
             .clipShape(Capsule())
         }
@@ -1063,12 +1079,24 @@ private struct LaneProgress: View {
         let done = f.seg_done ?? 0
         let completed: Double = notches.isEmpty ? live
             : (done >= notches.count ? 1.0 : (done > 0 ? notches[done - 1] : 0))
+        // Peak repair: cut the segment being re-encoded out of the bar and refill it with
+        // the repair's real frame progress. The span comes from the notch plan (segment z
+        // runs from notch z-1 to notch z).
+        let z = (f.repair_seg ?? 0) - 1
+        let repairing = z >= 0 && z < notches.count
+        let rLo: Double? = repairing ? (z == 0 ? 0 : notches[z - 1]) : nil
+        let rHi: Double? = repairing ? notches[z] : nil
+        let rFrac: Double = {
+            guard repairing, let d = f.repair_done, let t = f.repair_total, t > 0 else { return 0 }
+            return Double(d) / Double(t)
+        }()
         VStack(alignment: .leading, spacing: 4) {
             if showEpisode, let ep = f.ep, !ep.isEmpty {
                 Text(ep).font(.system(size: 11, weight: .medium)).monospacedDigit()
                     .foregroundStyle(DS.steel).lineLimit(1)
             }
-            SteelBar(completed: completed, live: live, notches: notches, flashKey: done)
+            SteelBar(completed: completed, live: live, notches: notches, flashKey: done,
+                     repairLo: rLo, repairHi: rHi, repairFrac: rFrac)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(String(format: "%.0f%%", pct))
                     .font(.system(size: primary ? 17 : 13, weight: .semibold)).monospacedDigit()
@@ -1083,6 +1111,18 @@ private struct LaneProgress: View {
                 if let h = held {
                     Text("held").font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary).help(h)
+                } else if let seg = f.repair_seg {
+                    // PEAK REPAIR, not stuck. The pass runs after the bar hit 100% — the
+                    // master measured over the peak cap, and only the offending segment(s)
+                    // are being re-encoded at a tighter cap. Without this the lane sat at
+                    // "100%" with no motion and read as a hung remux.
+                    let extent = (f.repair_of ?? 0) > 1
+                        ? " · \(f.repair_k ?? 1)/\(f.repair_of ?? 1)" : ""
+                    Text("repairing peaks · seg \(seg)\(extent)")
+                        .font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .help("The finished encode measured over the peak-bitrate cap. Only the "
+                              + "flagged segment(s) are re-encoded at a tighter cap, then re-gated.")
                 } else if let e = finLeft(f.eta_secs) {
                     Text(e).font(.system(size: 12, weight: .medium)).monospacedDigit()
                         .foregroundStyle(.secondary)

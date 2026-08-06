@@ -338,7 +338,7 @@ def _verify(output: str, ffprobe: str, optimized: bool = None) -> RemuxResult:
 
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None, boundaries=None,
-          abort=None, on_progress=None, on_plan=None, should_pause=None,
+          abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -443,7 +443,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     dv_video, rpu, segdir, offenders, tight,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
-                    abort=abort, ffmpeg=ffmpeg)
+                    abort=abort, on_repair=on_repair, ffmpeg=ffmpeg)
                 if not ok:
                     return RemuxResult(False, output, reason="peak repair: " + why)
                 # every segment is complete now → this call just re-verifies counts and re-concats

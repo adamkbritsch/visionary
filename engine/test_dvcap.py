@@ -588,3 +588,44 @@ class SdrEncode(unittest.TestCase):
             c = self._cmd(dv)
             self.assertIn("--vbv-maxrate", c)     # the peak cap is not a DV feature
             self.assertIn("--aud", c)             # count_hevc_frames needs access-unit delimiters
+
+
+class RepairProgressSurface(unittest.TestCase):
+    """The peak-repair pass reports which segment it is re-capping and its live frame
+    progress (on_repair) — without it the lane sat at "remux · 100%" for the whole pass
+    and read as stuck (user-caught 2026-08-06)."""
+
+    def test_on_repair_gets_start_and_frame_ticks(self):
+        import os, tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            def fake_pipe(dec, enc, out, abort, cb):
+                cb(7)                                     # a mid-encode x265 progress line
+                cb(999)                                   # over the segment count → clamped
+                with open(out, "wb") as f:
+                    f.write(b"NEW")
+                # plan_segments(100, "25", seg) → one 100-frame segment at index 0
+                return 100, "ok", []
+            with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe):
+                ok, _why = dvcap.reencode_segments_tighter(
+                    "dv.mov", "rpu.bin", td, [0], 42, total_frames=100, fps="25",
+                    on_repair=lambda *a: calls.append(a))
+            self.assertTrue(ok)
+        self.assertEqual(calls[0], (1, 1, 0, 0, 100))     # segment start: cut-out empty
+        self.assertEqual(calls[1], (1, 1, 0, 7, 100))     # live frames flow through
+        self.assertEqual(calls[2], (1, 1, 0, 100, 100))   # clamped to the segment's count
+
+    def test_no_callback_is_fine(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            def fake_pipe(dec, enc, out, abort, cb):
+                self.assertIsNone(cb)                     # no on_repair → no per-frame cb
+                with open(out, "wb") as f:
+                    f.write(b"NEW")
+                return 100, "ok", []
+            with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe):
+                ok, _why = dvcap.reencode_segments_tighter(
+                    "dv.mov", "rpu.bin", td, [0], 42, total_frames=100, fps="25")
+            self.assertTrue(ok)

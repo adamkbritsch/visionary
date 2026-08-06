@@ -94,6 +94,11 @@ struct FinishingDTO: Codable {
     var seg_total: Int?
     var holding: String?        // non-nil while this lane is preempted (Resolve has the machine)
     var fast: Bool?             // the 4K fast path (no Topaz) — a much shorter remux
+    var repair_seg: Int?        // peak-repair pass (post-100%): 1-based segment being re-capped
+    var repair_k: Int?          // ...which of the flagged segments this is (1-based)
+    var repair_of: Int?         // ...how many segments were flagged over the cap
+    var repair_done: Int?       // ...frames re-encoded so far within that segment
+    var repair_total: Int?      // ...the segment's frame count (drives the cut-out's refill)
     // Identity — `abandon_series` matches lanes on exactly these, and the puck labels with them.
     var series: String?
     var movie: Bool?

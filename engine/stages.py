@@ -582,7 +582,7 @@ def _remux(p, abort, progress=None, should_pause=None):
     def _on_plan(ends, exact_total):
         seg_plan["ends"], seg_plan["total"] = ends, exact_total
 
-    def _prog(frames, total):
+    def _prog(frames, total, **extra):
         if not progress:
             return
         t = seg_plan["total"] or total
@@ -593,11 +593,23 @@ def _remux(p, abort, progress=None, should_pause=None):
             d["notches"] = [round(e / t, 4) for e in ends]
             d["seg_done"] = sum(1 for e in ends if frames >= e)
             d["seg_total"] = len(ends)
+        d.update(extra)
         progress(d)
+
+    def _on_repair(k, of, seg_index, done, seg_frames):
+        # The peak-repair pass runs AFTER the bar hit 100% — without its own tick the
+        # lane read as stuck at "remux · 100%" for the whole re-encode (user-caught).
+        # Full-bar frames + which segment is being re-capped + its LIVE frame progress,
+        # so the UI can cut that segment out of the bar and refill it as it re-encodes.
+        # Keys self-clear on the next ordinary progress event (the setters null absent keys).
+        t = seg_plan["total"] or 0
+        _prog(t, t, repair_seg=seg_index + 1, repair_k=k, repair_of=of,
+              repair_done=done, repair_total=seg_frames)
 
     res = remux.remux(p.dv_render, p.source_cfr, p.source, p.final,
                       cap_mbps=cap, audio_target_lufs=lufs, boundaries=bounds, abort=abort,
-                      on_progress=_prog, on_plan=_on_plan, should_pause=should_pause)
+                      on_progress=_prog, on_plan=_on_plan, should_pause=should_pause,
+                      on_repair=_on_repair)
     return res.ok, res.reason
 
 

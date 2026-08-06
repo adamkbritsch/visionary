@@ -2684,6 +2684,11 @@ class Orchestrator:
                   # (upload) CLEARS the stale remux notches instead of inheriting them via `f`.
                   "notches": info.get("notches"), "seg_done": info.get("seg_done"),
                   "seg_total": info.get("seg_total"),
+                  # peak-repair pass (post-100%): which segment is being re-capped. Explicit
+                  # like the notches, so an ordinary tick clears a finished repair's hint.
+                  "repair_seg": info.get("repair_seg"), "repair_k": info.get("repair_k"),
+                  "repair_of": info.get("repair_of"), "repair_done": info.get("repair_done"),
+                  "repair_total": info.get("repair_total"),
                   "elapsed_secs": round(self._fin_elapsed_value(), 1)})
         # ETA from THIS attempt's live rate. The elapsed stopwatch deliberately ACCUMULATES
         # across killed attempts (user-dictated), so elapsed×remaining/pct read ~38 h after a
@@ -2709,7 +2714,10 @@ class Orchestrator:
         f.update({"stage": info.get("stage") or f.get("stage"), "pct": info.get("pct"),
                   "frames": info.get("frames"), "total": info.get("total"),
                   "notches": info.get("notches"), "seg_done": info.get("seg_done"),
-                  "seg_total": info.get("seg_total")})
+                  "seg_total": info.get("seg_total"),
+                  "repair_seg": info.get("repair_seg"), "repair_k": info.get("repair_k"),
+                  "repair_of": info.get("repair_of"), "repair_done": info.get("repair_done"),
+                  "repair_total": info.get("repair_total")})
         e = self._lane_eta(2, info, f.get("stage"))
         if e is None:
             f.pop("eta_secs", None)

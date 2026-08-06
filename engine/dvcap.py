@@ -644,7 +644,7 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
 def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: list,
                               tight_cap_mbps: int, *, total_frames: int, fps: str,
                               master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
-                              boundaries: list | None = None, abort=None,
+                              boundaries: list | None = None, abort=None, on_repair=None,
                               ffmpeg=FFMPEG, x265=X265, dovi_tool=DOVI_TOOL):
     """PEAK REPAIR: delete and re-encode ONLY `indices` segments at a TIGHTER cap. The full-cap
     encode can measure over the gate — VBV bufsize == maxrate legally allows a 1-second burst
@@ -654,7 +654,7 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
     (same source, same GLOBAL cap): a tighter segment is strictly safer to resume, and a
     mid-repair kill just resumes with the already-tightened segments. Returns (ok, reason)."""
     segs = plan_segments(total_frames, fps, seg_seconds, boundaries=boundaries)
-    for i in indices:
+    for k, i in enumerate(indices, 1):
         if abort is not None and abort.is_set():
             return False, "aborted"
         if not (0 <= i < len(segs)):
@@ -670,7 +670,18 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
             return False, why
         dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps)
         enc = build_x265_command(x265, rslice, stmp, tight_cap_mbps, master_display, max_cll)
-        got, why, _t = _encode_pipe(dec, enc, stmp, abort, None)
+        # Surface WHICH segment is being re-capped and its LIVE frame progress — the k'th
+        # of the flagged set, re-encoding frame `done` of the segment's `n`. Without this
+        # the lane sat at "remux · 100%" for the whole repair pass and read as stuck
+        # (user-caught 2026-08-06). Same per-frame source as the main encode's bar.
+        cb = None
+        if on_repair:
+            of = len(indices)
+            def cb(fr, _k=k, _i=i, _n=n, _of=of):
+                try: on_repair(_k, _of, _i, min(fr, _n), _n)
+                except Exception: pass
+            cb(0)                                        # segment start: cut-out shows empty
+        got, why, _t = _encode_pipe(dec, enc, stmp, abort, cb)
         _rm(rslice)
         if why == "aborted":
             _rm(stmp)

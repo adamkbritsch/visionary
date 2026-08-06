@@ -65,7 +65,7 @@ class RemuxProgress(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         emitted = []
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
             on_plan([100, 200, 300], 300)      # 3 segments ending at 100/200/300 of 300 frames
             on_progress(0, 300)                # nothing done
             on_progress(150, 300)              # into segment 2 → 1 done
@@ -101,7 +101,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[137, 402, 1000]), \
@@ -116,7 +116,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[]), \
@@ -185,7 +185,7 @@ class NormalizeAudioGate(unittest.TestCase):
     def _lufs_reaching_remux(self, p, *, per_item, target=-16):
         import types, remux, settings
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
             got["lufs"] = audio_target_lufs
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(remux, "remux", side_effect=fake_remux), \
@@ -861,3 +861,34 @@ class ResolveHostPreSpawnGuard(unittest.TestCase):
         _ok, _msg, calls = self._run(pinning=False, fallback=False)
         self.assertTrue(calls)
         self.assertEqual(calls[0][7], "-")
+
+
+class RepairProgressPlumbing(unittest.TestCase):
+    """stages._remux forwards on_repair into remux() and publishes the repair keys on the
+    same progress surface as the segment bar — full-bar frames, plus which segment is
+    being re-capped and its live refill fraction."""
+
+    def test_repair_ticks_carry_segment_and_frames(self):
+        import types, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort,
+                       on_progress, on_plan, should_pause=None, on_repair=None):
+            on_plan([100, 200, 300], 300)
+            on_progress(300, 300)                          # main encode done → bar at 100%
+            on_repair(1, 2, 1, 0, 100)                     # re-capping segment index 1 (of 2 flagged)
+            on_repair(1, 2, 1, 50, 100)                    # ...half way through its re-encode
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
+        self.assertTrue(ok)
+        plain, start, mid = emitted[0], emitted[1], emitted[2]
+        self.assertNotIn("repair_seg", plain)              # ordinary ticks carry no repair keys
+        self.assertEqual(start["pct"], 100.0)              # the bar stays full during repair
+        self.assertEqual(start["repair_seg"], 2)           # 1-based segment number
+        self.assertEqual((start["repair_k"], start["repair_of"]), (1, 2))
+        self.assertEqual((start["repair_done"], start["repair_total"]), (0, 100))
+        self.assertEqual((mid["repair_done"], mid["repair_total"]), (50, 100))
+        self.assertEqual(mid["seg_total"], 3)              # notch plan intact → span computable

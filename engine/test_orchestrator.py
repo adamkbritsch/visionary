@@ -2461,3 +2461,20 @@ class RealSeasonDirSurvivesResume(unittest.TestCase):
              mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
             back = o._finisher_reconstruct(d)
         self.assertEqual(back.nas_dir, "/Media/TV-Shows/The Office X/S02")   # old behavior kept
+
+
+class RepairKeysReachTheLane(unittest.TestCase):
+    def test_pass_through_and_self_clearing(self):
+        # The lane surfaces must carry the repair keys while the pass runs, and an
+        # ordinary tick (no repair keys) must CLEAR them — like the notches.
+        o = orch.Orchestrator()
+        o._set_finishing2_progress({"stage": "remux", "pct": 100.0, "frames": 300, "total": 300,
+                                    "repair_seg": 14, "repair_k": 1, "repair_of": 3,
+                                    "repair_done": 120, "repair_total": 240})
+        f = o.state["finishing2"]
+        self.assertEqual((f["repair_seg"], f["repair_k"], f["repair_of"]), (14, 1, 3))
+        self.assertEqual((f["repair_done"], f["repair_total"]), (120, 240))
+        o._set_finishing2_progress({"stage": "upload", "pct": None})
+        f = o.state["finishing2"]
+        self.assertIsNone(f["repair_seg"])                 # cleared, not inherited
+        self.assertIsNone(f["repair_done"])
