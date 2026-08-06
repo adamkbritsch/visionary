@@ -781,21 +781,34 @@ struct PipelineCard: View {
 
     /// THE Dock bar's number + which pipeline step it belongs to. The header readout is
     /// DEFINED as this bar in percentage form, with the step's icon (user-dictated
-    /// 2026-08-06) — one computation, so the two can never disagree. The rule is the Dock
-    /// bar's own, unchanged: the finisher wins whenever it has a number — INCLUDING a lane
-    /// suspended for Resolve (its frozen %, exactly what the bar under the icon shows) —
-    /// in display order (two lanes up → the earliest episode, the card's top row); else
-    /// the run-thread stage's live pct. nil = idle → plain icon, no header number.
+    /// 2026-08-06) — one computation, so the two can never disagree. ONE pick among
+    /// everything actively carrying a number: the EARLIEST episode processing anywhere
+    /// (user-dictated) — whichever step it is on, finisher lane or run thread, a lane
+    /// suspended for Resolve included (its frozen %, exactly what the bar shows).
+    /// Non-episodes (movies, YouTube — no SxxEyy ordinal) sort after episodes; among
+    /// themselves, finisher-before-run keeps the old precedence. nil = idle → plain
+    /// icon, no header number.
     static func unifiedProgress(_ s: StateDTO?) -> (stage: String, pct: Double)? {
         let o = s?.orchestrator
+        var cands: [(ord: (Int, Int)?, stage: String, pct: Double)] = []
         for f in lanesInDisplayOrder(o) {
-            if let st = f.stage, !st.isEmpty, let p = f.pct { return (st, p) }
+            if let st = f.stage, !st.isEmpty, let p = f.pct {
+                cands.append((f.episodeOrdinal, st, p))
+            }
         }
         if o?.stage_active ?? (o?.progress != nil),
            let pr = o?.progress, let st = pr.stage ?? o?.stage, let p = pr.pct {
-            return (st, Double(p))
+            cands.append((EpisodeOrdinal.parse(pr.ep ?? o?.current?.ep), st, Double(p)))
         }
-        return nil
+        let best = cands.enumerated().min { a, b in
+            switch (a.element.ord, b.element.ord) {
+            case let (x?, y?): return x == y ? a.offset < b.offset : x < y
+            case (_?, nil):    return true
+            case (nil, _?):    return false
+            case (nil, nil):   return a.offset < b.offset
+            }
+        }
+        return best.map { ($0.element.stage, $0.element.pct) }
     }
 
     /// Both finisher lanes in DISPLAY order: the earliest episode first (user-dictated —

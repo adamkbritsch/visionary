@@ -106,19 +106,23 @@ struct FinishingDTO: Codable {
     var source: String?
 }
 
-extension FinishingDTO {
+/// (season, episode) parsed from a display token ("S02E21" → (2, 21)) — NUMERIC, so E9
+/// sorts before E10. nil for movies/YouTube, whose token is a title, not an ordinal.
+enum EpisodeOrdinal {
     private static let sxxeyy = try! NSRegularExpression(pattern: #"S(\d+)E(\d+)"#,
                                                          options: [.caseInsensitive])
-    /// (season, episode) parsed from the display token ("S02E21" → (2, 21)) — NUMERIC, so
-    /// E9 sorts before E10. nil for movies/YouTube, whose `ep` is a title, not an ordinal.
-    var episodeOrdinal: (season: Int, episode: Int)? {
-        guard let ep, !ep.isEmpty else { return nil }
-        let r = NSRange(ep.startIndex..., in: ep)
-        guard let m = Self.sxxeyy.firstMatch(in: ep, range: r),
-              let sr = Range(m.range(at: 1), in: ep), let er = Range(m.range(at: 2), in: ep),
-              let s = Int(ep[sr]), let e = Int(ep[er]) else { return nil }
+    static func parse(_ text: String?) -> (season: Int, episode: Int)? {
+        guard let text, !text.isEmpty else { return nil }
+        let r = NSRange(text.startIndex..., in: text)
+        guard let m = sxxeyy.firstMatch(in: text, range: r),
+              let sr = Range(m.range(at: 1), in: text), let er = Range(m.range(at: 2), in: text),
+              let s = Int(text[sr]), let e = Int(text[er]) else { return nil }
         return (s, e)
     }
+}
+
+extension FinishingDTO {
+    var episodeOrdinal: (season: Int, episode: Int)? { EpisodeOrdinal.parse(ep) }
 }
 
 struct QueueNextDTO: Codable {
