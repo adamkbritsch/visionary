@@ -357,6 +357,39 @@ def ensure_segdir(segdir: str, manifest: dict) -> str:
     return "fresh"
 
 
+def _tight_caps_path(segdir: str) -> str:
+    return os.path.join(segdir, "tight_caps.json")
+
+
+def read_tight_caps(segdir: str) -> dict:
+    """{segment index -> Mbps} recorded by the peak-repair ladder. Missing/corrupt book →
+    {} — every segment then encodes at the global cap, the pre-book behavior. Lives INSIDE
+    segdir so ensure_segdir's wipe-on-mismatch removes it with the segments it describes."""
+    try:
+        with open(_tight_caps_path(segdir)) as f:
+            d = json.load(f)
+        return {int(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _remember_tight_cap(segdir: str, i: int, cap_mbps: int):
+    """Record BEFORE the tightened re-encode starts (atomic tmp+rename): an interrupted
+    repair then RESUMES this segment at its tight cap instead of regressing to the global
+    cap — which deterministic x265 guarantees would re-fail the gate and redo the whole
+    rung (a deploy mid-repair cost one full-cap re-encode + re-flag per interruption,
+    live-measured 2026-08-06). Best-effort: losing the note only costs that same rework."""
+    try:
+        book = read_tight_caps(segdir)
+        book[int(i)] = int(cap_mbps)
+        tmp = _tight_caps_path(segdir) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(k): v for k, v in book.items()}, f)
+        os.replace(tmp, _tight_caps_path(segdir))
+    except Exception:
+        pass
+
+
 def plan_segments(total_frames: int, fps_str: str, seg_seconds: int = SEG_SECONDS,
                   boundaries: list | None = None) -> list:
     """PURE. Contiguous [a, b) frame ranges covering [0, total_frames). With `boundaries` (this
@@ -595,6 +628,7 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
     segs = plan_segments(total_frames, fps, seg_seconds, boundaries=boundaries)
     if on_plan:
         on_plan([b for (_a, b) in segs], total_frames)
+    tights = read_tight_caps(segdir)   # repair-tightened segments resume at THEIR cap, not the global
     base, seg_files = 0, []
     for i, (a, b) in enumerate(segs):
         n = b - a
@@ -617,7 +651,8 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         if not ok:
             return False, base, why
         dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps)
-        enc = build_x265_command(x265, rslice, stmp, cap_mbps, master_display, max_cll)
+        enc = build_x265_command(x265, rslice, stmp, tights.get(i, cap_mbps),
+                                 master_display, max_cll)
         b0 = base
         got, why, _tail = _encode_pipe(dec, enc, stmp, abort,
                                        (lambda f: on_progress(b0 + f, total_frames)) if on_progress else None)
@@ -663,6 +698,8 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
         n = b - a
         sf = os.path.join(segdir, f"seg_{i:04d}.hevc")
         stmp = sf + ".part"
+        _remember_tight_cap(segdir, i, tight_cap_mbps)   # BEFORE the delete: a kill from here on
+                                                         # resumes this segment at the tight cap
         _rm(sf); _rm(stmp)                               # the over-peak segment is what we're replacing
         rslice = os.path.join(segdir, f"seg_{i:04d}.rpu")
         ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)

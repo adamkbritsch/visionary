@@ -629,3 +629,62 @@ class RepairProgressSurface(unittest.TestCase):
                 ok, _why = dvcap.reencode_segments_tighter(
                     "dv.mov", "rpu.bin", td, [0], 42, total_frames=100, fps="25")
             self.assertTrue(ok)
+
+
+class TightCapResume(unittest.TestCase):
+    """An interrupted peak-repair used to resume the killed segment at the GLOBAL cap —
+    deterministic x265 re-fails the gate identically, so every interruption cost a full
+    re-encode + re-flag + re-repair of that segment (live-measured 2026-08-06). The repair
+    now records each flagged segment's tight cap in segdir/tight_caps.json BEFORE touching
+    it; the segmented encode resumes those segments at THEIR cap."""
+
+    def test_book_roundtrip_and_junk(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(dvcap.read_tight_caps(td), {})          # absent → global-cap behavior
+            dvcap._remember_tight_cap(td, 13, 42)
+            dvcap._remember_tight_cap(td, 13, 35)                    # deeper rung overwrites
+            dvcap._remember_tight_cap(td, 2, 42)
+            self.assertEqual(dvcap.read_tight_caps(td), {13: 35, 2: 42})
+            with open(dvcap._tight_caps_path(td), "w") as f:
+                f.write("not json")
+            self.assertEqual(dvcap.read_tight_caps(td), {})          # corrupt → harmless
+
+    def test_repair_records_before_the_kill_window(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            def killed_pipe(dec, enc, out, abort, cb):
+                return None, "aborted", []                           # deploy landed mid-encode
+            with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=killed_pipe):
+                ok, why = dvcap.reencode_segments_tighter(
+                    "dv.mov", "rpu.bin", td, [0], 42, total_frames=100, fps="25")
+            self.assertFalse(ok)
+            self.assertEqual(dvcap.read_tight_caps(td), {0: 42})     # the note SURVIVES the kill
+
+    def test_resume_encodes_tightened_segments_at_their_cap(self):
+        import tempfile, os
+        TOTAL, SS = 200, 4
+        plan = dvcap.plan_segments(TOTAL, "24000/1001", SS)
+        n_of = {i: b - a for i, (a, b) in enumerate(plan)}
+        idx = lambda p: int(os.path.basename(p).split("_")[1].split(".")[0])
+        with tempfile.TemporaryDirectory() as td:
+            segdir = os.path.join(td, "segs"); os.makedirs(segdir)
+            dvcap._remember_tight_cap(segdir, 1, 42)                 # seg 1 was mid-repair when killed
+            caps = {}
+            def fake_pipe(dec, enc, out, abort, on_frame):
+                caps[idx(out)] = enc[enc.index("--vbv-maxrate") + 1]
+                open(out, "wb").write(b"y")
+                return n_of[idx(out)], "ok", []
+            with mock.patch.object(dvcap, "count_hevc_frames", return_value=0), \
+                 mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe), \
+                 mock.patch.object(dvcap, "concat_segments",
+                                   side_effect=AssertionError("paused run must not concat")):
+                ok, _f, why = dvcap.encode_capped_segmented(
+                    "/r.mov", "/rpu.bin", os.path.join(td, "out.hevc"), 50,
+                    segdir=segdir, total_frames=TOTAL, fps="24000/1001", seg_seconds=SS,
+                    should_pause=lambda: len(caps) >= 2)             # stop before concat
+            self.assertTrue(why.startswith("paused:"), why)
+            self.assertEqual(caps[0], "50000")                       # untouched → global cap
+            self.assertEqual(caps[1], "42000")                       # tightened → resumes tight
