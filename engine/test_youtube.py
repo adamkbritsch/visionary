@@ -387,3 +387,77 @@ class ResumeFirst(unittest.TestCase):
     def test_stale_marker_is_ignored(self):
         youtube.set_resume_first("Chan", "not_present")          # video no longer on disk → no crash, no move
         self.assertEqual(self._order(), ["aaaaaaaaaa1", "aaaaaaaaaa2", "aaaaaaaaaa3"])
+
+
+class SendToVisionary(unittest.TestCase):
+    """The companion YouTube app's button: POST /api/send-to-visionary → youtarr grabs
+    exactly that video, a durable priority book remembers it, and selection serves it as
+    the NEXT item (cadence-exempt) the moment its file is on staging."""
+
+    def setUp(self):
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        patcher = mock.patch.object(youtube, "PRIORITY_FILE", os.path.join(d, "p.json"))
+        patcher.start(); self.addCleanup(patcher.stop)
+        dp = mock.patch.object(youtube, "DONE_FILE", os.path.join(d, "done.json"))
+        dp.start(); self.addCleanup(dp.stop)
+
+    def test_parse_video_id_forms(self):
+        for t, want in [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("https://youtu.be/dQw4w9WgXcQ?t=5", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("not a url at all", ""),
+            ("", ""),
+        ]:
+            self.assertEqual(youtube.parse_video_id(t), want, t)
+
+    def test_send_queues_once_and_is_idempotent(self):
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos", return_value=True) as dl:
+            r1 = youtube.send_priority("https://youtu.be/dQw4w9WgXcQ", title="A Video")
+            r2 = youtube.send_priority("dQw4w9WgXcQ")
+        self.assertEqual(r1["status"], "queued")
+        self.assertEqual(r2["status"], "already-queued")
+        dl.assert_called_once_with(["dQw4w9WgXcQ"])
+        self.assertEqual(youtube._priority()[0]["title"], "A Video")
+
+    def test_send_reports_youtarr_down_and_records_nothing(self):
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos", return_value=None):
+            r = youtube.send_priority("dQw4w9WgXcQ")
+        self.assertEqual(r["status"], "youtarr-unreachable")
+        self.assertEqual(youtube._priority(), [])          # retry later re-sends
+
+    def test_send_refuses_junk_and_already_done(self):
+        self.assertEqual(youtube.send_priority("nope")["status"], "bad-url")
+        youtube.mark_done("dQw4w9WgXcQ")
+        self.assertEqual(youtube.send_priority("dQw4w9WgXcQ")["status"], "already-upscaled")
+
+    def test_mark_done_retires_the_priority_entry(self):
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos", return_value=True):
+            youtube.send_priority("dQw4w9WgXcQ")
+        self.assertEqual(len(youtube._priority()), 1)
+        youtube.mark_done("dQw4w9WgXcQ")                   # finished (either path)
+        self.assertEqual(youtube._priority(), [])
+
+    def test_locate_returns_only_on_staging_and_respects_skip(self):
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos", return_value=True):
+            youtube.send_priority("dQw4w9WgXcQ", title="T")
+        # not located yet → None (scan mocked quiet)
+        with mock.patch.object(youtube, "_locate_scan"):
+            self.assertIsNone(youtube.locate_priority())
+        # located → served; skip by the file STEM hides it (in-flight elsewhere)
+        book = youtube._priority()
+        book[0].update(channel="Chan", path="/staging/Chan/vid/My Video [dQw4w9WgXcQ].mp4")
+        youtube._save_priority(book)
+        with mock.patch.object(youtube, "_locate_scan"):
+            got = youtube.locate_priority()
+            self.assertEqual(got["channel"], "Chan")
+            self.assertEqual(got["vid"], "dQw4w9WgXcQ")
+            self.assertIsNone(youtube.locate_priority(
+                skip={"My Video [dQw4w9WgXcQ]"}))

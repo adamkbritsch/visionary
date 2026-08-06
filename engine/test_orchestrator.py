@@ -2622,3 +2622,37 @@ class AbandonMovie(unittest.TestCase):
             res = o.abandon_movie(self.MOVIE)
         self.assertFalse(res["aborted_finisher"])
         self.assertFalse(o._finish_abort.is_set())
+
+
+class SendToVisionaryJumpsTheQueue(unittest.TestCase):
+    def test_priority_video_outranks_a_due_movie(self):
+        # Pressing the button IS the priority signal: the pushed video is the next NEW
+        # item — ahead of due movies, cadence-exempt. Mid-pipeline TV still finishes
+        # first elsewhere (never strand an intermediate).
+        o = orch.Orchestrator()
+        pv = {"channel": "Chan", "video_path": "YouTube-raw/Chan/vid/My Video [dQw4w9WgXcQ].mp4",
+              "title": "T", "vid": "dQw4w9WgXcQ"}
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=None), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=pv), \
+             mock.patch.object(orch.movies, "next_due",
+                               side_effect=AssertionError("movie must not outrank the button")), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            ep, why = o._next_episode()
+        self.assertEqual(why, "ok")
+        self.assertTrue(ep.youtube)
+        self.assertEqual(ep.series, "Chan")
+
+    def test_no_priority_falls_through_to_movies(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=None), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=None), \
+             mock.patch.object(orch.movies, "next_due",
+                               return_value={"source_name": "M.mkv", "nas_dir": "/Media/Movies/M",
+                                             "title": "M"}) as nd, \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            ep, why = o._next_episode()
+        self.assertEqual(why, "ok")
+        self.assertTrue(ep.movie)
+        nd.assert_called_once()

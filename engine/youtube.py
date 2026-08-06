@@ -271,6 +271,7 @@ def mark_done(vid) -> None:
         done = get_done()
         done.add(vid)
         _save_done(done)
+    _drop_priority(vid)                # a send-to-Visionary one-off is retired however it finished
 
 
 # ---- resume-first: a channel PAUSE interrupted this video → serve it FIRST when the channel resumes -------
@@ -693,3 +694,152 @@ def _connected() -> bool:
         return ytdata.connected()
     except Exception:
         return False
+
+
+# ---- SEND TO VISIONARY: priority one-offs pushed from the companion YouTube app -----------
+# The app POSTs /api/send-to-visionary with a watch URL; Visionary asks youtarr to download
+# EXACTLY that video (works for unsubscribed channels too — youtarr's manual grab), records
+# it in a durable priority book, and the orchestrator serves it as the NEXT item the moment
+# the file lands on staging — cadence-exempt, ahead of due movies (the user just pressed a
+# button; that IS the priority signal). mark_done retires the entry however the video ends
+# up processed (priority pick or the ordinary channel stream).
+
+PRIORITY_FILE = os.path.expanduser("~/.topaz-pipeline/yt_priority.json")
+_PRIORITY_LOCK = threading.Lock()
+_PRIORITY_SCAN_GAP = 45.0            # min seconds between staging-wide FTP locate scans
+_priority_scan_at = 0.0
+
+_URL_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([0-9A-Za-z_-]{11})")
+_BARE_ID = re.compile(r"^[0-9A-Za-z_-]{11}$")
+
+
+def parse_video_id(text) -> str:
+    """The 11-char video id from a watch/short/live/embed URL or a bare id; '' if none."""
+    t = str(text or "").strip()
+    if _BARE_ID.match(t):
+        return t
+    m = _URL_ID.search(t)
+    return m.group(1) if m else ""
+
+
+def _priority() -> list:
+    try:
+        with open(PRIORITY_FILE) as f:
+            v = json.load(f)
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def _save_priority(items) -> None:
+    try:
+        os.makedirs(os.path.dirname(PRIORITY_FILE), exist_ok=True)
+        tmp = PRIORITY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(items, f)
+        os.replace(tmp, PRIORITY_FILE)
+    except OSError:
+        pass
+
+
+def send_priority(url_or_id, title=None) -> dict:
+    """The /api/send-to-visionary handler body. Idempotent; every outcome is a JSON-able
+    status the sending app can show on its button: queued | already-queued |
+    already-upscaled | bad-url | youtarr-unreachable."""
+    import youtarr
+    vid = parse_video_id(url_or_id)
+    if not vid:
+        return {"status": "bad-url"}
+    if vid in get_done():
+        return {"status": "already-upscaled", "id": vid}
+    with _PRIORITY_LOCK:
+        book = _priority()
+        if any(e.get("vid") == vid for e in book):
+            return {"status": "already-queued", "id": vid}
+    if not youtarr.download_videos([vid]):
+        return {"status": "youtarr-unreachable", "id": vid}
+    with _PRIORITY_LOCK:
+        book = _priority()
+        if not any(e.get("vid") == vid for e in book):     # re-check under the lock
+            book.append({"vid": vid, "title": (title or "").strip() or None,
+                         "sent_at": int(time.time())})
+            _save_priority(book)
+    return {"status": "queued", "id": vid}
+
+
+def _drop_priority(vid) -> None:
+    with _PRIORITY_LOCK:
+        book = _priority()
+        kept = [e for e in book if e.get("vid") != vid]
+        if len(kept) != len(book):
+            _save_priority(kept)
+
+
+def _locate_scan() -> None:
+    """Find on-staging files for un-located priority entries. Two tiers: the QUEUED
+    channels' caches first (no FTP), then one throttled staging-wide walk — a manual grab
+    from an UNSUBSCRIBED channel lands in a folder Visionary otherwise never scans.
+    Located entries cache {channel, path} in the book, so this goes quiet once found."""
+    global _priority_scan_at
+    with _PRIORITY_LOCK:
+        book = _priority()
+        want = {e["vid"] for e in book if not e.get("path")}
+    if not want:
+        return
+    found = {}
+    for e in get_queue():                                   # tier 1: cached, quota/FTP-free
+        folder = e.get("folder_name")
+        for v in (cached_videos(folder) if folder else []):
+            if v.get("vid") in want:
+                found[v["vid"]] = {"channel": folder, "path": v["path"]}
+    missing = want - set(found)
+    now = time.monotonic()
+    if missing and now - _priority_scan_at >= _PRIORITY_SCAN_GAP:
+        _priority_scan_at = now
+        try:                                                # tier 2: staging-wide (throttled)
+            ftp = ftp_connect(timeout=30)
+        except ftplib.all_errors:
+            ftp = None
+        if ftp is not None:
+            try:
+                queued = {e.get("folder_name") for e in get_queue()}
+                for folder in ftp_listdir(ftp, NAS_FTP_YOUTUBE_STAGING.rstrip("/")):
+                    if folder in queued or not missing:
+                        continue                            # tier 1 already covered queued folders
+                    for v in list_video_files(folder):
+                        if v.get("vid") in missing:
+                            found[v["vid"]] = {"channel": folder, "path": v["path"]}
+                            missing.discard(v["vid"])
+            finally:
+                try: ftp.quit()
+                except ftplib.all_errors: pass
+    if found:
+        with _PRIORITY_LOCK:
+            book = _priority()
+            for e in book:
+                hit = found.get(e.get("vid"))
+                if hit and not e.get("path"):
+                    e.update(hit)
+            _save_priority(book)
+
+
+def locate_priority(skip=()) -> dict | None:
+    """The first sent-to-Visionary video whose FILE is already on staging (oldest send
+    first), as {channel, video_path, title, vid} for youtube_paths — or None. `skip` is
+    the selection skip-key set (a YouTube key is the video's file STEM)."""
+    if not _priority():
+        return None
+    _locate_scan()
+    for e in _priority():
+        p = e.get("path")
+        if not p:
+            continue
+        stem = os.path.splitext(os.path.basename(p))[0]
+        if stem in skip:
+            continue
+        if e["vid"] in get_done():                          # finished via the ordinary stream
+            _drop_priority(e["vid"])
+            continue
+        return {"channel": e.get("channel"), "video_path": p,
+                "title": e.get("title"), "vid": e["vid"]}
+    return None

@@ -912,6 +912,14 @@ class Handler(BaseHTTPRequestHandler):
                     settings.set_settings({"activated": False})
                     orchestrator.ORCH.disable()
             self._json(orchestrator.ORCH.snapshot())
+        elif path == "/api/send-to-visionary":
+            # The companion YouTube app's button (localhost only — the server binds
+            # 127.0.0.1). youtarr grabs exactly this video; the orchestrator serves it
+            # as the NEXT item once it lands on staging. Idempotent; the status string
+            # is the button's feedback.
+            import youtube
+            self._json(youtube.send_priority((body.get("url") or body.get("id") or ""),
+                                             title=body.get("title")))
         elif path == "/api/settings":
             new = settings.set_settings(body or {})
             if "max_youtube_minutes" in (body or {}):

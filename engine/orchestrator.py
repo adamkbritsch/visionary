@@ -2190,6 +2190,17 @@ class Orchestrator:
         mid = self._midpipeline_tv(skip)
         if mid is not None:
             return mid, "ok"
+        # SEND-TO-VISIONARY priority: a video the user explicitly pushed from the
+        # companion YouTube app jumps the whole queue — cadence-exempt, ahead of due
+        # movies (pressing the button IS the priority signal) — the moment youtarr has
+        # its file on staging. Best-effort: a scan hiccup just means it's picked next
+        # pass; mid-pipeline TV still finishes first (never strand an intermediate).
+        try:
+            pv = youtube.locate_priority(skip=skip)
+        except Exception:
+            pv = None
+        if pv is not None:
+            return youtube_paths(pv["channel"], pv["video_path"], pv.get("title")), "ok"
         nx = movies.next_due(skip=skip)
         if nx:
             return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title")), "ok"
