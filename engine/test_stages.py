@@ -740,3 +740,57 @@ class ScopeHdr10IsNeverReEncoded(unittest.TestCase):
                                side_effect=AssertionError("rpu-only copies the stream — no segments")):
             ok, _msg = stages.run_stage("topaz", p)
         self.assertTrue(ok)
+
+
+class DownloadRefusesDolbyVision(unittest.TestCase):
+    """An already-DV source that slipped past queue exclusion is refused the moment the
+    file can be probed — BEFORE the expensive CFR re-encode — with a "permanent:" tag so
+    the run loop parks it once instead of climbing the 60s retry ladder."""
+
+    def test_dv_source_is_refused_before_the_cfr_pass(self):
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with open(p.source, "w") as fh:            # source already on disk (or just pulled)
+            fh.write("x")
+        with mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch("plan.probe_input", return_value={"is_dv": True}), \
+             mock.patch("topaz.is_cfr_ready", return_value=False), \
+             mock.patch("topaz.to_cfr") as cfr:
+            ok, msg = stages.run_stage("download", p)
+        self.assertFalse(ok)
+        self.assertTrue(str(msg).startswith("permanent:"))     # the run loop's park signal
+        self.assertIn("already Dolby Vision", msg)
+        cfr.assert_not_called()                    # refused BEFORE the libx264 CFR re-encode
+        dl.assert_not_called()
+
+    def test_non_dv_source_proceeds_to_the_cfr_pass(self):
+        import topaz
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with open(p.source, "w") as fh:
+            fh.write("x")
+        with mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch("plan.probe_input", return_value={"is_dv": False}), \
+             mock.patch("topaz.is_cfr_ready", return_value=False), \
+             mock.patch("topaz.to_cfr", return_value=topaz.CfrResult(
+                 ok=True, frames=100, rate="24000/1001", error_tail="")) as cfr:
+            ok, msg = stages.run_stage("download", p)
+        dl.assert_not_called()
+        cfr.assert_called_once()                   # the normal path is untouched
+        self.assertTrue(ok)
+
+    def test_permanent_refusal_logs_as_an_event_not_a_failure(self):
+        # Expected behavior, not an error: it must never hit the red "Recent issues" banner
+        # (the park adds its own single informational line).
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with open(p.source, "w") as fh:
+            fh.write("x")
+        with mock.patch.object(stages.transfer, "download"), \
+             mock.patch("plan.probe_input", return_value={"is_dv": True}), \
+             mock.patch.object(stages.logbook, "failure") as fail, \
+             mock.patch.object(stages.logbook, "event") as ev:
+            ok, _msg = stages.run_stage("download", p)
+        self.assertFalse(ok)
+        fail.assert_not_called()
+        ev.assert_called()

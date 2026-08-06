@@ -140,8 +140,9 @@ def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pau
         logbook.exception(f"{stage} {ep}", e)
         return False, f"{stage} crashed: {e.__class__.__name__}: {e}"
     # A clean segment-boundary pause is NOT a failure — log it as an event so it never
-    # shows up in the red "Recent issues" banner.
-    benign = (not ok) and str(msg).startswith("paused:")
+    # shows up in the red "Recent issues" banner. Same for a "permanent:" refusal
+    # (already-DV source): expected behavior, and the park logs its own single line.
+    benign = (not ok) and (str(msg).startswith("paused:") or str(msg).startswith("permanent:"))
     (logbook.event if (ok or benign) else logbook.failure)(f"{stage} {ep}: {msg}")
     return ok, msg
 
@@ -182,6 +183,15 @@ def _download(p, abort, progress=None, low_prio=False):
                 try: os.remove(p.source)
                 except OSError: pass
             return ok, reason
+    # Refuse an already-Dolby-Vision source HERE, before the expensive CFR re-encode.
+    # Queue building already excludes DV items (NAS dv-manifest / name mark); this catches
+    # the slip-throughs (manifest gap, unmarked name) the moment the file can be probed.
+    # "permanent:" tells the run loop the condition can never heal — park once, durably,
+    # instead of the 60s-retry ladder. Probe the ORIGINAL: the CFR pass strips DV side data.
+    # probe_input fails open (is_dv False on any probe error) → the topaz guard backstops.
+    import plan
+    if plan.probe_input(p.source).get("is_dv"):
+        return False, "permanent: source is already Dolby Vision — nothing to upscale"
     return _ensure_cfr(p, abort, progress, low_prio=low_prio)
 
 
@@ -229,7 +239,10 @@ def _topaz(p, abort, progress=None, should_pause=None):
     # HDR are identical in both. We then upscale the CFR file (exact, constant frame counts).
     pl = plan.plan_for(p.source)
     if pl["topaz"] == "skip":
-        return False, "source is already Dolby Vision — nothing to upscale"
+        # "permanent:" → the run loop parks it immediately + durably (no 60s retries).
+        # Reached when the download stage was already done (pre-fix scratch, reused source);
+        # a fresh download refuses earlier, before the CFR pass.
+        return False, "permanent: source is already Dolby Vision — nothing to upscale"
     if pl["topaz"] in ("rpu-only", "resolve-only"):
         # HIGH-BITRATE 4K FAST PATH: the source picture IS the deliverable — no upscale.
         # Succeed as a no-op so the run loop proceeds straight to the Resolve stage.
@@ -388,7 +401,7 @@ def _resolve(p, abort, progress=None):
     import plan
     pl = plan.plan_for(p.source)   # ORIGINAL: CFR re-encode strips DV side data (skip-detection)
     if pl.get("resolve") == "skip":
-        return False, "source is already Dolby Vision — nothing for Resolve to do"
+        return False, "permanent: source is already Dolby Vision — nothing for Resolve to do"
     # OUTPUT MODE. "auto" is the long-standing rule — SDR intake -> the 1000-nit DV project,
     # HDR intake -> the 2000-nit one. A per-item override pins it regardless of the source;
     # "sdr" is the only value that produces a non-DV master, and the only one whose Resolve

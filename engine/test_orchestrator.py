@@ -17,18 +17,27 @@ SRC = "The Office  Superfan Episodes S02e10 Christmas Party (Extended Cut).mp4"
 _FINISHER_PATCH = None
 
 
+_REFUSED_PATCH = None
+
+
 def setUpModule():
-    global _FINISHER_PATCH
+    global _FINISHER_PATCH, _REFUSED_PATCH
     import os as _os
     import tempfile as _tf
     d = _tf.mkdtemp()
     _FINISHER_PATCH = mock.patch.object(orch, "FINISHER_FILE", _os.path.join(d, "finisher_queue.json"))
     _FINISHER_PATCH.start()
+    # The durable permanent-refusal book has the same pollution problem as the finisher
+    # work-list: constructions load it, _park_permanent writes it — keep tests off the real one.
+    _REFUSED_PATCH = mock.patch.object(orch, "REFUSED_FILE", _os.path.join(d, "refused.json"))
+    _REFUSED_PATCH.start()
 
 
 def tearDownModule():
     if _FINISHER_PATCH is not None:
         _FINISHER_PATCH.stop()
+    if _REFUSED_PATCH is not None:
+        _REFUSED_PATCH.stop()
 
 
 class Paths(unittest.TestCase):
@@ -2255,3 +2264,111 @@ class DesktopPowerGate(unittest.TestCase):
             status, msg = o._power_ok()
         self.assertEqual(status, "pause")
         self.assertIn("96", msg)
+
+
+class PermanentRefusal(unittest.TestCase):
+    """A stage message tagged "permanent:" (an already-DV source the NAS manifest missed)
+    parks once and DURABLY: no 60s retry ladder, no red failure line, remembered across
+    constructions and manual Starts — unlike _parked, which enable() clears by design."""
+
+    PERM = "permanent: source is already Dolby Vision — nothing to upscale"
+
+    def setUp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        patcher = mock.patch.object(orch, "REFUSED_FILE", os.path.join(d, "refused.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _refuse(self, o, p, *, stage="download", msg=None, done=()):
+        """Run _process with `stage` refusing permanently; return the interesting mocks."""
+        bad = msg or self.PERM
+        run = lambda st, *_a, **_k: ((False, bad) if st == stage else (True, "ok"))
+        mocks = {}
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(orch, "stage_done",
+                                               side_effect=lambda st, _p: st in done))
+            es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
+            es.enter_context(mock.patch.object(o, "_claim_prefetched"))
+            es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+            mocks["sleep"] = es.enter_context(mock.patch.object(o, "_sleep"))
+            es.enter_context(mock.patch.object(o, "_quiet_mode", return_value=False))
+            mocks["hand"] = es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
+            es.enter_context(mock.patch("stages.run_stage", side_effect=run))
+            mocks["fail"] = es.enter_context(mock.patch.object(orch.logbook, "failure"))
+            mocks["event"] = es.enter_context(mock.patch.object(orch.logbook, "event"))
+            o._process(p)
+        return mocks
+
+    def test_refusal_parks_once_without_the_retry_ladder(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        m = self._refuse(o, p)
+        k = o._skip_key(p)
+        self.assertIn(k, o._parked)                       # out of THIS run's selection at once
+        self.assertIn(k, o._refused)                      # ...and recorded durably
+        self.assertNotIn("permanent", o._refused[k])      # the reason is stored untagged
+        self.assertEqual(o._fail_counts, {})              # never entered the fail ladder
+        m["sleep"].assert_not_called()                    # no 60s retry wait, no park backoff
+        m["hand"].assert_not_called()                     # nothing reaches the finisher
+        m["fail"].assert_not_called()                     # informational — never a red line
+        self.assertTrue(any("skipped for good" in str(c) for c in m["event"].call_args_list))
+
+    def test_refusal_survives_reconstruction_and_a_manual_start(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        self._refuse(o, p)
+        k = o._skip_key(p)
+        o2 = orch.Orchestrator()                          # relaunch: the book reloads from disk
+        self.assertIn(k, o2._refused)
+        with mock.patch.object(o2, "_start_caffeinate"), \
+             mock.patch.object(o2, "_finisher_reconcile"), \
+             mock.patch.object(o2, "_ensure"):
+            o2._parked.add("other")
+            o2.enable()
+        self.assertEqual(o2._parked, set())               # a Start retries parked eps...
+        self.assertIn(k, o2._refused)                     # ...but never a permanent refusal
+
+    def test_refused_items_are_skipped_by_prefetch(self):
+        o = orch.Orchestrator()
+        # entries share _skip_key's shape with _parked, so the same matching applies
+        o._refused = {"S02E10": "source is already Dolby Vision"}
+        with mock.patch.object(orch.youtube, "all_pending", return_value=[]), \
+             mock.patch.object(orch.movies, "get_selected", return_value=[]), \
+             mock.patch.object(orch.series, "get_active_series", return_value=["The Office"]), \
+             mock.patch.object(orch.series, "series_root", return_value="/Media/TV"), \
+             mock.patch.object(orch.series, "cached_queue",
+                               return_value={"remaining_items": [{"ep": "S02E10", "source_name": SRC}]}):
+            self.assertEqual(o._prefetch_candidates(), [])
+
+    def test_resolve_stage_refusal_bypasses_the_stall_ladder(self):
+        # The pre-fix scratch shape: download+topaz already done, the resolve guard fires.
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        self._refuse(o, p, stage="resolve", done=("download", "topaz"),
+                     msg="permanent: source is already Dolby Vision — nothing for Resolve to do")
+        self.assertIn(o._skip_key(p), o._refused)
+        self.assertEqual(o._resolve_fails, {})            # never counted as a Resolve fluke
+        self.assertFalse(o._stall_active)                 # and never suspected of a stall
+
+    def test_refusal_frees_the_items_scratch_files(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC, scratch_dir=d)
+        for f in (p.source, p.source_cfr):
+            with open(f, "w") as fh:
+                fh.write("x")
+        self._refuse(o, p)
+        self.assertFalse(os.path.exists(p.source))        # a refused item never continues —
+        self.assertFalse(os.path.exists(p.source_cfr))    # its scratch bytes are dead weight
+
+    def test_a_refused_youtube_video_restarts_the_cadence(self):
+        o = orch.Orchestrator()
+        o._tv_since_yt = 3
+        v = youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T")
+        with mock.patch.object(o, "_save_cadence"), \
+             mock.patch.object(o, "_save_refused"), \
+             mock.patch.object(orch.logbook, "event"):
+            o._park_permanent(v, "T", "download", self.PERM)
+        self.assertEqual(o._tv_since_yt, 0)               # spent its turn, same as _park_item

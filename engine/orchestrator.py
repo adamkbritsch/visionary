@@ -92,6 +92,14 @@ CADENCE_FILE = os.path.expanduser("~/.topaz-pipeline/orch_cadence.json")
                               # (Movies/YouTube run start-to-finish now — the 90-min turn system
                               # and its wait counters are gone, user-dictated; old files' extra
                               # keys are simply ignored.)
+REFUSED_FILE = os.path.expanduser("~/.topaz-pipeline/refused.json")
+                              # skip-key -> reason for items a stage refused PERMANENTLY (msg tagged
+                              # "permanent:", e.g. an already-DV source the NAS manifest missed).
+                              # Durable on purpose: a manual Start clears _parked but must not
+                              # re-attempt what can never succeed. Escape hatch: delete the file
+                              # (or the one key) and Start. Queue exclusion normally removes the
+                              # item for good once the NAS dv-manifest catches up.
+REFUSED_KEEP = 400            # ring cap, mirroring plan.PROBE_CACHE_KEEP
 FINISHER_FILE = os.path.expanduser("~/.topaz-pipeline/finisher_queue.json")
                               # DURABLE finisher work-list: every item HANDED OFF to the finisher
                               # (remux/upload/cleanup) is recorded here and removed only when it
@@ -750,6 +758,9 @@ class Orchestrator:
                                                # still reset _tv_since_yt — one lock, no torn RMW/tmp-file
         self._progress_last = 0.0              # time of the last progress update (to spot a stop/resume gap)
         self._parked = set()                   # episodes skipped after repeated failures (this run)
+        self._refused = self._load_refused()   # skip-key -> reason: PERMANENT refusals (already-DV).
+                                               # Durable — survives Starts, unlike _parked. Written
+                                               # only by the run thread (_park_permanent); no lock.
         self._resolve_deferred = set()         # items topaz'd but held before Resolve by QUIET MODE (in-memory;
                                                # self-heals each run — re-encountered items re-add themselves)
         self._fail_counts = {}                 # skip-key -> consecutive genuine-failure count
@@ -1082,6 +1093,32 @@ class Orchestrator:
             self._abort.set()
             return True
         return False
+
+    def _load_refused(self) -> dict:
+        """The durable permanent-refusal book (REFUSED_FILE): skip-key -> reason.
+        Unreadable/absent/malformed → empty (the item would just be re-probed and re-refused)."""
+        try:
+            with open(REFUSED_FILE) as f:
+                book = json.load(f)
+            return book if isinstance(book, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_refused(self):
+        """Atomic tmp+rename, like _save_cadence. Ring-capped so abandoned shows' stale
+        entries can never grow the file unbounded (they are harmless while present — a key
+        matches nothing once the item leaves the queue)."""
+        try:
+            if len(self._refused) > REFUSED_KEEP:          # ring: drop the oldest insertions
+                for k in list(self._refused)[:len(self._refused) - REFUSED_KEEP]:
+                    self._refused.pop(k, None)
+            os.makedirs(os.path.dirname(REFUSED_FILE), exist_ok=True)
+            tmp = REFUSED_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._refused, f)
+            os.replace(tmp, REFUSED_FILE)
+        except OSError:
+            pass
 
     def _load_cadence(self) -> dict:
         try:
@@ -1589,6 +1626,31 @@ class Orchestrator:
             f"{ep_disp} parked after {n} failures at {st} — moving to the next episode",
             fails=n, at=st)
 
+    def _park_permanent(self, p, ep_disp, st, msg):
+        """A stage refused this item for a reason that can never heal (msg tagged
+        "permanent:" — today: the source is already Dolby Vision and the queue-level
+        NAS-manifest exclusion missed it). Unlike _park_item there is no fail-count
+        ladder (retries would be pure waste and red-log noise) and the park is DURABLE
+        (REFUSED_FILE), so a manual Start doesn't re-attempt it; the dv-manifest cron
+        is expected to drop it from the queue for good. One informational logbook line,
+        never a red failure. The item's scratch files are freed — nothing can use them."""
+        key = self._skip_key(p)
+        reason = str(msg).split("permanent:", 1)[-1].strip()
+        self._parked.add(key)                 # out of THIS run's selection immediately
+        self._fail_counts.pop(key, None)
+        self._refused[key] = reason           # ...and out of every future run's
+        self._save_refused()
+        if p.youtube:                         # spent its turn — same cadence rule as _park_item
+            with self._cadence_lock:
+                self._tv_since_yt = 0
+                self._save_cadence()
+        for f in (p.source, p.source_cfr):    # a refused item never continues — free the scratch
+            try: os.remove(f)
+            except OSError: pass
+        logbook.event(f"{p.ep}: skipped for good — {reason} (recorded: a Start won't retry it; "
+                      f"the NAS DV manifest will drop it from the queue)")
+        self._hold("parked", f"{ep_disp} skipped — {reason}", at=st, permanent=True)
+
     def _on_resolve_failure(self, p, ep_disp, last_msg):
         """A Resolve ATTEMPT failed. A single failure can be a FLUKE, so until a stall is confirmed we
         retry the SAME item (like a normal stage failure); only after STALL_TRIGGER_ATTEMPTS straight
@@ -1799,7 +1861,7 @@ class Orchestrator:
         def add(p):
             if p is not None and p.source not in seen:
                 seen.add(p.source); cands.append(p)
-        skip = set(self._parked)
+        skip = set(self._parked) | set(self._refused)   # + PERMANENT refusals (already-DV, durable)
         if self._current_skip_key:           # never prefetch the item the run thread is processing NOW —
             skip.add(self._current_skip_key) # it does that download itself; prefetching it just collides
         try:
@@ -1989,7 +2051,8 @@ class Orchestrator:
                 logbook.event(f"slot handoff: {_old} finished -> {_new} takes its slot")
         except Exception:
             pass
-        skip = (self._parked | self._resolve_deferred        # + items QUIET MODE is holding before Resolve
+        skip = (self._parked | set(self._refused)            # + PERMANENT refusals (already-DV, durable)
+                | self._resolve_deferred                     # + items QUIET MODE is holding before Resolve
                 | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
                 | self._in_finisher_keys()                   # + items the FINISHER already owns (still
                                                              #   un-mastered on the NAS — must not re-pick)
@@ -2208,6 +2271,12 @@ class Orchestrator:
                 # A stop/pause abort isn't an episode FAILURE — don't count it toward parking
                 # and don't sit in the 60s retry; let the loop re-evaluate (power/stop) at once.
                 if self._abort.is_set() or not self._enabled:
+                    return
+                # "permanent:" = the stage says this can NEVER heal (already-DV source):
+                # park once, durably — before the resolve-fluke ladder too, because the
+                # resolve stage's own DV guard uses the same tag.
+                if str(msg).startswith("permanent:"):
+                    self._park_permanent(p, ep_disp, st, msg)
                     return
                 if st == "resolve":
                     # Resolve failed. Retry the same item a few times (fluke window); once confirmed a real
