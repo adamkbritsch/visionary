@@ -91,11 +91,11 @@ DEFAULT_SETTINGS = {
                                 # (no re-encode); SDR intake ships Resolve's HDR+DV conversion through
                                 # the normal capped remux. Sized so WWDITS-tier 4K web-DLs (~15 Mbps)
                                 # qualify while starved 4K still gets the full Topaz cleanup. 0 = off.
-    "resolve_share_remuxes": 1, # FAST-PATH Resolve shares the machine (user-dictated): while an
-                                # rpu-only/resolve-only item is in its Resolve pass, up to this many
-                                # remux lanes keep encoding beside it (extra lanes yield at their next
-                                # segment boundary). A NON-fast Resolve still takes the whole machine
-                                # (SIGSTOP). 0 = never share — old whole-machine behavior everywhere.
+    "resolve_share_remuxes": 0, # When Resolve runs it is the ONLY thing running (user-dictated
+                                # 2026-08-06, reversing the same-day sharing experiment): 0 = never
+                                # share, every Resolve takes the whole machine (SIGSTOP). Raising it
+                                # opts back in: up to this many remux lanes keep encoding beside a
+                                # FAST-PATH (rpu-only/resolve-only) item's Resolve pass only.
     "max_youtube_minutes": 20,  # YouTube: the per-channel length-cap threshold (applied only to channels
                                 # whose 'capped' toggle is on).
     "youtube_every_tv_episodes": 2,  # YouTube CADENCE: serve exactly 1 YouTube video after every N TV

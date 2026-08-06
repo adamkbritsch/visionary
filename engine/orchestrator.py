@@ -499,7 +499,7 @@ def unplug_decision(*, on_ac, stage_active, unplug_since, now,
 
 
 def resolve_must_wait(finishing, queued: int, finishing2=None,
-                      incoming_fast: bool = False, share: int = 1) -> bool:
+                      incoming_fast: bool = False, share: int = 0) -> bool:
     """PURE. The next item may NOT start its Resolve while the previous item's remux is in
     flight (finisher stage == remux) or still queued to start — deliberate 1-at-a-time
     pacing for the topaz path (whose next item overlaps via download/topaz anyway; the old
@@ -2588,11 +2588,12 @@ class Orchestrator:
 
     def _share_remuxes(self) -> int:
         """How many remux lanes may keep encoding beside a FAST-PATH item's Resolve pass
-        (the `resolve_share_remuxes` setting, re-read live; 0 = never share)."""
+        (the `resolve_share_remuxes` setting, re-read live). DEFAULT 0 — when Resolve
+        runs it is the only thing running (user-dictated); the setting is the opt-in."""
         try:
-            return max(0, min(2, int(settings.get_settings().get("resolve_share_remuxes", 1))))
+            return max(0, min(2, int(settings.get_settings().get("resolve_share_remuxes", 0))))
         except Exception:
-            return 1
+            return 0
 
     def _remux_must_wait(self, lane: int = 1) -> bool:
         """Should a remux lane stand down? True while Resolve is actually running, AND for

@@ -2714,8 +2714,8 @@ struct SettingsPopover: View {
                                            key: "passthrough_min_mbps", fallback: 12,
                                            range: 5...200, unit: "Mbps")
                         SettingRow(title: "Remuxes beside a fast-path Resolve",
-                                   blurb: "A fast-path title's Resolve pass shares the machine with this many running remuxes. A normal episode's Resolve still takes the whole machine.",
-                                   key: "resolve_share_remuxes", fallback: 1,
+                                   blurb: "Never (the default) gives every Resolve the whole machine. Raising it lets a fast-path title's Resolve share with this many running remuxes.",
+                                   key: "resolve_share_remuxes", fallback: 0,
                                    range: 0...2, zeroLabel: "Never")
                         SettingRow(title: "YouTube length cap",
                                    blurb: "The limit applied to channels that have their length cap switched on.",
