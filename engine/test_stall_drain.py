@@ -432,3 +432,33 @@ class RemuxRunsDuringAnUpload(unittest.TestCase):
         i = src.index('st == "upload"')
         self.assertIn("_upload_lock", src[i:i + 400],
                       "the upload branch must still take the single-push lock")
+
+
+class FastPathResolveStartsBesideARemux(unittest.TestCase):
+    """The OTHER half of the sharing rule (user-caught live: a movie sat at
+    "resolve-gate" behind one remux): a fast-path item's Resolve may START while up to
+    `share` lanes are mid-remux — it holds only when live remuxes exceed the share.
+    Non-fast incoming items keep the old 1-at-a-time gate."""
+
+    def test_fast_incoming_starts_beside_one_remux(self):
+        self.assertFalse(orch.resolve_must_wait({"stage": "remux"}, 0, None,
+                                                incoming_fast=True, share=1))
+
+    def test_fast_incoming_holds_beyond_the_share(self):
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0, {"stage": "remux"},
+                                               incoming_fast=True, share=1))
+        self.assertFalse(orch.resolve_must_wait({"stage": "remux"}, 0, {"stage": "remux"},
+                                                incoming_fast=True, share=2))
+
+    def test_fast_incoming_ignores_the_finisher_queue(self):
+        # Queued finisher items occupy no machine — the share counts RUNNING remuxes.
+        self.assertFalse(orch.resolve_must_wait({"stage": "remux"}, 2, None,
+                                                incoming_fast=True, share=1))
+
+    def test_share_zero_keeps_the_old_gate_for_fast(self):
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0, None,
+                                               incoming_fast=True, share=0))
+
+    def test_non_fast_incoming_unchanged(self):
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0, None))
+        self.assertFalse(orch.resolve_must_wait({"stage": "upload"}, 0, None))

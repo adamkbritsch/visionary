@@ -274,7 +274,7 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
     return 0
 
 
-def setup_single(video, mode=MODE_DV2000):
+def setup_single(video, mode=MODE_DV2000, superscale=0):
     """Single-file variant of setup() for the HIGH-BITRATE 4K FAST PATH: the ORIGINAL source
     goes on the timeline as ONE clip (no topaz segments exist — the source picture is the
     deliverable; Resolve runs only to produce the DV analysis/conversion). Same persistent
@@ -351,7 +351,7 @@ def setup_single(video, mode=MODE_DV2000):
 def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0):
     """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
     (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
-    rc = setup_single(video, mode)
+    rc = setup_single(video, mode, superscale)
     if rc != 0:
         return rc
     if not is_dv_mode(mode):

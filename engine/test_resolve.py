@@ -60,3 +60,19 @@ class HdrOutput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuperScaleThreading(unittest.TestCase):
+    """REGRESSION (live-caught 2026-08-06): the SuperScale block sat in setup_single,
+    whose scope had no `superscale` — NameError killed the movie's whole Resolve pass.
+    Pin the parameter chain: single() must PASS it into setup_single()."""
+
+    def test_setup_single_accepts_superscale(self):
+        import inspect, resolve_pipeline
+        self.assertIn("superscale", inspect.signature(resolve_pipeline.setup_single).parameters)
+        self.assertIn("superscale", inspect.signature(resolve_pipeline.single).parameters)
+
+    def test_single_threads_it_through(self):
+        import inspect, resolve_pipeline
+        src = inspect.getsource(resolve_pipeline.single)
+        self.assertIn("setup_single(video, mode, superscale)", src)

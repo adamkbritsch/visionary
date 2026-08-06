@@ -498,7 +498,8 @@ def unplug_decision(*, on_ac, stage_active, unplug_since, now,
     return "pause", None, 0
 
 
-def resolve_must_wait(finishing, queued: int, finishing2=None) -> bool:
+def resolve_must_wait(finishing, queued: int, finishing2=None,
+                      incoming_fast: bool = False, share: int = 1) -> bool:
     """PURE. The next item may NOT start its Resolve while the previous item's remux is in
     flight (finisher stage == remux) or still queued to start — deliberate 1-at-a-time
     pacing for the topaz path (whose next item overlaps via download/topaz anyway; the old
@@ -514,6 +515,13 @@ def resolve_must_wait(finishing, queued: int, finishing2=None) -> bool:
     idle and nothing is queued behind the finisher, so the cadence is A-remux → B-resolve
     (A holds) → A+B dual remux → the THIRD item waits here for a free lane."""
     f = finishing or {}
+    if incoming_fast and share > 0:
+        # The INCOMING item's Resolve shares the machine (user-dictated 2026-08-06): a
+        # fast-path item may START its Resolve while up to `share` lanes are mid-remux —
+        # the sharing rules (_remux_must_wait lane cap, no SIGSTOP) take it from there.
+        # It holds only when live remuxes exceed the share.
+        live = sum(1 for l in (finishing, finishing2) if (l or {}).get("stage") == "remux")
+        return live > share
     if f.get("stage") == "remux" and f.get("fast") and finishing2 is None and queued == 0:
         return False
     return f.get("stage") == "remux" or queued > 0
@@ -2313,7 +2321,18 @@ class Orchestrator:
                 if self._skip_key(p) != self._stall_probe: # attempt it (a blocked attempt hangs to
                     self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
                 self._stall_probe = None                   # this IS the probe → fall through and re-test Resolve
-            while st == "resolve" and self._resolve_should_hold():
+            fast_resolve = False
+            if st == "resolve":
+                # Decided BEFORE the doorstep gate (and reused at the SIGSTOP decision):
+                # a fast-path item's Resolve may START while a remux runs — holding it at
+                # the gate was the missing half of the sharing rule (user-caught live:
+                # a movie sat at "resolve-gate" behind one remux).
+                try:
+                    import plan as _plan
+                    fast_resolve = _plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
+                except Exception:
+                    pass
+            while st == "resolve" and self._resolve_should_hold(fast_resolve):
                 # RESOLVE GATE (user-dictated): hold this item at the Resolve doorstep until the
                 # previous item's remux fully completes. Side benefit: topaz is idle while we
                 # hold, so that remux runs at full tilt and clears fastest.
@@ -2363,13 +2382,7 @@ class Orchestrator:
                 # encoding beside it — its render is a DV analysis of an already-finished
                 # picture, not the pipeline's quality-critical bottleneck — and lanes
                 # above the share yield at their next segment boundary (soft, no SIGSTOP).
-                fast_resolve = False
-                try:
-                    import plan as _plan
-                    fast_resolve = _plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
-                except Exception:
-                    pass
-                self._resolve_fast = fast_resolve
+                self._resolve_fast = fast_resolve   # decided above, before the doorstep gate
                 self._resolve_active.set()
                 self._last_resolve_at = time.time()
                 if not (fast_resolve and self._share_remuxes() > 0):
@@ -2468,7 +2481,7 @@ class Orchestrator:
         except OSError:
             return 0
 
-    def _resolve_should_hold(self) -> bool:
+    def _resolve_should_hold(self, incoming_fast: bool = False) -> bool:
         """Should the run thread HOLD an item at the Resolve doorstep? Normally yes while the previous
         item's remux runs (user-dictated 1-at-a-time timing). But while DRAINING a Resolve-stall backlog
         of >=2 items, let Resolve get up to 'finisher_lanes' items ahead so a 2nd remux can run — hold
@@ -2486,7 +2499,8 @@ class Orchestrator:
         if self._drain_backlog() >= 2:
             return False
         return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize(),
-                                 self.state.get("finishing2"))
+                                 self.state.get("finishing2"),
+                                 incoming_fast=incoming_fast, share=self._share_remuxes())
 
     def _finisher_backlogged(self) -> bool:
         """Should the run thread hold before STARTING a new item? Only when TWO OR MORE items wait
