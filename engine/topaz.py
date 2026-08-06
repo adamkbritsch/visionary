@@ -347,14 +347,22 @@ def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False):
     ]
 
 
-def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False) -> CfrResult:
+def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
+           copy_only=False) -> CfrResult:
     """Give `source` a CONSTANT frame rate in `dst`. If the source is ALREADY CFR (the common
     case for modern rips), stream-COPY the video — a full re-encode of an already-CFR file is
     pure waste (~minutes for a movie). Otherwise re-encode at the source's own rate. Runs via
     _run_ffmpeg so it's registered for kill-on-stop/shutdown and dies within ~0.5 s of an
-    abort. A failed/aborted/partial output is removed (never left to be reused as 'ready')."""
+    abort. A failed/aborted/partial output is removed (never left to be reused as 'ready').
+
+    `copy_only` (FAST-PATH items, rpu-only/resolve-only): ALWAYS stream-copy, even when the
+    timebase-exactness test would force a re-encode. The true-CFR re-encode exists to keep
+    TOPAZ's frame counts stable — but the fast paths skip Topaz, ship the ORIGINAL video (or
+    Resolve's render of it), and read only this file's AUDIO (a bit-copy of the original's
+    either way) plus decoded frames for scene-cut planning. Hours of libx264 on a 4K movie
+    whose video bytes nothing reads (live-caught 2026-08-06, a 60 GB REMUX)."""
     rate = _fps_fraction(source)
-    if _is_already_cfr(source):
+    if copy_only or _is_already_cfr(source):
         cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio)
     else:
         cmd = build_cfr_command(FFMPEG_HB, source, dst, rate=rate,

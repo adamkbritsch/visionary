@@ -314,3 +314,33 @@ class CfrFastPath(unittest.TestCase):
             n = topaz._frame_count("x.mkv")
         self.assertEqual(n, 60961)
         self.assertFalse(any("-count_frames" in c for c in calls))   # never decoded
+
+
+class FastPathCfrCopy(unittest.TestCase):
+    """Fast-path items (rpu-only / resolve-only) skip Topaz, so the true-CFR re-encode —
+    which exists solely to keep Topaz's frame counts stable — is discarded work for them:
+    the CFR file only carries their audio (a bit-copy either way) and decodable frames.
+    `copy_only` forces the stream-copy even when the timebase test would re-encode."""
+
+    def _cfr(self, *, copy_only, already_cfr):
+        import topaz
+        from unittest import mock
+        with mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
+             mock.patch.object(topaz, "_is_already_cfr", return_value=already_cfr), \
+             mock.patch.object(topaz, "_cfr_pix_fmt", return_value="yuv420p10le"), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "_frame_count", return_value=100), \
+             mock.patch.object(topaz, "_run_ffmpeg") as rf:
+            rf.return_value = (0, 100, False, "")
+            topaz.to_cfr("/in.mkv", "/out.mkv", copy_only=copy_only)
+            return rf.call_args.args[0]                   # the ffmpeg command
+
+    def test_copy_only_forces_the_stream_copy(self):
+        cmd = self._cfr(copy_only=True, already_cfr=False)   # timebase says re-encode...
+        self.assertIn("copy", cmd)                           # ...fast path copies anyway
+        self.assertNotIn("libx264", " ".join(cmd))
+
+    def test_default_still_reencodes_a_non_cfr_source(self):
+        cmd = self._cfr(copy_only=False, already_cfr=False)
+        self.assertIn("libx264", " ".join(cmd))              # Topaz-bound items unchanged

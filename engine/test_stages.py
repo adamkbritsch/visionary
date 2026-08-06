@@ -892,3 +892,32 @@ class RepairProgressPlumbing(unittest.TestCase):
         self.assertEqual((start["repair_done"], start["repair_total"]), (0, 100))
         self.assertEqual((mid["repair_done"], mid["repair_total"]), (50, 100))
         self.assertEqual(mid["seg_total"], 3)              # notch plan intact → span computable
+
+
+class FastPathSkipsTheCfrReencode(unittest.TestCase):
+    """The download stage's CFR pass runs copy-only for fast-path plans — hours of libx264
+    on a 4K movie whose video bytes nothing reads (live-caught: a 60 GB HDR10 REMUX)."""
+
+    def _cfr_kwargs(self, plan_topaz):
+        import plan, topaz
+        p = _paths(tempfile.mkdtemp())
+        with open(p.source, "w") as fh:
+            fh.write("x")
+        with mock.patch.object(stages.transfer, "download"), \
+             mock.patch.object(plan, "plan_for", return_value={"topaz": plan_topaz}), \
+             mock.patch.object(plan, "probe_input", return_value={"is_dv": False}), \
+             mock.patch("topaz.is_cfr_ready", return_value=False), \
+             mock.patch("topaz.to_cfr", return_value=topaz.CfrResult(
+                 ok=True, frames=100, rate="24000/1001", error_tail="")) as cfr:
+            ok, _msg = stages.run_stage("download", p)
+        self.assertTrue(ok)
+        return cfr.call_args.kwargs
+
+    def test_rpu_only_copies(self):
+        self.assertTrue(self._cfr_kwargs("rpu-only")["copy_only"])
+
+    def test_resolve_only_copies(self):
+        self.assertTrue(self._cfr_kwargs("resolve-only")["copy_only"])
+
+    def test_upscale_still_true_cfr(self):
+        self.assertFalse(self._cfr_kwargs("upscale")["copy_only"])

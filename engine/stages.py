@@ -201,16 +201,24 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
     the back end of the download bar (20→99%) since it's the longer half of the stage."""
     import topaz
     import orchestrator
+    import plan
     orchestrator.apply_container(p)     # source is on disk now → lock the container (mkv vs mp4)
     if topaz.is_cfr_ready(p.source_cfr):
         return True, "source + CFR already on disk (reused)"
+    # FAST-PATH items (rpu-only / resolve-only) skip Topaz, so they don't need the true-CFR
+    # re-encode that keeps Topaz's frame counts stable — this file only carries their AUDIO
+    # (a bit-copy of the original's either way) and decodable frames for scene-cut planning.
+    # Stream-copy instead: minutes and disk-bound rather than hours of libx264 on a 4K
+    # movie whose video bytes nothing downstream reads (live-caught: a 60 GB REMUX).
+    fast = plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
     on_prog = None
     if progress:
         total = topaz.total_frames(p.source) or 0
         def on_prog(frames):
             pct = 20 + round(frames / total * 79) if total else None
             progress({"stage": "download", "ep": p.ep, "pct": min(99, pct) if pct else None})
-    res = topaz.to_cfr(p.source, p.source_cfr, abort=abort, on_progress=on_prog, low_prio=low_prio)
+    res = topaz.to_cfr(p.source, p.source_cfr, abort=abort, on_progress=on_prog,
+                       low_prio=low_prio, copy_only=fast)
     if not res.ok:
         return False, f"CFR convert failed: {_err_tail(res.error_tail)}"
     return True, f"downloaded + CFR @ {res.rate} ({res.frames} frames)"
