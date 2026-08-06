@@ -261,6 +261,19 @@ def upload(local_file, remote_dir, *, timeout=None, on_progress=None):
     except ftplib.all_errors as e:
         return False, final, f"FTP connect/login failed: {e}"
     try:
+        # ALREADY SHIPPED? An upload cut AFTER its last byte (an app relaunch between the
+        # transfer and the verify) leaves a complete master at the target; re-STORing it
+        # can be refused outright (553 on an existing file, observed live) — and even when
+        # allowed it re-sends gigabytes for nothing. An exact size match is the SAME
+        # verification the fresh-STOR path requires below, so presence-at-size IS shipped.
+        rs = remote_size(ftp, final)
+        if rs == lsz:
+            return True, final, f"already on the NAS at {lsz} bytes (size-verified) — STOR skipped"
+        if rs is not None:
+            # A PARTIAL from a cut transfer: clear it first, or the STOR itself may be
+            # refused. Only ever this master's own filename at the target — never a source.
+            try: ftp.delete(final)
+            except ftplib.all_errors: pass
         done = 0
         def _sent(block):
             nonlocal done

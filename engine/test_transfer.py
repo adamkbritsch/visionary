@@ -271,3 +271,54 @@ class Connect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadIdempotency(unittest.TestCase):
+    """An upload cut AFTER its last byte (app relaunch between transfer and verify) leaves
+    a complete master at the target. Re-STORing it was refused by the NAS (553 on an
+    existing file, live-caught 2026-08-05) — presence at the EXACT local size is the same
+    verification a fresh STOR requires, so it now counts as shipped without a transfer."""
+
+    def _local(self, n):
+        t = tempfile.NamedTemporaryFile(suffix=".mkv", delete=False)
+        t.write(b"x" * n); t.close()
+        return t.name
+
+    def test_complete_remote_skips_the_stor(self):
+        local = self._local(5)
+        rp = "/MediaVolume3/TV-Shows/Lost (2004)/Lost (2004) S02/" + os.path.basename(local)
+        f = FakeFTP(files={rp: 5})                     # already there, byte-identical size
+        try:
+            with mock.patch.object(transfer, "connect", return_value=f):
+                ok, final, reason = transfer.upload(local, os.path.dirname(rp))
+            self.assertTrue(ok)
+            self.assertEqual(final, rp)
+            self.assertEqual(f.stored, {})             # no STOR — nothing re-sent
+            self.assertIn("skipped", reason)
+        finally:
+            os.remove(local)
+
+    def test_partial_remote_is_cleared_and_reuploaded(self):
+        local = self._local(5)
+        rp = "/Media/TV-Shows/Show/S01/" + os.path.basename(local)
+        f = FakeFTP(files={rp: 3})                     # a stub from a cut transfer
+        try:
+            with mock.patch.object(transfer, "connect", return_value=f):
+                ok, final, _ = transfer.upload(local, os.path.dirname(rp))
+            self.assertTrue(ok)
+            self.assertIn(rp, f.deleted)               # partial cleared first (STOR may 553)
+            self.assertIn(rp, f.stored)                # then re-sent whole
+        finally:
+            os.remove(local)
+
+    def test_absent_remote_uploads_normally(self):
+        local = self._local(4)
+        f = FakeFTP()
+        try:
+            with mock.patch.object(transfer, "connect", return_value=f):
+                ok, final, _ = transfer.upload(local, "/Media/TV-Shows/Show/S01")
+            self.assertTrue(ok)
+            self.assertEqual(f.deleted, [])            # nothing to clear
+            self.assertIn(final, f.stored)
+        finally:
+            os.remove(local)

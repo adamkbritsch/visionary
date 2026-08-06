@@ -2411,3 +2411,53 @@ class YouTubeMetaInvalidation(unittest.TestCase):
         o._yt_meta_done = True
         o.refresh_youtube_meta()
         self.assertFalse(o._yt_meta_done)
+
+
+class RealSeasonDirSurvivesResume(unittest.TestCase):
+    """Season folders are NOT reliably `SNN` — "Lost (2004) S02" is real. The descriptor
+    used to reverse-engineer a root from nas_dir assuming the SNN shape; when that failed
+    it silently fell back to the DEFAULT root, and the resumed item uploaded into a path
+    that doesn't exist (553, live-caught 2026-08-05). nas_dir is now persisted verbatim."""
+
+    BASE = "Lost (2004) - S02E20 - Two for the Road (1080p BluRay x265 Silence).mkv"
+    DIR = "/MediaVolume3/TV-Shows/Lost (2004)/Lost (2004) S02"
+
+    def test_non_snn_season_dir_round_trips(self):
+        with mock.patch.object(orch.series, "episode_nas_dir", return_value=self.DIR), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            p = episode_paths("Lost (2004)", "S02E20", self.BASE)
+        self.assertEqual(p.nas_dir, self.DIR)
+        o = orch.Orchestrator()
+        d = o._finisher_descriptor(p)
+        self.assertEqual(d["nas_dir"], self.DIR)                 # persisted verbatim
+        # Resume in a FRESH process: the episode-dir book is cold → the synth fallback
+        # would produce root/<show>/S02. The persisted nas_dir must win.
+        with mock.patch.object(orch.series, "episode_nas_dir", return_value=None), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            back = o._finisher_reconstruct(d)
+        self.assertEqual(back.nas_dir, p.nas_dir)
+        self.assertEqual(back.nas_source, p.nas_source)
+        self.assertEqual(back.nas_final, p.nas_final)
+
+    def test_repath_survives_the_container_relabel(self):
+        # relabel_container rebuilds nas_final from nas_dir — the repath must land first.
+        with mock.patch.object(orch.series, "episode_nas_dir", return_value=self.DIR), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            p = episode_paths("Lost (2004)", "S02E20", self.BASE)
+        orch.relabel_container(p, ".mkv")
+        o = orch.Orchestrator()
+        d = o._finisher_descriptor(p)
+        with mock.patch.object(orch.series, "episode_nas_dir", return_value=None), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            back = o._finisher_reconstruct(d)
+        self.assertEqual(back.nas_final, p.nas_final)            # right dir AND right ext
+        self.assertTrue(back.nas_final.startswith(self.DIR + "/"))
+
+    def test_legacy_descriptor_without_nas_dir_still_reconstructs(self):
+        o = orch.Orchestrator()
+        d = {"kind": "episode", "ep": "S02E10", "series": "The Office X",
+             "source_basename": SRC, "nas_tv_root": "/Media/TV-Shows", "container_ext": ".mp4"}
+        with mock.patch.object(orch.series, "episode_nas_dir", return_value=None), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            back = o._finisher_reconstruct(d)
+        self.assertEqual(back.nas_dir, "/Media/TV-Shows/The Office X/S02")   # old behavior kept

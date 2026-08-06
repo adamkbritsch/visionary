@@ -1161,10 +1161,16 @@ class Orchestrator:
         if p.movie:
             return {"kind": "movie", "ep": p.ep, "source_basename": p.source_basename,
                     "nas_dir": p.nas_dir, "title": p.title, "container_ext": ext}
-        tail = f"/{p.series}/S{p.ep[1:3]}"                     # episode_paths built nas_dir this way
+        # nas_dir is persisted VERBATIM (like movies) — it is the ground truth of where the
+        # source actually sits. Reverse-engineering a root from it assumed season dirs are
+        # named `SNN`, but real libraries carry "Lost (2004) S02" and the like; the failed
+        # match silently fell back to the DEFAULT root, and the resumed item then uploaded
+        # into a path that doesn't exist (553, live-caught 2026-08-05). nas_tv_root stays
+        # for reading legacy descriptors.
+        tail = f"/{p.series}/S{p.ep[1:3]}"
         nas_tv_root = p.nas_dir[:-len(tail)] if p.nas_dir.endswith(tail) else transfer.NAS_FTP_TV_ROOT
         return {"kind": "episode", "ep": p.ep, "series": p.series, "source_basename": p.source_basename,
-                "nas_tv_root": nas_tv_root, "container_ext": ext}
+                "nas_tv_root": nas_tv_root, "nas_dir": p.nas_dir, "container_ext": ext}
 
     @staticmethod
     def _desc_skip_key(d: dict) -> str:
@@ -1191,6 +1197,16 @@ class Orchestrator:
             elif k == "episode":
                 p = episode_paths(d["series"], d["ep"], d["source_basename"],
                                   nas_tv_root=d.get("nas_tv_root"))
+                # The persisted nas_dir is the TRUTH. episode_paths consults the
+                # episode-dir book first, but that book is cold in a fresh process, so
+                # reconstruction falls back to synthesizing root/<show>/SNN — wrong for
+                # any show whose season folders aren't literally `SNN`. Repath BEFORE the
+                # container relabel below (it rebuilds nas_final from nas_dir).
+                nd = d.get("nas_dir")
+                if nd and nd != p.nas_dir:
+                    p.nas_dir = nd
+                    p.nas_source = nd.rstrip("/") + "/" + p.source_basename
+                    p.nas_final = nd.rstrip("/") + "/" + os.path.basename(p.nas_final)
             else:
                 return None
         except Exception:
