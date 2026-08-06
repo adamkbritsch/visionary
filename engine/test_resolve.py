@@ -76,3 +76,14 @@ class SuperScaleThreading(unittest.TestCase):
         import inspect, resolve_pipeline
         src = inspect.getsource(resolve_pipeline.single)
         self.assertIn("setup_single(video, mode, superscale)", src)
+
+
+class RefocusAfterPlacement(unittest.TestCase):
+    def test_place_now_hands_the_main_display_back(self):
+        # After Resolve moves to the PINNED display, the main display refocuses on the
+        # app (user-dictated 2026-08-06) — and only in the pinned case: with Resolve on
+        # the main display, raising Visionary would cover the automation's own window.
+        import inspect, resolve_pipeline
+        src = inspect.getsource(resolve_pipeline._place_now)
+        self.assertIn('tell application "Visionary" to activate', src)
+        self.assertIn("if not host:", src)          # the unpinned early-return guards it

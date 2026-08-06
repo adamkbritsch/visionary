@@ -122,6 +122,14 @@ def _place_now():
             return
         dv_shim.place_on_host(host)
         print(f"[{time.strftime('%H:%M:%S')}] Resolve moved to {host.get('key')}", flush=True)
+        # The launch stole focus on the MAIN display; Resolve's window now lives on the
+        # pinned one, so hand the main display back to the app (user-dictated 2026-08-06).
+        # Safe for the automation: goto_dolby_vision re-activates Resolve before any
+        # click, and the analysis watcher re-activates it whenever it leaves its screen.
+        # Host-pinned case ONLY — with Resolve on the main display, raising Visionary
+        # would cover the very window the templates need to see.
+        subprocess.run(["osascript", "-e", 'tell application "Visionary" to activate'],
+                       check=False, timeout=10)
     except Exception as e:
         print(f"placement at setup deferred ({e.__class__.__name__}: {e}) — "
               "the DV step will retry", flush=True)
