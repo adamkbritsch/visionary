@@ -271,7 +271,10 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
   from whichever copy carries one (grafted across releases with `dovi_tool`; Profile 7
   Blu-ray metadata is converted to 8.1, and real DV always beats a Resolve analysis), and
   the best lossless audio (**TrueHD Atmos** ranks first — the donor's compat AC-3 rides
-  along). The movie list now shows already-DV titles too, badged and combine-only. Every
+  along). The movie list also shows already-DV titles — but only the ones a combine can
+  still improve: a background sweep checks the seedbox, and a DV movie appears **only when
+  a counterpart exists there and its audio isn't already Dolby Atmos** (goal reached =
+  nothing to gain = not listed). Every
   choice is shown on a **verdict card** you approve before anything runs; the seedbox copy
   streams straight through the relay (never staged on the NAS, never modified — it keeps
   seeding), and the combined master obeys the same playback peak budget as every other

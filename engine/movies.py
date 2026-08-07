@@ -45,6 +45,12 @@ def movie_title(name: str) -> str:
     return stem.strip() or os.path.splitext(name)[0]
 
 
+def has_atmos_name(name: str) -> bool:
+    """Does the release name advertise Dolby Atmos? Word-bounded so a title like
+    'Atmosphere' can't false-positive (release tags are dot/space/dash separated)."""
+    return bool(re.search(r"\batmos\b", name or "", re.IGNORECASE))
+
+
 def release_tags(name: str) -> list:
     """APPROXIMATE pipeline-routing tags parsed from the release FILENAME (no probe — the
     authoritative plan comes from ffprobe at process time). Shown in the movie picker so each
@@ -188,6 +194,19 @@ def library_list() -> list:
     return _CACHE.get("lib") or []
 
 
+def _dv_row_visible(m, cmap) -> bool:
+    """Should a DV-badged movie appear in the picker? Only when a combine can still GAIN
+    something (user-dictated): not already Dolby Atmos (the goal audio — nothing left to
+    upgrade), and a seedbox counterpart is KNOWN to exist (background sweep, or an active
+    pairing flow in progress). Unknown-yet = hidden; it appears on a later refresh once
+    the sweep has answered. An unconfigured relay hides every DV row — there is no way
+    to combine without it."""
+    if has_atmos_name(m["name"]):
+        return False
+    e = cmap.get(m["name"]) or {}
+    return bool(e.get("status") or e.get("counterpart"))
+
+
 def refresh_library() -> list:
     try:
         import plex
@@ -195,10 +214,16 @@ def refresh_library() -> list:
     except Exception:
         wm = None
     movies = parse_movies(list_movie_entries(), load_movies_dv_manifest(), watched_map=wm)
+    import companion
+    companion.sweep_counterparts([{"name": m["name"], "title": m["title"], "dir": m["dir"]}
+                                  for m in movies
+                                  if m["has_dv"] and not has_atmos_name(m["name"])])
+    cmap = companion.counterparts()
     _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
                       "watched": m["watched"], "tags": m["tags"], "route": m["route"],
                       "has_dv": m["has_dv"]}
-                     for m in movies]
+                     for m in movies
+                     if not m["has_dv"] or _dv_row_visible(m, cmap)]
     return _CACHE["lib"]
 
 

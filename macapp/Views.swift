@@ -2043,7 +2043,7 @@ private struct MovieMode: View {
                                  options: store.movieLibrary.map { m in
                                      PickOption(id: m.id, label: store.movieTitle(m.name, m.title ?? m.name),
                                                 detail: m.has_dv == true
-                                                    ? [m.pipelineHint, "already DV — combine only"]
+                                                    ? [m.pipelineHint, "already DV — companion on the seedbox"]
                                                         .filter { !$0.isEmpty }.joined(separator: " — ")
                                                     : m.pipelineHint)
                                  },

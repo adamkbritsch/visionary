@@ -178,16 +178,20 @@ class CombineFlag(unittest.TestCase):
 
 
 class DvInclusiveLibrary(unittest.TestCase):
-    """The library keeps already-DV movies now (badged in the app, combine-only)."""
+    """The library keeps already-DV movies now (badged in the app, combine-only) —
+    visible once the seedbox sweep has found them a counterpart."""
 
     def test_refresh_keeps_dv_entries_with_the_flag(self):
         entries = [{"name": "NoDv (2001) [2160p].mkv", "dir": "/m"},
                    {"name": "HasDv (2002) [2160p].mkv", "dir": "/m"}]
         dv_map = {"HasDv (2002) [2160p].mkv": 1}
-        import plex
+        cmap = {"HasDv (2002) [2160p].mkv": {"status": None, "counterpart": True}}
+        import companion, plex
         with mock.patch.object(movies, "list_movie_entries", return_value=entries), \
              mock.patch.object(movies, "load_movies_dv_manifest", return_value=dv_map), \
              mock.patch.object(plex, "movie_watched_map", return_value={}), \
+             mock.patch.object(companion, "sweep_counterparts"), \
+             mock.patch.object(companion, "counterparts", return_value=cmap), \
              mock.patch.dict(movies._CACHE, {}, clear=True):
             lib = movies.refresh_library()
         self.assertEqual(len(lib), 2)                    # DV entry NOT filtered out
@@ -211,3 +215,58 @@ class CombineUpgrade(unittest.TestCase):
         items = movies.get_selected()
         self.assertEqual(len(items), 1)                          # still one entry
         self.assertTrue(items[0]["combine"])
+
+
+class DvRowVisibility(unittest.TestCase):
+    """DV-badged rows are curated (user-dictated): hidden when the movie already has
+    Dolby Atmos (goal audio reached) or when no seedbox counterpart is known."""
+
+    DV = {"name": "Dv (2001) [2160p DV].mkv", "title": "Dv (2001)", "dir": "/m"}
+
+    def test_atmos_name_detection_is_word_bounded(self):
+        self.assertTrue(movies.has_atmos_name("M.2160p.TrueHD.7.1.Atmos-FGT.mkv"))
+        self.assertTrue(movies.has_atmos_name("M (2020) [TrueHD Atmos].mkv"))
+        self.assertFalse(movies.has_atmos_name("Atmosphere (2019) [1080p].mkv"))
+        self.assertFalse(movies.has_atmos_name(""))
+
+    def test_dv_with_atmos_is_hidden_even_with_a_counterpart(self):
+        m = {"name": "Dv Atmos (2001) [2160p DV TrueHD Atmos].mkv"}
+        self.assertFalse(movies._dv_row_visible(m, {m["name"]: {"counterpart": True}}))
+
+    def test_dv_without_counterpart_is_hidden(self):
+        self.assertFalse(movies._dv_row_visible(self.DV, {}))
+        self.assertFalse(movies._dv_row_visible(self.DV,
+                                                {self.DV["name"]: {"counterpart": False}}))
+
+    def test_dv_with_counterpart_or_active_flow_is_visible(self):
+        self.assertTrue(movies._dv_row_visible(self.DV,
+                                               {self.DV["name"]: {"counterpart": True}}))
+        self.assertTrue(movies._dv_row_visible(self.DV,
+                                               {self.DV["name"]: {"status": "ready"}}))
+
+    def test_refresh_filters_dv_rows_and_kicks_the_sweep(self):
+        import companion, plex
+        entries = [{"name": "Plain (2001) [2160p HDR10 TrueHD Atmos].mkv", "dir": "/m"},
+                   {"name": "DvNoMatch (2002) [2160p].mkv", "dir": "/m"},
+                   {"name": "DvMatch (2003) [2160p].mkv", "dir": "/m"},
+                   {"name": "DvAtmos (2004) [2160p TrueHD Atmos].mkv", "dir": "/m"}]
+        dv_map = {"DvNoMatch (2002) [2160p].mkv": 1, "DvMatch (2003) [2160p].mkv": 1,
+                  "DvAtmos (2004) [2160p TrueHD Atmos].mkv": 1}
+        cmap = {"DvMatch (2003) [2160p].mkv": {"status": None, "counterpart": True}}
+        with mock.patch.object(movies, "list_movie_entries", return_value=entries), \
+             mock.patch.object(movies, "load_movies_dv_manifest", return_value=dv_map), \
+             mock.patch.object(plex, "movie_watched_map", return_value={}), \
+             mock.patch.object(companion, "sweep_counterparts") as sw, \
+             mock.patch.object(companion, "counterparts", return_value=cmap), \
+             mock.patch.dict(movies._CACHE, {}, clear=True):
+            lib = movies.refresh_library()
+        names = [m["name"] for m in lib]
+        # non-DV Atmos still listed (it still needs Dolby Vision — the daily fast path)
+        self.assertIn("Plain (2001) [2160p HDR10 TrueHD Atmos].mkv", names)
+        self.assertIn("DvMatch (2003) [2160p].mkv", names)         # counterpart known
+        self.assertNotIn("DvNoMatch (2002) [2160p].mkv", names)    # no counterpart yet
+        self.assertNotIn("DvAtmos (2004) [2160p TrueHD Atmos].mkv", names)  # goal reached
+        # the sweep got the DV rows WITHOUT Atmos (never wastes searches on done movies)
+        swept = [e["name"] for e in sw.call_args.args[0]]
+        self.assertEqual(sorted(swept),
+                         ["DvMatch (2003) [2160p].mkv", "DvNoMatch (2002) [2160p].mkv"])

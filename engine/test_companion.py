@@ -375,3 +375,70 @@ class RelayBaseDiscovery(unittest.TestCase):
         with mock.patch.object(companion, "_config", return_value={}), \
              mock.patch.object(companion, "SHUTTLE_RELAY_FILE", "/no/such/relay.json"):
             self.assertEqual(companion.relay_base(), "")
+
+
+class CounterpartSweep(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.pb = mock.patch.object(companion, "BOOK_FILE",
+                                    os.path.join(self.d, "companions.json"))
+        self.pb.start()
+
+    def tearDown(self):
+        self.pb.stop()
+
+    def _sweep(self, entries, results):
+        # run the sweep synchronously: patch Thread to invoke work() inline
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        with mock.patch.object(companion, "configured", return_value=True), \
+             mock.patch.object(companion.threading, "Thread", T), \
+             mock.patch.object(companion.time, "sleep", lambda s: None), \
+             mock.patch.object(companion, "search", side_effect=results):
+            companion.sweep_counterparts(entries)
+
+    def test_sweep_caches_the_answer(self):
+        self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m"}],
+                    [[{"name": "a REMUX.mkv", "path": "/seedbox/a", "size": 9,
+                       "is_dir": False}]])
+        e = companion.entry("a.mkv")
+        self.assertTrue(e["counterpart"])
+        self.assertEqual(len(e["candidates"]), 1)
+        self.assertIsNone(e.get("status"))               # NEVER creates a panel state
+        self.assertNotIn("a.mkv", companion.book_view()) # and stays out of the app's view
+        self.assertTrue(companion.counterparts()["a.mkv"]["counterpart"])
+
+    def test_no_match_caches_false(self):
+        self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m"}], [[]])
+        self.assertFalse(companion.entry("b.mkv")["counterpart"])
+
+    def test_fresh_answers_are_not_reswept(self):
+        companion.mark("c.mkv", None, counterpart=True, counterpart_at=__import__("time").time())
+        self._sweep([{"name": "c.mkv", "title": "C", "dir": "/m"}],
+                    AssertionError("fresh answer must not re-search"))
+        self.assertTrue(companion.entry("c.mkv")["counterpart"])
+
+    def test_active_pairing_is_never_touched(self):
+        companion.mark("d.mkv", "ready", verdict={"video_from": "nas"})
+        self._sweep([{"name": "d.mkv", "title": "D", "dir": "/m"}],
+                    AssertionError("active flow must not be swept"))
+        self.assertEqual(companion.entry("d.mkv")["status"], "ready")
+
+    def test_unconfigured_sweep_is_a_noop(self):
+        with mock.patch.object(companion, "configured", return_value=False), \
+             mock.patch.object(companion.threading, "Thread",
+                               side_effect=AssertionError("no thread when unconfigured")):
+            companion.sweep_counterparts([{"name": "e.mkv"}])
+
+    def test_start_search_reuses_a_fresh_sweep_result(self):
+        companion.mark("f.mkv", None, counterpart=True,
+                       counterpart_at=__import__("time").time(),
+                       candidates=[{"name": "x", "path": "/seedbox/x", "size": 1,
+                                    "is_dir": False}])
+        with mock.patch.object(companion, "configured", return_value=True), \
+             mock.patch.object(companion.threading, "Thread",
+                               side_effect=AssertionError("cached candidates skip the search")):
+            out = companion.start_search("f.mkv", "/m", "F")
+        self.assertEqual(out["status"], "found")
+        self.assertEqual(companion.entry("f.mkv")["status"], "found")

@@ -541,12 +541,25 @@ def confirmed_verdict(basename: str) -> dict | None:
     return None
 
 
+def counterparts() -> dict:
+    """{basename: {status, counterpart}} — what the movie-library filter needs to decide
+    whether a DV row is combine-able (an active flow OR a swept seedbox match)."""
+    with _BOOK_LOCK:
+        d = _book()
+    return {k: {"status": e.get("status"), "counterpart": e.get("counterpart")}
+            for k, e in d.items()}
+
+
 def book_view() -> dict:
-    """Poll-safe view for the app: everything the UI needs, nothing bulky."""
+    """Poll-safe view for the app: everything the UI needs, nothing bulky. Entries the
+    background counterpart sweep created (no `status` yet) are NOT the app's business —
+    only explicit pairing flows render panels."""
     with _BOOK_LOCK:
         d = _book()
     out = {}
     for name, e in d.items():
+        if not e.get("status"):
+            continue
         out[name] = {
             "status": e.get("status") or "",
             "title": e.get("title") or "",
@@ -575,6 +588,44 @@ def confirm(basename: str) -> dict:
 
 # ------------------------------------------------------------- async workers
 
+COUNTERPART_TTL = 6 * 3600      # a swept seedbox answer stays fresh this long
+_SWEEP_LOCK = threading.Lock()  # one sweep at a time (the relay has ONE search slot)
+
+
+def sweep_counterparts(entries: list) -> None:
+    """Background: does the seedbox hold a counterpart for each DV movie? Drives the
+    picker's DV-row visibility (user-dictated: DV movies without a counterpart are not
+    listed). One daemon at a time, paced for the relay's single search slot, results
+    cached in the book as counterpart/counterpart_at/candidates with a TTL. NEVER touches
+    an entry's pairing `status` — panels stay driven by explicit user actions, and an
+    active flow is skipped entirely."""
+    if not configured() or not entries:
+        return
+
+    def work():
+        if not _SWEEP_LOCK.acquire(blocking=False):
+            return                            # a sweep is already running
+        try:
+            import movies as movies_mod
+            for m in entries:
+                e = entry(m["name"])
+                if e.get("status"):           # active pairing — don't interfere
+                    continue
+                if time.time() - (e.get("counterpart_at") or 0) < COUNTERPART_TTL:
+                    continue
+                try:
+                    cands = search(movies_mod.movie_title(m["name"]))
+                except RelayError:
+                    return                    # relay down/busy — a later refresh retries
+                mark(m["name"], None, counterpart=bool(cands), counterpart_at=time.time(),
+                     candidates=cands, title=m.get("title") or "", dir=m.get("dir") or "")
+                time.sleep(2.0)               # pace: the relay search slot is shared
+        finally:
+            _SWEEP_LOCK.release()
+
+    threading.Thread(target=work, daemon=True, name="companion-sweep").start()
+
+
 def _claim(basename: str) -> bool:
     with _INFLIGHT_LOCK:
         if basename in _INFLIGHT:
@@ -590,11 +641,18 @@ def _release(basename: str) -> None:
 
 def start_search(basename: str, nas_dir: str, title: str) -> dict:
     """Kick an async seedbox search for a movie's companion. Idempotent while
-    one is running."""
+    one is running. A FRESH background-sweep result short-circuits straight to
+    'found' — the user tapped a row the sweep already answered for."""
     if not configured():
         mark(basename, "error", title=title, dir=nas_dir,
              error="Shuttle relay not configured")
         return {"status": "error", "error": "Shuttle relay not configured"}
+    e = entry(basename)
+    if (e.get("candidates")
+            and time.time() - (e.get("counterpart_at") or 0) < COUNTERPART_TTL):
+        mark(basename, "found", title=title or e.get("title") or "",
+             dir=nas_dir or e.get("dir") or "", error=None)
+        return {"status": "found"}
     if not _claim(basename):
         return {"status": "busy"}
     mark(basename, "searching", title=title, dir=nas_dir, error=None,
