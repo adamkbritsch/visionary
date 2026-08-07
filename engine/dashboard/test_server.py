@@ -160,3 +160,70 @@ class PreviewVariants(unittest.TestCase):
             self.assertIsNone(server._preview_frame(big=True))
         finally:
             server._PREVIEW.update(old)
+
+
+class CompanionEndpoint(unittest.TestCase):
+    """POST /api/companion action routing + the DV combine-only add rejection."""
+
+    def test_search_routes_to_companion(self):
+        from unittest import mock
+        import companion
+        with mock.patch.object(companion, "start_search",
+                               return_value={"status": "searching"}) as ss:
+            out = server.api_companion({"action": "search", "name": "m.mkv",
+                                        "dir": "/Media/Movies", "title": "M (2020)"})
+        self.assertEqual(out["status"], "searching")
+        ss.assert_called_once_with("m.mkv", "/Media/Movies", "M (2020)")
+
+    def test_pair_requires_a_path(self):
+        out = server.api_companion({"action": "pair", "name": "m.mkv"})
+        self.assertIn("error", out)
+
+    def test_confirm_queues_the_combine_item(self):
+        from unittest import mock
+        import companion, movies
+        with mock.patch.object(companion, "confirm",
+                               return_value={"status": "confirmed"}), \
+             mock.patch.object(companion, "entry",
+                               return_value={"dir": "/Media/Movies/M", "title": "M (2020)"}), \
+             mock.patch.object(movies, "add_selected") as add, \
+             mock.patch.object(movies, "selected_view", return_value={"items": []}), \
+             mock.patch.object(movies, "get_selected", return_value=[]):
+            out = server.api_companion({"action": "confirm", "name": "m.mkv"})
+        self.assertEqual(out["status"], "confirmed")
+        add.assert_called_once_with("m.mkv", "/Media/Movies/M", "M (2020)", combine=True)
+
+    def test_confirm_not_ready_does_not_queue(self):
+        from unittest import mock
+        import companion, movies
+        with mock.patch.object(companion, "confirm",
+                               return_value={"status": "error", "error": "not ready"}), \
+             mock.patch.object(movies, "add_selected",
+                               side_effect=AssertionError("must not queue")), \
+             mock.patch.object(movies, "selected_view", return_value={"items": []}):
+            out = server.api_companion({"action": "confirm", "name": "m.mkv"})
+        self.assertEqual(out["status"], "error")
+
+    def test_dv_movie_plain_add_is_rejected(self):
+        from unittest import mock
+        import movies
+        with mock.patch.object(movies, "peek_library",
+                               return_value=[{"name": "dv.mkv", "has_dv": True}]), \
+             mock.patch.object(movies, "add_selected",
+                               side_effect=AssertionError("DV must not plain-add")), \
+             mock.patch.object(movies, "selected_view", return_value={"items": []}):
+            out = server.api_movie_queue({"action": "add", "name": "dv.mkv",
+                                          "dir": "/m", "title": "DV"})
+        self.assertIn("error", out)
+        self.assertIn("companion", out["error"])
+
+    def test_non_dv_add_still_works(self):
+        from unittest import mock
+        import movies
+        with mock.patch.object(movies, "peek_library",
+                               return_value=[{"name": "plain.mkv", "has_dv": False}]), \
+             mock.patch.object(movies, "add_selected") as add, \
+             mock.patch.object(movies, "selected_view", return_value={"items": []}):
+            server.api_movie_queue({"action": "add", "name": "plain.mkv",
+                                    "dir": "/m", "title": "P"})
+        add.assert_called_once()

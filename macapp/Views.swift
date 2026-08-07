@@ -2040,9 +2040,22 @@ private struct MovieMode: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 8) {
                 SearchablePicker(placeholder: "Search movies to add…",   // never locked — addable mid-run
-                                 options: store.movieLibrary.map { PickOption(id: $0.id, label: store.movieTitle($0.name, $0.title ?? $0.name), detail: $0.pipelineHint) },
+                                 options: store.movieLibrary.map { m in
+                                     PickOption(id: m.id, label: store.movieTitle(m.name, m.title ?? m.name),
+                                                detail: m.has_dv == true
+                                                    ? [m.pipelineHint, "already DV — combine only"]
+                                                        .filter { !$0.isEmpty }.joined(separator: " — ")
+                                                    : m.pipelineHint)
+                                 },
                                  disabled: !store.moviesReachable) { id in
                     if let m = store.movieLibrary.first(where: { $0.id == id }) {
+                        if m.has_dv == true {
+                            // DV-badged movies are COMBINE-ONLY (user-dictated): the tap
+                            // starts the seedbox companion search instead of a plain add.
+                            Task { await store.companionAction("search", name: m.name ?? "",
+                                                               dir: m.dir, title: m.title) }
+                            return
+                        }
                         let queued = items.contains { $0.name == m.name }
                         Task {
                             let prof = await store.profileFor(m.title ?? "")
@@ -2068,6 +2081,16 @@ private struct MovieMode: View {
                 LibraryRefreshButton(help: "Rescan the Movies library") { await store.fetchMovies() }
             }
             if store.movieDetecting { DetectingRow() }
+            // COMPANION COMBINE flows in progress (search → candidates → verdict card →
+            // confirm). Driven entirely by the state poll's companions map — no view-local
+            // state, so a tab switch mid-pairing loses nothing. Confirmed pairings leave
+            // this list and appear as COMBINE rows in the queue below.
+            let companions = (store.state?.movies?.companions ?? [:])
+                .filter { $0.value.status != nil && $0.value.status != "confirmed" }
+                .sorted { ($0.value.title ?? $0.key) < ($1.value.title ?? $1.key) }
+            ForEach(companions, id: \.key) { name, c in
+                CompanionPanel(name: name, c: c)
+            }
             if let pm = store.pendingMovie {
                 let queued = items.contains { $0.name == pm.name }
                 PresetChooser(title: store.movieTitle(pm.name, pm.title ?? pm.name), catalog: catalog,
@@ -2080,7 +2103,9 @@ private struct MovieMode: View {
                 if !store.moviesReachable {
                     Pill(systemImage: "wifi.slash", text: "NAS unreachable", tint: DS.steelBright, iconOnly: true)
                 } else {
-                    Text("\(store.movieLibrary.count) movies without DV")
+                    // the library now lists EVERYTHING (DV titles are combine-only) — the
+                    // count that matters is still how many have no DV yet
+                    Text("\(store.movieLibrary.filter { $0.has_dv != true }.count) movies without DV")
                         .font(.system(size: 13)).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -2126,13 +2151,31 @@ private struct MovieRow: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
-                Image(systemName: "film").foregroundStyle(.secondary).font(.system(size: 12))
+                Image(systemName: m.combine == true ? "arrow.triangle.merge" : "film")
+                    .foregroundStyle(.secondary).font(.system(size: 12))
                 Text(store.movieTitle(m.name, m.title ?? m.name)).font(.system(size: 13)).lineLimit(1)
                 Spacer()
-                Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
-                    .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                if m.combine == true {
+                    // a combine item has no Topaz preset — the pill says what it IS instead
+                    Text("COMBINE")
+                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.steelBright)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                        .help("Best-of merge with its seedbox companion (DV + best audio)")
+                } else {
+                    Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                    Button {
+                        Task { await store.companionAction("search", name: m.name ?? "",
+                                                           dir: m.dir, title: m.title) }
+                    } label: {
+                        Image(systemName: "link.badge.plus").foregroundStyle(.secondary)
+                            .font(.system(size: 11))
+                    }.buttonStyle(.plain)
+                    .help("Pair a seedbox companion copy (best-of combine: DV + best audio)")
+                }
                 Button {
                     if inFlight { confirmCancel = true }
                     else if let n = m.name { Task { await store.removeMovie(n) } }
@@ -2153,20 +2196,191 @@ private struct MovieRow: View {
             }
             .padding(.vertical, 7).padding(.horizontal, 10)
             .contentShape(Rectangle())
-            .onTapGesture { onTap() }
-            .help("Tap to change this movie's Topaz preset")
+            .onTapGesture { if m.combine != true { onTap() } }   // combine rows have no preset
+            .help(m.combine == true ? "Companion combine — tracks were decided on the verdict card"
+                                    : "Tap to change this movie's Topaz preset")
             // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
             // Change buttons must not trigger it. Keyed by TITLE (the movie's settings key).
-            OutputModeRow(key: m.title ?? m.name ?? "", effective: m.output_mode_effective ?? "dv1000")
-                .padding(.horizontal, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            NormalizeAudioRow(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
-                .padding(.horizontal, 10).padding(.top, 4)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // COMBINE rows hide the inert controls (user rule): no Topaz/Resolve encode to
+            // range-pin, and MKV lossless audio is never boosted — only the source's fate
+            // is still a real choice.
+            if m.combine != true {
+                OutputModeRow(key: m.title ?? m.name ?? "", effective: m.output_mode_effective ?? "dv1000")
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                NormalizeAudioRow(key: m.title ?? m.name ?? "", on: m.normalize_audio ?? true)
+                    .padding(.horizontal, 10).padding(.top, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             ReplaceSourceRow(key: m.title ?? m.name ?? "", on: m.replace_source ?? true)
-                .padding(.horizontal, 10).padding(.bottom, 7).padding(.top, 4)
+                .padding(.horizontal, 10).padding(.bottom, 7)
+                .padding(.top, m.combine == true ? 0 : 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Divider()
+        }
+    }
+}
+
+// COMPANION COMBINE: one movie's pairing flow, driven entirely by the state poll's
+// companions map (search → candidates → probing → VERDICT CARD → confirm). The card is
+// the user-dictated decision gate: nothing runs until "Run this combine" is pressed.
+private struct CompanionPanel: View {
+    @EnvironmentObject var store: AppStore
+    let name: String
+    let c: CompanionDTO
+
+    private func gb(_ n: Int64?) -> String {
+        let v = Double(n ?? 0) / 1e9
+        return v >= 100 ? String(format: "%.0f GB", v) : String(format: "%.1f GB", v)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.merge").font(.system(size: 12))
+                    .foregroundStyle(DS.steelBright)
+                Text(store.movieTitle(name, c.title ?? name))
+                    .font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                Spacer()
+                Button {
+                    Task { await store.companionAction("dismiss", name: name) }
+                } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }.buttonStyle(.plain).help("Abandon this pairing")
+            }
+            switch c.status ?? "" {
+            case "searching":
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.small)
+                    Text("Searching the seedbox for a companion copy…")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+            case "found":
+                Text("Pick the companion copy:")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                ForEach(c.candidates ?? []) { cand in
+                    Button {
+                        Task { await store.companionAction("pair", name: name, path: cand.path) }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: cand.is_dir == true ? "folder" : "doc")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                            Text(cand.name ?? "").font(.system(size: 12)).lineLimit(1)
+                            Spacer()
+                            if (cand.size ?? 0) > 0 {
+                                Text(gb(cand.size)).font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 5).padding(.horizontal, 8)
+                        .contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05)))
+                }
+            case "probing":
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.small)
+                    Text("Probing both copies (codecs, DV, audio)…")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+            case "ready":
+                VerdictCard(name: name, c: c)
+            default:      // error / vanished / mismatch
+                HStack(spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle").font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                    Text(c.error ?? (c.status == "vanished"
+                                     ? "The companion is no longer on the seedbox."
+                                     : "The copies are different cuts — they cannot combine."))
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Search again") {
+                        Task { await store.companionAction("search", name: name, title: c.title) }
+                    }.buttonStyle(SteelButtonStyle(lit: false)).controlSize(.small)
+                }
+            }
+        }
+        .padding(10)
+        .panel(DS.radiusControl, inset: true)
+    }
+}
+
+// The decision gate: exactly what ships from where, in plain rows, and a Confirm button.
+private struct VerdictCard: View {
+    @EnvironmentObject var store: AppStore
+    let name: String
+    let c: CompanionDTO
+
+    private func sideLabel(_ side: String?) -> String {
+        switch side ?? "" {
+        case "nas": return "library copy"
+        case "remote": return "seedbox copy"
+        default: return side ?? "?"
+        }
+    }
+
+    private func row(_ icon: String, _ label: String, _ value: String,
+                     _ detail: String?) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: icon).font(.system(size: 11)).foregroundStyle(DS.steel)
+                .frame(width: 14)
+            Text(label).font(.system(size: 12, weight: .medium)).frame(width: 82, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(value).font(.system(size: 12))
+                if let d = detail, !d.isEmpty {
+                    Text(d).font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+        }
+    }
+
+    var body: some View {
+        let v = c.verdict
+        VStack(alignment: .leading, spacing: 7) {
+            if let specs = v?.specs {
+                VStack(alignment: .leading, spacing: 2) {
+                    if let s = specs["nas"] {
+                        Text("Library: " + s).font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    if let s = specs["remote"] {
+                        Text("Seedbox: " + s).font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Divider()
+            row("film", "Video", sideLabel(v?.video_from), v?.video_why)
+            row("sparkles.tv", "Dolby Vision",
+                (v?.rpu_from == "resolve") ? "Resolve analysis"
+                    : "real (P\(v?.rpu_profile ?? "?")) from the \(sideLabel(v?.rpu_from))",
+                v?.rpu_why)
+            row("speaker.wave.3", "Audio", sideLabel(v?.audio_from), v?.audio_why)
+            row("gauge.with.needle", "Re-encode",
+                (v?.reencode?.predicted == true)
+                    ? "yes — over the playback ceiling"
+                    : "no — ships its original bits",
+                (v?.reencode?.basis == "estimate")
+                    ? "estimated from the average bitrate — re-checked before shipping"
+                    : String(format: "measured 1-second peak: %.1f Mbps", v?.reencode?.mbps ?? 0))
+            if let warn = v?.cut_warning {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle").font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                    Text(warn + " — the combine will refuse if frames don't align.")
+                        .font(.system(size: 11)).foregroundStyle(.orange)
+                }
+            }
+            HStack(spacing: 8) {
+                Button {
+                    Task { await store.companionAction("confirm", name: name, title: c.title) }
+                } label: {
+                    Label("Run this combine", systemImage: "arrow.triangle.merge")
+                }.buttonStyle(SteelButtonStyle(lit: true))
+                Button("Cancel") {
+                    Task { await store.companionAction("dismiss", name: name) }
+                }.buttonStyle(SteelButtonStyle(lit: false))
+                Spacer()
+            }.padding(.top, 2)
         }
     }
 }

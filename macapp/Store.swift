@@ -320,6 +320,16 @@ final class AppStore: ObservableObject {
     func removeMovie(_ name: String) async {
         await post("/api/movie-queue", ["action": "remove", "name": name]); await refresh()
     }
+    // COMPANION COMBINE control. action: "search" | "pair" | "unpair" | "confirm" | "dismiss".
+    // Status flows back through the state poll's movies.companions map (async workers).
+    func companionAction(_ action: String, name: String, path: String? = nil,
+                         dir: String? = nil, title: String? = nil) async {
+        var body: [String: Any] = ["action": action, "name": name]
+        if let path { body["path"] = path }
+        if let dir { body["dir"] = dir }
+        if let title { body["title"] = title }
+        await post("/api/companion", body); await refresh()
+    }
     // Manage the combined up-next queue. action: "remove" | "up" | "down". A movie removes
     // outright / reorders among queued movies; an episode's "remove" defers it to the end.
     func queueAction(_ action: String, _ item: UpNextDTO) async {

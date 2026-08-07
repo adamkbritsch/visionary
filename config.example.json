@@ -13,6 +13,9 @@
 
   "tmdb_api_key": "",
 
+  "shuttle_relay_url": "",
+  "shuttle_relay_token": "",
+
   "youtarr_url": "",
   "youtarr_user": "",
   "youtarr_pass": "",

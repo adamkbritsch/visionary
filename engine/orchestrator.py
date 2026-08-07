@@ -226,6 +226,12 @@ class EpisodePaths:
                             # a movie removed mid-pipeline must NOT be miscounted as a TV episode.
     title: str = ""         # clean display title (movies + YouTube videos) — for the "now processing" header
     sidecar_dir: str = ""   # YouTube: the STAGING video folder — sidecars copy from here, purged after
+    combine: bool = False   # COMPANION COMBINE (movies only): best-of merge with a seedbox copy.
+                            # The verdict (which file donates video/RPU/audio) lives in the
+                            # companions book — the item only carries the fetch coordinates.
+    companion_virtual: str = ""   # the companion's relay path (/seedbox/…), fetched at download
+    companion_src: str = ""       # where the companion lands locally (scratch)
+    companion_size: int = 0       # manifest size — the fetch verify target
 
     def item_view(self) -> dict:
         """The currently-processing item as an up-next-shaped dict, so the dashboard header shows what's
@@ -242,7 +248,10 @@ class EpisodePaths:
 
     def working_files(self) -> list:
         """Everything created locally for this episode — deleted on cleanup."""
-        return [self.source, self.source_cfr, self.prores, self.dv_render, self.final]
+        files = [self.source, self.source_cfr, self.prores, self.dv_render, self.final]
+        if self.companion_src:
+            files.append(self.companion_src)
+        return files
 
 
 # A source filename advertises the SOURCE's encoding — "1080p", "x264", "8bit", "SDR".
@@ -327,18 +336,35 @@ def episode_paths(series_name, ep, source_basename, *,
     )
 
 
-def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None) -> EpisodePaths:
+def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None,
+                combine=False) -> EpisodePaths:
     """Paths for a MOVIE (Movie mode). Same shape as episode_paths but FLAT: a movie's NAS
     dir is wherever it lives under /Media/Movies (a per-movie subfolder OR the root), not a
     series/season tree. series = the movie TITLE so its Topaz preset is set/read per-movie
     (settings.show_preset_key(title), just like a show); ep = the filename stem (the parking
-    / fail-count / display id). The generic stages then process it exactly like an episode."""
+    / fail-count / display id). The generic stages then process it exactly like an episode.
+
+    `combine=True` = COMPANION COMBINE: the item also fetches its confirmed seedbox
+    companion (coordinates from the companions book) and the remux merges the two per the
+    confirmed verdict. Container is FORCED to .mkv (the goal output carries TrueHD-class
+    audio) — apply_container() is bypassed for combine items."""
     scratch_dir = scratch_dir or scratch.default_scratch()
     stem = os.path.splitext(source_basename)[0]
     nas_dir = nas_dir.rstrip("/")
     tag = master_tag(title or os.path.splitext(source_basename)[0])
     mstem = master_stem(source_basename, sdr=(tag == SDR_TAG))
     j = lambda n: os.path.join(scratch_dir, n)
+    ext = ".mkv" if combine else ".mp4"
+    comp_virtual, comp_src, comp_size = "", "", 0
+    if combine:
+        import companion as companion_mod
+        cv = companion_mod.confirmed_verdict(source_basename)
+        if cv:
+            comp = cv["companion"]
+            comp_virtual = comp.get("path") or ""
+            comp_size = int(comp.get("size") or 0)
+            comp_src = j(stem + ".companion" + (os.path.splitext(comp.get("name") or "")[1]
+                                                or ".mkv"))
     return EpisodePaths(
         series=(title or stem), ep=stem, source_basename=source_basename,
         source=j(source_basename),
@@ -347,12 +373,16 @@ def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None) -> Ep
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),
         dv_render=j(stem + DV_TAG + ".mov"),
-        final=j(mstem + tag + ".mp4"),
+        final=j(mstem + tag + ext),
         nas_dir=nas_dir,
         nas_source=nas_dir + "/" + source_basename,
-        nas_final=nas_dir + "/" + mstem + tag + ".mp4",
+        nas_final=nas_dir + "/" + mstem + tag + ext,
         movie=True,
         title=(title or stem),
+        combine=combine,
+        companion_virtual=comp_virtual,
+        companion_src=comp_src,
+        companion_size=comp_size,
     )
 
 
@@ -423,6 +453,9 @@ def discard_workfiles(source_basename: str) -> None:
     names = _buffer_names(source_basename) | {
         stem + "_prob4_upscaled.mov",
         stem + DV_TAG + ".mov",
+        # companion-combine fetch (either container the companion could have carried)
+        stem + ".companion.mkv",
+        stem + ".companion.mp4",
     } | {                       # BOTH stems AND both tags: the deliverable is retagged
         m + t + e               # (x264 -> x265 ...), a pre-retag leftover must still be
         for m in {stem, master_stem(source_basename),           # swept, and an SDR-pinned
@@ -448,6 +481,11 @@ def apply_container(p: EpisodePaths) -> EpisodePaths:
     stable (the source persists until cleanup). No-op until the source exists. Idempotent — called
     at the top of _process (resume: source already present) and inside the download stage (first
     run: source appears mid-stage, before the CFR is written)."""
+    if p.combine:
+        # COMBINE items are pinned to .mkv at build time (the goal output carries
+        # TrueHD-class audio, and the LOCAL source may not — probing it would flip the
+        # container back to .mp4 mid-pipeline).
+        return p
     if not os.path.exists(p.source):
         return p
     import remux
@@ -587,6 +625,22 @@ def _nb_frames(path):
     return None
 
 
+def combine_winner_path(p) -> str | None:
+    """The COMBINE item's shipping video (the verdict's winner): p.source when the NAS
+    copy won, else the fetched companion. None for non-combine items or when the book
+    entry is gone (callers fail safe on None — never guess which file ships)."""
+    if not getattr(p, "combine", False):
+        return None
+    try:
+        import companion as companion_mod
+        cv = companion_mod.confirmed_verdict(p.source_basename)
+        if not cv:
+            return None
+        return p.source if cv["verdict"].get("video_from") == "nas" else p.companion_src
+    except Exception:
+        return None
+
+
 def render_is_complete(p) -> bool:
     """Is the Resolve render the WHOLE episode, not a truncated one?
 
@@ -600,9 +654,10 @@ def render_is_complete(p) -> bool:
     — the 1080p original is deleted after a size-verify that compares the master to the
     remote MASTER and never to the source.
 
-    Compares against the CFR source, which is what Resolve ingested. Unknown on either side
-    means "don't judge" — this must never fail a good render on a probe hiccup."""
-    want = _nb_frames(getattr(p, "source_cfr", None))
+    Compares against the CFR source, which is what Resolve ingested (a combine item's
+    Resolve fallback ingests the verdict WINNER instead — no CFR exists there). Unknown on
+    either side means "don't judge" — this must never fail a good render on a probe hiccup."""
+    want = _nb_frames(combine_winner_path(p) or getattr(p, "source_cfr", None))
     got = _nb_frames(getattr(p, "dv_render", None))
     if not want or not got:
         return True
@@ -612,7 +667,16 @@ def render_is_complete(p) -> bool:
 # ---- stage-done detection (resume) ---------------------------------------
 
 def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
+    combine = getattr(p, "combine", False)   # duck-typed callers (tests) predate the field
     if stage == "download":
+        if combine:
+            # Done = BOTH copies verified complete. No CFR — combine never feeds Topaz,
+            # and the remux reads the originals directly.
+            return (os.path.exists(p.source)
+                    and os.path.getsize(p.source) == _remote_size(p.nas_source, ftp)
+                    and os.path.exists(p.companion_src)
+                    and p.companion_size > 0
+                    and os.path.getsize(p.companion_src) == p.companion_size)
         # Done = the original is verified complete (size == the NAS file) AND its
         # constant-frame-rate re-encode is present (that's what every later stage reads).
         import topaz
@@ -620,6 +684,8 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
                 and os.path.getsize(p.source) == _remote_size(p.nas_source, ftp)
                 and topaz.is_cfr_ready(p.source_cfr))
     if stage == "topaz":
+        if combine:
+            return True                    # combine never upscales — the stage is a no-op
         # Done = every scene-cut chunk is present with its exact frame count (per the
         # manifest) — OR a VALID DV RENDER already exists: the segments are DROPPED at
         # hand-off to free ~120-300 GB, so an item whose remux later aborts must resume at
@@ -629,6 +695,13 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
             return True
         return topaz.segments_complete(p.segdir)
     if stage == "resolve":
+        if combine:
+            # A REAL RPU (from either copy) makes Resolve unnecessary — real DV beats
+            # Resolve DV (user-dictated). Only the no-RPU fallback renders anything.
+            import companion as companion_mod
+            cv = companion_mod.confirmed_verdict(p.source_basename)
+            if cv and cv["verdict"].get("rpu_from") != "resolve":
+                return True
         # DV profile AND length: a truncated render carries a perfectly valid DOVI record.
         return _is_dv81(_vstream(p.dv_render)) and render_is_complete(p)
     if stage == "remux":
@@ -1251,8 +1324,13 @@ class Orchestrator:
             return {"kind": "youtube", "ep": p.ep, "channel": p.series,
                     "video_path": p.nas_source, "title": p.title, "container_ext": ext}
         if p.movie:
-            return {"kind": "movie", "ep": p.ep, "source_basename": p.source_basename,
-                    "nas_dir": p.nas_dir, "title": p.title, "container_ext": ext}
+            d = {"kind": "movie", "ep": p.ep, "source_basename": p.source_basename,
+                 "nas_dir": p.nas_dir, "title": p.title, "container_ext": ext}
+            if p.combine:
+                # the flag only — the VERDICT stays in the companions book (single source of
+                # truth); a reconstruct with the book missing parks rather than guessing
+                d["combine"] = True
+            return d
         # nas_dir is persisted VERBATIM (like movies) — it is the ground truth of where the
         # source actually sits. Reverse-engineering a root from it assumed season dirs are
         # named `SNN`, but real libraries carry "Lost (2004) S02" and the like; the failed
@@ -1285,7 +1363,8 @@ class Orchestrator:
             if k == "youtube":
                 p = youtube_paths(d["channel"], d["video_path"], d.get("title"))
             elif k == "movie":
-                p = movie_paths(d["source_basename"], d["nas_dir"], d.get("title"))
+                p = movie_paths(d["source_basename"], d["nas_dir"], d.get("title"),
+                                combine=bool(d.get("combine")))
             elif k == "episode":
                 p = episode_paths(d["series"], d["ep"], d["source_basename"],
                                   nas_tv_root=d.get("nas_tv_root"))
@@ -2003,7 +2082,10 @@ class Orchestrator:
             pass
         try:
             for m in movies.get_selected():                                # 2. queued movies
-                if m.get("name") not in skip and m.get("dir"):
+                # COMBINE items are excluded: ~2x the bytes of a normal movie (both
+                # copies), and the companion fetch is relay-streamed at download time —
+                # buffering them would fight the free-space gate for no overlap win.
+                if m.get("name") not in skip and m.get("dir") and not m.get("combine"):
                     add(movie_paths(m["name"], m["dir"], m.get("title"), scratch_dir=PF))
         except Exception:
             pass
@@ -2221,7 +2303,8 @@ class Orchestrator:
             return youtube_paths(pv["channel"], pv["video_path"], pv.get("title")), "ok"
         nx = movies.next_due(skip=skip)
         if nx:
-            return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title")), "ok"
+            return movie_paths(nx["source_name"], nx["nas_dir"], nx.get("title"),
+                               combine=bool(nx.get("combine"))), "ok"
         # YOUTUBE CADENCE: YouTube is NOT a round-robin peer (its 4K-SDR upscales are far slower than a
         # TV episode). It's a GATED single-video insert — after `youtube_every_tv_episodes` TV episodes
         # (`_tv_since_yt`), exactly ONE YouTube video runs, then the counter resets. So the stream is

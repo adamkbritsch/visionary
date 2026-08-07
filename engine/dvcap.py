@@ -136,9 +136,22 @@ def build_inject_command(dovi_tool: str, src_es: str, rpu: str, out_es: str) -> 
     return [dovi_tool, "inject-rpu", "-i", src_es, "--rpu-in", rpu, "-o", out_es]
 
 
-def build_rpu_extract_command(dovi_tool: str, rpu_out: str) -> list:
-    """Reads Annex-B HEVC from stdin, writes the binary RPU."""
-    return [dovi_tool, "extract-rpu", "-", "-o", rpu_out]
+def build_rpu_extract_command(dovi_tool: str, rpu_out: str, mode: int | None = None) -> list:
+    """Reads Annex-B HEVC from stdin, writes the binary RPU. `mode` is dovi_tool's
+    GLOBAL -m flag (before the subcommand — verified on the pinned 2.3.0): mode 2
+    rewrites a Profile 7 (Blu-ray dual-layer) RPU to be 8.1-compatible during the
+    extract, which is how a REAL studio RPU from a P7 companion gets grafted onto
+    an HDR10 base (companion combine)."""
+    head = [dovi_tool] + (["-m", str(mode)] if mode is not None else [])
+    return head + ["extract-rpu", "-", "-o", rpu_out]
+
+
+def build_dovi_convert_command(dovi_tool: str, in_es: str, out_es: str) -> list:
+    """Single-layer-ify an ES that carries P7 DV INLINE: `-m 2 convert --discard`
+    drops the enhancement layer and rewrites the RPU to 8.1 in one pass (verified
+    on the pinned 2.3.0). Used when the combine's video WINNER is itself the P7
+    file — its own base layer ships, converted."""
+    return [dovi_tool, "-m", "2", "convert", "--discard", "-i", in_es, "-o", out_es]
 
 
 def build_decode_command(ffmpeg: str, src: str) -> list:
@@ -255,17 +268,19 @@ def over_gate_segments(buckets: dict, segs: list, fps_str: str, cap_mbps: int,
 
 # ---- orchestration ---------------------------------------------------------------------
 
-def extract_rpu(dv_video: str, rpu_out: str, *, ffmpeg=FFMPEG, dovi_tool=DOVI_TOOL,
-                timeout=None):
-    """Resolve render -> binary RPU file. Returns (ok, reason). ATOMIC: writes a temp then
-    os.replace, so a hard kill mid-extract can never leave a TRUNCATED rpu.bin at the real
-    path (which the segmented resume reuses verbatim → wrong DV slices)."""
+def extract_rpu(dv_video: str, rpu_out: str, *, mode: int | None = None,
+                ffmpeg=FFMPEG, dovi_tool=DOVI_TOOL, timeout=None):
+    """DV video -> binary RPU file. Returns (ok, reason). `mode=2` converts a P7
+    RPU to 8.1 on the way out (companion combine's graft path). ATOMIC: writes a
+    temp then os.replace, so a hard kill mid-extract can never leave a TRUNCATED
+    rpu.bin at the real path (which the segmented resume reuses verbatim → wrong
+    DV slices)."""
     tmp = rpu_out + ".part"
     _rm(tmp)
     p1 = subprocess.Popen(build_annexb_command(ffmpeg, dv_video),
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        p2 = subprocess.run(build_rpu_extract_command(dovi_tool, tmp),
+        p2 = subprocess.run(build_rpu_extract_command(dovi_tool, tmp, mode=mode),
                             stdin=p1.stdout, capture_output=True, text=True, timeout=timeout)
     finally:
         p1.stdout.close()
@@ -339,7 +354,8 @@ def _rm(path: str):
 
 def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
                     seg_seconds: int, crf: float = X265_CRF, preset: str = X265_PRESET,
-                    boundaries: list | None = None, encode_source: str | None = None) -> dict:
+                    boundaries: list | None = None, encode_source: str | None = None,
+                    rpu_mode: int | None = None) -> dict:
     """Identity of a segmented-encode run. If ANY of this changes between attempts, the
     persisted segments/RPU describe a DIFFERENT encode and must not be resumed: a re-rendered
     dv_video would pass the frame-count check yet concat WRONG CONTENT into the master. `segb`
@@ -359,6 +375,8 @@ def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
             m["enc"] = f"{st.st_size}:{int(st.st_mtime)}"
         except OSError:
             m["enc"] = "missing"
+    if rpu_mode is not None:                # a mode-2 (P7→8.1) RPU is a DIFFERENT RPU: switching
+        m["rpu_mode"] = int(rpu_mode)       # modes must wipe the persisted rpu.bin + segments
     return m                                # and resumes instead of wiping on the schema change
 
 

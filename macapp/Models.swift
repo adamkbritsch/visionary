@@ -201,6 +201,8 @@ struct MovieItemDTO: Codable, Identifiable {
     var output_mode_effective: String?  // auto already resolved against the source range
     var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
     var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
+    var has_dv: Bool?      // already Dolby Vision — badged, combine-only (no plain add)
+    var combine: Bool?     // queued as a COMPANION COMBINE (best-of merge with a seedbox copy)
     var id: String { name ?? title ?? "" }
 
     // "4K · HDR · HEVC — fast path ~2.5× runtime" (empty when the name carries no tags)
@@ -219,9 +221,48 @@ struct MovieSelectedDTO: Codable {        // the curated queue
 
 struct MoviesStateDTO: Codable {
     var selected: MovieSelectedDTO?       // what's queued to process
-    var library: [MovieItemDTO]?          // the searchable pool (non-DV movies)
+    var library: [MovieItemDTO]?          // the searchable pool (ALL movies; has_dv badged)
     var reachable: Bool?
     var titles: [String: String]?         // file basename -> Plex movie title
+    var companions: [String: CompanionDTO]?   // basename -> pairing/verdict state (book_view)
+}
+
+struct CompanionCandidateDTO: Codable, Identifiable {
+    var name: String?
+    var path: String?      // relay virtual path (/seedbox/…)
+    var size: Int64?
+    var is_dir: Bool?
+    var id: String { path ?? name ?? "" }
+}
+
+struct VerdictReencodeDTO: Codable {
+    var predicted: Bool?
+    var basis: String?     // "measured" | "estimate"
+    var mbps: Double?
+}
+
+struct VerdictDTO: Codable {
+    var video_from: String?    // "nas" | "remote"
+    var video_why: String?
+    var rpu_from: String?      // "nas" | "remote" | "resolve"
+    var rpu_profile: String?   // "8.1" / "7.x" / "resolve"
+    var rpu_inline: Bool?
+    var rpu_why: String?
+    var audio_from: String?
+    var audio_why: String?
+    var subs_from: String?
+    var reencode: VerdictReencodeDTO?
+    var cut_warning: String?   // runtimes differ — likely different cuts
+    var specs: [String: String]?   // side -> one-line spec for the card
+}
+
+struct CompanionDTO: Codable {
+    var status: String?        // searching|found|paired|probing|ready|confirmed|error|vanished|mismatch
+    var title: String?
+    var candidates: [CompanionCandidateDTO]?
+    var companion: CompanionCandidateDTO?
+    var verdict: VerdictDTO?
+    var error: String?
 }
 
 struct YouTubeChannelDTO: Codable, Identifiable {   // a queued channel (standing subscription)

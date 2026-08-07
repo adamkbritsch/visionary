@@ -508,3 +508,106 @@ class StepWatch(unittest.TestCase):
     def test_none_callback_is_inert(self):
         with remux._StepWatch(None, "x", "/nope", 100):
             pass                                   # no crash, no thread
+
+
+class CombineDispatcher(unittest.TestCase):
+    """remux.combine(): a thin dispatcher over remux_inject (stream) / remux (capped)."""
+
+    def test_stream_path_grafts_from_the_donor(self):
+        with mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")) as inj, \
+             mock.patch.object(remux, "remux", side_effect=AssertionError("capped path")):
+            res = remux.combine("winner.mkv", "donor.mkv", "audio.mkv", "o.mkv",
+                                rpu_inline=False, rpu_profile="7.x", capped=False)
+        self.assertTrue(res.ok)
+        args, kw = inj.call_args
+        self.assertEqual(args, ("donor.mkv", "audio.mkv", "winner.mkv", "o.mkv"))
+        self.assertEqual(kw["rpu_mode"], 2)              # P7 donor → mode-2 extract
+        self.assertFalse(kw["skip_inject"])
+        self.assertFalse(kw["convert_es"])
+
+    def test_inline_81_winner_skips_the_inject(self):
+        with mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")) as inj:
+            remux.combine("winner.mkv", "winner.mkv", "audio.mkv", "o.mkv",
+                          rpu_inline=True, rpu_profile="8.1", capped=False)
+        kw = inj.call_args.kwargs
+        self.assertTrue(kw["skip_inject"])
+        self.assertFalse(kw["convert_es"])               # 8.1 inline needs no conversion
+        self.assertIsNone(kw["rpu_mode"])
+
+    def test_inline_p7_winner_converts_the_es(self):
+        with mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")) as inj:
+            remux.combine("winner.mkv", "winner.mkv", "audio.mkv", "o.mkv",
+                          rpu_inline=True, rpu_profile="7.x", capped=False)
+        kw = inj.call_args.kwargs
+        self.assertTrue(kw["skip_inject"])
+        self.assertTrue(kw["convert_es"])
+
+    def test_capped_path_delegates_to_remux_with_encode_source(self):
+        with mock.patch.object(remux, "remux",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")) as rm, \
+             mock.patch.object(remux, "remux_inject",
+                               side_effect=AssertionError("stream path")):
+            remux.combine("winner.mkv", "donor.mkv", "audio.mkv", "o.mkv",
+                          rpu_inline=False, rpu_profile="7.x", capped=True,
+                          cap_mbps=50, boundaries=[10, 20])
+        args, kw = rm.call_args
+        self.assertEqual(args, ("donor.mkv", "audio.mkv", "winner.mkv", "o.mkv"))
+        self.assertEqual(kw["encode_source"], "winner.mkv")
+        self.assertEqual(kw["rpu_mode"], 2)
+        self.assertEqual(kw["boundaries"], [10, 20])
+
+
+class InjectSkipAndConvert(unittest.TestCase):
+    """remux_inject's combine extensions, driven with mocked externals."""
+
+    def _run(self, tmp, *, skip_inject, convert_es, calls):
+        import os
+        out = os.path.join(tmp, "master.mkv")
+        info = {"frames": 100, "fps": "24000/1001", "start_time": 0.0,
+                "master_display": None, "max_cll": None}
+        ran = type("R", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+        def fake_run(cmd, **kw):
+            calls.append(cmd[0] if isinstance(cmd, list) else str(cmd))
+            # the convert step gates on its output existing
+            if isinstance(cmd, list) and "convert" in cmd:
+                open(cmd[cmd.index("-o") + 1], "wb").write(b"c" * 10)
+            if isinstance(cmd, list) and any(str(c).endswith(".src.hevc") for c in cmd):
+                for c in cmd:
+                    if str(c).endswith(".src.hevc"):
+                        open(c, "wb").write(b"e" * 10)
+            return ran
+        with mock.patch.object(remux.dvcap, "probe_video", return_value=info), \
+             mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
+             mock.patch.object(remux.dvcap, "extract_rpu",
+                               side_effect=AssertionError("skip_inject must not extract")), \
+             mock.patch.object(remux.dvcap, "build_inject_command",
+                               side_effect=AssertionError("skip_inject must not inject")), \
+             mock.patch.object(remux, "_verify",
+                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 2, 1,
+                                                                           "DV 8.1")), \
+             mock.patch.object(remux.subprocess, "run", side_effect=fake_run):
+            return remux.remux_inject("winner.mkv", "audio.mkv", "winner.mkv", out,
+                                      skip_inject=skip_inject, convert_es=convert_es)
+
+    def test_skip_inject_ships_the_es_untouched(self):
+        import tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, skip_inject=True, convert_es=False, calls=calls)
+        self.assertTrue(res.ok)
+        self.assertIn("shipped as-is", res.reason)
+
+    def test_skip_inject_with_convert_runs_dovi_convert(self):
+        import tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, skip_inject=True, convert_es=True, calls=calls)
+        self.assertTrue(res.ok)
+        self.assertIn("converted to 8.1", res.reason)

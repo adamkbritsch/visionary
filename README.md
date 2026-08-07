@@ -265,6 +265,18 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
   the one case where HDR material is re-encoded, and the plan says which property forced it
   rather than doing it silently.
 
+- **Companion combine** (needs [Shuttle](https://github.com/adamkbritsch/shuttle)'s relay):
+  when a second copy of a movie sits on your seedbox, Visionary pairs the two and builds
+  ONE best-of MKV — the genuinely better HDR10 video, a **real (studio) Dolby Vision RPU**
+  from whichever copy carries one (grafted across releases with `dovi_tool`; Profile 7
+  Blu-ray metadata is converted to 8.1, and real DV always beats a Resolve analysis), and
+  the best lossless audio (**TrueHD Atmos** ranks first — the donor's compat AC-3 rides
+  along). The movie list now shows already-DV titles too, badged and combine-only. Every
+  choice is shown on a **verdict card** you approve before anything runs; the seedbox copy
+  streams straight through the relay (never staged on the NAS, never modified — it keeps
+  seeding), and the combined master obeys the same playback peak budget as every other
+  output, taking the capped re-encode (real RPU preserved) when the winner's peaks bust it.
+
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
@@ -340,6 +352,8 @@ override (env wins):
 | `youtarr_url` / `youtarr_user` / `youtarr_pass` | `TOPAZ_YOUTARR_URL` / `_USER` / `_PASS` | optional — YouTube mode |
 | `youtarr_archive` | `TOPAZ_YOUTARR_ARCHIVE` | optional — FTP path to youtarr's yt-dlp download archive (`complete.list`); defaults to the UGREEN docker layout `/docker/youtarr/config/complete.list` |
 | `youtube_client_id` / `_secret` / `_refresh_token` | — | optional — YouTube subscriptions picker |
+| `shuttle_relay_url` | — | optional — [Shuttle](https://github.com/adamkbritsch/shuttle) relay base URL (e.g. `http://nas:8789`); enables the movie **companion combine** |
+| `shuttle_relay_token` | — | optional — relay bearer token; normally read from Shuttle's own token file in `~/Library/Application Support/Shuttle/` |
 
 > **Plex is optional — you don't need it to run this.** Leave the `plex_*` keys blank and
 > everything still works. Show and movie names come from your **NAS folder structure**, not

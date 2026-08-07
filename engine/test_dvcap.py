@@ -723,3 +723,31 @@ class TightCapResume(unittest.TestCase):
             self.assertTrue(why.startswith("paused:"), why)
             self.assertEqual(caps[0], "50000")                       # untouched → global cap
             self.assertEqual(caps[1], "42000")                       # tightened → resumes tight
+
+
+class DoviModeBuilders(unittest.TestCase):
+    """dovi_tool CLI shapes for the companion combine (verified against the pinned 2.3.0:
+    -m is a GLOBAL flag and must precede the subcommand)."""
+
+    def test_extract_default_has_no_mode(self):
+        cmd = dvcap.build_rpu_extract_command("/dovi", "/r.bin")
+        self.assertEqual(cmd, ["/dovi", "extract-rpu", "-", "-o", "/r.bin"])
+
+    def test_extract_mode_2_precedes_the_subcommand(self):
+        cmd = dvcap.build_rpu_extract_command("/dovi", "/r.bin", mode=2)
+        self.assertEqual(cmd, ["/dovi", "-m", "2", "extract-rpu", "-", "-o", "/r.bin"])
+
+    def test_convert_discards_the_el(self):
+        cmd = dvcap.build_dovi_convert_command("/dovi", "/in.hevc", "/out.hevc")
+        self.assertEqual(cmd, ["/dovi", "-m", "2", "convert", "--discard",
+                               "-i", "/in.hevc", "-o", "/out.hevc"])
+
+    def test_manifest_carries_rpu_mode_only_when_set(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            dv = os.path.join(td, "r.mov"); open(dv, "wb").write(b"x")
+            m0 = dvcap.resume_manifest(dv, 50, 100, "24/1", 300)
+            m2 = dvcap.resume_manifest(dv, 50, 100, "24/1", 300, rpu_mode=2)
+            self.assertNotIn("rpu_mode", m0)             # schema-stable for existing runs
+            self.assertEqual(m2["rpu_mode"], 2)
+            self.assertNotEqual(m0, m2)                  # switching modes wipes stale RPU

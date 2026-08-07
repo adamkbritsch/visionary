@@ -152,3 +152,62 @@ class ReleaseTags(unittest.TestCase):
         ms = movies.parse_movies([{"name": "Alpha (2010) [2160p WEB HEVC].mkv", "dir": "/M"}])
         self.assertEqual(ms[0]["tags"], ["4K", "HEVC"])
         self.assertEqual(ms[0]["route"], "fast path ~2.5× runtime")
+
+
+class CombineFlag(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = mock.patch.object(movies, "SELECTED_FILE", os.path.join(self.d, "movie_queue.json"))
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_combine_flag_rides_the_queue_entry(self):
+        movies.add_selected("a.mkv", "/Media/Movies", "A (2001)", combine=True)
+        movies.add_selected("b.mkv", "/Media/Movies", "B (2002)")
+        items = movies.get_selected()
+        self.assertTrue(items[0].get("combine"))
+        self.assertNotIn("combine", items[1])            # plain adds carry no key
+        nx = movies.next_due()
+        self.assertTrue(nx["combine"])                   # next_due surfaces it
+
+    def test_selected_view_carries_combine(self):
+        movies.add_selected("a.mkv", "/m", "A", combine=True)
+        self.assertTrue(movies.selected_view()["items"][0].get("combine"))
+
+
+class DvInclusiveLibrary(unittest.TestCase):
+    """The library keeps already-DV movies now (badged in the app, combine-only)."""
+
+    def test_refresh_keeps_dv_entries_with_the_flag(self):
+        entries = [{"name": "NoDv (2001) [2160p].mkv", "dir": "/m"},
+                   {"name": "HasDv (2002) [2160p].mkv", "dir": "/m"}]
+        dv_map = {"HasDv (2002) [2160p].mkv": 1}
+        import plex
+        with mock.patch.object(movies, "list_movie_entries", return_value=entries), \
+             mock.patch.object(movies, "load_movies_dv_manifest", return_value=dv_map), \
+             mock.patch.object(plex, "movie_watched_map", return_value={}), \
+             mock.patch.dict(movies._CACHE, {}, clear=True):
+            lib = movies.refresh_library()
+        self.assertEqual(len(lib), 2)                    # DV entry NOT filtered out
+        by_name = {m["name"]: m for m in lib}
+        self.assertTrue(by_name["HasDv (2002) [2160p].mkv"]["has_dv"])
+        self.assertFalse(by_name["NoDv (2001) [2160p].mkv"]["has_dv"])
+
+
+class CombineUpgrade(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = mock.patch.object(movies, "SELECTED_FILE", os.path.join(self.d, "q.json"))
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_confirming_a_pairing_upgrades_a_queued_movie(self):
+        movies.add_selected("a.mkv", "/m", "A")                  # plain add first
+        movies.add_selected("a.mkv", "/m", "A", combine=True)    # then the pairing confirms
+        items = movies.get_selected()
+        self.assertEqual(len(items), 1)                          # still one entry
+        self.assertTrue(items[0]["combine"])

@@ -339,7 +339,7 @@ def _verify(output: str, ffprobe: str, optimized: bool = None) -> RemuxResult:
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
-          encode_source=None,
+          encode_source=None, rpu_mode=None,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -370,13 +370,14 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     # a re-rendered dv_video or changed cap would otherwise concat stale/wrong segments
     dvcap.ensure_segdir(segdir, dvcap.resume_manifest(
         dv_video, cap_mbps, info["frames"], info["fps"], dvcap.SEG_SECONDS, boundaries=boundaries,
-        encode_source=encode_source))
+        encode_source=encode_source, rpu_mode=rpu_mode))
     rpu = os.path.join(segdir, "rpu.bin")
     hevc = output + ".capped.hevc"          # transient: the concat of the segments, rebuilt each attempt
     tracks = dv_mp4 = None
     try:
         if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):   # resume keeps the extracted RPU
-            ok, why = dvcap.extract_rpu(dv_video, rpu, ffmpeg=ffmpeg, timeout=timeout)
+            ok, why = dvcap.extract_rpu(dv_video, rpu, mode=rpu_mode, ffmpeg=ffmpeg,
+                                        timeout=timeout)
             if not ok:
                 return RemuxResult(False, output, reason=why)
         # RPU frame count is GROUND TRUTH (one per coded frame). The container nb_frames HEADER
@@ -385,6 +386,17 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         real_frames = dvcap.rpu_frame_count(rpu)
         if real_frames <= 0:
             return RemuxResult(False, output, reason="could not read RPU frame count — resume state intact")
+        if encode_source is not None:
+            # FAIL FAST before the hours-long encode: when the RPU donor and the encoded
+            # video are different files (rpu-only fallback / companion combine), a frame
+            # mismatch means a different cut — the post-encode count check would only
+            # catch it after burning the whole x265 pass.
+            n_enc = dvcap.count_hevc_frames(enc, ffprobe)
+            if n_enc > 0 and n_enc != real_frames:
+                return RemuxResult(False, output,
+                                   reason=f"RPU/source frame mismatch: rpu {real_frames} != "
+                                          f"source {n_enc} — the RPU donor is not frame-aligned "
+                                          f"with the encoded video (shipped nothing)")
         ok, frames, why = dvcap.encode_capped_segmented(
             enc, rpu, hevc, cap_mbps, segdir=segdir,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
@@ -553,13 +565,21 @@ def _fsize(path) -> int:
 
 def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                  audio_target_lufs=None, abort=None, on_step=None,
+                 rpu_mode=None, skip_inject=False, convert_es=False,
                  ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
-    """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream with
-    Resolve's Dolby Vision RPU injected — NO re-encode, NO peak cap (the source's own peaks
-    were already direct-playing before the pipeline touched it). The DV render contributes
-    ONLY its RPU; its video is discarded. HARD GATE: the RPU frame count must exactly equal
+    """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream
+    (orig_source) with a Dolby Vision RPU from `dv_video` injected — no re-encode (the
+    caller peak-gates before choosing this path). The RPU donor contributes ONLY its
+    metadata; its video is discarded. HARD GATE: the RPU frame count must exactly equal
     the source's coded-frame count — a misaligned RPU time-shifts every frame's DV trim,
-    which is worse than no DV, so a mismatch ships NOTHING."""
+    which is worse than no DV, so a mismatch ships NOTHING.
+
+    Companion-combine extensions (all default-off — zero change for the classic path):
+    `rpu_mode=2` converts a Profile 7 donor's RPU to 8.1 during extraction;
+    `skip_inject=True` means orig_source ALREADY carries the wanted RPU inline (the
+    winner is itself the real-DV file) — no extraction, no inject, its own bits ship;
+    `convert_es=True` (with skip_inject) runs dovi_tool `-m 2 convert --discard` on the
+    copied ES first, single-layer-ifying an inline-P7 winner."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     info = dvcap.probe_video(dv_video, ffprobe)
     if info["frames"] <= 0:      # transient ffprobe blip — fail cleanly, resume state intact
@@ -572,37 +592,44 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
     try:
         if Fraction(str(src_info["fps"])) != Fraction(str(info["fps"])):
             return RemuxResult(False, output,
-                               reason=f"fps mismatch: source {src_info['fps']} vs render "
+                               reason=f"fps mismatch: source {src_info['fps']} vs RPU donor "
                                       f"{info['fps']} — RPU cannot align (shipped nothing)")
     except (ValueError, ZeroDivisionError):
         return RemuxResult(False, output, reason="unreadable fps — RPU alignment unverifiable")
-    # Small resume dir: keeps ONLY the extracted RPU (tens of MB). Same name the cleanup
-    # stage already sweeps; the manifest identity wipes a stale RPU if the render changed.
-    segdir = output + ".remuxsegs"
-    try:
-        st = os.stat(dv_video)
-        src_id = f"{st.st_size}:{int(st.st_mtime)}"
-    except OSError:
-        src_id = "missing"
-    dvcap.ensure_segdir(segdir, {"mode": "inject", "src": src_id,
-                                 "frames": n_src, "fps": str(info["fps"])})
-    rpu = os.path.join(segdir, "rpu.bin")
     src_es = output + ".src.hevc"           # transient: the source's Annex-B ES (original bits)
     inj_es = output + ".inject.hevc"        # transient: same ES with the RPU interleaved
     tracks = dv_mp4 = None
+    segdir = None
     try:
-        if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):
-            if on_step:
-                on_step("extracting DV metadata", None)   # reads the whole render; no
-            ok, why = dvcap.extract_rpu(dv_video, rpu, ffmpeg=ffmpeg, timeout=timeout)   # watchable output
-            if not ok:
-                return RemuxResult(False, output, reason=why)
-        n_rpu = dvcap.rpu_frame_count(rpu)
-        if n_rpu != n_src:
-            return RemuxResult(False, output,
-                               reason=f"RPU/source frame mismatch: rpu {n_rpu} != source {n_src} "
-                                      f"— Resolve render is not frame-aligned with the original "
-                                      f"(shipped nothing)")
+        if not skip_inject:
+            # Small resume dir: keeps ONLY the extracted RPU (tens of MB). Same name the
+            # cleanup stage sweeps; the manifest identity wipes a stale RPU if the donor
+            # (or the extraction mode) changed.
+            segdir = output + ".remuxsegs"
+            try:
+                st = os.stat(dv_video)
+                src_id = f"{st.st_size}:{int(st.st_mtime)}"
+            except OSError:
+                src_id = "missing"
+            manifest = {"mode": "inject", "src": src_id,
+                        "frames": n_src, "fps": str(info["fps"])}
+            if rpu_mode is not None:
+                manifest["rpu_mode"] = int(rpu_mode)
+            dvcap.ensure_segdir(segdir, manifest)
+            rpu = os.path.join(segdir, "rpu.bin")
+            if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):
+                if on_step:
+                    on_step("extracting DV metadata", None)   # reads the whole donor; no
+                ok, why = dvcap.extract_rpu(dv_video, rpu, mode=rpu_mode,        # watchable output
+                                            ffmpeg=ffmpeg, timeout=timeout)
+                if not ok:
+                    return RemuxResult(False, output, reason=why)
+            n_rpu = dvcap.rpu_frame_count(rpu)
+            if n_rpu != n_src:
+                return RemuxResult(False, output,
+                                   reason=f"RPU/source frame mismatch: rpu {n_rpu} != source "
+                                          f"{n_src} — the RPU donor is not frame-aligned with "
+                                          f"the shipped video (shipped nothing)")
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
         with _StepWatch(on_step, "copying the original video", src_es, _fsize(orig_source)):
@@ -612,16 +639,29 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             return RemuxResult(False, output, reason="source ES extract failed: " + _tail(ex.stderr))
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
-        with _StepWatch(on_step, "injecting DV metadata", inj_es, _fsize(src_es)):
-            ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
-                                capture_output=True, text=True, timeout=timeout)
-        if ij.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
-            return RemuxResult(False, output,
-                               reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
-        n_inj = dvcap.count_hevc_frames(inj_es, ffprobe)    # inject writes AUDs → 1 packet/frame
+        if skip_inject:
+            if convert_es:
+                # inline-P7 winner: drop the EL, rewrite the RPU to 8.1, in one pass
+                with _StepWatch(on_step, "converting DV to profile 8.1", inj_es, _fsize(src_es)):
+                    cv = subprocess.run(dvcap.build_dovi_convert_command(dvcap.DOVI_TOOL,
+                                                                         src_es, inj_es),
+                                        capture_output=True, text=True, timeout=timeout)
+                if cv.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
+                    return RemuxResult(False, output,
+                                       reason="DV convert failed: " + _tail(cv.stderr or cv.stdout))
+            else:
+                inj_es = src_es              # the winner's own bits, RPU already inline
+        else:
+            with _StepWatch(on_step, "injecting DV metadata", inj_es, _fsize(src_es)):
+                ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
+                                    capture_output=True, text=True, timeout=timeout)
+            if ij.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
+                return RemuxResult(False, output,
+                                   reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
+        n_inj = dvcap.count_hevc_frames(inj_es, ffprobe)    # AUDs → 1 packet/frame
         if n_inj != n_src:
             return RemuxResult(False, output,
-                               reason=f"injected ES frame count changed: {n_inj} != {n_src} "
+                               reason=f"processed ES frame count changed: {n_inj} != {n_src} "
                                       f"(shipped nothing)")
         audio_note = ""
         if output.lower().endswith(".mkv"):
@@ -686,14 +726,58 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
                 _rm(output)
                 return res
-        # NO peak gate here (user-dictated): the shipped video IS the source's own encode.
-        res.reason += " · original stream + injected RPU (no re-encode, peak gate n/a)" + audio_note
-        shutil.rmtree(segdir, ignore_errors=True)      # SUCCESS: the RPU won't be needed again
+        # NO peak gate here: the caller gated the source's peaks before choosing this path.
+        if skip_inject and convert_es:
+            note = " · original stream, DV converted to 8.1 (no re-encode)"
+        elif skip_inject:
+            note = " · original DV stream shipped as-is (no re-encode)"
+        else:
+            note = " · original stream + injected RPU (no re-encode)"
+        res.reason += note + audio_note
+        if segdir:
+            shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the RPU won't be needed again
         return res
     finally:
         # the two big ESes are transient EVERY attempt (recreated in minutes); only the small
         # rpu.bin persists (in segdir) for resume — segdir is KEPT on any non-success return
         _rm(src_es); _rm(inj_es); _rm(tracks); _rm(dv_mp4)
+
+
+def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
+            rpu_inline=False, rpu_profile="", capped=False,
+            cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, boundaries=None,
+            audio_target_lufs=None, abort=None, on_step=None, on_progress=None,
+            on_plan=None, should_pause=None, on_repair=None,
+            ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
+    """COMPANION COMBINE (user-dictated): one best-of master from two copies of a film.
+    `winner` = the video that ships (the genuinely better HDR10 base, or the real-DV file
+    itself); `rpu_source` = where the Dolby Vision metadata comes from (the real-DV copy,
+    or the Resolve render when neither copy has an RPU); `audio_source` = the file whose
+    ENTIRE audio ships (best track wins the whole file — its compat AC-3 rides along).
+    Subtitles ship from the winner. Output is always MKV (TrueHD-class audio).
+
+    `capped=False` → stream path: the winner's own bits ship (RPU grafted/converted as
+    needed) — the caller peak-gates first. `capped=True` → the enforced-VBV x265
+    native-DV re-encode of the winner with the SAME RPU (real DV survives a re-encode —
+    prioritized over Resolve DV either way, user-dictated).
+
+    A thin dispatcher: both paths are the proven remux_inject / remux machinery — the
+    frame-count and fps hard gates in there are exactly the different-cut gates a
+    cross-release graft needs (a mismatch ships NOTHING; the stage parks it)."""
+    p7 = str(rpu_profile).startswith("7")
+    mode = 2 if p7 else None
+    if capped:
+        return remux(rpu_source, audio_source, winner, output,
+                     cap_mbps=cap_mbps, audio_target_lufs=audio_target_lufs,
+                     boundaries=boundaries, abort=abort, on_progress=on_progress,
+                     on_plan=on_plan, should_pause=should_pause, on_repair=on_repair,
+                     encode_source=winner, rpu_mode=mode,
+                     ffmpeg=ffmpeg, mp4box=mp4box, ffprobe=ffprobe, timeout=timeout)
+    return remux_inject(rpu_source, audio_source, winner, output,
+                        audio_target_lufs=audio_target_lufs, abort=abort, on_step=on_step,
+                        rpu_mode=mode, skip_inject=rpu_inline,
+                        convert_es=(rpu_inline and p7),
+                        ffmpeg=ffmpeg, mp4box=mp4box, ffprobe=ffprobe, timeout=timeout)
 
 
 def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: str, *,

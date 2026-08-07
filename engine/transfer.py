@@ -207,6 +207,43 @@ class _Aborted(Exception):
     stopped — so the blocking RETR returns at once instead of finishing the file."""
 
 
+def download_head(remote_path, local_file, max_bytes, *, timeout=None):
+    """The FIRST `max_bytes` of a NAS file → `local_file`, for header probing
+    (companion combine: MKV track/codec/DV metadata lives at the front). Aborting
+    RETR mid-stream is the POINT here — the truncation is deliberate, so unlike
+    download() there is no size verify. Returns (ok, reason)."""
+    os.makedirs(os.path.dirname(local_file) or ".", exist_ok=True)
+    try:
+        ftp = connect(timeout=timeout or TRANSFER_TIMEOUT)
+    except ftplib.all_errors as e:
+        return False, f"FTP connect/login failed: {e}"
+    got = 0
+    try:
+        with open(local_file, "wb") as f:
+            def _write(block):
+                nonlocal got
+                f.write(block)
+                got += len(block)
+                if got >= max_bytes:
+                    raise _Aborted()
+            try:
+                ftp.retrbinary("RETR " + remote_path, _write)
+            except _Aborted:
+                pass                      # deliberate early stop — the head is complete
+        if got <= 0:
+            return False, "no bytes read"
+        return True, f"read {got} bytes"
+    except ftplib.all_errors as e:
+        # small files can finish BEFORE max_bytes: that path returns above; here the
+        # transfer itself failed
+        return False, f"head read failed: {e}"
+    finally:
+        # the deliberate mid-RETR abort leaves the control connection wedged — close
+        # hard, never quit()
+        try: ftp.close()
+        except Exception: pass
+
+
 def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=None):
     """Pull a source from the NAS via FTP. Returns (ok, local_path, reason).
     on_progress(done_bytes, total_bytes) fires as blocks arrive, for a live % bar.

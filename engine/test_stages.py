@@ -1338,3 +1338,163 @@ class FastRemuxStepProgress(unittest.TestCase):
         self.assertIsNone(emitted[1]["pct"])
         self.assertEqual(emitted[2]["step"], "copying the original video")
         self.assertEqual(emitted[2]["pct"], 41.5)
+
+
+class CombineStages(unittest.TestCase):
+    """COMPANION COMBINE routing through the generic stages."""
+
+    CV = {"verdict": {"video_from": "nas", "rpu_from": "remote", "rpu_profile": "7.x",
+                      "rpu_inline": False, "audio_from": "remote"},
+          "companion": {"path": "/seedbox/M/m.remux.mkv", "name": "m.remux.mkv",
+                        "size": 500}}
+
+    def _p(self, d, cv=None):
+        import companion
+        from orchestrator import movie_paths
+        with mock.patch.object(companion, "confirmed_verdict",
+                               return_value=(cv if cv is not None else dict(self.CV))):
+            return movie_paths("Movie (2020) [2160p].mkv", "/Media/Movies/M",
+                               "Movie (2020)", scratch_dir=d, combine=True)
+
+    def test_topaz_noops_before_the_dv_refusal(self):
+        import plan
+        p = self._p(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for",
+                               side_effect=AssertionError("combine must not consult the plan")):
+            ok, msg = stages.run_stage("topaz", p)
+        self.assertTrue(ok)
+        self.assertIn("combine", msg)
+
+    def test_resolve_skips_on_a_real_rpu(self):
+        import companion
+        p = self._p(tempfile.mkdtemp())
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages.subprocess, "Popen",
+                               side_effect=AssertionError("must not launch Resolve")):
+            ok, msg = stages.run_stage("resolve", p)
+        self.assertTrue(ok)
+        self.assertIn("Resolve not needed", msg)
+
+    def test_resolve_parks_when_the_book_is_lost(self):
+        import companion
+        p = self._p(tempfile.mkdtemp())
+        with mock.patch.object(companion, "confirmed_verdict", return_value=None):
+            ok, msg = stages.run_stage("resolve", p)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("permanent:"))
+
+    def test_download_pulls_both_copies(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        def fake_dl(remote, local_dir, **kw):
+            open(p.source, "w").write("xxx")
+            return True, p.source, "downloaded 3 bytes"
+        def fake_fetch(virtual, dest, size, **kw):
+            open(dest, "w").write("x" * size)
+            return True, f"fetched {size} bytes"
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_remote_size", return_value=3), \
+             mock.patch.object(stages.transfer, "download", side_effect=fake_dl), \
+             mock.patch.object(companion, "manifest",
+                               return_value={"files": [{"rel": "m.remux.mkv", "size": 500}]}), \
+             mock.patch.object(companion, "fetch_to_file", side_effect=fake_fetch), \
+             mock.patch.object(stages, "_ensure_cfr",
+                               side_effect=AssertionError("combine has no CFR pass")):
+            ok, msg = stages.run_stage("download", p)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(p.companion_src))
+        self.assertEqual(os.path.getsize(p.companion_src), 500)
+
+    def test_download_vanished_companion_parks(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        open(p.source, "w").write("xxx")                     # NAS copy already on disk
+        with mock.patch.object(stages, "_remote_size", return_value=3), \
+             mock.patch.object(companion, "manifest", return_value={"files": []}), \
+             mock.patch.object(companion, "mark") as mk:
+            ok, msg = stages.run_stage("download", p)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("permanent:"))
+        mk.assert_called_once_with(p.source_basename, "vanished")
+
+    def test_download_relay_down_is_retryable(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        open(p.source, "w").write("xxx")
+        with mock.patch.object(stages, "_remote_size", return_value=3), \
+             mock.patch.object(companion, "manifest",
+                               side_effect=companion.RelayDownError("relay unreachable")):
+            ok, msg = stages.run_stage("download", p)
+        self.assertFalse(ok)
+        self.assertFalse(msg.startswith("permanent:"))
+        self.assertIn("relay unreachable", msg)
+
+    def test_remux_under_gate_streams_via_combine(self):
+        import companion, remux
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_peak_of", return_value=40.0), \
+             mock.patch.object(remux, "combine",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 2, 1,
+                                                              "ok")) as cb, \
+             mock.patch.object(remux, "remux", side_effect=AssertionError("classic path")), \
+             mock.patch.object(remux, "remux_inject", side_effect=AssertionError("direct inject")):
+            ok, _ = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        kw = cb.call_args.kwargs
+        self.assertFalse(kw["capped"])
+        self.assertEqual(kw["rpu_profile"], "7.x")
+        args = cb.call_args.args
+        self.assertEqual(args[0], p.source)              # winner = NAS copy
+        self.assertEqual(args[1], p.companion_src)       # RPU donor = remote
+        self.assertEqual(args[2], p.companion_src)       # audio donor = remote
+
+    def test_remux_over_gate_takes_the_capped_combine(self):
+        import companion, remux
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_peak_of", return_value=96.0), \
+             mock.patch.object(stages, "_plan_fast_path_bounds", return_value=" planned") as pb, \
+             mock.patch.object(stages, "_read_topaz_bounds", return_value=[100, 200]), \
+             mock.patch.object(remux, "combine",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 2, 1,
+                                                              "ok")) as cb:
+            ok, _ = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        pb.assert_called_once()
+        kw = cb.call_args.kwargs
+        self.assertTrue(kw["capped"])
+        self.assertEqual(kw["boundaries"], [100, 200])
+
+    def test_remux_cut_mismatch_with_a_real_donor_is_permanent(self):
+        import companion, remux
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        bad = remux.RemuxResult(False, p.final,
+                                reason="RPU/source frame mismatch: rpu 9 != source 8 (shipped nothing)")
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_peak_of", return_value=40.0), \
+             mock.patch.object(remux, "combine", return_value=bad):
+            ok, msg = stages.run_stage("remux", p)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("permanent: companion is a different cut"))
+
+    def test_remux_mismatch_against_the_resolve_render_is_retryable(self):
+        import companion, remux
+        d = tempfile.mkdtemp()
+        cv = {"verdict": dict(self.CV["verdict"], rpu_from="resolve", rpu_profile="resolve"),
+              "companion": self.CV["companion"]}
+        p = self._p(d, cv=cv)
+        bad = remux.RemuxResult(False, p.final,
+                                reason="RPU/source frame mismatch: rpu 9 != source 8 (shipped nothing)")
+        with mock.patch.object(companion, "confirmed_verdict", return_value=cv), \
+             mock.patch.object(stages, "_peak_of", return_value=40.0), \
+             mock.patch.object(remux, "combine", return_value=bad):
+            ok, msg = stages.run_stage("remux", p)
+        self.assertFalse(ok)
+        self.assertFalse(msg.startswith("permanent:"))   # truncated render → retry resolves it

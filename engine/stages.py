@@ -91,16 +91,23 @@ def _source_peak_mbps(p):
     and it is the exact stream the RPU is frame-aligned with and that a revoked stream copy
     would re-encode. Returns None when unmeasurable (the caller fails the attempt — never
     ship OR re-encode unverified); an unmeasurable result is never cached."""
+    return _peak_of(p.source_cfr, p.source_basename)
+
+
+def _peak_of(path, key):
+    """The cached-peak machinery on an ARBITRARY file (companion combine measures the
+    verdict WINNER, which may be the fetched seedbox copy). `key` is the peak book's
+    entry name."""
     import dvcap
     try:
         with _PEAKGATE_LOCK:
             with open(_PEAKGATE_FILE) as f:
-                v = (json.load(f) or {}).get(p.source_basename)
+                v = (json.load(f) or {}).get(key)
         if isinstance(v, (int, float)) and v > 0:
             return float(v)
     except (OSError, ValueError, TypeError):
         pass
-    mbps = dvcap.video_peak_1s_mbps(p.source_cfr)
+    mbps = dvcap.video_peak_1s_mbps(path)
     if mbps <= 0:
         return None
     try:
@@ -112,7 +119,7 @@ def _source_peak_mbps(p):
                     d = {}
             except (OSError, ValueError):
                 d = {}
-            d[p.source_basename] = round(mbps, 1)
+            d[key] = round(mbps, 1)
             os.makedirs(os.path.dirname(_PEAKGATE_FILE), exist_ok=True)
             tmp = _PEAKGATE_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -123,26 +130,29 @@ def _source_peak_mbps(p):
     return mbps
 
 
-def _plan_fast_path_bounds(p, progress=None) -> str:
+def _plan_fast_path_bounds(p, progress=None, src=None) -> str:
     """RESOLVE-ONLY fast path: no upscale, but the capped remux still re-encodes — so run
     topaz's PLANNING front half (scene detect + ~90 s grouping, the exact same utilities)
     and stash the cumulative end-frames, so the remux segments at scene cuts like the
     topaz path (user-dictated). Best-effort: any failure just leaves the remux on its
     flat ~SEG_SECONDS plan. Returns a short note for the stage message. The scan is
     cached twice over — bounds in _SEGBOUNDS_FILE (checked first, so retries are free)
-    and raw cut times in segdir/scenes.json (swept at cleanup like any segdir)."""
+    and raw cut times in segdir/scenes.json (swept at cleanup like any segdir).
+    `src` overrides WHICH file gets scanned (companion combine scans the verdict winner;
+    the bounds book still keys on the item's own basename)."""
     import topaz
+    src = src or p.source_cfr
     if _read_topaz_bounds(p.source_basename):        # resume: already planned — no re-scan
         return " (scene plan cached)"
     try:
         if progress:
             progress({"stage": "topaz", "ep": p.ep, "pct": None})
-        total = topaz.total_frames(p.source_cfr)
-        fps, _dur = topaz.media_timing(p.source_cfr)
+        total = topaz.total_frames(src)
+        fps, _dur = topaz.media_timing(src)
         if not total or not fps:
             return " (no scene plan — flat remux segments)"
         os.makedirs(p.segdir, exist_ok=True)         # scenes.json cache lives here
-        cuts = topaz._cached_scene_frames(p.source_cfr, p.segdir, fps)
+        cuts = topaz._cached_scene_frames(src, p.segdir, fps)
         segs = topaz.plan_segments(total, fps, cuts)
         if segs:
             _write_topaz_bounds(p.source_basename, [b for (_a, b) in segs])
@@ -210,6 +220,8 @@ def _download(p, abort, progress=None, low_prio=False):
     and the Resolve timeline-length guard. p.source_cfr is what Topaz, Resolve and the
     remux all read; the original stays so the size check still proves the download finished.
     stage_done('download') requires BOTH, so an interrupted CFR pass just resumes here."""
+    if p.combine:
+        return _download_combine(p, abort, progress)
     have_source = False
     if os.path.exists(p.source):
         if _source_complete(p) is not False:   # complete, OR can't verify → keep & reuse
@@ -241,6 +253,67 @@ def _download(p, abort, progress=None, low_prio=False):
     if plan.probe_input(p.source).get("is_dv"):
         return False, "permanent: source is already Dolby Vision — nothing to upscale"
     return _ensure_cfr(p, abort, progress, low_prio=low_prio)
+
+
+def _download_combine(p, abort, progress=None):
+    """COMPANION COMBINE download: BOTH copies land on scratch — the NAS copy over
+    Visionary's own FTP (same reuse/verify/partial rules as the classic path) and the
+    seedbox companion streamed through the Shuttle relay (rclone-cat; nothing staged on
+    the NAS). NO Dolby Vision refusal (a DV copy is the point here) and NO CFR pass
+    (combine never feeds Topaz; the remux and Resolve read the originals directly)."""
+    import companion as companion_mod
+    import scratch as scratch_mod
+    if not p.companion_virtual or p.companion_size <= 0:
+        # book lost/unpaired after the item entered the pipeline — never guess tracks
+        return False, "permanent: combine verdict lost — re-pair the companion"
+    # Free-space precheck: both copies + the winner's two ES transients + the master —
+    # roughly 4x the larger copy when both still need to land. Short → retryable hold
+    # (space frees as other items finish), never a park.
+    nas_size = _remote_size(p.nas_source, None) or 0
+    pending = ((0 if os.path.exists(p.source) else nas_size)
+               + (0 if os.path.exists(p.companion_src) else p.companion_size))
+    need_gb = (pending + 3 * max(nas_size, p.companion_size)) / 1e9
+    avail = scratch_mod.available_gb()
+    if avail is not None and nas_size and avail < need_gb:
+        return False, f"holding: combine needs ~{need_gb:.0f} GB free ({avail:.0f} GB available)"
+    # -- NAS copy (FTP, verified) ---------------------------------------------------
+    have_source = os.path.exists(p.source) and _source_complete(p) is not False
+    if os.path.exists(p.source) and not have_source:
+        try: os.remove(p.source)               # verified INCOMPLETE → re-pull clean
+        except OSError: pass
+    if not have_source:
+        on_prog = None
+        if progress:
+            def on_prog(done, total):          # NAS pull = the front half of the bar
+                progress({"stage": "download", "ep": p.ep, "pct": round(done / total * 50)})
+        ok, _local, reason = transfer.download(p.nas_source, os.path.dirname(p.source),
+                                               on_progress=on_prog, abort=abort)
+        if not ok:
+            if os.path.exists(p.source):
+                try: os.remove(p.source)
+                except OSError: pass
+            return ok, reason
+    # -- companion (relay-streamed from the seedbox) --------------------------------
+    if progress:
+        progress({"stage": "download", "ep": p.ep, "pct": 50, "step": "fetching companion"})
+    try:
+        m = companion_mod.manifest(p.companion_virtual)
+        if not (m.get("files") or []):
+            companion_mod.mark(p.source_basename, "vanished")
+            return False, "permanent: companion no longer on the seedbox — re-pair"
+    except companion_mod.RelayError as e:
+        return False, f"companion manifest: {e}"     # relay down/busy → retryable
+    on_cprog = None
+    if progress:
+        def on_cprog(done, total):                   # companion = the back half
+            progress({"stage": "download", "ep": p.ep,
+                      "pct": 50 + round(done / total * 50), "step": "fetching companion"})
+    ok, reason = companion_mod.fetch_to_file(p.companion_virtual, p.companion_src,
+                                             p.companion_size,
+                                             on_progress=on_cprog, abort=abort)
+    if not ok:
+        return False, "companion fetch: " + reason
+    return True, f"both copies on scratch ({reason})"
 
 
 def _ensure_cfr(p, abort, progress=None, low_prio=False):
@@ -289,6 +362,11 @@ def _topaz(p, abort, progress=None, should_pause=None):
     (upscale 1080p 2×, clean already-4K 1×; range PRESERVED, never SDR<->HDR).
     Reports live frame progress to the dashboard (Topaz is headless — the app is
     the only UI). `abort` lets the watchdog kill it mid-encode."""
+    if p.combine:
+        # COMPANION COMBINE never upscales — and this return must come BEFORE the
+        # plan_for skip below, which would otherwise "permanent:"-refuse the DV copy
+        # that is the whole point of the combine.
+        return True, "combine — no upscale, both copies ship their own bits"
     import topaz, settings, plan
     # Plan from the ORIGINAL source: the CFR re-encode (libx264) strips Dolby Vision side
     # data, so an already-DV source must be detected here, not on the CFR file. Resolution/
@@ -530,8 +608,19 @@ def _resolve(p, abort, progress=None):
     FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
     nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""
     import plan
+    if p.combine:
+        # COMPANION COMBINE: a REAL RPU (either copy) makes this whole stage unnecessary —
+        # real DV beats Resolve DV (user-dictated). Only the neither-copy-has-DV fallback
+        # renders, and it analyzes the verdict WINNER. Checked BEFORE the plan skip below:
+        # a DV library copy would otherwise "permanent:"-refuse the item it belongs to.
+        import companion as companion_mod
+        cv = companion_mod.confirmed_verdict(p.source_basename)
+        if not cv:
+            return False, "permanent: combine verdict lost — re-pair the companion"
+        if cv["verdict"].get("rpu_from") != "resolve":
+            return True, "combine: real Dolby Vision RPU present — Resolve not needed"
     pl = plan.plan_for(p.source)   # ORIGINAL: CFR re-encode strips DV side data (skip-detection)
-    if pl.get("resolve") == "skip":
+    if not p.combine and pl.get("resolve") == "skip":
         return False, "permanent: source is already Dolby Vision — nothing for Resolve to do"
     # OUTPUT MODE. "auto" is the long-standing rule — SDR intake -> the 1000-nit DV project,
     # HDR intake -> the 2000-nit one. A per-item override pins it regardless of the source;
@@ -568,7 +657,7 @@ def _resolve(p, abort, progress=None):
     # sources are routinely VFR, and the render-completeness gate counts frames against
     # source_cfr. SuperScale 2x only for ~1080p sources (user-dictated).
     yt = bool(p.youtube)
-    single = fast or yt
+    single = fast or yt or p.combine
     ss = "-"
     if yt:
         try:
@@ -581,7 +670,7 @@ def _resolve(p, abort, progress=None):
     # near-lossless crf bitrate, which would inflate the export for no quality gain. In
     # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
     # (A mezzanine retry keeps this same value — the inflated mezz bitrate is not quality.)
-    bitrate = (EXPORT_BITRATE_FLOOR_KBPS if pl.get("topaz") == "rpu-only"
+    bitrate = (EXPORT_BITRATE_FLOOR_KBPS if (pl.get("topaz") == "rpu-only" or p.combine)
                else YOUTUBE_RENDER_KBPS if yt
                else max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS))
 
@@ -673,7 +762,12 @@ def _resolve(p, abort, progress=None):
         return ok, out, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")
 
     try:
-        ok, out, reason = _run(p.source_cfr if yt else p.source)
+        from orchestrator import combine_winner_path
+        video_in = (combine_winner_path(p) if p.combine
+                    else p.source_cfr if yt else p.source)
+        if p.combine and not video_in:
+            return False, "permanent: combine verdict lost — re-pair the companion"
+        ok, out, reason = _run(video_in)
         # A PINNED display that is unplugged, asleep or unmovable must not silently become
         # "drive the main display" — that is the one outcome hosting exists to prevent. The
         # item defers instead, so a yanked cable stalls the run rather than surprising the
@@ -689,7 +783,8 @@ def _resolve(p, abort, progress=None):
         logbook.failure(f"resolve {p.ep}: source not ingestible — building HEVC compat mezzanine")
         if progress:
             progress({"stage": "resolve", "ep": p.ep, "pct": 0})
-        mok, mezz = _build_mezzanine(p, abort, progress, src=(p.source_cfr if yt else None))
+        mok, mezz = _build_mezzanine(p, abort, progress,
+                                     src=(video_in if (yt or p.combine) else None))
         if not mok:
             return False, f"compat mezzanine failed: {mezz}"
         ok, _out, reason = _run(mezz)
@@ -699,6 +794,20 @@ def _resolve(p, abort, progress=None):
         return ok, (reason + " (via compat mezzanine)" if ok else reason)
     finally:
         _quit_resolve_focus_app()
+
+
+def _combine_result(res, real_rpu_donor):
+    """Map a combine RemuxResult to the stage's (ok, reason). A frame/fps mismatch
+    against a REAL companion donor means the two releases are different cuts — that can
+    never heal, so it parks permanently. The same mismatch against the Resolve render is
+    just a truncated render: retryable (the resolve stage redoes it)."""
+    if res.ok:
+        return True, res.reason
+    r = res.reason or ""
+    low = r.lower()
+    if real_rpu_donor and ("frame mismatch" in low or "fps mismatch" in low):
+        return False, "permanent: companion is a different cut — " + r
+    return False, r
 
 
 def _remux(p, abort, progress=None, should_pause=None):
@@ -730,7 +839,48 @@ def _remux(p, abort, progress=None, should_pause=None):
                       "pct": (round(pct, 1) if pct is not None else None), "step": label})
 
     encode_source = None   # set when rpu-only loses its stream-copy privilege (peak-gated)
-    if plan.plan_for(p.source).get("topaz") == "rpu-only":
+    combine_call = None    # set when a COMBINE item needs the capped path (notched bar below)
+    if p.combine:
+        # COMPANION COMBINE: the confirmed verdict names the donors; the peak gate picks
+        # the path. Under the 72 Mbps gate the winner's own bits ship (RPU grafted or
+        # converted as needed — remux_inject machinery); over it, the enforced-VBV capped
+        # re-encode runs with the SAME RPU (real DV survives a re-encode and still beats
+        # Resolve DV, user-dictated).
+        import companion as companion_mod
+        from orchestrator import combine_winner_path
+        cv = companion_mod.confirmed_verdict(p.source_basename)
+        winner = combine_winner_path(p)
+        if not cv or not winner:
+            return False, "permanent: combine verdict lost — re-pair the companion"
+        v = cv["verdict"]
+        side = {"nas": p.source, "remote": p.companion_src}
+        real_rpu = v.get("rpu_from") != "resolve"
+        combine_call = {
+            "winner": winner,
+            "rpu_source": side[v["rpu_from"]] if real_rpu else p.dv_render,
+            "audio_source": side.get(v.get("audio_from")) or winner,
+            "rpu_inline": bool(v.get("rpu_inline")),
+            "rpu_profile": (v.get("rpu_profile") or "") if real_rpu else "",
+            "real_rpu": real_rpu,
+        }
+        _on_step("measuring source peaks", None)
+        peak = _peak_of(winner, os.path.basename(winner))
+        if peak is None:
+            return False, "could not measure source peaks — retrying (never ship unverified)"
+        if peak <= dvcap.RPU_SHIP_VIDEO_GATE_MBPS:
+            res = remux.combine(winner, combine_call["rpu_source"],
+                                combine_call["audio_source"], p.final,
+                                rpu_inline=combine_call["rpu_inline"],
+                                rpu_profile=combine_call["rpu_profile"], capped=False,
+                                cap_mbps=cap, audio_target_lufs=lufs, abort=abort,
+                                on_step=_on_step)
+            return _combine_result(res, combine_call["real_rpu"])
+        logbook.event(f"remux {p.ep}: winner peaks {peak:.1f} Mbps — over the "
+                      f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate; combine takes "
+                      "the capped re-encode (real DV preserved)")
+        _on_step("planning scene-cut segments", None)
+        _plan_fast_path_bounds(p, src=winner)   # cached in the bounds book — retries free
+    elif plan.plan_for(p.source).get("topaz") == "rpu-only":
         # FAST PATH (HDR10 keep-the-source), PEAK-GATED (user-dictated 2026-08-06): the bare
         # HDR10 source direct-played fine, but injecting the RPU arms the SHIELD's DV decode
         # ceiling — ~80 Mbps WHOLE-STREAM, and every output is budgeted as if it carries
@@ -798,6 +948,15 @@ def _remux(p, abort, progress=None, should_pause=None):
         _prog(t, t, repair_seg=seg_index + 1, repair_k=k, repair_of=of,
               repair_done=done, repair_total=seg_frames)
 
+    if combine_call:
+        res = remux.combine(combine_call["winner"], combine_call["rpu_source"],
+                            combine_call["audio_source"], p.final,
+                            rpu_inline=combine_call["rpu_inline"],
+                            rpu_profile=combine_call["rpu_profile"], capped=True,
+                            cap_mbps=cap, boundaries=bounds, audio_target_lufs=lufs,
+                            abort=abort, on_progress=_prog, on_plan=_on_plan,
+                            should_pause=should_pause, on_repair=_on_repair)
+        return _combine_result(res, combine_call["real_rpu"])
     res = remux.remux(p.dv_render, p.source_cfr, p.source, p.final,
                       cap_mbps=cap, audio_target_lufs=lufs, boundaries=bounds, abort=abort,
                       on_progress=_prog, on_plan=_on_plan, should_pause=should_pause,

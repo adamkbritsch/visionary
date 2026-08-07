@@ -1,4 +1,5 @@
 import contextlib
+import tempfile
 import datetime
 import time
 import unittest
@@ -2767,3 +2768,111 @@ class StepReachesTheLane(unittest.TestCase):
         self.assertEqual(o.state["finishing2"]["step"], "injecting DV metadata")
         o._set_finishing2_progress({"stage": "upload", "pct": None})
         self.assertIsNone(o.state["finishing2"]["step"])       # ordinary ticks clear it
+
+
+class CombinePaths(unittest.TestCase):
+    """movie_paths(combine=True): companion coordinates from the book, container FORCED
+    to .mkv, apply_container bypassed, descriptor round-trip, prefetch exclusion."""
+
+    CV = {"verdict": {"video_from": "nas", "rpu_from": "remote", "rpu_profile": "7.x",
+                      "rpu_inline": False, "audio_from": "remote"},
+          "companion": {"path": "/seedbox/M/m.remux.mkv", "name": "m.remux.mkv",
+                        "size": 12345}}
+
+    def _combine_paths(self, d):
+        import companion
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)):
+            return orch.movie_paths("Movie (2020) [2160p].mkv", "/Media/Movies/M",
+                                    "Movie (2020)", scratch_dir=d, combine=True)
+
+    def test_combine_paths_carry_the_companion_and_force_mkv(self):
+        p = self._combine_paths(tempfile.mkdtemp())
+        self.assertTrue(p.combine)
+        self.assertEqual(p.companion_virtual, "/seedbox/M/m.remux.mkv")
+        self.assertEqual(p.companion_size, 12345)
+        self.assertTrue(p.companion_src.endswith(".companion.mkv"))
+        self.assertTrue(p.final.endswith(".mkv"))
+        self.assertTrue(p.nas_final.endswith(".mkv"))
+        self.assertIn(p.companion_src, p.working_files())
+
+    def test_apply_container_is_a_noop_for_combine(self):
+        d = tempfile.mkdtemp()
+        p = self._combine_paths(d)
+        open(p.source, "w").write("x")           # source exists → classic path would probe
+        import remux
+        with mock.patch.object(remux, "container_ext",
+                               side_effect=AssertionError("combine must not probe")):
+            q = orch.apply_container(p)
+        self.assertTrue(q.final.endswith(".mkv"))
+
+    def test_descriptor_roundtrip_keeps_combine(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._combine_paths(d)
+        desc = orch.Orchestrator._finisher_descriptor(p)
+        self.assertTrue(desc["combine"])
+        self.assertEqual(desc["container_ext"], ".mkv")
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)):
+            q = o._finisher_reconstruct(desc)
+        self.assertIsNotNone(q)
+        self.assertTrue(q.combine)
+        self.assertEqual(q.companion_size, 12345)
+        self.assertTrue(q.final.endswith(".mkv"))
+
+    def test_plain_movie_descriptor_has_no_combine_key(self):
+        p = orch.movie_paths("Movie (2020).mkv", "/Media/Movies/M", "Movie (2020)",
+                             scratch_dir=tempfile.mkdtemp())
+        self.assertNotIn("combine", orch.Orchestrator._finisher_descriptor(p))
+
+    def test_stage_done_download_needs_both_copies(self):
+        d = tempfile.mkdtemp()
+        p = self._combine_paths(d)
+        with mock.patch.object(orch, "_remote_size", return_value=3):
+            self.assertFalse(orch.stage_done("download", p))
+            open(p.source, "w").write("xxx")                       # NAS copy (3 bytes)
+            self.assertFalse(orch.stage_done("download", p))       # companion missing
+            open(p.companion_src, "w").write("x" * 12345)
+            self.assertTrue(orch.stage_done("download", p))
+
+    def test_stage_done_topaz_and_resolve_short_circuit(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._combine_paths(d)
+        self.assertTrue(orch.stage_done("topaz", p))
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)):
+            self.assertTrue(orch.stage_done("resolve", p))         # real RPU → no Resolve
+
+    def test_stage_done_resolve_falls_through_without_a_real_rpu(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._combine_paths(d)
+        cv = {"verdict": dict(self.CV["verdict"], rpu_from="resolve"),
+              "companion": self.CV["companion"]}
+        with mock.patch.object(companion, "confirmed_verdict", return_value=cv):
+            self.assertFalse(orch.stage_done("resolve", p))        # no render on disk
+
+    def test_combine_winner_path_maps_sides(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._combine_paths(d)
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)):
+            self.assertEqual(orch.combine_winner_path(p), p.source)
+        cv = {"verdict": dict(self.CV["verdict"], video_from="remote"),
+              "companion": self.CV["companion"]}
+        with mock.patch.object(companion, "confirmed_verdict", return_value=cv):
+            self.assertEqual(orch.combine_winner_path(p), p.companion_src)
+        with mock.patch.object(companion, "confirmed_verdict", return_value=None):
+            self.assertIsNone(orch.combine_winner_path(p))         # book lost → fail safe
+
+    def test_discard_workfiles_sweeps_the_companion(self):
+        names = orch.discard_workfiles     # smoke the name set via the helper it builds on
+        d = tempfile.mkdtemp()
+        stem = "Movie (2020) [2160p]"
+        comp = os.path.join(d, stem + ".companion.mkv")
+        open(comp, "w").write("x")
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d), \
+             mock.patch.object(orch.scratch, "prefetch_dir", return_value=d), \
+             mock.patch.dict(orch.ORCH.state, {"current": None}):
+            orch.discard_workfiles(stem + ".mkv")
+        self.assertFalse(os.path.exists(comp))

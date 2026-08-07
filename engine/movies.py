@@ -179,8 +179,10 @@ _CACHE = {}
 
 
 def library_list() -> list:
-    """All movies WITHOUT a DV master, title-sorted — the pool the picker searches. Cached
-    (NAS walk + Plex). Each = {name, dir, title, watched}."""
+    """ALL movies, title-sorted — the pool the picker searches. Cached (NAS walk + Plex).
+    Each = {name, dir, title, watched, tags, route, has_dv}. DV-badged entries are
+    combine-only (user-dictated): the server rejects a plain add for them, and the app
+    routes their tap to the companion flow instead."""
     if "lib" not in _CACHE:
         refresh_library()
     return _CACHE.get("lib") or []
@@ -194,8 +196,9 @@ def refresh_library() -> list:
         wm = None
     movies = parse_movies(list_movie_entries(), load_movies_dv_manifest(), watched_map=wm)
     _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
-                      "watched": m["watched"], "tags": m["tags"], "route": m["route"]}
-                     for m in movies if not m["has_dv"]]
+                      "watched": m["watched"], "tags": m["tags"], "route": m["route"],
+                      "has_dv": m["has_dv"]}
+                     for m in movies]
     return _CACHE["lib"]
 
 
@@ -235,11 +238,19 @@ def _pos(item) -> int:
         return 0
 
 
-def add_selected(name, nas_dir, title) -> list:
+def add_selected(name, nas_dir, title, combine=False) -> list:
     items = get_selected()
-    if not any(i.get("name") == name for i in items):
-        items.append({"name": name, "dir": nas_dir, "title": title, "pos": 0})  # pos 0 = process next
-        _save_selected(items)
+    ex = next((i for i in items if i.get("name") == name), None)
+    if ex is not None:
+        if combine and not ex.get("combine"):
+            ex["combine"] = True   # UPGRADE a queued movie to a combine item (pairing
+            _save_selected(items)  # confirmed after the plain add)
+        return items
+    it = {"name": name, "dir": nas_dir, "title": title, "pos": 0}  # pos 0 = process next
+    if combine:
+        it["combine"] = True       # best-of pairing with a seedbox companion (companion.py)
+    items.append(it)
+    _save_selected(items)
     return items
 
 
@@ -257,7 +268,8 @@ def next_due(skip=()):
     if not due:
         return None
     nx = due[0]
-    return {"source_name": nx["name"], "nas_dir": nx["dir"], "title": nx.get("title")}
+    return {"source_name": nx["name"], "nas_dir": nx["dir"], "title": nx.get("title"),
+            "combine": bool(nx.get("combine"))}
 
 
 def decrement_positions() -> list:

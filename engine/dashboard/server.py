@@ -195,10 +195,11 @@ def movies_info():
     """The curated movie queue (fast — a small local file) for state polling, plus the cached
     library pool if it's been built, plus the {basename: Plex title} map (background-warmed).
     No NAS walk here."""
-    import movies, plex
+    import companion, movies, plex
     plex.ensure_movie_titles_warming()
     return {"selected": movies.selected_view(), "library": movies.peek_library(),
-            "titles": plex.peek_movie_titles()}
+            "titles": plex.peek_movie_titles(),
+            "companions": companion.book_view()}   # pairing/verdict states (small local file)
 
 
 def api_movies():
@@ -219,7 +220,14 @@ def api_movie_queue(body):
     action = (body.get("action") or "").strip()
     if action == "add":
         title = (body.get("title") or "").strip()
-        movies.add_selected((body.get("name") or "").strip(), (body.get("dir") or "").strip(), title)
+        name = (body.get("name") or "").strip()
+        # DV-badged movies are COMBINE-ONLY (user-dictated): a plain add would send an
+        # already-DV file into the pipeline just to be permanent-parked at download.
+        lib = movies.peek_library() or []
+        if any(m.get("name") == name and m.get("has_dv") for m in lib):
+            return {"error": "already Dolby Vision — pair a companion copy instead",
+                    "selected": movies.selected_view()}
+        movies.add_selected(name, (body.get("dir") or "").strip(), title)
         preset = (body.get("preset") or "").strip()
         if preset and title:
             settings.set_show_preset(title, preset)
@@ -231,6 +239,12 @@ def api_movie_queue(body):
         except Exception:                         # run item / lanes, drop the durable entry,
             pass                                  # sweep scratch once the encoders die
         orchestrator.discard_workfiles(nm)   # a part-processed (turn-deferred) movie's scratch
+        try:
+            import companion
+            if companion.entry(nm).get("status") == "confirmed":
+                companion.mark(nm, "ready")  # keep the pairing, re-arm the confirm gate
+        except Exception:
+            pass
     elif action == "clear":                  # files would otherwise be orphaned forever
         for it in movies.get_selected():
             if it.get("name"):
@@ -239,6 +253,50 @@ def api_movie_queue(body):
                 orchestrator.discard_workfiles(it["name"])
         movies.clear_selected()
     return {"selected": movies.selected_view()}
+
+
+def api_companion(body):
+    """COMPANION COMBINE control (all localhost): pair a NAS movie with its seedbox copy.
+    Actions: `search` (async relay search → candidates), `pair` (async dual head-probe →
+    verdict, status `ready`), `confirm` (the verdict card's button — flips the book AND
+    queues the movie as a combine item), `unpair`/`dismiss` (drop the pairing; a queued
+    combine item is removed like any movie). Slow steps run in daemon workers — the app
+    watches status via the state poll's `companions` map."""
+    import companion, movies
+    action = (body.get("action") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not name:
+        return {"error": "name required"}
+    if action == "search":
+        return companion.start_search(name, (body.get("dir") or "").strip(),
+                                      (body.get("title") or "").strip())
+    if action == "pair":
+        path = (body.get("path") or "").strip()
+        if not path:
+            return {"error": "path required"}
+        return companion.pair(name, path)
+    if action == "confirm":
+        res = companion.confirm(name)
+        if res.get("status") == "confirmed":
+            e = companion.entry(name)
+            movies.add_selected(name, (body.get("dir") or e.get("dir") or "").strip(),
+                                (body.get("title") or e.get("title") or "").strip(),
+                                combine=True)
+        res["selected"] = movies.selected_view()
+        return res
+    if action in ("unpair", "dismiss"):
+        was_queued = any(i.get("name") == name and i.get("combine")
+                         for i in movies.get_selected())
+        companion.unpair(name)
+        if was_queued:
+            movies.remove_selected(name)
+            try:
+                orchestrator.ORCH.abandon_movie(name)
+            except Exception:
+                pass
+            orchestrator.discard_workfiles(name)
+        return {"status": "unpaired", "selected": movies.selected_view()}
+    return {"error": f"unknown action {action!r}"}
 
 
 def api_queue_action(body):
@@ -885,6 +943,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_mode((body.get("mode") or "tv").strip()))
         elif path == "/api/movie-queue":
             self._json(api_movie_queue(body or {}))
+        elif path == "/api/companion":
+            self._json(api_companion(body or {}))
         elif path == "/api/queue-action":
             self._json(api_queue_action(body or {}))
         elif path == "/api/youtube-connect":
