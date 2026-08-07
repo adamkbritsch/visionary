@@ -775,6 +775,11 @@ class Orchestrator:
                                                # only by the run thread (_park_permanent); no lock.
         self._resolve_deferred = set()         # items topaz'd but held before Resolve by QUIET MODE (in-memory;
                                                # self-heals each run — re-encountered items re-add themselves)
+        self._gate_deferred = set()            # FAST-PATH items (no topaz of their own) deferred at the
+                                               # resolve DOORSTEP so the next episode's topaz can run
+                                               # meanwhile (user-dictated 2026-08-06); released the moment
+                                               # the gating remux ends — the topaz then yields to them.
+                                               # In-memory; self-heals like _resolve_deferred.
         self._fail_counts = {}                 # skip-key -> consecutive genuine-failure count
         self._resolve_stall = set()            # items topaz'd but HELD before a STALLED Resolve (its update
                                                # prompt): buffered ahead down to STALL_FLOOR_GB, drained when
@@ -1060,7 +1065,8 @@ class Orchestrator:
                 k = self._skip_key(p)
                 if k not in keep_keys:
                     for st in (self._in_finisher, self._in_finisher_movies,
-                               self._resolve_stall, self._resolve_deferred, self._parked):
+                               self._resolve_stall, self._resolve_deferred,
+                               self._gate_deferred, self._parked):
                         st.discard(k)
                     self._fail_counts.pop(self._skip_key(p), None)
                 sweep.append(p.source_basename)
@@ -1407,6 +1413,7 @@ class Orchestrator:
             # items held before a stalled Resolve re-enter selection and Resolve is re-tried fresh (another
             # STALL_TRIGGER_ATTEMPTS before we'd re-conclude a stall) — e.g. after you dismiss its prompt.
             self._stall_active = False
+            self._gate_deferred.clear()
             self._resolve_stall.clear()
             self._resolve_fails.clear()
             self._stall_probe = None
@@ -1663,7 +1670,7 @@ class Orchestrator:
                         self.state["episode"] = None
                         self._hold("empty", "no series selected")
                         self._sleep(self._retry_seconds())
-                    elif self._resolve_deferred:
+                    elif self._resolve_deferred or self._gate_deferred:
                         # NOT complete — every remaining item is just held before Resolve by
                         # Screen Control. Calling that "series complete" and sleeping the
                         # poll interval (up to hours) meant "Resume now" — and the pause's own
@@ -2173,7 +2180,15 @@ class Orchestrator:
                 logbook.event(f"slot handoff: {_old} finished -> {_new} takes its slot")
         except Exception:
             pass
+        gate_released = False
+        if self._gate_deferred and not self._resolve_should_hold():
+            # The gating remux ended: the doorstep-deferred fast items re-enter selection
+            # NOW, and the first pick goes to them (user-dictated) — the paused topaz's
+            # intermediate is safe on disk and resumes right after their Resolve.
+            self._gate_deferred.clear()
+            gate_released = True
         skip = (self._parked | set(self._refused)            # + PERMANENT refusals (already-DV, durable)
+                | self._gate_deferred                        # + fast items still waiting at the doorstep
                 | self._resolve_deferred                     # + items QUIET MODE is holding before Resolve
                 | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
                 | self._in_finisher_keys()                   # + items the FINISHER already owns (still
@@ -2187,7 +2202,7 @@ class Orchestrator:
         # only resolve+remux left), resume it: a fresh movie must NOT preempt it and strand its
         # ~140 GB intermediate idle through the movie's whole run. (Live-hit: a deploy killed
         # S07E22 mid-resolve; on re-arm a due movie jumped the queue and its topaz sat unused.)
-        mid = self._midpipeline_tv(skip)
+        mid = None if gate_released else self._midpipeline_tv(skip)
         if mid is not None:
             return mid, "ok"
         # SEND-TO-VISIONARY priority: a video the user explicitly pushed from the
@@ -2343,10 +2358,23 @@ class Orchestrator:
                     fast_resolve = _plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
                 except Exception:
                     pass
+            if st == "resolve" and fast_resolve and self._resolve_should_hold(fast_resolve):
+                # A FAST-PATH item (its topaz was a no-op — nothing invested) must not
+                # idle the whole run thread behind the previous remux (user-dictated
+                # 2026-08-06): DEFER it and let the NEXT episode's topaz run meanwhile.
+                # The release preempts that topaz at its next segment boundary the moment
+                # the remux ends (see _gate_release_pending / _next_episode).
+                self._gate_deferred.add(self._skip_key(p))
+                self.state["current"] = None
+                self._hold("resolve-gate",
+                    f"{ep_disp}: waiting for the remux to finish — the next episode "
+                    f"upscales meanwhile; Resolve preempts it when the remux ends")
+                return
             while st == "resolve" and self._resolve_should_hold(fast_resolve):
                 # RESOLVE GATE (user-dictated): hold this item at the Resolve doorstep until the
                 # previous item's remux fully completes. Side benefit: topaz is idle while we
-                # hold, so that remux runs at full tilt and clears fastest.
+                # hold, so that remux runs at full tilt and clears fastest. (An EPISODE holds
+                # here; a fast-path item deferred above instead.)
                 if not self._enabled or self._abort.is_set():
                     return
                 if self._quiet_mode():                     # Screen Control turned OFF mid-hold (this gate
@@ -2403,7 +2431,10 @@ class Orchestrator:
                     ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
                 else:
                     ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
-                                        should_pause=self._dual_remux_live)   # topaz: yield to 2 live remuxes
+                                        # topaz yields to 2 live remuxes AND to a gate-released
+                                        # fast item whose Resolve is now clear to run alone
+                                        should_pause=lambda: (self._dual_remux_live()
+                                                              or self._gate_release_pending()))
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
@@ -2429,8 +2460,13 @@ class Orchestrator:
                 # lane frees, then it's re-selected and topaz resumes from its completed segments.
                 if str(msg).startswith("paused:"):
                     self.state["current"] = None
-                    self._hold("dual-remux",
-                        f"{ep_disp}: topaz paused at a segment boundary — two remuxes running")
+                    if self._gate_release_pending():
+                        self._hold("resolve-gate",
+                            f"{ep_disp}: topaz paused at a segment boundary — a waiting "
+                            f"item's Resolve gets the machine (topaz resumes after)")
+                    else:
+                        self._hold("dual-remux",
+                            f"{ep_disp}: topaz paused at a segment boundary — two remuxes running")
                     return
                 # A stop/pause abort isn't an episode FAILURE — don't count it toward parking
                 # and don't sit in the 60s retry; let the loop re-evaluate (power/stop) at once.
@@ -2627,6 +2663,13 @@ class Orchestrator:
         if self._drain_backlog() < 2:
             return False
         return (time.time() - self._last_resolve_at) < BACKLOG_WAIT_GRACE_SECONDS
+
+    def _gate_release_pending(self) -> bool:
+        """A fast-path item deferred at the resolve doorstep can enter NOW (the gating
+        remux ended): the in-flight topaz should yield at its next segment boundary so
+        that item's Resolve gets the whole machine (user-dictated 2026-08-06). False
+        while the remux still runs — the topaz keeps working through the wait."""
+        return bool(self._gate_deferred) and not self._resolve_should_hold()
 
     def _dual_remux_live(self) -> bool:
         """Both remux lanes actually working right now."""

@@ -1250,7 +1250,17 @@ class DoubleRemux(unittest.TestCase):
              mock.patch.object(o, "_hand_to_finisher"), \
              mock.patch("stages.run_stage", side_effect=spy):
             o._process(p)
-        self.assertEqual(seen.get("topaz"), o._dual_remux_live)
+        # BEHAVIOR, not identity (the predicate is a lambda now — it also yields to a
+        # gate-released fast item): dual-remux → pause; gate release → pause; neither → run.
+        sp = seen.get("topaz")
+        with mock.patch.object(o, "_dual_remux_live", return_value=True):
+            self.assertTrue(sp())
+        with mock.patch.object(o, "_dual_remux_live", return_value=False), \
+             mock.patch.object(o, "_gate_release_pending", return_value=True):
+            self.assertTrue(sp())
+        with mock.patch.object(o, "_dual_remux_live", return_value=False), \
+             mock.patch.object(o, "_gate_release_pending", return_value=False):
+            self.assertFalse(sp())
 
     def test_topaz_pauses_whenever_both_remux_lanes_are_live(self):
         # The general case (no stall drain): two lanes actually running → fresh Topaz waits.
@@ -2656,3 +2666,94 @@ class SendToVisionaryJumpsTheQueue(unittest.TestCase):
         self.assertEqual(why, "ok")
         self.assertTrue(ep.movie)
         nd.assert_called_once()
+
+
+class GateDeferralKeepsTopazBusy(unittest.TestCase):
+    """A fast-path item at the resolve doorstep DEFERS instead of idling the run thread
+    (user-dictated): the next episode's topaz runs through the wait, yields at its next
+    segment boundary the moment the gating remux ends, and the released item's Resolve
+    runs alone — the paused topaz resumes right after."""
+
+    def _movie(self):
+        return orch.movie_paths("Big Movie (2020).mkv", "/Media/Movies/Big Movie (2020)",
+                                "Big Movie", scratch_dir="/tmp")
+
+    def test_gated_fast_item_defers_and_frees_the_run_thread(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._movie()
+        ran = []
+        run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(orch, "stage_done",
+                                               side_effect=lambda st, _p: st in ("download", "topaz")))
+            es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
+            es.enter_context(mock.patch.object(o, "_claim_prefetched"))
+            es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+            es.enter_context(mock.patch.object(o, "_sleep"))
+            es.enter_context(mock.patch.object(o, "_quiet_mode", return_value=False))
+            es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=True))
+            es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
+            import plan
+            es.enter_context(mock.patch.object(plan, "plan_for",
+                                               return_value={"topaz": "rpu-only"}))
+            es.enter_context(mock.patch("stages.run_stage", side_effect=run))
+            o._process(p)
+        self.assertNotIn("resolve", ran)                      # never launched, never spun
+        self.assertIn(o._skip_key(p), o._gate_deferred)       # parked at the doorstep
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
+
+    def test_release_pending_only_when_the_gate_clears(self):
+        o = orch.Orchestrator()
+        o._gate_deferred = {"Big Movie (2020).mkv"}
+        with mock.patch.object(o, "_resolve_should_hold", return_value=True):
+            self.assertFalse(o._gate_release_pending())       # remux still running → topaz works on
+        with mock.patch.object(o, "_resolve_should_hold", return_value=False):
+            self.assertTrue(o._gate_release_pending())        # remux done → topaz yields
+        o._gate_deferred = set()
+        with mock.patch.object(o, "_resolve_should_hold", return_value=False):
+            self.assertFalse(o._gate_release_pending())       # nothing waiting → no yield
+
+    def test_released_item_outranks_the_midpipeline_resume_once(self):
+        o = orch.Orchestrator()
+        o._gate_deferred = {"Big Movie (2020).mkv"}
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_resolve_should_hold", return_value=False), \
+             mock.patch.object(o, "_midpipeline_tv",
+                               side_effect=AssertionError("released item must go first")), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=None), \
+             mock.patch.object(orch.movies, "next_due",
+                               return_value={"source_name": "Big Movie (2020).mkv",
+                                             "nas_dir": "/Media/Movies/Big Movie (2020)",
+                                             "title": "Big Movie"}), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            ep, why = o._next_episode()
+        self.assertEqual(why, "ok")
+        self.assertTrue(ep.movie)
+        self.assertEqual(o._gate_deferred, set())             # released
+
+    def test_still_gated_item_stays_skipped(self):
+        o = orch.Orchestrator()
+        key = "Big Movie (2020).mkv"
+        o._gate_deferred = {key}
+        seen = {}
+        def next_due(skip=()):
+            seen["skip"] = set(skip)
+            return None
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_resolve_should_hold", return_value=True), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=None), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=None), \
+             mock.patch.object(orch.movies, "next_due", side_effect=next_due), \
+             mock.patch.object(orch.series, "get_active_series", return_value=[]):
+            o._next_episode()
+        self.assertIn(key, seen["skip"])                      # the gated movie is not re-picked
+        self.assertIn(key, o._gate_deferred)                  # and stays deferred
+
+    def test_enable_clears_the_doorstep_set(self):
+        o = orch.Orchestrator()
+        o._gate_deferred = {"X"}
+        with mock.patch.object(o, "_start_caffeinate"), \
+             mock.patch.object(o, "_finisher_reconcile"), \
+             mock.patch.object(o, "_ensure"):
+            o.enable()
+        self.assertEqual(o._gate_deferred, set())
