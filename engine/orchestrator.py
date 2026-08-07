@@ -145,7 +145,10 @@ STALL_ITEM_RESERVE_GB = 200   # a TV-episode ProRes intermediate needs ~190 GiB 
                               # the buffer stop one item earlier, which is strictly safer. Don't START
                               # a fresh upscale during a stall unless raw free ≥ FLOOR + this (so the
                               # last one that starts lands near the floor, never past it)
-STALL_MOVIE_RESERVE_GB = 260  # a feature ProRes can reach ~245 GB — a movie needs this much headroom
+STALL_MOVIE_RESERVE_GB = 340  # a movie's working set MEASURED 318 GB peak (Doctor Strange 4K
+                              # fast path, live-tracked 2026-08-06: source + CFR copy + DV render
+                              # + two ES transients + wrap + master all coexist at the mux) — the
+                              # ProRes-feature path peaks lower (~245 GB). Sized to the worst case.
 RESOLVE_DRAIN_MIN_GB = 80     # DRAIN gate: raw physical free needed to advance an ALREADY-UPSCALED
                               # item through Resolve while a remux runs. The normal overlap gate
                               # (OVERLAP_MIN_PHYS_GB) reserves room for the next item's own ~190 GiB

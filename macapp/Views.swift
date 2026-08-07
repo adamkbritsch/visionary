@@ -2698,7 +2698,7 @@ struct SettingsPopover: View {
 
                         SettingsGroupLabel(text: "Disk").padding(.top, 4)
                         SettingRow(title: "Keep free",
-                                   blurb: "Space that must stay free before an item may start. One episode needs about 140 GB while it upscales.",
+                                   blurb: "Space that must stay free before an item may start. An episode needs about 140 GB while it upscales; a 4K fast-path movie peaks around 320 GB (measured) — keep this at 350+ with movies queued.",
                                    key: "min_free_gb", fallback: 400,
                                    range: 200...2000, step: 25, unit: "GB")
                         OptionalSettingRow(title: "Download ahead",

@@ -387,10 +387,12 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   feature film's intermediate can reach ~245 GB). That intermediate is **deleted the
   moment Resolve finishes its export** — the remux only needs the DV render plus the
   original — so the item being remuxed alongside the next upscale carries just ~10 GB, and
-  the dual pipeline never doubles the peak. Still, budget generously: the pipeline keeps a
-  **400 GB free-space floor** before starting an item (room for one movie-sized
-  intermediate plus margin), so plan for a fast SSD with ~1 TB free (a 2 TB SSD is
-  comfortable).
+  the dual pipeline never doubles the peak. A **4K fast-path movie** peaks higher than
+  anything with a ProRes stage: its source, CFR copy, DV render, two stream-copy
+  transients and the growing master all coexist at the final mux — **live-measured
+  317.7 GB** for a 56 GB REMUX. Budget generously: the pipeline keeps a **400 GB
+  free-space floor** before starting an item (room for one movie-sized working set plus
+  margin), so plan for a fast SSD with ~1 TB free (a 2 TB SSD is comfortable).
 
 - Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
   library (that's the point — keep backups if you want a way back).
