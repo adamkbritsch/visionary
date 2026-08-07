@@ -2863,6 +2863,8 @@ class Orchestrator:
                   "repair_seg": info.get("repair_seg"), "repair_k": info.get("repair_k"),
                   "repair_of": info.get("repair_of"), "repair_done": info.get("repair_done"),
                   "repair_total": info.get("repair_total"),
+                  # fast-remux labeled step (inject/ship) — self-clears like the notches
+                  "step": info.get("step"),
                   "elapsed_secs": round(self._fin_elapsed_value(), 1)})
         # ETA from THIS attempt's live rate. The elapsed stopwatch deliberately ACCUMULATES
         # across killed attempts (user-dictated), so elapsed×remaining/pct read ~38 h after a
@@ -2891,7 +2893,8 @@ class Orchestrator:
                   "seg_total": info.get("seg_total"),
                   "repair_seg": info.get("repair_seg"), "repair_k": info.get("repair_k"),
                   "repair_of": info.get("repair_of"), "repair_done": info.get("repair_done"),
-                  "repair_total": info.get("repair_total")})
+                  "repair_total": info.get("repair_total"),
+                  "step": info.get("step")})
         e = self._lane_eta(2, info, f.get("stage"))
         if e is None:
             f.pop("eta_secs", None)

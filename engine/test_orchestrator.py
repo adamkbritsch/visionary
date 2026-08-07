@@ -2757,3 +2757,13 @@ class GateDeferralKeepsTopazBusy(unittest.TestCase):
              mock.patch.object(o, "_ensure"):
             o.enable()
         self.assertEqual(o._gate_deferred, set())
+
+
+class StepReachesTheLane(unittest.TestCase):
+    def test_step_passes_through_and_clears(self):
+        o = orch.Orchestrator()
+        o._set_finishing2_progress({"stage": "remux", "pct": None,
+                                    "step": "injecting DV metadata"})
+        self.assertEqual(o.state["finishing2"]["step"], "injecting DV metadata")
+        o._set_finishing2_progress({"stage": "upload", "pct": None})
+        self.assertIsNone(o.state["finishing2"]["step"])       # ordinary ticks clear it

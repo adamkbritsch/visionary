@@ -102,6 +102,9 @@ struct FinishingDTO: Codable {
     var repair_of: Int?         // ...how many segments were flagged over the cap
     var repair_done: Int?       // ...frames re-encoded so far within that segment
     var repair_total: Int?      // ...the segment's frame count (drives the cut-out's refill)
+    var step: String?           // fast remux (inject/ship): the labeled step running now —
+                                // one bar at a time, pct = that step's own progress (nil =
+                                // a label-only phase with no watchable output)
     // Identity — `abandon_series` matches lanes on exactly these, and the puck labels with them.
     var series: String?
     var movie: Bool?

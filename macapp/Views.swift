@@ -1134,7 +1134,7 @@ struct FinisherProgress: View {
         // to draw, and an empty bar reads as "running at 0%". Rows come pre-ordered:
         // earliest episode on top (user-dictated), whichever engine lane holds it.
         let mine = PipelineCard.lanesInDisplayOrder(o).filter {
-            $0.stage == stageKey && $0.pct != nil
+            $0.stage == stageKey && ($0.pct != nil || $0.step != nil)
         }
         // With BOTH rows up, each must name its own episode. The card's top-right says "x2"
         // then, so it can no longer carry the first one's — which left it anonymous while the
@@ -1178,6 +1178,7 @@ private struct LaneProgress: View {
     var body: some View {
         let pct = f.pct ?? 0
         let live = min(1, max(0, pct / 100))
+        let stepOnly = f.step != nil && f.pct == nil     // label-only phase: no honest number
         // Same notched segment bar as Topaz — the remux is segmented too (dvcap ~5-min chunks):
         // bright fill = completed segments (snaps to the last finished boundary + a flash when
         // one lands), dark shadow = live progress through the current segment. Non-segmented
@@ -1202,10 +1203,17 @@ private struct LaneProgress: View {
                 Text(ep).font(.system(size: 11, weight: .medium)).monospacedDigit()
                     .foregroundStyle(DS.steel).lineLimit(1)
             }
+            // FAST-REMUX STEPS (inject / ship): one labeled bar at a time — the bar is
+            // the CURRENT step's own progress; a label-only phase (no watchable output)
+            // shows its label with an empty track, never a fake number.
+            if let step = f.step {
+                Text(step).font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(DS.steel).lineLimit(1)
+            }
             SteelBar(completed: completed, live: live, notches: notches, flashKey: done,
                      repairLo: rLo, repairHi: rHi, repairFrac: rFrac)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(String(format: "%.0f%%", pct))
+                Text(stepOnly ? "—" : String(format: "%.0f%%", pct))
                     .font(.system(size: primary ? 17 : 13, weight: .semibold)).monospacedDigit()
                     .foregroundStyle(held == nil ? DS.steelBright : DS.steelDim)
                     .frame(width: primary ? nil : Self.pctSlot, alignment: .leading)
@@ -2902,10 +2910,21 @@ struct ScratchContentsCard: View {
     // instead of repeating the (already-in-the-header) episode name.
     static func role(_ name: String) -> String {
         let n = name.lowercased()
+        // ORDER MATTERS: the transient suffixes must match before the generic
+        // "hdr10 dv upscaled" catch-all — a movie mid-remux briefly holds FOUR files
+        // with that stem, and all of them read as "Master" (user-caught 2026-08-06).
         if n.hasSuffix(".remuxsegs") { return "Remux segments" }
+        if n.hasSuffix(".src.hevc") { return "Original stream · temp" }
+        if n.hasSuffix(".inject.hevc") { return "DV-injected stream · temp" }
+        if n.hasSuffix(".ship.hevc") { return "Render stream · temp" }
+        if n.hasSuffix(".capped.hevc") { return "Capped stream · temp" }
+        if n.hasSuffix(".tracks.mp4") { return "Audio tracks · temp" }
+        if n.hasSuffix(".dv.mp4") { return "DV wrap · temp" }
+        if n.contains("_mezz.mp4.segments") { return "Compat copy segments" }
+        if n.hasSuffix("_mezz.mp4") { return "Resolve compat copy" }
         if n.contains("_prob4_upscaled.segments") { return "Topaz segments" }
         if n.contains("_prob4_upscaled") { return "Topaz ProRes" }
-        if n.contains(" hdr10 dv upscaled") { return n.hasSuffix(".mov") ? "DV render" : "Master" }
+        if n.contains(" hdr10 dv upscaled") { return n.hasSuffix(".mov") ? "DV render" : "4K DV master" }
         if n.contains("_cfr.") { return "CFR source" }
         return "Source"
     }

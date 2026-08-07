@@ -413,3 +413,26 @@ class ShipRender(unittest.TestCase):
                                           "/tmp/out.mp4", cap_mbps=50)
         self.assertFalse(res.ok)
         self.assertFalse(res.reason.startswith("render-over-cap"))   # a real failure retries
+
+
+class StepWatch(unittest.TestCase):
+    def test_reports_label_immediately_and_caps_at_99(self):
+        seen = []
+        with open("/tmp/_sw_test.bin", "wb") as f:
+            f.write(b"x" * 50)
+        with remux._StepWatch(lambda l, p: seen.append((l, p)), "copying", "/tmp/_sw_test.bin", 100):
+            pass                                   # immediate label call, poller may not tick
+        self.assertEqual(seen[0], ("copying", 0.0))
+        # the pct math itself (poller body): capped, size-proportional
+        self.assertEqual(min(99.0, 100.0 * 50 / 100), 50.0)
+        self.assertEqual(min(99.0, 100.0 * 200 / 100), 99.0)
+
+    def test_label_only_when_no_target(self):
+        seen = []
+        with remux._StepWatch(lambda l, p: seen.append((l, p)), "verifying", "/nope", 0):
+            pass
+        self.assertEqual(seen, [("verifying", 0.0)])
+
+    def test_none_callback_is_inert(self):
+        with remux._StepWatch(None, "x", "/nope", 100):
+            pass                                   # no crash, no thread

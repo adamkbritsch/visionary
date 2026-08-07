@@ -498,8 +498,54 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         _rm(hevc); _rm(tracks); _rm(dv_mp4)
 
 
+# ---- STEP PROGRESS for the fast (no-re-encode) remuxes -------------------------------------
+# The inject/ship paths are a chain of blocking subprocess phases with no encoder progress
+# to parse — but the LONG phases each write one growing file with a known target size, so a
+# background size-poller yields an honest per-step percentage (user-asked 2026-08-06: a
+# progress bar with labeled steps, one at a time). Label-only steps report pct=None.
+
+class _StepWatch:
+    """Context manager: poll `path`'s size toward `target` every 2 s and report
+    on_step(label, pct) — capped at 99 (the phase's own exit reports completion)."""
+
+    def __init__(self, on_step, label, path, target):
+        self._on, self._label, self._path, self._target = on_step, label, path, target
+        self._stop = None
+        self._thread = None
+
+    def __enter__(self):
+        if self._on:
+            self._on(self._label, 0.0)
+            if self._target and self._target > 0:
+                import threading
+                self._stop = threading.Event()
+                def _poll():
+                    while not self._stop.wait(2.0):
+                        try:
+                            sz = os.path.getsize(self._path)
+                        except OSError:
+                            continue
+                        self._on(self._label, min(99.0, 100.0 * sz / self._target))
+                self._thread = threading.Thread(target=_poll, daemon=True)
+                self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+            self._thread.join(timeout=5)
+        return False
+
+
+def _fsize(path) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
-                 audio_target_lufs=None, abort=None,
+                 audio_target_lufs=None, abort=None, on_step=None,
                  ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream with
     Resolve's Dolby Vision RPU injected — NO re-encode, NO peak cap (the source's own peaks
@@ -539,7 +585,9 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
     tracks = dv_mp4 = None
     try:
         if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):
-            ok, why = dvcap.extract_rpu(dv_video, rpu, ffmpeg=ffmpeg, timeout=timeout)
+            if on_step:
+                on_step("extracting DV metadata", None)   # reads the whole render; no
+            ok, why = dvcap.extract_rpu(dv_video, rpu, ffmpeg=ffmpeg, timeout=timeout)   # watchable output
             if not ok:
                 return RemuxResult(False, output, reason=why)
         n_rpu = dvcap.rpu_frame_count(rpu)
@@ -550,14 +598,16 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                                       f"(shipped nothing)")
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
-        ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, orig_source, src_es),
-                            capture_output=True, text=True, timeout=timeout)
+        with _StepWatch(on_step, "copying the original video", src_es, _fsize(orig_source)):
+            ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, orig_source, src_es),
+                                capture_output=True, text=True, timeout=timeout)
         if ex.returncode != 0 or not (os.path.exists(src_es) and os.path.getsize(src_es) > 0):
             return RemuxResult(False, output, reason="source ES extract failed: " + _tail(ex.stderr))
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
-        ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
-                            capture_output=True, text=True, timeout=timeout)
+        with _StepWatch(on_step, "injecting DV metadata", inj_es, _fsize(src_es)):
+            ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
+                                capture_output=True, text=True, timeout=timeout)
         if ij.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
             return RemuxResult(False, output,
                                reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
@@ -569,18 +619,22 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
         audio_note = ""
         if output.lower().endswith(".mkv"):
             dv_mp4 = output + ".dv.mp4"
-            with mp4box_safe_input(inj_es) as _es_in:
+            with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(inj_es)), \
+                 mp4box_safe_input(inj_es) as _es_in:
                 vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
                                 capture_output=True, text=True, timeout=timeout)
             if vx.returncode != 0:
                 return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-            mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                capture_output=True, text=True, timeout=timeout)
+            with _StepWatch(on_step, "muxing the master", output, _fsize(dv_mp4)):
+                mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
+                                    capture_output=True, text=True, timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
         else:
             # same audio machinery as the cap path (boost validated, falls back to a copy);
             # the CFR gate guarantees cfr audio is a bit-exact stream copy of the source's
+            if on_step:
+                on_step("preparing audio", None)
             gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
             tracks = output + ".tracks.mp4"
             subs_note = ""
@@ -607,11 +661,14 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
             audio_note += subs_note
-            with mp4box_safe_input(inj_es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
+            with _StepWatch(on_step, "muxing the master", output, _fsize(inj_es)), \
+                 mp4box_safe_input(inj_es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
                 mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
                                 capture_output=True, text=True, timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+        if on_step:
+            on_step("verifying the master", None)
         res = _verify(output, ffprobe)
         if not res.ok:
             return res
@@ -634,7 +691,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
 
 def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                       cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
-                      abort=None, ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE,
+                      abort=None, on_step=None, ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE,
                       timeout=None) -> RemuxResult:
     """YOUTUBE FAST REMUX (user-asked 2026-08-06: videos should move through fast). The
     Resolve render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
@@ -659,24 +716,29 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
     try:
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
-        ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, dv_video, es),
-                            capture_output=True, text=True, timeout=timeout)
+        with _StepWatch(on_step, "copying the render's video", es, _fsize(dv_video)):
+            ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, dv_video, es),
+                                capture_output=True, text=True, timeout=timeout)
         if ex.returncode != 0 or not (os.path.exists(es) and os.path.getsize(es) > 0):
             return RemuxResult(False, output, reason="render ES extract failed: " + _tail(ex.stderr))
         audio_note = ""
         if output.lower().endswith(".mkv"):
             dv_mp4 = output + ".dv.mp4"
-            with mp4box_safe_input(es) as _es_in:
+            with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(es)), \
+                 mp4box_safe_input(es) as _es_in:
                 vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
                                 capture_output=True, text=True, timeout=timeout)
             if vx.returncode != 0:
                 return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-            mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                capture_output=True, text=True, timeout=timeout)
+            with _StepWatch(on_step, "muxing the master", output, _fsize(dv_mp4)):
+                mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
+                                    capture_output=True, text=True, timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
         else:
             # same audio machinery as the cap/inject paths (boost validated, falls back to copy)
+            if on_step:
+                on_step("preparing audio", None)
             gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
             tracks = output + ".tracks.mp4"
             subs_note = ""
@@ -701,11 +763,14 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
             audio_note += subs_note
-            with mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
+            with _StepWatch(on_step, "muxing the master", output, _fsize(es)), \
+                 mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
                 mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
                                 capture_output=True, text=True, timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+        if on_step:
+            on_step("verifying the master", None)
         res = _verify(output, ffprobe)
         if not res.ok:
             return res

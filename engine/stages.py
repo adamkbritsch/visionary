@@ -676,19 +676,28 @@ def _remux(p, abort, progress=None, should_pause=None):
     # OFF -> None -> the boost-off bit-exact copy path remux already has.
     if lufs and p.series and not settings_mod.get_show_normalize_audio(p.series):
         lufs = None
+    def _on_step(label, pct):
+        # LABELED STEP progress for the fast (stream-copy) remuxes (user-asked): one bar
+        # at a time — the current step's own percentage where a phase has a watchable
+        # output file, label-only (pct None) where it doesn't.
+        if progress:
+            progress({"stage": "remux", "ep": p.ep,
+                      "pct": (round(pct, 1) if pct is not None else None), "step": label})
+
     if plan.plan_for(p.source).get("topaz") == "rpu-only":
         # FAST PATH (HDR10 keep-the-source): no re-encode, no peak cap — the ORIGINAL stream
         # ships with Resolve's DV RPU injected (user-dictated; the source's own peaks were
         # already direct-playing before the pipeline touched it).
         res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
-                                 audio_target_lufs=lufs, abort=abort)
+                                 audio_target_lufs=lufs, abort=abort, on_step=_on_step)
         return res.ok, res.reason
     if p.youtube:
         # FAST YOUTUBE REMUX (user-asked): the render targets a cap-safe bitrate, so ship
         # its video untouched when the peak gate agrees — minutes instead of an hour.
         # "render-over-cap" (and only that) falls through to the normal capped re-encode.
         res = remux.remux_ship_render(p.dv_render, p.source_cfr, p.source, p.final,
-                                      cap_mbps=cap, audio_target_lufs=lufs, abort=abort)
+                                      cap_mbps=cap, audio_target_lufs=lufs, abort=abort,
+                                      on_step=_on_step)
         if res.ok or not str(res.reason).startswith("render-over-cap"):
             return res.ok, res.reason
         logbook.event(f"remux {p.ep}: {res.reason}")

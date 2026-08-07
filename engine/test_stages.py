@@ -1233,3 +1233,26 @@ class RenderPhaseFlag(unittest.TestCase):
         self.assertTrue(render[0]["rendering"])            # the preview-off signal
         self.assertTrue(takeover)
         self.assertNotIn("rendering", takeover[0])         # pre-render events carry nothing
+
+
+class FastRemuxStepProgress(unittest.TestCase):
+    def test_steps_reach_the_lane_with_label_and_pct(self):
+        # The inject/ship remuxes publish labeled steps — one bar at a time; a label-only
+        # phase carries pct None (never a fake number).
+        import types, plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        def fake_inject(dv, cfr, orig, out, *, audio_target_lufs, abort, on_step=None):
+            on_step("extracting DV metadata", None)
+            on_step("copying the original video", 41.5)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "rpu-only"}), \
+             mock.patch.object(remux, "remux_inject", side_effect=fake_inject), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
+        self.assertTrue(ok)
+        self.assertEqual(emitted[0]["step"], "extracting DV metadata")
+        self.assertIsNone(emitted[0]["pct"])
+        self.assertEqual(emitted[1]["step"], "copying the original video")
+        self.assertEqual(emitted[1]["pct"], 41.5)
