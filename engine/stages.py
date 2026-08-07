@@ -80,6 +80,49 @@ def _write_topaz_bounds(basename: str, bounds: list) -> None:
         pass
 
 
+_PEAKGATE_FILE = os.path.expanduser("~/.topaz-pipeline/source_peaks.json")
+_PEAKGATE_LOCK = threading.Lock()
+
+
+def _source_peak_mbps(p):
+    """Measured 1-second VIDEO peak of the source (Mb/s), cached by basename — the packet
+    sweep reads the whole file (~minutes on a movie), so retries and relaunches reuse the
+    book. Measures the CFR file: for fast-path items it is a stream copy (identical bits),
+    and it is the exact stream the RPU is frame-aligned with and that a revoked stream copy
+    would re-encode. Returns None when unmeasurable (the caller fails the attempt — never
+    ship OR re-encode unverified); an unmeasurable result is never cached."""
+    import dvcap
+    try:
+        with _PEAKGATE_LOCK:
+            with open(_PEAKGATE_FILE) as f:
+                v = (json.load(f) or {}).get(p.source_basename)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    except (OSError, ValueError, TypeError):
+        pass
+    mbps = dvcap.video_peak_1s_mbps(p.source_cfr)
+    if mbps <= 0:
+        return None
+    try:
+        with _PEAKGATE_LOCK:
+            try:
+                with open(_PEAKGATE_FILE) as f:
+                    d = json.load(f)
+                if not isinstance(d, dict):
+                    d = {}
+            except (OSError, ValueError):
+                d = {}
+            d[p.source_basename] = round(mbps, 1)
+            os.makedirs(os.path.dirname(_PEAKGATE_FILE), exist_ok=True)
+            tmp = _PEAKGATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, _PEAKGATE_FILE)
+    except OSError:
+        pass
+    return mbps
+
+
 def _plan_fast_path_bounds(p, progress=None) -> str:
     """RESOLVE-ONLY fast path: no upscale, but the capped remux still re-encodes — so run
     topaz's PLANNING front half (scene detect + ~90 s grouping, the exact same utilities)
@@ -260,7 +303,8 @@ def _topaz(p, abort, progress=None, should_pause=None):
         # HIGH-BITRATE 4K FAST PATH: the source picture IS the deliverable — no upscale.
         # Succeed as a no-op so the run loop proceeds straight to the Resolve stage.
         # resolve-only still runs topaz's scene-cut PLANNING so its capped remux segments
-        # at scene cuts (rpu-only is exempt — remux_inject copies the stream, no segments).
+        # at scene cuts (rpu-only plans LAZILY in the remux stage instead — it only needs
+        # segments at all when the peak gate revokes its stream copy).
         note = _plan_fast_path_bounds(p, progress) if pl["topaz"] == "resolve-only" else ""
         return True, pl["reason"] + " — skipping upscale" + note
     if p.youtube:
@@ -665,6 +709,7 @@ def _remux(p, abort, progress=None, should_pause=None):
     the CFR pass no longer carries them. remux() dispatches on p.final's extension: MKV
     (lossless audio / bitmap subs) or MP4 (default). The x265 pass makes this stage LONG
     (~an hour per episode) — it reports live progress and honours abort."""
+    import dvcap
     import plan
     import remux
     import settings as settings_mod
@@ -684,14 +729,33 @@ def _remux(p, abort, progress=None, should_pause=None):
             progress({"stage": "remux", "ep": p.ep,
                       "pct": (round(pct, 1) if pct is not None else None), "step": label})
 
+    encode_source = None   # set when rpu-only loses its stream-copy privilege (peak-gated)
     if plan.plan_for(p.source).get("topaz") == "rpu-only":
-        # FAST PATH (HDR10 keep-the-source): no re-encode, no peak cap — the ORIGINAL stream
-        # ships with Resolve's DV RPU injected (user-dictated; the source's own peaks were
-        # already direct-playing before the pipeline touched it).
-        res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
-                                 audio_target_lufs=lufs, abort=abort, on_step=_on_step)
-        return res.ok, res.reason
-    if p.youtube:
+        # FAST PATH (HDR10 keep-the-source), PEAK-GATED (user-dictated 2026-08-06): the bare
+        # HDR10 source direct-played fine, but injecting the RPU arms the SHIELD's DV decode
+        # ceiling — ~80 Mbps WHOLE-STREAM, and every output is budgeted as if it carries
+        # TrueHD (~8 Mbps above the video; lossless audio alone tipped Spider-Man NWH over,
+        # re-confirmed by Doctor Strange). Video peaks at/under the 72 Mbps gate ship as the
+        # ORIGINAL stream with the RPU injected; over it, the stream-copy privilege is
+        # revoked and the SOURCE video takes the same enforced-VBV x265 native-DV capped
+        # re-encode as everything else (the cap must bind — an uncapped CRF pass can't
+        # promise the ceiling).
+        _on_step("measuring source peaks", None)
+        peak = _source_peak_mbps(p)
+        if peak is None:
+            return False, "could not measure source peaks — retrying (never ship unverified)"
+        if peak <= dvcap.RPU_SHIP_VIDEO_GATE_MBPS:
+            res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
+                                     audio_target_lufs=lufs, abort=abort, on_step=_on_step)
+            return res.ok, res.reason
+        logbook.event(f"remux {p.ep}: source peaks {peak:.1f} Mbps — over the "
+                      f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate "
+                      f"({dvcap.DV_STREAM_CEILING_MBPS} ceiling - TrueHD headroom); "
+                      "stream copy revoked, capped re-encode of the source instead")
+        _on_step("planning scene-cut segments", None)
+        _plan_fast_path_bounds(p)      # cached in the bounds book — retries are free
+        encode_source = p.source_cfr   # RPU from the render; VIDEO re-encoded from the source
+    elif p.youtube:
         # FAST YOUTUBE REMUX (user-asked): the render targets a cap-safe bitrate, so ship
         # its video untouched when the peak gate agrees — minutes instead of an hour.
         # "render-over-cap" (and only that) falls through to the normal capped re-encode.
@@ -737,7 +801,7 @@ def _remux(p, abort, progress=None, should_pause=None):
     res = remux.remux(p.dv_render, p.source_cfr, p.source, p.final,
                       cap_mbps=cap, audio_target_lufs=lufs, boundaries=bounds, abort=abort,
                       on_progress=_prog, on_plan=_on_plan, should_pause=should_pause,
-                      on_repair=_on_repair)
+                      on_repair=_on_repair, encode_source=encode_source)
     return res.ok, res.reason
 
 

@@ -65,7 +65,7 @@ class RemuxProgress(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         emitted = []
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
             on_plan([100, 200, 300], 300)      # 3 segments ending at 100/200/300 of 300 frames
             on_progress(0, 300)                # nothing done
             on_progress(150, 300)              # into segment 2 → 1 done
@@ -101,7 +101,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[137, 402, 1000]), \
@@ -116,7 +116,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[]), \
@@ -185,7 +185,7 @@ class NormalizeAudioGate(unittest.TestCase):
     def _lufs_reaching_remux(self, p, *, per_item, target=-16):
         import types, remux, settings
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
             got["lufs"] = audio_target_lufs
             return types.SimpleNamespace(ok=True, reason="ok")
         # A YouTube item tries the SHIP path first; send it to the capped path so the
@@ -392,6 +392,7 @@ class FastPathDispatch(unittest.TestCase):
         import plan, remux
         p = _paths(tempfile.mkdtemp())
         with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=15.0), \
              mock.patch.object(remux, "remux_inject",
                                return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as inj, \
              mock.patch.object(remux, "remux", side_effect=AssertionError("cap path must not run")):
@@ -399,6 +400,78 @@ class FastPathDispatch(unittest.TestCase):
         self.assertTrue(ok)
         args = inj.call_args[0]
         self.assertEqual(args, (p.dv_render, p.source_cfr, p.source, p.final))
+
+    def test_remux_rpu_only_over_ceiling_revokes_the_stream_copy(self):
+        # SHIELD DV ceiling (user-dictated): the whole stream must stay under ~80 Mbps with
+        # TrueHD budgeted in, so source VIDEO peaks over the 72 Mbps gate may not ship as a
+        # stream copy — the capped path runs instead, re-encoding the SOURCE (encode_source,
+        # RPU still from the render), with scene-cut bounds planned lazily.
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=96.4), \
+             mock.patch.object(stages, "_plan_fast_path_bounds", return_value=" planned") as pb, \
+             mock.patch.object(stages, "_read_topaz_bounds", return_value=[100, 200]), \
+             mock.patch.object(remux, "remux_inject",
+                               side_effect=AssertionError("over-ceiling must NOT stream-copy")), \
+             mock.patch.object(remux, "remux",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as rm:
+            ok, _msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        pb.assert_called_once()
+        self.assertEqual(rm.call_args.kwargs.get("encode_source"), p.source_cfr)
+        self.assertEqual(rm.call_args.kwargs.get("boundaries"), [100, 200])
+
+    def test_remux_rpu_only_gate_boundary_still_ships_the_copy(self):
+        # exactly AT the gate = allowed (the gate already reserves the TrueHD headroom)
+        import dvcap, plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages, "_source_peak_mbps",
+                               return_value=float(dvcap.RPU_SHIP_VIDEO_GATE_MBPS)), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as inj, \
+             mock.patch.object(remux, "remux", side_effect=AssertionError("cap path must not run")):
+            ok, _msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        inj.assert_called_once()
+
+    def test_remux_rpu_only_unmeasurable_peak_fails_the_attempt(self):
+        # can't measure -> neither ship unverified nor burn an hour of x265 on a probe
+        # hiccup — fail the attempt cleanly; the retry ladder re-measures.
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=None), \
+             mock.patch.object(remux, "remux_inject",
+                               side_effect=AssertionError("unverified must not ship")), \
+             mock.patch.object(remux, "remux",
+                               side_effect=AssertionError("unverified must not re-encode")):
+            ok, msg = stages.run_stage("remux", p)
+        self.assertFalse(ok)
+        self.assertIn("could not measure", msg)
+
+    def test_source_peak_is_measured_once_then_served_from_the_book(self):
+        import dvcap
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with mock.patch.object(stages, "_PEAKGATE_FILE", os.path.join(d, "pk.json")):
+            with mock.patch.object(dvcap, "video_peak_1s_mbps", return_value=88.4) as sweep:
+                self.assertEqual(stages._source_peak_mbps(p), 88.4)
+            sweep.assert_called_once_with(p.source_cfr)
+            with mock.patch.object(dvcap, "video_peak_1s_mbps",
+                                   side_effect=AssertionError("book hit must skip the sweep")):
+                self.assertEqual(stages._source_peak_mbps(p), 88.4)
+
+    def test_unmeasurable_peak_is_not_cached(self):
+        import dvcap
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with mock.patch.object(stages, "_PEAKGATE_FILE", os.path.join(d, "pk.json")):
+            with mock.patch.object(dvcap, "video_peak_1s_mbps", return_value=0.0):
+                self.assertIsNone(stages._source_peak_mbps(p))
+            with mock.patch.object(dvcap, "video_peak_1s_mbps", return_value=77.0):
+                self.assertEqual(stages._source_peak_mbps(p), 77.0)   # sweep re-ran
 
     def test_remux_resolve_only_still_uses_the_capped_path(self):
         import plan, remux
@@ -412,6 +485,8 @@ class FastPathDispatch(unittest.TestCase):
             ok, msg = stages.run_stage("remux", p)
         self.assertTrue(ok)
         rm.assert_called_once()
+        # ordinary capped runs encode the RENDER — encode_source is a fallback-only override
+        self.assertIsNone(rm.call_args.kwargs.get("encode_source"))
 
     def test_remux_threads_should_pause_through(self):
         # run_stage("remux", should_pause=...) must reach remux.remux — the Resolve
@@ -735,6 +810,7 @@ class ScopeHdr10IsNeverReEncoded(unittest.TestCase):
         import plan, remux
         p = _paths(tempfile.mkdtemp())
         with mock.patch.object(plan, "plan_for", return_value=self._real_plan()), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=68.0), \
              mock.patch.object(remux, "remux_inject",
                                return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as inj, \
              mock.patch.object(remux, "remux",
@@ -748,6 +824,7 @@ class ScopeHdr10IsNeverReEncoded(unittest.TestCase):
         import plan, remux
         p = _paths(tempfile.mkdtemp())
         with mock.patch.object(plan, "plan_for", return_value=self._real_plan(video_kbps=4000)), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=6.0), \
              mock.patch.object(remux, "remux_inject",
                                return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")), \
              mock.patch.object(remux, "remux",
@@ -879,7 +956,8 @@ class RepairProgressPlumbing(unittest.TestCase):
         p = _paths(tempfile.mkdtemp())
         emitted = []
         def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort,
-                       on_progress, on_plan, should_pause=None, on_repair=None):
+                       on_progress, on_plan, should_pause=None, on_repair=None,
+                       encode_source=None):
             on_plan([100, 200, 300], 300)
             on_progress(300, 300)                          # main encode done → bar at 100%
             on_repair(1, 2, 1, 0, 100)                     # re-capping segment index 1 (of 2 flagged)
@@ -1247,12 +1325,16 @@ class FastRemuxStepProgress(unittest.TestCase):
             on_step("copying the original video", 41.5)
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(plan, "plan_for", return_value={"topaz": "rpu-only"}), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=15.0), \
              mock.patch.object(remux, "remux_inject", side_effect=fake_inject), \
              mock.patch.object(settings, "get_settings",
                                return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
             ok, _ = stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
         self.assertTrue(ok)
-        self.assertEqual(emitted[0]["step"], "extracting DV metadata")
+        # the peak gate announces itself first (label-only), then the inject steps follow
+        self.assertEqual(emitted[0]["step"], "measuring source peaks")
         self.assertIsNone(emitted[0]["pct"])
-        self.assertEqual(emitted[1]["step"], "copying the original video")
-        self.assertEqual(emitted[1]["pct"], 41.5)
+        self.assertEqual(emitted[1]["step"], "extracting DV metadata")
+        self.assertIsNone(emitted[1]["pct"])
+        self.assertEqual(emitted[2]["step"], "copying the original video")
+        self.assertEqual(emitted[2]["pct"], 41.5)

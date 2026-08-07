@@ -339,6 +339,7 @@ def _verify(output: str, ffprobe: str, optimized: bool = None) -> RemuxResult:
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
+          encode_source=None,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -347,9 +348,14 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     Dispatches on `output`'s extension, decided by `container_ext` upstream.
     `should_pause`: polled between x265 segments — yields a benign "paused:" result so the
     finisher can hold this remux while the run thread's Resolve is active (Resolve gets the
-    whole machine, user-dictated); every finished segment is kept and the retry resumes here."""
+    whole machine, user-dictated); every finished segment is kept and the retry resumes here.
+    `encode_source`: the peak-gated rpu-only fallback (SHIELD DV ceiling) — the RPU still
+    comes from `dv_video` (Resolve's analysis), but the video that gets the capped re-encode
+    is THIS file (the original HDR10 stream; frame-aligned because Resolve rendered from the
+    same CFR copy) instead of the render, whose floor-bitrate video was never meant to ship."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-    info = dvcap.probe_video(dv_video, ffprobe)
+    enc = encode_source or dv_video   # the video the x265 pass re-encodes (RPU: always dv_video)
+    info = dvcap.probe_video(enc, ffprobe)
     # GUARD BEFORE touching the resume state (review-caught): a transient ffprobe failure returns
     # frames=0, which would build a mismatched manifest and make ensure_segdir WIPE hours of
     # finished segments. Fail the attempt cleanly instead — the segdir is untouched, next try resumes.
@@ -363,7 +369,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     # resume ONLY if the previous attempt encoded the SAME render with the SAME params —
     # a re-rendered dv_video or changed cap would otherwise concat stale/wrong segments
     dvcap.ensure_segdir(segdir, dvcap.resume_manifest(
-        dv_video, cap_mbps, info["frames"], info["fps"], dvcap.SEG_SECONDS, boundaries=boundaries))
+        dv_video, cap_mbps, info["frames"], info["fps"], dvcap.SEG_SECONDS, boundaries=boundaries,
+        encode_source=encode_source))
     rpu = os.path.join(segdir, "rpu.bin")
     hevc = output + ".capped.hevc"          # transient: the concat of the segments, rebuilt each attempt
     tracks = dv_mp4 = None
@@ -379,7 +386,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         if real_frames <= 0:
             return RemuxResult(False, output, reason="could not read RPU frame count — resume state intact")
         ok, frames, why = dvcap.encode_capped_segmented(
-            dv_video, rpu, hevc, cap_mbps, segdir=segdir,
+            enc, rpu, hevc, cap_mbps, segdir=segdir,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
             master_display=info["master_display"], max_cll=info["max_cll"],
             abort=abort, on_progress=on_progress, on_plan=on_plan,
@@ -440,7 +447,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                        reason=f"peak over cap and burst not localizable: "
                                               f"{peak:.1f} Mbps > {cap_mbps} (shipped nothing)")
                 ok, why = dvcap.reencode_segments_tighter(
-                    dv_video, rpu, segdir, offenders, tight,
+                    enc, rpu, segdir, offenders, tight,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
                     abort=abort, on_repair=on_repair, ffmpeg=ffmpeg)
@@ -448,7 +455,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     return RemuxResult(False, output, reason="peak repair: " + why)
                 # every segment is complete now → this call just re-verifies counts and re-concats
                 ok, frames, why = dvcap.encode_capped_segmented(
-                    dv_video, rpu, hevc, cap_mbps, segdir=segdir,
+                    enc, rpu, hevc, cap_mbps, segdir=segdir,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
                     abort=abort, ffmpeg=ffmpeg)

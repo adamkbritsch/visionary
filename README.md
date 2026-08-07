@@ -203,7 +203,7 @@ flowchart TD
     BR -->|yes| CONV["resolve-only"]
     BR -->|no| CLEAN
 
-    INJ --> INJ2["Topaz skipped<br/>Resolve does DV analysis only<br/>video stream-copied, RPU injected<br/>no re-encode, no peak cap"]
+    INJ --> INJ2["Topaz skipped<br/>Resolve does DV analysis only<br/>peaks &le; 72 Mbps: video stream-copied,<br/>RPU injected, no re-encode<br/>over: capped x265 of the source"]
     CONV --> CONV2["Topaz skipped<br/>Resolve converts and adds DV<br/>capped x265 remux"]
     CLEAN --> CLEAN2["Topaz 1x clean pass<br/>Resolve converts and adds DV<br/>capped x265 remux"]
     UPS --> UPS2["Topaz upscales to 4K<br/>Resolve converts and adds DV<br/>capped x265 remux"]
@@ -211,7 +211,7 @@ flowchart TD
 
 | source | Topaz | Resolve | remux | video re-encoded? |
 |---|---|---|---|---|
-| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 2000 nits | RPU injected onto the original | **no — bit-identical** |
+| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 2000 nits | RPU injected onto the original | **no — bit-identical** (video peaks ≤ 72 Mbps; hotter sources take the capped x265 instead — see below) |
 | 4K HDR · HLG/AV1/H.264/8-bit ≥ 12 Mbps | skipped | converts + DV, 2000 nits | capped x265 | yes — DV 8.1 needs an HEVC PQ base |
 | 4K SDR ≥ 12 Mbps | skipped | adds HDR + DV, 1000 nits | capped x265 | yes |
 | 4K, VFR or under threshold | 1× clean pass | adds (HDR+)DV | capped x265 | yes |
@@ -240,11 +240,20 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
 - **4K fast paths**: a 4K CFR source skips Topaz entirely — its picture is already the
   deliverable. Two tiers, decided by what the stream can technically carry:
 
-  **HDR10 is never re-encoded.** A 4K PQ / HEVC / 10-bit source keeps its **original video
-  bits**, and Resolve runs purely as a Dolby Vision analyser: its render is discarded and
-  only the RPU is injected onto the original with `dovi_tool`. No x265, no peak cap, at any
-  bitrate and any 4K geometry (2.39:1 scope and DCI 4K included). The coded pictures come
-  out bit-identical; only the container and NAL scaffolding are rebuilt.
+  **HDR10 keeps its original bits — up to the Dolby Vision playback ceiling.** A 4K PQ /
+  HEVC / 10-bit source keeps its **original video bits**, and Resolve runs purely as a
+  Dolby Vision analyser: its render is discarded and only the RPU is injected onto the
+  original with `dovi_tool`, at any 4K geometry (2.39:1 scope and DCI 4K included). The
+  coded pictures come out bit-identical; only the container and NAL scaffolding are
+  rebuilt. One gate applies: players that choke on high-bitrate single-layer DV (the
+  SHIELD stutters above ~80 Mbps **whole-stream** with DV engaged, though it direct-plays
+  non-DV at 121 — and lossless TrueHD audio rides another 4–8 Mbps above the video, so a
+  file that plays fine bare can be pushed over purely by injecting the RPU and muxing
+  Atmos in). The remux therefore measures the source's 1-second video peaks first: at or
+  under **72 Mbps** (80 minus TrueHD headroom — every output is budgeted as if it carries
+  TrueHD) the stream ships untouched; over it, the source video takes the same
+  enforced-VBV capped x265 native-DV re-encode as every other path, scene-cut segmented
+  and resumable.
 
   **Everything else 4K** at or above the `passthrough_min_mbps` setting (default **12 Mbps**)
   ships Resolve's HDR+DV conversion through the normal capped remux. Eligibility there is
@@ -307,7 +316,7 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
 | Movies | YouTube |
 |:---:|:---:|
 | <img src="docs/assets/movies.png" alt="Movies tab: a queued movie showing its resolved output mode, audio and source-fate settings" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
-| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — an HDR10 source lands on <b>2000 nits</b> and is never re-encoded, an SDR source on 1000. The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence (<b>1 per 3 TV episodes</b>), with per-channel length and age filters. Channels can be paused individually.</sub> |
+| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — an HDR10 source lands on <b>2000 nits</b> and keeps its original bits (unless its peaks breach the DV playback ceiling), an SDR source on 1000. The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence (<b>1 per 3 TV episodes</b>), with per-channel length and age filters. Channels can be paused individually.</sub> |
 
 <p align="center">
   <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">

@@ -39,6 +39,24 @@ X265_PRESET = "fast"            # 4K10 on the M3 Max; quality carried by CRF + g
 X265_CRF = 16
 PEAK_TOLERANCE = 1.15           # measured-peak gate: cap * this (container/NAL framing overhead)
 SEG_SECONDS = 300               # ~5-min resumable x265 segments (worst-case kill loss, was ~75 min)
+DV_STREAM_CEILING_MBPS = 80     # SHIELD DV playback ceiling (user-dictated 2026-08-06): with
+                                # single-layer Dolby Vision engaged, playback stutters above
+                                # ~80 Mbps. The ceiling is DV-specific and WHOLE-STREAM — the
+                                # same box direct-plays non-DV at 121 Mbps, and a bare HDR10
+                                # source plays fine until the injected RPU arms DV decoding.
+TRUEHD_HEADROOM_MBPS = 8        # lossless audio rides above the video: TrueHD Atmos peaks at
+                                # ~4-8 Mbps, enough to tip a borderline file over the ceiling
+                                # on its own (Spider-Man NWH: 115 Mbps peaks + TrueHD =
+                                # unplayable; re-confirmed by Doctor Strange). EVERY output is
+                                # budgeted as if it carries TrueHD (user-dictated) — reserve
+                                # the worst case, whatever audio actually ships.
+RPU_SHIP_VIDEO_GATE_MBPS = DV_STREAM_CEILING_MBPS - TRUEHD_HEADROOM_MBPS   # = 72
+                                # rpu-only ship gate: a source whose 1-second VIDEO peaks
+                                # exceed this may NOT ship as a stream copy — it takes the
+                                # enforced-VBV capped re-encode instead (an uncapped CRF pass
+                                # can't promise the ceiling; the cap must bind). The x265
+                                # path honours the same budget through the max_peak_mbps
+                                # LIMIT: cap * PEAK_TOLERANCE + TRUEHD_HEADROOM <= CEILING.
 
 # Resolve project constant: "1000-nit, P3, D65, ST.2084" mastering display, in x265's units
 # (chromaticities in 0.00002, luminance in 0.0001 nit) — used when the render carries no
@@ -321,7 +339,7 @@ def _rm(path: str):
 
 def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
                     seg_seconds: int, crf: float = X265_CRF, preset: str = X265_PRESET,
-                    boundaries: list | None = None) -> dict:
+                    boundaries: list | None = None, encode_source: str | None = None) -> dict:
     """Identity of a segmented-encode run. If ANY of this changes between attempts, the
     persisted segments/RPU describe a DIFFERENT encode and must not be resumed: a re-rendered
     dv_video would pass the frame-count check yet concat WRONG CONTENT into the master. `segb`
@@ -335,6 +353,12 @@ def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
          "fps": str(fps), "seg": int(seg_seconds), "crf": float(crf), "preset": preset}
     if boundaries:                          # only when a topaz-aligned plan is in force — so a fallback
         m["segb"] = [int(b) for b in boundaries]   # (~seg_seconds) remux still matches a pre-segb manifest
+    if encode_source:                       # peak-gated rpu-only fallback: the ENCODED video is the
+        try:                                # source, not the render — its identity must invalidate
+            st = os.stat(encode_source)     # resume too (key absent on ordinary runs, like segb)
+            m["enc"] = f"{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            m["enc"] = "missing"
     return m                                # and resumes instead of wiping on the schema change
 
 

@@ -384,6 +384,41 @@ class ResumeFingerprint(unittest.TestCase):
                 dvcap.ensure_segdir(seg, dvcap.resume_manifest(dv, 40, 100, "24/1", 300)), "fresh")
             self.assertFalse(os.path.exists(os.path.join(seg, "seg_0000.hevc")))
 
+    def test_ordinary_manifest_carries_no_encode_source_key(self):
+        # schema-stable: existing in-flight segdirs must keep resuming across the deploy
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            dv = os.path.join(td, "r.mov"); open(dv, "wb").write(b"x")
+            self.assertNotIn("enc", dvcap.resume_manifest(dv, 50, 100, "24/1", 300))
+
+    def test_encode_source_identity_invalidates_resume(self):
+        # peak-gated rpu-only fallback: a changed SOURCE (the encoded video) must wipe
+        # persisted segments even when the render (the RPU donor) is unchanged
+        import tempfile, os, time
+        with tempfile.TemporaryDirectory() as td:
+            dv = os.path.join(td, "r.mov"); open(dv, "wb").write(b"x")
+            src = os.path.join(td, "source_cfr.mkv"); open(src, "wb").write(b"s" * 100)
+            seg = os.path.join(td, "segs")
+            dvcap.ensure_segdir(seg, dvcap.resume_manifest(dv, 50, 100, "24/1", 300,
+                                                           encode_source=src))
+            open(os.path.join(seg, "seg_0000.hevc"), "wb").write(b"y")
+            open(src, "wb").write(b"s" * 200)             # the source was re-fetched
+            os.utime(src, (time.time() + 5, time.time() + 5))
+            m2 = dvcap.resume_manifest(dv, 50, 100, "24/1", 300, encode_source=src)
+            self.assertEqual(dvcap.ensure_segdir(seg, m2), "fresh")
+            self.assertFalse(os.path.exists(os.path.join(seg, "seg_0000.hevc")))
+
+    def test_whole_stream_budget_holds_at_the_settings_limit(self):
+        # every output is budgeted as if it carries TrueHD (user-dictated): even the
+        # MAXED max_peak_mbps setting + the measured-peak gate tolerance + the TrueHD
+        # headroom must stay under the SHIELD's whole-stream DV ceiling
+        import settings
+        lo, hi = settings.LIMITS["max_peak_mbps"]
+        self.assertLessEqual(hi * dvcap.PEAK_TOLERANCE + dvcap.TRUEHD_HEADROOM_MBPS,
+                             dvcap.DV_STREAM_CEILING_MBPS)
+        self.assertEqual(dvcap.RPU_SHIP_VIDEO_GATE_MBPS,
+                         dvcap.DV_STREAM_CEILING_MBPS - dvcap.TRUEHD_HEADROOM_MBPS)
+
 
 class ResumeRobustness(unittest.TestCase):
     """Kill-during-remux is the COMMON case for segmented remux — every persisted artifact must

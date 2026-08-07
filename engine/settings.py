@@ -85,6 +85,8 @@ DEFAULT_SETTINGS = {
                                 # rate (dvcap.py). Resolve's VideoToolbox export spikes to ~139 Mbps on
                                 # a ~27 Mbps average, which glitches players; ~2x the average only clips
                                 # the pathological seconds. NO uncapped fallback — cap fails => stage fails.
+                                # LIMIT capped at 62 so cap + gate tolerance + TrueHD headroom stays
+                                # under the SHIELD's ~80 Mbps whole-stream DV ceiling (dvcap constants).
     "passthrough_min_mbps": 12, # HIGH-BITRATE 4K FAST PATH: a 3840x2160 HEVC 10-bit CFR source whose
                                 # VIDEO bitrate is at/above this skips Topaz entirely. HDR10 (PQ) intake
                                 # keeps its ORIGINAL stream and gets Resolve's Dolby Vision RPU injected
@@ -156,7 +158,9 @@ DEFAULT_SETTINGS = {
 LIMITS = {
     "poll_minutes": (1, 1440),
     "dim_after_minutes": (0, 240),          # 0 = Off (never dim)
-    "max_peak_mbps": (20, 100),
+    "max_peak_mbps": (20, 62),  # 62 * 1.15 gate tolerance + 8 TrueHD headroom = 79.3, the most
+                                # the SHIELD's ~80 Mbps DV ceiling allows (dvcap constants) —
+                                # EVERY output is budgeted as if it carries TrueHD (user-dictated)
     "audio_target_lufs": (-24, -10),
     "min_adapter_watts": (1, 500),
     "passthrough_min_mbps": (5, 200),

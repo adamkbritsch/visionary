@@ -260,6 +260,78 @@ class PeakRepairLadder(unittest.TestCase):
         self.assertIn("peak still over cap after encode + repair: 58.6", res.reason)
 
 
+class EncodeSourceRouting(unittest.TestCase):
+    """Peak-gated rpu-only fallback (SHIELD DV ceiling): remux(encode_source=...) must run
+    every encode-side call — probe, capped encode, repair rung — on the SOURCE video, while
+    the RPU still comes from the render (dv_video)."""
+
+    def test_capped_encode_runs_on_the_source_and_rpu_on_the_render(self):
+        import os, tempfile
+        seen = {"enc": [], "repair": []}
+        info = {"frames": 100, "fps": "24000/1001", "master_display": None, "max_cll": None}
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+        def fake_probe(path, fp=None):
+            seen["probe"] = path
+            return info
+        def fake_extract(dv, rpu, **kw):
+            seen["rpu_from"] = dv
+            return True, "ok"
+        def fake_encode(src, rpu, hevc, cap, **kw):
+            seen["enc"].append(src)
+            return True, 100, "ok"
+        def fake_repair(src, rpu, segdir, idx, tight, **kw):
+            seen["repair"].append(src)
+            return True, "ok"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "master.mkv")        # MKV path: no audio machinery to mock
+            source_cfr = os.path.join(tmp, "source_cfr.mkv")
+            render = os.path.join(tmp, "render.mov")
+            with mock.patch.object(remux.dvcap, "probe_video", side_effect=fake_probe), \
+                 mock.patch.object(remux.dvcap, "ensure_segdir", return_value="fresh"), \
+                 mock.patch.object(remux.dvcap, "extract_rpu", side_effect=fake_extract), \
+                 mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+                 mock.patch.object(remux.dvcap, "encode_capped_segmented", side_effect=fake_encode), \
+                 mock.patch.object(remux.dvcap, "reencode_segments_tighter", side_effect=fake_repair), \
+                 mock.patch.object(remux.dvcap, "video_peak_buckets",
+                                   side_effect=[{1: 58.6}, {1: 40.0}]), \
+                 mock.patch.object(remux, "_verify",
+                                   side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1,
+                                                                               "ok")), \
+                 mock.patch.object(remux.subprocess, "run", return_value=ran):
+                res = remux.remux(render, "cfr.mkv", "orig.mkv", out, encode_source=source_cfr)
+        self.assertTrue(res.ok)
+        self.assertEqual(seen["probe"], source_cfr)      # frames/fps/mastering read off the source
+        self.assertEqual(seen["rpu_from"], render)       # DV analysis still comes from Resolve
+        for src in seen["enc"] + seen["repair"]:         # main encode, repair rung, repair concat
+            self.assertEqual(src, source_cfr)
+        self.assertTrue(seen["repair"])                  # the over-gate first pass exercised repair
+
+    def test_without_encode_source_the_render_is_encoded(self):
+        import os, tempfile
+        seen = {"enc": []}
+        info = {"frames": 100, "fps": "24000/1001", "master_display": None, "max_cll": None}
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+        def fake_encode(src, rpu, hevc, cap, **kw):
+            seen["enc"].append(src)
+            return True, 100, "ok"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "master.mkv")
+            render = os.path.join(tmp, "render.mov")
+            with mock.patch.object(remux.dvcap, "probe_video", return_value=info), \
+                 mock.patch.object(remux.dvcap, "ensure_segdir", return_value="fresh"), \
+                 mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+                 mock.patch.object(remux.dvcap, "encode_capped_segmented", side_effect=fake_encode), \
+                 mock.patch.object(remux.dvcap, "video_peak_buckets", return_value={1: 45.0}), \
+                 mock.patch.object(remux, "_verify",
+                                   side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1,
+                                                                               "ok")), \
+                 mock.patch.object(remux.subprocess, "run", return_value=ran):
+                res = remux.remux(render, "cfr.mkv", "orig.mkv", out)
+        self.assertTrue(res.ok)
+        self.assertEqual(seen["enc"], [render])
+
+
 class InjectPath(unittest.TestCase):
     """FAST-PATH remux (rpu-only): the ORIGINAL stream ships with Resolve's RPU injected —
     no re-encode, no peak gate; strict frame/fps alignment gates ship-nothing on mismatch."""
