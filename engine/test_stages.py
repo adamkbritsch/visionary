@@ -1201,3 +1201,35 @@ class SegmentedMezzanine(unittest.TestCase):
         ok, _out, _calls = self._run(p, total_ok=False)
         self.assertFalse(ok)
         self.assertFalse(os.path.exists(stages.mezzanine_path(p.source)))
+
+
+class RenderPhaseFlag(unittest.TestCase):
+    def test_render_pct_events_carry_rendering_and_others_do_not(self):
+        # The app's live screen preview hides for the render phase (user-dictated). The
+        # flag rides ONLY on RENDER_PCT events; state["progress"] is replaced per event,
+        # so any non-render event (a retry's setup) brings the preview back by itself.
+        import plan, preflight, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        with mock.patch.object(plan, "plan_for",
+                               return_value={"resolve": "run", "topaz": "upscale",
+                                             "is_hdr": False, "input": {"height": 1080}}), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.threading, "Thread", _InlineThread), \
+             mock.patch.object(stages.time, "sleep"), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", return_value=False), \
+             mock.patch.object(stages.subprocess, "Popen",
+                               side_effect=lambda *a, **k: _FakeResolveProc(
+                                   ["SCREEN_TAKEOVER_SOON\n", "RENDER_PCT 42\n"], 1)):
+            stages.run_stage("resolve", p, progress=lambda d: emitted.append(d))
+        takeover = [d for d in emitted if d.get("takeover_soon")]
+        render = [d for d in emitted if d.get("pct") == 42]
+        self.assertTrue(render)
+        self.assertTrue(render[0]["rendering"])            # the preview-off signal
+        self.assertTrue(takeover)
+        self.assertNotIn("rendering", takeover[0])         # pre-render events carry nothing

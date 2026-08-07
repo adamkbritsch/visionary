@@ -932,7 +932,13 @@ struct StageView: View {
                         // live frame of that screen is the only honest progress indicator it
                         // has, and it is how you see a wrong-screen or stuck-dialog failure
                         // without going to look.
-                        if info.key == "resolve" { ResolvePreview() }
+                        // The preview ENDS once the render starts (user-dictated):
+                        // analysis is over, and each frame is a 4K screencapture
+                        // taken while the machine renders.
+                        if info.key == "resolve"
+                            && store.state?.orchestrator?.progress?.rendering != true {
+                            ResolvePreview()
+                        }
                         if role == .finisher { FinisherProgress(stageKey: info.key) }
                         else { StageProgress(stageKey: info.key) }     // reads orchestrator.progress
                     }
@@ -1051,6 +1057,7 @@ struct ExpandedResolvePreview: View {
     private var resolveActive: Bool {
         let o = store.state?.orchestrator
         return (o?.stage_active ?? false) && ((o?.progress?.stage ?? o?.stage) == "resolve")
+            && o?.progress?.rendering != true      // the render phase closes the preview too
     }
 
     var body: some View {

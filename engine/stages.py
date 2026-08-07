@@ -568,7 +568,13 @@ def _resolve(p, abort, progress=None):
                 out_lines.append(line)
                 m = re.match(r"RENDER_PCT (\d+)", line.strip())
                 if m and progress:
-                    progress({"stage": "resolve", "ep": p.ep, "pct": int(m.group(1))})
+                    # `rendering` gates the app's live screen preview OFF for the render
+                    # phase (user-dictated 2026-08-06): the analysis worth watching is
+                    # over, and each preview frame is a screencapture of the 4K panel
+                    # while the machine renders. Carried only by these events, so any
+                    # non-render event (a retry's setup) brings the preview back.
+                    progress({"stage": "resolve", "ep": p.ep, "pct": int(m.group(1)),
+                              "rendering": True})
                     continue
                 # The screen/mouse takeover is about to happen. This marker is the ONLY
                 # lead time that exists — the stage flips to "resolve" seconds before

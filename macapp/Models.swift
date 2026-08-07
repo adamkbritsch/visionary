@@ -25,6 +25,9 @@ struct ScratchDTO: Codable {
 struct ProgressDTO: Codable {
     var stage: String?
     var ep: String?
+    var rendering: Bool?      // resolve: the RENDER phase is running — the live screen
+                              // preview hides (nothing left worth watching, and each
+                              // frame costs a 4K screencapture mid-render)
     var notches: [Double]?    // topaz: segment boundaries as 0..1 fractions (progress-bar ticks)
     var seg_done: Int?        // topaz: fully-encoded segment count (drives the tiny flash)
     var seg_total: Int?
