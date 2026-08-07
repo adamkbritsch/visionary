@@ -75,9 +75,21 @@ def _config() -> dict:
         return {}
 
 
+SHUTTLE_RELAY_FILE = os.path.expanduser("~/Library/Application Support/Shuttle/relay.json")
+
+
 def relay_base() -> str:
-    """The relay's base URL from config ('shuttle_relay_url'); '' = unconfigured."""
-    return str(_config().get("shuttle_relay_url") or "").rstrip("/")
+    """The relay's base URL: config ('shuttle_relay_url') first, else Shuttle's own
+    relay.json beside its token file (the Shuttle app writes {"base_url": ...} there so
+    the integration is zero-config); '' = unconfigured."""
+    url = str(_config().get("shuttle_relay_url") or "").rstrip("/")
+    if url:
+        return url
+    try:
+        with open(SHUTTLE_RELAY_FILE) as f:
+            return str((json.load(f) or {}).get("base_url") or "").rstrip("/")
+    except (OSError, ValueError):
+        return ""
 
 
 def relay_token() -> str:

@@ -355,3 +355,23 @@ class ProbeNormalization(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelayBaseDiscovery(unittest.TestCase):
+    def test_config_key_wins(self):
+        with mock.patch.object(companion, "_config",
+                               return_value={"shuttle_relay_url": "http://cfg:8789/"}):
+            self.assertEqual(companion.relay_base(), "http://cfg:8789")
+
+    def test_falls_back_to_shuttles_relay_json(self):
+        d = tempfile.mkdtemp()
+        rj = os.path.join(d, "relay.json")
+        json.dump({"base_url": "http://shuttle:8789/"}, open(rj, "w"))
+        with mock.patch.object(companion, "_config", return_value={}), \
+             mock.patch.object(companion, "SHUTTLE_RELAY_FILE", rj):
+            self.assertEqual(companion.relay_base(), "http://shuttle:8789")
+
+    def test_unconfigured_is_empty(self):
+        with mock.patch.object(companion, "_config", return_value={}), \
+             mock.patch.object(companion, "SHUTTLE_RELAY_FILE", "/no/such/relay.json"):
+            self.assertEqual(companion.relay_base(), "")
