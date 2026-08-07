@@ -144,3 +144,19 @@ class UpNext(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreviewVariants(unittest.TestCase):
+    def test_big_and_small_are_served_from_one_capture(self):
+        # The enlarged view gets the 1080p-class encode; the card keeps the 420w tile.
+        # Both come from the same screenshot and share one freshness clock.
+        import time as _t
+        old = dict(server._PREVIEW)
+        try:
+            server._PREVIEW.update(jpg=b"small", big=b"large", at=_t.time(), busy=False)
+            self.assertEqual(server._preview_frame(), b"small")
+            self.assertEqual(server._preview_frame(big=True), b"large")
+            server._PREVIEW["at"] = _t.time() - 999          # stale → neither is served
+            self.assertIsNone(server._preview_frame(big=True))
+        finally:
+            server._PREVIEW.update(old)

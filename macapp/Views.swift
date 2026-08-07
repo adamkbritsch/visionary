@@ -781,7 +781,12 @@ struct PipelineCard: View {
     static func laneLive(_ f: FinishingDTO?) -> Bool {
         guard let f, f.stage?.isEmpty == false else { return false }
         if f.holding != nil { return false }
-        // upload/cleanup report no percentage but ARE running; only remux has one to wait for.
+        // upload/cleanup report no percentage but ARE running; only remux has one to wait
+        // for — EXCEPT a fast-path remux (RPU inject / ship-the-render): those stream-copy
+        // and never publish a pct, yet run for many minutes on a movie-sized file. Gating
+        // them on pct made the movie's remux invisible while its files plainly grew
+        // (user-caught 2026-08-06). Like upload, claimed = running for those.
+        if f.stage == "remux" && f.fast == true { return true }
         return f.stage != "remux" || f.pct != nil
     }
 
@@ -1098,7 +1103,9 @@ struct ExpandedResolvePreview: View {
     }
 
     private func load() async {
-        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg") else { return }
+        // The 1080p-class variant — the card's 420w tile stretched to the full window
+        // was mush. Same server-side capture; only the encode differs.
+        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg?size=big") else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
         req.cachePolicy = .reloadIgnoringLocalCacheData

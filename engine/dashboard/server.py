@@ -405,7 +405,7 @@ def _hdr_hint(name) -> bool:
 # --- RESOLVE SCREEN PREVIEW ----------------------------------------------------------------
 # One capture at a time, shared by every request. A capture of the 4K host measured 1.9-9.9 s
 # under load, so the endpoint must never do it inline.
-_PREVIEW = {"jpg": None, "at": 0.0, "busy": False}
+_PREVIEW = {"jpg": None, "big": None, "at": 0.0, "busy": False}
 _PREVIEW_LOCK = threading.Lock()
 PREVIEW_MAX_AGE = 1.0        # refresh if the newest frame is older than this
 PREVIEW_STALE = 15.0         # ...and stop serving one this old entirely
@@ -427,13 +427,20 @@ def _preview_capture():
         if img is None:
             return
         h, w = img.shape[:2]
-        want_w = 420
-        small = cv2.resize(img, (want_w, max(1, int(round(h * (want_w / float(w)))))),
-                           interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        if ok:
+        # TWO variants from the ONE capture (the screenshot is the expensive part): the
+        # card's 420w tile, and a 1080p-class frame for the full-width overlay — 420
+        # stretched across the window was mush (user-caught 2026-08-06).
+        out = {}
+        for key, want_w in (("jpg", 420), ("big", 1920)):
+            scale = want_w / float(w)
+            sized = img if scale >= 1.0 else cv2.resize(
+                img, (want_w, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", sized, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            if ok:
+                out[key] = buf.tobytes()
+        if out:
             with _PREVIEW_LOCK:
-                _PREVIEW["jpg"] = buf.tobytes()
+                _PREVIEW.update(out)
                 _PREVIEW["at"] = time.time()
     except Exception:
         pass
@@ -442,11 +449,13 @@ def _preview_capture():
             _PREVIEW["busy"] = False
 
 
-def _preview_frame():
-    """The newest frame, kicking off a refresh when it is getting old. Never blocks."""
+def _preview_frame(big=False):
+    """The newest frame (420w tile, or the 1080p-class `big` for the enlarged view),
+    kicking off a refresh when it is getting old. Never blocks."""
     now = time.time()
     with _PREVIEW_LOCK:
-        jpg, at, busy = _PREVIEW["jpg"], _PREVIEW["at"], _PREVIEW["busy"]
+        jpg = _PREVIEW["big" if big else "jpg"]
+        at, busy = _PREVIEW["at"], _PREVIEW["busy"]
         due = (now - at) > PREVIEW_MAX_AGE
         if due and not busy:
             _PREVIEW["busy"] = True
@@ -818,7 +827,8 @@ class Handler(BaseHTTPRequestHandler):
             # stale, and overlapping requests raced on one shared temp file. Decoupling the
             # two means the client always gets the freshest frame that EXISTS, at whatever
             # rate captures actually manage, and never waits on one.
-            frame = _preview_frame()
+            big = (parse_qs(urlparse(self.path).query).get("size") or [""])[0] == "big"
+            frame = _preview_frame(big=big)
             if frame is None:
                 self._send(204, b"", "image/jpeg")     # nothing captured yet — try again
             else:
