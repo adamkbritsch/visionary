@@ -185,7 +185,8 @@ class DvInclusiveLibrary(unittest.TestCase):
         entries = [{"name": "NoDv (2001) [2160p].mkv", "dir": "/m"},
                    {"name": "HasDv (2002) [2160p].mkv", "dir": "/m"}]
         dv_map = {"HasDv (2002) [2160p].mkv": 1}
-        cmap = {"HasDv (2002) [2160p].mkv": {"status": None, "counterpart": True}}
+        cmap = {"HasDv (2002) [2160p].mkv": {"status": None, "counterpart": True,
+                                             "atmos": False}}
         import companion, plex
         with mock.patch.object(movies, "list_movie_entries", return_value=entries), \
              mock.patch.object(movies, "load_movies_dv_manifest", return_value=dv_map), \
@@ -239,10 +240,20 @@ class DvRowVisibility(unittest.TestCase):
                                                 {self.DV["name"]: {"counterpart": False}}))
 
     def test_dv_with_counterpart_or_active_flow_is_visible(self):
-        self.assertTrue(movies._dv_row_visible(self.DV,
-                                               {self.DV["name"]: {"counterpart": True}}))
+        self.assertTrue(movies._dv_row_visible(
+            self.DV, {self.DV["name"]: {"counterpart": True, "atmos": False}}))
         self.assertTrue(movies._dv_row_visible(self.DV,
                                                {self.DV["name"]: {"status": "ready"}}))
+
+    def test_unprobed_audio_keeps_the_row_hidden(self):
+        # the name doesn't say Atmos, but the bitstream hasn't been probed yet — hidden
+        # until the sweep answers (release names lie by omission: Disclosure Day)
+        self.assertFalse(movies._dv_row_visible(
+            self.DV, {self.DV["name"]: {"counterpart": True, "atmos": None}}))
+
+    def test_probed_atmos_hides_the_row_despite_a_clean_name(self):
+        self.assertFalse(movies._dv_row_visible(
+            self.DV, {self.DV["name"]: {"counterpart": True, "atmos": True}}))
 
     def test_refresh_filters_dv_rows_and_kicks_the_sweep(self):
         import companion, plex
@@ -252,7 +263,8 @@ class DvRowVisibility(unittest.TestCase):
                    {"name": "DvAtmos (2004) [2160p TrueHD Atmos].mkv", "dir": "/m"}]
         dv_map = {"DvNoMatch (2002) [2160p].mkv": 1, "DvMatch (2003) [2160p].mkv": 1,
                   "DvAtmos (2004) [2160p TrueHD Atmos].mkv": 1}
-        cmap = {"DvMatch (2003) [2160p].mkv": {"status": None, "counterpart": True}}
+        cmap = {"DvMatch (2003) [2160p].mkv": {"status": None, "counterpart": True,
+                                               "atmos": False}}
         with mock.patch.object(movies, "list_movie_entries", return_value=entries), \
              mock.patch.object(movies, "load_movies_dv_manifest", return_value=dv_map), \
              mock.patch.object(plex, "movie_watched_map", return_value={}), \

@@ -800,12 +800,15 @@ def _combine_result(res, real_rpu_donor):
     """Map a combine RemuxResult to the stage's (ok, reason). A frame/fps mismatch
     against a REAL companion donor means the two releases are different cuts — that can
     never heal, so it parks permanently. The same mismatch against the Resolve render is
-    just a truncated render: retryable (the resolve stage redoes it)."""
+    just a truncated render: retryable (the resolve stage redoes it). The AUDIO-donor
+    sync gate compares two release files, so its mismatch is a different cut regardless
+    of where the RPU came from."""
     if res.ok:
         return True, res.reason
     r = res.reason or ""
     low = r.lower()
-    if real_rpu_donor and ("frame mismatch" in low or "fps mismatch" in low):
+    if "audio donor is a different cut" in low or \
+            (real_rpu_donor and ("frame mismatch" in low or "fps mismatch" in low)):
         return False, "permanent: companion is a different cut — " + r
     return False, r
 

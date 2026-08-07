@@ -542,11 +542,13 @@ def confirmed_verdict(basename: str) -> dict | None:
 
 
 def counterparts() -> dict:
-    """{basename: {status, counterpart}} — what the movie-library filter needs to decide
-    whether a DV row is combine-able (an active flow OR a swept seedbox match)."""
+    """{basename: {status, counterpart, atmos}} — what the movie-library filter needs to
+    decide whether a DV row is combine-able: an active flow, OR a swept seedbox match on
+    a copy PROVEN not to already carry Dolby Atmos (`atmos` None = not probed yet)."""
     with _BOOK_LOCK:
         d = _book()
-    return {k: {"status": e.get("status"), "counterpart": e.get("counterpart")}
+    return {k: {"status": e.get("status"), "counterpart": e.get("counterpart"),
+                "atmos": e.get("nas_atmos")}
             for k, e in d.items()}
 
 
@@ -592,13 +594,36 @@ COUNTERPART_TTL = 6 * 3600      # a swept seedbox answer stays fresh this long
 _SWEEP_LOCK = threading.Lock()  # one sweep at a time (the relay has ONE search slot)
 
 
-def sweep_counterparts(entries: list) -> None:
-    """Background: does the seedbox hold a counterpart for each DV movie? Drives the
-    picker's DV-row visibility (user-dictated: DV movies without a counterpart are not
-    listed). One daemon at a time, paced for the relay's single search slot, results
-    cached in the book as counterpart/counterpart_at/candidates with a TTL. NEVER touches
-    an entry's pairing `status` — panels stay driven by explicit user actions, and an
-    active flow is skipped entirely."""
+def _probe_nas_atmos(m: dict) -> bool | None:
+    """Head-probe the NAS copy's AUDIO over FTP: does it already carry Dolby Atmos?
+    Release names lie by omission (an EAC3 Atmos WEB-DL often doesn't say 'Atmos' —
+    live-caught: Disclosure Day), so the sweep asks the bitstream. None = couldn't
+    answer (retried on a later sweep); probed once per basename (files are immutable)."""
+    import scratch
+    import transfer
+    tmp = os.path.join(scratch.default_scratch(), ".companion-heads", "sweep.bin")
+    try:
+        remote = (m.get("dir") or "").rstrip("/") + "/" + m["name"]
+        ok, _why = transfer.download_head(remote, tmp, HEAD_BYTES)
+        if not ok:
+            return None
+        p = probe_media(tmp, name=m["name"])
+        if not p:
+            return None
+        return any(t.get("atmos") for t in p.get("audio") or [])
+    finally:
+        _rm(tmp)
+
+
+def sweep_counterparts(entries: list, on_update=None) -> None:
+    """Background: for each DV movie, (1) PROBE whether its audio is already Dolby Atmos
+    (goal reached → hidden, and the seedbox search is skipped entirely) and (2) ask the
+    seedbox for a counterpart. Drives the picker's DV-row visibility (user-dictated:
+    Atmos movies and counterpart-less DV movies are not listed). One daemon at a time,
+    paced for the relay's single search slot; results cached in the book (atmos: once
+    per basename; counterpart: TTL). NEVER touches an entry's pairing `status` — panels
+    stay driven by explicit user actions, and an active flow is skipped entirely.
+    `on_update` fires after every cached answer so the library cache can re-filter."""
     if not configured() or not entries:
         return
 
@@ -611,6 +636,18 @@ def sweep_counterparts(entries: list) -> None:
                 e = entry(m["name"])
                 if e.get("status"):           # active pairing — don't interfere
                     continue
+                if e.get("nas_atmos") is None:
+                    atmos = _probe_nas_atmos(m)
+                    if atmos is not None:
+                        mark(m["name"], None, nas_atmos=atmos,
+                             title=m.get("title") or "", dir=m.get("dir") or "")
+                        if on_update:
+                            on_update()
+                        e = entry(m["name"])
+                    if atmos:
+                        continue              # already Atmos — hidden; don't burn a search
+                elif e.get("nas_atmos"):
+                    continue
                 if time.time() - (e.get("counterpart_at") or 0) < COUNTERPART_TTL:
                     continue
                 try:
@@ -619,6 +656,8 @@ def sweep_counterparts(entries: list) -> None:
                     return                    # relay down/busy — a later refresh retries
                 mark(m["name"], None, counterpart=bool(cands), counterpart_at=time.time(),
                      candidates=cands, title=m.get("title") or "", dir=m.get("dir") or "")
+                if on_update:
+                    on_update()
                 time.sleep(2.0)               # pace: the relay search slot is shared
         finally:
             _SWEEP_LOCK.release()

@@ -387,7 +387,7 @@ class CounterpartSweep(unittest.TestCase):
     def tearDown(self):
         self.pb.stop()
 
-    def _sweep(self, entries, results):
+    def _sweep(self, entries, results, atmos=False, on_update=None):
         # run the sweep synchronously: patch Thread to invoke work() inline
         class T:
             def __init__(self, target=None, **kw): self.t = target
@@ -395,8 +395,9 @@ class CounterpartSweep(unittest.TestCase):
         with mock.patch.object(companion, "configured", return_value=True), \
              mock.patch.object(companion.threading, "Thread", T), \
              mock.patch.object(companion.time, "sleep", lambda s: None), \
+             mock.patch.object(companion, "_probe_nas_atmos", return_value=atmos), \
              mock.patch.object(companion, "search", side_effect=results):
-            companion.sweep_counterparts(entries)
+            companion.sweep_counterparts(entries, on_update=on_update)
 
     def test_sweep_caches_the_answer(self):
         self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m"}],
@@ -442,3 +443,53 @@ class CounterpartSweep(unittest.TestCase):
             out = companion.start_search("f.mkv", "/m", "F")
         self.assertEqual(out["status"], "found")
         self.assertEqual(companion.entry("f.mkv")["status"], "found")
+
+
+class AtmosProbeInSweep(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.pb = mock.patch.object(companion, "BOOK_FILE",
+                                    os.path.join(self.d, "companions.json"))
+        self.pb.start()
+
+    def tearDown(self):
+        self.pb.stop()
+
+    def _sweep(self, entries, results, atmos, on_update=None):
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        with mock.patch.object(companion, "configured", return_value=True), \
+             mock.patch.object(companion.threading, "Thread", T), \
+             mock.patch.object(companion.time, "sleep", lambda s: None), \
+             mock.patch.object(companion, "_probe_nas_atmos", return_value=atmos), \
+             mock.patch.object(companion, "search", side_effect=results):
+            companion.sweep_counterparts(entries, on_update=on_update)
+
+    def test_atmos_movie_is_marked_and_never_searched(self):
+        ticks = []
+        self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m"}],
+                    AssertionError("Atmos movie must not burn a search"),
+                    atmos=True, on_update=lambda: ticks.append(1))
+        e = companion.entry("a.mkv")
+        self.assertTrue(e["nas_atmos"])
+        self.assertNotIn("counterpart", e)
+        self.assertEqual(len(ticks), 1)          # the cache got told to re-filter
+        self.assertTrue(companion.counterparts()["a.mkv"]["atmos"])
+
+    def test_non_atmos_movie_is_probed_then_searched(self):
+        ticks = []
+        self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m"}],
+                    [[{"name": "b REMUX.mkv", "path": "/seedbox/b", "size": 9,
+                       "is_dir": False}]],
+                    atmos=False, on_update=lambda: ticks.append(1))
+        e = companion.entry("b.mkv")
+        self.assertFalse(e["nas_atmos"])
+        self.assertTrue(e["counterpart"])
+        self.assertEqual(len(ticks), 2)          # once per answer
+
+    def test_probe_failure_leaves_atmos_unknown_for_retry(self):
+        self._sweep([{"name": "c.mkv", "title": "C", "dir": "/m"}], [[]], atmos=None)
+        e = companion.entry("c.mkv")
+        self.assertNotIn("nas_atmos", e)         # unanswered → re-probed next sweep
+        self.assertFalse(e["counterpart"])       # the search still ran (fail-open on probe)

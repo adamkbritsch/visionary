@@ -763,9 +763,38 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
 
     A thin dispatcher: both paths are the proven remux_inject / remux machinery — the
     frame-count and fps hard gates in there are exactly the different-cut gates a
-    cross-release graft needs (a mismatch ships NOTHING; the stage parks it)."""
+    cross-release graft needs (a mismatch ships NOTHING; the stage parks it).
+
+    AUDIO SYNC: audio is stream-copied, never retimed — alignment is guaranteed by
+    proving the donor is the SAME CUT as the shipped video. Two donor configurations
+    carry that proof already (audio from the winner itself is trivial; audio from the
+    real-RPU donor is transitively proven by the RPU-vs-winner frame gate). The
+    remaining one — audio from the other copy while the RPU comes from elsewhere
+    (Resolve fallback, or an inline-DV winner borrowing audio) — is gated HERE: the
+    donor's video must match the winner frame-for-frame, else its audio would drift."""
     p7 = str(rpu_profile).startswith("7")
     mode = 2 if p7 else None
+    if audio_source not in (winner, rpu_source):
+        nw = dvcap.count_hevc_frames(winner, ffprobe)
+        na = dvcap.count_hevc_frames(audio_source, ffprobe)
+        if nw <= 0 or na <= 0:
+            return RemuxResult(False, output,
+                               reason="could not count frames to verify the audio donor "
+                                      "— resume state intact")
+        if na != nw:
+            return RemuxResult(False, output,
+                               reason=f"audio donor is a different cut: {na} != {nw} frames "
+                                      f"— its audio would drift (shipped nothing)")
+        try:
+            fa = dvcap.probe_video(audio_source, ffprobe)["fps"]
+            fw = dvcap.probe_video(winner, ffprobe)["fps"]
+            if Fraction(str(fa)) != Fraction(str(fw)):
+                return RemuxResult(False, output,
+                                   reason=f"audio donor is a different cut: fps {fa} vs {fw} "
+                                          f"— its audio would drift (shipped nothing)")
+        except (ValueError, ZeroDivisionError):
+            return RemuxResult(False, output,
+                               reason="unreadable fps — audio-donor alignment unverifiable")
     if capped:
         return remux(rpu_source, audio_source, winner, output,
                      cap_mbps=cap_mbps, audio_target_lufs=audio_target_lufs,

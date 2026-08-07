@@ -196,15 +196,30 @@ def library_list() -> list:
 
 def _dv_row_visible(m, cmap) -> bool:
     """Should a DV-badged movie appear in the picker? Only when a combine can still GAIN
-    something (user-dictated): not already Dolby Atmos (the goal audio — nothing left to
-    upgrade), and a seedbox counterpart is KNOWN to exist (background sweep, or an active
-    pairing flow in progress). Unknown-yet = hidden; it appears on a later refresh once
-    the sweep has answered. An unconfigured relay hides every DV row — there is no way
-    to combine without it."""
+    something (user-dictated): its audio is PROVEN not to be Dolby Atmos already (the
+    sweep head-probes the bitstream — release names lie by omission, live-caught on an
+    EAC3 Atmos WEB-DL), and a seedbox counterpart is KNOWN to exist. Unknown-on-either =
+    hidden; it appears on a later refresh once the sweep has answered. An active pairing
+    flow keeps its row visible; an unconfigured relay hides every DV row — there is no
+    way to combine without it."""
     if has_atmos_name(m["name"]):
         return False
     e = cmap.get(m["name"]) or {}
-    return bool(e.get("status") or e.get("counterpart"))
+    if e.get("status"):
+        return True
+    return bool(e.get("counterpart")) and e.get("atmos") is False
+
+
+def _refilter_lib() -> None:
+    """Re-apply the DV-row filter to the CACHED pool — the background sweep calls this
+    after every answer (atmos probe / counterpart search), so a just-proven-Atmos row
+    disappears on the picker's next fetch instead of waiting out a full NAS re-walk."""
+    lib = _CACHE.get("lib")
+    if not lib:
+        return
+    import companion
+    cmap = companion.counterparts()
+    _CACHE["lib"] = [m for m in lib if not m.get("has_dv") or _dv_row_visible(m, cmap)]
 
 
 def refresh_library() -> list:
@@ -217,7 +232,8 @@ def refresh_library() -> list:
     import companion
     companion.sweep_counterparts([{"name": m["name"], "title": m["title"], "dir": m["dir"]}
                                   for m in movies
-                                  if m["has_dv"] and not has_atmos_name(m["name"])])
+                                  if m["has_dv"] and not has_atmos_name(m["name"])],
+                                 on_update=_refilter_lib)
     cmap = companion.counterparts()
     _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
                       "watched": m["watched"], "tags": m["tags"], "route": m["route"],

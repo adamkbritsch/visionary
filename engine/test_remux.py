@@ -513,6 +513,17 @@ class StepWatch(unittest.TestCase):
 class CombineDispatcher(unittest.TestCase):
     """remux.combine(): a thin dispatcher over remux_inject (stream) / remux (capped)."""
 
+    def setUp(self):
+        # a distinct audio donor arms the sync gate — pin it PROVEN so dispatch is what's
+        # under test (the gate has its own class below)
+        self.g1 = mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100)
+        self.g2 = mock.patch.object(remux.dvcap, "probe_video",
+                                    return_value={"fps": "24000/1001"})
+        self.g1.start(); self.g2.start()
+
+    def tearDown(self):
+        self.g1.stop(); self.g2.stop()
+
     def test_stream_path_grafts_from_the_donor(self):
         with mock.patch.object(remux, "remux_inject",
                                return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
@@ -611,3 +622,64 @@ class InjectSkipAndConvert(unittest.TestCase):
             res = self._run(tmp, skip_inject=True, convert_es=True, calls=calls)
         self.assertTrue(res.ok)
         self.assertIn("converted to 8.1", res.reason)
+
+
+class AudioDonorSyncGate(unittest.TestCase):
+    """Cross-copy audio muxes only after the donor is PROVEN the same cut as the shipped
+    video (frame count + fps) — the two already-gated configurations skip the extra sweep."""
+
+    def test_unproven_donor_with_mismatched_frames_ships_nothing(self):
+        counts = {"winner.mkv": 100, "audio.mkv": 99}
+        with mock.patch.object(remux.dvcap, "count_hevc_frames",
+                               side_effect=lambda p, fp=None: counts[p]), \
+             mock.patch.object(remux, "remux_inject",
+                               side_effect=AssertionError("must not mux drifting audio")):
+            res = remux.combine("winner.mkv", "render.mov", "audio.mkv", "o.mkv",
+                                rpu_profile="resolve", capped=False)
+        self.assertFalse(res.ok)
+        self.assertIn("audio donor is a different cut", res.reason)
+
+    def test_unproven_donor_with_mismatched_fps_ships_nothing(self):
+        infos = {"winner.mkv": {"fps": "24000/1001"}, "audio.mkv": {"fps": "25/1"}}
+        with mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
+             mock.patch.object(remux.dvcap, "probe_video",
+                               side_effect=lambda p, fp=None: infos[p]), \
+             mock.patch.object(remux, "remux_inject",
+                               side_effect=AssertionError("must not mux drifting audio")):
+            res = remux.combine("winner.mkv", "render.mov", "audio.mkv", "o.mkv",
+                                rpu_profile="resolve", capped=False)
+        self.assertFalse(res.ok)
+        self.assertIn("fps", res.reason)
+
+    def test_proven_donor_proceeds(self):
+        with mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
+             mock.patch.object(remux.dvcap, "probe_video",
+                               return_value={"fps": "24000/1001"}), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")) as inj:
+            res = remux.combine("winner.mkv", "render.mov", "audio.mkv", "o.mkv",
+                                rpu_profile="resolve", capped=False)
+        self.assertTrue(res.ok)
+        inj.assert_called_once()
+
+    def test_audio_from_the_rpu_donor_skips_the_extra_sweep(self):
+        # transitively proven by the RPU-vs-winner frame gate inside remux_inject
+        with mock.patch.object(remux.dvcap, "count_hevc_frames",
+                               side_effect=AssertionError("already gated — no extra sweep")), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")):
+            res = remux.combine("winner.mkv", "donor.mkv", "donor.mkv", "o.mkv",
+                                rpu_profile="7.x", capped=False)
+        self.assertTrue(res.ok)
+
+    def test_audio_from_the_winner_skips_the_extra_sweep(self):
+        with mock.patch.object(remux.dvcap, "count_hevc_frames",
+                               side_effect=AssertionError("trivially synced — no sweep")), \
+             mock.patch.object(remux, "remux_inject",
+                               return_value=remux.RemuxResult(True, "o.mkv", "8.1", 2, 1,
+                                                              "ok")):
+            res = remux.combine("winner.mkv", "donor.mkv", "winner.mkv", "o.mkv",
+                                rpu_profile="7.x", capped=False)
+        self.assertTrue(res.ok)

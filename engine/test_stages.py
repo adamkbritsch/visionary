@@ -1498,3 +1498,14 @@ class CombineStages(unittest.TestCase):
             ok, msg = stages.run_stage("remux", p)
         self.assertFalse(ok)
         self.assertFalse(msg.startswith("permanent:"))   # truncated render → retry resolves it
+
+
+class AudioDonorMismatchMapping(unittest.TestCase):
+    def test_audio_donor_cut_mismatch_is_permanent_even_with_resolve_rpu(self):
+        import remux
+        bad = remux.RemuxResult(False, "o.mkv",
+                                reason="audio donor is a different cut: 99 != 100 frames "
+                                       "— its audio would drift (shipped nothing)")
+        ok, msg = stages._combine_result(bad, real_rpu_donor=False)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("permanent: companion is a different cut"))
