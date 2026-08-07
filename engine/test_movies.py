@@ -282,3 +282,22 @@ class DvRowVisibility(unittest.TestCase):
         swept = [e["name"] for e in sw.call_args.args[0]]
         self.assertEqual(sorted(swept),
                          ["DvMatch (2003) [2160p].mkv", "DvNoMatch (2002) [2160p].mkv"])
+
+
+class NameAdvertisedDv(unittest.TestCase):
+    def test_dv_release_name_counts_before_the_manifest_catches_up(self):
+        # the NAS dv-probe cron runs overnight — a fresh '...WEB-DL.DV...' file must not
+        # slip past the DV-row curation as a plain movie meanwhile (Disclosure Day)
+        ms = movies.parse_movies([{"name": "Disclosure Day (2026) [2160p WEB-DL DV HEVC].mkv",
+                                   "dir": "/m"}])
+        self.assertTrue(ms[0]["has_dv"])
+
+    def test_dovi_spelling_counts_too(self):
+        ms = movies.parse_movies([{"name": "M.2026.2160p.WEB-DL.DoVi.HDR10.HEVC.mkv",
+                                   "dir": "/m"}])
+        self.assertTrue(ms[0]["has_dv"])
+
+    def test_plain_hdr10_name_is_not_dv(self):
+        ms = movies.parse_movies([{"name": "M (2026) [2160p WEB-DL HDR10 HEVC].mkv",
+                                   "dir": "/m"}])
+        self.assertFalse(ms[0]["has_dv"])

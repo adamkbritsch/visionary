@@ -92,15 +92,18 @@ def route_hint(tags) -> str:
 
 def parse_movies(entries, dv_map=None, watched_map=None) -> list:
     """entries = [{name, dir}] -> [{name, dir, title, has_dv, watched, tags, route}] sorted
-    by title. A movie 'has DV' if the NAS-probed dv_map says so OR the name carries the DV
-    mark."""
+    by title. A movie 'has DV' if the NAS-probed dv_map says so, OR the name carries the
+    master mark, OR the RELEASE NAME advertises DV (release_tags: DV/DoVi/Dolby Vision —
+    word-bounded). The last one matters for FRESH files: the NAS dv-probe cron only runs
+    overnight, and until it catches up a '...WEB-DL.DV...' release read as a plain movie
+    slipped past the DV-row curation entirely (live-caught: Disclosure Day)."""
     out = []
     for e in entries:
         n = e["name"]
-        has_dv = series_mod_is_master(n)
+        tags = release_tags(n)
+        has_dv = series_mod_is_master(n) or "DV" in tags
         if dv_map is not None:
             has_dv = has_dv or bool(dv_map.get(n))
-        tags = release_tags(n)
         out.append({"name": n, "dir": e["dir"], "title": movie_title(n), "has_dv": has_dv,
                     "watched": bool(watched_map.get(n)) if watched_map else False,
                     "tags": tags, "route": route_hint(tags)})
