@@ -291,7 +291,7 @@ struct DolbyMark: View {
 
 struct HeaderBar: View {
     @EnvironmentObject var store: AppStore
-    @State private var showSettings = false
+    // popover binding lives in the STORE so the "Finish setup" card can open it
     var body: some View {
         let on = store.activated          // appliance: the persisted arm state, not the transient run
         HStack(spacing: 14) {
@@ -304,7 +304,7 @@ struct HeaderBar: View {
             }
             Spacer()
             PowerPill()
-            Button(action: { showSettings.toggle() }) {
+            Button(action: { store.showSettings.toggle() }) {
                 // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
                 // giving it a button chrome made it compete with Activate. Screen Control lives
                 // inside the popup now, so the gear carries its one at-a-glance signal: it goes
@@ -317,7 +317,7 @@ struct HeaderBar: View {
             }
             .buttonStyle(.plain)
             .help("Settings")
-            .popover(isPresented: $showSettings, arrowEdge: .bottom) {
+            .popover(isPresented: $store.showSettings, arrowEdge: .bottom) {
                 SettingsPopover().environmentObject(store)
             }
             Button(action: { Task { await store.toggleAutomation() } }) {
@@ -2869,7 +2869,9 @@ struct SettingsPopover: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Settings").font(.system(size: 15, weight: .semibold))
+                SetupSection()          // onboarding: fields + checks + installs (SetupViews.swift)
+            Divider()
+            Text("Settings").font(.system(size: 15, weight: .semibold))
 
                 ScreenControlSection()
                 ResolveHostSection()
@@ -3164,19 +3166,42 @@ struct GrantsCard: View {
     var body: some View {
         let t = store.selftest
         let grantsOK = (t?.screen_recording ?? false) && (t?.accessibility ?? false)
-        // HARD requirements (exact Resolve/Topaz builds + the 16" MBP built-in display —
+        // the arm-gate 409's face: the server named exactly what refused — show it
+        if let err = store.lastError {
+            Card(title: "Can't start", systemImage: "exclamationmark.octagon") {
+                Text(err).font(.system(size: 12)).foregroundStyle(DS.fault)
+                    .textSelection(.enabled)
+            }
+        }
+        // HARD requirements (exact Resolve/Topaz builds + a 2.0-backing-scale display —
         // engine/versions.py). hard_ok false → the server refuses to arm; explain why here.
         if let t, t.hard_ok == false {
             Card(title: "Unsupported setup", systemImage: "xmark.octagon") {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 12) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DS.steelBright)
-                        Text("Visionary requires DaVinci Resolve Studio 18.6.0, Topaz Video AI 7.0.1, and the 16-inch MacBook Pro built-in display (3456×2234). It will not arm until they match.")
+                        Text("Visionary requires DaVinci Resolve Studio 18.6.0, Topaz Video AI 7.0.1, and a main display rendering at 2.0x (Retina/HiDPI — a built-in panel, a 4K/5K monitor in its default scaled mode, or a 4K dummy plug). It will not arm until they match.")
                             .font(.system(size: 13, weight: .medium))
                     }
                     ForEach((t.found ?? [:]).sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
                         Text("\(k): \(v)").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
+                }
+            }
+        }
+        // FIRST-RUN: everything else healthy but setup incomplete (no config yet, tools
+        // missing, projects not imported) — point at the one place that finishes it.
+        if let t, t.hard_ok != false, t.setup_complete == false {
+            Card(title: "Finish setup", systemImage: "wrench.and.screwdriver") {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("A few setup steps are still open").font(.system(size: 13, weight: .medium))
+                        Text("Connections, dependencies, permissions and the Resolve import all live in one place.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Open Setup") { store.showSettings = true }
+                        .buttonStyle(SteelButtonStyle(lit: true))
                 }
             }
         }

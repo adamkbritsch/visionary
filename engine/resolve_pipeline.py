@@ -31,12 +31,12 @@ FFPROBE = "/opt/homebrew/bin/ffprobe"
 # range on two of them ("SDR"/"HDR") and the output on the third, which made them unreadable:
 # an "SDR" project that emitted Dolby Vision. Legacy names stay in each list as fallbacks so a
 # machine that has not re-imported the bundle keeps working. First existing one wins.
-DV1000_PROJECTS = ["Visionary DV1000 Output",                       # 1000-nit Dolby Vision
-                   "Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler"]
-DV2000_PROJECTS = ["Visionary DV2000 Output",                       # 2000-nit Dolby Vision
-                   "Visionary HDR", "Overnight Upscaler HDR"]
-SDR_OUT_PROJECTS = ["Visionary SDR Output",                         # true Rec.709, NO Dolby Vision
-                    "Overnight Upscaler SDR Output"]
+# The lists live in versions.py (single source of truth — import_resolve and preflight's
+# artifacts check consume the SAME tuples, so they can never drift apart again).
+import versions as _versions
+DV1000_PROJECTS = list(_versions.RESOLVE_PROJECTS_DV1000)
+DV2000_PROJECTS = list(_versions.RESOLVE_PROJECTS_DV2000)
+SDR_OUT_PROJECTS = list(_versions.RESOLVE_PROJECTS_SDR_OUT)
 
 # Output modes, named the same way. These are the values that travel between stages.py and this
 # module, and they match the per-item `output_mode` setting one-for-one.

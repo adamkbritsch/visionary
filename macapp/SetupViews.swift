@@ -1,0 +1,415 @@
+import SwiftUI
+import AppKit
+
+// The in-app onboarding: every README setup step as a live row inside Settings —
+// connection fields (writing ~/.topaz-pipeline/config.json through the redacted
+// /api/config), one-click dependency installs with live output, version/display
+// checks, TCC grant buttons, the Resolve project import, and the optional NAS
+// helper. Auto-expanded until every preflight check passes, collapsed after.
+
+private struct SetupGroupLabel: View {
+    let text: String
+    var body: some View {
+        Text(text.uppercased()).font(.system(size: 10, weight: .semibold))
+            .tracking(1.1).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 6)
+    }
+}
+
+private struct CheckDot: View {
+    let ok: Bool?
+    var body: some View {
+        Circle().fill(ok == true ? Color.green.opacity(0.75)
+                      : ok == false ? DS.fault : Color.secondary.opacity(0.4))
+            .frame(width: 7, height: 7)
+    }
+}
+
+/// Monospaced value with a copy button — the pattern YouTubeSetupPanel established.
+struct CopyValueRow: View {
+    let value: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(value).font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+            Spacer(minLength: 4)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+            } label: { Image(systemName: "doc.on.doc").font(.system(size: 10)) }
+                .buttonStyle(.plain).help("Copy")
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05)))
+    }
+}
+
+struct SetupSection: View {
+    @EnvironmentObject var store: AppStore
+    @State private var expanded = false
+    @State private var seeded = false
+
+    private var complete: Bool { store.preflight?.setup_complete ?? false }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            DisclosureGroup(isExpanded: $expanded) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ConnectionsGroup()
+                    DependenciesGroup()
+                    ApplicationsGroup()
+                    PermissionsGroup()
+                    ResolveProjectsGroup()
+                    NASExtrasGroup()
+                    HStack {
+                        Button("Recheck everything") { Task { await store.recheckSetup() } }
+                            .buttonStyle(SteelButtonStyle(lit: false))
+                        Spacer()
+                    }.padding(.top, 2)
+                }.padding(.top, 8)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: complete ? "checkmark.seal" : "wrench.and.screwdriver")
+                        .font(.system(size: 12))
+                        .foregroundStyle(complete ? Color.green.opacity(0.8) : DS.steelBright)
+                    Text("Setup").font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text(complete ? "complete" : "needs attention")
+                        .font(.system(size: 11))
+                        .foregroundStyle(complete ? .secondary : DS.steelBright)
+                }.contentShape(Rectangle())
+            }
+        }
+        .task {
+            await store.fetchSetup()
+            if !seeded { expanded = !complete; seeded = true }   // open until healthy
+        }
+        .onChange(of: complete) { done in
+            if done { expanded = false }                          // collapse on the green flip
+        }
+    }
+}
+
+// MARK: - connections (the config.json fields)
+
+private struct ConnectionsGroup: View {
+    @EnvironmentObject var store: AppStore
+    // field state seeded from the REDACTED config view; secrets always arrive "" and
+    // show a "saved" placeholder instead (typing replaces; explicit clear sends "")
+    @State private var f: [String: String] = [:]
+    @State private var seeded = false
+    @State private var tests: [String: ConfigTestDTO] = [:]
+    @State private var testing: String? = nil
+
+    private func secretSaved(_ key: String) -> Bool {
+        store.configDTO?.secrets_set?[key] ?? false
+    }
+
+    private func field(_ label: String, _ key: String, secret: Bool = false,
+                       hint: String = "") -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.system(size: 12)).frame(width: 92, alignment: .leading)
+            Group {
+                if secret {
+                    SecureField(secretSaved(key) ? "•••• saved" : hint,
+                                text: Binding(get: { f[key] ?? "" },
+                                              set: { f[key] = $0 }))
+                } else {
+                    TextField(hint, text: Binding(get: { f[key] ?? "" },
+                                                  set: { f[key] = $0 }))
+                }
+            }
+            .textFieldStyle(.roundedBorder).font(.system(size: 12))
+            if secret && secretSaved(key) {
+                Button {
+                    f[key] = ""
+                    Task { await store.saveConfig([key: ""]) }   // explicit clear
+                } label: { Image(systemName: "xmark.circle").font(.system(size: 10)) }
+                    .buttonStyle(.plain).help("Clear the saved value")
+            }
+        }
+    }
+
+    private func saveTest(_ title: String, keys: [String], what: String?) -> some View {
+        HStack(spacing: 8) {
+            Button("Save \(title)") {
+                var body: [String: Any] = [:]
+                for k in keys {
+                    // secrets: only send when the user actually typed something (an
+                    // empty secret field means "keep what's saved", never "clear")
+                    let v = f[k] ?? ""
+                    let isSecret = store.configDTO?.secrets_set?.keys.contains(k) ?? false
+                    if isSecret && v.isEmpty { continue }
+                    body[k] = v
+                }
+                Task { await store.saveConfig(body) }
+            }.buttonStyle(SteelButtonStyle(lit: true))
+            if let what {
+                Button {
+                    testing = what
+                    Task { tests[what] = await store.testConfig(what); testing = nil }
+                } label: {
+                    if testing == what { ProgressView().controlSize(.small) }
+                    else { Text("Test") }
+                }.buttonStyle(SteelButtonStyle(lit: false))
+                if let t = tests[what] {
+                    HStack(spacing: 5) {
+                        CheckDot(ok: t.ok)
+                        Text(t.detail ?? "").font(.system(size: 11))
+                            .foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+            }
+            Spacer()
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SetupGroupLabel(text: "Connections")
+            Text("NAS FTP — required. Everything else here is optional and degrades gracefully.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            field("NAS hosts", "ftp_hosts", hint: "100.x.y.z, nas.local")
+            field("FTP port", "ftp_port", hint: "21")
+            field("FTP user", "ftp_user")
+            field("FTP password", "ftp_pass", secret: true)
+            saveTest("NAS", keys: ["ftp_hosts", "ftp_port", "ftp_user", "ftp_pass"], what: "ftp")
+            Divider().padding(.vertical, 2)
+            field("Plex URL", "plex_url", hint: "http://nas:32400 (optional)")
+            field("Plex token", "plex_token", secret: true)
+            saveTest("Plex", keys: ["plex_url", "plex_token"], what: "plex")
+            field("TMDb key", "tmdb_api_key", secret: true, hint: "optional — smart presets")
+            saveTest("TMDb", keys: ["tmdb_api_key"], what: "tmdb")
+            field("youtarr URL", "youtarr_url", hint: "http://nas:3087 (optional)")
+            field("youtarr user", "youtarr_user")
+            field("youtarr pass", "youtarr_pass", secret: true)
+            saveTest("youtarr", keys: ["youtarr_url", "youtarr_user", "youtarr_pass"],
+                     what: "youtarr")
+            field("Shuttle relay", "shuttle_relay_url", hint: "http://nas:8789 (optional)")
+            saveTest("relay", keys: ["shuttle_relay_url"], what: "relay")
+        }
+        .onChange(of: store.configDTO?.fields) { fields in
+            guard !seeded, let fields else { return }
+            for (k, v) in fields where !(f[k]?.isEmpty == false) { f[k] = v }
+            seeded = true
+        }
+    }
+}
+
+// MARK: - dependencies (one-click installs)
+
+private struct DependenciesGroup: View {
+    @EnvironmentObject var store: AppStore
+
+    private func job(_ what: String) -> InstallJobDTO? { store.installStatus?.jobs?[what] }
+    private func running(_ what: String) -> Bool {
+        store.installStatus?.active == what && job(what)?.state == "running"
+    }
+
+    private func row(_ title: String, check id: String, install what: String) -> some View {
+        let c = store.preflight?[check: id]
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                CheckDot(ok: c?.ok)
+                Text(title).font(.system(size: 12, weight: .medium))
+                Spacer()
+                if c?.ok != true {
+                    Button {
+                        Task { await store.startInstall(what) }
+                    } label: {
+                        if running(what) { ProgressView().controlSize(.small) }
+                        else { Text("Install") }
+                    }.buttonStyle(SteelButtonStyle(lit: true))
+                        .disabled(store.installStatus?.active != nil && !running(what))
+                }
+            }
+            if let d = c?.detail, !d.isEmpty {
+                Text(d).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+            }
+            if let j = job(what), running(what) || j.state == "failed" {
+                // the live tail (or the failure's last lines) — the job IS the feedback
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(Array((j.tail ?? []).suffix(8).enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(j.state == "failed" ? DS.fault : .secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.25)))
+            }
+            if c?.ok != true, let fix = c?.fix, !fix.isEmpty {
+                CopyValueRow(value: fix)
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "Dependencies")
+            if store.preflight?.brew_present == false {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        CheckDot(ok: false)
+                        Text("Homebrew").font(.system(size: 12, weight: .medium))
+                    }
+                    Text("Its installer needs your admin password, so run it in Terminal "
+                         + "first — the installs below unlock once it exists.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    CopyValueRow(value: "/bin/bash -c \"$(curl -fsSL https://raw."
+                                 + "githubusercontent.com/Homebrew/install/HEAD/install.sh)\"")
+                }
+            }
+            row("Command-line tools", check: "brew_tools", install: "brew_tools")
+            row("SublerCLI + Rosetta", check: "sublercli", install: "sublercli")
+            row("Python OpenCV", check: "python_deps", install: "python_deps")
+        }
+    }
+}
+
+// MARK: - applications (detected, not installable from here)
+
+private struct ApplicationsGroup: View {
+    @EnvironmentObject var store: AppStore
+
+    private func row(_ title: String, _ id: String) -> some View {
+        let c = store.preflight?[check: id]
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                CheckDot(ok: c?.ok)
+                Text(title).font(.system(size: 12, weight: .medium))
+                Spacer()
+            }
+            if let d = c?.detail, !d.isEmpty {
+                Text(d).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+            }
+            if c?.ok == false, let fix = c?.fix, !fix.isEmpty {
+                Text(fix).font(.system(size: 11)).foregroundStyle(DS.steelBright).lineLimit(4)
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "Applications & hardware")
+            row("DaVinci Resolve Studio", "resolve_version")
+            row("Topaz Video AI", "topaz_version")
+            row("Display", "display")
+            row("Power", "power_adapter")
+        }
+    }
+}
+
+// MARK: - permissions (TCC)
+
+private struct PermissionsGroup: View {
+    @EnvironmentObject var store: AppStore
+    var body: some View {
+        let t = store.selftest
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "Permissions")
+            HStack(spacing: 8) {
+                CheckDot(ok: t?.screen_recording)
+                Text("Screen Recording").font(.system(size: 12, weight: .medium))
+                Spacer()
+                Button("Request") { Task { await store.requestScreenRecording() } }
+                    .buttonStyle(SteelButtonStyle(lit: t?.screen_recording != true))
+                Button("Open Settings") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:"
+                        + "com.apple.preference.security?Privacy_ScreenCapture")!)
+                }.buttonStyle(SteelButtonStyle(lit: false))
+            }
+            HStack(spacing: 8) {
+                CheckDot(ok: t?.accessibility)
+                Text("Accessibility").font(.system(size: 12, weight: .medium))
+                Spacer()
+                Button("Request") { Task { await store.requestAccessibility() } }
+                    .buttonStyle(SteelButtonStyle(lit: t?.accessibility != true))
+            }
+            Text("macOS shows each prompt once; relaunch Visionary after granting.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - resolve projects (the bundled import)
+
+private struct ResolveProjectsGroup: View {
+    @EnvironmentObject var store: AppStore
+    var body: some View {
+        let c = store.preflight?[check: "resolve_artifacts"]
+        let j = store.installStatus?.jobs?["import_resolve"]
+        let running = store.installStatus?.active == "import_resolve"
+        VStack(alignment: .leading, spacing: 6) {
+            SetupGroupLabel(text: "Resolve projects & DV preset")
+            HStack(spacing: 8) {
+                CheckDot(ok: c?.ok)
+                Text(c?.detail ?? "not checked yet").font(.system(size: 11))
+                    .foregroundStyle(.secondary).lineLimit(2)
+                Spacer()
+                Button {
+                    Task { await store.importResolve() }
+                } label: {
+                    if running { ProgressView().controlSize(.small) }
+                    else { Text("Import projects & preset") }
+                }.buttonStyle(SteelButtonStyle(lit: c?.ok != true))
+                    .disabled(store.installStatus?.active != nil && !running)
+            }
+            Text("Quit DaVinci Resolve first — it rewrites the preset file on exit.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            if let steps = j?.steps {
+                ForEach(steps) { s in
+                    HStack(spacing: 6) {
+                        CheckDot(ok: s.ok)
+                        Text("\(s.step ?? "?"): \(s.detail ?? "")")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+            } else if j?.state == "failed" {
+                Text((j?.tail ?? []).suffix(3).joined(separator: " · "))
+                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(DS.fault)
+            }
+        }
+    }
+}
+
+// MARK: - NAS extras (optional helper)
+
+private struct NASExtrasGroup: View {
+    @EnvironmentObject var store: AppStore
+    @State private var result: DvProbeDTO? = nil
+    @State private var uploading = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SetupGroupLabel(text: "NAS extras (optional)")
+            HStack(spacing: 8) {
+                Text("DV probe — precise Dolby Vision detection for files you didn't "
+                     + "make with Visionary. Without it, filename marks cover the rest.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    uploading = true
+                    Task { result = await store.uploadDvProbe(); uploading = false }
+                } label: {
+                    if uploading { ProgressView().controlSize(.small) }
+                    else { Text("Upload to NAS") }
+                }.buttonStyle(SteelButtonStyle(lit: false))
+            }
+            if let r = result {
+                if r.ok == true {
+                    Text("Uploaded to \(r.uploaded_to ?? "") — add this line to the NAS "
+                         + "task scheduler (cron):")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    CopyValueRow(value: r.cron ?? "")
+                } else {
+                    HStack(spacing: 6) {
+                        CheckDot(ok: false)
+                        Text(r.detail ?? "upload failed").font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+}

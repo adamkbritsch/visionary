@@ -477,4 +477,72 @@ struct SelftestDTO: Codable {
     var display_ok: Bool?
     var hard_ok: Bool?                 // false → the server refuses to arm (409)
     var found: [String: String]?       // failing check id -> human detail ("found X; require Y")
+    var setup_complete: Bool?          // ALL 12 preflight checks pass → the Setup section
+                                       // auto-collapses and the "Finish setup" card hides
+}
+
+// ---- in-app Setup (onboarding) ------------------------------------------------------
+
+struct PreflightCheckDTO: Codable, Identifiable {
+    var id: String?                    // check id ("brew_tools", "resolve_version", ...)
+    var ok: Bool?
+    var severity: String?              // "fail" | "warn"
+    var detail: String?
+    var fix: String?                   // remediation text/command — ALWAYS present now
+}
+
+struct PreflightDTO: Codable {
+    var ok: Bool?
+    var hard_ok: Bool?
+    var setup_complete: Bool?
+    var brew_present: Bool?            // false → dependency installs are copy-only
+    var checks: [PreflightCheckDTO]?
+    subscript(check id: String) -> PreflightCheckDTO? {
+        checks?.first { $0.id == id }
+    }
+}
+
+struct ConfigDTO: Codable {
+    var fields: [String: String]?      // non-secret values verbatim (secrets always "")
+    var secrets_set: [String: Bool]?   // secret keys → stored-or-not (values never sent)
+    var path: String?
+}
+
+struct ConfigTestDTO: Codable {
+    var ok: Bool?
+    var detail: String?
+}
+
+struct ImportStepDTO: Codable, Identifiable {
+    var step: String?
+    var ok: Bool?
+    var detail: String?
+    var id: String { step ?? UUID().uuidString }
+}
+
+struct InstallJobDTO: Codable {
+    var what: String?
+    var state: String?                 // "running" | "ok" | "failed"
+    var rc: Int?
+    var tail: [String]?                // live output (bounded ring server-side)
+    var steps: [ImportStepDTO]?        // import_resolve only
+}
+
+struct InstallStatusDTO: Codable {
+    var active: String?
+    var jobs: [String: InstallJobDTO]?
+}
+
+struct DvProbeDTO: Codable {
+    var ok: Bool?
+    var detail: String?
+    var uploaded_to: String?
+    var cron: String?
+}
+
+struct ApiErrorDTO: Codable {          // 4xx bodies (the arm-gate 409 carries `checks`)
+    var error: String?
+    var detail: String?
+    var hint: String?
+    var checks: [PreflightCheckDTO]?
 }

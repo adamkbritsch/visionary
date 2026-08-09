@@ -36,11 +36,13 @@ SETTINGS_DIR = os.path.expanduser(
     "~/Library/Application Support/Blackmagic Design/DaVinci Resolve/"
     "Resolve Project Library/Resolve Projects/Settings")
 DELIVER_PRESETS = os.path.join(SETTINGS_DIR, "DeliverPresetList.xml")
-# Kept in step with engine/resolve_pipeline.py — all three named for what they PRODUCE.
-DV1000_CANDIDATES = ("Visionary DV1000 Output",
-                     "Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler")
-DV2000_CANDIDATES = ("Visionary DV2000 Output", "Visionary HDR", "Overnight Upscaler HDR")
-SDR_OUT_CANDIDATES = ("Visionary SDR Output", "Overnight Upscaler SDR Output")
+# SINGLE SOURCE OF TRUTH lives in engine/versions.py — resolve_pipeline and
+# preflight.check_resolve_artifacts consume the same tuples (they drifted once:
+# a clean import passed here then FAILED preflight, which only knew legacy names).
+import versions as _versions
+DV1000_CANDIDATES = _versions.RESOLVE_PROJECTS_DV1000
+DV2000_CANDIDATES = _versions.RESOLVE_PROJECTS_DV2000
+SDR_OUT_CANDIDATES = _versions.RESOLVE_PROJECTS_SDR_OUT
 
 
 def _result(step, ok, detail):
@@ -152,14 +154,16 @@ def import_projects(dry_run=False):
         out.append(_result(f"project_{mode.lower()}", ok,
                            f"imported {os.path.basename(drps[mode])!r}" if ok
                            else f"ImportProject failed for {drps[mode]}"))
-    # verify: projects visible + the preset visible to a loaded project
+    # verify: projects visible + the preset visible to a loaded project. (These two lines
+    # referenced undefined SDR_CANDIDATES/HDR_CANDIDATES — a NameError on every real,
+    # non-dry-run import, after the imports had already succeeded.)
     existing = set(pm.GetProjectListInCurrentFolder() or [])
-    sdr = next((c for c in SDR_CANDIDATES if c in existing), None)
-    hdr = next((c for c in HDR_CANDIDATES if c in existing), None)
-    out.append(_result("verify_projects", bool(sdr and hdr),
-                       f"SDR={sdr!r} HDR={hdr!r} (Resolve {r.GetVersionString()})"))
-    if sdr:
-        proj = pm.LoadProject(sdr)
+    dv1000 = next((c for c in DV1000_CANDIDATES if c in existing), None)
+    dv2000 = next((c for c in DV2000_CANDIDATES if c in existing), None)
+    out.append(_result("verify_projects", bool(dv1000 and dv2000),
+                       f"DV1000={dv1000!r} DV2000={dv2000!r} (Resolve {r.GetVersionString()})"))
+    if dv1000:
+        proj = pm.LoadProject(dv1000)
         presets = (proj.GetRenderPresetList() or []) if proj else []
         out.append(_result("verify_preset", "OvernightDV" in presets,
                            "OvernightDV visible in GetRenderPresetList()" if "OvernightDV" in presets

@@ -11,12 +11,20 @@ BIN="$TMP/Visionary"
 # the signing cert, so KEEP whatever id you first granted with — changing it resets grants.
 # (The maintainer exports BUNDLE_ID=com.adambritsch.overnightupscaler locally for that reason.)
 BUNDLE_ID="${BUNDLE_ID:-com.visionary.upscaler}"
+# --release [version]: also produce a version-stamped distributable zip in dist/.
+RELEASE=0
+VERSION="${VISIONARY_VERSION:-0.4}"
+if [ "${1:-}" = "--release" ]; then
+  RELEASE=1
+  [ -n "${2:-}" ] && VERSION="$2"
+fi
 
 # 1. COMPILE FIRST — to a temp path, so a build error never wrecks the working app.
 swiftc \
   "$ROOT/macapp/Models.swift" \
   "$ROOT/macapp/Store.swift" \
   "$ROOT/macapp/Views.swift" \
+  "$ROOT/macapp/SetupViews.swift" \
   "$ROOT/macapp/main.swift" \
   -o "$BIN" -framework AppKit -framework SwiftUI
 
@@ -49,8 +57,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>Visionary</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleVersion</key><string>0.3</string>
-  <key>CFBundleShortVersionString</key><string>0.3</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
 $ICON_KEYS
@@ -58,6 +66,13 @@ $ICON_KEYS
 PLIST
 
 rsync -a --exclude __pycache__ --exclude '*.pyc' --exclude manifests "$ROOT/engine/" "$APP/Contents/Resources/engine/"
+# Ship the SETUP-TIME artifacts too, mirroring the repo layout (import_resolve.py derives
+# its paths from its own location, so Resources/{setup,bundle,nas} beside engine/ makes a
+# drop-in .app fully self-sufficient — the in-app Setup section drives all three):
+rsync -a --exclude __pycache__ --exclude '*.pyc' "$ROOT/setup/" "$APP/Contents/Resources/setup/"
+rsync -a "$ROOT/bundle/resolve/" "$APP/Contents/Resources/bundle/resolve/"
+mkdir -p "$APP/Contents/Resources/nas"
+cp "$ROOT/nas/dv_probe.py" "$APP/Contents/Resources/nas/dv_probe.py"
 cp "$BIN" "$APP/Contents/MacOS/Visionary"
 # Sign with the STABLE self-signed identity (see setup-signing-cert.sh) so TCC keys on
 # the cert-based designated requirement, not the binary hash — Screen Recording +
@@ -71,3 +86,13 @@ else
 fi
 rm -rf "$TMP"
 echo "built: $APP"
+if [ "$RELEASE" = 1 ]; then
+  # Distribution: a plain zip attached to a GitHub Release. Not notarized — the README
+  # documents the one-time right-click-Open (and drag to /Applications first, or macOS
+  # App Translocation runs it from a randomized read-only path and TCC grants won't stick).
+  mkdir -p "$ROOT/dist"
+  ZIP="$ROOT/dist/Visionary-v$VERSION.zip"
+  rm -f "$ZIP"
+  ditto -c -k --norsrc --keepParent "$APP" "$ZIP"   # --norsrc: no ._ AppleDouble noise
+  echo "release: $ZIP"
+fi

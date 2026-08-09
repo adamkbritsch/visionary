@@ -23,6 +23,19 @@ RESOLVE_BUILD = "18.6.00009"   # CFBundleVersion — reported for diagnostics, n
 TOPAZ_APP = "/Applications/Topaz Video AI.app"
 TOPAZ_VERSION = "7.0.1"        # CFBundleShortVersionString — the gate (exact match)
 
+# The three persistent Resolve projects, named for what they PRODUCE, with legacy names
+# as fallbacks (first existing one wins). SINGLE SOURCE OF TRUTH — consumed by
+# resolve_pipeline (which project to load), setup/import_resolve.py (what to import and
+# verify), and preflight.check_resolve_artifacts (what counts as imported). These three
+# drifted apart once already: preflight only knew the legacy names, so a CLEAN import of
+# "Visionary DV1000 Output" then failed the artifacts check.
+RESOLVE_PROJECTS_DV1000 = ("Visionary DV1000 Output",               # 1000-nit Dolby Vision
+                           "Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler")
+RESOLVE_PROJECTS_DV2000 = ("Visionary DV2000 Output",               # 2000-nit Dolby Vision
+                           "Visionary HDR", "Overnight Upscaler HDR")
+RESOLVE_PROJECTS_SDR_OUT = ("Visionary SDR Output",                 # true Rec.709, NO DV
+                            "Overnight Upscaler SDR Output")
+
 # Hardware — TWO independent requirements, each with its own rule below:
 #  1) A MAIN DISPLAY at 2.0 backing scale (REQUIRED_BACKING_SCALE).
 #  2) Sustained 140 W: the Topaz stage runs the GPU flat-out for hours. A DESKTOP Mac is

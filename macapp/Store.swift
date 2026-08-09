@@ -34,6 +34,15 @@ final class AppStore: ObservableObject {
     @Published var pendingSeriesSlot: Int? = nil    // slot to set it into (nil = change preset only)
     @Published var seriesPick = ""
 
+    // In-app Setup (onboarding): the popover binding lives HERE so the first-run card
+    // can open Settings programmatically; the setup payloads are fetched on demand
+    // (popover open), never on the poll — /api/config stays off the state broadcast.
+    @Published var showSettings = false
+    @Published var lastError: String? = nil       // the app's first real error surface
+    @Published var preflight: PreflightDTO?
+    @Published var configDTO: ConfigDTO?
+    @Published var installStatus: InstallStatusDTO?
+
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
                                                   // click, before the server round-trip lands
     var mode: String { modeOverride ?? state?.mode ?? "tv" }     // "tv" | "youtube" | "movie" (nav VIEW)
@@ -148,7 +157,19 @@ final class AppStore: ObservableObject {
     // button must read + toggle THAT. A run ends only when you Deactivate.
     var activated: Bool { state?.settings?.activated ?? state?.automation_enabled ?? false }
     func toggleAutomation() async {
-        await post("/api/automation", ["enabled": !activated])
+        let enabling = !activated
+        let (ok, data) = await postResult("/api/automation", ["enabled": enabling])
+        if !ok, enabling, let data,
+           let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data) {
+            // the arm-gate 409 finally gets a face: name the first failing check
+            if let c = e.checks?.first {
+                lastError = "Refusing to arm — \(c.id ?? "?"): \(c.detail ?? "")"
+            } else {
+                lastError = e.error ?? "Refusing to arm"
+            }
+        } else if ok {
+            lastError = nil
+        }
         await refresh()
     }
     // SCREEN CONTROL. quietMode == true means the pipeline is NOT using the screen.
@@ -345,6 +366,71 @@ final class AppStore: ObservableObject {
     func requestAccessibility() async {
         await post("/api/request-accessibility", [:]); await runSelftest()
     }
+    func requestScreenRecording() async {
+        await post("/api/request-screen-recording", [:]); await runSelftest()
+    }
+
+    // ---- in-app Setup (onboarding) ----------------------------------------------
+    func fetchSetup() async {
+        if let p: PreflightDTO = await get("/api/preflight") { preflight = p }
+        if let c: ConfigDTO = await get("/api/config") { configDTO = c }
+        await fetchInstallStatus()
+    }
+    func recheckSetup() async {
+        if let p: PreflightDTO = await get("/api/preflight?fresh=1") { preflight = p }
+        await runSelftest()
+    }
+    /// Save changed config fields. The response is the REDACTED view (secrets round-trip
+    /// as set/unset booleans only — values never come back).
+    func saveConfig(_ body: [String: Any]) async {
+        let (_, data) = await postResult("/api/config", body)
+        if let data, let c = try? JSONDecoder().decode(ConfigDTO.self, from: data) {
+            configDTO = c
+        }
+        await recheckSetup()
+    }
+    func testConfig(_ what: String) async -> ConfigTestDTO? {
+        let (_, data) = await postResult("/api/config-test", ["what": what])
+        guard let data else { return nil }
+        return try? JSONDecoder().decode(ConfigTestDTO.self, from: data)
+    }
+    func fetchInstallStatus() async {
+        if let s: InstallStatusDTO = await get("/api/setup/install-status") { installStatus = s }
+    }
+    /// Kick an installer job and follow it to completion (the row shows the live tail).
+    func startInstall(_ what: String) async {
+        let (_, data) = await postResult("/api/setup/install", ["what": what])
+        if let data, let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data),
+           let err = e.error {
+            lastError = err == "homebrew-missing"
+                ? "Homebrew isn't installed — run its installer in Terminal first (command in the row)."
+                : err == "busy" ? "Another install is still running." : err
+            return
+        }
+        await followInstalls()
+    }
+    func importResolve() async {
+        let (ok, data) = await postResult("/api/setup/import-resolve", [:])
+        if !ok, let data, let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data) {
+            lastError = e.detail ?? e.error
+            return
+        }
+        await followInstalls()
+    }
+    /// Poll the job registry once a second until the active job finishes, then recheck.
+    private func followInstalls() async {
+        for _ in 0..<900 {
+            await fetchInstallStatus()
+            if installStatus?.active == nil { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        await recheckSetup()
+    }
+    func uploadDvProbe() async -> DvProbeDTO? {
+        let (_, data) = await postResult("/api/setup/install-dv-probe", [:])
+        guard let data else { return nil }
+        return try? JSONDecoder().decode(DvProbeDTO.self, from: data)
+    }
 
     // Auto-detect a preset for a just-picked, unconfigured title (shotonwhat film/digital + TMDb
     // animation). Returns a preset key to auto-apply, or nil = no confident match → open the picker.
@@ -363,6 +449,21 @@ final class AppStore: ObservableObject {
             let (data, _) = try await URLSession.shared.data(from: url)
             return try JSONDecoder().decode(T.self, from: data)
         } catch { return nil }
+    }
+    /// POST that KEEPS the status code + body — the classic `post` throws both away,
+    /// which is how the arm-gate 409 stayed invisible for months. Setup endpoints and
+    /// toggleAutomation use this.
+    private func postResult(_ path: String, _ body: [String: Any]) async -> (ok: Bool, data: Data?) {
+        guard let url = URL(string: base + path) else { return (false, nil) }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            return ((200...299).contains(code), data)
+        } catch { return (false, nil) }
     }
     private func postDecode<T: Decodable>(_ path: String, _ body: [String: Any]) async -> T? {
         guard let url = URL(string: base + path) else { return nil }

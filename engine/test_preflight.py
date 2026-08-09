@@ -288,3 +288,47 @@ class ResolveProcessMatch(unittest.TestCase):
             if '"-x", "DaVinci Resolve"' in body:
                 bad.append(os.path.relpath(f, root))
         self.assertEqual(bad, [], "these still use a pgrep pattern that can never match")
+
+
+class FixStringsAlwaysPresent(unittest.TestCase):
+    def test_passing_check_keeps_its_fix(self):
+        # the in-app Setup rows show each check's remediation/command regardless of state
+        c = preflight._check("x", True, "fail", "fine", "the fix text")
+        self.assertEqual(c["fix"], "the fix text")
+
+    def test_failing_check_keeps_it_too(self):
+        c = preflight._check("x", False, "fail", "broken", "the fix text")
+        self.assertEqual(c["fix"], "the fix text")
+
+
+class ArmGate(unittest.TestCase):
+    def test_arm_gate_is_cheap_plus_instant_deps(self):
+        from unittest import mock
+        fake = lambda cid: {"id": cid, "ok": True, "severity": "fail", "detail": "", "fix": ""}
+        with mock.patch.object(preflight, "run_cheap",
+                               return_value=[fake("resolve_version"), fake("topaz_version"),
+                                             fake("display")]), \
+             mock.patch.object(preflight, "check_brew_tools",
+                               return_value=fake("brew_tools")), \
+             mock.patch.object(preflight, "check_python_deps",
+                               return_value=fake("python_deps")):
+            ids = [c["id"] for c in preflight.run_arm_gate()]
+        self.assertEqual(ids, ["resolve_version", "topaz_version", "display",
+                               "brew_tools", "python_deps"])
+
+
+class ArtifactsAcceptNewProjectNames(unittest.TestCase):
+    def test_clean_import_names_pass_the_check(self):
+        # regression: preflight only knew legacy names, so a clean import of
+        # "Visionary DV1000 Output" failed the artifacts check
+        import os, tempfile
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        for name in ("Visionary DV1000 Output", "Visionary DV2000 Output"):
+            os.makedirs(os.path.join(d, name))
+        presets = os.path.join(d, "DeliverPresetList.xml")
+        open(presets, "w").write("<x><DbKey>OvernightDV</DbKey></x>")
+        with mock.patch.object(preflight, "RESOLVE_PROJECT_DIR", d), \
+             mock.patch.object(preflight, "DELIVER_PRESETS", presets):
+            c = preflight.check_resolve_artifacts()
+        self.assertTrue(c["ok"], c["detail"])

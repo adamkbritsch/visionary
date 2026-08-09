@@ -43,7 +43,10 @@ TEMPLATES = ("dolby_vision_palette.png", "analyze_all.png", "analyze_modal.png",
 
 
 def _check(cid, ok, severity, detail, fix=""):
-    return {"id": cid, "ok": bool(ok), "severity": severity, "detail": detail, "fix": "" if ok else fix}
+    # `fix` is kept even when the check PASSES (it used to be blanked): the in-app Setup
+    # section shows each row's remediation/command regardless of current state, and the
+    # CLI printer guards on `ok` itself.
+    return {"id": cid, "ok": bool(ok), "severity": severity, "detail": detail, "fix": fix}
 
 
 def _bundle_version(app_path):
@@ -340,13 +343,13 @@ def check_shim_templates():
     if missing:
         return _check("shim_templates", False, "fail",
                       "missing template PNGs: " + ", ".join(missing),
-                      "Re-clone the repo — engine/dv_shim_templates/*.png must ship with it.")
+                      "Reinstall the app (or re-clone the repo) — engine/dv_shim_templates/*.png must ship with it.")
     try:
         import cv2
         bad = [t for t in TEMPLATES if cv2.imread(os.path.join(TEMPLATES_DIR, t)) is None]
         return _check("shim_templates", not bad, "fail",
                       "all 4 templates load" if not bad else "unreadable PNGs: " + ", ".join(bad),
-                      "Re-clone the repo — a template PNG is corrupt.")
+                      "Reinstall the app (or re-clone the repo) — a template PNG is corrupt.")
     except Exception:
         return _check("shim_templates", True, "warn",
                       "4 templates present (cv2 unavailable — could not validate contents)",
@@ -404,8 +407,9 @@ def check_tcc_grants(in_app=False):
 
 def check_resolve_artifacts(post_setup=False):
     sev = "fail" if post_setup else "warn"
-    fix = "Quit Resolve, then run: python3 setup/import_resolve.py  (imports the two Visionary " \
-          "projects and the OvernightDV Dolby Vision render preset shipped in bundle/resolve/)."
+    fix = "Quit Resolve, then use Settings → Setup → 'Import projects & preset' in the app " \
+          "(or run: python3 setup/import_resolve.py from a clone). Imports the Visionary " \
+          "projects and the OvernightDV Dolby Vision render preset shipped in bundle/resolve/."
     preset_ok = False
     try:
         with open(DELIVER_PRESETS, encoding="utf-8", errors="replace") as f:
@@ -416,12 +420,16 @@ def check_resolve_artifacts(post_setup=False):
         projects = set(os.listdir(RESOLVE_PROJECT_DIR))
     except OSError:
         projects = set()
-    sdr = {"Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler"} & projects
-    hdr = {"Visionary HDR", "Overnight Upscaler HDR"} & projects
-    ok = preset_ok and bool(sdr) and bool(hdr)
+    # SAME tuples import_resolve imports from (versions.py) — these drifted once: a clean
+    # import of "Visionary DV1000 Output" then failed this check, which only knew the
+    # legacy names.
+    dv1000 = set(versions.RESOLVE_PROJECTS_DV1000) & projects
+    dv2000 = set(versions.RESOLVE_PROJECTS_DV2000) & projects
+    ok = preset_ok and bool(dv1000) and bool(dv2000)
     return _check("resolve_artifacts", ok, sev,
                   f"OvernightDV preset={'present' if preset_ok else 'MISSING'}; "
-                  f"SDR project={sorted(sdr) or 'MISSING'}; HDR project={sorted(hdr) or 'MISSING'}",
+                  f"DV1000 project={sorted(dv1000) or 'MISSING'}; "
+                  f"DV2000 project={sorted(dv2000) or 'MISSING'}",
                   fix)
 
 
@@ -655,6 +663,16 @@ def run_cheap():
     return [check_resolve_version(), check_topaz_version(), check_display()]
 
 
+def run_arm_gate():
+    """What Activation requires: the version/display pins PLUS the instant dependency
+    checks. STRENGTHENS the gate (CLAUDE.md allows that; weakening is forbidden) — a
+    missing x265 or a broken cv2 used to surface as a stage failure HOURS into a job;
+    now it refuses to arm with a named check. Not run_cheap(): check_python_deps spawns
+    /usr/bin/python3 (~0.3 s), too heavy for the selftest poll, fine at arm time and in
+    the 60 s re-arm tick."""
+    return run_cheap() + [check_brew_tools(), check_python_deps()]
+
+
 def run_checks(network=False, smoke=False, post_setup=False, in_app=False):
     checks = run_cheap() + [
         check_power_adapter(), check_brew_tools(), check_sublercli(), check_python_deps(),
@@ -682,7 +700,7 @@ def main(argv=None):
         for c in result["checks"]:
             mark = "PASS" if c["ok"] else ("FAIL" if c["severity"] == "fail" else "WARN")
             print(f"[{mark:4}] {c['id']}: {c['detail']}")
-            if c["fix"]:
+            if not c["ok"] and c["fix"]:       # fix is now always populated — print on failure only
                 print(f"       fix: {c['fix']}")
         print(f"\nhard_ok={result['hard_ok']} ok={result['ok']}")
     return 0 if result["ok"] else (1 if not result["hard_ok"] else 2)

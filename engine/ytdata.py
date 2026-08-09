@@ -49,19 +49,11 @@ def connected() -> bool:
 
 
 def _save(**kw) -> None:
-    """Merge keys into config.json (atomic, 0600). Used to persist the refresh token."""
-    try:
-        with open(CONFIG) as f:
-            cfg = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        cfg = {}
-    cfg.update(kw)
-    tmp = CONFIG + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG)
-    os.chmod(CONFIG, 0o600)
+    """Merge keys into config.json (atomic, 0600). Used to persist the refresh token.
+    Now an alias over configstore.write — the ONE config writer (it also creates
+    ~/.topaz-pipeline 0700 on a fresh machine, which this never did)."""
+    import configstore
+    configstore.write(kw)
 
 
 # ---- HTTP -----------------------------------------------------------------

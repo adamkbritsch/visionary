@@ -670,6 +670,13 @@ def selftest_full():
     r["hard_ok"] = all(c["ok"] for c in cheap)
     r["found"] = {c["id"]: c["detail"] for c in cheap if not c["ok"]}
     r["ok"] = r["ok"] and r["hard_ok"]
+    # setup_complete drives the app's "Finish setup" card + the Setup section's
+    # auto-expand. A FULL pass costs ~1.4 s, so it rides its own 300 s cache here
+    # (the 5 s /api/preflight cache refreshes it whenever the Setup UI is open).
+    if _FULL_PREFLIGHT["result"] is not None and now - _FULL_PREFLIGHT["t"] < 300:
+        r["setup_complete"] = _FULL_PREFLIGHT["result"]["ok"]
+    else:
+        r["setup_complete"] = api_preflight()["setup_complete"]
     return r
 
 
@@ -701,6 +708,161 @@ def request_accessibility():
         return {"prompted": True, "trusted": bool(ax.AXIsProcessTrustedWithOptions(opts))}
     except Exception as e:
         return {"prompted": False, "error": str(e)}
+
+
+def request_screen_recording():
+    """Fire the macOS Screen Recording approval prompt for this process's responsible
+    app, via CGRequestScreenCaptureAccess. macOS shows the dialog at most once per boot;
+    the grant takes effect after an app relaunch (the Setup row says both)."""
+    try:
+        import ctypes, ctypes.util
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+        cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+        return {"prompted": True, "granted": bool(cg.CGRequestScreenCaptureAccess())}
+    except Exception as e:
+        return {"prompted": False, "error": str(e)}
+
+
+# ---- in-app Setup (onboarding) ---------------------------------------------------
+# RESOURCES_DIR: Contents/Resources in the bundle, the repo root in a checkout — both
+# hold engine/ beside setup/, bundle/ and nas/ (build.sh ships all four).
+RESOURCES_DIR = os.path.dirname(ENGINE_DIR)
+
+_FULL_PREFLIGHT = {"t": 0.0, "result": None}    # 5 s cache (a full offline pass ≈ 1.4 s)
+_FULL_PREFLIGHT_LOCK = threading.Lock()
+
+
+def _invalidate_preflight():
+    """Config saved / an install finished / grants changed — force fresh answers."""
+    _FULL_PREFLIGHT["result"] = None
+    _PREFLIGHT_CACHE["result"] = None
+
+
+def api_preflight(fresh=False):
+    """The FULL check list for the Setup section (12 checks, fix strings included) —
+    on demand only, never on the poll. run_checks(in_app=True): the server runs inside
+    the app's TCC context, so the grants check is authoritative and severity=fail."""
+    import time as _t
+    with _FULL_PREFLIGHT_LOCK:
+        now = _t.monotonic()
+        if fresh or _FULL_PREFLIGHT["result"] is None or now - _FULL_PREFLIGHT["t"] > 5:
+            _FULL_PREFLIGHT["result"] = preflight.run_checks(in_app=True)
+            _FULL_PREFLIGHT["t"] = now
+        r = dict(_FULL_PREFLIGHT["result"])
+    r["setup_complete"] = r["ok"]
+    r["brew_present"] = os.path.exists("/opt/homebrew/bin/brew")
+    return r
+
+
+def api_config_test(what):
+    """Live connectivity probe for one Setup group, bounded timeouts, secrets never in
+    the response. 'not configured' is a clean non-error (the UI shows it neutrally)."""
+    import urllib.request
+    try:
+        if what == "ftp":
+            if not transfer.nas_hosts():
+                return {"ok": False, "detail": "not configured"}
+            ftp = transfer.connect(timeout=6)
+            host = ftp.host
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+            return {"ok": True, "detail": f"connected to {host}"}
+        if what == "plex":
+            import plex
+            token = plex.plex_token() if hasattr(plex, "plex_token") else None
+            base = (plex.plex_base_urls() or [None])[0]
+            if not base or not token:
+                return {"ok": False, "detail": "not configured"}
+            req = urllib.request.Request(base + "/identity",
+                                         headers={"X-Plex-Token": token})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return {"ok": resp.status == 200, "detail": f"Plex answered at {base}"}
+        if what == "youtarr":
+            import youtarr
+            bases = youtarr.base_urls()
+            if not bases or not all(youtarr._creds()):
+                return {"ok": False, "detail": "not configured"}
+            for base in bases:
+                if youtarr._login(base):
+                    return {"ok": True, "detail": f"youtarr login ok at {base}"}
+            return {"ok": False, "detail": "youtarr login failed (check url/user/pass)"}
+        if what == "relay":
+            import companion
+            if not companion.configured():
+                return {"ok": False, "detail": "not configured"}
+            companion.relay_get_json("/v1/targets", timeout=8)
+            return {"ok": True, "detail": "relay answered"}
+        if what == "tmdb":
+            import tmdb
+            key = tmdb._api_key()
+            if not key:
+                return {"ok": False, "detail": "not configured"}
+            url = f"https://api.themoviedb.org/3/configuration?api_key={key}"
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                return {"ok": resp.status == 200, "detail": "TMDb key accepted"}
+        return {"ok": False, "detail": f"unknown test {what!r}"}
+    except Exception as e:
+        # exception text can carry host names but never credentials (nothing here puts
+        # a secret into a URL or an error string)
+        return {"ok": False, "detail": f"{e.__class__.__name__}: {e}"}
+
+
+def api_import_resolve():
+    """Run the bundled setup/import_resolve.py as a SUBPROCESS job (fusionscript can
+    hang holding the GIL — it must never run inside the server). Hard guard first:
+    Resolve must be closed (it rewrites DeliverPresetList.xml on exit)."""
+    script = os.path.join(RESOURCES_DIR, "setup", "import_resolve.py")
+    if not os.path.exists(script):
+        return {"error": "missing", "detail": "setup/import_resolve.py not in this build"}
+    try:
+        r = subprocess.run(["pgrep", "-f", "DaVinci Resolve.app/Contents/MacOS/Resolve"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return {"error": "resolve-running",
+                    "detail": "Quit DaVinci Resolve first — it rewrites the render-preset "
+                              "file on exit and would undo the import."}
+    except Exception:
+        pass
+    import setup_jobs
+    return setup_jobs.start("import_resolve",
+                            argv=[preflight.ENGINE_PYTHON, script, "--json"])
+
+
+DV_PROBE_CRON = "0 5 * * * /usr/bin/python3 {fs_path} all"
+
+
+def api_install_dv_probe():
+    """Upload the optional NAS-side DV prober over the configured FTP and hand back the
+    cron line to paste into the NAS scheduler. The FTP path→filesystem mapping default
+    matches UGOS (/Media/... = /volume1/Media/...), both overridable in config."""
+    import configstore
+    local = os.path.join(RESOURCES_DIR, "nas", "dv_probe.py")
+    if not os.path.exists(local):
+        return {"ok": False, "detail": "nas/dv_probe.py not in this build"}
+    cfg = configstore.read()
+    remote_dir = str(cfg.get("dv_probe_remote_dir") or "/Media/Config").rstrip("/")
+    try:
+        ftp = transfer.connect(timeout=10)
+        try:
+            try:
+                ftp.mkd(remote_dir)               # best-effort; exists = fine
+            except Exception:
+                pass
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+        ok, remote, reason = transfer.upload(local, remote_dir)
+        if not ok:
+            return {"ok": False, "detail": reason}
+    except Exception as e:
+        return {"ok": False, "detail": f"{e.__class__.__name__}: {e}"}
+    fs_path = str(cfg.get("dv_probe_fs_path") or ("/volume1" + remote_dir + "/dv_probe.py"))
+    return {"ok": True, "uploaded_to": remote_dir + "/dv_probe.py",
+            "cron": DV_PROBE_CRON.format(fs_path=fs_path), "optional": True}
 
 
 def up_next(limit=10, current=None, inflight=None):
@@ -844,6 +1006,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/settings":
             self._json({"settings": settings.get_settings(),
                         "defaults": settings.DEFAULT_SETTINGS})
+        elif path == "/api/config":
+            # REDACTED view only — secret values never leave configstore (Setup UI
+            # learns set/unset). Deliberately NOT part of /api/state.
+            import configstore
+            self._json(configstore.read_redacted())
+        elif path == "/api/preflight":
+            fresh = (parse_qs(urlparse(self.path).query).get("fresh") or ["0"])[0] == "1"
+            self._json(api_preflight(fresh=fresh))
+        elif path == "/api/setup/install-status":
+            import setup_jobs
+            self._json(setup_jobs.status())
         elif path == "/api/show-profile":
             show = (parse_qs(urlparse(self.path).query).get("show") or [None])[0]
             self._json(show_profile_info(show))
@@ -970,8 +1143,11 @@ class Handler(BaseHTTPRequestHandler):
                     # HARD GATE (server-side so the UI can't bypass it): never arm on a machine
                     # that isn't the exact Resolve/Topaz/display Visionary is built for — the
                     # screen automation would click the wrong pixels (see engine/versions.py).
-                    cheap = preflight.run_cheap()
-                    bad = [c for c in cheap if not c["ok"]]
+                    # run_arm_gate = the version/display pins PLUS the instant
+                    # dependency checks (brew tools, cv2) — a missing x265 used to
+                    # surface HOURS into a job; now it refuses to arm, named.
+                    gate = preflight.run_arm_gate()
+                    bad = [c for c in gate if not c["ok"]]
                     if bad:
                         self._json({"error": "preflight failed — refusing to arm",
                                     "checks": bad}, code=409)
@@ -990,6 +1166,30 @@ class Handler(BaseHTTPRequestHandler):
             import youtube
             self._json(youtube.send_priority((body.get("url") or body.get("id") or ""),
                                              title=body.get("title")))
+        elif path == "/api/config":
+            # values are never logged (log_message is a no-op; keep it that way) and the
+            # response is the redacted view, so a secret can't round-trip out
+            import configstore
+            out = configstore.save(body or {})
+            _invalidate_preflight()
+            self._json(out)
+        elif path == "/api/config-test":
+            self._json(api_config_test((body or {}).get("what") or ""))
+        elif path == "/api/setup/install":
+            import setup_jobs
+            out = setup_jobs.start((body or {}).get("what") or "")
+            _invalidate_preflight()          # a finished job re-detects on next preflight
+            self._json(out, code=(409 if out.get("error") == "busy" else 200))
+        elif path == "/api/setup/import-resolve":
+            out = api_import_resolve()
+            self._json(out, code=(409 if out.get("error") == "resolve-running" else 200))
+        elif path == "/api/setup/install-dv-probe":
+            self._json(api_install_dv_probe())
+        elif path == "/api/request-accessibility":
+            # the app's button POSTs; this was GET-only and 404'd silently (live bug)
+            self._json(request_accessibility())
+        elif path == "/api/request-screen-recording":
+            self._json(request_screen_recording())
         elif path == "/api/settings":
             new = settings.set_settings(body or {})
             if "max_youtube_minutes" in (body or {}):
@@ -1123,7 +1323,7 @@ def _rearm_loop():
                                 enabled=bool(orchestrator.ORCH.snapshot().get("enabled"))):
                     # same HARD GATE as POST /api/automation — the rearm daemon must not
                     # arm a machine that fails the exact-version/display preflight.
-                    if all(c["ok"] for c in preflight.run_cheap()):
+                    if all(c["ok"] for c in preflight.run_arm_gate()):
                         print("appliance: activated + idle → re-arming the run")
                         orchestrator.ORCH.enable()
                     else:
