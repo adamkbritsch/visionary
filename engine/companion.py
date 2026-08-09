@@ -326,6 +326,13 @@ def probe_media(path: str, ffprobe: str = FFPROBE, name: str = "") -> dict:
     }
 
 
+def is_imax_name(name: str) -> bool:
+    """Does the release name advertise an IMAX edition ('IMAX', '{edition-IMAX}',
+    'IMAX Enhanced')? Word-bounded. IMAX means MORE PICTURE (the expanded ~1.90:1
+    frame vs the scope crop) — user-dictated: it outranks every other video signal."""
+    return bool(re.search(r"\bimax\b", name or "", re.IGNORECASE))
+
+
 def pedigree_rank(name: str) -> int:
     """Release pedigree from the filename: REMUX(3) > BluRay(2) > WEB(1) > other(0)."""
     n = (name or "").lower()
@@ -388,7 +395,9 @@ def _side_spec(probe: dict, name: str) -> str:
         if probe.get("transfer") == "smpte2084" else ""
     tracks = probe.get("audio") or []
     best = max(tracks, key=audio_rank) if tracks else None
-    parts = [p for p in (res, ped, (probe.get("video_codec") or "").upper(), rate, dv) if p]
+    imax = "IMAX" if is_imax_name(name) else ""
+    parts = [p for p in (res, imax, ped, (probe.get("video_codec") or "").upper(), rate, dv)
+             if p]
     if best:
         parts.append(_audio_summary(best))
     return " · ".join(parts)
@@ -409,13 +418,18 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
     that the verdict card shows verbatim."""
     import dvcap
 
-    # ---- video winner: pixels, then pedigree, then bitrate --------------------
+    # ---- video winner: IMAX above ALL else (user-dictated — more picture beats
+    # every other signal, re-encode cost accepted), then pixels, pedigree, bitrate
     np_px = (nas_probe.get("width") or 0) * (nas_probe.get("height") or 0)
     rp_px = (remote_probe.get("width") or 0) * (remote_probe.get("height") or 0)
     n_ped, r_ped = pedigree_rank(nas_name), pedigree_rank(remote_name)
     n_kbps = nas_probe.get("video_kbps") or 0
     r_kbps = remote_probe.get("video_kbps") or 0
-    if np_px != rp_px:
+    n_imax, r_imax = is_imax_name(nas_name), is_imax_name(remote_name)
+    if n_imax != r_imax:
+        video_from = "nas" if n_imax else "remote"
+        video_why = "IMAX edition — more picture, prioritized above all else"
+    elif np_px != rp_px:
         video_from = "nas" if np_px > rp_px else "remote"
         video_why = "higher resolution"
     elif n_ped != r_ped:

@@ -267,7 +267,8 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
 
 - **Companion combine** (needs [Shuttle](https://github.com/adamkbritsch/shuttle)'s relay):
   when a second copy of a movie sits on your seedbox, Visionary pairs the two and builds
-  ONE best-of MKV — the genuinely better HDR10 video, a **real (studio) Dolby Vision RPU**
+  ONE best-of MKV — the genuinely better HDR10 video (an **IMAX edition wins outright**:
+  more picture beats every other signal), a **real (studio) Dolby Vision RPU**
   from whichever copy carries one (grafted across releases with `dovi_tool`; Profile 7
   Blu-ray metadata is converted to 8.1, and real DV always beats a Resolve analysis), and
   the best lossless audio (**TrueHD Atmos** ranks first — the donor's compat AC-3 rides

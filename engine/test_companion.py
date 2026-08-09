@@ -493,3 +493,40 @@ class AtmosProbeInSweep(unittest.TestCase):
         e = companion.entry("c.mkv")
         self.assertNotIn("nas_atmos", e)         # unanswered → re-probed next sweep
         self.assertFalse(e["counterpart"])       # the search still ran (fail-open on probe)
+
+
+class ImaxPriority(unittest.TestCase):
+    """IMAX outranks EVERY other video signal (user-dictated) — more picture wins even
+    when the other copy has higher resolution/pedigree/bitrate, re-encode cost accepted."""
+
+    def test_imax_name_detection(self):
+        self.assertTrue(companion.is_imax_name("Movie (2021) {edition-IMAX} [2160p].mkv"))
+        self.assertTrue(companion.is_imax_name("Movie.2021.IMAX.2160p.WEB-DL.mkv"))
+        self.assertTrue(companion.is_imax_name("Movie 2021 IMAX Enhanced 2160p.mkv"))
+        self.assertFalse(companion.is_imax_name("Maximax (2020) [2160p].mkv"))
+
+    def test_imax_beats_a_higher_resolution_remux(self):
+        v = companion.build_verdict(
+            _probe(kbps=90000),                                   # 2160p REMUX, hotter
+            _probe(width=1920, height=1080, kbps=20000),          # 1080p... but IMAX
+            "a 2160p BluRay REMUX.mkv", "b (2021) {edition-IMAX} 1080p WEB-DL.mkv")
+        self.assertEqual(v["video_from"], "remote")
+        self.assertIn("IMAX", v["video_why"])
+
+    def test_imax_on_the_nas_side_wins_too(self):
+        v = companion.build_verdict(_probe(kbps=20000), _probe(kbps=90000),
+                                    "a IMAX 2160p WEB-DL.mkv", "b 2160p REMUX.mkv")
+        self.assertEqual(v["video_from"], "nas")
+        self.assertIn("IMAX", v["video_why"])
+
+    def test_both_imax_falls_through_to_the_normal_ladder(self):
+        v = companion.build_verdict(_probe(kbps=20000), _probe(kbps=90000),
+                                    "a IMAX 2160p REMUX.mkv", "b IMAX 2160p REMUX.mkv")
+        self.assertEqual(v["video_from"], "remote")               # bitrate decides again
+        self.assertNotIn("IMAX", v["video_why"])
+
+    def test_specs_line_carries_the_imax_marker(self):
+        v = companion.build_verdict(_probe(), _probe(kbps=30000),
+                                    "a IMAX 2160p REMUX.mkv", "b 2160p WEB.mkv")
+        self.assertIn("IMAX", v["specs"]["nas"])
+        self.assertNotIn("IMAX", v["specs"]["remote"])
