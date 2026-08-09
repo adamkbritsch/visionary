@@ -1,8 +1,15 @@
 # SETUP-CLAUDE — the guided-install runbook
 
-This mirrors README "Setup" steps 1-10 **exactly** (same numbering — the README is the
-canonical source; if they ever disagree, the README wins). It adds what Claude needs:
-per-step checks, expected preflight output, and secrets etiquette.
+This mirrors the README's "Setup (manual / development path)" steps 1-10 **exactly**
+(same numbering — the README is the canonical source; if they ever disagree, the README
+wins). It adds what Claude needs: per-step checks, expected preflight output, and
+secrets etiquette.
+
+Note there is now a FASTER route for most steps: the app's own **Settings → Setup**
+section (README "Install") holds the config fields, one-click dependency installs, both
+permission prompts, and the Resolve import. When guiding a user who already has the app
+running, prefer pointing them at the in-app rows; this runbook remains the full manual
+equivalent (and the only path on a machine where the app can't launch yet).
 
 **The loop:** after every step, run
 

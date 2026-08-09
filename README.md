@@ -19,7 +19,7 @@ Arm it in the evening; wake up to finished episodes.
 >
 > | Requirement | What works |
 > |---|---|
-> | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro or a MacBook Air can't sustain the power draw and is refused. |
+> | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro (M1/M2) or a MacBook Air can't sustain the power draw and is refused; a laptop too new for the model lists is judged by its live charger reading instead (see below). |
 > | Display | Any **Retina / HiDPI** screen: a Mac laptop's built-in panel, or a **4K or 5K monitor** on its normal (scaled) setting. A **4K dummy HDMI plug** also counts — that's how you run it with the lid closed. A monitor switched to "More Space" is refused. |
 > | DaVinci Resolve | **Studio 18.6.0** (build 18.6.00009) — the paid Studio edition, this exact build |
 > | Topaz Video AI | **7.0.1** — this exact build |
@@ -28,8 +28,9 @@ Arm it in the evening; wake up to finished episodes.
 >
 > **Why the display rule?** Dolby Vision's "Analyze All Shots" button can't be clicked by
 > script, so Visionary finds it by matching a picture of the button against the screen.
-> Every Retina screen draws that button at the same size, so it works on any of them and
-> the monitor's size and shape don't matter. A non-Retina mode draws everything at half
+> Every Retina screen draws that button at the same size, so it works on any of them —
+> the monitor's size and shape barely matter (anything at least 1280×720 points: every
+> real 4K/5K or built-in panel qualifies, while a 1080p dummy plug is too small). A non-Retina mode draws everything at half
 > size, and nothing matches. Only the 16-inch built-in panel and a 4K dummy plug have been
 > tested end to end — on any other screen, run `python3 engine/preflight.py --smoke` once
 > to confirm Visionary can see Resolve's buttons.
@@ -42,13 +43,37 @@ Arm it in the evening; wake up to finished episodes.
 >
 > Resolve Studio and Topaz Video AI are commercial products — bring your own licenses.
 
-## Setup
+## Install
 
-The main path is manual, below. **Prefer a guided install?** Open [Claude Code](https://claude.com/claude-code)
+The easy path — no clone, no Terminal for most of it:
+
+1. **Download** the latest `Visionary-vX.zip` from
+   [Releases](https://github.com/adamkbritsch/visionary/releases) and unzip it.
+2. **Drag Visionary.app to /Applications.** This step is required, not cosmetic: macOS
+   runs a quarantined app opened elsewhere from a randomized read-only path (App
+   Translocation), and the privacy grants wouldn't stick.
+3. **Right-click → Open** the first time (the app isn't notarized; macOS asks once).
+4. Install the two commercial apps — **DaVinci Resolve Studio 18.6.0** and **Topaz
+   Video AI 7.0.1**, exact builds, links in step 2 of the manual path below. These are
+   licensed software; the app detects them but can't install them for you.
+5. Open the **gear → Settings → Setup** section. Everything else lives there, with a
+   live check beside each item: your NAS connection (and the optional Plex / TMDb /
+   youtarr / Shuttle fields), **one-click installs** for the command-line dependencies,
+   both **privacy permission prompts**, the **Resolve projects + DV preset import**
+   (quit Resolve first), and the optional NAS DV-probe helper with its cron line. The
+   section stays expanded until every check is green, then tucks itself away.
+
+The pipeline won't arm until the hardware gate passes (see the requirements box above)
+and the dependencies exist — and it names exactly what's missing rather than failing
+mid-run. The NAS side needs its **FTP service enabled** (System Settings on a UGREEN /
+your NAS's file-services panel elsewhere); everything else NAS-side is optional.
+
+## Setup (manual / development path)
+
+The same result from a clone — every step has a matching in-app Setup row and a check in
+the preflight tool. **Prefer a guided install?** Open [Claude Code](https://claude.com/claude-code)
 in your clone and say *"set this up for me"* — the repo ships instructions Claude follows
 ([CLAUDE.md](CLAUDE.md) + [docs/SETUP-CLAUDE.md](docs/SETUP-CLAUDE.md)).
-
-Each step below has a matching check in the preflight tool — re-run it any time:
 
 ```bash
 python3 engine/preflight.py          # human output; add --json for machine-readable
@@ -127,8 +152,8 @@ Quit Resolve if it's open, then:
 
 This merges the **OvernightDV** render preset (it carries the Dolby Vision 8.1 profile —
 the one setting with no scripting API) into your global preset list, launches Resolve,
-imports the two persistent projects (SDR + HDR intake) from `bundle/resolve/`, and
-verifies both. Optional: import `bundle/topaz/*.json` in Topaz's GUI (File → Import
+imports the three persistent projects (the DV1000/DV2000 Dolby Vision outputs + the
+SDR output) from `bundle/resolve/`, and verifies them. Optional: import `bundle/topaz/*.json` in Topaz's GUI (File → Import
 preset) — reference only; the pipeline embeds its Topaz parameters.
 
 ### 8. Configure
@@ -341,8 +366,8 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
 
 ## Configuration
 
-`~/.topaz-pipeline/config.json` (never committed; `chmod 600`). Every key has an env-var
-override (env wins):
+`~/.topaz-pipeline/config.json` (never committed; `chmod 600`). Most keys have an env-var
+override (env wins); keys marked — have no env override:
 
 | config key | env override | what |
 |---|---|---|
@@ -410,8 +435,9 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless, so while an item is
-  being upscaled it holds about **140 GB of scratch** — **~175× the ~0.8 GB source** (a
-  feature film's intermediate can reach ~245 GB). That intermediate is **deleted the
+  being upscaled it holds roughly **190 GiB (~205 GB) of scratch** — **over 250× the
+  ~0.8 GB source** (re-measured 2026-08-05; a feature film's intermediate can reach
+  ~245 GB). That intermediate is **deleted the
   moment Resolve finishes its export** — the remux only needs the DV render plus the
   original — so the item being remuxed alongside the next upscale carries just ~10 GB, and
   the dual pipeline never doubles the peak. A **4K fast-path movie** peaks higher than
@@ -421,8 +447,11 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
   free-space floor** before starting an item (room for one movie-sized working set plus
   margin), so plan for a fast SSD with ~1 TB free (a 2 TB SSD is comfortable).
 
-- Replaces originals: the finished 4K DV master **overwrites the 1080p source** in your
-  library (that's the point — keep backups if you want a way back).
+- Replaces originals **by default**: once the uploaded 4K DV master size-verifies on the
+  NAS, the superseded 1080p source is deleted — but the per-show/movie **"Replaces
+  source"** setting can instead keep the source beside the master (Plex merges them
+  into one item with two versions and serves the 4K, and the source stays re-runnable
+  by future, better upscale models). Keep backups if you want a way back regardless.
 
 ## Legal
 

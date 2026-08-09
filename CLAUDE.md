@@ -7,8 +7,10 @@ requirements box in `README.md`.
 
 ## Setting this repo up for a user
 
-Follow **`docs/SETUP-CLAUDE.md`** — it mirrors README "Setup" steps 1-10 exactly and
-adds per-step machine-readable checks. The operating loop:
+Follow **`docs/SETUP-CLAUDE.md`** — it mirrors the README's "Setup (manual /
+development path)" steps 1-10 exactly and adds per-step machine-readable checks. If the
+app is already running, the in-app **Settings → Setup** section covers config,
+dependency installs, permissions, and the Resolve import — prefer it. The operating loop:
 
 1. Run `python3 engine/preflight.py --json` between steps.
 2. For each failing check, act on its `fix` string (or relay it verbatim to the user).
