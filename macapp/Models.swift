@@ -511,6 +511,7 @@ struct ConfigDTO: Codable {
 struct ConfigTestDTO: Codable {
     var ok: Bool?
     var detail: String?
+    var url: String?      // plex-discover: the found Plex base URL (autofills the field)
 }
 
 struct ImportStepDTO: Codable, Identifiable {

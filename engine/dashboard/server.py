@@ -779,6 +779,27 @@ def api_config_test(what):
                                          headers={"X-Plex-Token": token})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return {"ok": resp.status == 200, "detail": f"Plex answered at {base}"}
+        if what == "plex-discover":
+            # AUTO-IDENTIFY: once the NAS is configured, a Plex server is almost always
+            # sitting on the same host at :32400 — /identity answers WITHOUT a token, so
+            # discovery needs nothing from the user. Returns the found base URL so the
+            # Setup UI can fill the field in (the token stays the user's, and optional).
+            import re as _re
+            hosts = transfer.nas_hosts()
+            if not hosts:
+                return {"ok": False, "detail": "configure the NAS first"}
+            for h in hosts:
+                base = f"http://{h}:32400"
+                try:
+                    with urllib.request.urlopen(base + "/identity", timeout=3) as resp:
+                        body = resp.read(2000).decode("utf-8", "replace")
+                    ver = _re.search(r'version="([^"]+)"', body)
+                    return {"ok": True, "url": base,
+                            "detail": f"found Plex {ver.group(1) if ver else ''} at {base}".strip()}
+                except Exception:
+                    continue
+            return {"ok": False,
+                    "detail": f"no Plex answered on :32400 at {', '.join(hosts[:3])}"}
         if what == "youtarr":
             import youtarr
             bases = youtarr.base_urls()

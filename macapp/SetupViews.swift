@@ -55,11 +55,13 @@ struct SetupSection: View {
         VStack(alignment: .leading, spacing: 6) {
             DisclosureGroup(isExpanded: $expanded) {
                 VStack(alignment: .leading, spacing: 10) {
-                    ConnectionsGroup()
+                    // REQUIRED first (user-dictated), optional integrations last.
+                    NASGroup()
                     DependenciesGroup()
                     ApplicationsGroup()
                     PermissionsGroup()
                     ResolveProjectsGroup()
+                    OptionalConnectionsGroup()
                     NASExtrasGroup()
                     HStack {
                         Button("Recheck everything") { Task { await store.recheckSetup() } }
@@ -91,8 +93,20 @@ struct SetupSection: View {
 }
 
 // MARK: - connections (the config.json fields)
+// One parameterized struct, instantiated twice: the REQUIRED NAS group sits at the top
+// of the section, the optional integrations (Plex/TMDb/youtarr/relay) at the bottom
+// (user-dictated ordering). The field/save/test machinery is shared.
+
+private struct NASGroup: View {
+    var body: some View { ConnectionsGroup(optional: false) }
+}
+
+private struct OptionalConnectionsGroup: View {
+    var body: some View { ConnectionsGroup(optional: true) }
+}
 
 private struct ConnectionsGroup: View {
+    let optional: Bool
     @EnvironmentObject var store: AppStore
     // field state seeded from the REDACTED config view; secrets always arrive "" and
     // show a "saved" placeholder instead (typing replaces; explicit clear sends "")
@@ -147,7 +161,13 @@ private struct ConnectionsGroup: View {
             if let what {
                 Button {
                     testing = what
-                    Task { tests[what] = await store.testConfig(what); testing = nil }
+                    Task {
+                        tests[what] = await store.testConfig(what)
+                        testing = nil
+                        if what == "ftp", tests[what]?.ok == true {
+                            await store.discoverPlex()   // NAS works → find Plex on it
+                        }
+                    }
                 } label: {
                     if testing == what { ProgressView().controlSize(.small) }
                     else { Text("Test") }
@@ -164,34 +184,66 @@ private struct ConnectionsGroup: View {
         }
     }
 
+    private var ftpConfigured: Bool {
+        !(store.configDTO?.fields?["ftp_hosts"] ?? "").isEmpty
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SetupGroupLabel(text: "Connections")
-            Text("NAS FTP — required. Everything else here is optional and degrades gracefully.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-            field("NAS hosts", "ftp_hosts", hint: "100.x.y.z, nas.local")
-            field("FTP port", "ftp_port", hint: "21")
-            field("FTP user", "ftp_user")
-            field("FTP password", "ftp_pass", secret: true)
-            saveTest("NAS", keys: ["ftp_hosts", "ftp_port", "ftp_user", "ftp_pass"], what: "ftp")
-            Divider().padding(.vertical, 2)
-            field("Plex URL", "plex_url", hint: "http://nas:32400 (optional)")
-            field("Plex token", "plex_token", secret: true)
-            saveTest("Plex", keys: ["plex_url", "plex_token"], what: "plex")
-            field("TMDb key", "tmdb_api_key", secret: true, hint: "optional — smart presets")
-            saveTest("TMDb", keys: ["tmdb_api_key"], what: "tmdb")
-            field("youtarr URL", "youtarr_url", hint: "http://nas:3087 (optional)")
-            field("youtarr user", "youtarr_user")
-            field("youtarr pass", "youtarr_pass", secret: true)
-            saveTest("youtarr", keys: ["youtarr_url", "youtarr_user", "youtarr_pass"],
-                     what: "youtarr")
-            field("Shuttle relay", "shuttle_relay_url", hint: "http://nas:8789 (optional)")
-            saveTest("relay", keys: ["shuttle_relay_url"], what: "relay")
+            if !optional {
+                SetupGroupLabel(text: "NAS connection")
+                Text("Required — everything talks to the NAS over FTP.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                field("NAS hosts", "ftp_hosts", hint: "100.x.y.z, nas.local")
+                field("FTP port", "ftp_port", hint: "21")
+                field("FTP user", "ftp_user")
+                field("FTP password", "ftp_pass", secret: true)
+                saveTest("NAS", keys: ["ftp_hosts", "ftp_port", "ftp_user", "ftp_pass"],
+                         what: "ftp")
+            } else {
+                SetupGroupLabel(text: "Optional integrations")
+                Text("All optional — each degrades gracefully when unset.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                if let d = store.plexDiscovery {
+                    // auto-identified the moment the NAS connection works: /identity
+                    // answers without a token, so only the token stays yours to add
+                    HStack(spacing: 6) {
+                        CheckDot(ok: d.ok == true ? true : nil)   // a miss is neutral, never red
+                        Text(d.detail ?? "").font(.system(size: 11)).foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                field("Plex URL", "plex_url", hint: "auto-detected once the NAS connects")
+                field("Plex token", "plex_token", secret: true)
+                saveTest("Plex", keys: ["plex_url", "plex_token"], what: "plex")
+                field("TMDb key", "tmdb_api_key", secret: true, hint: "optional — smart presets")
+                saveTest("TMDb", keys: ["tmdb_api_key"], what: "tmdb")
+                field("youtarr URL", "youtarr_url", hint: "http://nas:3087 (optional)")
+                field("youtarr user", "youtarr_user")
+                field("youtarr pass", "youtarr_pass", secret: true)
+                saveTest("youtarr", keys: ["youtarr_url", "youtarr_user", "youtarr_pass"],
+                         what: "youtarr")
+                field("Shuttle relay", "shuttle_relay_url", hint: "http://nas:8789 (optional)")
+                saveTest("relay", keys: ["shuttle_relay_url"], what: "relay")
+            }
         }
         .onChange(of: store.configDTO?.fields) { fields in
             guard !seeded, let fields else { return }
             for (k, v) in fields where !(f[k]?.isEmpty == false) { f[k] = v }
             seeded = true
+        }
+        .onChange(of: store.plexDiscovery?.url) { url in
+            // discovery filled config server-side isn't a thing — the STORE auto-saved
+            // plex_url when it was empty; mirror it into the visible field here
+            guard optional, let url, !url.isEmpty, (f["plex_url"] ?? "").isEmpty else { return }
+            f["plex_url"] = url
+        }
+        .task {
+            // discover on open when the NAS is already configured and Plex isn't
+            if optional, ftpConfigured, (store.configDTO?.fields?["plex_url"] ?? "").isEmpty,
+               store.plexDiscovery == nil {
+                await store.discoverPlex()
+            }
         }
     }
 }

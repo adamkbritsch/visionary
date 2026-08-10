@@ -42,6 +42,7 @@ final class AppStore: ObservableObject {
     @Published var preflight: PreflightDTO?
     @Published var configDTO: ConfigDTO?
     @Published var installStatus: InstallStatusDTO?
+    @Published var plexDiscovery: ConfigTestDTO?   // tokenless :32400/identity probe result
 
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
                                                   // click, before the server round-trip lands
@@ -393,6 +394,17 @@ final class AppStore: ObservableObject {
         let (_, data) = await postResult("/api/config-test", ["what": what])
         guard let data else { return nil }
         return try? JSONDecoder().decode(ConfigTestDTO.self, from: data)
+    }
+    /// AUTO-IDENTIFY Plex once the NAS connection works: probe :32400/identity on the
+    /// configured hosts (tokenless). A hit auto-saves plex_url when it was empty — the
+    /// same value the engine's fallback would use, now visible in the field.
+    func discoverPlex() async {
+        guard let t = await testConfig("plex-discover") else { return }
+        plexDiscovery = t
+        if t.ok == true, let url = t.url, !url.isEmpty,
+           (configDTO?.fields?["plex_url"] ?? "").isEmpty {
+            await saveConfig(["plex_url": url])
+        }
     }
     func fetchInstallStatus() async {
         if let s: InstallStatusDTO = await get("/api/setup/install-status") { installStatus = s }

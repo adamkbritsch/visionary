@@ -341,3 +341,39 @@ class SetupEndpoints(unittest.TestCase):
             out = server.api_install_dv_probe()
         self.assertFalse(out["ok"])
         self.assertIn("no NAS FTP host", out["detail"])
+
+
+class PlexDiscovery(unittest.TestCase):
+    """Tokenless auto-identify: NAS configured -> probe :32400/identity on each host."""
+
+    def test_found_on_a_host_returns_the_url_and_version(self):
+        from unittest import mock
+        import io, transfer, urllib.request
+        body = io.BytesIO(b'<MediaContainer version="1.41.0.100" machineIdentifier="x"/>')
+        body.status = 200
+        body.__enter__ = lambda s: s
+        body.__exit__ = lambda s, *a: False
+        with mock.patch.object(transfer, "nas_hosts", return_value=["10.0.0.5", "nas.local"]), \
+             mock.patch.object(urllib.request, "urlopen", return_value=body) as uo:
+            out = server.api_config_test("plex-discover")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["url"], "http://10.0.0.5:32400")
+        self.assertIn("1.41.0.100", out["detail"])
+        self.assertIn("/identity", uo.call_args.args[0])
+
+    def test_no_answer_on_any_host_is_a_clean_miss(self):
+        from unittest import mock
+        import transfer, urllib.request
+        with mock.patch.object(transfer, "nas_hosts", return_value=["10.0.0.5"]), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=OSError("refused")):
+            out = server.api_config_test("plex-discover")
+        self.assertFalse(out["ok"])
+        self.assertIn("no Plex answered", out["detail"])
+
+    def test_nas_unconfigured_says_so(self):
+        from unittest import mock
+        import transfer
+        with mock.patch.object(transfer, "nas_hosts", return_value=[]):
+            out = server.api_config_test("plex-discover")
+        self.assertFalse(out["ok"])
+        self.assertIn("configure the NAS first", out["detail"])
