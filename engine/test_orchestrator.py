@@ -2876,3 +2876,42 @@ class CombinePaths(unittest.TestCase):
              mock.patch.dict(orch.ORCH.state, {"current": None}):
             orch.discard_workfiles(stem + ".mkv")
         self.assertFalse(os.path.exists(comp))
+
+
+class RotationWiring(unittest.TestCase):
+    """The round-robin pointer is series.advance_rotation's PERSISTED one (it was an
+    unwired twin: the engine advanced an in-memory copy that reset to show 0 on every
+    relaunch/deploy, while the up-next preview read the never-advanced persisted pointer
+    and silently disagreed with the engine)."""
+
+    def _handoff(self, p, advance_ret=2):
+        import series, tempfile, os
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._cadence_lock = __import__("threading").Lock()
+        o._cadence_advanced = set()
+        o._tv_since_yt = 0
+        o._rr = 0
+        with mock.patch.object(series, "advance_rotation", return_value=advance_ret) as adv, \
+             mock.patch.object(series, "get_active_series", return_value=["A", "B", "C"]), \
+             mock.patch.object(o, "_save_cadence"):
+            o._advance_cadence_at_handoff(p)
+        return o, adv
+
+    def test_tv_handoff_advances_the_persisted_rotation_and_syncs_rr(self):
+        p = episode_paths("B", "S01E02", "b.mp4", scratch_dir=tempfile.mkdtemp(),
+                          nas_tv_root="/Media/TV-Shows")
+        o, adv = self._handoff(p, advance_ret=2)
+        adv.assert_called_once_with("B")
+        self.assertEqual(o._rr, 2)
+
+    def test_movie_handoff_never_touches_rotation(self):
+        p = orch.movie_paths("M (2020).mkv", "/Media/Movies", "M (2020)",
+                             scratch_dir=tempfile.mkdtemp())
+        o, adv = self._handoff(p)
+        adv.assert_not_called()
+
+    def test_init_seeds_rr_from_the_persisted_pointer(self):
+        import series
+        with mock.patch.object(series, "get_rotation", return_value=1):
+            o = orch.Orchestrator()
+        self.assertEqual(o._rr, 1)

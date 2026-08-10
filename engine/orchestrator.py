@@ -876,7 +876,10 @@ class Orchestrator:
                                                # not yet finished. While >=2 remain, the 2nd remux lane runs +
                                                # Resolve is let 2 items ahead so the backlog clears ~2x faster.
         self._upload_lock = threading.Lock()   # one NAS push at a time even when 2 remux lanes run concurrently
-        self._rr = 0                           # round-robin pointer over the active TV series
+        try:                                   # round-robin pointer over the active TV series —
+            self._rr = series.get_rotation()   # seeded from the PERSISTED pointer so rotation
+        except Exception:                      # survives relaunches/deploys (it used to reset to
+            self._rr = 0                       # the first show on every restart)
         c = self._load_cadence()
         self._tv_since_yt = c["tv_since_yt"]   # TV episodes completed since the last YouTube video — the
                                                # cadence counter: at >= youtube_every_tv_episodes, 1 YT
@@ -2315,7 +2318,8 @@ class Orchestrator:
         if yt is not None and self._tv_since_yt >= every:
             return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
         # Round-robin over the ACTIVE TV SERIES (one episode each in turn, looping). `_rr` advances only
-        # on completion (see _process), so a retry re-serves the same series. Per-run, reset on relaunch.
+        # on completion (series.advance_rotation at hand-off), so a retry re-serves the same series.
+        # Persisted: seeded from series.get_rotation() at init, so it survives relaunches.
         parts = self._participants()
         if parts:
             n = len(parts)
@@ -2791,10 +2795,14 @@ class Orchestrator:
                     self._tv_since_yt = 0                 # cadence: restart the N-episode countdown
                 elif not p.movie:                         # a TV episode
                     self._tv_since_yt += 1                # one more TV episode toward the next video
-                    parts = self._participants()          # active TV series (round-robin peers)
-                    idx = next((i for i, r in enumerate(parts) if r == p.series), None)
-                    if idx is not None and parts:
-                        self._rr = (idx + 1) % len(parts)
+                    # ONE rotation, persisted: series.advance_rotation is the single source
+                    # of truth (it was an unwired twin of the old inline advance — the
+                    # up-next preview reads the persisted pointer, so preview and engine
+                    # now always agree, and rotation survives relaunches).
+                    try:
+                        self._rr = series.advance_rotation(p.series)
+                    except Exception:
+                        pass
                 self._save_cadence()
             except Exception:
                 pass
