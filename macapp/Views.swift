@@ -852,7 +852,14 @@ struct PipelineCard: View {
                 $0.stage == stageKey && PipelineCard.laneLive($0)
             }
             if mine.count > 1 { return "\u{00D7}2" }
-            return mine.first?.ep                                     // already a display string
+            guard let f = mine.first else { return nil }
+            // TV lanes carry the show beside the episode token (user-asked); movie/
+            // YouTube lanes' ep IS already a title — never double it.
+            if f.movie != true, f.youtube != true, let s = f.series, !s.isEmpty {
+                let parts = [f.ep ?? "", store.seriesTitle(s)].filter { !$0.isEmpty }
+                if !parts.isEmpty { return parts.joined(separator: " \u{00B7} ") }
+            }
+            return f.ep                                               // already a display string
         case .run:      return runEpisodeShort(o?.current)
         case .inactive: return nil
         }
@@ -862,7 +869,13 @@ struct PipelineCard: View {
         switch it.kind {
         case "movie":   return store.movieTitle(it.name, it.title)
         case "youtube": return (it.title?.isEmpty == false) ? it.title : epTitle(it.name)
-        default:        return it.ep ?? epTitle(it.source_name)       // "S06E07"
+        default:
+            // "S06E07 · Show" — ep first so truncation clips the show's tail, never the
+            // token (the label renders lineLimit(1) in the card's top-right).
+            let ep = it.ep ?? epTitle(it.source_name) ?? ""
+            let show = store.seriesTitle(it.series ?? "")
+            let parts = [ep, show].filter { !$0.isEmpty }
+            return parts.isEmpty ? nil : parts.joined(separator: " \u{00B7} ")
         }
     }
 
