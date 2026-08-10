@@ -490,3 +490,12 @@ class QuietUntilValidator(unittest.TestCase):
             self.assertEqual(settings.set_settings({"quiet_until": -5})["quiet_until"], 0)
             ok = int(t.time()) + 600
             self.assertEqual(settings.set_settings({"quiet_until": ok})["quiet_until"], ok)
+
+
+class ManualOnly2000Nits(unittest.TestCase):
+    def test_auto_never_resolves_to_2000(self):
+        # 2000-nit DV is MANUAL-ONLY (user-dictated 2026-08-09): auto = 1000 nits
+        # whatever the intake range; the pin still wins.
+        import settings as s
+        self.assertEqual(s.effective_output_mode("unpinned-title", True), "dv1000")
+        self.assertEqual(s.effective_output_mode("unpinned-title", False), "dv1000")

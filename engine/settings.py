@@ -531,13 +531,16 @@ def looks_hdr(name) -> bool:
 
 def effective_output_mode(key: str, hdr_source: bool = False) -> str:
     """What the item will ACTUALLY be mastered as — a pin if there is one, otherwise the
-    automatic rule resolved against the source range. Automatic is always Dolby Vision:
-    1000 nits from an SDR source, 2000 from an HDR one. This is what the app displays, so
-    the row never shows an abstract "auto" the user has to translate."""
+    automatic rule. Automatic is always Dolby Vision at 1000 nits, whatever the intake
+    range (user-dictated 2026-08-09: the 2000-nit target is MANUAL-ONLY — it stays a
+    per-item override but nothing selects it automatically). This is what the app
+    displays, so the row never shows an abstract "auto" the user has to translate.
+    `hdr_source` is retained for signature compatibility; it no longer changes the
+    automatic answer."""
     m = get_show_output_mode(key)
     if m in ("sdr", "dv1000", "dv2000"):
         return m
-    return "dv2000" if hdr_source else "dv1000"
+    return "dv1000"
 
 
 def is_sdr_output(key: str) -> bool:

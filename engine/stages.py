@@ -629,10 +629,10 @@ def _resolve(p, abort, progress=None):
     import settings as _st
     override = _st.get_show_output_mode(p.series)
     # The setting's values ARE the Resolve modes now ("sdr" / "dv1000" / "dv2000"), so there is
-    # no translation table to get wrong. "auto" keeps the long-standing rule: an HDR intake
-    # masters to 2000 nits, anything else to 1000.
-    mode = override if override in ("sdr", "dv1000", "dv2000") else (
-        "dv2000" if pl.get("is_hdr") else "dv1000")
+    # no translation table to get wrong. "auto" = ALWAYS 1000 nits (user-dictated
+    # 2026-08-09): the 2000-nit project stays available as an explicit per-item override,
+    # but nothing selects it automatically — HDR intake included.
+    mode = override if override in ("sdr", "dv1000", "dv2000") else "dv1000"
     # WHICH SCREEN. Resolved ONCE here, before the subprocess spawns, so an unplugged or
     # unproven display is a clean stage-level decision with a log line — not a surprise
     # 200 seconds into a Resolve cold start.

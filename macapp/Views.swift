@@ -1966,12 +1966,12 @@ private struct ReplaceSourceRow: View {
 }
 
 // Per-item "Output range" row (shows, movies, YouTube channels): what Resolve DELIVERS.
-// AUTO is the long-standing rule and stays the default, and it ALWAYS produces Dolby Vision:
-// an SDR source becomes 1000-nit DV, an already-HDR source 2000-nit. It never yields a non-DV
-// master — that is a manual choice only. The other three PIN the output regardless
-// of what came in, so a show that grades badly at 2000 nits can be forced to 1000, and one
-// you'd rather keep flat can skip Dolby Vision entirely. Same preset-style shape as the
-// rows above; a 4-way choice, so the confirm sheet lists the three you aren't on.
+// AUTO is the default and ALWAYS produces 1000-nit Dolby Vision, whatever the intake
+// range (user-dictated 2026-08-09: 2000-nit is MANUAL-ONLY — it stays in the picker but
+// nothing selects it automatically). Auto never yields a non-DV master either — SDR is
+// also a manual choice. The three explicit values PIN the output regardless of what came
+// in. Same preset-style shape as the rows above; the confirm sheet lists the ones you
+// aren't on.
 private struct OutputModeRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
@@ -1999,9 +1999,9 @@ private struct OutputModeRow: View {
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.07)))
-                .help("What Resolve masters this as. Left alone it follows the source — an SDR "
-                      + "source to 1000 nits, an HDR source to 2000 — and it is always Dolby "
-                      + "Vision. SDR is a manual choice only.")
+                .help("What Resolve masters this as. Left alone everything masters to "
+                      + "1000-nit Dolby Vision; the 2000-nit target and SDR are manual "
+                      + "choices only.")
             Button("Change") { confirming = true }
                 .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
             Spacer()
@@ -2016,10 +2016,10 @@ private struct OutputModeRow: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Left alone, an item follows its source and is always Dolby Vision: an SDR "
-                 + "source masters to 1000 nits, an HDR source to 2000. Picking a value pins it "
-                 + "whatever the source is. SDR masters are named differently from Dolby Vision "
-                 + "ones, so anything already finished keeps the range it shipped with.")
+            Text("Left alone, every item masters to 1000-nit Dolby Vision — the 2000-nit "
+                 + "target is never chosen automatically. Picking a value pins it whatever "
+                 + "the source is. SDR masters are named differently from Dolby Vision ones, "
+                 + "so anything already finished keeps the range it shipped with.")
         }
     }
 }

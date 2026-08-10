@@ -236,15 +236,15 @@ flowchart TD
 
 | source | Topaz | Resolve | remux | video re-encoded? |
 |---|---|---|---|---|
-| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 2000 nits | RPU injected onto the original | **no — bit-identical** (video peaks ≤ 72 Mbps; hotter sources take the capped x265 instead — see below) |
-| 4K HDR · HLG/AV1/H.264/8-bit ≥ 12 Mbps | skipped | converts + DV, 2000 nits | capped x265 | yes — DV 8.1 needs an HEVC PQ base |
+| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 1000 nits | RPU injected onto the original | **no — bit-identical** (video peaks ≤ 72 Mbps; hotter sources take the capped x265 instead — see below) |
+| 4K HDR · HLG/AV1/H.264/8-bit ≥ 12 Mbps | skipped | converts + DV, 1000 nits | capped x265 | yes — DV 8.1 needs an HEVC PQ base |
 | 4K SDR ≥ 12 Mbps | skipped | adds HDR + DV, 1000 nits | capped x265 | yes |
 | 4K, VFR or under threshold | 1× clean pass | adds (HDR+)DV | capped x265 | yes |
-| 1080p and below | upscale to 4K | adds (HDR+)DV, 1000/2000 by intake | capped x265 | yes |
+| 1080p and below | upscale to 4K | adds (HDR+)DV, 1000 nits | capped x265 | yes |
 | already Dolby Vision | — | — | — | filtered out of the queue up front; a slip-through is refused at the Topaz stage — never mastered or uploaded |
 
-The nit ceiling follows the **intake range**, not the path: an HDR intake masters to 2000, an
-SDR intake to 1000. Both are overridable per show, movie or channel.
+The nit ceiling is **1000 by default on every path** — the 2000-nit target exists but is
+manual-only, set per show, movie or channel (as is the true-SDR output).
 
 <p align="center">
   <img src="docs/assets/before-after-4k.png" alt="Before/after: a 1080p source frame vs Visionary's 4K upscale, cropped equally" width="880">
@@ -257,10 +257,11 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
   with per-resolution variants for 480p/720p/1080p sources. No confident match → it asks
   once, and every choice is overridable per show.
 
-- **Intake-matched Dolby Vision mastering**: the Resolve stage picks one of two hand-configured
-  projects by the source's range. An **SDR** input is mastered to **Dolby Vision at 1000 nits**;
-  an **HDR** input to **2000 nits** — so each gets the right DV target-display ceiling for how
-  bright it was meant to go. Both export HDR10 + Dolby Vision Profile 8.1.
+- **Dolby Vision mastering at 1000 nits**: every item is automatically mastered to
+  **Dolby Vision at 1000 nits** through a hand-configured Resolve project, whatever the
+  intake range. A second **2000-nit** project ships too, but it is **manual-only** — a
+  per-show/movie/channel override, never chosen automatically. Both export HDR10 +
+  Dolby Vision Profile 8.1.
 
 - **4K fast paths**: a 4K CFR source skips Topaz entirely — its picture is already the
   deliverable. Two tiers, decided by what the stream can technically carry:
@@ -357,7 +358,7 @@ SDR intake to 1000. Both are overridable per show, movie or channel.
 | Movies | YouTube |
 |:---:|:---:|
 | <img src="docs/assets/movies.png" alt="Movies tab: a queued movie showing its resolved output mode, audio and source-fate settings" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
-| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — an HDR10 source lands on <b>2000 nits</b> and keeps its original bits (unless its peaks breach the DV playback ceiling), an SDR source on 1000. The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence (<b>1 per 3 TV episodes</b>), with per-channel length and age filters. Channels can be paused individually.</sub> |
+| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned otherwise (2000-nit is manual-only), and an HDR10 source keeps its original bits (unless its peaks breach the DV playback ceiling). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence (<b>1 per 3 TV episodes</b>), with per-channel length and age filters. Channels can be paused individually.</sub> |
 
 <p align="center">
   <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">

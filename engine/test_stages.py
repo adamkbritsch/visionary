@@ -360,8 +360,9 @@ class FastPathDispatch(unittest.TestCase):
         self.assertIn("single", cmd)
         self.assertIn(p.source, cmd)                      # the ORIGINAL file, not the segdir
         self.assertNotIn(p.segdir, cmd)
-        # Modes are named for the OUTPUT now: an HDR intake still masters to 2000-nit DV.
-        self.assertEqual(cmd[cmd.index("single") + 3], "dv2000")
+        # 2000-nit is MANUAL-ONLY now (user-dictated 2026-08-09): auto = dv1000
+        # whatever the intake range.
+        self.assertEqual(cmd[cmd.index("single") + 3], "dv1000")
         # argv: [py, resolve_pipeline.py, phase, in, out, mode, bitrate, host]
         self.assertEqual(cmd[6], str(stages.EXPORT_BITRATE_FLOOR_KBPS))   # render video discarded
         self.assertEqual(cmd[7], "-", "unpinned must pass '-' = drive the main display")
@@ -695,12 +696,14 @@ class OutputModeOverride(unittest.TestCase):
         # argv: [python, resolve_pipeline.py, episode|single, in, out, MODE, bitrate]
         return calls[0][5]
 
-    def test_auto_is_unchanged_behaviour(self):
+    def test_auto_is_always_1000_nits(self):
+        # 2000-nit DV is manual-only (user-dictated 2026-08-09): nothing selects it
+        # automatically — HDR intake included.
         self.assertEqual(self._mode("auto", is_hdr=False), "dv1000")
-        self.assertEqual(self._mode("auto", is_hdr=True), "dv2000")
+        self.assertEqual(self._mode("auto", is_hdr=True), "dv1000")
 
     def test_an_unset_override_is_also_auto(self):
-        self.assertEqual(self._mode("", is_hdr=True), "dv2000")
+        self.assertEqual(self._mode("", is_hdr=True), "dv1000")
         self.assertEqual(self._mode(None, is_hdr=False), "dv1000")
 
     def test_an_override_wins_over_the_source(self):
@@ -709,15 +712,15 @@ class OutputModeOverride(unittest.TestCase):
         self.assertEqual(self._mode("sdr", is_hdr=True), "sdr")
         self.assertEqual(self._mode("dv1000", is_hdr=True), "dv1000")
 
-    def test_the_automatic_rule_can_never_pick_sdr(self):
-        """User-dictated invariant: automatically it is ALWAYS Dolby Vision — 1000-nit for
-        an SDR intake, 2000-nit for an HDR one. A non-DV master is a manual choice only, so
-        no source, and no junk left in the setting, may fall through to it."""
+    def test_the_automatic_rule_can_never_pick_sdr_or_2000(self):
+        """User-dictated invariants: automatically it is ALWAYS Dolby Vision at 1000 nits.
+        A non-DV master AND the 2000-nit target are manual choices only — no source range,
+        and no junk left in the setting, may fall through to either."""
         for stored in ("auto", "", None, "SDR", "sdr ", "hdr", "dv3000", 0, True):
             for is_hdr in (False, True):
                 got = self._mode(stored, is_hdr=is_hdr)
                 self.assertNotEqual(got, "sdr", f"{stored!r}/is_hdr={is_hdr} fell through to SDR")
-                self.assertEqual(got, "dv2000" if is_hdr else "dv1000")
+                self.assertEqual(got, "dv1000")
 
     def test_the_sdr_mode_is_the_only_headless_one(self):
         import resolve_pipeline as RP
