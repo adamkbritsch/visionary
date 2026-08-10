@@ -349,7 +349,8 @@ class PlexDiscovery(unittest.TestCase):
     def test_found_on_a_host_returns_the_url_and_version(self):
         from unittest import mock
         import io, transfer, urllib.request
-        body = io.BytesIO(b'<MediaContainer version="1.41.0.100" machineIdentifier="x"/>')
+        body = io.BytesIO(b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                          b'<MediaContainer version="1.41.0.100" machineIdentifier="x"/>')
         body.status = 200
         body.__enter__ = lambda s: s
         body.__exit__ = lambda s, *a: False

@@ -793,7 +793,9 @@ def api_config_test(what):
                 try:
                     with urllib.request.urlopen(base + "/identity", timeout=3) as resp:
                         body = resp.read(2000).decode("utf-8", "replace")
-                    ver = _re.search(r'version="([^"]+)"', body)
+                    # anchor to the MediaContainer tag — a bare version= match grabs the
+                    # XML declaration's version="1.0" first (live-caught)
+                    ver = _re.search(r'<MediaContainer[^>]*\bversion="([^"]+)"', body)
                     return {"ok": True, "url": base,
                             "detail": f"found Plex {ver.group(1) if ver else ''} at {base}".strip()}
                 except Exception:
