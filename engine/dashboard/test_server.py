@@ -378,3 +378,74 @@ class PlexDiscovery(unittest.TestCase):
             out = server.api_config_test("plex-discover")
         self.assertFalse(out["ok"])
         self.assertIn("configure the NAS first", out["detail"])
+
+
+class AutoConnectSweep(unittest.TestCase):
+    """One sweep: Plex (:32400 tokenless), youtarr (:3087 presence), Shuttle relay
+    (:8789/healthz pre-auth + Shuttle's local token verified)."""
+
+    def _resp(self, body=b"", status=200):
+        import io
+        r = io.BytesIO(body)
+        r.status = status
+        r.__enter__ = lambda s: s
+        r.__exit__ = lambda s, *a: False
+        return r
+
+    def test_sweep_finds_all_three_and_verifies_the_relay_token(self):
+        from unittest import mock
+        import companion, transfer, urllib.request
+        def route(req, timeout=None):
+            url = req if isinstance(req, str) else req.full_url
+            if ":32400/identity" in url:
+                return self._resp(b'<?xml version="1.0"?><MediaContainer version="1.41.0"/>')
+            if ":3087/" in url:
+                return self._resp(b"<html>youtarr</html>")
+            if ":8789/healthz" in url:
+                return self._resp(b'{"ok": true}')
+            if ":8789/v1/targets" in url:
+                # the authed probe must carry Shuttle's token
+                assert req.get_header("Authorization") == "Bearer tok"
+                return self._resp(b'{"targets": []}')
+            raise OSError("refused")
+        with mock.patch.object(transfer, "nas_hosts", return_value=["10.0.0.5"]), \
+             mock.patch.object(companion, "relay_token", return_value="tok"), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=route):
+            out = server.api_config_test("auto-connect")
+        self.assertTrue(out["ok"])
+        f = out["found"]
+        self.assertEqual(f["plex"]["url"], "http://10.0.0.5:32400")
+        self.assertIn("1.41.0", f["plex"]["detail"])
+        self.assertEqual(f["youtarr"]["url"], "http://10.0.0.5:3087")
+        self.assertEqual(f["relay"]["url"], "http://10.0.0.5:8789")
+        self.assertTrue(f["relay"]["authed"])
+        self.assertIn("connected", f["relay"]["detail"])
+
+    def test_relay_found_without_a_local_token_says_so(self):
+        from unittest import mock
+        import companion, transfer, urllib.request
+        def route(req, timeout=None):
+            url = req if isinstance(req, str) else req.full_url
+            if ":8789/healthz" in url:
+                return self._resp(b'{"ok": true}')
+            raise OSError("refused")
+        with mock.patch.object(transfer, "nas_hosts", return_value=["10.0.0.5"]), \
+             mock.patch.object(companion, "relay_token", return_value=""), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=route):
+            out = server.api_config_test("auto-connect")
+        r = out["found"]["relay"]
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["authed"])
+        self.assertIn("Shuttle app", r["detail"])
+
+    def test_nothing_found_is_all_clean_misses(self):
+        from unittest import mock
+        import companion, transfer, urllib.request
+        with mock.patch.object(transfer, "nas_hosts", return_value=["10.0.0.5"]), \
+             mock.patch.object(companion, "relay_token", return_value=""), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=OSError("refused")):
+            out = server.api_config_test("auto-connect")
+        self.assertFalse(out["ok"])
+        for svc in ("plex", "youtarr", "relay"):
+            self.assertFalse(out["found"][svc]["ok"])
+            self.assertNotIn("error", out["found"][svc].get("detail", "").lower())

@@ -42,7 +42,7 @@ final class AppStore: ObservableObject {
     @Published var preflight: PreflightDTO?
     @Published var configDTO: ConfigDTO?
     @Published var installStatus: InstallStatusDTO?
-    @Published var plexDiscovery: ConfigTestDTO?   // tokenless :32400/identity probe result
+    @Published var autoConnected: AutoConnectDTO?  // tokenless NAS-host service sweep
 
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
                                                   // click, before the server round-trip lands
@@ -395,16 +395,25 @@ final class AppStore: ObservableObject {
         guard let data else { return nil }
         return try? JSONDecoder().decode(ConfigTestDTO.self, from: data)
     }
-    /// AUTO-IDENTIFY Plex once the NAS connection works: probe :32400/identity on the
-    /// configured hosts (tokenless). A hit auto-saves plex_url when it was empty — the
-    /// same value the engine's fallback would use, now visible in the field.
-    func discoverPlex() async {
-        guard let t = await testConfig("plex-discover") else { return }
-        plexDiscovery = t
-        if t.ok == true, let url = t.url, !url.isEmpty,
-           (configDTO?.fields?["plex_url"] ?? "").isEmpty {
-            await saveConfig(["plex_url": url])
+    /// AUTO-CONNECT everything discoverable once the NAS works: Plex (:32400/identity,
+    /// tokenless), youtarr (:3087 presence), the Shuttle relay (:8789/healthz + its
+    /// token verified from Shuttle's own local file — a found relay is a COMPLETE
+    /// connection). Each found URL auto-saves when its field was empty — the same values
+    /// the engine's fallbacks would use, now visible.
+    func autoConnect() async {
+        let (_, data) = await postResult("/api/config-test", ["what": "auto-connect"])
+        guard let data,
+              let t = try? JSONDecoder().decode(AutoConnectDTO.self, from: data) else { return }
+        autoConnected = t
+        var save: [String: Any] = [:]
+        for (svc, key) in [("plex", "plex_url"), ("youtarr", "youtarr_url"),
+                           ("relay", "shuttle_relay_url")] {
+            if let f = t.found?[svc], f.ok == true, let url = f.url, !url.isEmpty,
+               (configDTO?.fields?[key] ?? "").isEmpty {
+                save[key] = url
+            }
         }
+        if !save.isEmpty { await saveConfig(save) }
     }
     func fetchInstallStatus() async {
         if let s: InstallStatusDTO = await get("/api/setup/install-status") { installStatus = s }

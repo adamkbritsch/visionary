@@ -508,10 +508,17 @@ struct ConfigDTO: Codable {
     var path: String?
 }
 
-struct ConfigTestDTO: Codable {
+struct ConfigTestDTO: Codable, Equatable {
     var ok: Bool?
     var detail: String?
-    var url: String?      // plex-discover: the found Plex base URL (autofills the field)
+    var url: String?      // discovery: the found service base URL (autofills its field)
+    var authed: Bool?     // relay only: the Shuttle token verified — fully connected
+}
+
+struct AutoConnectDTO: Codable, Equatable {           // one sweep: plex / youtarr / relay
+    var ok: Bool?
+    var detail: String?                     // "configure the NAS first" when unconfigured
+    var found: [String: ConfigTestDTO]?
 }
 
 struct ImportStepDTO: Codable, Identifiable {

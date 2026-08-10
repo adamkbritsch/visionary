@@ -754,6 +754,75 @@ def api_preflight(fresh=False):
     return r
 
 
+def _discover_plex(hosts):
+    """Tokenless: :32400/identity answers without auth; version parsed off the
+    MediaContainer tag (a bare version= match grabs the XML declaration's 1.0)."""
+    import re as _re
+    import urllib.request
+    for h in hosts:
+        base = f"http://{h}:32400"
+        try:
+            with urllib.request.urlopen(base + "/identity", timeout=3) as resp:
+                body = resp.read(2000).decode("utf-8", "replace")
+            ver = _re.search(r'<MediaContainer[^>]*\bversion="([^"]+)"', body)
+            return {"ok": True, "url": base,
+                    "detail": f"found Plex {ver.group(1) if ver else ''} at {base}".strip()}
+        except Exception:
+            continue
+    return {"ok": False, "detail": f"no Plex answered on :32400 at {', '.join(hosts[:3])}"}
+
+
+def _discover_youtarr(hosts):
+    """Presence only — youtarr's web app answers on :3087; the login creds stay the
+    user's (there is no tokenless identity endpoint)."""
+    import urllib.request
+    for h in hosts:
+        base = f"http://{h}:3087"
+        try:
+            with urllib.request.urlopen(base + "/", timeout=3) as resp:
+                if resp.status == 200:
+                    return {"ok": True, "url": base,
+                            "detail": f"found youtarr at {base} — add its login below"}
+        except Exception:
+            continue
+    return {"ok": False, "detail": "no youtarr on :3087 (optional)"}
+
+
+def _discover_relay(hosts):
+    """The Shuttle relay serves /healthz BEFORE auth by design. If Shuttle's local token
+    file exists we also VERIFY it (authenticated /v1/targets) — a found+authed relay is a
+    complete connection: the token never needs typing."""
+    import urllib.request
+    import companion
+    token = companion.relay_token()
+    for h in hosts:
+        base = f"http://{h}:8789"
+        try:
+            with urllib.request.urlopen(base + "/healthz", timeout=3) as resp:
+                if resp.status != 200:
+                    continue
+        except Exception:
+            continue
+        if token:
+            try:
+                req = urllib.request.Request(base + "/v1/targets",
+                                             headers={"Authorization": "Bearer " + token})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        return {"ok": True, "url": base, "authed": True,
+                                "detail": f"found the Shuttle relay at {base} — connected "
+                                          "(token from the Shuttle app)"}
+            except Exception:
+                pass
+            return {"ok": True, "url": base, "authed": False,
+                    "detail": f"found the Shuttle relay at {base} — its token was refused; "
+                              "open Shuttle once to refresh it"}
+        return {"ok": True, "url": base, "authed": False,
+                "detail": f"found the Shuttle relay at {base} — set up the Shuttle app "
+                          "for the token"}
+    return {"ok": False, "detail": "no Shuttle relay on :8789 (optional)"}
+
+
 def api_config_test(what):
     """Live connectivity probe for one Setup group, bounded timeouts, secrets never in
     the response. 'not configured' is a clean non-error (the UI shows it neutrally)."""
@@ -780,28 +849,26 @@ def api_config_test(what):
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return {"ok": resp.status == 200, "detail": f"Plex answered at {base}"}
         if what == "plex-discover":
-            # AUTO-IDENTIFY: once the NAS is configured, a Plex server is almost always
-            # sitting on the same host at :32400 — /identity answers WITHOUT a token, so
-            # discovery needs nothing from the user. Returns the found base URL so the
-            # Setup UI can fill the field in (the token stays the user's, and optional).
-            import re as _re
             hosts = transfer.nas_hosts()
             if not hosts:
                 return {"ok": False, "detail": "configure the NAS first"}
-            for h in hosts:
-                base = f"http://{h}:32400"
-                try:
-                    with urllib.request.urlopen(base + "/identity", timeout=3) as resp:
-                        body = resp.read(2000).decode("utf-8", "replace")
-                    # anchor to the MediaContainer tag — a bare version= match grabs the
-                    # XML declaration's version="1.0" first (live-caught)
-                    ver = _re.search(r'<MediaContainer[^>]*\bversion="([^"]+)"', body)
-                    return {"ok": True, "url": base,
-                            "detail": f"found Plex {ver.group(1) if ver else ''} at {base}".strip()}
-                except Exception:
-                    continue
-            return {"ok": False,
-                    "detail": f"no Plex answered on :32400 at {', '.join(hosts[:3])}"}
+            return _discover_plex(hosts)
+        if what == "auto-connect":
+            # ONE sweep for everything discoverable once the NAS is known (user-asked):
+            # Plex :32400 (/identity is tokenless), youtarr :3087 (presence — creds stay
+            # the user's), the Shuttle relay :8789 (/healthz answers before auth BY
+            # DESIGN — and the relay token comes from Shuttle's own local file, so a
+            # found relay is a COMPLETE connection, no typing at all).
+            hosts = transfer.nas_hosts()
+            if not hosts:
+                return {"ok": False, "detail": "configure the NAS first"}
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                futs = {"plex": ex.submit(_discover_plex, hosts),
+                        "youtarr": ex.submit(_discover_youtarr, hosts),
+                        "relay": ex.submit(_discover_relay, hosts)}
+                found = {k: f.result() for k, f in futs.items()}
+            return {"ok": any(v.get("ok") for v in found.values()), "found": found}
         if what == "youtarr":
             import youtarr
             bases = youtarr.base_urls()

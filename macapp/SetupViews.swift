@@ -165,7 +165,7 @@ private struct ConnectionsGroup: View {
                         tests[what] = await store.testConfig(what)
                         testing = nil
                         if what == "ftp", tests[what]?.ok == true {
-                            await store.discoverPlex()   // NAS works → find Plex on it
+                            await store.autoConnect()   // NAS works → find its services
                         }
                     }
                 } label: {
@@ -204,13 +204,19 @@ private struct ConnectionsGroup: View {
                 SetupGroupLabel(text: "Optional integrations")
                 Text("All optional — each degrades gracefully when unset.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
-                if let d = store.plexDiscovery {
-                    // auto-identified the moment the NAS connection works: /identity
-                    // answers without a token, so only the token stays yours to add
-                    HStack(spacing: 6) {
-                        CheckDot(ok: d.ok == true ? true : nil)   // a miss is neutral, never red
-                        Text(d.detail ?? "").font(.system(size: 11)).foregroundStyle(.secondary)
-                            .lineLimit(1)
+                if let found = store.autoConnected?.found {
+                    // auto-identified the moment the NAS connection works — Plex's
+                    // /identity and the relay's /healthz answer tokenless, youtarr by
+                    // presence; the relay even verifies Shuttle's local token, so a
+                    // found relay is already fully connected
+                    ForEach(["plex", "youtarr", "relay"], id: \.self) { svc in
+                        if let d = found[svc] {
+                            HStack(spacing: 6) {
+                                CheckDot(ok: d.ok == true ? true : nil)   // a miss is neutral
+                                Text(d.detail ?? "").font(.system(size: 11))
+                                    .foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
                     }
                 }
                 field("Plex URL", "plex_url", hint: "auto-detected once the NAS connects")
@@ -232,17 +238,21 @@ private struct ConnectionsGroup: View {
             for (k, v) in fields where !(f[k]?.isEmpty == false) { f[k] = v }
             seeded = true
         }
-        .onChange(of: store.plexDiscovery?.url) { url in
-            // discovery filled config server-side isn't a thing — the STORE auto-saved
-            // plex_url when it was empty; mirror it into the visible field here
-            guard optional, let url, !url.isEmpty, (f["plex_url"] ?? "").isEmpty else { return }
-            f["plex_url"] = url
+        .onChange(of: store.autoConnected?.found) { found in
+            // the STORE auto-saved found URLs into empty config keys; mirror them into
+            // the visible fields here
+            guard optional, let found else { return }
+            for (svc, key) in [("plex", "plex_url"), ("youtarr", "youtarr_url"),
+                               ("relay", "shuttle_relay_url")] {
+                if let url = found[svc]?.url, !url.isEmpty, (f[key] ?? "").isEmpty {
+                    f[key] = url
+                }
+            }
         }
         .task {
-            // discover on open when the NAS is already configured and Plex isn't
-            if optional, ftpConfigured, (store.configDTO?.fields?["plex_url"] ?? "").isEmpty,
-               store.plexDiscovery == nil {
-                await store.discoverPlex()
+            // sweep on open once the NAS is configured (cheap: parallel 3 s probes)
+            if optional, ftpConfigured, store.autoConnected == nil {
+                await store.autoConnect()
             }
         }
     }
