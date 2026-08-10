@@ -59,8 +59,9 @@ Watch `resolve_version` + `topaz_version`. Both must report the exact pins
   bundled ffmpeg + models landed.
 
 ### Step 3 — Brew tools
-`brew_tools` + `sublercli` checks. Run the commands from `fix` (they're in the README
-too). Rosetta is required for SublerCLI (x86_64).
+`brew_tools` check. Run the command from `fix` (it's in the README too). (SublerCLI +
+Rosetta were RETIRED 2026-08-09 — the x265 + MP4Box mux superseded the Subler-optimize
+step and nothing invokes it; don't install them.)
 
 ### Step 4 — Python dependency
 `python_deps` probes `/usr/bin/python3` specifically (the app's engine interpreter;

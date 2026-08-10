@@ -323,7 +323,6 @@ private struct DependenciesGroup: View {
                 }
             }
             row("Command-line tools", check: "brew_tools", install: "brew_tools")
-            row("SublerCLI + Rosetta", check: "sublercli", install: "sublercli")
             row("Python OpenCV", check: "python_deps", install: "python_deps")
         }
     }

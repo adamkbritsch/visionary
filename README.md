@@ -107,8 +107,6 @@ plug and close the lid.
 
 ```bash
 brew install ffmpeg x265 dovi_tool gpac cliclick
-brew install --cask sublercli
-softwareupdate --install-rosetta --agree-to-license   # SublerCLI is x86_64
 ```
 
 ### 4. Python dependency (for the SYSTEM python)

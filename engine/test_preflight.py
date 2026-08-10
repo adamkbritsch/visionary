@@ -156,7 +156,6 @@ class Semantics(unittest.TestCase):
         with mock.patch.object(preflight, "run_cheap", return_value=fails), \
              mock.patch.object(preflight, "check_power_adapter", return_value=warns[0]), \
              mock.patch.object(preflight, "check_brew_tools", return_value=fails[0]), \
-             mock.patch.object(preflight, "check_sublercli", return_value=warns[0]), \
              mock.patch.object(preflight, "check_python_deps", return_value=fails[0]), \
              mock.patch.object(preflight, "check_shim_templates", return_value=fails[0]), \
              mock.patch.object(preflight, "check_tcc_grants", return_value=warns[0]), \

@@ -28,8 +28,6 @@ BREW_INSTALL_HINT = ('/bin/bash -c "$(curl -fsSL '
 TARGETS = {
     "brew_tools": {"cmd": f"{BREW} install ffmpeg x265 dovi_tool gpac cliclick",
                    "needs_brew": True},
-    "sublercli": {"cmd": f"{BREW} install --cask sublercli", "needs_brew": True},
-    "rosetta": {"cmd": "/usr/sbin/softwareupdate --install-rosetta --agree-to-license"},
     "python_deps": {"cmd": "/usr/bin/python3 -m pip install --user opencv-python || "
                            "(/usr/bin/python3 -m ensurepip --user && "
                            "/usr/bin/python3 -m pip install --user opencv-python)"},

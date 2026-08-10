@@ -291,20 +291,10 @@ def check_brew_tools():
                   "brew install ffmpeg x265 dovi_tool gpac cliclick")
 
 
-def check_sublercli():
-    if not os.path.exists(os.path.join(BREW, "SublerCLI")):
-        return _check("sublercli", False, "fail", "SublerCLI missing from /opt/homebrew/bin",
-                      "brew install --cask sublercli")
-    try:
-        rosetta = subprocess.run(["arch", "-arch", "x86_64", "/usr/bin/true"],
-                                 capture_output=True, timeout=10).returncode == 0
-    except Exception:
-        return _check("sublercli", True, "warn",
-                      "SublerCLI present; could not determine Rosetta status",
-                      "softwareupdate --install-rosetta --agree-to-license")
-    return _check("sublercli", rosetta, "warn",
-                  f"SublerCLI present; Rosetta {'present' if rosetta else 'MISSING (SublerCLI is x86_64)'}",
-                  "softwareupdate --install-rosetta --agree-to-license")
+# check_sublercli was RETIRED (2026-08-09): the enforced-VBV x265 + fresh MP4Box mux
+# superseded the Subler-optimize step long ago (see remux.py's header) — optimize_dv has
+# no pipeline callers and is reference-only, so demanding an x86_64 tool + Rosetta from
+# every fresh install was pure vestige. remux.SUBLERCLI + optimize_dv remain for manual use.
 
 
 ENGINE_PYTHON = "/usr/bin/python3"   # what the app launches the engine with (macapp/main.swift)
@@ -675,7 +665,7 @@ def run_arm_gate():
 
 def run_checks(network=False, smoke=False, post_setup=False, in_app=False):
     checks = run_cheap() + [
-        check_power_adapter(), check_brew_tools(), check_sublercli(), check_python_deps(),
+        check_power_adapter(), check_brew_tools(), check_python_deps(),
         check_shim_templates(), check_tcc_grants(in_app=in_app),
         check_resolve_artifacts(post_setup=post_setup), check_config(network=network),
     ]
