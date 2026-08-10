@@ -42,6 +42,7 @@ final class AppStore: ObservableObject {
     @Published var preflight: PreflightDTO?
     @Published var configDTO: ConfigDTO?
     @Published var installStatus: InstallStatusDTO?
+    @Published var bordersStatus: BordersStatusDTO?
     @Published var autoConnected: AutoConnectDTO?  // tokenless NAS-host service sweep
 
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
@@ -241,6 +242,13 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": key, "normalize_audio": on]); await refresh()
     }
 
+    // Per-show: AI border extension (4:3 -> 16:9) before the upscale. The row only
+    // renders on 4:3 shows with the models installed; the stage re-gates per episode.
+    func setExtendBorders(_ key: String, _ on: Bool) async {
+        guard !key.isEmpty else { return }
+        await post("/api/show-profile", ["show": key, "extend_borders": on]); await refresh()
+    }
+
     // Per-item (show / movie title) upload policy: master replaces the source (on) vs both kept (off).
     func setReplaceSource(_ key: String, _ on: Bool) async {
         guard !key.isEmpty else { return }
@@ -373,6 +381,10 @@ final class AppStore: ObservableObject {
         if let p: PreflightDTO = await get("/api/preflight") { preflight = p }
         if let c: ConfigDTO = await get("/api/config") { configDTO = c }
         await fetchInstallStatus()
+        await fetchBordersStatus()
+    }
+    func fetchBordersStatus() async {
+        if let b: BordersStatusDTO = await get("/api/borders/status") { bordersStatus = b }
     }
     func recheckSetup() async {
         if let p: PreflightDTO = await get("/api/preflight?fresh=1") { preflight = p }
@@ -437,12 +449,16 @@ final class AppStore: ObservableObject {
     }
     /// Poll the job registry once a second until the active job finishes, then recheck.
     private func followInstalls() async {
-        for _ in 0..<900 {
+        for _ in 0..<10800 {         // model downloads are GB-class — outlive the old 15 min
             await fetchInstallStatus()
+            if installStatus?.active?.hasPrefix("borders_") == true {
+                await fetchBordersStatus()   // the row's live progress IS the on-disk byte count
+            }
             if installStatus?.active == nil { break }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         await recheckSetup()
+        await fetchBordersStatus()      // a finished borders_* download flips its row
     }
     func uploadDvProbe() async -> DvProbeDTO? {
         let (_, data) = await postResult("/api/setup/install-dv-probe", [:])

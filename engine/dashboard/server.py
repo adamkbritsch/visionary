@@ -130,7 +130,7 @@ def series_info():
     """Active series (the round-robin set) + each one's cached queue + the {nas_dir: Plex title}
     map — fast (no NAS I/O) for state polling. `selected` is the primary (back-compat); `extras`
     are the additional round-robin shows; `rotation` is whose turn is next."""
-    import plex
+    import borders, plex
     plex.ensure_titles_warming()
     active = series.get_active_series()
     sel = active[0] if active else None
@@ -138,6 +138,8 @@ def series_info():
     shows = []
     for nm in active:
         nu = series.get_next_up(nm) or None
+        if borders.show_aspect(nm) is None:
+            _kick_aspect_probe(nm)       # eager fill; the row can't render until it lands
         shows.append({"name": nm, "preset": settings.show_preset_key(nm),
                       "configured": settings.get_show_preset(nm) is not None,
                       "unwatched_first": settings.get_show_unwatched_first(nm),
@@ -145,6 +147,10 @@ def series_info():
                       "normalize_audio": settings.get_show_normalize_audio(nm),
                       "replace_source": settings.get_show_replace_source(nm),
                       "output_mode": settings.get_show_output_mode(nm),
+                      # AI border extension: the row renders ONLY when aspect == "4:3"
+                      # AND the top-level borders_ready is true (hide-inert-UI).
+                      "extend_borders": settings.get_show_extend_borders(nm),
+                      "aspect": borders.show_aspect(nm),
                       # what it will ACTUALLY master as — the app shows this, not "auto"
                       "output_mode_effective": settings.effective_output_mode(
                           nm, _hdr_hint(nm)),
@@ -157,9 +163,85 @@ def series_info():
                       # they already persist for a show that isn't active yet).
                       "next_up_profile": show_settings_view(nu) if nu else None,
                       "queue": series.cached_queue(nm)})
+    ready = False
+    try:
+        env = borders.discover()
+        ready = bool(env["ok"]) and borders.models_ready(env["models_dir"])[0]
+    except Exception:
+        pass
     return {"selected": sel, "active": active, "rotation": series.get_rotation(),
             "queue": shows[0]["queue"] if shows else None,
-            "shows": shows, "titles": plex.peek_titles()}
+            "shows": shows, "titles": plex.peek_titles(),
+            # Comfy + all models installed — half of the ExtendBordersRow's visibility
+            # gate (a few file stats per poll; nothing network).
+            "borders_ready": ready}
+
+
+_ASPECT_PROBES = set()          # shows whose eager head-probe already ran this process
+_ASPECT_LOCK = threading.Lock()
+
+
+def _kick_aspect_probe(name):
+    """EAGER show-aspect fill: the per-show "Extend borders" row can only appear once the
+    show's aspect is KNOWN, and a show freshly added to the rotation has never been
+    probed. Pull the first queued episode's first ~3 MB over FTP and probe THAT (an MKV
+    puts its track geometry up front; an MP4 whose moov sits at the end just stays
+    unknown until the first real download probes it — the authoritative fill). Once per
+    show per process; fully best-effort, never blocks the poll."""
+    with _ASPECT_LOCK:
+        if name in _ASPECT_PROBES:
+            return
+        _ASPECT_PROBES.add(name)
+
+    def work():
+        try:
+            import tempfile
+            import borders, plan, transfer
+            q = series.cached_queue(name) or {}
+            item = q.get("next") or (q.get("remaining_items") or [None])[0] or {}
+            base = item.get("source_name")
+            if not base:
+                return
+            ep = item.get("ep") or ""
+            nas_dir = series.episode_nas_dir(name, base)
+            if not nas_dir and len(ep) >= 3:      # the S{NN} convention, like episode_paths
+                nas_dir = f"{transfer.NAS_FTP_TV_ROOT.rstrip('/')}/{name}/S{ep[1:3]}"
+            if not nas_dir:
+                return
+            head = os.path.join(tempfile.gettempdir(),
+                                f"_aspect_head_{abs(hash(name))}.bin")
+            ok, _r = transfer.download_head(f"{nas_dir}/{base}", head, 3 * 1024 * 1024)
+            if ok:
+                info = plan.probe_input(head)
+                label = borders.aspect_label(info.get("width"), info.get("height"),
+                                             info.get("sar"))
+                if label:
+                    borders.record_show_aspect(name, label)
+            try:
+                os.remove(head)
+            except OSError:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=work, daemon=True, name="aspect-probe").start()
+
+
+def api_borders_status():
+    """The border-extender environment for the Setup group: where ComfyUI lives, each
+    model's install state (ok/truncated/missing — truncated resumes via curl -C -),
+    overall readiness, and the learned seconds-per-chunk for the row's projection."""
+    import borders
+    env = borders.discover()
+    models = borders.model_status(env["models_dir"]) if env.get("models_dir") else {}
+    ready, missing = ((borders.models_ready(env["models_dir"]))
+                      if env.get("models_dir") else (False, []))
+    if not env.get("ok"):
+        missing = list(env.get("missing") or []) + missing
+    return {"env": env, "models": models,
+            "ready": bool(env.get("ok")) and ready, "missing": missing,
+            "sec_per_chunk": borders.avg_sec_per_chunk(),
+            "chunk_frames": borders.CHUNK_FRAMES}
 
 
 def api_refresh_library():
@@ -520,6 +602,7 @@ def displays_view() -> dict:
 def show_settings_view(name) -> dict:
     """The per-show settings that can be set for ANY show — active or merely queued as a
     slot's follow-up (all three live in show_profiles.json keyed by show name)."""
+    import borders
     return {"preset": settings.show_preset_key(name),
             "configured": settings.get_show_preset(name) is not None,
             "unwatched_first": settings.get_show_unwatched_first(name),
@@ -529,7 +612,9 @@ def show_settings_view(name) -> dict:
             "normalize_audio": settings.get_show_normalize_audio(name),
             "replace_source": settings.get_show_replace_source(name),
             "output_mode": settings.get_show_output_mode(name),
-            "output_mode_effective": settings.effective_output_mode(name, _hdr_hint(name))}
+            "output_mode_effective": settings.effective_output_mode(name, _hdr_hint(name)),
+            "extend_borders": settings.get_show_extend_borders(name),
+            "aspect": borders.show_aspect(name)}
 
 
 def api_series():
@@ -574,9 +659,13 @@ def show_profile_info(show=None):
     `show` overrides the default target — Movie mode passes the current movie's title so the
     Settings card edits that movie's preset. The user only PICKS a preset (no per-param
     tuning); unconfigured targets show the default until set."""
+    import borders
     target = show or series.get_selection()
     saved = settings.get_show_preset(target) if target else None
     return {"show": target, "configured": saved is not None,
+            "extend_borders": (settings.get_show_extend_borders(target)
+                               if target else False),
+            "aspect": borders.show_aspect(target) if target else None,
             "preset": settings.show_preset_key(target) if target else settings.DEFAULT_PRESET,
             "unwatched_first": settings.get_show_unwatched_first(target) if target else True,
             "normalize_audio": settings.get_show_normalize_audio(target) if target else True,
@@ -1086,6 +1175,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/setup/install-status":
             import setup_jobs
             self._json(setup_jobs.status())
+        elif path == "/api/borders/status":
+            self._json(api_borders_status())
         elif path == "/api/show-profile":
             show = (parse_qs(urlparse(self.path).query).get("show") or [None])[0]
             self._json(show_profile_info(show))
@@ -1241,7 +1332,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_config_test((body or {}).get("what") or ""))
         elif path == "/api/setup/install":
             import setup_jobs
-            out = setup_jobs.start((body or {}).get("what") or "")
+            what = (body or {}).get("what") or ""
+            argv = None
+            if what.startswith("borders_"):
+                # Border-extender model downloads: argv is ENGINE-computed (the
+                # import_resolve escape hatch — nothing user-supplied reaches a shell)
+                # and lands in Comfy Desktop's own models directory. curl -C - resumes
+                # a truncated file in place.
+                import borders
+                env = borders.discover()
+                argv = borders.model_download_argv(what, env.get("models_dir") or "")
+                if not argv:
+                    self._json({"error": "missing",
+                                "detail": "Comfy Desktop's models directory not found — "
+                                          "install and run Comfy Desktop once"})
+                    return
+            out = setup_jobs.start(what, argv=argv)
             _invalidate_preflight()          # a finished job re-detects on next preflight
             self._json(out, code=(409 if out.get("error") == "busy" else 200))
         elif path == "/api/setup/import-resolve":
@@ -1348,6 +1454,11 @@ class Handler(BaseHTTPRequestHandler):
                 # (SDR masters carry a different done-mark), so it only affects items not yet
                 # shipped — anything already finished keeps the name it was shipped under.
                 settings.set_show_output_mode(show, body.get("output_mode"))
+            if "extend_borders" in body:
+                # AI border extension (4:3 -> 16:9) — the extend stage's per-show opt-in.
+                # The UI only renders the row on 4:3 shows with the models installed; the
+                # stage re-gates per episode. No queue refresh: ordering is unaffected.
+                settings.set_show_extend_borders(show, bool(body.get("extend_borders")))
             self._json(show_profile_info(show))
         else:
             self._send(404, b"not found", "text/plain")

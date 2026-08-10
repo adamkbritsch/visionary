@@ -1,6 +1,6 @@
 """Overnight orchestrator — round-robins the active shows, item by item:
 
-    download -> topaz -> resolve -> remux -> upload -> cleanup
+    download -> extend -> topaz -> resolve -> remux -> upload -> cleanup
 
 Design guarantees (per the user's spec):
   * ONE download, REUSED. The source is fetched once to scratch; Topaz AND the
@@ -44,11 +44,13 @@ import transfer
 import youtube
 
 FFPROBE = "/opt/homebrew/bin/ffprobe"
-STAGES = ["download", "topaz", "resolve", "remux", "upload", "cleanup"]
+STAGES = ["download", "extend", "topaz", "resolve", "remux", "upload", "cleanup"]
 # OVERLAP SPLIT: the run thread owns the stages that need the GPU and/or the screen; the
 # FINISHER thread owns the headless tail (CPU/network only), so item N's ~75-min x265 remux
 # runs WHILE item N+1 downloads/upscales — the peak-cap re-encode costs ~zero wall-clock.
-RUN_STAGES = ["download", "topaz", "resolve"]
+# "extend" (AI border extension, 4:3 -> 16:9) is a no-op for every item except a TV episode
+# whose show OPTED IN and whose source actually probes 4:3 — see borders.extend_gate.
+RUN_STAGES = ["download", "extend", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
 FINISHER_LANES = 2           # DEFAULT max concurrent remuxes ('finisher_lanes' setting — read via
                              # _finisher_lanes()). The 2nd lane runs whenever >=2 topaz-done items need
@@ -232,6 +234,9 @@ class EpisodePaths:
     companion_virtual: str = ""   # the companion's relay path (/seedbox/…), fetched at download
     companion_src: str = ""       # where the companion lands locally (scratch)
     companion_size: int = 0       # manifest size — the fetch verify target
+    source_wide: str = ""   # extend-stage output: the 4:3 CFR source outpainted to 16:9
+                            # ("" = item can never extend: movies/YouTube). When present on
+                            # disk, Topaz upscales THIS instead of source_cfr.
 
     def item_view(self) -> dict:
         """The currently-processing item as an up-next-shaped dict, so the dashboard header shows what's
@@ -251,6 +256,8 @@ class EpisodePaths:
         files = [self.source, self.source_cfr, self.prores, self.dv_render, self.final]
         if self.companion_src:
             files.append(self.companion_src)
+        if self.source_wide:
+            files.append(self.source_wide)
         return files
 
 
@@ -333,6 +340,7 @@ def episode_paths(series_name, ep, source_basename, *,
         nas_dir=nas_dir,
         nas_source=f"{nas_dir}/{source_basename}",
         nas_final=f"{nas_dir}/{mstem}{tag}.mp4",
+        source_wide=j(stem + "_wide.mp4"),        # extend-stage output (TV episodes only)
     )
 
 
@@ -683,6 +691,20 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         return (os.path.exists(p.source)
                 and os.path.getsize(p.source) == _remote_size(p.nas_source, ftp)
                 and topaz.is_cfr_ready(p.source_cfr))
+    if stage == "extend":
+        # AI border extension — done when the gate says there is no work (option off /
+        # not 4:3 / HDR / movie / YouTube / combine: all cheap re-checks, the probe only
+        # runs for OPTED-IN shows) or the wide file is complete (frame count == the CFR
+        # source's). The gate fails OPEN, so a probe hiccup skips the enhancement rather
+        # than parking the episode.
+        import borders
+        if not borders.extend_gate(p)["needed"]:
+            return True
+        wide = getattr(p, "source_wide", "")
+        if not wide or not os.path.exists(wide):
+            return False
+        want, got = _nb_frames(p.source_cfr), _nb_frames(wide)
+        return bool(want and got and got == want)
     if stage == "topaz":
         if combine:
             return True                    # combine never upscales — the stage is a no-op

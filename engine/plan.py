@@ -47,8 +47,9 @@ def resolution_bucket(height) -> str:
 
 
 def probe_input(path: str) -> dict:
-    info = {"width": 0, "height": 0, "is_4k": False, "is_hdr": False, "is_dv": False,
-            "codec": None, "transfer": None, "pix_fmt": None, "is_cfr": False, "video_kbps": 0}
+    info = {"width": 0, "height": 0, "sar": "", "is_4k": False, "is_hdr": False,
+            "is_dv": False, "codec": None, "transfer": None, "pix_fmt": None,
+            "is_cfr": False, "video_kbps": 0}
     try:
         out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
                               "-show_streams", "-show_format", "-of", "json", path],
@@ -60,6 +61,7 @@ def probe_input(path: str) -> dict:
         return info
     info["width"] = int(v.get("width") or 0)
     info["height"] = int(v.get("height") or 0)
+    info["sar"] = v.get("sample_aspect_ratio") or ""   # "8:9" on anamorphic DV; ""/"0:1"/"1:1" square
     info["is_4k"] = info["width"] >= 3840 or info["height"] >= 2160
     info["is_hdr"] = v.get("color_transfer") in HDR_TRANSFERS
     info["is_dv"] = any(sd.get("side_data_type") == "DOVI configuration record"

@@ -68,7 +68,7 @@ class Paths(unittest.TestCase):
     def test_working_files_are_the_locals(self):
         self.assertEqual(set(self.p.working_files()),
                          {self.p.source, self.p.source_cfr, self.p.prores,
-                          self.p.dv_render, self.p.final})
+                          self.p.dv_render, self.p.final, self.p.source_wide})
 
 
 class ApplyContainer(unittest.TestCase):
@@ -200,7 +200,7 @@ class Resume(unittest.TestCase):
 
     def test_resume_point_is_first_incomplete_stage(self):
         with mock.patch.object(orch, "stage_done",
-                               side_effect=lambda st, p, ftp=None: st in ("download", "topaz")):
+                               side_effect=lambda st, p, ftp=None: st in ("download", "extend", "topaz")):
             self.assertEqual(orch.first_incomplete_stage(self._p()), "resolve")
 
     def test_none_when_episode_fully_done(self):
@@ -523,7 +523,7 @@ class MovieScheduling(unittest.TestCase):
              mock.patch.object(o, "_hand_to_finisher", side_effect=lambda _p: ran.append("handoff")), \
              mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
             o._process(p)
-        self.assertEqual(ran, ["download", "topaz", "resolve", "handoff"])
+        self.assertEqual(ran, ["download", "extend", "topaz", "resolve", "handoff"])
 
     def test_midpipeline_episode_finishes_before_a_due_movie(self):
         # a part-processed episode (topaz segments already on disk) must NOT be preempted by a
@@ -924,7 +924,7 @@ class QuietMode(unittest.TestCase):
         p = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M")
         ran = []
         with mock.patch.object(o, "_quiet_mode", return_value=True), \
-             mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "topaz")), \
+             mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")), \
              mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
              mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
             o._process(p)
@@ -990,7 +990,7 @@ class ResolveStall(unittest.TestCase):
 
     def _stall_ctx(self, o, run):
         return [
-            mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "topaz")),
+            mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")),
             mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
             mock.patch.object(o, "_claim_prefetched"),
             mock.patch.object(o, "_reclaim_for_pipeline"),
@@ -1391,7 +1391,7 @@ class FinisherOverlap(unittest.TestCase):
              mock.patch.object(orch.series, "get_active_series", return_value=[]), \
              mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
             o._process(p)
-        self.assertEqual(ran, ["download", "topaz", "resolve"])   # remux/upload/cleanup NOT here
+        self.assertEqual(ran, ["download", "extend", "topaz", "resolve"])   # remux/upload/cleanup NOT here
         self.assertIn(o._skip_key(p), o._in_finisher_keys())      # owned by the finisher now
         self.assertEqual(o._finish_q.qsize(), 1)
         self.assertIn("finisher", o.state["message"])
@@ -1938,7 +1938,7 @@ class ResolveGate(unittest.TestCase):
         ran = []
         def fake_sleep(_s):                       # remux "finishes" after the first hold tick
             o.state["finishing"] = None
-        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "topaz")), \
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")), \
              mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
              mock.patch.object(o, "_claim_prefetched"), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
@@ -1959,7 +1959,7 @@ class ResolveGate(unittest.TestCase):
         ran = []
         def flip_off_mid_hold(_s):
             o._quiet_flag = True                  # user turns Screen Control OFF (remux keeps running)
-        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "topaz")), \
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")), \
              mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
              mock.patch.object(o, "_claim_prefetched"), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
@@ -1976,7 +1976,7 @@ class ResolveGate(unittest.TestCase):
         p = episode_paths("A", "S01E01", SRC)
         def stop(_s):
             o._enabled = False
-        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "topaz")), \
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")), \
              mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
              mock.patch.object(o, "_claim_prefetched"), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
@@ -2356,7 +2356,7 @@ class PermanentRefusal(unittest.TestCase):
         # The pre-fix scratch shape: download+topaz already done, the resolve guard fires.
         o = orch.Orchestrator(); o._enabled = True
         p = episode_paths("The Office", "S02E10", SRC)
-        self._refuse(o, p, stage="resolve", done=("download", "topaz"),
+        self._refuse(o, p, stage="resolve", done=("download", "extend", "topaz"),
                      msg="permanent: source is already Dolby Vision — nothing for Resolve to do")
         self.assertIn(o._skip_key(p), o._refused)
         self.assertEqual(o._resolve_fails, {})            # never counted as a Resolve fluke
@@ -2399,7 +2399,7 @@ class QuietModeLaunchRace(unittest.TestCase):
         quiet = mock.Mock(side_effect=[False, True])   # doorstep passes; final re-check catches
         with contextlib.ExitStack() as es:
             es.enter_context(mock.patch.object(orch, "stage_done",
-                                               side_effect=lambda st, _p: st in ("download", "topaz")))
+                                               side_effect=lambda st, _p: st in ("download", "extend", "topaz")))
             es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
             es.enter_context(mock.patch.object(o, "_claim_prefetched"))
             es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
@@ -2535,7 +2535,7 @@ class FastPathResolveShares(unittest.TestCase):
             o._resolve_active.clear(); o._resolve_fast = False
             with contextlib.ExitStack() as es:
                 es.enter_context(mock.patch.object(orch, "stage_done",
-                                                   side_effect=lambda st, _p: st in ("download", "topaz")))
+                                                   side_effect=lambda st, _p: st in ("download", "extend", "topaz")))
                 es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
                 es.enter_context(mock.patch.object(o, "_claim_prefetched"))
                 es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
@@ -2686,7 +2686,7 @@ class GateDeferralKeepsTopazBusy(unittest.TestCase):
         run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
         with contextlib.ExitStack() as es:
             es.enter_context(mock.patch.object(orch, "stage_done",
-                                               side_effect=lambda st, _p: st in ("download", "topaz")))
+                                               side_effect=lambda st, _p: st in ("download", "extend", "topaz")))
             es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
             es.enter_context(mock.patch.object(o, "_claim_prefetched"))
             es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))

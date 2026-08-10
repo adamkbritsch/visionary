@@ -438,3 +438,78 @@ class AutoConnectSweep(unittest.TestCase):
         for svc in ("plex", "youtarr", "relay"):
             self.assertFalse(out["found"][svc]["ok"])
             self.assertNotIn("error", out["found"][svc].get("detail", "").lower())
+
+
+class BordersEndpoints(unittest.TestCase):
+    """The border-extender Setup surface: environment + model states + readiness, and
+    the engine-computed download argv reaching setup_jobs."""
+
+    def test_status_shape_when_comfy_missing(self):
+        from unittest import mock
+        import borders
+        with mock.patch.object(borders, "discover",
+                               return_value={"ok": False, "missing": ["Comfy Desktop"],
+                                             "models_dir": "", "port": 8189}):
+            out = server.api_borders_status()
+        self.assertFalse(out["ready"])
+        self.assertIn("Comfy Desktop", out["missing"])
+        self.assertEqual(out["models"], {})
+        self.assertEqual(out["chunk_frames"], borders.CHUNK_FRAMES)
+
+    def test_status_reports_model_states(self):
+        import tempfile
+        from unittest import mock
+        import borders
+        d = tempfile.mkdtemp()
+        env = {"ok": True, "models_dir": d, "port": 8189, "missing": [],
+               "install_dir": d, "checkout": d, "venv_python": "x",
+               "desktop_version": "1.0", "comfy_version": "0.30.2"}
+        with mock.patch.object(borders, "discover", return_value=env):
+            out = server.api_borders_status()
+        self.assertFalse(out["ready"])                       # nothing installed yet
+        self.assertEqual(out["models"]["borders_vace"]["state"], "missing")
+        self.assertIn("WAN 2.1 VACE 1.3B", out["missing"])
+
+    def test_series_info_carries_aspect_and_readiness(self):
+        from unittest import mock
+        import borders, plex, series, settings
+        with mock.patch.object(series, "get_active_series", return_value=["Show"]), \
+             mock.patch.object(series, "get_next_up", return_value=None), \
+             mock.patch.object(series, "cached_queue", return_value=None), \
+             mock.patch.object(series, "next_up_armed", return_value=False), \
+             mock.patch.object(series, "near_done", return_value=False), \
+             mock.patch.object(series, "get_rotation", return_value=0), \
+             mock.patch.object(plex, "ensure_titles_warming"), \
+             mock.patch.object(plex, "peek_titles", return_value={}), \
+             mock.patch.object(borders, "show_aspect", return_value="4:3"), \
+             mock.patch.object(borders, "discover",
+                               return_value={"ok": True, "models_dir": "/m"}), \
+             mock.patch.object(borders, "models_ready", return_value=(True, [])), \
+             mock.patch.object(settings, "get_show_extend_borders", return_value=True):
+            out = server.series_info()
+        self.assertTrue(out["borders_ready"])
+        self.assertEqual(out["shows"][0]["aspect"], "4:3")
+        self.assertTrue(out["shows"][0]["extend_borders"])
+
+    def test_aspect_probe_kicks_once_per_show(self):
+        from unittest import mock
+        import borders, plex, series
+        server._ASPECT_PROBES.discard("NewShow")
+        with mock.patch.object(series, "get_active_series", return_value=["NewShow"]), \
+             mock.patch.object(series, "get_next_up", return_value=None), \
+             mock.patch.object(series, "cached_queue", return_value=None), \
+             mock.patch.object(series, "next_up_armed", return_value=False), \
+             mock.patch.object(series, "near_done", return_value=False), \
+             mock.patch.object(series, "get_rotation", return_value=0), \
+             mock.patch.object(plex, "ensure_titles_warming"), \
+             mock.patch.object(plex, "peek_titles", return_value={}), \
+             mock.patch.object(borders, "show_aspect", return_value=None), \
+             mock.patch.object(borders, "discover",
+                               return_value={"ok": False, "models_dir": ""}), \
+             mock.patch.object(server.threading, "Thread") as th:
+            server.series_info()
+            server.series_info()                     # second poll: already kicked
+        self.assertEqual(
+            sum(1 for c in th.call_args_list
+                if c.kwargs.get("name") == "aspect-probe"), 1)
+        server._ASPECT_PROBES.discard("NewShow")

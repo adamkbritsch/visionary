@@ -203,7 +203,7 @@ def regime_of(*, run_stage: str | None, run_active: bool,
     with the other lane playing the part Topaz usually plays."""
     if other_lane_live:
         return CONTENDED
-    if run_active and run_stage in ("download", "topaz"):
+    if run_active and run_stage in ("download", "extend", "topaz"):
         return CONTENDED
     return SOLO
 

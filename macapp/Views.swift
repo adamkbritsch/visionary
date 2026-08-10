@@ -685,6 +685,14 @@ struct ScreenControlSection: View {
 // number; the ACTIVE stage is the lit one (silver badge well + bevel border + pulse).
 struct StageInfo { let key, name, symbol, desc, how: String }
 
+// The Extend step is NOT in the static table: it joins the card dynamically (see
+// PipelineCard) only when it is real for the current item — hide-inert-UI.
+let EXTEND_STAGE = StageInfo(
+    key: "extend", name: "Extend", symbol: "arrow.left.and.right.square",
+    desc: "AI-outpaint the 4:3 borders to 16:9 before the upscale — only the side strips "
+        + "are generated; the original picture ships untouched.",
+    how: "WAN VACE \u{00B7} chunked")
+
 let PIPELINE: [StageInfo] = [
     .init(key: "download", name: "Download", symbol: "arrow.down.circle",
           desc: "Pull the 1080p source from the NAS to local scratch.", how: "FTP RETR · size-verified"),
@@ -760,13 +768,29 @@ struct PipelineCard: View {
                 } message: {
                     Text("Stops the encode now; the video is deleted and never re-downloaded.")
                 }) : nil) {
+            // HIDE-INERT-UI: the Extend step only joins the card when it is real for the
+            // CURRENT item — the run is in it, or the running episode's show opted in
+            // (and probed 4:3). Every other item keeps the classic five steps.
+            let showExtend: Bool = {
+                if runStage == "extend" { return true }
+                guard let c = cur, c.kind == "episode",
+                      let s = store.state?.series?.shows?.first(where: { $0.name == c.series })
+                else { return false }
+                return (s.extend_borders ?? false) && s.aspect == "4:3"
+            }()
+            let stages: [StageInfo] = {
+                guard showExtend else { return PIPELINE }
+                var a = PIPELINE
+                a.insert(EXTEND_STAGE, at: 1)
+                return a
+            }()
             HStack(alignment: .top, spacing: 6) {
-                ForEach(Array(PIPELINE.enumerated()), id: \.offset) { i, st in
+                ForEach(Array(stages.enumerated()), id: \.offset) { i, st in
                     let role: StageRole = (st.key == runStage) ? .run
                         : finStages.contains(st.key) ? .finisher : .inactive
                     StageView(index: i + 1, info: st, role: role, twoUp: twoUp,
                               episode: episodeLabel(role, stageKey: st.key))
-                    if i < PIPELINE.count - 1 {
+                    if i < stages.count - 1 {
                         Image(systemName: "chevron.right").font(.system(size: 11)).foregroundStyle(.tertiary)
                             .padding(.top, 21)
                     }
@@ -1665,7 +1689,8 @@ private struct TVMode: View {
                     isDefaultPreset: !(show.configured ?? false),
                     output: show.output_mode_effective ?? "dv1000",
                     normalized: show.normalize_audio ?? true,
-                    replaces: show.replace_source ?? true)
+                    replaces: show.replace_source ?? true,
+                    extending: show.aspect == "4:3" && (show.extend_borders ?? false))
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: "cpu").font(.system(size: 12)).foregroundStyle(DS.steelDim)
@@ -1685,6 +1710,9 @@ private struct TVMode: View {
                 OutputModeRow(key: name, effective: show.output_mode_effective ?? "dv1000")
                 NormalizeAudioRow(key: name, on: show.normalize_audio ?? true)
                 ReplaceSourceRow(key: name, on: show.replace_source ?? true)
+                if show.aspect == "4:3", store.state?.series?.borders_ready == true {
+                    ExtendBordersRow(key: name, on: show.extend_borders ?? false)
+                }
             }
             if (show.queue?.featurette_count ?? 0) > 0 {
                 FeaturettesLastRow(key: name, on: show.featurettes_last ?? true,
@@ -1711,6 +1739,7 @@ private struct LockedSettingsLine: View {
     let output: String            // the RESOLVED range (dv1000 / dv2000 / sdr)
     let normalized: Bool
     let replaces: Bool
+    var extending: Bool = false   // 4:3 show with border extension ON (hidden otherwise)
 
     private var outputLabel: String {
         switch output {
@@ -1729,6 +1758,10 @@ private struct LockedSettingsLine: View {
             item("square.stack.3d.up", normalized ? "Normalized audio" : "Original audio")
             dot
             item("arrow.up.circle", replaces ? "Replaces source" : "Keeps source")
+            if extending {
+                dot
+                item("arrow.left.and.right.square", "Extends to 16:9")
+            }
             Spacer(minLength: 0)
         }
         .lineLimit(1)
@@ -1820,6 +1853,63 @@ private struct NormalizeAudioRow: View {
     }
 }
 
+// AI border extension (4:3 -> 16:9) — per-show opt-in, rendered ONLY when the show's
+// sources probe 4:3 AND the extender is fully installed (hide-inert-UI: absent
+// otherwise, never disabled). Same preset-style shape as NormalizeAudioRow.
+private struct ExtendBordersRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let on: Bool
+    @State private var confirming = false
+
+    private var projection: String {
+        guard let spc = store.bordersStatus?.sec_per_chunk, spc > 0 else {
+            return "overnight-scale \u{2014} hours per episode"
+        }
+        let chunks = 25.0 * 60.0 * 24.0 / 81.0          // a 25-min episode at ~24 fps
+        let h = chunks * spc / 3600.0
+        return String(format: "~%.1f h per 25-min episode", h)
+    }
+
+    private var helpText: String {
+        "AI border extension: outpaints the left/right borders to 16:9 before the "
+            + "upscale. Only the borders are generated \u{2014} the original picture ships "
+            + "untouched (" + projection + ")."
+    }
+    private var dialogMessage: String {
+        if on {
+            return "Episodes not yet processed ship at their original 4:3. Nothing already made changes."
+        }
+        return "Adds an Extend step before the upscale \u{2014} " + projection + ". Only the "
+            + "generated side strips are AI; the original frames ship untouched. Wide "
+            + "specials inside the show skip automatically."
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.left.and.right.square").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            Text(on ? "Extends to 16:9" : "Keeps 4:3")
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .help(helpText)
+            Button("Change") { confirming = true }
+                .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
+            Spacer()
+        }
+        .confirmationDialog(on ? "Stop extending this show to 16:9?"
+                               : "Extend this show's borders to 16:9?",
+                            isPresented: $confirming, titleVisibility: .visible) {
+            Button(on ? "Keep the original 4:3" : "Extend to 16:9") {
+                Task { await store.setExtendBorders(key, !on) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(dialogMessage)
+        }
+    }
+}
+
 // Per-slot "Up next" row: the show queued to take THIS slot the moment its current show
 // finishes (clean handoff — no interleaving). Deliberately NOT gated by the run lock: the
 // slot's CURRENT show can't be swapped mid-run, but queueing what comes AFTER only records
@@ -1877,6 +1967,9 @@ private struct NextUpRow: View {
                     OutputModeRow(key: n, effective: profile?.output_mode_effective ?? "dv1000")
                     NormalizeAudioRow(key: n, on: profile?.normalize_audio ?? true)
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
+                    if profile?.aspect == "4:3", store.state?.series?.borders_ready == true {
+                        ExtendBordersRow(key: n, on: profile?.extend_borders ?? false)
+                    }
                     if profile?.has_featurettes == true {
                         FeaturettesLastRow(key: n, on: profile?.featurettes_last ?? true, count: 0)
                     }

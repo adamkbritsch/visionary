@@ -32,6 +32,13 @@ TARGETS = {
                            "(/usr/bin/python3 -m ensurepip --user && "
                            "/usr/bin/python3 -m pip install --user opencv-python)"},
     "import_resolve": {"cmd": None},       # argv supplied by the caller
+    # Border-extender model downloads (the extend stage): argv computed by the caller
+    # from borders.model_download_argv (curl -fL -C - into Comfy Desktop's models dir —
+    # fixed URL + engine-computed dest, nothing user-supplied).
+    "borders_vace": {"cmd": None},
+    "borders_umt5": {"cmd": None},
+    "borders_causvid": {"cmd": None},
+    "borders_vae": {"cmd": None},
 }
 
 TAIL_LINES = 200

@@ -61,6 +61,7 @@ struct SetupSection: View {
                     ApplicationsGroup()
                     PermissionsGroup()
                     ResolveProjectsGroup()
+                    BorderExtenderGroup()
                     OptionalConnectionsGroup()
                     NASExtrasGroup()
                     HStack {
@@ -325,6 +326,93 @@ private struct DependenciesGroup: View {
             row("Command-line tools", check: "brew_tools", install: "brew_tools")
             row("Python OpenCV", check: "python_deps", install: "python_deps")
         }
+    }
+}
+
+// MARK: - border extender (optional)
+// AI border extension (4:3 -> 16:9): Comfy Desktop detection + the four WAN model
+// downloads (engine-computed curl argv into Comfy's own models dir; a truncated file
+// resumes in place). Optional — never part of setup_complete; the per-show
+// "Extend borders" row only appears once everything here is green.
+private struct BorderExtenderGroup: View {
+    @EnvironmentObject var store: AppStore
+
+    private var st: BordersStatusDTO? { store.bordersStatus }
+    private func job(_ what: String) -> InstallJobDTO? { store.installStatus?.jobs?[what] }
+    private func running(_ what: String) -> Bool {
+        store.installStatus?.active == what && job(what)?.state == "running"
+    }
+    private static func size(_ b: Int64?) -> String {
+        let v = Double(b ?? 0)
+        return v >= 1_000_000_000 ? String(format: "%.1f GB", v / 1_073_741_824.0)
+                                  : String(format: "%.0f MB", v / 1_048_576.0)
+    }
+
+    private func modelRow(_ what: String) -> some View {
+        let m = st?.models?[what]
+        let state = m?.state ?? "missing"
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                CheckDot(ok: state == "ok")
+                Text(m?.label ?? what).font(.system(size: 12, weight: .medium))
+                Text(state == "ok" ? Self.size(m?.bytes)
+                     : state == "truncated" ? Self.size(m?.bytes) + " of " + Self.size(m?.expected)
+                     : Self.size(m?.expected))
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                if state != "ok" {
+                    Button {
+                        Task { await store.startInstall(what) }
+                    } label: {
+                        if running(what) { ProgressView().controlSize(.small) }
+                        else { Text(state == "truncated" ? "Resume" : "Install") }
+                    }.buttonStyle(SteelButtonStyle(lit: true))
+                        .disabled(store.installStatus?.active != nil && !running(what))
+                }
+            }
+            if let j = job(what), j.state == "failed" {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(Array((j.tail ?? []).suffix(4).enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(DS.fault).lineLimit(1)
+                    }
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.25)))
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "Border extender (optional)")
+            Text("AI-outpaints 4:3 shows to 16:9 before the upscale (per-show opt-in \u{2014} "
+                 + "the option appears on 4:3 shows once this is installed). Drives Comfy "
+                 + "Desktop's own ComfyUI headlessly on port \(st?.env?.port ?? 8189).")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                CheckDot(ok: st?.env?.ok)
+                Text("Comfy Desktop").font(.system(size: 12, weight: .medium))
+                if st?.env?.ok == true {
+                    Text("ComfyUI \(st?.env?.comfy_version ?? "?")"
+                         + ((st?.env?.desktop_version).map { " \u{00B7} app \($0)" } ?? ""))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            if st?.env?.ok != true {
+                Text((st?.env?.missing ?? st?.missing ?? ["Open Setup after installing Comfy Desktop."])
+                        .joined(separator: " \u{00B7} "))
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            if st?.env?.ok == true {
+                modelRow("borders_vace")
+                modelRow("borders_umt5")
+                modelRow("borders_causvid")
+                modelRow("borders_vae")
+            }
+        }
+        .task { await store.fetchBordersStatus() }
     }
 }
 

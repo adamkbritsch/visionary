@@ -430,6 +430,19 @@ def set_show_normalize_audio(key: str, value) -> bool:
     return bool(value)
 
 
+def get_show_extend_borders(key: str) -> bool:
+    """Per-show: AI-outpaint a 4:3 show's borders to 16:9 (the extend stage) before the
+    upscale? Default OFF — overnight-scale compute per episode. The UI only surfaces this
+    on shows whose sources probe 4:3 (hide-inert-UI); the stage itself re-checks each
+    episode, so specials/wide episodes inside an enabled show skip cleanly."""
+    return bool(_show_entry(key).get("extend_borders", False))
+
+
+def set_show_extend_borders(key: str, value) -> bool:
+    _update_show(key, extend_borders=bool(value))
+    return bool(value)
+
+
 def get_show_featurettes_last(key: str) -> bool:
     """Per-show: process season-00 specials/featurettes AFTER the whole show (True,
     default) or leave them in numeric order, where "S00" sorts ahead of "S01" and they

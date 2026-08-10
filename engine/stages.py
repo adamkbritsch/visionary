@@ -180,7 +180,7 @@ def _source_video_kbps(path):
 
 def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pause=None):
     fn = {
-        "download": _download, "topaz": _topaz, "resolve": _resolve,
+        "download": _download, "extend": _extend, "topaz": _topaz, "resolve": _resolve,
         "remux": _remux, "upload": _upload, "cleanup": _cleanup,
     }.get(stage, lambda *_a, **_k: (False, f"unknown stage {stage}"))
     ep = getattr(p, "ep", "?")
@@ -250,8 +250,21 @@ def _download(p, abort, progress=None, low_prio=False):
     # instead of the 60s-retry ladder. Probe the ORIGINAL: the CFR pass strips DV side data.
     # probe_input fails open (is_dv False on any probe error) → the topaz guard backstops.
     import plan
-    if plan.probe_input(p.source).get("is_dv"):
+    info = plan.probe_input(p.source)
+    if info.get("is_dv"):
         return False, "permanent: source is already Dolby Vision — nothing to upscale"
+    # Show-aspect book (drives the per-show "Extend borders" row's visibility): every TV
+    # source probe records its show's aspect, so the row appears the first time any
+    # episode of a 4:3 show passes through. Best-effort — never blocks the download.
+    if not (p.movie or p.youtube):
+        try:
+            import borders
+            label = borders.aspect_label(info.get("width"), info.get("height"),
+                                         info.get("sar"))
+            if label:
+                borders.record_show_aspect(p.series, label)
+        except Exception:
+            pass
     return _ensure_cfr(p, abort, progress, low_prio=low_prio)
 
 
@@ -357,6 +370,161 @@ def _source_complete(p):
         return False
 
 
+def _extend(p, abort, progress=None):
+    """AI BORDER EXTENSION (4:3 -> 16:9): outpaint the CFR source's left/right borders
+    with WAN VACE through the locally installed ComfyUI (headless, dedicated port),
+    producing p.source_wide for Topaz to upscale. QUALITY PRINCIPLE: only the borders
+    are AI — each chunk is outpainted at ~480p working res, then just the generated side
+    strips are cropped, upscaled to source height, and hstacked around the ORIGINAL
+    full-res frames. Video only — the remux takes audio from source_cfr as always.
+
+    CHUNKED + RESUMABLE (81 frames/chunk, ~1-2 min each — an episode is overnight-scale):
+    finished chunks persist in <source_wide>.segments under a dvcap.ensure_segdir
+    manifest (source identity + geometry + models + sampler + seed — any change wipes);
+    an abort/deploy costs at most the in-flight chunk. The Comfy backend is stopped on
+    every exit path (plus killpg/atexit inside borders)."""
+    try:
+        import borders, dvcap, topaz
+        g0 = borders.extend_gate(p)
+        if not g0["needed"]:
+            return True, f"no border extension — {g0['reason']}"
+        geom = g0["geom"]
+        env = borders.discover()
+        if not env["ok"]:
+            return False, "border extend: " + "; ".join(env["missing"])
+        ready, missing = borders.models_ready(env["models_dir"])
+        if not ready:
+            return False, "border extend: models not installed — " + ", ".join(missing)
+        total = borders.count_frames(p.source_cfr)      # EXACT (packet count): chunk
+        fps, _dur = topaz.media_timing(p.source_cfr)    # indices + the final verify need it
+        if not total or not fps:
+            return False, "border extend: could not read the source's frame count/rate"
+        chunks = borders.plan_chunks(total)
+        # Resume identity: any change to the source, geometry, models, sampler, or seed
+        # invalidates the persisted chunks (same contract as the remux's segdir).
+        import zlib
+        try:
+            st = os.stat(p.source_cfr)
+            src_id = f"{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            src_id = "missing"
+        seed = zlib.crc32(p.source_basename.encode("utf-8")) & 0x7FFFFFFF
+        manifest = {"src": src_id, "chunk": borders.CHUNK_FRAMES, "geom": geom,
+                    "models": sorted(borders.MODELS),
+                    "sampler": [borders.STEPS, borders.CFG, borders.SAMPLER,
+                                borders.SCHEDULER, borders.SHIFT],
+                    "seed": seed, "prompt": borders.DEFAULT_PROMPT}
+        segdir = p.source_wide + ".segments"
+        dvcap.ensure_segdir(segdir, manifest)
+        backend = borders.ComfyBackend(env, os.path.join(segdir, "in"),
+                                       os.path.join(segdir, "out"))
+    except Exception as e:
+        logbook.exception(f"extend {getattr(p, 'ep', '?')}", e)
+        return False, f"border extend setup crashed: {e.__class__.__name__}: {e}"
+
+    # Notched progress, the Topaz pattern: notches = chunk ends as 0..1 fractions
+    # (omitted past 48 chunks — a movie-length notch comb is visual noise; seg counts +
+    # pct still tell the story), seg_done drives the flash, seg_rem_pct feeds the ETA.
+    ends, cum = [], 0
+    for _s, n in chunks:
+        cum += n
+        ends.append(cum)
+    notches = [round(e / total, 4) for e in ends] if len(ends) <= 48 else None
+    def report(frames_done, done_chunks):
+        if not progress:
+            return
+        d = {"stage": "extend", "ep": p.ep,
+             "pct": min(100, round(frames_done / total * 100)),
+             "seg_done": done_chunks, "seg_total": len(chunks)}
+        if notches:
+            d["notches"] = notches
+        if done_chunks < len(ends):
+            d["seg_rem_pct"] = max(0.0, (ends[done_chunks] - frames_done) / total * 100)
+        progress(d)
+
+    if not backend.port_free():
+        # Our dedicated port answering = a stale orphan of a hard-killed run (a graceful
+        # stop kills the backend via atexit; SIGKILL can't). Reclaim it — 8189 is
+        # Visionary's alone (reclaim_port refuses the Desktop app's 8188).
+        borders.reclaim_port(env["port"])
+        if not backend.port_free():
+            return False, (f"border extend: port {env['port']} is already in use — "
+                           "close whatever holds it (retried automatically)")
+    backend.start()
+    if not backend.wait_ready():
+        tail = " ".join((backend.tail or [])[-4:])
+        backend.stop()
+        return False, "border extend: ComfyUI did not come up — " + (tail or "no output")
+    client = borders.ComfyClient(backend.base)
+    done_frames, done_chunks = 0, 0
+    try:
+        for k, (start, n) in enumerate(chunks):
+            wide_k = os.path.join(segdir, f"wide_{k:04d}.mp4")
+            if os.path.exists(wide_k) and borders.count_frames(wide_k) == n:
+                done_frames += n
+                done_chunks += 1
+                report(done_frames, done_chunks)
+                continue                                 # resume: chunk already composited
+            if abort is not None and abort.is_set():
+                return False, "aborted"
+            t0 = time.monotonic()
+            chunk_in = os.path.join(backend.in_dir, f"chunk_{k:04d}.mp4")
+            r = subprocess.run(borders.chunk_extract_cmd(p.source_cfr, chunk_in, start,
+                                                         n, geom),
+                               capture_output=True, text=True, timeout=1800)
+            if r.returncode != 0:
+                return False, "border extend: chunk extract failed — " + _err_tail(r.stderr)
+            graph = borders.build_outpaint_graph(
+                input_name=os.path.basename(chunk_in),
+                canvas_w=geom["canvas_w"], canvas_h=geom["canvas_h"],
+                pad_left=geom["pad_work"], pad_right=geom["pad_work"],
+                length=n, fps=float(fps), seed=seed + k,
+                filename_prefix=f"gen_{k:04d}")
+            hist = client.wait(client.submit(graph), backend=backend, abort=abort)
+            gen = borders.ComfyClient.output_file(hist, backend.out_dir)
+            if not gen or not os.path.exists(gen):
+                return False, f"border extend: ComfyUI produced no output for chunk {k}"
+            part = wide_k + ".part.mp4"                  # atomic: rename marks the chunk done
+            r = subprocess.run(borders.composite_cmd(p.source_cfr, gen, part, start, n,
+                                                     geom),
+                               capture_output=True, text=True, timeout=1800)
+            got = borders.count_frames(part) if r.returncode == 0 else 0
+            if got != n:
+                try: os.remove(part)
+                except OSError: pass
+                return False, (f"border extend: composite failed for chunk {k} — "
+                               + _err_tail(r.stderr or f"{got}/{n} frames"))
+            os.replace(part, wide_k)
+            for f in (chunk_in, gen):                    # per-chunk temps: keep the dir lean
+                try: os.remove(f)
+                except OSError: pass
+            borders.add_pace_sample(time.monotonic() - t0)
+            done_frames += n
+            done_chunks += 1
+            report(done_frames, done_chunks)
+        list_file = os.path.join(segdir, "concat.txt")
+        with open(list_file, "w") as f:
+            for k in range(len(chunks)):
+                f.write("file '%s'\n" % os.path.join(segdir, f"wide_{k:04d}.mp4"))
+        r = subprocess.run(borders.concat_cmd(list_file, p.source_wide),
+                           capture_output=True, text=True, timeout=1800)
+        got = borders.count_frames(p.source_wide) if r.returncode == 0 else 0
+        if got != total:
+            try: os.remove(p.source_wide)               # a short wide file must never be
+            except OSError: pass                        # mistaken for done by stage_done
+            return False, (f"border extend: concat produced {got}/{total} frames — "
+                           + _err_tail(r.stderr))
+    except RuntimeError as e:                            # ComfyClient: node error / backend
+        if str(e) == "aborted":                          # death (MPS OOM tail) / abort / timeout
+            return False, "aborted"
+        return False, "border extend: " + str(e)
+    finally:
+        backend.stop()
+    return True, (f"[extend {geom['src_w']}x{geom['src_h']} -> "
+                  f"{geom['final_w']}x{geom['src_h']}] {len(chunks)} chunks, "
+                  f"{total} frames -> 16:9 wide source")
+
+
 def _topaz(p, abort, progress=None, should_pause=None):
     """source -> ProRes 4444 XQ. Uses the SHOW's chosen preset + the input plan
     (upscale 1080p 2×, clean already-4K 1×; range PRESERVED, never SDR<->HDR).
@@ -396,7 +564,14 @@ def _topaz(p, abort, progress=None, should_pause=None):
     # tuned param set to use; the source can be ANY of 480p/720p/1080p and still reach 4K.
     params = settings.show_topaz_params(p.series, pl.get("res") or "1080p")
     key = settings.show_preset_key(p.series)
-    total = topaz.total_frames(p.source_cfr)
+    # The extend stage's border-extended 16:9 file supersedes the CFR source as Topaz's
+    # input when it exists (same height + frame count, so the plan's res bucket and every
+    # downstream frame-count check hold unchanged; audio still comes from source_cfr).
+    src_in = p.source_cfr
+    wide = getattr(p, "source_wide", "")
+    if wide and os.path.exists(wide):
+        src_in = wide
+    total = topaz.total_frames(src_in)
     # Segment plan (fires once, from upscale_resumable): cumulative end-frames + EXACT total.
     # Feeds the dashboard's notched progress bar — `notches` = each segment's end as a 0..1
     # fraction, `seg_done` = how many segments are fully encoded (drives the little flash).
@@ -430,7 +605,7 @@ def _topaz(p, abort, progress=None, should_pause=None):
     # is what got stuck); the chunks STAY as separate files and the Resolve stage assembles
     # them on its timeline. The segdir is the topaz OUTPUT + the resume checkpoint — KEPT on
     # interruption, removed only at cleanup. stage_done("topaz") checks the manifest.
-    res = topaz.upscale_resumable(p.source_cfr, segdir=p.segdir, profile=params, scale=pl["scale"],
+    res = topaz.upscale_resumable(src_in, segdir=p.segdir, profile=params, scale=pl["scale"],
                                   fit_height=pl.get("fit_height"), on_progress=on_progress, abort=abort,
                                   on_plan=on_plan, should_pause=should_pause)
     if not res.ok and str(res.error_tail).startswith("paused:"):
@@ -1032,6 +1207,8 @@ def _cleanup(p, abort, progress=None):
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)
     shutil.rmtree(p.final + ".remuxsegs", ignore_errors=True)   # the resumable REMUX segments + rpu
+    if getattr(p, "source_wide", ""):                    # the extend stage's resumable chunk dir
+        shutil.rmtree(p.source_wide + ".segments", ignore_errors=True)
     deleted, failed = 0, []
     for f in p.working_files():
         if not os.path.exists(f):

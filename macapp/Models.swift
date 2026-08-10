@@ -160,6 +160,8 @@ struct ShowSettingsDTO: Codable {
     var replace_source: Bool?
     var output_mode: String?      // "auto" | "sdr" | "dv1000" | "dv2000"
     var output_mode_effective: String?   // what it will ACTUALLY master as (auto already resolved)
+    var extend_borders: Bool?     // AI border extension opt-in (rendered only on 4:3 shows)
+    var aspect: String?           // "4:3" | "16:9" | "other" | nil (not probed yet)
 }
 
 struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (all rendered the same)
@@ -172,6 +174,8 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
     var output_mode: String?      // what Resolve OUTPUTS: auto | sdr | dv1000 | dv2000
     var output_mode_effective: String?   // auto already resolved against the source range
+    var extend_borders: Bool?     // AI border extension (4:3 -> 16:9) opt-in, default off
+    var aspect: String?           // "4:3" | "16:9" | "other" | nil — drives the row's visibility
     var next_up: String?          // show queued to take this slot when this one finishes
     var next_up_armed: Bool?      // <10% left -> the follow-up is locked in + pre-downloading
     var near_done: Bool?          // >=90% done -> only then is "queue a follow-up" offered
@@ -187,6 +191,7 @@ struct SeriesStateDTO: Codable {
     var queue: QueueDTO?             // the primary's queue (back-compat)
     var shows: [SeriesShowDTO]?      // ALL active shows, in order — each rendered as the same block
     var titles: [String: String]?    // nas_dir -> Plex display title
+    var borders_ready: Bool?         // Comfy + all extend models installed (row visibility)
 }
 
 struct MovieItemDTO: Codable, Identifiable {
@@ -377,7 +382,39 @@ struct ShowProfileDTO: Codable {
     var replace_source: Bool?
     var output_mode: String?
     var output_mode_effective: String?
+    var extend_borders: Bool?
+    var aspect: String?
     var catalog: [PresetDTO]?
+}
+
+/// GET /api/borders/status — the border-extender environment for the Setup group.
+struct BordersEnvDTO: Codable {
+    var ok: Bool?
+    var install_dir: String?
+    var checkout: String?
+    var models_dir: String?
+    var desktop_version: String?
+    var comfy_version: String?
+    var port: Int?
+    var missing: [String]?
+}
+
+struct BordersModelDTO: Codable {
+    var label: String?
+    var rel: String?
+    var present: Bool?
+    var bytes: Int64?
+    var expected: Int64?
+    var state: String?            // "ok" | "truncated" (resumes in place) | "missing"
+}
+
+struct BordersStatusDTO: Codable {
+    var env: BordersEnvDTO?
+    var models: [String: BordersModelDTO]?
+    var ready: Bool?
+    var missing: [String]?
+    var sec_per_chunk: Double?    // learned median — projects hours/episode
+    var chunk_frames: Int?
 }
 
 struct DisplayDTO: Codable, Identifiable {

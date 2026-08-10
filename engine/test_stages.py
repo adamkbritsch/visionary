@@ -22,7 +22,7 @@ class Cleanup(unittest.TestCase):
         ok, msg = stages.run_stage("cleanup", p)
         self.assertTrue(ok)
         self.assertFalse(any(os.path.exists(f) for f in p.working_files()))
-        self.assertIn("5", msg)   # source + CFR + prores + dv_render + final removed
+        self.assertIn("6", msg)   # source + CFR + prores + dv_render + final + wide removed
 
 
 class DownloadReuse(unittest.TestCase):
@@ -1512,3 +1512,197 @@ class AudioDonorMismatchMapping(unittest.TestCase):
         ok, msg = stages._combine_result(bad, real_rpu_donor=False)
         self.assertFalse(ok)
         self.assertTrue(msg.startswith("permanent: companion is a different cut"))
+
+
+class ExtendStage(unittest.TestCase):
+    """The AI border-extension stage: gate no-ops, environment failures, the chunked
+    outpaint loop (mocked backend/client/ffmpeg), resume, and Topaz consuming the wide
+    file. borders' own pure pieces (geometry/graph/argv) are covered in test_borders."""
+
+    def setUp(self):
+        import borders
+        self.borders = borders
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.d, ignore_errors=True)
+        self.p = _paths(self.d)
+        for f in (self.p.source, self.p.source_cfr):
+            with open(f, "w") as fh:
+                fh.write("x")
+        self.geom = borders.plan_geometry(640, 480)
+        self.env = {"ok": True, "install_dir": self.d, "checkout": self.d,
+                    "venv_python": "/x/python", "models_dir": self.d,
+                    "port": 8189, "missing": [],
+                    "desktop_version": "1.0", "comfy_version": "0.30.2"}
+
+    def test_gate_not_needed_is_a_clean_no_op(self):
+        with mock.patch.object(self.borders, "extend_gate",
+                               return_value={"needed": False,
+                                             "reason": "extend borders is off for this show",
+                                             "geom": None}):
+            ok, msg = stages.run_stage("extend", self.p)
+        self.assertTrue(ok)
+        self.assertIn("no border extension", msg)
+
+    def test_missing_comfy_fails_retryable(self):
+        with mock.patch.object(self.borders, "extend_gate",
+                               return_value={"needed": True, "reason": "", "geom": self.geom}), \
+             mock.patch.object(self.borders, "discover",
+                               return_value={"ok": False, "missing": ["Comfy Desktop"],
+                                             "port": 8189}):
+            ok, msg = stages.run_stage("extend", self.p)
+        self.assertFalse(ok)
+        self.assertIn("Comfy Desktop", msg)
+
+    def test_missing_models_fails_retryable(self):
+        with mock.patch.object(self.borders, "extend_gate",
+                               return_value={"needed": True, "reason": "", "geom": self.geom}), \
+             mock.patch.object(self.borders, "discover", return_value=self.env), \
+             mock.patch.object(self.borders, "models_ready",
+                               return_value=(False, ["WAN 2.1 VACE 1.3B"])):
+            ok, msg = stages.run_stage("extend", self.p)
+        self.assertFalse(ok)
+        self.assertIn("WAN 2.1 VACE 1.3B", msg)
+
+    def _run_mocked(self, total=170, emitted=None):
+        """The full mocked chunk loop. total=170 -> chunks [(0,81),(81,89)] (tail folds)."""
+        import re as _re
+        import types
+        import topaz
+        borders = self.borders
+        p, geom = self.p, self.geom
+
+        class FakeBackend:
+            insts = []
+            def __init__(self, env, in_dir, out_dir):
+                self.in_dir, self.out_dir, self.base = in_dir, out_dir, "http://b"
+                os.makedirs(in_dir, exist_ok=True)
+                os.makedirs(out_dir, exist_ok=True)
+                self.stopped = False
+                FakeBackend.insts.append(self)
+            def port_free(self): return True
+            def start(self): pass
+            def wait_ready(self, timeout=180): return True
+            def alive(self): return True
+            def stop(self): self.stopped = True
+            tail = []
+
+        class FakeClient:
+            submits = []
+            def __init__(self, base): self.base = base
+            def submit(self, graph):
+                FakeClient.submits.append(graph)
+                return "pid"
+            def wait(self, pid, backend=None, abort=None, timeout_s=3600): return {"outputs": {}}
+            @staticmethod
+            def output_file(hist, out_dir):
+                path = os.path.join(out_dir, "gen.mp4")
+                with open(path, "w") as fh:
+                    fh.write("g")
+                return path
+
+        chunk_lens = [n for (_s, n) in borders.plan_chunks(total)]
+        def fake_count(path, ffprobe=None):
+            b = os.path.basename(path)
+            if path == p.source_wide:
+                return total
+            if b.endswith("_cfr.mp4"):
+                return total
+            m = _re.search(r"wide_(\d+)", b)
+            return chunk_lens[int(m.group(1))] if m else 0
+        def fake_run(argv, **kw):
+            with open(argv[-1], "w") as fh:     # every builder's dst is the last arg
+                fh.write("out")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(self.borders, "extend_gate",
+                               return_value={"needed": True, "reason": "", "geom": geom}), \
+             mock.patch.object(borders, "discover", return_value=self.env), \
+             mock.patch.object(borders, "models_ready", return_value=(True, [])), \
+             mock.patch.object(borders, "count_frames", side_effect=fake_count), \
+             mock.patch.object(borders, "ComfyBackend", FakeBackend), \
+             mock.patch.object(borders, "ComfyClient", FakeClient), \
+             mock.patch.object(borders, "add_pace_sample", lambda s: None), \
+             mock.patch.object(topaz, "media_timing", return_value=(23.976, 7.1)), \
+             mock.patch.object(stages.subprocess, "run", side_effect=fake_run):
+            ok, msg = stages.run_stage("extend", self.p,
+                                       progress=(emitted.append if emitted is not None
+                                                 else None))
+        return ok, msg, FakeBackend, FakeClient
+
+    def test_chunked_loop_produces_wide_file(self):
+        emitted = []
+        ok, msg, FakeBackend, FakeClient = self._run_mocked(emitted=emitted)
+        self.assertTrue(ok, msg)
+        self.assertIn("2 chunks", msg)
+        self.assertTrue(os.path.exists(self.p.source_wide))
+        segdir = self.p.source_wide + ".segments"
+        self.assertTrue(os.path.exists(os.path.join(segdir, "wide_0000.mp4")))
+        self.assertTrue(os.path.exists(os.path.join(segdir, "wide_0001.mp4")))
+        self.assertEqual(len(FakeClient.submits), 2)          # one graph per chunk
+        self.assertTrue(FakeBackend.insts[-1].stopped)        # backend never left running
+        # Notched progress, the Topaz shape.
+        self.assertEqual(emitted[0]["stage"], "extend")
+        self.assertEqual(emitted[0]["seg_total"], 2)
+        self.assertEqual([e["seg_done"] for e in emitted], [1, 2])
+        self.assertEqual(emitted[-1]["pct"], 100)
+        self.assertEqual(emitted[0]["notches"], [round(81 / 170, 4), 1.0])
+        # Per-chunk seeds differ (base+k), geometry canvas rides the graph.
+        s0 = FakeClient.submits[0]["15"]["inputs"]["seed"]
+        s1 = FakeClient.submits[1]["15"]["inputs"]["seed"]
+        self.assertEqual(s1, s0 + 1)
+
+    def test_resume_skips_finished_chunks(self):
+        ok, msg, _B, FakeClient = self._run_mocked()
+        self.assertTrue(ok, msg)
+        os.remove(self.p.source_wide)                         # lose the concat only
+        FakeClient.submits.clear()
+        ok, msg, _B, FakeClient = self._run_mocked()
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(FakeClient.submits), 0)          # every chunk reused
+        self.assertTrue(os.path.exists(self.p.source_wide))
+
+    def test_stage_done_roundtrip(self):
+        import orchestrator
+        with mock.patch.object(self.borders, "extend_gate",
+                               return_value={"needed": False, "reason": "off", "geom": None}):
+            self.assertTrue(orchestrator.stage_done("extend", self.p))   # no work -> done
+        with mock.patch.object(self.borders, "extend_gate",
+                               return_value={"needed": True, "reason": "", "geom": self.geom}):
+            self.assertFalse(orchestrator.stage_done("extend", self.p))  # work, no wide yet
+            with open(self.p.source_wide, "w") as fh:
+                fh.write("w")
+            with mock.patch.object(orchestrator, "_nb_frames", return_value=170):
+                self.assertTrue(orchestrator.stage_done("extend", self.p))
+            def mismatch(path):
+                return 100 if path == self.p.source_wide else 170
+            with mock.patch.object(orchestrator, "_nb_frames", side_effect=mismatch):
+                self.assertFalse(orchestrator.stage_done("extend", self.p))  # short wide
+
+    def test_topaz_consumes_the_wide_file(self):
+        import types
+        import plan
+        import settings
+        import topaz
+        got = {}
+        pl = {"topaz": "upscale", "scale": 2, "res": "480p", "fit_height": 2160,
+              "input": {"is_4k": False}}
+        def fake_upscale(cfr, *, segdir, profile, scale, fit_height, on_progress, abort,
+                         on_plan, should_pause=None):
+            got["input"] = cfr
+            return types.SimpleNamespace(ok=True, error_tail="", frames=100)
+        common = dict(plan_for=mock.patch.object(plan, "plan_for", return_value=pl),
+                      params=mock.patch.object(settings, "show_topaz_params",
+                                               return_value={}),
+                      key=mock.patch.object(settings, "show_preset_key",
+                                            return_value="digital"),
+                      total=mock.patch.object(topaz, "total_frames", return_value=100),
+                      up=mock.patch.object(topaz, "upscale_resumable",
+                                           side_effect=fake_upscale))
+        with common["plan_for"], common["params"], common["key"], common["total"], common["up"]:
+            ok, _ = stages.run_stage("topaz", self.p)         # no wide file on disk
+            self.assertTrue(ok)
+            self.assertEqual(got["input"], self.p.source_cfr)
+            with open(self.p.source_wide, "w") as fh:
+                fh.write("w")
+            ok, _ = stages.run_stage("topaz", self.p)         # wide file present
+            self.assertTrue(ok)
+            self.assertEqual(got["input"], self.p.source_wide)

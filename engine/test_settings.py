@@ -80,6 +80,20 @@ class Presets(unittest.TestCase):
         self.assertEqual(settings.get_show_preset("Old"), "animation2d") # preset preserved
         self.assertFalse(settings.get_show_normalize_audio("Old"))
 
+    def test_extend_borders_defaults_off(self):
+        # Overnight-scale compute per episode — the option must be an explicit opt-in.
+        self.assertFalse(settings.get_show_extend_borders("Brand New Show"))
+
+    def test_extend_borders_set_persists_and_coexists_with_preset(self):
+        settings.set_show_preset("S", "film")
+        settings.set_show_extend_borders("S", True)
+        self.assertEqual(settings.get_show_preset("S"), "film")          # preset survives
+        self.assertTrue(settings.get_show_extend_borders("S"))
+        self.assertTrue(settings.get_show_normalize_audio("S"))          # sibling key untouched
+        settings.set_show_extend_borders("S", False)
+        self.assertFalse(settings.get_show_extend_borders("S"))
+        self.assertEqual(settings.get_show_preset("S"), "film")
+
     def test_replace_source_defaults_true(self):
         # Default = REPLACE (the output replaces its input); key is show name or movie title.
         self.assertTrue(settings.get_show_replace_source("Brand New Show"))
