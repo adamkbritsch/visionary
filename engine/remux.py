@@ -7,11 +7,9 @@ measured 139 Mbps single-second spikes on a 27.5 Mbps average, which underruns p
      in its native Dolby Vision mode with a HARD VBV ceiling (settings `max_peak_mbps`,
      default 50) and interleaves the RPU itself. NO UNCAPPED FALLBACK (user-dictated):
      if capping fails in any way, the stage FAILS — an uncapped file IS the broken file.
-     (This supersedes the Subler-optimize step: the x265 ES + fresh MP4Box mux has none of
-     VideoToolbox's malformed layout; optimize_dv is kept only for reference/manual use.)
   1. ffmpeg extracts every audio + subtitle track from the source (its `-map`
      is reliable; subs -> mov_text) into a temp track file.
-  2. MP4Box muxes the capped ES (`:dvp=8.1:xps_inband:fps=`) + those tracks into the final
+  2. MP4Box muxes the capped ES (`:dvp=8.1:fps=`) + those tracks into the final
      container, writing the Profile 8.1 dvcC box.
 A verification gate then confirms DV 8.1 + tracks survived AND re-measures the actual
 1-second peak of the shipped file (must be <= cap * tolerance) — this is where DV or the
@@ -41,8 +39,6 @@ import dvcap
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 MP4BOX = "/opt/homebrew/bin/MP4Box"
-SUBLERCLI = "/opt/homebrew/bin/SublerCLI"   # `brew install --cask sublercli` (x86_64 → needs Rosetta;
-                                            # clear the Gatekeeper quarantine once: xattr -dr com.apple.quarantine)
 _DOVI_RECORD = "DOVI configuration record"
 
 # --- container choice: MP4 by default, MKV only when the content can't live in an MP4 -------
@@ -160,22 +156,6 @@ def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
             "-c", "copy",
             output]
 
-
-def build_mux_command(mp4box: str, dv_video: str, tracks: str, output: str,
-                      interleave_ms: int = 500) -> list:
-    """MP4Box mux — preserves the Dolby Vision config box that ffmpeg drops. `-inter`
-    interleaves audio+video samples (chunks of `interleave_ms`) for the final master, on top of
-    the structural repair the Subler optimize already did to the DV video (see optimize_dv)."""
-    return [mp4box, "-add", dv_video, "-add", tracks,
-            "-inter", str(interleave_ms), "-new", output]
-
-
-# MP4Box's `-add` parser mangles some characters in the INPUT path. A "+" makes it fail
-# with "Requested URL is not valid or cannot be found" — live-caught 2026-08-03 on
-# "Lost (2004) - S02E12 - Fire + Water", which parked after 5 identical failures.
-# Backslash-escaping does NOT help (verified); the OUTPUT path is unaffected (verified).
-# So hand MP4Box a HARDLINK with a sanitised name instead: same directory, so always the
-# same filesystem, instant and no extra bytes.
 _MP4BOX_UNSAFE = re.compile(r"[+#:,@]")
 
 
@@ -221,37 +201,6 @@ def build_capped_video_mux_command(mp4box: str, hevc_es: str, fps: str, output: 
     unlike its mp4 muxer) carries it into the .mkv alongside the audio + bitmap subs.
     Same no-`xps_inband` rule as above -> `hvc1`."""
     return [mp4box, "-add", f"{hevc_es}:dvp=8.1:fps={fps}", "-new", output]
-
-
-def build_optimize_command(sublercli: str, src: str, dst: str) -> list:
-    """SublerCLI's real `-optimize` — Subler's 'Optimize file' pass. It rewrites the mov/mp4 sample
-    layout: the Resolve/VideoToolbox DV render ships an un-interleaved, malformed-layout file that
-    makes hardware players (SHIELD / Apple TV) stutter AND that mkvmerge/MP4Box mis-parse. Subler's
-    parser reads it robustly and writes a clean, interleaved file while KEEPING the Dolby Vision
-    metadata. Runs on the Resolve `.mov` BEFORE the audio remux, so both the MP4 and MKV masters
-    inherit the repaired video (interleave-only MP4Box `-inter` was never the full optimize)."""
-    return [sublercli, "-source", src, "-dest", dst, "-optimize"]
-
-
-def optimize_dv(dv_video: str, output: str, *, sublercli=SUBLERCLI, ffprobe=FFPROBE, timeout=None):
-    """Subler-optimize the Resolve DV `.mov`. Returns (optimized_path, is_temp). On any failure —
-    SublerCLI missing / not runnable / errored / dropped DV — returns the ORIGINAL dv_video so a
-    Subler problem degrades to today's behaviour instead of blocking a ship (loud log either way)."""
-    dst = output + ".dvopt.mp4"
-    try:
-        r = subprocess.run(build_optimize_command(sublercli, dv_video, dst),
-                           capture_output=True, text=True, timeout=timeout)
-    except Exception as e:
-        print(f"[remux] subler optimize could not run ({e}); shipping un-optimized video", flush=True)
-        return dv_video, False
-    if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
-        print(f"[remux] subler optimize failed (rc={r.returncode}): {_tail(r.stderr)}; un-optimized", flush=True)
-        _rm(dst); return dv_video, False
-    if not parse_streams(_probe(dst, ffprobe)).get("dovi_profile"):   # DV must survive the optimize
-        print("[remux] subler optimize dropped Dolby Vision; shipping un-optimized video", flush=True)
-        _rm(dst); return dv_video, False
-    return dst, True
-
 
 def _rm(path: str):
     try:
@@ -327,12 +276,10 @@ def _tail(text: str, n: int = 12) -> str:
     return "\n".join((text or "").splitlines()[-n:])
 
 
-def _verify(output: str, ffprobe: str, optimized: bool = None) -> RemuxResult:
+def _verify(output: str, ffprobe: str) -> RemuxResult:
     probe_json = _probe(output, ffprobe)
     s = parse_streams(probe_json)
     ok, reason = verify_remux(probe_json)
-    if ok and optimized is not None:            # record whether Subler -optimize engaged (else it's
-        reason += " · optimized" if optimized else " · un-optimized"   # invisible in the logbook)
     return RemuxResult(ok, output, s["dovi_profile"], s["audio"], s["subtitle"], reason)
 
 

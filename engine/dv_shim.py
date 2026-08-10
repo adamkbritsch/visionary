@@ -550,15 +550,6 @@ def click_analyze_all():
         raise RuntimeError("Analyze 'All' button not found in the Dolby Vision palette")
     click(*btn)
 
-
-def analyzing_in_progress() -> bool:
-    """True while the 'Analyzing all clips…' modal (its Cancel button) is on screen."""
-    return found(screenshot(), _t("analyze_modal.png"))
-
-
-# Templates that prove RESOLVE IS ON SCREEN in a capture, regardless of what it is doing.
-# The palette icon lives in the Color page toolbar whether the palette is open or shut; the
-# Analyze All button is there whenever it IS open. Either one is a witness.
 _ONSCREEN_WITNESSES = ("analyze_all.png", "dolby_vision_palette.png")
 
 BLIND_POLLS_BEFORE_FORCING = 3
@@ -578,7 +569,7 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
     for it to APPEAR (analysis started) then DISAPPEAR (done). The old region-hash
     approach false-fired — the Min/Max/Avg strip reads 0.000 the whole analysis and
     looks 'stable' once the initial UI transient settles, so it returned in ~55 s
-    while the analyze was still at 52%. Honours `abort` (stop-time).
+    while the analyze was still at 52%. Honours `abort` if a caller passes one (production kills the resolve subprocess instead).
 
     FOCUS. This used to `activate()` on EVERY poll — up to 360 focus steals per episode,
     an hour of having the keyboard yanked away every ten seconds. It doesn't need to:
@@ -731,7 +722,7 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
     warn_takeover_soon()          # ~10 s of real work still to do before the first click
     # Remember where the user had the pointer, and hand it back when the takeover ends —
     # however it ends. In `finally`, so a raised template failure, a wrong-target refusal
-    # or a stop-time abort all release the mouse too; those are exactly the paths where
+    # or an abort all release the mouse too; those are exactly the paths where
     # leaving the pointer stranded on Resolve's screen would be most annoying.
     saved_pointer = pointer_position()
     # BEGIN/END bracket the period the pipeline actually holds the screen and mouse. The

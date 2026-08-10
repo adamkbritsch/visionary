@@ -61,7 +61,6 @@ OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/u
                              # hand-off so the finisher item is small (~10 GB), but available_gb still
                              # counts scratch as reclaimable — so gate on physical free to reserve room
                              # for the NEXT item's own intermediate. Room for one movie ProRes + margin.
-STATE_FILE = os.path.expanduser("~/.topaz-pipeline/run-state.json")
 DIM_IDLE_MINUTES_DEFAULT = 15   # fallback for the 'dim_after_minutes' setting (idle this long → backlight 0)
 DRAIN_POLL_SECONDS = 30      # how often to re-check while paused for power
 UNPLUG_GRACE_SECONDS = 60    # DEFAULT for the 'unplug_grace_seconds' setting (read via
@@ -80,7 +79,8 @@ MIN_FREE_GB = 400            # DEFAULT for the 'min_free_gb' setting — ALWAYS 
                              # ever on disk at a time; the previous item, now remuxing, holds ~10 GB.
                              # Sized for that single peak: one feature-length MOVIE ProRes (~245 GB) +
                              # its source/CFR/render (~10 GB) + ~145 GB OS/FS margin ≈ 400. (A TV
-                             # episode's intermediate is only ~140 GB — measured — so this is generous
+                             # episode's intermediate is ~190 GiB — re-measured 2026-08-05 — still under
+                             # the movie sizing, with less slack than the old ~140 GB implied
                              # for the current all-TV workload.) Was 600 back when topaz lingered into
                              # the finisher and TWO intermediates could coexist during a tail-overlap.
                              # Keep >= OVERLAP_MIN_PHYS_GB (the finisher-overlap gate reuses this floor).
@@ -783,7 +783,7 @@ class Orchestrator:
         self._enabled = False
         self._thread = None
         self._lock = threading.Lock()
-        self._abort = threading.Event()        # set when the stop-time hits mid-stage
+        self._abort = threading.Event()        # set on manual stop / power pause / quiet reclaim / item removal
         self._caffeinate = None                # held while running: display+system awake
         self._drain_baseline = None            # battery % the current drain episode began at
         self._power_paused = False             # published by _run (single-writer): the prefetcher reads it
@@ -2285,7 +2285,7 @@ class Orchestrator:
         # FINISH a part-processed episode before any movie/YouTube priority interrupt. If the
         # active series' next episode already has its topaz on disk (segments or a DV render —
         # only resolve+remux left), resume it: a fresh movie must NOT preempt it and strand its
-        # ~140 GB intermediate idle through the movie's whole run. (Live-hit: a deploy killed
+        # ~190 GiB intermediate idle through the movie's whole run. (Live-hit: a deploy killed
         # S07E22 mid-resolve; on re-arm a due movie jumped the queue and its topaz sat unused.)
         mid = None if gate_released else self._midpipeline_tv(skip)
         if mid is not None:

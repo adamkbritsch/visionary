@@ -74,17 +74,9 @@ def should_rearm(*, activated: bool, enabled: bool) -> bool:
     return activated and not enabled
 
 
-def build_state(*, power, scratch, adapter_watts, in_win, manifest,
+def build_state(*, power, scratch, adapter_watts, in_win,
                 automation_enabled) -> dict:
     draining = _is_draining(power)   # param 'power' shadows the module; helper routes correctly
-    job = None
-    if manifest:
-        job = {
-            "show": manifest.get("show"),
-            "total": manifest.get("total"),
-            "located": manifest.get("located"),
-            "missing": manifest.get("missing"),
-        }
     return {
         "automation_enabled": automation_enabled,
         "status": "disabled" if not automation_enabled else "armed",
@@ -102,7 +94,6 @@ def build_state(*, power, scratch, adapter_watts, in_win, manifest,
         },
         "scratch": scratch,
         "window": {"start": WINDOW_START, "end": WINDOW_END, "in_window": in_win},
-        "job": job,
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -133,17 +124,6 @@ def collect_scratch():
     free_gb = scratch.available_gb(path)
     return {"name": "Internal SSD", "connected": True, "path": path,
             "free_gb": free_gb, "source": "internal"}
-
-
-def load_manifest():
-    files = sorted(glob.glob(os.path.join(DASHBOARD_DIR, "manifests", "*.json")))
-    if not files:
-        return None
-    try:
-        with open(files[0]) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 def series_info():
@@ -1050,7 +1030,6 @@ def current_state():
         scratch=collect_scratch(),
         adapter_watts=read_adapter_watts(),
         in_win=in_window(datetime.datetime.now().time(), WINDOW_START, WINDOW_END),
-        manifest=load_manifest(),
         automation_enabled=orch["enabled"],     # live: the orchestrator's arm state
     )
     # scratch preview: local files inherit the FTP wire name, so decode for display
@@ -1110,9 +1089,6 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/show-profile":
             show = (parse_qs(urlparse(self.path).query).get("show") or [None])[0]
             self._json(show_profile_info(show))
-        elif path == "/api/log":
-            self._json({"lines": logbook.tail(120, levels=None), "file": logbook.LOG_FILE,
-                        "issues": logbook.tail(40)})
         elif path == "/api/selftest":
             self._json(selftest_full())
         elif path == "/api/screen.png":
@@ -1165,8 +1141,6 @@ class Handler(BaseHTTPRequestHandler):
             # NOT folded into /api/state: that polls every 1.5 s and re-enumerating
             # displays at that rate is pointless work.
             self._json(displays_view())
-        elif path == "/api/request-accessibility":
-            self._json(request_accessibility())
         elif path == "/oauth/youtube":
             import ytdata
             code = (parse_qs(urlparse(self.path).query).get("code") or [""])[0]

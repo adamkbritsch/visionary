@@ -1,7 +1,7 @@
 """User-adjustable settings + per-show Topaz preset selection.
 
 Two JSON files under ~/.topaz-pipeline/ (atomic writes):
-  settings.json       — global knobs (stop time, power policy, …)
+  settings.json       — global knobs (power policy, disk floor, quiet mode, …)
   show_profiles.json  — { "<show name>": "<preset key>" }
 
 Topaz presets are a FIXED CATALOG — all SDR ProRes 4444 XQ. They differ ONLY by
@@ -32,7 +32,7 @@ PROFILES_FILE = os.path.join(CONFIG_DIR, "show_profiles.json")
 MAX_ACTIVE_CEILING = 4
 
 # Longest Screen Control may be switched off for. It is a TIMED pause, never a latch:
-# while it is off, items hold before Resolve and their ~140 GB Topaz intermediates pile up
+# while it is off, items hold before Resolve and their ~190 GiB Topaz intermediates pile up
 # against the min_free_gb floor, so a forgotten "off" stalls the run on low disk instead of
 # doing anything useful. Four hours is about where the buffer runs out (2-3 items at
 # 1-2 h of Topaz each), so that is the ceiling — and every pause self-cancels.
@@ -62,7 +62,7 @@ DEFAULT_SETTINGS = {
                                 # launch (see server._rearm_loop). A run ends only on a manual stop.
     "quiet_until": 0,           # SCREEN CONTROL is only ever turned off TEMPORARILY: this is the epoch
                                 # second it comes back on by itself (0 = not currently timed). Holding
-                                # items before Resolve piles up ~140 GB ProRes intermediates against the
+                                # items before Resolve piles up ~190 GiB ProRes intermediates against the
                                 # min_free_gb floor, so an indefinite "off" would quietly stall the run
                                 # on low disk — hence MAX_QUIET_SECONDS. The expiry is enforced in the
                                 # ENGINE (orchestrator._quiet_mode), so it survives an app relaunch.
@@ -114,7 +114,7 @@ DEFAULT_SETTINGS = {
                                 # Topaz; 2 = the current throughput (Resolve gets 2 items ahead).
     "min_free_gb": 400,         # DISK FLOOR (was orchestrator.MIN_FREE_GB): free space that must remain
                                 # before an item may START, and the base of the prefetch gate. A Topaz
-                                # ProRes working set is ~140 GB per episode, ~245 GB for a feature.
+                                # ProRes working set is ~190 GiB per episode (re-measured 2026-08-05), ~245 GB for a feature.
     "prefetch_cap_gb": 100,     # DOWNLOAD-AHEAD BUFFER (was orchestrator.PREFETCH_HARD_CAP_GB): hard
                                 # ceiling on the total size of pre-staged sources. 0 = off (fetch each
                                 # item only when it's needed).
@@ -244,7 +244,6 @@ TOPAZ_PRESETS = {
 }
 DEFAULT_PRESET = "digital"
 DEFAULT_RES = "1080p"   # fallback variant; also what a 4K-clean pass uses (lightest cleanup)
-TOPAZ_PARAMS = ("model", "compression", "details", "halo", "blend")
 
 
 def _load(path: str, default):
@@ -406,21 +405,6 @@ def show_preset_key(show: str) -> str:
     return get_show_preset(show) or DEFAULT_PRESET
 
 
-YT_SCOPES = ("popular", "all")
-
-
-def get_yt_scope(channel: str) -> str:
-    """Per-channel YouTube UPSCALE scope: 'popular' (only the channel's top-viewed videos) or 'all'
-    (every downloaded video within the length cap). Default 'popular'."""
-    v = _show_entry(channel).get("yt_scope")
-    return v if v in YT_SCOPES else "popular"
-
-
-def set_yt_scope(channel: str, scope: str) -> str:
-    scope = scope if scope in YT_SCOPES else "popular"
-    _update_show(channel, yt_scope=scope)
-    return scope
-
 
 def get_show_unwatched_first(show: str) -> bool:
     """Per-show: process UNWATCHED episodes first? Default True (the prior always-on
@@ -458,9 +442,9 @@ def set_show_featurettes_last(key: str, value) -> bool:
     return bool(value)
 
 
-# What the Resolve stage should OUTPUT for an item. "auto" keeps the long-standing rule —
-# SDR intake -> 1000-nit Dolby Vision, HDR intake -> 2000-nit — and is the default. The other
-# three pin it regardless of the source. "sdr" is the only one that produces a non-DV master,
+# What the Resolve stage should OUTPUT for an item. "auto" is the default and ALWAYS
+# resolves to 1000-nit Dolby Vision, whatever the intake range (user-dictated 2026-08-09:
+# the 2000-nit target is MANUAL-ONLY). The other three pin it regardless of the source. "sdr" is the only one that produces a non-DV master,
 # and the only one whose Resolve stage needs no screen automation at all (no DV analyze).
 OUTPUT_MODES = ("auto", "sdr", "dv1000", "dv2000")
 

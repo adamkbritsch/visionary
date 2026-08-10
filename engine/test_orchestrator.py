@@ -527,7 +527,7 @@ class MovieScheduling(unittest.TestCase):
 
     def test_midpipeline_episode_finishes_before_a_due_movie(self):
         # a part-processed episode (topaz segments already on disk) must NOT be preempted by a
-        # due movie — else its ~140 GB intermediate sits idle through the movie's turn.
+        # due movie — else its ~190 GiB intermediate sits idle through the movie's turn.
         import tempfile, os as _os
         o = orch.Orchestrator()
         scratchd = tempfile.mkdtemp()

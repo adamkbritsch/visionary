@@ -65,7 +65,7 @@ $ICON_KEYS
 </dict></plist>
 PLIST
 
-rsync -a --exclude __pycache__ --exclude '*.pyc' --exclude manifests "$ROOT/engine/" "$APP/Contents/Resources/engine/"
+rsync -a --exclude __pycache__ --exclude '*.pyc' "$ROOT/engine/" "$APP/Contents/Resources/engine/"
 # Ship the SETUP-TIME artifacts too, mirroring the repo layout (import_resolve.py derives
 # its paths from its own location, so Resources/{setup,bundle,nas} beside engine/ makes a
 # drop-in .app fully self-sufficient — the in-app Setup section drives all three):

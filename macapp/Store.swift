@@ -247,8 +247,8 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": key, "replace_source": on]); await refresh()
     }
 
-    /// What Resolve should OUTPUT for this item. "auto" keeps the long-standing rule (SDR
-    /// intake -> 1000-nit Dolby Vision, HDR intake -> 2000-nit); the rest pin it. Note "sdr"
+    /// What Resolve should OUTPUT for this item. "auto" always resolves to 1000-nit
+    /// Dolby Vision (2000-nit is manual-only); the rest pin it. Note "sdr"
     /// also changes the master's FILENAME, so it only affects items not yet shipped.
     func setOutputMode(_ key: String, _ mode: String) async {
         guard !key.isEmpty else { return }
@@ -285,9 +285,6 @@ final class AppStore: ObservableObject {
             }
             // else: no client in config yet — the view shows the setup panel (ytConfigured == false)
         }
-    }
-    func disconnectYouTube() async {
-        await post("/api/youtube-connect", ["action": "disconnect"]); await fetchChannels()
     }
     func addChannel(_ channelId: String, _ title: String, scope: String = "popular") async {
         guard !channelId.isEmpty else { return }

@@ -4,9 +4,9 @@ download / topaz / remux / upload / cleanup run fully unattended. The resolve
 stage runs setup + render via the scripting API; its two UI-only steps (DV Analyze
 All Shots @ 1000-nit, and the DV Profile 8.1 dropdown) go through dv_shim, which
 needs this process to have macOS Screen-Recording + Accessibility grants and
-`cliclick`. Until that's set up, the resolve stage returns not-ok and the episode
-stays parked at this stage (resumable) — it's the remaining piece for FULL
-automation; everything around it is done.
+`cliclick`. Missing grants surface in preflight/Setup (check_tcc_grants); if they
+are missing at run time the resolve stage returns not-ok and the episode stays
+parked at this stage (resumable).
 """
 from __future__ import annotations
 import json
@@ -601,9 +601,9 @@ def _resolve(p, abort, progress=None):
     unresponsive — in-process that wedges the entire orchestrator (the exact bug
     that froze the app mid-run). As a child process it's killable on timeout/abort,
     so a Resolve hang fails this stage cleanly and the orchestrator keeps breathing.
-    The OUTPUT MODE picks the Resolve project. Automatically that is only ever one of
-    the two Dolby Vision projects (SDR intake -> 1000-nit, HDR intake -> 2000-nit);
-    the non-DV SDR project is reachable ONLY through an explicit per-item override.
+    The OUTPUT MODE picks the Resolve project. Automatically that is ALWAYS the
+    1000-nit Dolby Vision project (user-dictated 2026-08-09); the 2000-nit DV project
+    and the non-DV SDR project are reachable ONLY through explicit per-item overrides.
     When the stage finishes (any outcome) Resolve is quit and the app refocused.
     FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
     nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""
@@ -622,8 +622,8 @@ def _resolve(p, abort, progress=None):
     pl = plan.plan_for(p.source)   # ORIGINAL: CFR re-encode strips DV side data (skip-detection)
     if not p.combine and pl.get("resolve") == "skip":
         return False, "permanent: source is already Dolby Vision — nothing for Resolve to do"
-    # OUTPUT MODE. "auto" is the long-standing rule — SDR intake -> the 1000-nit DV project,
-    # HDR intake -> the 2000-nit one. A per-item override pins it regardless of the source;
+    # OUTPUT MODE. "auto" = the 1000-nit DV project, whatever the intake range
+    # (user-dictated 2026-08-09; 2000-nit is manual-only). A per-item override pins it regardless of the source;
     # "sdr" is the only value that produces a non-DV master, and the only one whose Resolve
     # stage needs no screen automation at all.
     import settings as _st

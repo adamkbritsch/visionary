@@ -635,28 +635,6 @@ def segments_complete(segdir) -> bool:
             return False
     return True
 
-
-def _concat_segments(seg_files, output, *, ffmpeg=FFMPEG_HB) -> tuple:
-    """Losslessly join the ProRes segments into ONE file (`-c copy` — all-intra, so the
-    joins are bit-exact, no re-encode, no seam). Returns (ok, reason)."""
-    listfile = output + ".concat.txt"
-    try:
-        with open(listfile, "w") as f:
-            for s in seg_files:
-                f.write("file '%s'\n" % os.path.abspath(s).replace("'", "'\\''"))
-        r = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-y", "-f", "concat",
-                            "-safe", "0", "-i", listfile, "-c", "copy", output],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "concat failed: " + "\n".join((r.stderr or "").splitlines()[-4:])
-        return True, "concatenated %d segments" % len(seg_files)
-    except Exception as e:
-        return False, f"concat error: {e}"
-    finally:
-        try: os.remove(listfile)
-        except OSError: pass
-
-
 def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_height=None,
                       preserve_color=True, on_progress=None, abort=None,
                       target_seconds=SEGMENT_TARGET_SECONDS, on_plan=None, should_pause=None,

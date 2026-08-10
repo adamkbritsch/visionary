@@ -36,26 +36,6 @@ def is_draining_on_ac(reading: PowerReading, noise_floor: int = -50) -> bool:
     """True only when plugged in AND net-discharging beyond sensor noise."""
     return reading.external_connected and reading.amperage < noise_floor
 
-
-class DrainMonitor:
-    """Trips only on *sustained* drain, to ignore momentary load spikes."""
-
-    def __init__(self, min_consecutive: int = 5, noise_floor: int = -50):
-        self.min_consecutive = min_consecutive
-        self.noise_floor = noise_floor
-        self._streak = 0
-
-    def add(self, reading: PowerReading) -> int:
-        if is_draining_on_ac(reading, self.noise_floor):
-            self._streak += 1
-        else:
-            self._streak = 0
-        return self._streak
-
-    def inadequate(self) -> bool:
-        return self._streak >= self.min_consecutive
-
-
 # --------------------------------------------------------------------------
 # Real reader (macOS ioreg). Pure logic above is unit-tested; this is the thin
 # I/O glue, validated by a live read.
@@ -128,14 +108,6 @@ def model_id() -> str:
                               text=True, timeout=10).stdout.strip()
     except (subprocess.TimeoutExpired, OSError):
         return ""
-
-
-def power_class() -> tuple:
-    """(kind, model, watts) — ONE place both preflight and the run gate consult, so the
-    setup check and the live check can never disagree. kind is 'desktop' (no battery →
-    mains-powered, no wattage rule) or 'laptop' (the 140 W rule applies)."""
-    return ("laptop" if has_battery() else "desktop", model_id(), adapter_watts())
-
 
 def adapter_watts():
     """The connected power adapter's wattage (int), or None if on battery / unknown.

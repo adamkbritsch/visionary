@@ -7,5 +7,3 @@
 opencv-python
 numpy
 
-# NOT needed on the Mac: `plexapi` is only used by the OPTIONAL NAS-side tool in
-# resolver/ (see resolver/README.md) — install it on the NAS, not here.

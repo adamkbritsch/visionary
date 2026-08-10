@@ -375,7 +375,6 @@
     <div class="row" data-r="wall"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-power"/></svg></span>On wall power</div><span class="chip neutral">&mdash;</span></div>
     <div class="row" data-r="power"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-bolt"/></svg></span>Power adequate (battery not draining)</div><span class="chip neutral">&mdash;</span></div>
     <div class="row" data-r="scratch"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-drive"/></svg></span>Scratch volume connected</div><span class="chip neutral">&mdash;</span></div>
-    <div class="row" data-r="job"><div class="k"><span class="ck"><svg class="ic sm"><use href="#i-list"/></svg></span>Episode queued</div><span class="chip neutral">&mdash;</span></div>
   </div>
 
   <div class="card">
@@ -470,7 +469,6 @@ async function refresh(){
   setRow("wall", p.external_connected, "Yes","No");
   setRow("power", p.adequate, "Adequate","Draining");
   setRow("scratch", sc.connected, "Connected","Disconnected");
-  setRow("job", !!s.job, "Queued","None");
   const ps = document.querySelector('[data-pwr-state]');
   ps.textContent = p.external_connected ? (p.adequate ? "Adequate" : "Battery draining") : "On battery";
   ps.className = "v " + (p.external_connected && p.adequate ? "good" : "bad");

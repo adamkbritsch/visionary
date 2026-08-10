@@ -10,7 +10,7 @@ HOW (the industry-standard conformant-DV path):
      --dolby-vision-rpu`), which *mandates* VBV (`--vbv-maxrate/--vbv-bufsize`) because DV
      certification requires HRD conformance — a hard ceiling on any 1-second window. x265
      interleaves the RPU NALs itself; no separate inject step.
-  3. The capped HEVC ES is muxed by the remux stage (MP4Box `:dvp=8.1:xps_inband:fps=`).
+  3. The capped HEVC ES is muxed by the remux stage (MP4Box `:dvp=8.1:fps=`).
 
 CONTRACT (user-dictated): there is NO uncapped fallback. If any step fails — RPU missing,
 encode error, frame-count mismatch, DV lost, or the measured peak still over the cap — the
@@ -297,42 +297,6 @@ def extract_rpu(dv_video: str, rpu_out: str, *, mode: int | None = None,
 # episode and the ONE encode in the pipeline that cannot checkpoint (killed = the whole pass
 # lost). Topaz yields instead (topaz.TVAI_NICE=10 — it resumes from segments), and the
 # prefetcher's CFR encodes sit below both at nice 15.
-
-
-def encode_capped(dv_video: str, rpu: str, out_hevc: str, cap_mbps: int, *,
-                  master_display=None, max_cll=None, total_frames=0,
-                  abort=None, on_progress=None,
-                  ffmpeg=FFMPEG, x265=X265):
-    """Decode | x265-DV pipe with the VBV ceiling. Polls `abort` (kills both procs) and
-    reports frames via on_progress(frames, total). Returns (ok, frames_encoded, reason)."""
-    dec = subprocess.Popen(build_decode_command(ffmpeg, dv_video),
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    enc = subprocess.Popen(build_x265_command(x265, rpu, out_hevc, cap_mbps,
-                                              master_display, max_cll),
-                           stdin=dec.stdout, stderr=subprocess.PIPE, text=True)
-    dec.stdout.close()                       # enc owns the pipe; let SIGPIPE reach the decoder
-    tail = []
-    try:
-        for line in enc.stderr:              # x265 writes progress to stderr (\r-terminated)
-            for chunk in line.replace("\r", "\n").splitlines():
-                tail.append(chunk)
-                if len(tail) > 20:
-                    tail.pop(0)
-                n = parse_x265_progress(chunk)
-                if n is not None and on_progress:
-                    on_progress(n, total_frames)
-            if abort is not None and abort.is_set():
-                dec.kill(); enc.kill()
-                return False, 0, "aborted"
-        enc.wait(); dec.wait()
-    except Exception as e:
-        dec.kill(); enc.kill()
-        return False, 0, f"encode pipe error: {e}"
-    if enc.returncode != 0 or not os.path.exists(out_hevc) or os.path.getsize(out_hevc) == 0:
-        return False, 0, "x265 failed (rc=%s): %s" % (enc.returncode, " / ".join(tail[-4:]))
-    frames = parse_x265_encoded("\n".join(tail)) or 0
-    return True, frames, "encoded %d frames" % frames
-
 
 # ---- SEGMENTED (resumable) encode ------------------------------------------------------
 # The x265 peak-cap pass is the ONE un-resumable encode in the pipeline: killed mid-way

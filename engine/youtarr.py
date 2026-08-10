@@ -236,13 +236,6 @@ def forget_downloads(video_ids) -> int:
         try: ftp.quit()
         except Exception: pass
 
-
-def running_jobs():
-    """youtarr's in-flight jobs (downloads), or [] on failure."""
-    r = _call("GET", "/runningjobs")
-    return r if isinstance(r, (list, dict)) else []
-
-
 def subscribed_channels(*, timeout=10):
     """The user's SUBSCRIBED youtarr channel names (each channel's `uploader`, which == its on-disk
     folder name), or None on any failure (no creds / unreachable / auth). Auto-logs-in + caches the

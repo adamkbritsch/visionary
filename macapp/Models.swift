@@ -424,7 +424,6 @@ struct WindowDTO: Codable {
     var in_window: Bool?
 }
 
-struct EmptyJob: Codable {}   // job is an object when queued, null otherwise — presence = queued
 
 struct UpNextDTO: Codable, Identifiable {
     var kind: String?          // "movie" | "episode" | "youtube"
@@ -443,7 +442,6 @@ struct StateDTO: Codable {
     var power: PowerDTO?
     var scratch: ScratchDTO?
     var window: WindowDTO?
-    var job: EmptyJob?
     var generated_at: String?
     var scratch_contents: [ScratchItemDTO]?   // plain preview of the topaz-scratch folder
     var mode: String?                  // "tv" | "movie" | "youtube" — the nav bar VIEW

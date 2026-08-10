@@ -399,8 +399,8 @@ override (env wins); keys marked — have no env override:
 > extras inert — the pipeline carries on.
 
 Media roots default to `/Media/TV-Shows`, `/Media/Movies`, `/Media/YouTube` (+ multi-volume
-variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_FTP_YOUTUBE`
-(and `..._ROOTS` comma-lists) if your share layout differs.
+variants for TV and Movies); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`,
+`TOPAZ_NAS_FTP_YOUTUBE` (TV/Movies also take `..._ROOTS` comma-lists) if your layout differs.
 
 ## Repo map
 
@@ -412,7 +412,6 @@ variants); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`, `TOPAZ_NAS_
 | `setup/` | new-machine import tooling (`import_resolve.py`) |
 | `nas/` | optional NAS-side helper (`dv_probe.py`) |
 | `tools/` | maintainer-only (artifact export) |
-| `resolver/` | optional NAS-side show-manifest tool |
 | `deploy-now.sh` | redeploy the app at a safe pipeline boundary |
 
 ## Known limitations

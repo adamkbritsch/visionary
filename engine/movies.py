@@ -186,17 +186,6 @@ def load_movies_dv_manifest(*, timeout=20):
 # instead of auto-walking the whole library. This is the pool you pick FROM.)
 _CACHE = {}
 
-
-def library_list() -> list:
-    """ALL movies, title-sorted — the pool the picker searches. Cached (NAS walk + Plex).
-    Each = {name, dir, title, watched, tags, route, has_dv}. DV-badged entries are
-    combine-only (user-dictated): the server rejects a plain add for them, and the app
-    routes their tap to the companion flow instead."""
-    if "lib" not in _CACHE:
-        refresh_library()
-    return _CACHE.get("lib") or []
-
-
 def _dv_row_visible(m, cmap) -> bool:
     """Should a DV-badged movie appear in the picker? Only when a combine can still GAIN
     something (user-dictated): its audio is PROVEN not to be Dolby Atmos already (the

@@ -553,7 +553,6 @@ def next_due(skip=()):
     stream = all_pending(skip)
     return stream[0] if stream else None
 
-
 def video_secs(vid) -> int:
     """A video's true duration in seconds from the PERSISTED duration cache (0 if not yet measured)."""
     return _durations().get(vid, 0)

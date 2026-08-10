@@ -3,7 +3,7 @@ import unittest
 from unittest import mock
 
 import remux
-from remux import (build_extract_command, build_mux_command, build_mkv_mux_command,
+from remux import (build_extract_command, build_mkv_mux_command,
                    parse_streams, has_dolby_vision, dolby_vision_profile, verify_remux,
                    needs_mkv, container_ext)
 
@@ -56,20 +56,6 @@ class BuildCommands(unittest.TestCase):
         self.assertIn("2:s?", cmd)       # ALL subs (incl. bitmap PGS) from the original
         self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
         self.assertEqual(cmd[-1], "/out.mkv")
-
-    def test_mux_uses_mp4box_to_preserve_dv(self):
-        # ffmpeg drops the DV box; MP4Box keeps it. DV video first, then tracks.
-        cmd = build_mux_command("/MP4Box", "/dv.mov", "/t.mp4", "/out.mp4")
-        self.assertEqual(cmd[0], "/MP4Box")
-        adds = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-add"]
-        self.assertEqual(adds, ["/dv.mov", "/t.mp4"])
-        self.assertEqual(cmd[cmd.index("-new") + 1], "/out.mp4")
-
-    def test_mux_interleaves_for_playback(self):
-        # Subler-style "Optimize": interleave so players don't seek per-track.
-        cmd = build_mux_command("/MP4Box", "/dv.mov", "/t.mp4", "/out.mp4")
-        self.assertEqual(cmd[cmd.index("-inter") + 1], "500")
-
 
 class ContainerDecision(unittest.TestCase):
     """MP4 by default; MKV only for content MP4 can't hold (lossless audio / bitmap subs)."""
@@ -150,54 +136,6 @@ class ParseAndVerify(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("audio", reason.lower())
 
-
-class SublerOptimize(unittest.TestCase):
-    NO_DV = json.dumps({"streams": [{"codec_type": "video", "codec_name": "hevc"}]})
-
-    def _ran(self, rc):
-        m = mock.Mock(); m.returncode = rc; m.stderr = ""
-        return m
-
-    def test_optimize_command_is_sublercli_optimize(self):
-        self.assertEqual(remux.build_optimize_command("/SublerCLI", "/dv.mov", "/dv.opt.mp4"),
-                         ["/SublerCLI", "-source", "/dv.mov", "-dest", "/dv.opt.mp4", "-optimize"])
-
-    def test_uses_optimized_temp_when_dv_survives(self):
-        with mock.patch.object(remux.subprocess, "run", return_value=self._ran(0)), \
-             mock.patch.object(remux.os.path, "exists", return_value=True), \
-             mock.patch.object(remux.os.path, "getsize", return_value=1234), \
-             mock.patch.object(remux, "_probe", return_value=SAMPLE):   # SAMPLE carries DV
-            out, is_temp = remux.optimize_dv("/dv.mov", "/scratch/out.mp4")
-        self.assertEqual(out, "/scratch/out.mp4.dvopt.mp4")
-        self.assertTrue(is_temp)
-
-    def test_falls_back_to_original_when_optimize_drops_dv(self):
-        with mock.patch.object(remux.subprocess, "run", return_value=self._ran(0)), \
-             mock.patch.object(remux.os.path, "exists", return_value=True), \
-             mock.patch.object(remux.os.path, "getsize", return_value=1234), \
-             mock.patch.object(remux, "_probe", return_value=self.NO_DV), \
-             mock.patch.object(remux, "_rm"):
-            out, is_temp = remux.optimize_dv("/dv.mov", "/scratch/out.mp4")
-        self.assertEqual(out, "/dv.mov")   # never ship a DV-less video
-        self.assertFalse(is_temp)
-
-    def test_falls_back_when_sublercli_errors(self):
-        with mock.patch.object(remux.subprocess, "run", return_value=self._ran(1)), \
-             mock.patch.object(remux, "_rm"):
-            out, is_temp = remux.optimize_dv("/dv.mov", "/scratch/out.mp4")
-        self.assertEqual((out, is_temp), ("/dv.mov", False))
-
-    def test_falls_back_when_sublercli_missing(self):
-        with mock.patch.object(remux.subprocess, "run", side_effect=FileNotFoundError):
-            out, is_temp = remux.optimize_dv("/dv.mov", "/scratch/out.mp4")
-        self.assertEqual((out, is_temp), ("/dv.mov", False))
-
-    def test_verify_reason_records_optimize_status(self):
-        # the remux stage msg (= RemuxResult.reason) must reveal whether Subler engaged
-        with mock.patch.object(remux, "_probe", return_value=SAMPLE):
-            self.assertTrue(remux._verify("/o.mp4", "/ff", optimized=True).reason.endswith("· optimized"))
-            self.assertTrue(remux._verify("/o.mp4", "/ff", optimized=False).reason.endswith("· un-optimized"))
-            self.assertNotIn("optimized", remux._verify("/o.mp4", "/ff").reason)   # None → no marker
 
 
 if __name__ == "__main__":

@@ -24,10 +24,9 @@ SCRATCH = {"name": "2TB SSD", "connected": True, "path": "/Volumes/2TB SSD/topaz
            "free_gb": 956, "source": "external"}
 
 
-def state(power, manifest=None, automation_enabled=False, scratch=None, in_win=True, adapter_watts=65):
+def state(power, automation_enabled=False, scratch=None, in_win=True, adapter_watts=65):
     return server.build_state(power=power, scratch=scratch or SCRATCH, adapter_watts=adapter_watts,
-                              in_win=in_win, manifest=manifest,
-                              automation_enabled=automation_enabled)
+                              in_win=in_win, automation_enabled=automation_enabled)
 
 
 class BuildState(unittest.TestCase):
@@ -45,16 +44,6 @@ class BuildState(unittest.TestCase):
         st = state(PowerReading(True, False, 96, -1500))
         self.assertFalse(st["power"]["adequate"])
         self.assertTrue(st["power"]["draining_on_ac"])
-
-    def test_no_job_when_no_manifest(self):
-        st = state(PowerReading(True, False, 100, 0), manifest=None)
-        self.assertIsNone(st["job"])
-
-    def test_job_summary_from_manifest(self):
-        st = state(PowerReading(True, False, 100, 0),
-                   manifest={"show": "Brooklyn Nine-Nine", "total": 153, "located": 153, "missing": 0})
-        self.assertEqual(st["job"]["show"], "Brooklyn Nine-Nine")
-        self.assertEqual(st["job"]["total"], 153)
 
 
 class UpNext(unittest.TestCase):

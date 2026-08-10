@@ -560,7 +560,7 @@ struct ResolveHostSection: View {
 /// SCREEN CONTROL, now a Settings row rather than a header button.
 ///
 /// It can only be switched off for a WHILE — a duration or a clock time, never indefinitely.
-/// Holding items before Resolve buffers their ~140 GB Topaz intermediates against the disk
+/// Holding items before Resolve buffers their ~190 GiB Topaz intermediates against the disk
 /// floor, so a forgotten "off" doesn't keep the Mac free, it quietly stalls the run. The
 /// engine owns the deadline (`quiet_until`), so the pause still lifts if the app is closed.
 struct ScreenControlSection: View {

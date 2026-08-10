@@ -38,8 +38,6 @@ NAS_FTP_MOVIES_ROOTS = [r.strip() for r in os.environ.get(
 # Visionary reads sources from _STAGING and publishes masters into _ROOT (mirrored path).
 NAS_FTP_YOUTUBE_ROOT = os.environ.get("TOPAZ_NAS_FTP_YOUTUBE", "/Media/YouTube")
 NAS_FTP_YOUTUBE_STAGING = os.environ.get("TOPAZ_NAS_FTP_YOUTUBE_STAGING", "/Media/YouTube-raw")
-NAS_FTP_YOUTUBE_ROOTS = [r.strip() for r in os.environ.get(
-    "TOPAZ_NAS_FTP_YOUTUBE_ROOTS", NAS_FTP_YOUTUBE_ROOT).split(",") if r.strip()]
 MEDIA_OWNER = "1000:10"   # what FTP yields automatically (user gid 10 + umask 007)
 # A connection's timeout also becomes the per-block read/write timeout for RETR/STOR. The
 # 15 s default (fine for quick listings) would abort a multi-GB transfer on any brief
@@ -410,47 +408,6 @@ def delete_tree(remote_dir) -> bool:
     finally:
         try: ftp.quit()
         except ftplib.all_errors: pass
-
-
-def upload_overwrite(local_file, remote_path, *, timeout=None, on_progress=None) -> tuple:
-    """Replace-in-place upload (YouTube mode): put the master at `remote_path` — the ORIGINAL
-    file's exact path — so Plex/youtarr keep the same entry (now 4K DV) and youtarr won't
-    re-download it. STOR to a temp sibling, size-verify, then atomically swap (delete original +
-    RNFR/RNTO temp→original) so a mid-upload failure never corrupts the original. Returns
-    (ok, remote_path, reason). Re-run-safe: a half-finished swap leaves the master in the temp;
-    the local master persists until cleanup, so a resumed upload completes it."""
-    lsz = os.path.getsize(local_file)
-    tmp = remote_path + ".upscaling"
-    try:
-        ftp = connect(timeout=timeout or TRANSFER_TIMEOUT)
-    except ftplib.all_errors as e:
-        return False, remote_path, f"FTP connect/login failed: {e}"
-    try:
-        done = 0
-        def _sent(block):
-            nonlocal done
-            done += len(block)
-            if on_progress and lsz:
-                on_progress(done, lsz)
-        with open(local_file, "rb") as f:
-            ftp.storbinary("STOR " + tmp, f, callback=_sent)
-        rs = remote_size(ftp, tmp)
-        if rs is None or rs != lsz:
-            try: ftp.delete(tmp)
-            except ftplib.all_errors: pass
-            return False, remote_path, f"upload size unverifiable/mismatch (remote {rs} vs {lsz}) — original kept"
-        try: ftp.delete(remote_path)          # remove the original (may be absent on a re-run)
-        except ftplib.all_errors: pass
-        ftp.rename(tmp, remote_path)          # RNFR/RNTO — atomic swap into place
-        return True, remote_path, f"replaced in place ({lsz} bytes, owner {MEDIA_OWNER})"
-    except ftplib.all_errors as e:
-        try: ftp.delete(tmp)
-        except ftplib.all_errors: pass
-        return False, remote_path, f"upload-overwrite failed: {e}"
-    finally:
-        try: ftp.quit()
-        except ftplib.all_errors: pass
-
 
 # ---- folder-split publish (YouTube: staging source -> Plex library master) ---
 

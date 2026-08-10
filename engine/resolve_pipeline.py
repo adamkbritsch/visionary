@@ -9,7 +9,8 @@ dropdown) are done by the dv_shim between phases:
   # <set DV Profile 8.1 on the Deliver page via dv_shim>
   python3 resolve_pipeline.py render <out.mov>      # render entire timeline + verify (fps + DV)
 
-Color management = Automatic + HDR preset (the user's _office_test settings).
+  Color management is INHERITED from the persistent per-mode project (the user
+  configures each ONCE in Resolve; this pipeline never sets it — see resolve.py).
 Frame rate is set from the SOURCE before the timeline exists (no conform).
 """
 from __future__ import annotations

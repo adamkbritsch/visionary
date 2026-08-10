@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest import mock
 import resolve
-from resolve import render_preset, hdr_summary, is_hdr10
+from resolve import render_preset, is_hdr10
 
 
 class InheritColor(unittest.TestCase):
@@ -46,14 +46,6 @@ class HdrOutput(unittest.TestCase):
     SAMPLE = json.dumps({"streams": [{"codec_type": "video", "codec_name": "hevc",
              "profile": "Main 10", "width": 3840, "height": 2160,
              "color_transfer": "smpte2084", "color_primaries": "bt2020", "color_space": "bt2020nc"}]})
-
-    def test_summary_picks_video(self):
-        s = hdr_summary(self.SAMPLE)
-        self.assertEqual(s["profile"], "Main 10")
-        self.assertEqual(s["transfer"], "smpte2084")
-
-    def test_is_hdr10_true_for_4k_st2084(self):
-        self.assertTrue(is_hdr10(hdr_summary(self.SAMPLE)))
 
     def test_is_hdr10_false_for_rec709(self):
         self.assertFalse(is_hdr10({"profile": "Main 10", "width": 3840, "height": 2160,

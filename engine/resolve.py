@@ -50,12 +50,6 @@ def connect():
     spec.loader.exec_module(fs)
     return fs.scriptapp("Resolve")
 
-
-def set_format_codec(project) -> bool:
-    rp = render_preset()
-    return project.SetCurrentRenderFormatAndCodec(rp["format"], rp["codec"])
-
-
 def inspect_color_management(project) -> dict:
     """READ-ONLY view of the project's CURRENT color management — we never change
     it. Use to log / verify the user's HDR setup is in place before a run."""
@@ -68,16 +62,6 @@ def is_hdr_project(project) -> bool:
     """True if the project's output is HDR PQ — a guard so a misconfigured project
     (defaulting to SDR Rec.709) doesn't silently produce an SDR master."""
     return project.GetSetting("colorSpaceOutput") == "Rec.2100 ST2084"
-
-
-def hdr_summary(probe_json: str) -> dict:
-    for s in json.loads(probe_json).get("streams", []):
-        if s.get("codec_type") == "video":
-            return {"codec": s.get("codec_name"), "profile": s.get("profile"),
-                    "width": s.get("width"), "height": s.get("height"),
-                    "transfer": s.get("color_transfer"), "primaries": s.get("color_primaries")}
-    return {}
-
 
 def is_hdr10(summary: dict) -> bool:
     """True for a 4K 10-bit Rec.2020 ST2084 stream — the render's HDR output."""

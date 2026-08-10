@@ -197,14 +197,6 @@ def video_meta(ids):
     except Exception:
         return None
 
-
-def video_seconds(ids):
-    """{videoId: duration_seconds}, or None on failure. Thin wrapper over video_meta (kept for the
-    length-cap callers that don't need publish dates)."""
-    m = video_meta(ids)
-    return None if m is None else {k: v["secs"] for k, v in m.items()}
-
-
 def popular_videos(channel_id, max_secs=1200, n=50):
     """A channel's top videos by view count, filtered to ≤ max_secs, most-viewed first:
     [{id, secs, views}]. None on failure. Uses search(order=viewCount) → videos.list for
