@@ -839,6 +839,9 @@ class Orchestrator:
         self._finish_q = queue.Queue()         # EpisodePaths handed off after their resolve completes
         self._finish_abort = threading.Event() # aborts the finisher's CURRENT stage (disable / power pause)
         self._resolve_active = threading.Event()   # run thread's Resolve is live → remux lanes HOLD/yield
+        self._extend_active = threading.Event()    # AI outpainting is live → the machine is EXCLUSIVELY
+                                                   # its own: remuxes SIGSTOPped, the finisher held at
+                                                   # every stage, the prefetcher stood down
         self._resolve_fast = False             # ...unless that Resolve is a FAST-PATH item's (rpu-only/
                                                # resolve-only): those SHARE the machine — up to
                                                # `resolve_share_remuxes` lanes keep encoding beside it
@@ -1538,6 +1541,7 @@ class Orchestrator:
             # caffeinate keeps the display logically ON so the resolve stage's screencapture still works.
             self._finish_abort.clear()
             self._resolve_active.clear()       # fresh run: never inherit a stale Resolve hold
+            self._extend_active.clear()        # ...nor a stale outpainting hold
             self._resume_remuxes()             # nor a stale SIGSTOP from a previous run
             self.state["finishing"] = None
             # RESUME BOTH: re-queue any item whose remux was interrupted mid-flight (durable work-list)
@@ -1556,6 +1560,7 @@ class Orchestrator:
             self._abort.set()
             self._finish_abort.set()           # the finisher's in-flight remux/upload stops too
             self._resolve_active.clear()       # never leave the remux lanes held by a dead run
+            self._extend_active.clear()
             self._resume_remuxes()             # ...nor frozen by one
             self._stop_caffeinate()            # let the display sleep again
             self.state.update(enabled=False, ended_reason=reason)
@@ -2214,13 +2219,16 @@ class Orchestrator:
                 self._sleep(30); continue                         # burn CPU on CFR encodes either
             if self._plex_playing:                                # FAILSAFE: a Plex stream is live → keep the
                 self._sleep(20); continue                         # NAS quiet so precache can't stutter it
+            if self._extend_active.is_set():                      # AI outpainting owns the machine — a
+                self._sleep(20); continue                         # background CFR would contend for it
             try:
                 cands = self._prefetch_candidates()
                 self._purge_prefetch_orphans(cands)               # drop buffer files for now-gone items
                 main = scratch.default_scratch()
                 for p in cands:
                     if (not self._enabled or self._abort.is_set()
-                            or self._power_paused or self._plex_playing):
+                            or self._power_paused or self._plex_playing
+                            or self._extend_active.is_set()):
                         break
                     p = apply_container(p)                        # lock the CFR ext (.mkv/.mp4) to the source
                     if os.path.exists(os.path.join(main, p.source_basename)):   # so an MKV item reads as
@@ -2538,6 +2546,21 @@ class Orchestrator:
                 self._last_resolve_at = time.time()
                 if not (fast_resolve and self._share_remuxes() > 0):
                     self._suspend_remuxes()
+            if st == "extend":
+                # AI OUTPAINTING GETS THE WHOLE MACHINE (user-dictated 2026-08-10). The
+                # diffusion model is GPU- and unified-memory-bound, and MPS has no
+                # oversubscription story: an x265 remux or a background CFR encode beside
+                # it costs throughput on both and turns a marginal allocation into an OOM
+                # that kills the chunk. Same instrument as the Resolve rule, harder: SIGSTOP
+                # freezes in-flight remuxes the instant the stage begins (a should_pause
+                # yield alone waits out most of a ~7-minute segment), the finisher is held
+                # at EVERY stage rather than remux alone, and the prefetcher aborts its pull.
+                # The gate is a no-op for every item that does not actually outpaint — the
+                # stage returns "not needed" before this for movies, YouTube, wide episodes
+                # and shows that never opted in.
+                self._extend_active.set()
+                self._suspend_remuxes(reason="AI outpainting has the machine")
+                self._prefetch_yield.set()      # drop any in-flight background pull/CFR
             try:
                 if st == "download":          # per-source lock: the prefetcher may already be pulling
                     ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
@@ -2553,6 +2576,11 @@ class Orchestrator:
                     self._resolve_fast = False
                     self._last_resolve_at = time.time()   # the grace window starts HERE
                     self._resume_remuxes()
+                if st == "extend":
+                    self._extend_active.clear()
+                    self._prefetch_yield.clear()
+                    self._resume_remuxes()      # in a finally: a frozen x265 nobody SIGCONTs
+                                                # would stall its lane forever
             self._stage_active = False
             self.state["stage_active"] = False
             if ok:  self._elapsed_done(ekey)         # stage complete → reset its timer for any re-run
@@ -2710,22 +2738,23 @@ class Orchestrator:
             return False
         return self.state.get("finishing") is not None and self._finish_q.qsize() >= 1
 
-    def _suspend_remuxes(self):
-        """Freeze every in-flight remux encode, and say so in the UI."""
+    def _suspend_remuxes(self, reason: str = "Resolve has the machine"):
+        """Freeze every in-flight remux encode, and say so in the UI. `reason` names the
+        claimant (Resolve or the AI outpainting stage) — it is what the held lane displays."""
         try:
             import dvcap
             n = dvcap.suspend_encoders()
         except Exception as e:
-            logbook.event(f"could not suspend remuxes for Resolve: {e}")
+            logbook.event(f"could not suspend remuxes ({reason}): {e}")
             return
         if n:
-            logbook.event(f"Resolve has the machine — {n} remux encode(s) suspended")
+            logbook.event(f"{reason} — {n} remux encode(s) suspended")
         for key in ("finishing", "finishing2"):
             f = self.state.get(key)
             if f and f.get("stage") == "remux":
                 # MERGE: series/source/movie/youtube are what abandon_series matches lanes
                 # on, and the last-known pct is what the UI keeps showing while frozen.
-                self.state[key] = {**f, "holding": "Resolve has the machine"}
+                self.state[key] = {**f, "holding": reason}
 
     def _resume_remuxes(self):
         """Unfreeze them. Runs in a finally — a stopped x265 left behind stalls its lane
@@ -2785,6 +2814,8 @@ class Orchestrator:
         convert. Tying it to "Resolve actually ran in the last few minutes" covers the gaps
         BETWEEN back-to-back conversions — which is all it was ever for — and self-releases
         the moment conversions stop happening."""
+        if self._extend_active.is_set():
+            return True                     # AI outpainting takes the machine outright — no share
         if self._resolve_active.is_set():
             if not (self._resolve_fast and lane <= self._share_remuxes()):
                 return True
@@ -3122,6 +3153,19 @@ class Orchestrator:
                 return
             if stage_done(st, p):
                 continue
+            # AI OUTPAINTING EXCLUSIVITY: while the run thread outpaints, the finisher does
+            # NOTHING — not remux, not upload, not cleanup. The remux hold below covers only
+            # remux (and only via _remux_must_wait); this covers the whole tail, so no other
+            # step for any other item overlaps the stage. Everything here is resumable or
+            # idempotent, so holding costs nothing but latency.
+            while (self._extend_active.is_set() and self._enabled
+                   and not self._finish_abort.is_set()):
+                self.state[fin_key] = {**(self.state.get(fin_key) or {}),
+                                       "ep": ep_disp, "stage": st, "fast": fast,
+                                       "holding": "AI outpainting has the machine"}
+                time.sleep(5)
+            if not self._enabled or self._finish_abort.is_set():
+                return
             self._reclaim_for_pipeline()   # same pipeline>queue guarantee for the finisher's writes
             self.state[fin_key] = {"ep": ep_disp, "stage": st, "pct": None, "fast": fast,
                                    # so abandon_series can tell whose work this lane is doing

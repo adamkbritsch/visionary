@@ -2945,3 +2945,106 @@ class RotationWiring(unittest.TestCase):
         with mock.patch.object(series, "get_rotation", return_value=1):
             o = orch.Orchestrator()
         self.assertEqual(o._rr, 1)
+
+
+class ExtendExclusivity(unittest.TestCase):
+    """AI OUTPAINTING GETS THE WHOLE MACHINE (user-dictated 2026-08-10). While the extend
+    stage runs, NO other step for any other item may run: in-flight remuxes are SIGSTOPped
+    the instant it starts, the finisher holds at every stage (not just remux), and the
+    prefetcher stands down. The diffusion model is GPU/unified-memory bound and MPS has no
+    oversubscription story — a competing encode costs both jobs and can OOM a chunk."""
+
+    def _process_extend(self, *, fail=False, raise_exc=False):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        seen = {}
+        def run(st, *_a, **_k):
+            if st == "extend":
+                seen["active"] = o._extend_active.is_set()
+                seen["yield"] = o._prefetch_yield.is_set()
+                if raise_exc:
+                    raise RuntimeError("boom")
+                return (not fail), ("ok" if not fail else "nope")
+            return True, "ok"
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(orch, "stage_done",
+                                               side_effect=lambda st, _p: st == "download"))
+            es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
+            es.enter_context(mock.patch.object(o, "_claim_prefetched"))
+            es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+            es.enter_context(mock.patch.object(o, "_sleep"))
+            es.enter_context(mock.patch.object(o, "_quiet_mode", return_value=False))
+            es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
+            seen["sus"] = es.enter_context(mock.patch.object(o, "_suspend_remuxes"))
+            seen["res"] = es.enter_context(mock.patch.object(o, "_resume_remuxes"))
+            es.enter_context(mock.patch("stages.run_stage", side_effect=run))
+            try:
+                o._process(p)
+            except RuntimeError:
+                pass
+        return o, seen
+
+    def test_extend_claims_the_machine_and_releases_it(self):
+        o, seen = self._process_extend()
+        self.assertTrue(seen["active"], "the stage must run with _extend_active set")
+        self.assertTrue(seen["yield"], "the prefetcher must be told to drop its pull")
+        # (resolve later claims it too — assert the EXTEND claim specifically)
+        self.assertIn("AI outpainting has the machine",
+                      [c.kwargs.get("reason") for c in seen["sus"].call_args_list])
+        seen["res"].assert_called()                       # released in the finally
+        self.assertFalse(o._extend_active.is_set())
+        self.assertFalse(o._prefetch_yield.is_set())
+
+    def test_a_failed_or_crashed_extend_still_releases(self):
+        # A lane left SIGSTOPped is stalled forever — nothing else would ever SIGCONT it.
+        for kw in ({"fail": True}, {"raise_exc": True}):
+            o, seen = self._process_extend(**kw)
+            self.assertFalse(o._extend_active.is_set(), kw)
+            self.assertFalse(o._prefetch_yield.is_set(), kw)
+            seen["res"].assert_called()
+
+    def test_every_remux_lane_yields_with_no_fast_path_share(self):
+        o = orch.Orchestrator()
+        o._extend_active.set()
+        o._resolve_fast = True                            # the Resolve share must NOT apply
+        with mock.patch.object(o, "_share_remuxes", return_value=2):
+            self.assertTrue(o._remux_must_wait(1))
+            self.assertTrue(o._remux_must_wait(2))
+        o._extend_active.clear()
+        with mock.patch.object(o, "_drain_backlog", return_value=0):
+            self.assertFalse(o._remux_must_wait(1))       # released cleanly
+
+    def test_finisher_holds_upload_and_cleanup_too_not_just_remux(self):
+        # The pre-existing remux hold only covers remux. Outpainting must stop the WHOLE
+        # tail, or an FTP push or an rmtree runs beside it.
+        for st in ("upload", "cleanup"):
+            o = orch.Orchestrator(); o._enabled = True
+            o._extend_active.set()
+            p = episode_paths("The Office", "S02E10", SRC)
+            started = []
+            def run(stage, *_a, **_k):
+                started.append(stage); return True, "ok"
+            held = {}
+            def release(_s):
+                held.update(o.state.get("finishing") or {})   # what the UI shows while held
+                o._extend_active.clear()                  # outpainting ends → the hold frees
+            with contextlib.ExitStack() as es:
+                es.enter_context(mock.patch.object(orch, "stage_done",
+                                                   side_effect=lambda s, _p: s != st))
+                es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+                es.enter_context(mock.patch.object(orch.time, "sleep", side_effect=release))
+                import plan
+                es.enter_context(mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}))
+                o._finish_item(p, run)
+            self.assertEqual(started, [st])
+            self.assertEqual(held.get("holding"), "AI outpainting has the machine")
+            self.assertEqual(held.get("stage"), st)
+
+    def test_prefetcher_stands_down(self):
+        o = orch.Orchestrator(); o._enabled = True
+        o._extend_active.set()
+        cands = mock.Mock()
+        with mock.patch.object(o, "_prefetch_candidates", cands), \
+             mock.patch.object(o, "_sleep", side_effect=lambda _s: setattr(o, "_enabled", False)):
+            o._prefetch()
+        cands.assert_not_called()          # never even enumerates work while outpainting runs

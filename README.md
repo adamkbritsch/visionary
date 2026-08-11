@@ -3,9 +3,9 @@
 </p>
 
 **An overnight appliance that upscales your TV library to 4K Dolby Vision.**
-Topaz Video AI → DaVinci Resolve (real Dolby Vision 8.1, not a tone-map) → peak-capped
-x265 remux → straight back into your NAS's Plex library, replacing the 1080p original.
-Arm it in the evening; wake up to finished episodes.
+Optional AI border extension for 4:3 shows → Topaz Video AI → DaVinci Resolve (real Dolby
+Vision 8.1, not a tone-map) → peak-capped x265 remux → straight back into your NAS's Plex
+library, replacing the 1080p original. Arm it in the evening; wake up to finished episodes.
 
 <p align="center">
   <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one in Topaz while the previous one remuxes" width="820">
@@ -25,6 +25,7 @@ Arm it in the evening; wake up to finished episodes.
 > | Topaz Video AI | **7.0.1** — this exact build |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
+> | AI border extension | **optional.** Needs [Comfy Desktop](https://www.comfy.org/) installed and run once, plus ~11.4 GB of WAN 2.1 models that Visionary downloads for you from Settings → Setup. Without it, everything else works unchanged — the feature simply never appears. |
 >
 > **Why the display rule?** Dolby Vision's "Analyze All Shots" button can't be clicked by
 > script, so Visionary finds it by matching a picture of the button against the screen.
@@ -192,7 +193,11 @@ button to defer it while you're using the Mac).
 
 ```
 NAS (FTP) ──download──▶ local scratch
-                          │  Topaz Video AI (bundled ffmpeg, prob-4) — 1080p → 4K ProRes chunks
+                          │  [optional, 4:3 shows only] AI outpainting — WAN 2.1 VACE via ComfyUI
+                          │  extends the left/right borders to 16:9 (borders only; the original
+                          │  picture is untouched). Runs alone: everything else is suspended.
+                          ▼
+                        Topaz Video AI (bundled ffmpeg, prob-4) — 1080p → 4K ProRes chunks
                           ▼
                         DaVinci Resolve Studio (scripted + screen automation)
                           │  scene cuts → Dolby Vision "Analyze All Shots" → DV 8.1 render
@@ -305,6 +310,37 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   seeding), and the combined master obeys the same playback peak budget as every other
   output, taking the capped re-encode (real RPU preserved) when the winner's peaks bust it.
 
+- **AI border extension — 4:3 shows to 16:9** (optional, off by default): an old 4:3 show
+  can have its **left and right borders generated** by a diffusion model
+  ([WAN 2.1 VACE](https://github.com/Wan-Video/Wan2.1)) instead of living in pillarboxes,
+  filling a 16:9 screen before the upscale even starts.
+
+  **Only the borders are AI.** Each 81-frame chunk is outpainted at a 480p-class working
+  resolution; then *only the generated side strips* are cropped out, scaled to the source
+  height, and stacked either side of the **original full-resolution frames**. Your picture
+  is never round-tripped through the model, the frame count is preserved exactly, and the
+  audio never goes near any of it. Topaz then upscales the widened 16:9 result to 4K like
+  any other source.
+
+  The option lives on each show's settings card and **only appears on shows that actually
+  measure 4:3** (anamorphic DV included, via the sample aspect ratio) once the models are
+  installed — there is nothing to see on a 16:9 library. Each episode is re-checked at run
+  time, so a widescreen special inside a 4:3 show skips itself, as do movies, YouTube
+  videos and HDR sources (the model is SDR-only).
+
+  It runs through **your own Comfy Desktop install, headlessly** — Visionary starts that
+  ComfyUI from its own venv on a **dedicated port (8189)** and talks to the HTTP API, so
+  the Comfy app you use normally, and its port 8188, are never touched.
+
+  > [!WARNING]
+  > **This is the slowest thing Visionary does — by a wide margin.** Expect *hours* per
+  > episode, on top of the normal ~1h35m. It is chunked and resumable (a stop or a deploy
+  > costs at most the chunk in flight), and **it takes the whole machine**: the moment
+  > outpainting starts, in-flight remuxes are suspended outright (SIGSTOP — no CPU, no lost
+  > work), the finisher stops taking on remux, upload *or* cleanup work, and the background
+  > prefetcher stands down. Nothing else runs until the episode's borders are done. Turn it
+  > on per show, deliberately.
+
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
   most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
@@ -319,7 +355,8 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   Resolve always gets the whole machine: the in-flight remuxes are **suspended outright**
   the instant it starts (SIGSTOP, so they use no CPU) and resume exactly where they were —
   no lost work, and no waiting for a segment boundary. Simultaneous remuxes stay capped at
-  two.
+  two. The AI border extension takes the machine the same way but harder — it also halts
+  uploads, cleanup and the prefetcher, so nothing whatsoever overlaps it.
 
 <p align="center">
   <img src="docs/assets/dual-remux.png" alt="The pipeline card with two remux lanes running at once, and the header showing both percentages" width="900">
@@ -382,6 +419,8 @@ override (env wins); keys marked — have no env override:
 | `youtube_client_id` / `_secret` / `_refresh_token` | — | optional — YouTube subscriptions picker |
 | `shuttle_relay_url` | — | optional — [Shuttle](https://github.com/adamkbritsch/shuttle) relay base URL (e.g. `http://nas:8789`); enables the movie **companion combine** |
 | `shuttle_relay_token` | — | optional — relay bearer token; normally read from Shuttle's own token file in `~/Library/Application Support/Shuttle/` |
+| `comfy_dir` | — | optional — ComfyUI install dir for the **AI border extension**; normally auto-discovered from Comfy Desktop's own `settings.json` |
+| `comfy_port` | — | optional — port for Visionary's headless ComfyUI (default **8189**; the Comfy app's own 8188 is never used) |
 
 > **Plex is optional — you don't need it to run this.** Leave the `plex_*` keys blank and
 > everything still works. Show and movie names come from your **NAS folder structure**, not
@@ -418,6 +457,12 @@ variants for TV and Movies); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MO
 
 - One hardware target (see the requirements box) — by design, not laziness: the DV
   analysis step is screen automation and pixel-exact.
+
+- **AI border extension is slow and exclusive.** Hours per episode on top of the normal
+  run, and while it works nothing else does — remuxes are suspended, uploads and cleanup
+  wait, the prefetcher stands down. It is chunked and resumable, off by default, and only
+  offered on shows that measure 4:3. Chunk seams are butt-joined: the generated borders can
+  shift slightly every 81 frames. SDR only.
 
 - **Resolve's upgrade nag stalls Resolve — not the pipeline.** Every week or so, DaVinci
   Resolve throws an "update available" dialog on launch that blocks its screen automation.

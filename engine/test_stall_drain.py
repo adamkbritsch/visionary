@@ -245,6 +245,7 @@ class NoRemuxingDuringResolve(unittest.TestCase):
         import threading, time
         o = orch.Orchestrator.__new__(orch.Orchestrator)
         o._resolve_active = threading.Event()
+        o._extend_active = threading.Event()  # idle here — pinned in ExtendExclusivity
         o._resolve_fast = False               # the whole-machine case these tests pin
         if resolve_active:
             o._resolve_active.set()
@@ -434,6 +435,7 @@ class RemuxRunsDuringAnUpload(unittest.TestCase):
                    "finishing2": None}
         o._finish_q = mock.Mock(qsize=lambda: queued)
         o._resolve_active = threading.Event()
+        o._extend_active = threading.Event()   # idle here — pinned in ExtendExclusivity
         o._resolve_fast = False
         o._drain_backlog = lambda: backlog
         o._last_resolve_at = 0.0
