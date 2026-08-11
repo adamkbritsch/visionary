@@ -2629,13 +2629,30 @@ class Orchestrator:
 
         Counting segdirs is exact rather than approximate, because outside a stall the code
         already guarantees AT MOST ONE exists — _drop_topaz_intermediates rmtree's each at
-        hand-off. So >= 2 segdirs IS the stall buffer, by the pipeline's own invariant."""
+        hand-off. So >= 2 segdirs IS the stall buffer, by the pipeline's own invariant.
+
+        A segdir counts ONLY once it holds a real upscaled segment (`seg_NNNN.mov`). A dir
+        containing nothing but the `scenes.json` scene-plan cache is not buffered work:
+        _plan_fast_path_bounds creates one for an item that never upscales AT ALL, and a
+        topaz paused before its first segment leaves exactly the same shape. Counting those
+        deadlocked the run thread (live, 2026-08-10): Borat's fast-path plan + a paused
+        S03E14 made two plan-only dirs, so _dual_remux_pauses_topaz held every fresh item
+        under "two remuxes running" with ZERO remuxes live — and the gate could never
+        reopen, because the items owning those dirs are the ones it was blocking. The
+        seg_ test also excludes the extend stage's own `<stem>_wide.mp4.segments` chunk
+        dir, which holds `wide_NNNN.mp4` and is likewise not a topaz buffer."""
         try:
             base = scratch.default_scratch()
             n = 0
             for name in os.listdir(base):
-                if name.endswith(".segments") and os.path.isdir(os.path.join(base, name)):
-                    n += 1
+                d = os.path.join(base, name)
+                if not (name.endswith(".segments") and os.path.isdir(d)):
+                    continue
+                try:
+                    if any(f.startswith("seg_") and f.endswith(".mov") for f in os.listdir(d)):
+                        n += 1
+                except OSError:
+                    pass
             return n
         except OSError:
             return 0

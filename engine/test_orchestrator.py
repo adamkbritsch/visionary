@@ -1148,13 +1148,43 @@ class DoubleRemux(unittest.TestCase):
         import tempfile, os as _os
         d = tempfile.mkdtemp()
         for i in range(3):
-            _os.makedirs(_os.path.join(d, f"X S01E{i}_prob4_upscaled.segments"))
+            sd = _os.path.join(d, f"X S01E{i}_prob4_upscaled.segments")
+            _os.makedirs(sd)
+            open(_os.path.join(sd, "seg_0000.mov"), "w").close()   # real upscaled work
         o = orch.Orchestrator()
         with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
             self.assertEqual(o._drain_backlog(), 3)
             o.enable()                       # the "dismiss the prompt, press Start" gesture
             self.assertEqual(o._drain_backlog(), 3, "Start must no longer erase the backlog")
             o.disable()
+
+    def test_plan_only_segdirs_are_not_a_backlog(self):
+        """LIVE DEADLOCK 2026-08-10. A fast-path item (_plan_fast_path_bounds) and a topaz
+        paused before its first segment each leave a segdir holding ONLY scenes.json. Two
+        of those made _drain_backlog() report 2, so every fresh item was held under "two
+        remuxes running" with zero remuxes live — and the gate could never reopen, because
+        the items owning those dirs were the ones it blocked. Borat sat there for an hour."""
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        for name in ("Borat_prob4_upscaled.segments", "X S03E14_prob4_upscaled.segments"):
+            sd = _os.path.join(d, name)
+            _os.makedirs(sd)
+            with open(_os.path.join(sd, "scenes.json"), "w") as f:
+                f.write("[]")                      # the scene-plan cache, no upscale at all
+        _os.makedirs(_os.path.join(d, "X S03E14_wide.mp4.segments"))   # the extend stage's
+        with open(_os.path.join(d, "X S03E14_wide.mp4.segments", "wide_0000.mp4"), "w") as f:
+            f.write("x")                           # chunk dir — also not a topaz buffer
+        o = orch.Orchestrator()
+        p = episode_paths("S", "S01E01", "x.mp4", scratch_dir=d, nas_tv_root="/Media/TV-Shows")
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
+            self.assertEqual(o._drain_backlog(), 0)
+            with mock.patch.object(orch, "stage_done", return_value=False):
+                self.assertFalse(o._dual_remux_pauses_topaz(p),
+                                 "plan-only segdirs must never wedge the run thread")
+            # ...and a real segment still counts.
+            sd = _os.path.join(d, "Borat_prob4_upscaled.segments")
+            open(_os.path.join(sd, "seg_0000.mov"), "w").close()
+            self.assertEqual(o._drain_backlog(), 1)
 
     def test_resolve_gate_keeps_single_timing_when_not_draining(self):
         o = orch.Orchestrator(); o._drain_backlog = lambda: 1

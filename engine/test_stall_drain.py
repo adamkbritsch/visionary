@@ -34,7 +34,11 @@ class DrainBacklog(unittest.TestCase):
     def _with_segdirs(self, n, extra=()):
         d = tempfile.mkdtemp()
         for i in range(n):
-            os.makedirs(os.path.join(d, f"Show S01E{i:02d}_prob4_upscaled.segments"))
+            sd = os.path.join(d, f"Show S01E{i:02d}_prob4_upscaled.segments")
+            os.makedirs(sd)
+            # A segdir is a BUFFER only once it holds real upscaled work — see
+            # test_plan_only_segdirs_never_count below.
+            open(os.path.join(sd, "seg_0000.mov"), "w").close()
         for name in extra:
             open(os.path.join(d, name), "w").close()
         return d
@@ -54,6 +58,32 @@ class DrainBacklog(unittest.TestCase):
         d = self._with_segdirs(2, extra=("something.mov", "a_prob4_upscaled.segments.txt"))
         os.makedirs(os.path.join(d, "prefetch"))
         self.assertEqual(self._count(d), 2)
+
+    def test_plan_only_segdirs_never_count(self):
+        """The 2026-08-10 deadlock: _plan_fast_path_bounds creates a segdir holding ONLY
+        scenes.json for an item that never upscales, and a topaz paused before its first
+        segment leaves the same shape. Two of those read as a stall buffer, so the run
+        thread held every fresh item under "two remuxes running" with no remux live — and
+        nothing could clear it, since the blocked items owned the dirs."""
+        d = tempfile.mkdtemp()
+        for name in ("Borat_prob4_upscaled.segments", "Show S03E14_prob4_upscaled.segments"):
+            sd = os.path.join(d, name)
+            os.makedirs(sd)
+            with open(os.path.join(sd, "scenes.json"), "w") as f:
+                f.write("[]")
+        self.assertEqual(self._count(d), 0)
+        open(os.path.join(d, "Borat_prob4_upscaled.segments", "seg_0000.mov"), "w").close()
+        self.assertEqual(self._count(d), 1)      # a real segment makes it a buffer
+
+    def test_extend_chunk_dirs_never_count(self):
+        """The extend stage's own resume dir also ends in .segments and shares the scratch,
+        but holds wide_NNNN.mp4 — it is not topaz work and must not gate the run thread."""
+        d = tempfile.mkdtemp()
+        for i in range(3):
+            sd = os.path.join(d, f"Show S01E{i:02d}_wide.mp4.segments")
+            os.makedirs(sd)
+            open(os.path.join(sd, f"wide_{i:04d}.mp4"), "w").close()
+        self.assertEqual(self._count(d), 0)
 
     def test_a_missing_scratch_is_zero_not_a_crash(self):
         self.assertEqual(self._count("/nonexistent/scratch/path"), 0)
