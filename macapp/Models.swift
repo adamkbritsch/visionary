@@ -395,6 +395,7 @@ struct BordersEnvDTO: Codable {
     var models_dir: String?
     var desktop_version: String?
     var comfy_version: String?
+    var vhs: Bool?                // ComfyUI-VideoHelperSuite present (NOT bundled with the app)
     var port: Int?
     var missing: [String]?
 }

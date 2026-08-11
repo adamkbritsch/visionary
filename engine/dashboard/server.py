@@ -165,8 +165,7 @@ def series_info():
                       "queue": series.cached_queue(nm)})
     ready = False
     try:
-        env = borders.discover()
-        ready = bool(env["ok"]) and borders.models_ready(env["models_dir"])[0]
+        ready = borders.env_ready()[0]     # ComfyUI + VideoHelperSuite + every model
     except Exception:
         pass
     return {"selected": sel, "active": active, "rotation": series.get_rotation(),
@@ -234,10 +233,7 @@ def api_borders_status():
     import borders
     env = borders.discover()
     models = borders.model_status(env["models_dir"]) if env.get("models_dir") else {}
-    ready, missing = ((borders.models_ready(env["models_dir"]))
-                      if env.get("models_dir") else (False, []))
-    if not env.get("ok"):
-        missing = list(env.get("missing") or []) + missing
+    ready, missing = borders.env_ready(env)
     return {"env": env, "models": models,
             "ready": bool(env.get("ok")) and ready, "missing": missing,
             "sec_per_chunk": borders.avg_sec_per_chunk(),

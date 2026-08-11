@@ -125,6 +125,36 @@ download → topaz → resolve → remux → upload. Warn them the resolve stage
 screen for ~10-15 min (Screen Control defers it). If the server answers a 409 on arming,
 read its `checks` — that's the preflight refusing; step back to whichever check failed.
 
+### Step 11 — AI border extension (OPTIONAL, skip by default)
+Only if the user asks for 4:3 shows to be widened to 16:9. It never affects
+`setup_complete`, and preflight does not check it — the readiness probe is
+`GET /api/borders/status` (or `python3 -c "import sys; sys.path.insert(0,'engine'); import borders; print(borders.env_ready())"`).
+
+It **requires the Comfy Desktop app** — https://www.comfy.org/ — not any ComfyUI. The
+engine reads Comfy Desktop's `~/Library/Application Support/Comfy Desktop/settings.json`
+for `installDir`, then expects ITS managed layout (`<installDir>/ComfyUI/ComfyUI/main.py`
+plus a `.venv` beside it). A hand-cloned ComfyUI does not satisfy that, and the
+`comfy_dir` config key only relocates the same layout.
+
+USER does these two; you cannot:
+1. Install Comfy Desktop and **launch it once** (that first launch creates the checkout,
+   the venv and the models dir).
+2. Install **ComfyUI-VideoHelperSuite** from Comfy Desktop's Manager — it is NOT bundled,
+   and the workflow's output node (`VHS_VideoCombine`) needs it.
+
+Then the models (~11.4 GB, four files) — either have the user press Install in
+Settings → Setup → *Border extender (optional)*, or drive it:
+```bash
+for w in borders_vace borders_umt5 borders_causvid borders_vae; do
+  curl -s -X POST http://127.0.0.1:8765/api/setup/install \
+       -H 'Content-Type: application/json' -d "{\"what\":\"$w\"}"
+  # one job at a time: poll /api/setup/install-status until .active is null before the next
+done
+```
+Downloads resume in place (`curl -C -`), so a partial from an earlier attempt is fine.
+`env_ready()` returning `(True, [])` is the acceptance gate; the per-show "Extends to
+16:9" option then appears on 4:3 shows only.
+
 ---
 
 Everything else about working in this repo (hard rules, tests, deploys): `CLAUDE.md`.

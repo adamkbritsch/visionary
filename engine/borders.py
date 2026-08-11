@@ -101,10 +101,21 @@ def _config() -> dict:
 
 def discover() -> dict:
     """Where ComfyUI lives — zero-config from Comfy Desktop's own settings.json (the
-    Shuttle-token pattern), with `comfy_dir`/`comfy_port` config overrides. Never raises."""
+    Shuttle-token pattern), with `comfy_dir`/`comfy_port` config overrides. Never raises.
+
+    COMFY DESKTOP IS REQUIRED, not merely convenient: the paths below are its managed
+    layout (the doubled `ComfyUI/ComfyUI` checkout and a `.venv` beside it), and the
+    `comfy_dir` override only relocates that layout — it does not accept a hand-cloned
+    ComfyUI, whose main.py sits at the root and whose interpreter is wherever you made it.
+
+    VideoHelperSuite is required too and is NOT bundled with Comfy Desktop (its custom_nodes
+    ships only websocket_image_save.py): the graph writes its result through
+    VHS_VideoCombine, because core SaveVideo's DynamicCombo codec input does not
+    hand-serialize into an API-format prompt. Detected here so a missing node is named in
+    Setup up front, rather than failing the first chunk of an overnight run."""
     cfg = _config()
     out = {"ok": False, "install_dir": "", "checkout": "", "venv_python": "",
-           "models_dir": "", "desktop_version": "", "comfy_version": "",
+           "models_dir": "", "desktop_version": "", "comfy_version": "", "vhs": False,
            "port": int(cfg.get("comfy_port") or COMFY_PORT), "missing": []}
     try:
         with open(DESKTOP_SETTINGS) as f:
@@ -137,8 +148,28 @@ def discover() -> dict:
             out["desktop_version"] = plistlib.load(f).get("CFBundleShortVersionString", "")
     except Exception:
         pass
-    out["ok"] = True
+    try:                                  # dir name varies by how it was installed
+        out["vhs"] = any("videohelpersuite" in n.lower()
+                         for n in os.listdir(os.path.join(checkout, "custom_nodes")))
+    except OSError:
+        pass
+    if not out["vhs"]:
+        out["missing"].append("ComfyUI-VideoHelperSuite (install it from ComfyUI Manager)")
+    out["ok"] = True                      # ComfyUI itself is usable — see `vhs` for the node
     return out
+
+
+def env_ready(env=None, models_dir=None):
+    """(ready, [missing]) for the WHOLE extender: ComfyUI + the VideoHelperSuite node +
+    every model. The per-show row and the stage both gate on this, so they can never
+    disagree about whether outpainting is actually possible."""
+    env = discover() if env is None else env
+    if not env.get("ok"):
+        return False, list(env.get("missing") or ["ComfyUI not found"])
+    missing = [m for m in (env.get("missing") or [])]          # e.g. VideoHelperSuite
+    ok, model_missing = models_ready(models_dir or env.get("models_dir") or "")
+    missing += model_missing
+    return (not missing), missing
 
 
 # ---- models --------------------------------------------------------------------------

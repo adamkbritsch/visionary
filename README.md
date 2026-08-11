@@ -25,7 +25,7 @@ library, replacing the 1080p original. Arm it in the evening; wake up to finishe
 > | Topaz Video AI | **7.0.1** — this exact build |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
-> | AI border extension | **optional.** Needs [Comfy Desktop](https://www.comfy.org/) installed and run once, plus ~11.4 GB of WAN 2.1 models that Visionary downloads for you from Settings → Setup. Without it, everything else works unchanged — the feature simply never appears. |
+> | AI border extension | **optional.** Requires the **[Comfy Desktop](https://www.comfy.org/) app** (run once so it builds its ComfyUI + venv — a hand-cloned ComfyUI is not detected), its **ComfyUI-VideoHelperSuite** node from Manager, and ~11.4 GB of WAN 2.1 models Visionary downloads for you from Settings → Setup. Without all of it, everything else works unchanged — the feature simply never appears. See [step 11](#11-ai-border-extension--optional-only-for-43-shows). |
 >
 > **Why the display rule?** Dolby Vision's "Analyze All Shots" button can't be clicked by
 > script, so Visionary finds it by matching a picture of the button against the screen.
@@ -189,6 +189,33 @@ through download → topaz → resolve → remux → upload. The first resolve s
 screen for ~10-15 minutes — that's the Dolby Vision analysis (there's a Screen Control
 button to defer it while you're using the Mac).
 
+### 11. AI border extension — OPTIONAL, only for 4:3 shows
+
+Skip this entirely unless you want [4:3 shows widened to 16:9](#how-it-works). Nothing
+else depends on it, it never affects `setup_complete`, and with it absent the per-show
+option simply never appears.
+
+It **requires the [Comfy Desktop](https://www.comfy.org/) app** — not just any ComfyUI.
+Visionary runs *its* bundled ComfyUI headlessly (own venv, dedicated port 8189) and finds
+it through Comfy Desktop's own `settings.json`, so the install has to be the one Comfy
+Desktop manages. A hand-cloned ComfyUI won't be detected; the `comfy_dir` config key only
+relocates Comfy Desktop's layout, it doesn't replace it.
+
+1. **Install Comfy Desktop and launch it once.** The first launch is what creates the
+   ComfyUI checkout, its virtual environment and the models directory — Visionary reads
+   all three from it. Quit it afterwards if you like; it is never used again (Visionary
+   only ever talks to port 8189, so the app's own 8188 stays free for your normal work).
+2. **Add ComfyUI-VideoHelperSuite**, from within Comfy Desktop's **Manager** — it is *not*
+   bundled. The outpainting workflow writes its result through that node's
+   `VHS_VideoCombine`.
+3. **Download the models from Visionary**: Settings → **Setup** → *Border extender
+   (optional)*. Four files, **~11.4 GB** total (WAN 2.1 VACE 1.3B, the UMT5-XXL text
+   encoder, the CausVid LoRA and the WAN VAE). They land in Comfy Desktop's own models
+   directory, one at a time, and a partial download **resumes** rather than restarting.
+
+The group turns green when all of it is present. Only then does the per-show
+**"Extends to 16:9"** option appear — and only on shows that actually measure 4:3.
+
 ## How it works
 
 ```
@@ -330,7 +357,11 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
   It runs through **your own Comfy Desktop install, headlessly** — Visionary starts that
   ComfyUI from its own venv on a **dedicated port (8189)** and talks to the HTTP API, so
-  the Comfy app you use normally, and its port 8188, are never touched.
+  the Comfy app you use normally, and its port 8188, are never touched. **The Comfy
+  Desktop app is required** (Visionary uses the checkout, venv and models directory it
+  manages, located via its own `settings.json`), as is the **ComfyUI-VideoHelperSuite**
+  node, which Comfy Desktop does not bundle — install it from Manager. Setup names
+  whichever piece is missing; see [step 11](#11-ai-border-extension--optional-only-for-43-shows).
 
   > [!WARNING]
   > **This is the slowest thing Visionary does — by a wide margin.** Expect *hours* per

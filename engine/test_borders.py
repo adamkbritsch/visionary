@@ -224,7 +224,40 @@ class Discovery(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
+    def _add_vhs(self):
+        os.makedirs(os.path.join(self.checkout, "custom_nodes",
+                                 "comfyui-videohelpersuite"), exist_ok=True)
+
+    def test_videohelpersuite_is_a_named_requirement(self):
+        # NOT bundled with Comfy Desktop (its custom_nodes ships only
+        # websocket_image_save.py), and the graph's output node needs it — so a missing
+        # VHS must be named in Setup, not discovered at the first chunk of an overnight run.
+        os.makedirs(os.path.join(self.checkout, "custom_nodes"), exist_ok=True)
+        d = borders.discover()
+        self.assertTrue(d["ok"], "ComfyUI itself is still usable")
+        self.assertFalse(d["vhs"])
+        self.assertTrue(any("VideoHelperSuite" in m for m in d["missing"]))
+        ready, missing = borders.env_ready(d, models_dir=self.tmp)
+        self.assertFalse(ready)
+        self.assertTrue(any("VideoHelperSuite" in m for m in missing))
+        self._add_vhs()
+        self.assertTrue(borders.discover()["vhs"])
+
+    def test_env_ready_needs_comfy_and_the_node_and_the_models(self):
+        self._add_vhs()
+        env = borders.discover()
+        ready, missing = borders.env_ready(env, models_dir=self.tmp)
+        self.assertFalse(ready)                       # node present, models absent
+        self.assertTrue(all("VideoHelperSuite" not in m for m in missing))
+        self.assertEqual(len(missing), len(borders.MODELS))
+        # No ComfyUI at all -> the environment's own reasons, not model noise.
+        os.remove(os.path.join(self.checkout, "main.py"))
+        ready, missing = borders.env_ready(borders.discover(), models_dir=self.tmp)
+        self.assertFalse(ready)
+        self.assertTrue(any("checkout" in m for m in missing))
+
     def test_full_discovery(self):
+        self._add_vhs()
         d = borders.discover()
         self.assertTrue(d["ok"], d)
         self.assertEqual(d["checkout"], self.checkout)

@@ -390,11 +390,9 @@ def _extend(p, abort, progress=None):
             return True, f"no border extension — {g0['reason']}"
         geom = g0["geom"]
         env = borders.discover()
-        if not env["ok"]:
-            return False, "border extend: " + "; ".join(env["missing"])
-        ready, missing = borders.models_ready(env["models_dir"])
+        ready, missing = borders.env_ready(env)
         if not ready:
-            return False, "border extend: models not installed — " + ", ".join(missing)
+            return False, "border extend: " + "; ".join(missing)
         total = borders.count_frames(p.source_cfr)      # EXACT (packet count): chunk
         fps, _dur = topaz.media_timing(p.source_cfr)    # indices + the final verify need it
         if not total or not fps:

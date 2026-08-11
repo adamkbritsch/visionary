@@ -388,11 +388,12 @@ private struct BorderExtenderGroup: View {
             SetupGroupLabel(text: "Border extender (optional)")
             Text("AI-outpaints 4:3 shows to 16:9 before the upscale (per-show opt-in \u{2014} "
                  + "the option appears on 4:3 shows once this is installed). Drives Comfy "
-                 + "Desktop's own ComfyUI headlessly on port \(st?.env?.port ?? 8189).")
+                 + "Desktop's own ComfyUI headlessly on port \(st?.env?.port ?? 8189), so "
+                 + "the Comfy app you use normally is never touched.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 CheckDot(ok: st?.env?.ok)
-                Text("Comfy Desktop").font(.system(size: 12, weight: .medium))
+                Text("Comfy Desktop app").font(.system(size: 12, weight: .medium))
                 if st?.env?.ok == true {
                     Text("ComfyUI \(st?.env?.comfy_version ?? "?")"
                          + ((st?.env?.desktop_version).map { " \u{00B7} app \($0)" } ?? ""))
@@ -401,11 +402,29 @@ private struct BorderExtenderGroup: View {
                 Spacer()
             }
             if st?.env?.ok != true {
-                Text((st?.env?.missing ?? st?.missing ?? ["Open Setup after installing Comfy Desktop."])
-                        .joined(separator: " \u{00B7} "))
+                Text("REQUIRED: install the Comfy Desktop app and launch it once \u{2014} that "
+                     + "first launch creates the ComfyUI, its virtual environment and the "
+                     + "models folder Visionary uses. A hand-installed ComfyUI is not detected.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
+                CopyValueRow(value: "https://www.comfy.org/")
+                if let m = st?.env?.missing ?? st?.missing, !m.isEmpty {
+                    Text(m.joined(separator: " \u{00B7} "))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
             }
             if st?.env?.ok == true {
+                HStack(spacing: 8) {
+                    CheckDot(ok: st?.env?.vhs)
+                    Text("ComfyUI-VideoHelperSuite").font(.system(size: 12, weight: .medium))
+                    Spacer()
+                }
+                if st?.env?.vhs != true {
+                    // Not bundled with Comfy Desktop, and the workflow's output node needs
+                    // it — so it gets its own row rather than hiding in a missing-list.
+                    Text("REQUIRED, and not bundled: open Comfy Desktop \u{2192} Manager and "
+                         + "install ComfyUI-VideoHelperSuite, then reopen Setup.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
                 modelRow("borders_vace")
                 modelRow("borders_umt5")
                 modelRow("borders_causvid")
