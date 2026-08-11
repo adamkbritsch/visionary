@@ -104,13 +104,16 @@ plug and close the lid.
   once in the app (that activates the license + downloads models; the pipeline runs it
   headlessly afterwards), then **disable auto-updates** in its preferences and quit.
 
-- **Comfy Desktop — OPTIONAL, and only for the [AI border extension](#11-ai-border-extension--optional-only-for-43-shows)**
-  (widening 4:3 shows to 16:9). Free, from [comfy.org](https://www.comfy.org/). Install and
-  **launch it once** — that first launch builds the ComfyUI, virtual environment and models
-  folder Visionary drives headlessly; any version will do, and a hand-installed ComfyUI is
-  *not* a substitute. Skip it entirely if you don't want the feature: nothing else uses it,
-  and the option just never appears. Finish the rest of setup first, then see step 11 for
-  the node and the models.
+> [!NOTE]
+> **A third app, optional — and not one of the two above.** [Comfy Desktop](https://www.comfy.org/)
+> is needed *only* for the [AI border extension](#11-ai-border-extension--optional-only-for-43-shows)
+> (widening 4:3 shows to 16:9). It's free, there's **no pinned version**, and nothing else
+> in Visionary touches it — skip it and the feature simply never appears.
+>
+> If you do want it, install it now and **launch it once**: that first launch is what builds
+> the ComfyUI, virtual environment and models folder Visionary later drives headlessly. A
+> hand-installed ComfyUI is *not* a substitute. Then carry on with setup — the node and the
+> ~11.4 GB of models come later, in [step 11](#11-ai-border-extension--optional-only-for-43-shows).
 
 ### 3. Command-line tools
 
