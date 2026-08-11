@@ -510,8 +510,11 @@ variants for TV and Movies); override with `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MO
 - **AI border extension is slow and exclusive.** Hours per episode on top of the normal
   run, and while it works nothing else does — remuxes are suspended, uploads and cleanup
   wait, the prefetcher stands down. It is chunked and resumable, off by default, and only
-  offered on shows that measure 4:3. Chunk seams are butt-joined: the generated borders can
-  shift slightly every 81 frames. SDR only.
+  offered on shows that measure 4:3. SDR only. For continuity, chunk boundaries **snap to
+  scene cuts** (a wing reset at an edit is invisible) and every chunk within a scene shares
+  its seed — but a boundary that must land mid-scene can still shift the generated borders
+  slightly, and invented content is never persistent across shots or episodes. A per-show
+  **wing prompt** (on the show's settings card) gently biases what the wings contain.
 
 - **Resolve's upgrade nag stalls Resolve — not the pipeline.** Every week or so, DaVinci
   Resolve throws an "update available" dialog on launch that blocks its screen automation.

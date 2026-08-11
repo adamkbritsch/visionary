@@ -443,6 +443,20 @@ def set_show_extend_borders(key: str, value) -> bool:
     return bool(value)
 
 
+def get_show_extend_prompt(key: str) -> str:
+    """Per-show WING PROMPT for the extend stage ("" = borders.DEFAULT_PROMPT). A gentle
+    style bias for the generated side wings ("dark wood bar interior, neon beer signs") —
+    the CausVid path samples at cfg 1.0, so this nudges palette and content; it cannot
+    pin geometry. Part of the extend chunks' resume identity: changing it re-generates."""
+    return str(_show_entry(key).get("extend_prompt") or "")
+
+
+def set_show_extend_prompt(key: str, value) -> str:
+    v = str(value or "").strip()
+    _update_show(key, extend_prompt=v)
+    return v
+
+
 def get_show_featurettes_last(key: str) -> bool:
     """Per-show: process season-00 specials/featurettes AFTER the whole show (True,
     default) or leave them in numeric order, where "S00" sorts ahead of "S01" and they

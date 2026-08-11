@@ -1712,6 +1712,9 @@ private struct TVMode: View {
                 ReplaceSourceRow(key: name, on: show.replace_source ?? true)
                 if show.aspect == "4:3", store.state?.series?.borders_ready == true {
                     ExtendBordersRow(key: name, on: show.extend_borders ?? false)
+                    if show.extend_borders == true {
+                        ExtendPromptRow(key: name, prompt: show.extend_prompt ?? "")
+                    }
                 }
             }
             if (show.queue?.featurette_count ?? 0) > 0 {
@@ -1911,6 +1914,54 @@ private struct ExtendBordersRow: View {
     }
 }
 
+// The show's WING PROMPT (continuity): what the generated side wings should contain
+// ("dark wood bar interior, neon beer signs"). Rendered only under an ENABLED extend
+// row. A gentle style bias — the fast sampler runs at cfg 1.0, so it nudges palette
+// and content, it cannot pin geometry. Changing it re-generates unprocessed chunk work.
+private struct ExtendPromptRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let prompt: String                    // "" = the built-in default
+    @State private var editing = false
+    @State private var draft = ""
+
+    var body: some View {
+        if editing {
+            HStack(spacing: 6) {
+                TextField("what the generated wings should show\u{2026}", text: $draft)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11))
+                    .onSubmit { save() }
+                Button("Save") { save() }
+                    .buttonStyle(.plain).font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.brand)
+                Button("Cancel") { editing = false }
+                    .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .padding(.leading, 20)
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "text.quote").font(.system(size: 10)).foregroundStyle(DS.steelDim)
+                Text(prompt.isEmpty ? "Default wing prompt" : prompt)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    .help("Describes what the AI-generated side wings should contain for this "
+                          + "show \u{2014} e.g. \"dark wood bar interior, neon beer signs\". A "
+                          + "gentle style bias applied to every episode; empty uses the built-in "
+                          + "default. Changing it re-generates any unfinished extend work.")
+                Button("Change") { draft = prompt; editing = true }
+                    .buttonStyle(.plain).font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.brand)
+                Spacer()
+            }
+            .padding(.leading, 20)
+        }
+    }
+
+    private func save() {
+        editing = false
+        Task { await store.setExtendPrompt(key, draft.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+}
+
 // Per-slot "Up next" row: the show queued to take THIS slot the moment its current show
 // finishes (clean handoff — no interleaving). Deliberately NOT gated by the run lock: the
 // slot's CURRENT show can't be swapped mid-run, but queueing what comes AFTER only records
@@ -1970,6 +2021,9 @@ private struct NextUpRow: View {
                     ReplaceSourceRow(key: n, on: profile?.replace_source ?? true)
                     if profile?.aspect == "4:3", store.state?.series?.borders_ready == true {
                         ExtendBordersRow(key: n, on: profile?.extend_borders ?? false)
+                        if profile?.extend_borders == true {
+                            ExtendPromptRow(key: n, prompt: profile?.extend_prompt ?? "")
+                        }
                     }
                     if profile?.has_featurettes == true {
                         FeaturettesLastRow(key: n, on: profile?.featurettes_last ?? true, count: 0)

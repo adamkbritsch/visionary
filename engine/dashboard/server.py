@@ -150,6 +150,7 @@ def series_info():
                       # AI border extension: the row renders ONLY when aspect == "4:3"
                       # AND the top-level borders_ready is true (hide-inert-UI).
                       "extend_borders": settings.get_show_extend_borders(nm),
+                      "extend_prompt": settings.get_show_extend_prompt(nm),
                       "aspect": borders.show_aspect(nm),
                       # what it will ACTUALLY master as — the app shows this, not "auto"
                       "output_mode_effective": settings.effective_output_mode(
@@ -610,6 +611,7 @@ def show_settings_view(name) -> dict:
             "output_mode": settings.get_show_output_mode(name),
             "output_mode_effective": settings.effective_output_mode(name, _hdr_hint(name)),
             "extend_borders": settings.get_show_extend_borders(name),
+            "extend_prompt": settings.get_show_extend_prompt(name),
             "aspect": borders.show_aspect(name)}
 
 
@@ -661,6 +663,7 @@ def show_profile_info(show=None):
     return {"show": target, "configured": saved is not None,
             "extend_borders": (settings.get_show_extend_borders(target)
                                if target else False),
+            "extend_prompt": settings.get_show_extend_prompt(target) if target else "",
             "aspect": borders.show_aspect(target) if target else None,
             "preset": settings.show_preset_key(target) if target else settings.DEFAULT_PRESET,
             "unwatched_first": settings.get_show_unwatched_first(target) if target else True,
@@ -1455,6 +1458,11 @@ class Handler(BaseHTTPRequestHandler):
                 # The UI only renders the row on 4:3 shows with the models installed; the
                 # stage re-gates per episode. No queue refresh: ordering is unaffected.
                 settings.set_show_extend_borders(show, bool(body.get("extend_borders")))
+            if "extend_prompt" in body:
+                # The show's WING PROMPT (continuity tier 1) — what the generated side
+                # wings should contain. "" = the built-in default. Part of the extend
+                # chunks' resume identity, so changing it re-generates unprocessed work.
+                settings.set_show_extend_prompt(show, str(body.get("extend_prompt") or ""))
             self._json(show_profile_info(show))
         else:
             self._send(404, b"not found", "text/plain")

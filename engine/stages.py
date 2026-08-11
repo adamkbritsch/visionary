@@ -397,22 +397,40 @@ def _extend(p, abort, progress=None):
         fps, _dur = topaz.media_timing(p.source_cfr)    # indices + the final verify need it
         if not total or not fps:
             return False, "border extend: could not read the source's frame count/rate"
-        chunks = borders.plan_chunks(total)
-        # Resume identity: any change to the source, geometry, models, sampler, or seed
-        # invalidates the persisted chunks (same contract as the remux's segdir).
+        # CONTINUITY (user-dictated 2026-08-10): the per-show WING PROMPT (tier 1 — a
+        # gentle style bias at cfg 1.0) and scene-aware chunking (tier 2 — boundaries
+        # snap to scene cuts so wing resets coincide with edits, and chunks within one
+        # scene share a seed so their inventions converge).
+        import settings as settings_mod
+        try:
+            eff_prompt = (settings_mod.get_show_extend_prompt(p.series) or "").strip()
+        except Exception:
+            eff_prompt = ""
+        eff_prompt = eff_prompt or borders.DEFAULT_PROMPT
+        segdir = p.source_wide + ".segments"
+        os.makedirs(segdir, exist_ok=True)        # the scene cache lives inside it
+        try:
+            cuts = [int(c) for c in (topaz._cached_scene_frames(p.source_cfr, segdir,
+                                                                fps) or [])]
+        except Exception:
+            cuts = []                             # no cuts → plain fixed windows
+        chunks = borders.plan_chunks_snapped(total, cuts)
+        # Resume identity: any change to the source, geometry, models, sampler, seed,
+        # PROMPT, or the chunk PLAN itself (scene detection moved a boundary) invalidates
+        # the persisted chunks (same contract as the remux's segdir).
         import zlib
         try:
             st = os.stat(p.source_cfr)
             src_id = f"{st.st_size}:{int(st.st_mtime)}"
         except OSError:
             src_id = "missing"
-        seed = zlib.crc32(p.source_basename.encode("utf-8")) & 0x7FFFFFFF
+        seed_base = zlib.crc32(p.source_basename.encode("utf-8")) & 0x7FFFFFFF
         manifest = {"src": src_id, "chunk": borders.CHUNK_FRAMES, "geom": geom,
                     "models": sorted(borders.MODELS),
                     "sampler": [borders.STEPS, borders.CFG, borders.SAMPLER,
                                 borders.SCHEDULER, borders.SHIFT],
-                    "seed": seed, "prompt": borders.DEFAULT_PROMPT}
-        segdir = p.source_wide + ".segments"
+                    "seed": seed_base, "prompt": eff_prompt,
+                    "plan": [[s, n] for (s, n) in chunks]}
         dvcap.ensure_segdir(segdir, manifest)
         backend = borders.ComfyBackend(env, os.path.join(segdir, "in"),
                                        os.path.join(segdir, "out"))
@@ -476,8 +494,9 @@ def _extend(p, abort, progress=None):
                 input_name=os.path.basename(chunk_in),
                 canvas_w=geom["canvas_w"], canvas_h=geom["canvas_h"],
                 pad_left=geom["pad_work"], pad_right=geom["pad_work"],
-                length=n, fps=float(fps), seed=seed + k,
-                filename_prefix=f"gen_{k:04d}")
+                length=n, fps=float(fps),
+                seed=seed_base + borders.scene_of(start, cuts),   # per-SCENE, not per-chunk
+                filename_prefix=f"gen_{k:04d}", prompt=eff_prompt)
             hist = client.wait(client.submit(graph), backend=backend, abort=abort)
             gen = borders.ComfyClient.output_file(hist, backend.out_dir)
             if not gen or not os.path.exists(gen):

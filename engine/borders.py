@@ -398,6 +398,40 @@ def plan_chunks(total_frames: int, chunk_len: int = CHUNK_FRAMES) -> list:
     return out
 
 
+def plan_chunks_snapped(total_frames: int, cuts, chunk_len: int = CHUNK_FRAMES,
+                        min_len: int = MIN_TAIL_FRAMES) -> list:
+    """plan_chunks, but a chunk ENDS AT A SCENE CUT whenever one falls inside its window —
+    the wing "reset" then coincides with an edit and is invisible (CONTINUITY tier 2).
+    `cuts` = frame indices where a new scene starts (topaz's cached scene detection);
+    empty/None degrades to exactly plan_chunks. A cut closer than `min_len` to the chunk
+    start is ignored (never a sliver chunk); the model window (`chunk_len`) is a ceiling,
+    so a chunk between dense cuts is simply short — WanVaceToVideo takes any length."""
+    if total_frames <= 0:
+        return []
+    cs = sorted({int(c) for c in (cuts or []) if 0 < int(c) < total_frames})
+    out, start = [], 0
+    while start < total_frames:
+        hard_end = min(start + chunk_len, total_frames)
+        end = hard_end
+        for c in cs:                          # ascending → keeps the LAST cut in range
+            if start + min_len < c <= hard_end:
+                end = c
+        out.append((start, end - start))
+        start = end
+    if len(out) >= 2 and out[-1][1] < min_len:
+        s, n = out[-2]
+        out[-2] = (s, n + out[-1][1])
+        out.pop()
+    return out
+
+
+def scene_of(frame, cuts) -> int:
+    """Which scene a frame belongs to = cuts at/before it. Chunks in the SAME scene share
+    a seed (seed_base + scene): same noise + same set + same prompt converges to far more
+    consistent wings across the chunk boundaries inside a scene (CONTINUITY tier 2)."""
+    return sum(1 for c in (cuts or []) if int(c) <= int(frame))
+
+
 # ---- workflow graph (PURE) -----------------------------------------------------------
 
 def build_outpaint_graph(*, input_name: str, canvas_w: int, canvas_h: int,

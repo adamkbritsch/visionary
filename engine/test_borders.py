@@ -573,3 +573,52 @@ class ExtendGate(unittest.TestCase):
                                          "is_hdr": False})
         self.assertTrue(g["needed"])
         self.assertEqual(g["geom"]["disp_w"], 640)
+
+
+class SnappedChunks(unittest.TestCase):
+    """CONTINUITY tier 2: chunk boundaries snap to scene cuts (a wing reset at an edit is
+    invisible) and chunks within one scene share a seed."""
+
+    def test_no_cuts_degrades_to_plain_plan(self):
+        for total in (81, 162, 170, 200, 1234):
+            self.assertEqual(borders.plan_chunks_snapped(total, []),
+                             borders.plan_chunks(total))
+            self.assertEqual(borders.plan_chunks_snapped(total, None),
+                             borders.plan_chunks(total))
+
+    def test_cut_inside_the_window_ends_the_chunk(self):
+        # cut at 60: chunk 1 ends there; the next starts exactly at the cut.
+        plan = borders.plan_chunks_snapped(200, [60])
+        self.assertEqual(plan[0], (0, 60))
+        self.assertEqual(plan[1][0], 60)
+
+    def test_last_cut_in_range_wins(self):
+        plan = borders.plan_chunks_snapped(300, [30, 60, 75])
+        self.assertEqual(plan[0], (0, 75))               # latest cut inside the window
+
+    def test_cut_too_close_to_start_is_ignored(self):
+        plan = borders.plan_chunks_snapped(200, [5])     # < MIN_TAIL_FRAMES from start
+        self.assertEqual(plan[0], (0, 81))
+
+    def test_cut_beyond_the_window_cannot_stretch_a_chunk(self):
+        plan = borders.plan_chunks_snapped(300, [100])   # 81 is the model window
+        self.assertEqual(plan[0], (0, 81))
+        self.assertEqual(plan[1], (81, 19))              # then snaps to the cut
+
+    def test_coverage_is_gapless_with_cuts(self):
+        for total, cuts in ((200, [60]), (300, [30, 60, 75]), (500, [100, 101, 350]),
+                            (1234, [81, 400, 1200])):
+            plan = borders.plan_chunks_snapped(total, cuts)
+            self.assertEqual(plan[0][0], 0)
+            self.assertEqual(sum(n for _, n in plan), total)
+            for (s1, n1), (s2, _) in zip(plan, plan[1:]):
+                self.assertEqual(s1 + n1, s2)
+
+    def test_scene_of(self):
+        cuts = [100, 400]
+        self.assertEqual(borders.scene_of(0, cuts), 0)
+        self.assertEqual(borders.scene_of(99, cuts), 0)
+        self.assertEqual(borders.scene_of(100, cuts), 1)   # a cut STARTS its scene
+        self.assertEqual(borders.scene_of(399, cuts), 1)
+        self.assertEqual(borders.scene_of(400, cuts), 2)
+        self.assertEqual(borders.scene_of(50, []), 0)

@@ -1563,10 +1563,12 @@ class ExtendStage(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("WAN 2.1 VACE 1.3B", msg)
 
-    def _run_mocked(self, total=170, emitted=None):
-        """The full mocked chunk loop. total=170 -> chunks [(0,81),(81,89)] (tail folds)."""
+    def _run_mocked(self, total=170, emitted=None, cuts=None, show_prompt=""):
+        """The full mocked chunk loop. total=170 -> chunks [(0,81),(81,89)] (tail folds);
+        `cuts` feeds the scene-snap planner, `show_prompt` the per-show wing prompt."""
         import re as _re
         import types
+        import settings
         import topaz
         borders = self.borders
         p, geom = self.p, self.geom
@@ -1600,7 +1602,7 @@ class ExtendStage(unittest.TestCase):
                     fh.write("g")
                 return path
 
-        chunk_lens = [n for (_s, n) in borders.plan_chunks(total)]
+        chunk_lens = [n for (_s, n) in borders.plan_chunks_snapped(total, cuts or [])]
         def fake_count(path, ffprobe=None):
             b = os.path.basename(path)
             if path == p.source_wide:
@@ -1622,6 +1624,10 @@ class ExtendStage(unittest.TestCase):
              mock.patch.object(borders, "ComfyClient", FakeClient), \
              mock.patch.object(borders, "add_pace_sample", lambda s: None), \
              mock.patch.object(topaz, "media_timing", return_value=(23.976, 7.1)), \
+             mock.patch.object(topaz, "_cached_scene_frames",
+                               return_value=list(cuts or [])), \
+             mock.patch.object(settings, "get_show_extend_prompt",
+                               return_value=show_prompt), \
              mock.patch.object(stages.subprocess, "run", side_effect=fake_run):
             ok, msg = stages.run_stage("extend", self.p,
                                        progress=(emitted.append if emitted is not None
@@ -1645,10 +1651,35 @@ class ExtendStage(unittest.TestCase):
         self.assertEqual([e["seg_done"] for e in emitted], [1, 2])
         self.assertEqual(emitted[-1]["pct"], 100)
         self.assertEqual(emitted[0]["notches"], [round(81 / 170, 4), 1.0])
-        # Per-chunk seeds differ (base+k), geometry canvas rides the graph.
+        # No scene cuts detected -> both chunks are scene 0 -> the SAME seed
+        # (continuity: chunks within one scene share their noise).
         s0 = FakeClient.submits[0]["15"]["inputs"]["seed"]
         s1 = FakeClient.submits[1]["15"]["inputs"]["seed"]
-        self.assertEqual(s1, s0 + 1)
+        self.assertEqual(s1, s0)
+
+    def test_scene_cuts_shape_chunks_and_seeds(self):
+        """CONTINUITY tier 2 through the stage: boundaries snap to a cut, and the seed
+        changes exactly at the scene change — not per chunk."""
+        ok, msg, _B, FakeClient = self._run_mocked(cuts=[100])
+        self.assertTrue(ok, msg)
+        # 170 frames, cut at 100 -> (0,81) (cut beyond window), (81,19) (snap), (100,70)
+        lens = [g["14"]["inputs"]["length"] for g in FakeClient.submits]
+        self.assertEqual(lens, [81, 19, 70])
+        seeds = [g["15"]["inputs"]["seed"] for g in FakeClient.submits]
+        self.assertEqual(seeds[0], seeds[1])              # both start in scene 0
+        self.assertEqual(seeds[2], seeds[0] + 1)          # the cut starts scene 1
+
+    def test_show_prompt_reaches_the_graph(self):
+        """CONTINUITY tier 1: the per-show wing prompt conditions every chunk; empty
+        falls back to the built-in default."""
+        ok, _m, _B, FakeClient = self._run_mocked(show_prompt="dark wood bar, neon signs")
+        self.assertTrue(ok)
+        self.assertEqual(FakeClient.submits[0]["11"]["inputs"]["text"],
+                         "dark wood bar, neon signs")
+        ok, _m, _B, FakeClient = self._run_mocked(show_prompt="")
+        self.assertTrue(ok)
+        self.assertEqual(FakeClient.submits[-1]["11"]["inputs"]["text"],
+                         self.borders.DEFAULT_PROMPT)
 
     def test_resume_skips_finished_chunks(self):
         ok, msg, _B, FakeClient = self._run_mocked()

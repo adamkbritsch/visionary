@@ -94,6 +94,13 @@ class Presets(unittest.TestCase):
         self.assertFalse(settings.get_show_extend_borders("S"))
         self.assertEqual(settings.get_show_preset("S"), "film")
 
+    def test_extend_prompt_defaults_empty_and_persists(self):
+        self.assertEqual(settings.get_show_extend_prompt("Brand New Show"), "")
+        settings.set_show_extend_prompt("S", "  dark wood bar, neon signs  ")
+        self.assertEqual(settings.get_show_extend_prompt("S"), "dark wood bar, neon signs")
+        settings.set_show_extend_prompt("S", "")                 # back to the default
+        self.assertEqual(settings.get_show_extend_prompt("S"), "")
+
     def test_replace_source_defaults_true(self):
         # Default = REPLACE (the output replaces its input); key is show name or movie title.
         self.assertTrue(settings.get_show_replace_source("Brand New Show"))

@@ -249,6 +249,12 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": key, "extend_borders": on]); await refresh()
     }
 
+    // Per-show wing prompt for the extend stage ("" = the built-in default).
+    func setExtendPrompt(_ key: String, _ text: String) async {
+        guard !key.isEmpty else { return }
+        await post("/api/show-profile", ["show": key, "extend_prompt": text]); await refresh()
+    }
+
     // Per-item (show / movie title) upload policy: master replaces the source (on) vs both kept (off).
     func setReplaceSource(_ key: String, _ on: Bool) async {
         guard !key.isEmpty else { return }
