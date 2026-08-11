@@ -1979,6 +1979,33 @@ class ResolveGate(unittest.TestCase):
         self.assertEqual(ran, ["resolve"])        # held once, then proceeded
         self.assertIn(o._skip_key(p), o._in_finisher_keys())
 
+    def test_doorstep_yields_to_an_earlier_deferred_fast_item(self):
+        """STARVATION (live-hit: Borat, 2026-08-10). A fast movie deferred at the gate is
+        promised FIRST PICK when the remux ends — but that release only runs at selection,
+        and an episode camping in the doorstep hold takes the machine within 10 s of the
+        remux ending. Its own remux then re-defers the movie, the next episode's topaz
+        outpaces that remux and camps in turn — the movie never runs. The doorstep must
+        step back to selection instead when something was deferred ahead of it."""
+        o = orch.Orchestrator(); o._enabled = True
+        o.state["finishing"] = {"stage": "remux", "ep": "S03E14"}
+        o._gate_deferred.add("Borat.mkv")                 # deferred EARLIER, still waiting
+        p = episode_paths("A", "S01E01", SRC)
+        ran = []
+        def fake_sleep(_s):                       # the gating remux ends after one hold tick
+            o.state["finishing"] = None
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(orch.time, "sleep", side_effect=fake_sleep), \
+             mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
+            o._process(p)
+        self.assertEqual(ran, [], "the episode must NOT take Resolve ahead of the deferred item")
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
+        self.assertIn("yielding", o.state.get("message") or "")
+        # ...and with nothing deferred, the same situation proceeds as before
+        # (test_process_holds_resolve_until_remux_clears pins that).
+
     def test_screen_control_off_during_gate_hold_defers(self):
         # DUAL-SYSTEM BUG: disabling Screen Control (quiet mode) WHILE an item holds in the resolve
         # gate must DEFER it — not launch Resolve when the previous remux clears. The gate hold can

@@ -2504,6 +2504,21 @@ class Orchestrator:
                     f"{ep_disp}: holding before Resolve — finishing "
                     f"{fin.get('ep') or 'the previous item'}'s remux first")
                 time.sleep(10)
+            if st == "resolve" and self._gate_deferred:
+                # STARVATION GUARD (live-hit: Borat, 2026-08-10). A fast-path item was
+                # deferred at this doorstep EARLIER with the promise of first pick — but
+                # that release only happens at SELECTION, and this episode camping in the
+                # hold above takes the machine within 10 s of the remux ending, so the run
+                # thread never gets there. Its own remux then re-defers the fast item, the
+                # next episode's topaz outpaces that remux, camps, wins again — and the
+                # movie starves for as long as the episode cadence holds. Step back to
+                # selection instead: the released fast item goes first (user-dictated),
+                # and THIS episode is re-picked right after — everything it needs is on
+                # disk, so it re-enters exactly here at first_incomplete_stage=resolve.
+                self.state["current"] = None
+                self._hold("resolve-gate",
+                    f"{ep_disp}: yielding Resolve to the item deferred ahead of it")
+                return
             if st == "resolve" and self._quiet_mode():     # flipped OFF in the instant the gate cleared —
                 self._defer_resolve(p, ep_disp); return    # never launch Resolve with Screen Control off
             self.state.update(stage=st, message=f"{ep_disp}: {st}", progress=None, hold=None)

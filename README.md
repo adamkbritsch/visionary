@@ -63,6 +63,11 @@ The easy path — no clone, no Terminal for most of it:
    both **privacy permission prompts**, the **Resolve projects + DV preset import**
    (quit Resolve first), and the optional NAS DV-probe helper with its cron line. The
    section stays expanded until every check is green, then tucks itself away.
+6. *Optional* — want [4:3 shows widened to 16:9](#11-ai-border-extension--optional-only-for-43-shows)?
+   Install the free **[Comfy Desktop](https://www.comfy.org/)** app, **launch it once**,
+   add **ComfyUI-VideoHelperSuite** from its Manager, then back in Setup use the *Border
+   extender* group's one-click downloads for the ~11.4 GB of models. Skip this and the
+   feature simply never appears — nothing else needs it.
 
 The pipeline won't arm until the hardware gate passes (see the requirements box above)
 and the dependencies exist — and it names exactly what's missing rather than failing
