@@ -57,6 +57,10 @@ Watch `resolve_version` + `topaz_version`. Both must report the exact pins
 - Remind them to disable auto-updates in both apps (the `fix` strings say this too).
 - Topaz: the one GUI login activates headless use; `topaz_version` also verifies the
   bundled ffmpeg + models landed.
+- OPTIONAL, only if they want the AI border extension (step 11): mention Comfy Desktop
+  (https://www.comfy.org/) here so it can be installed in the same sitting — free, no
+  pinned version, but it must be LAUNCHED once. Do not push it; it is unrelated to
+  everything else and preflight never checks it.
 
 ### Step 3 — Brew tools
 `brew_tools` check. Run the command from `fix` (it's in the README too). (SublerCLI +
