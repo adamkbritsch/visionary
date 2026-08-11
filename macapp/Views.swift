@@ -1881,8 +1881,9 @@ private struct ExtendBordersRow: View {
             return "Episodes not yet processed ship at their original 4:3. Nothing already made changes."
         }
         return "Adds an Extend step before the upscale \u{2014} " + projection + ". Only the "
-            + "generated side strips are AI; the original frames ship untouched. Wide "
-            + "specials inside the show skip automatically."
+            + "generated side strips are AI; the original frames ship untouched. Each episode "
+            + "is checked individually, so a show that goes widescreen in later seasons "
+            + "extends only its 4:3 episodes \u{2014} wide episodes and specials pass through."
     }
 
     var body: some View {

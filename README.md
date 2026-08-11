@@ -367,9 +367,11 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
   The option lives on each show's settings card and **only appears on shows that actually
   measure 4:3** (anamorphic DV included, via the sample aspect ratio) once the models are
-  installed — there is nothing to see on a 16:9 library. Each episode is re-checked at run
-  time, so a widescreen special inside a 4:3 show skips itself, as do movies, YouTube
-  videos and HDR sources (the model is SDR-only).
+  installed — there is nothing to see on a 16:9 library, and once a show has ANY 4:3
+  episode the option stays offered even after later seasons go widescreen (It's Always
+  Sunny switches at S06 — the classic case). Each episode is re-checked at run time, so
+  only the actually-4:3 episodes extend: wide episodes and specials skip themselves, as do
+  movies, YouTube videos and HDR sources (the model is SDR-only).
 
   It runs through **your own Comfy Desktop install, headlessly** — Visionary starts that
   ComfyUI from its own venv on a **dedicated port (8189)** and talks to the HTTP API, so

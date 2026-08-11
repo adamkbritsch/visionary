@@ -306,13 +306,20 @@ def aspect_label(width, height, sar=""):
 
 def record_show_aspect(show, label) -> None:
     """Best-effort book write ({show: "4:3"|...}) — filled by every source probe and by
-    the server's eager head-probe, read by the settings rows. Never raises."""
+    the server's eager head-probe, read by the settings rows. Never raises.
+
+    "4:3" IS STICKY. Real shows mix aspects — It's Always Sunny is 4:3 through S05 and
+    16:9 from S06 (verified against the live library) — and the book holds ONE label per
+    show, so last-probe-wins made the row VANISH mid-show the moment a wide episode was
+    probed (with the option still on underneath). A show that has ever probed 4:3 HAS 4:3
+    content: the row stays offered, and the per-episode gate already makes every wide
+    episode skip itself, so a sticky label can never extend the wrong picture."""
     if not show or label not in ("4:3", "16:9", "other"):
         return
     try:
         book = all_show_aspects()
-        if book.get(show) == label:
-            return
+        if book.get(show) == label or book.get(show) == "4:3":
+            return                          # sticky: 4:3 is never downgraded
         book[str(show)] = label
         os.makedirs(os.path.dirname(ASPECT_FILE), exist_ok=True)
         tmp = ASPECT_FILE + ".tmp"

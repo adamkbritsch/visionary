@@ -482,14 +482,25 @@ class AspectBook(unittest.TestCase):
 
     def test_book_roundtrip(self):
         self.assertIsNone(borders.show_aspect("Show"))
-        borders.record_show_aspect("Show", "4:3")
-        self.assertEqual(borders.show_aspect("Show"), "4:3")
-        borders.record_show_aspect("Show", "16:9")               # later probes can revise
+        borders.record_show_aspect("Show", "16:9")
         self.assertEqual(borders.show_aspect("Show"), "16:9")
         borders.record_show_aspect("Show", "garbage")            # junk never lands
         self.assertEqual(borders.show_aspect("Show"), "16:9")
         borders.record_show_aspect("", "4:3")
         self.assertEqual(borders.all_show_aspects(), {"Show": "16:9"})
+
+    def test_4x3_is_sticky_for_mixed_aspect_shows(self):
+        """It's Always Sunny: 4:3 through S05, 16:9 from S06 (live-verified). One label
+        per show + last-probe-wins made the row vanish mid-show the moment a wide episode
+        was probed. A show that ever probed 4:3 HAS 4:3 content — the label stays, and
+        the per-episode gate keeps wide episodes skipping themselves."""
+        borders.record_show_aspect("Sunny", "4:3")               # an S01 episode
+        borders.record_show_aspect("Sunny", "16:9")              # an S06 episode
+        self.assertEqual(borders.show_aspect("Sunny"), "4:3")    # row stays offered
+        # ...and the upgrade direction still works: 16:9 first, 4:3 later.
+        borders.record_show_aspect("Other", "16:9")
+        borders.record_show_aspect("Other", "4:3")
+        self.assertEqual(borders.show_aspect("Other"), "4:3")
 
 
 class ExtendGate(unittest.TestCase):
