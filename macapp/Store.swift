@@ -255,6 +255,13 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": key, "extend_prompt": text]); await refresh()
     }
 
+    // Forget a show's remembered wing inventions (set-reference book): the next episode
+    // re-invents fresh. Never touches finished masters.
+    func resetSetBook(_ key: String) async {
+        guard !key.isEmpty else { return }
+        await post("/api/borders/reset-set-book", ["show": key]); await refresh()
+    }
+
     // Per-item (show / movie title) upload policy: master replaces the source (on) vs both kept (off).
     func setReplaceSource(_ key: String, _ on: Bool) async {
         guard !key.isEmpty else { return }

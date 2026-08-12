@@ -1563,9 +1563,12 @@ class ExtendStage(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("WAN 2.1 VACE 1.3B", msg)
 
-    def _run_mocked(self, total=170, emitted=None, cuts=None, show_prompt=""):
+    def _run_mocked(self, total=170, emitted=None, cuts=None, show_prompt="",
+                    dhash=None):
         """The full mocked chunk loop. total=170 -> chunks [(0,81),(81,89)] (tail folds);
-        `cuts` feeds the scene-snap planner, `show_prompt` the per-show wing prompt."""
+        `cuts` feeds the scene-snap planner, `show_prompt` the per-show wing prompt,
+        `dhash` a constant probe hash (None = unhashable -> reference-free, the default).
+        The set book is always redirected to this test's tmp dir."""
         import re as _re
         import types
         import settings
@@ -1628,6 +1631,9 @@ class ExtendStage(unittest.TestCase):
                                return_value=list(cuts or [])), \
              mock.patch.object(settings, "get_show_extend_prompt",
                                return_value=show_prompt), \
+             mock.patch.object(borders, "SET_BOOK_ROOT",
+                               os.path.join(self.d, "set_book")), \
+             mock.patch.object(borders, "dhash_file", return_value=dhash), \
              mock.patch.object(stages.subprocess, "run", side_effect=fake_run):
             ok, msg = stages.run_stage("extend", self.p,
                                        progress=(emitted.append if emitted is not None
@@ -1668,6 +1674,31 @@ class ExtendStage(unittest.TestCase):
         seeds = [g["15"]["inputs"]["seed"] for g in FakeClient.submits]
         self.assertEqual(seeds[0], seeds[1])              # both start in scene 0
         self.assertEqual(seeds[2], seeds[0] + 1)          # the cut starts scene 1
+
+    def test_set_references_chain_within_and_across_scenes(self):
+        """CONTINUITY tier 3 through the stage: a NEW set's first chunk generates
+        reference-free and registers its widened frame; the rest of its scene chains
+        off it, and a later scene that MATCHES the set reuses it — one book entry."""
+        ok, msg, _B, FakeClient = self._run_mocked(cuts=[100], dhash=0xBEEF)
+        self.assertTrue(ok, msg)
+        subs = FakeClient.submits                        # scenes: 0, 0, 1
+        self.assertNotIn("19", subs[0])                  # unknown set -> reference-free
+        self.assertEqual(subs[1]["14"]["inputs"]["reference_image"], ["19", 0])
+        self.assertEqual(subs[1]["19"]["inputs"]["image"], "setref_0000.png")
+        self.assertEqual(subs[2]["19"]["inputs"]["image"], "setref_0001.png")
+        with mock.patch.object(self.borders, "SET_BOOK_ROOT",
+                               os.path.join(self.d, "set_book")):
+            self.assertEqual(self.borders.set_count(self.p.series), 1)  # matched, not re-added
+
+    def test_unhashable_probes_stay_reference_free(self):
+        # cv2 can't read the fake frames (dhash None): every chunk generates without a
+        # reference and NOTHING lands in the book — fail open, never park.
+        ok, _m, _B, FakeClient = self._run_mocked(cuts=[100])
+        self.assertTrue(ok)
+        self.assertTrue(all("19" not in g for g in FakeClient.submits))
+        with mock.patch.object(self.borders, "SET_BOOK_ROOT",
+                               os.path.join(self.d, "set_book")):
+            self.assertEqual(self.borders.set_count(self.p.series), 0)
 
     def test_show_prompt_reaches_the_graph(self):
         """CONTINUITY tier 1: the per-show wing prompt conditions every chunk; empty

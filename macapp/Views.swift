@@ -1714,6 +1714,9 @@ private struct TVMode: View {
                     ExtendBordersRow(key: name, on: show.extend_borders ?? false)
                     if show.extend_borders == true {
                         ExtendPromptRow(key: name, prompt: show.extend_prompt ?? "")
+                        if (show.extend_sets ?? 0) > 0 {
+                            ExtendSetMemoryRow(key: name, sets: show.extend_sets ?? 0)
+                        }
                     }
                 }
             }
@@ -1962,6 +1965,42 @@ private struct ExtendPromptRow: View {
     }
 }
 
+// The show's SET MEMORY (continuity): how many distinct sets the extender has learned
+// wings for. Rendered only when the book is non-empty; Reset is the recovery lever when
+// the AI took a set a wrong direction — the next episode re-invents fresh.
+private struct ExtendSetMemoryRow: View {
+    @EnvironmentObject var store: AppStore
+    let key: String
+    let sets: Int
+    @State private var confirming = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "square.grid.2x2").font(.system(size: 10)).foregroundStyle(DS.steelDim)
+            Text("Set memory: \(sets) set\(sets == 1 ? "" : "s")")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .help("Wing inventions the extender has learned for this show's recurring "
+                      + "sets \u{2014} reused across scenes and episodes so the generated "
+                      + "borders stay consistent.")
+            Button("Reset") { confirming = true }
+                .buttonStyle(.plain).font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.brand)
+            Spacer()
+        }
+        .padding(.leading, 20)
+        .confirmationDialog("Forget this show's \(sets) remembered set\(sets == 1 ? "" : "s")?",
+                            isPresented: $confirming, titleVisibility: .visible) {
+            Button("Reset set memory", role: .destructive) {
+                Task { await store.resetSetBook(key) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Future episodes re-invent the borders fresh and re-learn from there. "
+                 + "Episodes already made are untouched.")
+        }
+    }
+}
+
 // Per-slot "Up next" row: the show queued to take THIS slot the moment its current show
 // finishes (clean handoff — no interleaving). Deliberately NOT gated by the run lock: the
 // slot's CURRENT show can't be swapped mid-run, but queueing what comes AFTER only records
@@ -2023,6 +2062,9 @@ private struct NextUpRow: View {
                         ExtendBordersRow(key: n, on: profile?.extend_borders ?? false)
                         if profile?.extend_borders == true {
                             ExtendPromptRow(key: n, prompt: profile?.extend_prompt ?? "")
+                            if (profile?.extend_sets ?? 0) > 0 {
+                                ExtendSetMemoryRow(key: n, sets: profile?.extend_sets ?? 0)
+                            }
                         }
                     }
                     if profile?.has_featurettes == true {

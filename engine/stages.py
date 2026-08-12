@@ -473,6 +473,83 @@ def _extend(p, abort, progress=None):
         return False, "border extend: ComfyUI did not come up — " + (tail or "no output")
     client = borders.ComfyClient(backend.base)
     done_frames, done_chunks = 0, 0
+    # SET-REFERENCE BOOK (continuity tier 3): per scene, recognize the set (dHash of a
+    # probe frame vs the show's persisted book) and feed its remembered widened frame
+    # into WanVaceToVideo's reference_image — the model then keeps inventing THE SAME
+    # wings for that set, within the episode and across every future one. An unknown
+    # set generates its first chunk reference-free, REGISTERS the result, and the rest
+    # of the scene (and all future matches) chain off it. Every failure path degrades
+    # to reference-free generation. The book is deliberately NOT in the resume manifest:
+    # it only ever grows, matching is deterministic, and completed chunks never re-run —
+    # a resume reuses exactly the references the failed attempt persisted. KNOWN MINOR:
+    # a resume that lands mid-scene re-probes from a LATER chunk's frame — if that frame
+    # hashes far from the scene's original probe (wide shot vs closeup), the rest of the
+    # scene may generate reference-free or register a second entry for the set. Rare
+    # (needs a deploy/crash mid-scene), self-limiting (the book match is re-tried per
+    # scene), and always fail-open.
+    set_book = borders.load_set_book(p.series)
+    scene_refs: dict = {}       # scene -> reference filename in in_dir (None = none yet)
+    scene_hash: dict = {}       # scene -> the probe frame's dHash (for registration)
+
+    def _scene_reference(sc, chunk_in, n):
+        """Resolve this scene's reference (cached). Never raises."""
+        if sc in scene_refs:
+            return scene_refs[sc]
+        ref_name = None
+        try:
+            probe = os.path.join(backend.in_dir, f"probe_{sc:04d}.png")
+            r = subprocess.run(borders.extract_frame_cmd(chunk_in, probe, n // 2),
+                               capture_output=True, text=True, timeout=120)
+            h = borders.dhash_file(probe) if r.returncode == 0 else None
+            scene_hash[sc] = h
+            m = borders.match_set(set_book, h)
+            if m:
+                # Copy FIRST, name after: the book PNG can vanish between the stage-start
+                # load and this moment (a Reset mid-run, hours later) — a failed copy
+                # must degrade to reference-free, never cache a phantom filename that
+                # ComfyUI's LoadImage validation would reject on every chunk of the scene.
+                dst = f"setref_{sc:04d}.png"
+                shutil.copyfile(m["path"], os.path.join(backend.in_dir, dst))
+                ref_name = dst
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+        except Exception:
+            scene_hash.setdefault(sc, None)
+        scene_refs[sc] = ref_name
+        return ref_name
+
+    def _register_scene(sc, gen, n):
+        """A new set's first chunk just generated reference-free: remember its widened
+        canvas frame so the REST of the scene (and every future episode's matches)
+        reproduces the same wings. Never raises."""
+        nonlocal set_book
+        try:
+            if scene_hash.get(sc) is None:
+                return
+            # Re-match against the CURRENT book first: if an earlier attempt registered
+            # this set but its in_dir copy failed (ENOSPC, review-caught), the entry
+            # already exists — reuse it rather than appending a duplicate per chunk.
+            entry = borders.match_set(borders.load_set_book(p.series), scene_hash[sc])
+            canvas = os.path.join(backend.out_dir, f"canvas_{sc:04d}.png")
+            if entry is None:
+                r = subprocess.run(borders.extract_frame_cmd(gen, canvas, n // 2),
+                                   capture_output=True, text=True, timeout=120)
+                entry = (borders.register_set(p.series, scene_hash[sc], canvas)
+                         if r.returncode == 0 else None)
+            try:
+                os.remove(canvas)
+            except OSError:
+                pass
+            if entry:
+                set_book = borders.load_set_book(p.series)
+                ref_name = f"setref_{sc:04d}.png"
+                shutil.copyfile(entry["path"], os.path.join(backend.in_dir, ref_name))
+                scene_refs[sc] = ref_name
+        except Exception:
+            pass
+
     try:
         for k, (start, n) in enumerate(chunks):
             wide_k = os.path.join(segdir, f"wide_{k:04d}.mp4")
@@ -490,13 +567,15 @@ def _extend(p, abort, progress=None):
                                capture_output=True, text=True, timeout=1800)
             if r.returncode != 0:
                 return False, "border extend: chunk extract failed — " + _err_tail(r.stderr)
+            sc = borders.scene_of(start, cuts)
             graph = borders.build_outpaint_graph(
                 input_name=os.path.basename(chunk_in),
                 canvas_w=geom["canvas_w"], canvas_h=geom["canvas_h"],
                 pad_left=geom["pad_work"], pad_right=geom["pad_work"],
                 length=n, fps=float(fps),
-                seed=seed_base + borders.scene_of(start, cuts),   # per-SCENE, not per-chunk
-                filename_prefix=f"gen_{k:04d}", prompt=eff_prompt)
+                seed=seed_base + sc,                              # per-SCENE, not per-chunk
+                filename_prefix=f"gen_{k:04d}", prompt=eff_prompt,
+                reference_name=_scene_reference(sc, chunk_in, n))
             hist = client.wait(client.submit(graph), backend=backend, abort=abort)
             gen = borders.ComfyClient.output_file(hist, backend.out_dir)
             if not gen or not os.path.exists(gen):
@@ -512,6 +591,8 @@ def _extend(p, abort, progress=None):
                 return False, (f"border extend: composite failed for chunk {k} — "
                                + _err_tail(r.stderr or f"{got}/{n} frames"))
             os.replace(part, wide_k)
+            if scene_refs.get(sc) is None:               # a NEW set: remember its wings
+                _register_scene(sc, gen, n)
             for f in (chunk_in, gen):                    # per-chunk temps: keep the dir lean
                 try: os.remove(f)
                 except OSError: pass

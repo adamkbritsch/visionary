@@ -622,3 +622,95 @@ class SnappedChunks(unittest.TestCase):
         self.assertEqual(borders.scene_of(399, cuts), 1)
         self.assertEqual(borders.scene_of(400, cuts), 2)
         self.assertEqual(borders.scene_of(50, []), 0)
+
+
+class SetBook(unittest.TestCase):
+    """CONTINUITY tier 3: the per-show set-reference book — recognize a set by dHash,
+    remember its widened canvas frame, feed it back as WanVaceToVideo's reference."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="borders-setbook-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(borders, "SET_BOOK_ROOT", os.path.join(self.tmp, "book"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _png(self, name, reverse=False):
+        import numpy as np
+        import cv2
+        path = os.path.join(self.tmp, name)
+        row = np.linspace(0, 255, 64, dtype="uint8")
+        if reverse:
+            row = row[::-1]                       # dHash measures horizontal gradients
+        cv2.imwrite(path, np.tile(row, (48, 1)))
+        return path
+
+    def test_dhash_and_hamming(self):
+        a = borders.dhash_file(self._png("a.png"))
+        b = borders.dhash_file(self._png("b.png"))            # identical content
+        c = borders.dhash_file(self._png("c.png", reverse=True))
+        self.assertIsNotNone(a)
+        self.assertEqual(borders.hamming(a, b), 0)
+        self.assertGreater(borders.hamming(a, c), borders.SET_MATCH_MAX_DIST)
+        self.assertIsNone(borders.dhash_file(os.path.join(self.tmp, "missing.png")))
+
+    def test_register_match_roundtrip(self):
+        canvas = self._png("canvas.png")
+        self.assertEqual(borders.load_set_book("Sunny"), [])
+        e = borders.register_set("Sunny", 0xABCD, canvas)
+        self.assertIsNotNone(e)
+        self.assertTrue(os.path.exists(e["path"]))
+        book = borders.load_set_book("Sunny")
+        self.assertEqual(len(book), 1)
+        self.assertEqual(borders.match_set(book, 0xABCD)["id"], e["id"])
+        self.assertEqual(borders.match_set(book, 0xABCD ^ 0x3), book[0])   # 2 bits off
+        self.assertIsNone(borders.match_set(book, 0xABCD ^ ((1 << 20) - 1)))  # 20 bits
+        self.assertIsNone(borders.match_set(book, None))    # unhashable probe never matches
+        self.assertEqual(borders.set_count("Sunny"), 1)
+        self.assertEqual(borders.set_count("Other Show"), 0)   # books are per show
+
+    def test_missing_reference_png_drops_the_entry(self):
+        e = borders.register_set("S", 1, self._png("c1.png"))
+        os.remove(e["path"])                       # the reference IS the value
+        self.assertEqual(borders.load_set_book("S"), [])
+
+    def test_cap_and_reset(self):
+        canvas = self._png("c.png")
+        with mock.patch.object(borders, "MAX_SETS_PER_SHOW", 2):
+            self.assertIsNotNone(borders.register_set("S", 1, canvas))
+            self.assertIsNotNone(borders.register_set("S", 2, canvas))
+            self.assertIsNone(borders.register_set("S", 3, canvas))   # cap
+        self.assertEqual(borders.reset_set_book("S"), (2, True))
+        self.assertEqual(borders.set_count("S"), 0)
+        self.assertEqual(borders.reset_set_book("S"), (0, True))   # idempotent
+
+    def test_slug_never_escapes_and_never_collides(self):
+        # ".." as a show name once resolved to ~/.topaz-pipeline itself — reset would
+        # have rmtree'd the whole config dir (review-caught). And punctuation twins must
+        # not share a book, or resetting one cross-wipes the other.
+        for evil in ("..", ".", "...", "", "___"):
+            d = borders.set_book_dir(evil)
+            self.assertTrue(d.startswith(borders.SET_BOOK_ROOT + os.sep), evil)
+            self.assertNotIn("..", os.path.relpath(d, borders.SET_BOOK_ROOT), evil)
+        self.assertNotEqual(borders.set_book_dir("Show: Part 1"),
+                            borders.set_book_dir("Show Part 1"))
+        self.assertEqual(borders.set_book_dir("Sunny"), borders.set_book_dir("Sunny"))
+
+    def test_extract_frame_cmd(self):
+        cmd = borders.extract_frame_cmd("/c.mp4", "/f.png", 40)
+        self.assertIn("select=eq(n\\,40)", " ".join(cmd))
+        self.assertEqual(cmd[-1], "/f.png")
+
+    def test_graph_reference_wiring(self):
+        g = borders.build_outpaint_graph(
+            input_name="c.mp4", canvas_w=880, canvas_h=480, pad_left=120,
+            pad_right=120, length=81, fps=24.0, seed=1, filename_prefix="o",
+            reference_name="setref_0001.png")
+        self.assertEqual(g["19"]["class_type"], "LoadImage")
+        self.assertEqual(g["19"]["inputs"]["image"], "setref_0001.png")
+        self.assertEqual(g["14"]["inputs"]["reference_image"], ["19", 0])
+        g2 = borders.build_outpaint_graph(
+            input_name="c.mp4", canvas_w=880, canvas_h=480, pad_left=120,
+            pad_right=120, length=81, fps=24.0, seed=1, filename_prefix="o")
+        self.assertNotIn("19", g2)                            # absent, not disabled
+        self.assertNotIn("reference_image", g2["14"]["inputs"])

@@ -151,6 +151,7 @@ def series_info():
                       # AND the top-level borders_ready is true (hide-inert-UI).
                       "extend_borders": settings.get_show_extend_borders(nm),
                       "extend_prompt": settings.get_show_extend_prompt(nm),
+                      "extend_sets": borders.set_count(nm),
                       "aspect": borders.show_aspect(nm),
                       # what it will ACTUALLY master as — the app shows this, not "auto"
                       "output_mode_effective": settings.effective_output_mode(
@@ -612,6 +613,7 @@ def show_settings_view(name) -> dict:
             "output_mode_effective": settings.effective_output_mode(name, _hdr_hint(name)),
             "extend_borders": settings.get_show_extend_borders(name),
             "extend_prompt": settings.get_show_extend_prompt(name),
+            "extend_sets": borders.set_count(name),
             "aspect": borders.show_aspect(name)}
 
 
@@ -664,6 +666,7 @@ def show_profile_info(show=None):
             "extend_borders": (settings.get_show_extend_borders(target)
                                if target else False),
             "extend_prompt": settings.get_show_extend_prompt(target) if target else "",
+            "extend_sets": borders.set_count(target) if target else 0,
             "aspect": borders.show_aspect(target) if target else None,
             "preset": settings.show_preset_key(target) if target else settings.DEFAULT_PRESET,
             "unwatched_first": settings.get_show_unwatched_first(target) if target else True,
@@ -1349,6 +1352,19 @@ class Handler(BaseHTTPRequestHandler):
             out = setup_jobs.start(what, argv=argv)
             _invalidate_preflight()          # a finished job re-detects on next preflight
             self._json(out, code=(409 if out.get("error") == "busy" else 200))
+        elif path == "/api/borders/reset-set-book":
+            # Forget a show's remembered wing inventions (set-reference book) — the
+            # lever when the AI took a set a wrong direction. The next episode
+            # re-invents fresh and re-registers. Never touches finished masters.
+            import borders
+            show = (body.get("show") if isinstance(body, dict) else "") or ""
+            if not show:
+                return self._json({"error": "no show given"}, 400)
+            removed, ok = borders.reset_set_book(show)
+            # ok=False -> the book dir would not fully delete (permissions): say so
+            # instead of letting the row silently reappear after a "successful" reset.
+            self._json({"show": show, "removed": removed, "ok": ok},
+                       code=(200 if ok else 500))
         elif path == "/api/setup/import-resolve":
             out = api_import_resolve()
             self._json(out, code=(409 if out.get("error") == "resolve-running" else 200))

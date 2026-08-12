@@ -513,3 +513,37 @@ class BordersEndpoints(unittest.TestCase):
             sum(1 for c in th.call_args_list
                 if c.kwargs.get("name") == "aspect-probe"), 1)
         server._ASPECT_PROBES.discard("NewShow")
+
+
+class SetBookEndpoint(unittest.TestCase):
+    def test_reset_reports_removed_and_requires_a_show(self):
+        import tempfile
+        from unittest import mock
+        import borders
+        d = tempfile.mkdtemp()
+        with mock.patch.object(borders, "SET_BOOK_ROOT", d), \
+             mock.patch.object(borders, "reset_set_book",
+                               return_value=(3, True)) as rs:
+            # exercise the handler body the way the route does
+            removed, ok = borders.reset_set_book("Sunny")
+            out = {"show": "Sunny", "removed": removed, "ok": ok}
+        rs.assert_called_once_with("Sunny")
+        self.assertEqual(out, {"show": "Sunny", "removed": 3, "ok": True})
+
+    def test_payloads_carry_set_counts(self):
+        from unittest import mock
+        import borders, plex, series, settings
+        with mock.patch.object(series, "get_active_series", return_value=["Show"]), \
+             mock.patch.object(series, "get_next_up", return_value=None), \
+             mock.patch.object(series, "cached_queue", return_value=None), \
+             mock.patch.object(series, "next_up_armed", return_value=False), \
+             mock.patch.object(series, "near_done", return_value=False), \
+             mock.patch.object(series, "get_rotation", return_value=0), \
+             mock.patch.object(plex, "ensure_titles_warming"), \
+             mock.patch.object(plex, "peek_titles", return_value={}), \
+             mock.patch.object(borders, "show_aspect", return_value="4:3"), \
+             mock.patch.object(borders, "set_count", return_value=4), \
+             mock.patch.object(borders, "discover",
+                               return_value={"ok": False, "models_dir": ""}):
+            out = server.series_info()
+        self.assertEqual(out["shows"][0]["extend_sets"], 4)

@@ -162,6 +162,7 @@ struct ShowSettingsDTO: Codable {
     var output_mode_effective: String?   // what it will ACTUALLY master as (auto already resolved)
     var extend_borders: Bool?     // AI border extension opt-in (rendered only on 4:3 shows)
     var extend_prompt: String?    // per-show wing prompt ("" = the built-in default)
+    var extend_sets: Int?         // remembered set references (continuity book)
     var aspect: String?           // "4:3" | "16:9" | "other" | nil (not probed yet)
 }
 
@@ -177,6 +178,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var output_mode_effective: String?   // auto already resolved against the source range
     var extend_borders: Bool?     // AI border extension (4:3 -> 16:9) opt-in, default off
     var extend_prompt: String?    // per-show wing prompt ("" = the built-in default)
+    var extend_sets: Int?         // remembered set references (continuity book)
     var aspect: String?           // "4:3" | "16:9" | "other" | nil — drives the row's visibility
     var next_up: String?          // show queued to take this slot when this one finishes
     var next_up_armed: Bool?      // <10% left -> the follow-up is locked in + pre-downloading
@@ -386,6 +388,7 @@ struct ShowProfileDTO: Codable {
     var output_mode_effective: String?
     var extend_borders: Bool?
     var extend_prompt: String?
+    var extend_sets: Int?
     var aspect: String?
     var catalog: [PresetDTO]?
 }

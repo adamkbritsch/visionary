@@ -373,6 +373,16 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   only the actually-4:3 episodes extend: wide episodes and specials skip themselves, as do
   movies, YouTube videos and HDR sources (the model is SDR-only).
 
+  **Continuity is engineered, not hoped for.** Chunk boundaries snap to scene cuts (a
+  wing "reset" that lands on an edit is invisible) and every chunk within a scene shares
+  its seed. A per-show **wing prompt** on the settings card gently biases what the wings
+  contain. And a persistent **set memory**: the first time a recurring set is extended,
+  its invented wings are remembered (a reference frame per set, recognized by perceptual
+  hash) and fed back as VACE reference conditioning — so Paddy's Pub gets *the same*
+  invented bar in every scene and every episode, not a fresh hallucination each time.
+  The settings card shows how many sets a show has learned, with a Reset if the AI ever
+  takes one in a direction you don't like (already-made episodes are untouched).
+
   It runs through **your own Comfy Desktop install, headlessly** — Visionary starts that
   ComfyUI from its own venv on a **dedicated port (8189)** and talks to the HTTP API, so
   the Comfy app you use normally, and its port 8188, are never touched. **The Comfy

@@ -22,6 +22,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -432,18 +433,164 @@ def scene_of(frame, cuts) -> int:
     return sum(1 for c in (cuts or []) if int(c) <= int(frame))
 
 
+# ---- set-reference book (CONTINUITY tier 3) ------------------------------------------
+# Persistent invented geometry: the first time a set is extended, the widened canvas
+# frame is SAVED; later scenes — and later EPISODES — that look like the same set feed it
+# into WanVaceToVideo's reference_image, so the model keeps inventing THE SAME wings.
+# Recognition is a 64-bit dHash of a scene's source frame (cv2, no ML deps); matching is
+# conservative (SET_MATCH_MAX_DIST) because a WRONG set's reference is worse than none —
+# every failure path degrades to reference-free generation, never an error.
+
+SET_BOOK_ROOT = os.path.expanduser("~/.topaz-pipeline/set_book")
+SET_MATCH_MAX_DIST = 10         # Hamming bits out of 64 — conservative on purpose
+MAX_SETS_PER_SHOW = 200         # closeup-heavy scenes register noise entries; cap the book
+
+
+def dhash_file(path, hash_size: int = 8):
+    """64-bit difference hash of an image file, or None if unreadable. Lighting-tolerant
+    enough for "is this the same sitcom set" at a conservative threshold."""
+    try:
+        import cv2
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        r = cv2.resize(img, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+        bits = 0
+        for y in range(hash_size):
+            for x in range(hash_size):
+                bits = (bits << 1) | (1 if int(r[y, x]) > int(r[y, x + 1]) else 0)
+        return bits
+    except Exception:
+        return None
+
+
+def hamming(a: int, b: int) -> int:
+    return bin(int(a) ^ int(b)).count("1")
+
+
+def extract_frame_cmd(src: str, dst_png: str, frame_idx: int, ffmpeg: str = FFMPEG) -> list:
+    """ONE frame of a video as a PNG (scene probe frames + canvas reference frames)."""
+    return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", src,
+            "-vf", f"select=eq(n\\,{int(frame_idx)})", "-frames:v", "1",
+            "-fps_mode", "passthrough", dst_png]
+
+
+def _show_slug(show) -> str:
+    """Filesystem-safe PER-SHOW key. Two hard requirements (review-caught): a name like
+    ".." must never become a path component (set_book_dir/".." is ~/.topaz-pipeline
+    itself — reset would rmtree the whole config dir), and two titles differing only by
+    punctuation ("Show: Part 1" / "Show Part 1") must never share a book (reset would
+    cross-wipe) — hence the crc32 of the EXACT title in the suffix."""
+    import zlib
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(show or "")).strip("_")[:64]
+    if not base.strip("._-"):
+        base = "show"                     # dot/dash-only names carry no safe characters
+    return f"{base}_{zlib.crc32(str(show or '').encode('utf-8')) & 0xFFFFFFFF:08x}"
+
+
+def set_book_dir(show) -> str:
+    return os.path.join(SET_BOOK_ROOT, _show_slug(show))
+
+
+def load_set_book(show) -> list:
+    """[{"id", "hash" (int), "path" (existing PNG)}] — entries whose PNG vanished are
+    skipped (the reference IS the value; a hash alone can't condition anything)."""
+    try:
+        with open(os.path.join(set_book_dir(show), "book.json")) as f:
+            raw = (json.load(f) or {}).get("sets") or []
+    except Exception:
+        return []
+    out = []
+    for e in raw:
+        try:
+            path = os.path.join(set_book_dir(show), e["file"])
+            if os.path.exists(path):
+                out.append({"id": int(e["id"]), "hash": int(str(e["hash"]), 16),
+                            "path": path})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def match_set(book, h, max_dist: int = SET_MATCH_MAX_DIST):
+    """The closest set within the threshold, or None. `h` None (unhashable probe) never
+    matches — fail open to reference-free generation."""
+    if h is None:
+        return None
+    best, best_d = None, max_dist + 1
+    for e in book or []:
+        d = hamming(e["hash"], h)
+        if d < best_d:
+            best, best_d = e, d
+    return best
+
+
+def register_set(show, h, canvas_png):
+    """Add a NEW set: copy the widened canvas frame into the book and append its entry.
+    Returns the entry ({"id","hash","path"}) or None (cap reached / any failure)."""
+    if h is None or not os.path.exists(canvas_png or ""):
+        return None
+    try:
+        d = set_book_dir(show)
+        os.makedirs(d, exist_ok=True)
+        bj = os.path.join(d, "book.json")
+        try:
+            with open(bj) as f:
+                raw = (json.load(f) or {}).get("sets") or []
+        except Exception:
+            raw = []
+        if len(raw) >= MAX_SETS_PER_SHOW:
+            return None
+        nid = 1 + max([int(e.get("id", 0)) for e in raw] or [0])
+        fname = f"set_{nid:03d}.png"
+        shutil.copyfile(canvas_png, os.path.join(d, fname))
+        raw.append({"id": nid, "hash": f"{int(h):016x}", "file": fname,
+                    "created": int(time.time())})
+        tmp = bj + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"sets": raw}, f)
+        os.replace(tmp, bj)
+        return {"id": nid, "hash": int(h), "path": os.path.join(d, fname)}
+    except Exception:
+        return None
+
+
+def set_count(show) -> int:
+    return len(load_set_book(show))
+
+
+def reset_set_book(show):
+    """Forget a show's remembered sets (the lever when the wings went a wrong direction —
+    the next episode re-invents fresh). Returns (removed, ok): recounted AFTER the
+    delete, so a failed rmtree reports (0..n, False) instead of pretending success
+    (review-caught: ignore_errors + a pre-count made a permissions failure look like a
+    clean reset while the row quietly reappeared)."""
+    before = set_count(show)
+    shutil.rmtree(set_book_dir(show), ignore_errors=True)
+    after = set_count(show)
+    return before - after, after == 0
+
+
 # ---- workflow graph (PURE) -----------------------------------------------------------
 
 def build_outpaint_graph(*, input_name: str, canvas_w: int, canvas_h: int,
                          pad_left: int, pad_right: int, length: int, fps: float,
                          seed: int, filename_prefix: str,
                          prompt: str = DEFAULT_PROMPT,
-                         negative: str = DEFAULT_NEGATIVE) -> dict:
+                         negative: str = DEFAULT_NEGATIVE,
+                         reference_name: str = None) -> dict:
     """The API-format prompt graph — the bundled template's 1.3B/CausVid path with the
     demo I/O swapped for LoadVideo -> ... -> VHS_VideoCombine (flat widgets; core
     SaveVideo's DynamicCombo codec input is hostile to hand-serialization).
     ImagePadForOutpaint emits ONE 2D mask regardless of batch — hence the
-    MaskToImage -> RepeatImageBatch(length) -> ImageToMask chain (as the template does)."""
+    MaskToImage -> RepeatImageBatch(length) -> ImageToMask chain (as the template does).
+
+    `reference_name` (CONTINUITY tier 3): a set's remembered widened frame, already
+    copied into the job's input dir. It rides WanVaceToVideo's optional reference_image —
+    VAE-encoded and PREPENDED to the latent, auto-resized to the canvas, and removed
+    again by trim_latent (which node 16 already consumes), so the output frame count is
+    untouched (all verified against the installed 0.30.2 execute())."""
+    ref = ({"reference_image": ["19", 0]} if reference_name else {})
     vace = MODELS["borders_vace"]["rel"].split("/")[-1]
     umt5 = MODELS["borders_umt5"]["rel"].split("/")[-1]
     lora = MODELS["borders_causvid"]["rel"].split("/")[-1]
@@ -478,7 +625,7 @@ def build_outpaint_graph(*, input_name: str, canvas_w: int, canvas_h: int,
                "inputs": {"positive": ["11", 0], "negative": ["12", 0],
                           "vae": ["13", 0], "width": canvas_w, "height": canvas_h,
                           "length": length, "batch_size": 1, "strength": 1.0,
-                          "control_video": ["3", 0], "control_masks": ["6", 0]}},
+                          "control_video": ["3", 0], "control_masks": ["6", 0], **ref}},
         "15": {"class_type": "KSampler",
                "inputs": {"model": ["10", 0], "seed": seed, "steps": STEPS, "cfg": CFG,
                           "sampler_name": SAMPLER, "scheduler": SCHEDULER,
@@ -488,6 +635,8 @@ def build_outpaint_graph(*, input_name: str, canvas_w: int, canvas_h: int,
                                                            "trim_amount": ["14", 3]}},
         "17": {"class_type": "VAEDecode", "inputs": {"samples": ["16", 0],
                                                      "vae": ["13", 0]}},
+        **({"19": {"class_type": "LoadImage",
+                   "inputs": {"image": reference_name}}} if reference_name else {}),
         "18": {"class_type": "VHS_VideoCombine",
                "inputs": {"images": ["17", 0], "frame_rate": fps, "loop_count": 0,
                           "filename_prefix": filename_prefix,
