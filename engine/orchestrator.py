@@ -2683,8 +2683,11 @@ class Orchestrator:
                     ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
                                         # topaz yields to 2 live remuxes AND to a gate-released
                                         # fast item whose Resolve is now clear to run alone
+                                        # topaz yields to 2 live remuxes, to a gate-released
+                                        # fast item, and to a "run this video now" request
                                         should_pause=lambda: (self._dual_remux_live()
-                                                              or self._gate_release_pending()))
+                                                              or self._gate_release_pending()
+                                                              or self._yt_priority_waiting()))
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
@@ -2715,7 +2718,11 @@ class Orchestrator:
                 # lane frees, then it's re-selected and topaz resumes from its completed segments.
                 if str(msg).startswith("paused:"):
                     self.state["current"] = None
-                    if self._gate_release_pending():
+                    if self._yt_priority_waiting():
+                        self._hold("yt-priority",
+                            f"{ep_disp}: paused at a segment boundary — running the "
+                            f"YouTube video you moved up next (this resumes after)")
+                    elif self._gate_release_pending():
                         self._hold("resolve-gate",
                             f"{ep_disp}: topaz paused at a segment boundary — a waiting "
                             f"item's Resolve gets the machine (topaz resumes after)")
@@ -2938,6 +2945,24 @@ class Orchestrator:
         if self._drain_backlog() < 2:
             return False
         return (time.time() - self._last_resolve_at) < BACKLOG_WAIT_GRACE_SECONDS
+
+    def _yt_priority_waiting(self) -> bool:
+        """A YouTube video has been told to run NOW and is ready — so the in-flight item
+        should yield at its next SAFE boundary and let the run loop re-select it.
+
+        Cheap by construction (book-only, no staging scan) because this is polled between
+        Topaz segments. Never fires for the item already running: the current YouTube video
+        IS the priority pick while it processes, and yielding to itself would loop."""
+        try:
+            import youtube
+            cur = self.state.get("current") or {}
+            skip = set()
+            name = cur.get("name") or ""
+            if name:
+                skip.add(os.path.splitext(name)[0])
+            return youtube.has_priority_ready(skip=skip)
+        except Exception:
+            return False
 
     def _gate_release_pending(self) -> bool:
         """A fast-path item deferred at the resolve doorstep can enter NOW (the gating

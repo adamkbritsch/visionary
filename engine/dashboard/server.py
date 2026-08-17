@@ -449,6 +449,28 @@ def api_youtube_queue(body):
         youtube.clear_queue(); reconfigure = True
     elif action == "preset":                    # preset keyed by the channel FOLDER name
         settings.set_show_preset((body.get("folder") or "").strip(), (body.get("preset") or "").strip())
+    elif action == "prioritize":
+        # "Run this video now": promote it to the priority book (cadence-exempt, ahead of
+        # due movies) and ask the in-flight item to YIELD at its next safe boundary — a
+        # Topaz segment boundary, so at most one ~90 s segment is redone. A download is
+        # left to finish (aborting throws away GB) and Resolve is never interrupted, so
+        # the response says when it will actually start.
+        vid = (body.get("vid") or body.get("id") or "").strip()
+        if not vid:
+            name = (body.get("name") or "").strip()
+            vid = youtube.video_id(name) if name else ""
+        if not vid:
+            return {"error": "no-video", "detail": "need a video id or filename"}
+        out = youtube.prioritize_pending(vid)
+        if out.get("status") in ("queued", "already-first"):
+            o = orchestrator.ORCH.snapshot()
+            stage = (o.get("stage") or "") if o.get("running") else ""
+            out["current_stage"] = stage
+            out["starts"] = {"topaz": "at the current segment boundary (about a minute)",
+                             "resolve": "after the current Dolby Vision pass finishes",
+                             "download": "after the current download finishes",
+                             }.get(stage, "next")
+        return out
     elif action == "delete":
         # per-video skip/delete: works from the queue rows (channel folder) OR the
         # currently-processing header. Resolves the channelId from the folder when the

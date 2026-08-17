@@ -3184,3 +3184,67 @@ class ParkSweepsItsWorkingSet(unittest.TestCase):
              mock.patch.object(o, "_hold"):
             o._park_item(p, "S01E01", 5, "topaz", "boom")   # must not raise
         self.assertIn(o._skip_key(p), o._parked)            # the park still took effect
+
+
+class YoutubePreemption(unittest.TestCase):
+    """"Run this video now" must actually STOP the current item — at a SAFE boundary. Topaz
+    yields at its next segment (losing at most one ~90 s segment), and the hold says why;
+    Resolve is never interrupted and a download is left to finish."""
+
+    def _orch(self, current=None):
+        o = orch.Orchestrator()
+        o.state["current"] = current or {}
+        return o
+
+    def test_waiting_probe_ignores_the_video_already_running(self):
+        import youtube
+        o = self._orch({"kind": "youtube", "name": "clip [aaaaaaaaaa1].mp4"})
+        seen = {}
+        def fake(skip=()):
+            seen["skip"] = set(skip)
+            return False
+        with mock.patch.object(youtube, "has_priority_ready", side_effect=fake):
+            self.assertFalse(o._yt_priority_waiting())
+        self.assertEqual(seen["skip"], {"clip [aaaaaaaaaa1]"})   # its own stem is skipped
+
+    def test_waiting_probe_fires_for_a_different_video(self):
+        import youtube
+        o = self._orch({"kind": "episode", "ep": "S01E01"})
+        with mock.patch.object(youtube, "has_priority_ready", return_value=True):
+            self.assertTrue(o._yt_priority_waiting())
+
+    def test_probe_failure_never_preempts(self):
+        import youtube
+        o = self._orch()
+        with mock.patch.object(youtube, "has_priority_ready",
+                               side_effect=RuntimeError("book unreadable")):
+            self.assertFalse(o._yt_priority_waiting())
+
+    def test_topaz_yields_and_the_hold_names_the_reason(self):
+        import types, plan, settings, topaz
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("Show", "S01E01", "ep.mkv", scratch_dir="/s",
+                          nas_tv_root="/Media/TV-Shows")
+        paused = types.SimpleNamespace(
+            ok=False, frames=0,
+            error_tail="paused: yielded at a segment boundary — resumes from here")
+        held = {}
+        with mock.patch.object(orch, "stage_done",
+                               side_effect=lambda st, _p: st in ("download", "extend")), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=True), \
+             mock.patch.object(o, "_hold", side_effect=lambda c, m=None, **k: held.update(
+                 {"code": c, "msg": m})), \
+             mock.patch.object(plan, "plan_for",
+                               return_value={"topaz": "upscale", "scale": 2, "res": "1080p",
+                                             "fit_height": None, "input": {"is_4k": False}}), \
+             mock.patch.object(settings, "show_topaz_params", return_value={}), \
+             mock.patch.object(settings, "show_preset_key", return_value="digital"), \
+             mock.patch.object(topaz, "total_frames", return_value=1000), \
+             mock.patch.object(topaz, "upscale_resumable", return_value=paused):
+            o._process(p)
+        self.assertEqual(held.get("code"), "yt-priority")
+        self.assertIn("YouTube video you moved up next", held.get("msg") or "")

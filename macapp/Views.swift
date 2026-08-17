@@ -2939,6 +2939,14 @@ private struct UpNextView: View {
                            help: "Remove from the queue") { await store.queueAction("remove", it) }
             }
         } else if it.kind == "youtube" {
+            // Run this one NOW: it jumps ahead of everything (cadence-exempt, ahead of due
+            // movies) and the in-flight item yields at its next safe boundary.
+            iconButton("arrow.up.to.line", enabled: true,
+                       help: "Run this video now — pauses what's processing at its next "
+                           + "safe point (a Topaz segment boundary; Resolve is never cut off) "
+                           + "and resumes it afterwards") {
+                await store.runYoutubeNow(name: it.name ?? "")
+            }
             Button { confirmingVideoDelete = it } label: {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 12))
                     .frame(width: 26, height: 24, alignment: .center)

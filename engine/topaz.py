@@ -711,8 +711,10 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
         # Segment-boundary PAUSE (e.g. two remuxes have the machine — user-dictated): stop
         # cleanly here; every completed chunk stays on disk and the resume re-enters exactly here.
         if should_pause is not None and should_pause():
+            # The REASON lives with the caller (dual remux / a gate-released fast item / a
+            # "run this now" YouTube request) — naming one of them here mislabelled the others.
             return UpscaleResult(False, 0, done, segdir,
-                                 "paused: two remuxes running — topaz resumes when a lane frees")
+                                 "paused: yielded at a segment boundary — resumes from here")
         # Accurate input seek to the scene-cut start `a` (cold start is seamless there).
         # Middle chunks encode exactly n frames; the LAST chunk omits -frames:v and reads
         # to the source's end — so a source whose last frame won't decode can't fail it.

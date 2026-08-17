@@ -796,6 +796,53 @@ def send_priority(url_or_id, title=None) -> dict:
     return {"status": "queued", "id": vid}
 
 
+def prioritize_pending(vid) -> dict:
+    """JUMP AN ALREADY-DOWNLOADED video to the front of everything (user-asked 2026-08-17).
+
+    send_priority() is for a video the companion app pushes — it triggers a youtarr
+    download and waits for the file to appear. This is the other half: a video already on
+    staging and already sitting in the up-next list, promoted to the priority book with its
+    path filled in, so locate_priority serves it on the very next selection (cadence-exempt
+    and ahead of due movies). Inserted at the FRONT: the most recent "do this now" wins.
+
+    Status: queued | already-first | not-pending | already-upscaled | bad-id."""
+    v = parse_video_id(vid) or str(vid or "").strip()
+    if not v:
+        return {"status": "bad-id"}
+    if v in get_done():
+        return {"status": "already-upscaled", "id": v}
+    with _PRIORITY_LOCK:
+        if any(e.get("vid") == v for e in _priority()):
+            return {"status": "already-first", "id": v}
+    hit = next((x for x in all_pending() if x.get("vid") == v), None)
+    if not hit:
+        return {"status": "not-pending", "id": v}
+    with _PRIORITY_LOCK:
+        book = _priority()
+        if any(e.get("vid") == v for e in book):
+            return {"status": "already-first", "id": v}
+        book.insert(0, {"vid": v, "title": hit.get("title"),
+                        "channel": hit.get("channel"), "path": hit.get("video_path"),
+                        "sent_at": int(time.time())})
+        _save_priority(book)
+    return {"status": "queued", "id": v, "title": hit.get("title")}
+
+
+def has_priority_ready(skip=()) -> bool:
+    """Is a priority video sitting ready to run RIGHT NOW? Book-only — NO staging scan, so
+    this is cheap enough for the run thread to poll between Topaz segments (locate_priority
+    can trigger an FTP walk; this must never)."""
+    done = get_done()
+    for e in _priority():
+        p = e.get("path")
+        if not p or e.get("vid") in done:
+            continue
+        if os.path.splitext(os.path.basename(p))[0] in (skip or ()):
+            continue
+        return True
+    return False
+
+
 def _drop_priority(vid) -> None:
     with _PRIORITY_LOCK:
         book = _priority()

@@ -528,3 +528,60 @@ class ResumePinExpires(unittest.TestCase):
         with open(youtube.RESUME_FIRST_FILE, "w") as f:
             _json.dump({"Chan": "vid123"}, f)     # the old bare-string form
         self.assertIsNone(youtube.resume_first("Chan"))
+
+
+class PrioritizePending(unittest.TestCase):
+    """"Run this video now": an already-downloaded pending video jumps to the FRONT of the
+    priority book, so the very next selection serves it — cadence-exempt and ahead of due
+    movies. send_priority covers the companion-app push; this covers the queue rows."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        p = mock.patch.object(youtube, "PRIORITY_FILE",
+                              os.path.join(self.d, "prio.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.pending = [
+            {"vid": "aaaaaaaaaa1", "channel": "Chan", "title": "First",
+             "video_path": "/staging/Chan/a1/a1.mp4", "source_name": "a1 [aaaaaaaaaa1].mp4"},
+            {"vid": "aaaaaaaaaa2", "channel": "Chan", "title": "Second",
+             "video_path": "/staging/Chan/a2/a2.mp4", "source_name": "a2 [aaaaaaaaaa2].mp4"},
+        ]
+
+    def _prio(self, vid, done=()):
+        with mock.patch.object(youtube, "all_pending", return_value=self.pending), \
+             mock.patch.object(youtube, "get_done", return_value=set(done)):
+            return youtube.prioritize_pending(vid)
+
+    def test_queues_with_its_path_so_no_staging_scan_is_needed(self):
+        out = self._prio("aaaaaaaaaa2")
+        self.assertEqual(out["status"], "queued")
+        book = youtube._priority()
+        self.assertEqual(len(book), 1)
+        self.assertEqual(book[0]["path"], "/staging/Chan/a2/a2.mp4")
+        self.assertEqual(book[0]["channel"], "Chan")
+
+    def test_most_recent_request_wins_the_front(self):
+        self._prio("aaaaaaaaaa1")
+        self._prio("aaaaaaaaaa2")
+        self.assertEqual([e["vid"] for e in youtube._priority()],
+                         ["aaaaaaaaaa2", "aaaaaaaaaa1"])
+
+    def test_refusals_are_explicit_not_silent(self):
+        self.assertEqual(self._prio("")["status"], "bad-id")
+        self.assertEqual(self._prio("zzzzzzzzzzz")["status"], "not-pending")
+        self.assertEqual(self._prio("aaaaaaaaaa1", done=["aaaaaaaaaa1"])["status"],
+                         "already-upscaled")
+        self._prio("aaaaaaaaaa1")
+        self.assertEqual(self._prio("aaaaaaaaaa1")["status"], "already-first")
+
+    def test_readiness_probe_is_book_only_and_skips_the_current_item(self):
+        # Polled between Topaz segments, so it must never trigger the FTP staging walk.
+        with mock.patch.object(youtube, "_locate_scan",
+                               side_effect=AssertionError("must not scan")), \
+             mock.patch.object(youtube, "get_done", return_value=set()):
+            self.assertFalse(youtube.has_priority_ready())
+            self._prio("aaaaaaaaaa2")
+            self.assertTrue(youtube.has_priority_ready())
+            # the video already running IS the priority pick — it must not yield to itself
+            self.assertFalse(youtube.has_priority_ready(skip={"a2"}))

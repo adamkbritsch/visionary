@@ -326,6 +326,19 @@ final class AppStore: ObservableObject {
     }
     // Skip/delete ONE video: aborts it if currently processing, deletes its download from
     // staging, and tells youtarr to forget + never re-download it.
+    /// "Run this video now": jumps it ahead of everything and asks the in-flight item to
+    /// yield at its next SAFE boundary (a Topaz segment boundary — Resolve is never cut off).
+    func runYoutubeNow(name: String) async {
+        guard !name.isEmpty else { return }
+        let (_, data) = await postResult("/api/youtube-queue",
+                                        ["action": "prioritize", "name": name])
+        if let data, let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data),
+           let err = e.error {
+            lastError = e.detail ?? err
+        }
+        await refresh()
+    }
+
     func deleteYoutubeVideo(channel: String?, name: String) async {
         await post("/api/youtube-queue", ["action": "delete", "channel": channel ?? "", "name": name])
         await refresh()
