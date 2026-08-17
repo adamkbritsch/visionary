@@ -178,6 +178,22 @@ def media_timing(path: str, ffprobe: str = FFPROBE) -> tuple:
         return (0.0, 0.0)
 
 
+# ProRes footprint per minute of FINISHED (4K) content — MEASURED 2026-08-17 from a live
+# segdir: 61.5 GiB over 21,412 frames of Lost S04E09 = 4.13 GiB/content-min, which
+# reproduces the long-documented ~190 GiB for a 42-min episode. The rate is per OUTPUT
+# minute, so it holds for every Topaz path (480p x4, 1080p x2 and the already-4K clean
+# pass all write 4K ProRes) and depends only on RUNTIME.
+PRORES_GIB_PER_MIN = 4.2
+
+
+def projected_prores_gib(seconds: float) -> int:
+    """How much ProRes the Topaz stage will write for `seconds` of content. The whole point
+    is that this scales with RUNTIME: 42-min episode ~173 GiB, 2-hour film ~500 GiB, a
+    4 h 19 m cut ~1.1 TiB. Anything that gates disk on a flat floor is episode-sized
+    thinking (see orchestrator._projected_item_gb)."""
+    return int(max(0.0, float(seconds or 0.0)) / 60.0 * PRORES_GIB_PER_MIN)
+
+
 def total_frames(path: str, ffprobe: str = FFPROBE) -> int:
     """Total video frames = duration × fps (fast, no decode). The Topaz output has
     the same frame count as the source, so this is the denominator for live %.

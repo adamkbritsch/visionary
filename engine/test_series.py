@@ -487,3 +487,42 @@ class FeaturettesLast(unittest.TestCase):
         q = build_queue(self.NAMES, watched_map=watched)
         self.assertEqual(q["remaining"], ["S01E02", "S01E01", "S00E17", "S00E18"])
         self.assertTrue(all(series.is_featurette(e) for e in q["remaining"][-2:]))
+
+
+class UnreachableIsNotEmpty(unittest.TestCase):
+    """An unreadable NAS must read as UNKNOWN, never as "this show has no episodes".
+    The live symptom (2026-08-17): every deploy relaunches the server at exactly the
+    moment FTP/Tailscale is least likely to answer; the failed listing returned [],
+    build_queue read that as a finished show, cached_queue CACHED it, and the up-next
+    list — having no episodes to interleave against — rendered EVERY queued movie at
+    the top, persisting until some other call happened to refresh the queue."""
+
+    def test_failed_listing_is_none_not_empty(self):
+        import ftplib
+        with mock.patch.object(series, "series_root", return_value="/Media/TV"), \
+             mock.patch.object(series, "ftp_connect",
+                               side_effect=ftplib.error_temp("421 timeout")):
+            self.assertIsNone(series.list_episode_files("Lost (2004)"))
+
+    def test_genuinely_empty_show_still_reads_empty(self):
+        with mock.patch.object(series, "series_root", return_value="/Media/TV"), \
+             mock.patch.object(series, "ftp_connect", return_value=mock.MagicMock()), \
+             mock.patch.object(series, "ftp_walk_files", return_value=[]), \
+             mock.patch.object(series, "remember_episode_dirs"):
+            self.assertEqual(series.list_episode_files("Empty Show"), [])
+
+    def test_unreachable_never_overwrites_or_poisons_the_cache(self):
+        good = {"next": {"ep": "S01E01", "source_name": "x.mkv"},
+                "remaining_items": [{"ep": "S01E01", "source_name": "x.mkv"}],
+                "remaining": ["S01E01"], "remaining_count": 1, "done_count": 0,
+                "unwatched_count": 1, "featurette_count": 0, "source_count": 1}
+        series._QUEUE_CACHE.pop("Show", None)
+        with mock.patch.object(series, "episode_queue", return_value=None):
+            self.assertIsNone(series.cached_queue("Show"))          # not cached
+            self.assertNotIn("Show", series._QUEUE_CACHE)           # ...so it retries later
+        with mock.patch.object(series, "episode_queue", return_value=good):
+            self.assertEqual(series.cached_queue("Show"), good)
+        with mock.patch.object(series, "episode_queue", return_value=None):
+            self.assertEqual(series.refresh_queue("Show"), good)    # keeps the good one
+            self.assertEqual(series.cached_queue("Show"), good)
+        series._QUEUE_CACHE.pop("Show", None)

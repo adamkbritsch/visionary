@@ -183,6 +183,43 @@ def _min_free_gb() -> int:
     return settings.tunable("min_free_gb")
 
 
+# Everything an item writes BESIDES the Topaz ProRes: the source + its CFR copy, the
+# Resolve DV render, and the final master. Measured on real 4K items (~60 GB source,
+# ~60 GB CFR, ~100 GB render, ~60 GB master); generous on purpose — this is a gate, and
+# under-reserving is what fills the disk mid-stage.
+ITEM_TAIL_GB = 120
+
+
+def _projected_item_gb(p) -> int:
+    """RAW free space this item needs to complete, DERIVED FROM ITS RUNTIME.
+
+    The flat `min_free_gb` floor (400 GB) is EPISODE-SIZED thinking — the same mistake as
+    the flat RESOLVE_TIMEOUT. A 42-min episode's ProRes is ~176 GiB and fits under the
+    floor with room to spare; a 2-hour 1080p film needs ~529 GiB and a 4 h 19 m cut
+    ~1.1 TiB, so both would clear a 400 GB gate, start, and then ENOSPC mid-encode —
+    every segment retry hitting the same full disk until the item parks, with the scratch
+    left full for everything behind it.
+
+    Items that SKIP Topaz (already-DV, rpu-only/resolve-only fast paths, combine, YouTube's
+    Resolve-scales path) write no ProRes, so they only need the tail. Unprobeable duration
+    falls back to the flat floor — never gate on a guess."""
+    try:
+        import plan as _plan
+        import topaz as _topaz
+        if getattr(p, "combine", False) or getattr(p, "youtube", False):
+            return ITEM_TAIL_GB
+        pl = _plan.plan_for(p.source)
+        if pl.get("topaz") not in ("upscale", "clean"):
+            return ITEM_TAIL_GB                     # no ProRes intermediate at all
+        _fps, dur = _topaz.media_timing(p.source_cfr if os.path.exists(p.source_cfr)
+                                        else p.source)
+        if not dur:
+            return _min_free_gb()
+        return _topaz.projected_prores_gib(dur) + ITEM_TAIL_GB
+    except Exception:
+        return _min_free_gb()
+
+
 def _prefetch_gate_gb() -> int:
     """Free space the prefetcher must leave — the live floor plus a small margin."""
     return _min_free_gb() + PREFETCH_GATE_MARGIN_GB
@@ -2358,7 +2395,9 @@ class Orchestrator:
             for off in range(n):
                 ref = parts[(rot + off) % n]
                 q = series.episode_queue(ref, skip=self._tv_skip(ref, skip))
-                nxt = q.get("next")
+                if q is None:
+                    continue          # NAS unreadable for this show: UNKNOWN, not "no episodes"
+                nxt = q.get("next")   # (leaves saw_files False -> "unreachable", not "complete")
                 if nxt:
                     return episode_paths(ref, nxt["ep"], nxt["source_name"],
                                          nas_tv_root=series.series_root(ref)), "ok"

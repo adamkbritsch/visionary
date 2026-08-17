@@ -213,20 +213,29 @@ def episode_nas_dir(series, basename):
         return (_episode_dirs().get(series) or {}).get(basename)
 
 
-def list_episode_files(series, *, timeout=40) -> list:
+def list_episode_files(series, *, timeout=40):
     """All video basenames under a series dir on its volume (FTP, recurses into seasons).
-    Also records each file's REAL directory (see episode_nas_dir) — same walk, no extra I/O."""
+    Also records each file's REAL directory (see episode_nas_dir) — same walk, no extra I/O.
+
+    Returns None when the NAS could not be READ, and [] only when the show genuinely has no
+    files. That distinction is load-bearing: an unreachable NAS used to return [] too, which
+    build_queue reads as "this show is finished — no episodes left", and cached_queue then
+    CACHED that. Right after a relaunch (the moment the FTP/Tailscale path is least likely
+    to answer) every show could read empty, so the up-next list had no episodes to interleave
+    against and EVERY queued movie rendered at the top — the live symptom, on every deploy.
+    promote_finished_slots already guarded the same ambiguity for slot promotion; this is the
+    same guard at the source."""
     root = series_root(series)                 # resolve the volume first (own connection if it re-lists)
     try:
         ftp = ftp_connect(timeout=timeout)
     except ftplib.all_errors:
-        return []
+        return None
     try:
         pairs = ftp_walk_files(ftp, root.rstrip("/") + "/" + series, with_dirs=True)
         remember_episode_dirs(series, pairs)
         return [name for _d, name in pairs]
     except ftplib.all_errors:
-        return []
+        return None
     finally:
         try: ftp.quit()
         except ftplib.all_errors: pass
@@ -273,7 +282,10 @@ def episode_queue(series, skip=()) -> dict:
         feat_last = settings.get_show_featurettes_last(series)
     except Exception:
         feat_last = True
-    return build_queue(list_episode_files(series), load_dv_manifest(series),
+    names = list_episode_files(series)
+    if names is None:
+        return None                # NAS unreadable — "unknown", never "finished" (see above)
+    return build_queue(names, load_dv_manifest(series),
                        watched_map=wm, skip=skip, featurettes_last=feat_last)
 
 
@@ -283,11 +295,15 @@ _QUEUE_CACHE = {}
 
 def cached_queue(series_name):
     """The series' queue from cache (no NAS I/O — fast for state polling). Computes +
-    caches on first request."""
+    caches on first request. A failed computation (NAS unreadable) is NOT cached — the
+    next call retries instead of serving a phantom empty queue for the rest of the run."""
     if not series_name:
         return None
     if series_name not in _QUEUE_CACHE:
-        _QUEUE_CACHE[series_name] = episode_queue(series_name)
+        q = episode_queue(series_name)
+        if q is None:
+            return None
+        _QUEUE_CACHE[series_name] = q
     return _QUEUE_CACHE.get(series_name)
 
 
@@ -298,6 +314,8 @@ def refresh_queue(series_name):
     if not series_name:
         return None
     q = episode_queue(series_name)
+    if q is None:
+        return _QUEUE_CACHE.get(series_name)   # unreachable NAS never overwrites a good queue
     _QUEUE_CACHE[series_name] = q
     return q
 
