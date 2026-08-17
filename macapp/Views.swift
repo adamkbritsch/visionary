@@ -2907,7 +2907,7 @@ private struct UpNextView: View {
         // YouTube: × SKIPS & DELETES the video — staging download gone, youtarr forgets it,
         // never re-downloaded (confirmed first). Episodes are auto-generated — no controls.
         if it.kind == "movie" {
-            HStack(spacing: 9) {
+            HStack(spacing: 1) {
                 iconButton("chevron.up", enabled: idx > 0,
                            help: "Move earlier") { await store.queueAction("up", it) }
                 iconButton("chevron.down", enabled: idx < items.count - 1,
@@ -2918,7 +2918,8 @@ private struct UpNextView: View {
         } else if it.kind == "youtube" {
             Button { confirmingVideoDelete = it } label: {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 12))
-                    .frame(width: 16, height: 16, alignment: .center)
+                    .frame(width: 26, height: 24, alignment: .center)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(.secondary).opacity(0.9)
             .help("Skip & delete — removes the download and youtarr never re-fetches it")
@@ -2939,7 +2940,12 @@ private struct UpNextView: View {
     @ViewBuilder func iconButton(_ sym: String, enabled: Bool, help: String,
                                  _ act: @escaping () async -> Void) -> some View {
         Button { Task { await act() } } label: {
-            Image(systemName: sym).font(.system(size: 12)).frame(width: 16, height: 16, alignment: .center)
+            // The glyph stays 12 pt; the FRAME is the click target (26x24), and
+            // contentShape makes the whole frame hittable — a .plain button otherwise
+            // hit-tests only the glyph's opaque pixels, a ~10 px sliver.
+            Image(systemName: sym).font(.system(size: 12))
+                .frame(width: 26, height: 24, alignment: .center)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain).foregroundStyle(.secondary)
         .disabled(!enabled).opacity(enabled ? 0.9 : 0.22).help(help)
