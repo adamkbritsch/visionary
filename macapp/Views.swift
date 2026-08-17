@@ -2799,10 +2799,6 @@ private struct ChannelRow: View {
                                                   set: { s in Task { await store.setChannelScope(ch.channelId ?? "", s) } })) {
                         Text("Most popular").tag("popular"); Text("All").tag("all")
                     }.labelsHidden().frame(width: 128).font(.system(size: 11))
-                    Toggle("≤20m", isOn: Binding(get: { ch.capped ?? false },
-                                                 set: { on in Task { await store.setChannelCap(ch.channelId ?? "", on) } }))
-                        .toggleStyle(.checkbox).font(.system(size: 11))
-                        .help("Only upscale videos 20 minutes or shorter for this channel")
                     Picker("", selection: Binding(get: { ch.max_age_days ?? 0 },
                                                   set: { d in Task { await store.setChannelMaxAge(ch.channelId ?? "", d) } })) {
                         Text("Any age").tag(0); Text("≤1 week").tag(7); Text("≤1 month").tag(30)
@@ -3191,10 +3187,6 @@ struct SettingsPopover: View {
                                    blurb: "Never (the default) gives every Resolve the whole machine. Raising it lets a fast-path title's Resolve share with this many running remuxes.",
                                    key: "resolve_share_remuxes", fallback: 0,
                                    range: 0...2, zeroLabel: "Never")
-                        SettingRow(title: "YouTube length cap",
-                                   blurb: "The limit applied to channels that have their length cap switched on.",
-                                   key: "max_youtube_minutes", fallback: 20,
-                                   range: 1...600, step: 5, unit: "min")
                     }
                 } label: {
                     Text("Advanced settings").font(.system(size: 13, weight: .medium))

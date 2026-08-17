@@ -1182,7 +1182,7 @@ class YouTubeFastRemux(unittest.TestCase):
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
-        self.assertEqual(seen["cmd"][6], str(stages.YOUTUBE_RENDER_KBPS))   # 35000, not the 60000 floor
+        self.assertEqual(seen["cmd"][6], str(stages.YOUTUBE_RENDER_KBPS))   # the YT target, not the 60000 floor
 
 
 class MezzanineReuse(unittest.TestCase):
@@ -1805,3 +1805,43 @@ class ResolveBudget(unittest.TestCase):
 
     def test_unprobeable_falls_back_to_flat(self):
         self.assertEqual(self._budget(0.0), stages.RESOLVE_TIMEOUT)
+
+
+class YoutubeShipsItsRender(unittest.TestCase):
+    """YouTube's whole point is speed: Resolve exports at a cap-safe bitrate so the render
+    IS the deliverable and the remux stream-COPIES its video (minutes) instead of running
+    the hour-class capped x265 pass. That only pays off if the peak gate actually passes,
+    and Resolve's VideoToolbox export has no peak control — hence a conservative target."""
+
+    def test_render_target_leaves_headroom_under_the_cap(self):
+        import dvcap
+        cap = dvcap.DEFAULT_PEAK_MBPS
+        target_mbps = stages.YOUTUBE_RENDER_KBPS / 1000.0
+        # The gate compares a MEASURED 1-s peak against the cap; VideoToolbox bursts well
+        # above its average, so the target must sit far enough below the cap that a normal
+        # burst still lands inside it.
+        self.assertLessEqual(target_mbps * 2.0, cap * dvcap.PEAK_TOLERANCE,
+                             "a 2x burst over the YouTube render target must stay under cap")
+        self.assertLess(target_mbps, stages.EXPORT_BITRATE_FLOOR_KBPS / 1000.0)
+
+    def test_over_cap_render_still_falls_back_not_fails(self):
+        # The safety net: an over-cap render must fall through to the capped re-encode,
+        # never ship unverified and never fail the item outright.
+        import remux, settings, types, plan
+        p = _paths(tempfile.mkdtemp())
+        p.youtube = True
+        ship = types.SimpleNamespace(ok=False, reason="render-over-cap: 61.0 Mbps > 50 cap")
+        capped = types.SimpleNamespace(ok=True, reason="DV 8.1 · 1 audio · 0 sub")
+        def fake_remux(*a, **k):
+            return capped
+        with mock.patch.object(remux, "remux_ship_render", return_value=ship) as rs, \
+             mock.patch.object(remux, "remux", side_effect=fake_remux) as rr, \
+             mock.patch.object(plan, "plan_for",
+                               return_value={"topaz": "upscale", "scale": 2, "res": "1080p",
+                                             "fit_height": None, "input": {"is_4k": False}}), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, msg = stages.run_stage("remux", p, progress=lambda d: None)
+        self.assertTrue(rs.called)          # tried the fast path first
+        self.assertTrue(rr.called)          # ...then fell back to the capped encode
+        self.assertTrue(ok, msg)

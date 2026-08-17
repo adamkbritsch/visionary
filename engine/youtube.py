@@ -6,8 +6,6 @@ queue — youtarr (always on) then autonomously downloads exactly those channels
 library (/Media/YouTube-raw), which is NOT a Plex library. Visionary doesn't pick individual videos;
 instead it LIMITS WHAT IT UPSCALES:
 
-  * per-channel length cap (OFF by default): when a channel's `capped` toggle is on, never upscale
-    a video longer than `max_youtube_minutes` (settings, default 20); off → any length upscales;
   * per-channel scope: 'popular' → only the channel's top-viewed videos; 'all' → everything downloaded.
 
 FOLDER-SPLIT: the finished 4K DV master is PUBLISHED into the Plex "YouTube" library (/Media/YouTube)
@@ -376,7 +374,9 @@ def set_scope(channel_id, scope) -> list:
 
 
 def set_capped(channel_id, on) -> list:
-    """Per-channel length-cap toggle: on → only upscale videos ≤ max_youtube_minutes; off (default)
+    """DEPRECATED no-op flag (the length cap was removed 2026-08-17). Still stored so an
+    existing queue file round-trips, but nothing reads it when choosing videos.
+    Historical: on → only upscale videos ≤ max_youtube_minutes; off (default)
     → upscale any length. Purely upscale-side (doesn't change what youtarr downloads)."""
     items = get_queue()
     for e in items:
@@ -460,7 +460,7 @@ def configure_youtarr():
     return ok
 
 
-def _cap_secs():
+def _cap_secs():   # DEPRECATED — kept only so an old settings.json key stays readable
     import settings
     return int(settings.get_settings().get("max_youtube_minutes", 20)) * 60
 
@@ -507,7 +507,7 @@ def refresh_meta(entry) -> None:
         return
     # only length-limit the 'popular' set when this channel opts into the cap; else take top-viewed
     # of any length (huge ceiling).
-    max_secs = _cap_secs() if entry.get("capped") else 10 ** 9
+    max_secs = 10 ** 9        # no length limit — see channel_pending
     popular = set()
     pv = ytdata.popular_videos(cid, max_secs=max_secs, n=50)
     if pv:
@@ -527,15 +527,20 @@ def refresh_meta(entry) -> None:
 # ---- what to upscale (cap + scope filter) ---------------------------------
 
 def channel_pending(entry, skip=()) -> list:
-    """Pending videos to UPSCALE for one queued channel, NEWEST-first: on disk, within the length cap
-    IF this channel is capped (else any length), in scope ('popular' → in the top-viewed set; 'all' →
-    any), not done, not parked. Each = {source_name, nas_dir, video_path, title, vid, channel(folder)}."""
+    """Pending videos to UPSCALE for one queued channel, NEWEST-first: on disk, in scope
+    ('popular' → in the top-viewed set; 'all' → any), not done, not parked. Each =
+    {source_name, nas_dir, video_path, title, vid, channel(folder)}.
+
+    NO LENGTH CAP (removed 2026-08-17, user-dictated). The cap existed because a long video
+    used to cost the same hour-class Topaz + capped-x265 pass as a TV episode. It doesn't
+    any more: YouTube skips Topaz entirely (Resolve scales it) and ships Resolve's render
+    stream-copied (YOUTUBE_RENDER_KBPS + remux_ship_render), so a long video is now cheap
+    in proportion to its length instead of catastrophically expensive."""
     if entry.get("paused"):        # paused → no upscaling work at all (keeps what it already has)
         return []
     folder = entry.get("folder_name")
     if not folder:
         return []
-    cap = _cap_secs() if entry.get("capped") else None   # None → no length limit for this channel
     max_age = _max_age_secs(entry)                       # None → no age limit
     scope = entry.get("scope", "popular")
     popular = (_META.get(entry.get("channelId")) or {}).get("popular") or set()
@@ -544,9 +549,6 @@ def channel_pending(entry, skip=()) -> list:
     for v in cached_videos(folder):
         vid, stem = v["vid"], os.path.splitext(v["name"])[0]
         if vid in done or stem in skip:
-            continue
-        dur = durs.get(vid)
-        if cap and dur and dur > cap:                  # capped channel + known to be over the limit
             continue
         pub = pubs.get(vid)
         if max_age and pub and (now - pub) > max_age:  # older than this channel's max age (prune deletes it)

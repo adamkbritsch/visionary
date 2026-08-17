@@ -50,10 +50,21 @@ def _resolve_budget(p) -> int:
     return min(3600 + int(dur * 1.8) + 1200, 6 * 3600)
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 EXPORT_BITRATE_FLOOR_KBPS = 60000   # render preset's default; the export matches the intake above this
-YOUTUBE_RENDER_KBPS = 35000         # YouTube renders target THIS instead of the floor: comfortably
-                                    # transparent for upscaled web video, and its 1-s peaks land under
-                                    # the 50 Mbps cap — which lets the remux SHIP the render as-is
-                                    # (remux_ship_render) instead of an hour-class x265 re-encode.
+YOUTUBE_RENDER_KBPS = 20000         # YouTube renders target THIS instead of the floor, so the render
+                                    # IS the deliverable: its 1-s peaks land under the cap, which lets
+                                    # the remux SHIP its video stream-copied (remux_ship_render) in
+                                    # minutes instead of an hour-class x265 re-encode.
+                                    # WHY 20 and not 35 (lowered 2026-08-17, user-dictated "their
+                                    # resolve outputs should loosely be enough to function as the final
+                                    # thing"): the whole scheme only pays off if the peak gate actually
+                                    # PASSES, and Resolve's VideoToolbox export has no peak control at
+                                    # all — it was measured spiking to ~139 Mbps on a ~27 Mbps average,
+                                    # i.e. bursts of several times the target. At 35 the gate was a
+                                    # coin flip, and losing it costs the entire hour the fast path was
+                                    # meant to save. 20 Mbps of 4K HEVC is still generous for video
+                                    # UPSCALED FROM 1080p web sources (YouTube skips Topaz — Resolve
+                                    # does the scaling — so this is the only encode the picture ever
+                                    # gets, and its input is already a lossy 1080p web file).
                                     # SHIELD context: single-layer DV stutters above ~60 Mbps.
 
 # TOPAZ→REMUX segment BOUNDARIES: the remux re-encodes at the SAME scene-cut segment boundaries this

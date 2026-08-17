@@ -92,11 +92,15 @@ class UpscaleFilter(unittest.TestCase):
         # C (40 min) is NOT dropped — no cap on this channel
         self.assertEqual([v["vid"] for v in p], ["aaaaaaaaaa1", "aaaaaaaaaa2", "aaaaaaaaaa3"])
 
-    def test_capped_channel_drops_over_limit(self):
-        self.entry["scope"] = "all"; self.entry["capped"] = True   # opt IN to the ≤20-min cap
+    def test_length_cap_is_gone_even_with_the_legacy_flag_set(self):
+        """The cap was removed 2026-08-17: YouTube skips Topaz and ships Resolve's render
+        stream-copied, so a long video costs time in proportion to its length instead of an
+        hour-class pass. A queue file still carrying `capped: True` must NOT filter."""
+        self.entry["scope"] = "all"; self.entry["capped"] = True   # legacy flag, now inert
         with self._cap20():
             p = youtube.channel_pending(self.entry)
-        self.assertEqual([v["vid"] for v in p], ["aaaaaaaaaa1", "aaaaaaaaaa2"])  # C dropped (>20 min)
+        self.assertEqual([v["vid"] for v in p],
+                         ["aaaaaaaaaa1", "aaaaaaaaaa2", "aaaaaaaaaa3"])   # 40-min video kept
 
     def test_done_excluded(self):
         self.entry["scope"] = "all"                           # uncapped → C stays

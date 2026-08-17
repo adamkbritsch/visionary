@@ -78,6 +78,18 @@ def probe_video(path: str, ffprobe: str = FFPROBE) -> dict:
     streams = data.get("streams") or [{}]
     s = streams[0]
     frames = int(s.get("nb_frames") or 0)
+    if frames <= 0:
+        # nb_frames is MP4/MOV-only — MATROSKA NEVER CARRIES IT (not even with mkvmerge's
+        # NUMBER_OF_FRAMES statistics tag, which ffprobe does not surface as nb_frames). An
+        # MKV therefore reported frames=0, and every caller guarding on `frames <= 0` refused
+        # to run before doing any work: the peak-gated rpu-only fallback (whose encode_source
+        # is the .mkv CFR whenever TrueHD/DTS-HD/PGS forced that container — i.e. exactly the
+        # UHD remuxes that exceed the peak gate) and every companion combine grafting a REAL
+        # DV RPU (a P7 donor is Matroska by construction). Both branches were deterministically
+        # dead, failing 5x with a reason that blamed a Resolve render never involved.
+        # count_hevc_frames is the exact packet count the callers ultimately compare against.
+        # Same root cause as the topaz._frame_count tagless-MKV bug fixed in 8bc83fd.
+        frames = max(0, count_hevc_frames(path, ffprobe))
     fps = s.get("r_frame_rate") or "24000/1001"
     try:
         start = float(s.get("start_time") or 0.0)   # container offset for the frame-exact seek

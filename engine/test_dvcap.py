@@ -751,3 +751,37 @@ class DoviModeBuilders(unittest.TestCase):
             self.assertNotIn("rpu_mode", m0)             # schema-stable for existing runs
             self.assertEqual(m2["rpu_mode"], 2)
             self.assertNotEqual(m0, m2)                  # switching modes wipes stale RPU
+
+
+class MkvFrameCount(unittest.TestCase):
+    """nb_frames is MP4/MOV-only; Matroska never carries it. probe_video used to report
+    frames=0 for every MKV, and the `frames <= 0` guards in remux()/remux_inject() then
+    refused to run — killing the peak-gated rpu-only fallback (its encode_source is the
+    .mkv CFR for TrueHD/PGS remuxes, exactly the ones that exceed the peak gate) and every
+    companion combine grafting a real DV RPU (a P7 donor is Matroska by construction).
+    Confirmed by a live reproduction on 2026-08-17."""
+
+    def _probe(self, nb_frames, packets):
+        payload = {"streams": [{"nb_frames": nb_frames, "r_frame_rate": "24000/1001"}],
+                   "frames": []}
+        import json as _json, types
+        with mock.patch.object(dvcap.subprocess, "run",
+                               return_value=types.SimpleNamespace(
+                                   returncode=0, stdout=_json.dumps(payload), stderr="")), \
+             mock.patch.object(dvcap, "count_hevc_frames", return_value=packets) as c:
+            out = dvcap.probe_video("/x.mkv")
+        return out, c
+
+    def test_mkv_falls_back_to_the_packet_count(self):
+        out, counter = self._probe(None, 61536)          # MKV: no nb_frames
+        self.assertEqual(out["frames"], 61536)
+        counter.assert_called_once()
+
+    def test_mp4_header_count_wins_without_scanning(self):
+        out, counter = self._probe("1234", 999)          # MP4: header present
+        self.assertEqual(out["frames"], 1234)
+        counter.assert_not_called()
+
+    def test_unprobeable_still_reports_zero(self):
+        out, _c = self._probe(None, 0)                   # both unavailable -> honest 0
+        self.assertEqual(out["frames"], 0)

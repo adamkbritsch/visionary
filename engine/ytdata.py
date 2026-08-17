@@ -112,11 +112,16 @@ def disconnect() -> None:
 
 def access_token():
     """A valid access token (refreshed on demand), or None if not connected / refresh failed."""
-    if _TOKEN["access"] and _TOKEN["exp"] - 30 > time.time():
-        return _TOKEN["access"]
+    # CREDENTIALS FIRST, cache second. The cache used to short-circuit ahead of this check,
+    # so once a token had been fetched the process kept serving it even after the creds were
+    # gone — "disconnected" never actually took effect until a relaunch. (It also made the
+    # test suite order-dependent: any test that triggered a real refresh leaked a live token
+    # into every later "not connected" assertion.)
     cid, cs, rt = _creds()
     if not (cid and cs and rt):
         return None
+    if _TOKEN["access"] and _TOKEN["exp"] - 30 > time.time():
+        return _TOKEN["access"]
     try:
         r = _post_form(TOKEN, {"client_id": cid, "client_secret": cs, "refresh_token": rt,
                                "grant_type": "refresh_token"})

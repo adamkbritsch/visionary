@@ -49,9 +49,13 @@ class BuildState(unittest.TestCase):
 class UpNext(unittest.TestCase):
     """up_next round-robins the active series into an episode stream + interleaves movies by slot."""
     def _run(self, movies_list, episodes, limit=10, current=None, inflight=None):   # single active series "show"
-        import movies, series
+        import movies, series, youtube
         from unittest import mock
-        with mock.patch.object(movies, "get_selected", return_value=movies_list), \
+        # HERMETIC: without this the tests read the REAL YouTube queue off this machine and
+        # assert against whatever happens to be pending. They only passed before because the
+        # (now-removed) per-channel length cap filtered that live data to empty.
+        with mock.patch.object(youtube, "all_pending", return_value=[]), \
+             mock.patch.object(movies, "get_selected", return_value=movies_list), \
              mock.patch.object(series, "get_active_series", return_value=["show"]), \
              mock.patch.object(series, "get_rotation", return_value=0), \
              mock.patch.object(series, "cached_queue", return_value={"remaining_items": episodes}):
@@ -59,9 +63,10 @@ class UpNext(unittest.TestCase):
                     for o in server.up_next(limit=limit, current=current, inflight=inflight)]
 
     def _rr(self, active, queues, rotation=0, limit=10):   # multi-series round-robin, no movies
-        import movies, series
+        import movies, series, youtube
         from unittest import mock
-        with mock.patch.object(movies, "get_selected", return_value=[]), \
+        with mock.patch.object(youtube, "all_pending", return_value=[]), \
+             mock.patch.object(movies, "get_selected", return_value=[]), \
              mock.patch.object(series, "get_active_series", return_value=active), \
              mock.patch.object(series, "get_rotation", return_value=rotation), \
              mock.patch.object(series, "cached_queue", side_effect=lambda nm: queues.get(nm)):
