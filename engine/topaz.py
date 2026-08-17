@@ -584,13 +584,21 @@ def _frame_count(path, ffprobe=FFPROBE_HB) -> int:
     Critical for an already-CFR stream-COPY that keeps HEVC: a full HEVC `-count_frames` decode
     of a feature can take minutes and time out → the good CFR would be judged 'not ready' and
     re-copied forever. All three yield the SAME exact count, so segment planning is unaffected."""
-    for args in (["-show_entries", "stream=nb_frames"],
-                 ["-show_entries", "stream_tags=NUMBER_OF_FRAMES"],   # MKV exact count — no decode
-                 ["-count_frames", "-show_entries", "stream=nb_read_frames"]):
+    # NUMBER_OF_FRAMES is an mkvmerge STATISTICS tag — plenty of releases lack it (DTOne
+    # remuxes, bare WEBRips) and ffmpeg's own muxer NEVER writes it, so a stream-copied
+    # CFR of such a source has no header count at all. -count_packets is the exact
+    # no-decode fallback (packets == frames for these streams; it reads the index only —
+    # measured 0.7 s/GB, ~30 s for a 54 GB feature). Without it the good copy fell to the
+    # full-decode count, timed out, was judged 'not ready', deleted, re-copied and
+    # re-failed until the movie PARKED (live 2026-08-16: Deadpool 2 ×5, Hangover III ×5).
+    for args, tmo in ((["-show_entries", "stream=nb_frames"], 120),
+                      (["-show_entries", "stream_tags=NUMBER_OF_FRAMES"], 120),
+                      (["-count_packets", "-show_entries", "stream=nb_read_packets"], 300),
+                      (["-count_frames", "-show_entries", "stream=nb_read_frames"], 600)):
         try:
             out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
                                   *args, "-of", "csv=p=0", path],
-                                 capture_output=True, text=True, timeout=120).stdout.strip()
+                                 capture_output=True, text=True, timeout=tmo).stdout.strip()
             if out.isdigit():
                 return int(out)
         except Exception:

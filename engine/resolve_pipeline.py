@@ -25,6 +25,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from versions import RESOLVE_APP  # noqa: E402 — exact-version pin (versions.py); preflight gates on it
 LIB = RESOLVE_APP + "/Contents/Libraries/Fusion/fusionscript.so"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
+
+
+def _analysis_budget(path) -> float:
+    """DV "Analyze All Shots" wall-clock cap, scaled with CONTENT length. The flat hour
+    is right for episodes and ordinary films; a 4-hour fan cut (Ep III Siege of
+    Mandalore) can honestly need more. Analysis runs several-times realtime, so half of
+    runtime is a generous ceiling; unprobeable input keeps the proven flat hour."""
+    try:
+        out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        dur = float(out or 0)
+    except Exception:
+        dur = 0.0
+    return max(3600.0, dur * 0.5) if dur > 0 else 3600.0
 # Candidate project names per OUTPUT MODE, in preference order. We match whatever the
 # project is ACTUALLY named in Resolve (the API can't rename), so a rename — e.g. to the
 # new "Visionary …" app name — won't break the pipeline. First existing one wins.
@@ -544,7 +559,8 @@ def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0):
         return render(out, mode, bitrate)
     import dv_shim
     try:
-        if not dv_shim.run_dv_ui(expect_nit=target_nits(mode)):
+        if not dv_shim.run_dv_ui(expect_nit=target_nits(mode),
+                                 analysis_max_seconds=_analysis_budget(video)):
             print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
             return 2
     except Exception as e:
@@ -584,6 +600,8 @@ def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
         return render(out, mode, bitrate)
     import dv_shim
     try:
+        # Episodes are TV-length by construction — the flat hour has never been the
+        # wall for them; only single() (features, incl. 4 h fan cuts) scales.
         if not dv_shim.run_dv_ui(expect_nit=target_nits(mode)):
             print("DV_UI_INCOMPLETE — analyze did not finish (grants/cliclick?)", flush=True)
             return 2

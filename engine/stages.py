@@ -28,6 +28,26 @@ ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Resolve launch, or a long episode gets killed mid-analysis and fail-loops. Was 45 min
 # (< the 60-min analysis cap alone) — the exact recipe for a stuck resolve stage.
 RESOLVE_TIMEOUT = 120 * 60
+
+
+def _resolve_budget(p) -> int:
+    """The resolve stage's wall-clock budget for THIS item. The flat RESOLVE_TIMEOUT is
+    sized for EPISODES (launch + <=60 min DV analysis + a sub-hour render); a feature
+    cannot fit — the Star Wars Ep III "Siege of Mandalore" FAN CUT (4 h 19 m, 372,831
+    frames) rendered for two hours at ~2x realtime and was killed at exactly the wall,
+    attempt after attempt (live 2026-08-16: the partial ~42 GB render's mtime matched
+    the kill second), each retry burning another two hours with no chance of finishing.
+    Content at/below 50 min keeps the proven flat budget (a wedged Resolve still clears
+    in 2 h); longer content scales: analysis cap + render at a conservative realtime
+    factor + launch slack, capped at 6 h so a bad probe can't produce an unbounded hang."""
+    try:
+        import topaz
+        _fps, dur = topaz.media_timing(p.source_cfr)
+    except Exception:
+        dur = 0.0
+    if not dur or dur <= 50 * 60:
+        return RESOLVE_TIMEOUT
+    return min(3600 + int(dur * 1.8) + 1200, 6 * 3600)
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 EXPORT_BITRATE_FLOOR_KBPS = 60000   # render preset's default; the export matches the intake above this
 YOUTUBE_RENDER_KBPS = 35000         # YouTube renders target THIS instead of the floor: comfortably
@@ -1009,7 +1029,7 @@ def _resolve(p, abort, progress=None):
         # MONOTONIC: it pauses through a real sleep on macOS, so a laptop that slept
         # mid-pass wakes with its budget intact instead of a falsely-expired deadline
         # killing the subprocess ("starting over with resolve", user-caught 2026-08-06).
-        deadline = time.monotonic() + RESOLVE_TIMEOUT
+        deadline = time.monotonic() + _resolve_budget(p)
         while proc.poll() is None:
             aborted = abort is not None and abort.is_set()
             if aborted or time.monotonic() > deadline:

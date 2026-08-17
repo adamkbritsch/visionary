@@ -693,7 +693,7 @@ def _announce_mouse_use():
     print("MOUSE_IN_USE %d" % round(time.time()), flush=True)
 
 
-def run_dv_ui(abort=None, expect_nit=1000) -> bool:
+def run_dv_ui(abort=None, expect_nit=1000, analysis_max_seconds: float = 3600.0) -> bool:
     """The full per-episode UI step: open the DV palette, verify the inherited target,
     Analyze All Shots, wait for completion. Everything else (color, DV Profile 8.1,
     target display) is inherited from the project and left untouched. Returns True on
@@ -738,7 +738,10 @@ def run_dv_ui(abort=None, expect_nit=1000) -> bool:
             raise RuntimeError("Target Display Output is not the 1000-nit ST.2084 entry — "
                                "refusing to analyze against the wrong (likely 100-nit SDR) target")
         click_analyze_all()
-        ok = wait_for_analysis(abort=abort)
+        # `analysis_max_seconds` scales with CONTENT length (resolve_pipeline probes it):
+        # the flat hour covers episodes and ordinary films, but a 4 h fan cut (Star Wars
+        # Ep III "Siege of Mandalore", 372,831 frames) can legitimately analyze longer.
+        ok = wait_for_analysis(abort=abort, max_seconds=analysis_max_seconds)
         if not ok:
             _diag("analysis-incomplete", expect_nit=expect_nit)
         return ok

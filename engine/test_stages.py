@@ -573,6 +573,8 @@ class MezzanineFallback(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_resolve_budget",
+                               return_value=stages.RESOLVE_TIMEOUT), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
@@ -641,6 +643,8 @@ class MezzanineFallback(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_resolve_budget",
+                               return_value=stages.RESOLVE_TIMEOUT), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
@@ -685,6 +689,8 @@ class OutputModeOverride(unittest.TestCase):
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(plan, "plan_for", return_value=pl), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_resolve_budget",
+                               return_value=stages.RESOLVE_TIMEOUT), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
@@ -758,6 +764,8 @@ class HostDisplayFailSafe(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_resolve_budget",
+                               return_value=stages.RESOLVE_TIMEOUT), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
@@ -1299,6 +1307,8 @@ class RenderPhaseFlag(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_resolve_budget",
+                               return_value=stages.RESOLVE_TIMEOUT), \
              mock.patch.object(stages, "_quit_resolve_focus_app"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
@@ -1768,3 +1778,30 @@ class ExtendStage(unittest.TestCase):
             ok, _ = stages.run_stage("topaz", self.p)         # wide file present
             self.assertTrue(ok)
             self.assertEqual(got["input"], self.p.source_wide)
+
+
+class ResolveBudget(unittest.TestCase):
+    """The flat 120-min budget is episode-sized: the Star Wars Ep III "Siege of
+    Mandalore" fan cut (4h19m, 372,831 frames) rendered for two hours and was killed at
+    exactly the wall, every attempt (live 2026-08-16). Features scale with runtime,
+    capped at 6h; episodes keep the proven flat budget."""
+
+    def _budget(self, dur):
+        import topaz
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(topaz, "media_timing", return_value=(23.976, dur)):
+            return stages._resolve_budget(p)
+
+    def test_episode_keeps_the_flat_budget(self):
+        self.assertEqual(self._budget(42 * 60), stages.RESOLVE_TIMEOUT)
+        self.assertEqual(self._budget(50 * 60), stages.RESOLVE_TIMEOUT)
+
+    def test_features_scale_with_runtime(self):
+        self.assertEqual(self._budget(100 * 60), 3600 + int(100 * 60 * 1.8) + 1200)
+        # Ep III fan cut: 372,831 frames @ 23.976 = 15,550 s (4h19m) -> capped at 6 h,
+        # which still fits its ~2.2 h render + a scaled analysis with hours to spare.
+        self.assertEqual(self._budget(15550), 6 * 3600)
+        self.assertLessEqual(self._budget(8 * 3600), 6 * 3600)      # cap holds
+
+    def test_unprobeable_falls_back_to_flat(self):
+        self.assertEqual(self._budget(0.0), stages.RESOLVE_TIMEOUT)

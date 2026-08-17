@@ -344,3 +344,38 @@ class FastPathCfrCopy(unittest.TestCase):
     def test_default_still_reencodes_a_non_cfr_source(self):
         cmd = self._cfr(copy_only=False, already_cfr=False)
         self.assertIn("libx264", " ".join(cmd))              # Topaz-bound items unchanged
+
+
+class FrameCountTaglessMkv(unittest.TestCase):
+    """A stream-copied CFR of a release WITHOUT mkvmerge statistics tags has NO header
+    count (nb_frames N/A, no NUMBER_OF_FRAMES — ffmpeg's muxer never writes one). The
+    packet count must catch it EXACTLY, without ever reaching the full-decode count
+    that times out on a feature (live 2026-08-16: Deadpool 2 and Hangover III each
+    re-copied and re-failed 5x, then PARKED, on a byte-perfect copy)."""
+
+    def test_packet_count_rescues_a_tagless_file(self):
+        import types
+        calls = []
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "stream=nb_frames" in argv:
+                out = "N/A"
+            elif "stream_tags=NUMBER_OF_FRAMES" in argv:
+                out = ""
+            elif "-count_packets" in argv:
+                out = "192757"
+            else:
+                self.fail("full-decode count must not be reached")
+            return types.SimpleNamespace(stdout=out + "\n", returncode=0)
+        with mock.patch.object(topaz.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(topaz._frame_count("/cfr.mkv"), 192757)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("-count_packets", calls[2])
+
+    def test_header_count_still_wins_without_scanning(self):
+        import types
+        def fake_run(argv, **kw):
+            self.assertIn("stream=nb_frames", argv)     # first path answers -> no scan
+            return types.SimpleNamespace(stdout="61536\n", returncode=0)
+        with mock.patch.object(topaz.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(topaz._frame_count("/cfr.mp4"), 61536)
