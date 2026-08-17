@@ -33,6 +33,7 @@ class DownloadReuse(unittest.TestCase):
             fh.write("x")
         # CFR already made → the stage reuses both and never re-pulls or re-encodes
         with mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch.object(stages, "_source_complete", return_value=True), \
              mock.patch("topaz.is_cfr_ready", return_value=True):
             ok, msg = stages.run_stage("download", p)
         dl.assert_not_called()                 # reuse it — Topaz/Resolve/remux share this file
@@ -46,6 +47,7 @@ class DownloadReuse(unittest.TestCase):
             fh.write("x")
         import topaz
         with mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch.object(stages, "_source_complete", return_value=True), \
              mock.patch("topaz.is_cfr_ready", return_value=False), \
              mock.patch("topaz.to_cfr", return_value=topaz.CfrResult(
                  ok=True, frames=100, rate="24000/1001", error_tail="")) as cfr:
@@ -864,6 +866,7 @@ class DownloadRefusesDolbyVision(unittest.TestCase):
         with open(p.source, "w") as fh:            # source already on disk (or just pulled)
             fh.write("x")
         with mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch.object(stages, "_source_complete", return_value=True), \
              mock.patch("plan.probe_input", return_value={"is_dv": True}), \
              mock.patch("topaz.is_cfr_ready", return_value=False), \
              mock.patch("topaz.to_cfr") as cfr:
@@ -881,6 +884,7 @@ class DownloadRefusesDolbyVision(unittest.TestCase):
         with open(p.source, "w") as fh:
             fh.write("x")
         with mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch.object(stages, "_source_complete", return_value=True), \
              mock.patch("plan.probe_input", return_value={"is_dv": False}), \
              mock.patch("topaz.is_cfr_ready", return_value=False), \
              mock.patch("topaz.to_cfr", return_value=topaz.CfrResult(
@@ -898,6 +902,7 @@ class DownloadRefusesDolbyVision(unittest.TestCase):
         with open(p.source, "w") as fh:
             fh.write("x")
         with mock.patch.object(stages.transfer, "download"), \
+             mock.patch.object(stages, "_source_complete", return_value=True), \
              mock.patch("plan.probe_input", return_value={"is_dv": True}), \
              mock.patch.object(stages.logbook, "failure") as fail, \
              mock.patch.object(stages.logbook, "event") as ev:
@@ -999,6 +1004,7 @@ class FastPathSkipsTheCfrReencode(unittest.TestCase):
         with open(p.source, "w") as fh:
             fh.write("x")
         with mock.patch.object(stages.transfer, "download"), \
+             mock.patch.object(stages, "_source_complete", return_value=True), \
              mock.patch.object(plan, "plan_for", return_value={"topaz": plan_topaz}), \
              mock.patch.object(plan, "probe_input", return_value={"is_dv": False}), \
              mock.patch("topaz.is_cfr_ready", return_value=False), \
@@ -1254,7 +1260,13 @@ class SegmentedMezzanine(unittest.TestCase):
             if path == inp:
                 return want_frames
             return want_frames if total_ok else 5
+        def fake_exact(path, *a, **k):
+            # The plan now takes the EXACT count (duration x fps overran the real video and
+            # made the last segment ask for frames that do not exist). Mocked here so its
+            # ffprobe calls don't land on this harness's subprocess.run stub.
+            return want_frames if str(path) == inp else fake_count(path)
         with mock.patch.object(topaz, "total_frames", side_effect=fake_total), \
+             mock.patch.object(topaz, "_frame_count", side_effect=fake_exact), \
              mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
              mock.patch.object(topaz, "source_color", return_value=None), \
              mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run_ffmpeg), \
@@ -1845,3 +1857,69 @@ class YoutubeShipsItsRender(unittest.TestCase):
         self.assertTrue(rs.called)          # tried the fast path first
         self.assertTrue(rr.called)          # ...then fell back to the capped encode
         self.assertTrue(ok, msg)
+
+
+class UnverifiableSourceIsNeverTrusted(unittest.TestCase):
+    """A hard kill leaves a PARTIAL source on scratch. If the next arm can't reach the NAS
+    (Tailscale still coming up, smbftpd at its connection cap), _source_complete returns
+    None — and the stage used to promote that stub to a complete source. Nothing
+    downstream could catch it: the CFR is built from the fragment, the render is judged
+    against that same short CFR, the remux checks only internal consistency, upload
+    verifies the master against itself, and replace_source (default ON) then deletes the
+    real source. Truncated master + deleted original, every stage reporting success."""
+
+    def _run(self, state):
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        with open(p.source, "w") as fh:
+            fh.write("partial")
+        with mock.patch.object(stages, "_source_complete", return_value=state), \
+             mock.patch.object(stages.transfer, "download") as dl, \
+             mock.patch("plan.probe_input", return_value={"is_dv": False}), \
+             mock.patch("topaz.is_cfr_ready", return_value=True):
+            ok, msg = stages.run_stage("download", p)
+        return ok, msg, dl, p
+
+    def test_unverifiable_refuses_and_keeps_the_file(self):
+        ok, msg, dl, p = self._run(None)
+        self.assertFalse(ok)
+        self.assertIn("cannot verify", msg)
+        dl.assert_not_called()                       # no blind re-pull either
+        self.assertTrue(os.path.exists(p.source))    # kept — it may well be complete
+
+    def test_verified_complete_still_reuses(self):
+        ok, _msg, dl, _p = self._run(True)
+        self.assertTrue(ok)
+        dl.assert_not_called()
+
+    def test_verified_partial_is_deleted_and_repulled(self):
+        ok, _msg, dl, _p = self._run(False)
+        dl.assert_called_once()                      # verified short -> clean re-pull
+
+
+class MezzaninePlansFromExactFrames(unittest.TestCase):
+    """The segment plan used to come from format=duration x fps while every segment was
+    gated on an EXACT frame count. An audio track running past the last video frame (an
+    Opus/AAC tail of a few hundred ms is routine) inflated the estimate, so the last
+    segment asked for frames that do not exist, hit EOF short, failed the gate, and the
+    item failed identically on every retry until it parked."""
+
+    def test_exact_count_wins_over_the_duration_estimate(self):
+        import dvcap, topaz
+        seen = {}
+        with mock.patch.object(topaz, "_frame_count", return_value=138196) as exact, \
+             mock.patch.object(topaz, "total_frames", return_value=138205) as est, \
+             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(dvcap, "ensure_segdir",
+                               side_effect=lambda d, m: seen.update(m) or "fresh"), \
+             mock.patch.object(dvcap, "plan_segments", return_value=[]):
+            p = _paths(tempfile.mkdtemp())
+            try:
+                stages._build_mezzanine(p, abort=None)
+            except Exception:
+                pass                      # only the PLAN matters here
+        self.assertTrue(exact.called)
+        self.assertEqual(seen.get("frames"), 138196)   # the real count, not 138205
+        est.assert_not_called()

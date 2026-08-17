@@ -648,25 +648,43 @@ def build_outpaint_graph(*, input_name: str, canvas_w: int, canvas_h: int,
 
 # ---- ffmpeg builders (PURE) ----------------------------------------------------------
 
+def seek_seconds(start_frame: int, fps: float) -> float:
+    """Input-side seek for a frame index. MIDPOINT, like the remux's segment seeks: landing
+    exactly on a frame boundary can round up and shift every following frame by one."""
+    if not fps or start_frame <= 0:
+        return 0.0
+    return max(0.0, (float(start_frame) - 0.5) / float(fps))
+
+
 def chunk_extract_cmd(src: str, dst: str, start: int, nframes: int, geom: dict,
-                      ffmpeg: str = FFMPEG) -> list:
-    """One chunk of the source, downscaled to the model's 4:3 working core. No audio."""
-    vf = (f"trim=start_frame={start}:end_frame={start + nframes},setpts=PTS-STARTPTS,"
-          f"scale={geom['work_core_w']}:{geom['work_h']}:flags=lanczos,setsar=1")
-    return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", src,
-            "-vf", vf, "-an", "-c:v", "libx264", "-crf", "10", "-preset", "veryfast",
+                      fps: float = 0.0, ffmpeg: str = FFMPEG) -> list:
+    """One chunk of the source, downscaled to the model's 4:3 working core. No audio.
+
+    SEEKS with input-side -ss instead of filtering with trim=start_frame. A trim filter
+    still DECODES everything before the chunk, so extraction cost grew linearly with the
+    chunk index — an episode's last chunk decoded the whole episode. Over ~800 chunks of a
+    45-minute show that is tens of hours of pure redundant decode ON TOP of the generation
+    the design already costs (review-caught 2026-08-17). -ss on a CFR source is exact."""
+    scale = f"scale={geom['work_core_w']}:{geom['work_h']}:flags=lanczos,setsar=1"
+    pre = ["-ss", f"{seek_seconds(start, fps):.6f}"] if (fps and start > 0) else []
+    return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *pre, "-i", src,
+            "-frames:v", str(int(nframes)),
+            "-vf", scale, "-an", "-c:v", "libx264", "-crf", "10", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", dst]
 
 
 def composite_cmd(src: str, gen: str, dst: str, start: int, nframes: int, geom: dict,
-                  ffmpeg: str = FFMPEG) -> list:
+                  fps: float = 0.0, ffmpeg: str = FFMPEG) -> list:
     """[generated LEFT strip | ORIGINAL full-res frames | generated RIGHT strip].
     The original passes through at its display size (setsar=1 normalizes anamorphic);
     only the strips are upscaled from working res. Inner-aligned crops keep the
     seam-adjacent generated pixels."""
     g = geom
+    # Same input-side seek as chunk_extract_cmd — a trim filter here re-decoded the whole
+    # episode for every chunk's composite pass too, doubling the redundant decode.
+    pre = ["-ss", f"{seek_seconds(start, fps):.6f}"] if (fps and start > 0) else []
     fc = (
-        f"[0:v]trim=start_frame={start}:end_frame={start + nframes},"
+        f"[0:v]trim=end_frame={nframes},"
         f"setpts=PTS-STARTPTS,scale={g['disp_w']}:{g['src_h']}:flags=lanczos,setsar=1[orig];"
         f"[1:v]crop={g['crop_w_work']}:{g['canvas_h']}:{g['crop_left_x']}:0,"
         f"scale={g['strip_w']}:{g['src_h']}:flags=lanczos,setsar=1[L];"
@@ -675,7 +693,7 @@ def composite_cmd(src: str, gen: str, dst: str, start: int, nframes: int, geom: 
         f"[L][orig][R]hstack=inputs=3,format=yuv420p[out]"
     )
     return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-            "-i", src, "-i", gen, "-filter_complex", fc, "-map", "[out]",
+            *pre, "-i", src, "-i", gen, "-filter_complex", fc, "-map", "[out]",
             "-c:v", "libx264", "-crf", "12", "-preset", "medium", dst]
 
 

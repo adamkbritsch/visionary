@@ -42,7 +42,15 @@ def _resolve_budget(p) -> int:
     factor + launch slack, capped at 6 h so a bad probe can't produce an unbounded hang."""
     try:
         import topaz
-        _fps, dur = topaz.media_timing(p.source_cfr)
+        # COMBINE items never create a source_cfr (the remux reads both originals), so
+        # probing it returned 0 and every combine silently fell back to the flat
+        # episode-sized budget — on movie-length content, the exact failure this function
+        # exists to prevent. Measure whatever Resolve will actually ingest.
+        from orchestrator import combine_winner_path as _winner
+        src = p.source_cfr if os.path.exists(getattr(p, "source_cfr", "") or "") else ""
+        if not src:
+            src = _winner(p) or getattr(p, "source", "") or ""
+        _fps, dur = topaz.media_timing(src) if src else (0, 0.0)
     except Exception:
         dur = 0.0
     if not dur or dur <= 50 * 60:
@@ -255,11 +263,25 @@ def _download(p, abort, progress=None, low_prio=False):
         return _download_combine(p, abort, progress)
     have_source = False
     if os.path.exists(p.source):
-        if _source_complete(p) is not False:   # complete, OR can't verify → keep & reuse
+        state = _source_complete(p)
+        if state is True:                      # size matches the NAS file → reuse it
             have_source = True
-        else:
+        elif state is False:
             try: os.remove(p.source)           # verified INCOMPLETE → re-pull clean
             except OSError: pass
+        else:
+            # UNVERIFIABLE (NAS unreachable). "Don't destroy it" was right; "reuse it" was
+            # not. A hard kill (panic, power cut, forced quit) leaves a partial behind, and
+            # if the next arm can't reach the NAS — Tailscale still coming up, smbftpd at
+            # its connection cap — this promoted the stub to a complete source. NOTHING
+            # downstream would catch it: the CFR is built from the fragment, the render is
+            # judged against that same short CFR, the remux only checks internal
+            # consistency, upload verifies the master against itself, and replace_source
+            # (default ON) then deletes the real source. A truncated master and a deleted
+            # original, every stage reporting success. Keep the file, refuse to trust it:
+            # a retryable failure re-verifies the moment the NAS answers.
+            return False, ("NAS unreachable — cannot verify the local source is complete; "
+                           "not reusing it (it is kept for the next attempt)")
     if not have_source:
         on_prog = None
         if progress:
@@ -594,7 +616,7 @@ def _extend(p, abort, progress=None):
             t0 = time.monotonic()
             chunk_in = os.path.join(backend.in_dir, f"chunk_{k:04d}.mp4")
             r = subprocess.run(borders.chunk_extract_cmd(p.source_cfr, chunk_in, start,
-                                                         n, geom),
+                                                         n, geom, fps=float(fps)),
                                capture_output=True, text=True, timeout=1800)
             if r.returncode != 0:
                 return False, "border extend: chunk extract failed — " + _err_tail(r.stderr)
@@ -613,7 +635,7 @@ def _extend(p, abort, progress=None):
                 return False, f"border extend: ComfyUI produced no output for chunk {k}"
             part = wide_k + ".part.mp4"                  # atomic: rename marks the chunk done
             r = subprocess.run(borders.composite_cmd(p.source_cfr, gen, part, start, n,
-                                                     geom),
+                                                     geom, fps=float(fps)),
                                capture_output=True, text=True, timeout=1800)
             got = borders.count_frames(part) if r.returncode == 0 else 0
             if got != n:
@@ -820,7 +842,16 @@ def _build_mezzanine(p, abort, progress=None, src=None):
     # the input): a lid-close/transient killed pass used to REBUILD the ~10-minute,
     # ~50 GB encode on every retry (live-caught 2026-08-06). A partial never matches
     # (unreadable moov / short count); cleanup still sweeps strays.
-    want = topaz.total_frames(inp) or 0
+    # EXACT count, not duration x fps. total_frames() estimates from the container
+    # duration, which overruns the real video whenever a track runs past the last frame
+    # (an Opus/AAC tail is routinely a few hundred ms long). The plan built from that
+    # estimate then asks the FINAL segment for frames that do not exist, it hits EOF
+    # short, the exact-count gate rejects it, and the item fails identically on every
+    # retry until it parks (review-caught 2026-08-17). _frame_count reads headers/tags
+    # and falls back to a packet scan — the same exact number the gate compares against.
+    want = topaz._frame_count(inp)
+    if want <= 0:
+        want = topaz.total_frames(inp) or 0
     if want and os.path.exists(dst) and topaz.total_frames(dst) == want:
         return True, dst
     if not want:

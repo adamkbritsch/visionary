@@ -169,18 +169,37 @@ class FfmpegBuilders(unittest.TestCase):
     def setUp(self):
         self.g = borders.plan_geometry(720, 540)
 
-    def test_chunk_extract(self):
-        cmd = borders.chunk_extract_cmd("/s.mp4", "/d.mp4", 81, 81, self.g)
+    def test_chunk_extract_seeks_instead_of_decoding_from_zero(self):
+        """A trim filter still DECODES everything before the chunk, so cost grew with the
+        chunk index — the last chunk of an episode decoded the whole episode (tens of
+        hours of redundant decode over ~800 chunks). Input-side -ss is O(1)."""
+        cmd = borders.chunk_extract_cmd("/s.mp4", "/d.mp4", 81, 81, self.g, fps=24.0)
         joined = " ".join(cmd)
-        self.assertIn("trim=start_frame=81:end_frame=162", joined)
+        self.assertNotIn("trim=start_frame", joined)
+        self.assertLess(cmd.index("-ss"), cmd.index("-i"))       # INPUT-side seek
+        self.assertAlmostEqual(float(cmd[cmd.index("-ss") + 1]), (81 - 0.5) / 24.0, places=5)
+        self.assertEqual(cmd[cmd.index("-frames:v") + 1], "81")
         self.assertIn(f"scale={self.g['work_core_w']}:{self.g['work_h']}", joined)
         self.assertIn("-an", cmd)
         self.assertEqual(cmd[-1], "/d.mp4")
 
+    def test_chunk_zero_and_unknown_fps_do_not_seek(self):
+        for kw in ({"fps": 24.0}, {"fps": 0.0}):
+            cmd = borders.chunk_extract_cmd("/s.mp4", "/d.mp4", 0, 81, self.g, **kw)
+            self.assertNotIn("-ss", cmd)
+        cmd = borders.chunk_extract_cmd("/s.mp4", "/d.mp4", 500, 81, self.g, fps=0.0)
+        self.assertNotIn("-ss", cmd)          # no fps -> cannot seek; still correct, just slow
+
+    def test_seek_seconds_is_midpoint(self):
+        self.assertEqual(borders.seek_seconds(0, 24.0), 0.0)
+        self.assertAlmostEqual(borders.seek_seconds(240, 24.0), 9.979166, places=5)
+        self.assertEqual(borders.seek_seconds(240, 0), 0.0)
+
     def test_composite(self):
         g = self.g
-        cmd = borders.composite_cmd("/s.mp4", "/gen.mp4", "/w.mp4", 0, 81, g)
+        cmd = borders.composite_cmd("/s.mp4", "/gen.mp4", "/w.mp4", 0, 81, g, fps=24.0)
         fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertNotIn("trim=start_frame", fc)      # seeks, never re-decodes from zero
         self.assertIn("hstack=inputs=3", fc)
         self.assertIn(f"scale={g['disp_w']}:{g['src_h']}", fc)          # original lane
         self.assertIn(f"crop={g['crop_w_work']}:{g['canvas_h']}:{g['crop_left_x']}:0",

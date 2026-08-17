@@ -1885,12 +1885,58 @@ class Orchestrator:
         if self._resolve_deferred and not self._quiet_mode():
             self._resolve_deferred.clear()
 
+    @staticmethod
+    def _dir_gb(d) -> float:
+        try:
+            return sum(os.path.getsize(os.path.join(r, f))
+                       for r, _dirs, files in os.walk(d) for f in files
+                       if os.path.exists(os.path.join(r, f))) / (1024 ** 3)
+        except OSError:
+            return 0.0
+
+    def _sweep_parked_files(self, p, ep_disp):
+        """Delete a PARKED item's local working set. The item is out of the run, so its
+        files are pure dead weight — and its topaz segdir would otherwise keep the
+        dual-remux gate shut forever. Deliberately does NOT touch anything on the NAS: a
+        park is "skip this for now", never "throw the source away". Re-arming clears
+        `_parked`, and the item simply re-downloads."""
+        import shutil as _shutil
+        freed = 0
+        for d in (p.segdir, str(p.final) + ".remuxsegs",
+                  (str(p.source_wide) + ".segments") if getattr(p, "source_wide", "") else ""):
+            if d and os.path.isdir(d):
+                freed += self._dir_gb(d)
+                _shutil.rmtree(d, ignore_errors=True)
+        for f in p.working_files():
+            try:
+                if os.path.exists(f):
+                    freed += os.path.getsize(f) / (1024 ** 3)
+                    os.remove(f)
+            except OSError as e:
+                logbook.event(f"parked {ep_disp}: could not remove "
+                              f"{os.path.basename(f)} ({e.strerror})")
+        if freed >= 1:
+            logbook.event(f"parked {ep_disp}: swept {freed:.0f} GB of abandoned working files")
+
     def _park_item(self, p, ep_disp, n, st, last_msg=""):
         """Give up on this item for the run after repeated GENUINE failures: skip it so the series
         keeps moving. A parked YouTube video restarts its cadence (it spent no TV turn). Shared by the
         generic download/topaz fail path and the Resolve-stall path (a truly unrenderable file)."""
         self._parked.add(self._skip_key(p))
         self._fail_counts.pop(self._skip_key(p), None)
+        # SWEEP THE ABANDONED WORKING SET. Parking stops all work on an item but nothing
+        # ever came back for its files: only the cleanup STAGE deletes them, and a parked
+        # item never reaches it. So each park leaked its source + CFR + ProRes segdir +
+        # render — hundreds of GB — until the disk filled. Worse, a leaked topaz segdir
+        # still counts toward _drain_backlog, so two parked items permanently jam
+        # _dual_remux_pauses_topaz and the run holds forever on "two remuxes running"
+        # with zero remuxes live (the residual half of the b632ca4 deadlock).
+        # Best-effort and non-fatal: a file we cannot delete is worth a log line, never a
+        # crash in the failure path.
+        try:
+            self._sweep_parked_files(p, ep_disp)
+        except Exception as e:
+            logbook.exception(f"sweeping parked files for {ep_disp}", e)
         if p.youtube:                     # a parked video SPENT its YouTube turn — restart the cadence
             with self._cadence_lock:      # so the gate doesn't serve another video with no intervening TV
                 self._tv_since_yt = 0

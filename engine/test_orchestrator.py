@@ -3140,3 +3140,47 @@ class YoutubeBurstCadence(unittest.TestCase):
             self.assertEqual(o._yt_in_burst, 1)
             o2 = orch.Orchestrator()                  # "relaunch"
             self.assertEqual(o2._yt_in_burst, 1)      # mid-burst survives a deploy
+
+
+class ParkSweepsItsWorkingSet(unittest.TestCase):
+    """Parking stops all work on an item, but nothing ever came back for its FILES —
+    only the cleanup STAGE deletes them and a parked item never reaches it. Each park
+    leaked source + CFR + ProRes segdir + render (hundreds of GB), and a leaked segdir
+    keeps counting toward _drain_backlog, so two parked items jam the dual-remux gate
+    forever with zero remuxes live (the residual half of the b632ca4 deadlock)."""
+
+    def _item(self, d):
+        p = episode_paths("Show", "S01E01", "ep.mkv", scratch_dir=d,
+                          nas_tv_root="/Media/TV-Shows")
+        for f in (p.source, p.source_cfr, p.dv_render, p.final):
+            with open(f, "w") as fh:
+                fh.write("x" * 1024)
+        os.makedirs(p.segdir, exist_ok=True)
+        with open(os.path.join(p.segdir, "seg_0000.mov"), "w") as fh:
+            fh.write("y" * 2048)
+        return p
+
+    def test_park_deletes_the_local_set_and_frees_the_gate(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        o = orch.Orchestrator()
+        p = self._item(d)
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
+            self.assertEqual(o._drain_backlog(), 1)      # the segdir counts before
+            with mock.patch.object(o, "_hold"):
+                o._park_item(p, "S01E01", 5, "topaz", "boom")
+            self.assertEqual(o._drain_backlog(), 0)      # ...and not after
+        self.assertFalse(os.path.isdir(p.segdir))
+        for f in (p.source, p.source_cfr, p.dv_render, p.final):
+            self.assertFalse(os.path.exists(f), f)
+        self.assertIn(o._skip_key(p), o._parked)
+
+    def test_sweep_failure_never_breaks_the_park(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        o = orch.Orchestrator()
+        p = self._item(d)
+        with mock.patch.object(o, "_sweep_parked_files", side_effect=OSError("nope")), \
+             mock.patch.object(o, "_hold"):
+            o._park_item(p, "S01E01", 5, "topaz", "boom")   # must not raise
+        self.assertIn(o._skip_key(p), o._parked)            # the park still took effect
