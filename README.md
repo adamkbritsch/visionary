@@ -444,6 +444,13 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
+- **Run a video now**: any pending YouTube video can jump the whole queue from its up-next
+  row (the ↥ button) — cadence-exempt and ahead of due movies. Whatever is processing
+  **yields at its next safe boundary** and resumes afterwards: a Topaz segment boundary, so
+  at most one ~90-second segment is redone; never mid-Resolve (screen automation, not
+  resumable), and a download is left to finish rather than throwing away gigabytes. The
+  pipeline card says which of the three is happening and when the video will start.
+
 | Round-robin queue | Guardrails |
 |:---:|:---:|
 | <img src="docs/assets/queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine items lined up" width="420"> | <img src="docs/assets/scratch.png" alt="Scratch and power: the 140 W gate, free space, live per-episode scratch usage" width="420"> |
