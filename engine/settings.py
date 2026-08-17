@@ -100,6 +100,11 @@ DEFAULT_SETTINGS = {
                                 # FAST-PATH (rpu-only/resolve-only) item's Resolve pass only.
     "max_youtube_minutes": 20,  # YouTube: the per-channel length-cap threshold (applied only to channels
                                 # whose 'capped' toggle is on).
+    "youtube_videos_per_burst": 1,   # YouTube CADENCE, the OTHER direction: how many videos run
+                                # back-to-back once the gate fires. The pair expresses the whole dial
+                                # as WHOLE NUMBERS instead of a fraction (user-dictated 2026-08-17):
+                                # K videos per episode is (every=1, burst=K); 1 video per N episodes
+                                # is (every=N, burst=1). Both default to the long-standing 1-per-2.
     "youtube_every_tv_episodes": 2,  # YouTube CADENCE: serve exactly 1 YouTube video after every N TV
                                 # episodes (was: a ~max_youtube_minutes batch every turn). Throttles the
                                 # slow 4K-SDR YouTube upscales so they don't crowd out TV. If TV runs out,
@@ -167,6 +172,7 @@ LIMITS = {
     "resolve_share_remuxes": (0, 2),
     "max_youtube_minutes": (1, 600),
     "youtube_every_tv_episodes": (1, 50),
+    "youtube_videos_per_burst": (1, 10),
     "max_active_shows": (1, MAX_ACTIVE_CEILING),
     "finisher_lanes": (1, 2),
     "min_free_gb": (200, 2000),

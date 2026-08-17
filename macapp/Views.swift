@@ -1370,8 +1370,11 @@ struct SeriesCard: View {
         // the ONE statement of the scheduling model — kept accurate: movies and videos run
         // start-to-finish when their slot comes up; YouTube is cadence-gated, not a queue-jumper
         let n = store.state?.settings?.youtube_every_tv_episodes ?? 2
+        let k = store.state?.settings?.youtube_videos_per_burst ?? 1
+        let cadence = k > 1 ? "\(k) videos per episode"
+                            : (n == 1 ? "1 video per episode" : "1 video per \(n) episodes")
         Card(title: title, systemImage: icon,
-             hint: "TV in order · movies run whole when due · 1 video per \(n) episodes") {
+             hint: "TV in order · movies run whole when due · " + cadence) {
             ModeNavBar()                              // the TV / YouTube / Movies view toggle
             switch mode {
             case "movie":   MovieMode(locked: locked)
@@ -2640,8 +2643,9 @@ private struct YouTubeMode: View {
                     Spacer()
                     Pill(systemImage: "tray.full", text: "\(items.count) queued", tint: items.isEmpty ? DS.steelDim : DS.steel)
                 }
-                CadenceControl(every: store.state?.settings?.youtube_every_tv_episodes ?? 2) { n in
-                    Task { await store.setYoutubeEveryTv(n) }
+                CadenceControl(every: store.state?.settings?.youtube_every_tv_episodes ?? 2,
+                               burst: store.state?.settings?.youtube_videos_per_burst ?? 1) { n, k in
+                    Task { await store.setYoutubeCadence(every: n, burst: k) }
                 }
                 if items.isEmpty {
                     Text("Search your subscriptions above to add a channel.")
@@ -2663,20 +2667,43 @@ private struct YouTubeMode: View {
 
 // Global YouTube cadence: how many TV episodes play per 1 YouTube video. YouTube 4K-SDR upscales are
 // far slower than a 1080p episode, so this throttles them so they don't crowd out TV.
+// ONE dial spanning BOTH directions of the cadence as whole numbers (user-dictated
+// 2026-08-17): "3 videos per episode" ... "1 per episode" ... "1 video every 10 episodes".
+// A single Int position maps onto the engine's two whole-number knobs — no fractions:
+//   position < 0  ->  every = 1,        burst = -position + 1   (K videos per episode)
+//   position >= 0 ->  every = position + 1, burst = 1           (1 video per N episodes)
 private struct CadenceControl: View {
     let every: Int
-    let onChange: (Int) -> Void
+    let burst: Int
+    let onChange: (Int, Int) -> Void          // (every, burst)
+
+    private static let minPos = -9            // 10 videos per episode
+    private static let maxPos = 49            // 1 video per 50 episodes
+
+    private var position: Int { burst > 1 ? -(burst - 1) : every - 1 }
+
+    private static func knobs(_ pos: Int) -> (Int, Int) {
+        pos < 0 ? (1, -pos + 1) : (pos + 1, 1)
+    }
+
+    private var summary: String {
+        if burst > 1 { return "\(burst) videos per TV episode" }
+        return every == 1 ? "1 video per TV episode"
+                          : "1 video every \(every) TV episodes"
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "rectangle.stack.badge.play")
                 .font(.system(size: 15)).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 1) {
                 Text("YouTube cadence").font(.system(size: 13, weight: .medium))
-                Text("1 video every \(every) TV episode\(every == 1 ? "" : "s")")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(summary).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            Stepper(value: Binding(get: { every }, set: { onChange($0) }), in: 1...50) { EmptyView() }
+            Stepper(value: Binding(get: { position },
+                                   set: { p in let k = Self.knobs(p); onChange(k.0, k.1) }),
+                    in: Self.minPos...Self.maxPos) { EmptyView() }
                 .labelsHidden().fixedSize()
         }
         .padding(10).panel(DS.radiusControl, inset: true)

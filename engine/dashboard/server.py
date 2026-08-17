@@ -1066,7 +1066,9 @@ def up_next(limit=10, current=None, inflight=None):
         tv_since, parked = 0, set()
     mvs = sorted(movies.get_selected(), key=movies._pos)        # stable by slot, then add-order
     mvs = [m for m in mvs if m.get("name") not in mv_excl]      # in-flight movies are not "next"
-    every = max(1, int(settings.get_settings().get("youtube_every_tv_episodes", 2)))
+    _st = settings.get_settings()
+    every = max(1, int(_st.get("youtube_every_tv_episodes", 2)))
+    burst = max(1, int(_st.get("youtube_videos_per_burst", 1) or 1))   # videos per firing
     yt_videos = list(youtube.all_pending(skip=parked))         # flat, newest-first — 1 served per `every` eps
     yt_videos = [v for v in yt_videos if v.get("source_name") not in yt_excl]   # in-flight videos not "next"
     if cur_kind == "youtube":
@@ -1088,16 +1090,23 @@ def up_next(limit=10, current=None, inflight=None):
         out.append(yt_item(yt_videos[yi])); yi += 1
         ep_count = 0                                           # restart the N-episode countdown
         return len(out) >= limit
+    def _emit_yt_burst():                                      # the WHOLE burst runs back-to-back
+        for _ in range(burst):
+            if yi >= len(yt_videos):
+                break
+            if _emit_yt_one():
+                return True
+        return False
     def _after_episode():                                      # one TV episode emitted → toward the next YT
         nonlocal ep_count
         ep_count += 1
         if ep_count >= every and yi < len(yt_videos):
-            return _emit_yt_one()
+            return _emit_yt_burst()
         return False
     # Counter already saturated (after `current` completes) → the orchestrator's gate serves a
     # YouTube video BEFORE the TV rotation — lead with it to match.
     if ep_count >= every and yi < len(yt_videos):
-        if _emit_yt_one(): return out
+        if _emit_yt_burst(): return out
     for ei in range(len(eps) + 1):
         while mi < len(mvs) and movies._pos(mvs[mi]) == ei:    # movies due right before episode ei (a movie
             out.append(movie_item(mvs[mi])); mi += 1           # does NOT count toward the YouTube cadence)

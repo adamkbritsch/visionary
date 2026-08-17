@@ -326,6 +326,7 @@ struct SettingsDTO: Codable {
     var audio_target_lufs: Int?           // smart loudness boost target (measured per item; 0 = off)
     var max_youtube_minutes: Int?
     var youtube_every_tv_episodes: Int?   // serve 1 YouTube video per this many TV episodes
+    var youtube_videos_per_burst: Int?    // ...or this many videos back-to-back per firing
     var min_adapter_watts: Int?           // power sufficiency = a brick of at least this wattage
     var passthrough_min_mbps: Int?        // 4K fast path: a 4K source at/above this skips Topaz (0 = off)
 
@@ -356,6 +357,7 @@ extension SettingsDTO {
         case "audio_target_lufs":         return audio_target_lufs
         case "max_youtube_minutes":       return max_youtube_minutes
         case "youtube_every_tv_episodes": return youtube_every_tv_episodes
+        case "youtube_videos_per_burst": return youtube_videos_per_burst
         case "min_adapter_watts":         return min_adapter_watts
         case "passthrough_min_mbps":      return passthrough_min_mbps
         case "max_active_shows":          return max_active_shows

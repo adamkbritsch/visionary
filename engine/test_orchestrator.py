@@ -3075,3 +3075,68 @@ class ExtendExclusivity(unittest.TestCase):
              mock.patch.object(o, "_sleep", side_effect=lambda _s: setattr(o, "_enabled", False)):
             o._prefetch()
         cands.assert_not_called()          # never even enumerates work while outpainting runs
+
+
+class YoutubeBurstCadence(unittest.TestCase):
+    """The cadence dial reads as WHOLE NUMBERS in both directions (user-dictated
+    2026-08-17): (every=N, burst=1) is 1 video per N episodes — the long-standing
+    behavior — and (every=1, burst=K) is K videos per episode. The burst gate stays
+    open until the burst completes; only its LAST video restarts the countdown."""
+
+    def _orch(self, every, burst):
+        o = orch.Orchestrator()
+        o._yt_burst = lambda: burst
+        o._yt_every_tv = lambda: every
+        o._save_cadence = lambda: None
+        o._cadence_advanced = set()
+        o._yt_in_burst = 0
+        o._tv_since_yt = 0
+        return o
+
+    def _complete_yt(self, o, name):
+        p = orch.youtube_paths("Chan", f"/staging/Chan/{name}/{name}.mp4", name)
+        o._advance_cadence_at_handoff(p)
+
+    def _complete_ep(self, o, ep):
+        p = episode_paths("S", ep, f"{ep}.mkv", scratch_dir="/s", nas_tv_root="/Media/TV")
+        o._advance_cadence_at_handoff(p)
+
+    def test_single_video_cadence_is_unchanged(self):
+        o = self._orch(every=2, burst=1)
+        self._complete_ep(o, "S01E01"); self._complete_ep(o, "S01E02")
+        self.assertEqual(o._tv_since_yt, 2)          # gate open
+        self._complete_yt(o, "v1")
+        self.assertEqual(o._tv_since_yt, 0)          # one video resets it
+        self.assertEqual(o._yt_in_burst, 0)
+
+    def test_burst_of_three_keeps_the_gate_open_until_done(self):
+        o = self._orch(every=1, burst=3)
+        self._complete_ep(o, "S01E01")
+        self.assertEqual(o._tv_since_yt, 1)
+        self._complete_yt(o, "v1")
+        self.assertEqual((o._tv_since_yt, o._yt_in_burst), (1, 1))   # still open
+        self._complete_yt(o, "v2")
+        self.assertEqual((o._tv_since_yt, o._yt_in_burst), (1, 2))   # still open
+        self._complete_yt(o, "v3")
+        self.assertEqual((o._tv_since_yt, o._yt_in_burst), (0, 0))   # burst done -> reset
+
+    def test_an_episode_abandons_a_partial_burst(self):
+        o = self._orch(every=1, burst=3)
+        self._complete_ep(o, "S01E01")
+        self._complete_yt(o, "v1")
+        self.assertEqual(o._yt_in_burst, 1)
+        self._complete_ep(o, "S01E02")                # TV ran anyway -> burst is over
+        self.assertEqual(o._yt_in_burst, 0)
+
+    def test_burst_counter_persists_across_a_relaunch(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        with mock.patch.object(orch, "CADENCE_FILE", _os.path.join(d, "c.json")):
+            o = orch.Orchestrator()
+            o._yt_burst = lambda: 3
+            o._cadence_advanced = set()
+            o._tv_since_yt, o._yt_in_burst = 1, 0
+            self._complete_yt(o, "v1")
+            self.assertEqual(o._yt_in_burst, 1)
+            o2 = orch.Orchestrator()                  # "relaunch"
+            self.assertEqual(o2._yt_in_burst, 1)      # mid-burst survives a deploy

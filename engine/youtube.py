@@ -289,22 +289,38 @@ def _resume_first_map() -> dict:
         return {}
 
 
+# How long a pause may last before its "come back to THIS video" pin is forgotten. The pin
+# exists for the overnight case — pause mid-video, resume tomorrow, get that video back. A
+# pause measured in WEEKS means the opposite: the user wants the newest video, not the one
+# they walked away from (user-dictated 2026-08-17).
+RESUME_FIRST_MAX_AGE = 3 * 86400
+
+
 def set_resume_first(folder, vid) -> None:
     """Remember the video a channel PAUSE interrupted (keyed by channel FOLDER), so channel_pending
     serves it FIRST once the channel is unpaused — the user paused mid-video and wants THAT exact
-    video back before anything else. Persisted so it survives the gap until they resume."""
+    video back before anything else. Persisted (with the time it was set, so it can EXPIRE) so it
+    survives the gap until they resume."""
     if not (folder and vid):
         return
     with _RESUME_LOCK:
-        m = _resume_first_map(); m[folder] = vid
+        m = _resume_first_map(); m[folder] = {"vid": vid, "at": int(time.time())}
         os.makedirs(os.path.dirname(RESUME_FIRST_FILE), exist_ok=True)
         with open(RESUME_FIRST_FILE, "w") as f:
             json.dump(m, f)
 
 
 def resume_first(folder):
-    """The vid to serve first for this channel folder, or None."""
-    return _resume_first_map().get(folder or "") or None
+    """The vid to serve first for this channel folder, or None — EXPIRED pins return None.
+    A legacy bare-string entry (no timestamp) is treated as expired: it can only have been
+    written before this file learned to age, so it is exactly the stale kind."""
+    e = _resume_first_map().get(folder or "")
+    if not isinstance(e, dict):
+        return None                       # legacy/unknown-age -> newest-first wins
+    vid, at = e.get("vid"), e.get("at") or 0
+    if not vid or (time.time() - float(at)) > RESUME_FIRST_MAX_AGE:
+        return None
+    return vid
 
 
 def clear_resume_first(folder) -> None:
@@ -538,7 +554,19 @@ def channel_pending(entry, skip=()) -> list:
         if scope == "popular" and popular and vid not in popular:
             continue
         out.append({"channel": folder, "source_name": v["name"], "nas_dir": v["dir"],
-                    "video_path": v["path"], "title": video_title(v["name"], folder), "vid": vid})
+                    "video_path": v["path"], "title": video_title(v["name"], folder), "vid": vid,
+                    "_pub": pub or v.get("mtime") or 0})
+    # NEWEST-FIRST BY PUBLISH DATE, not by download time. cached_videos is ordered by the
+    # file's mtime on the NAS — i.e. WHEN YOUTARR FETCHED IT — which is the same thing only
+    # while a channel is being followed live. Un-pause a channel after weeks and youtarr
+    # backfills the gap: those older videos land with the NEWEST mtimes, sort to the front,
+    # and the pipeline grinds forward from where it paused instead of starting at the top
+    # (user-reported 2026-08-17). The publish map is already loaded here for the max-age
+    # filter, so the honest key costs nothing; mtime remains the fallback for a video whose
+    # publish date was never fetched (both are epoch seconds, so they mix safely).
+    out.sort(key=lambda e: e["_pub"], reverse=True)
+    for e in out:
+        e.pop("_pub", None)
     rf = resume_first(folder)          # a pause interrupted this video → it comes back FIRST on resume
     if rf:
         i = next((k for k, v in enumerate(out) if v["vid"] == rf), None)

@@ -946,6 +946,9 @@ class Orchestrator:
         self._tv_since_yt = c["tv_since_yt"]   # TV episodes completed since the last YouTube video — the
                                                # cadence counter: at >= youtube_every_tv_episodes, 1 YT
                                                # video is served next, then this resets to 0
+        self._yt_in_burst = int(c.get("yt_in_burst", 0) or 0)  # videos served so far in the CURRENT
+                                               # burst — persisted so a deploy mid-burst resumes it
+                                               # instead of restarting the whole burst
         self._cadence_advanced.update(c.get("advanced", []))   # once-per-item hand-off guard survives
                                                # restarts (else a relaunch re-counts the in-finisher item)
         self._yt_refresh_at = 0.0              # monotonic time of the next live staging re-scan
@@ -1355,9 +1358,10 @@ class Orchestrator:
             with open(CADENCE_FILE) as f:
                 d = json.load(f)
             return {"tv_since_yt": max(0, int(d.get("tv_since_yt", 0))),
+                    "yt_in_burst": max(0, int(d.get("yt_in_burst", 0) or 0)),
                     "advanced": [str(x) for x in d.get("advanced", [])]}
         except (OSError, ValueError, TypeError):
-            return {"tv_since_yt": 0, "advanced": []}
+            return {"tv_since_yt": 0, "yt_in_burst": 0, "advanced": []}
 
     def _save_cadence(self):
         """Persist the scheduling history counters (atomic tmp+rename) — call after every
@@ -1367,6 +1371,7 @@ class Orchestrator:
             tmp = CADENCE_FILE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump({"tv_since_yt": self._tv_since_yt,
+                           "yt_in_burst": self._yt_in_burst,
                            "advanced": sorted(self._cadence_advanced)}, f)
             os.replace(tmp, CADENCE_FILE)
         except OSError:
@@ -2382,6 +2387,9 @@ class Orchestrator:
         # checked BEFORE the TV rotation so the video fires the moment the count is reached.
         yt = youtube.next_due(skip=skip)
         every = self._yt_every_tv()
+        # The gate stays OPEN until the whole burst is served: `_yt_in_burst` counts how many
+        # of this burst's videos have completed, and only the LAST one resets _tv_since_yt
+        # (see _advance_cadence_at_handoff). burst=1 is the long-standing behavior exactly.
         if yt is not None and self._tv_since_yt >= every:
             return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
         # Round-robin over the ACTIVE TV SERIES (one episode each in turn, looping). `_rr` advances only
@@ -2412,6 +2420,13 @@ class Orchestrator:
         if yt is not None:
             return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
         return None, "no-series"
+
+    def _yt_burst(self) -> int:
+        """How many YouTube videos run back-to-back once the cadence gate fires (>=1)."""
+        try:
+            return max(1, int(settings.get_settings().get("youtube_videos_per_burst", 1)))
+        except (TypeError, ValueError):
+            return 1
 
     def _yt_every_tv(self) -> int:
         """How many TV episodes run per 1 YouTube video (the cadence, >=1). Read live from settings."""
@@ -2916,8 +2931,15 @@ class Orchestrator:
                                     # (fail / power requeue / disable / restart) must not re-count it
                 self._cadence_advanced.add(p.source_basename)
                 if p.youtube:
-                    self._tv_since_yt = 0                 # cadence: restart the N-episode countdown
+                    # One video of the burst done. Only when the burst is COMPLETE does the
+                    # N-episode countdown restart; until then the gate re-fires immediately
+                    # and the next video runs back-to-back.
+                    self._yt_in_burst += 1
+                    if self._yt_in_burst >= self._yt_burst():
+                        self._yt_in_burst = 0
+                        self._tv_since_yt = 0             # cadence: restart the countdown
                 elif not p.movie:                         # a TV episode
+                    self._yt_in_burst = 0                 # an episode ran: any partial burst is over
                     self._tv_since_yt += 1                # one more TV episode toward the next video
                     # ONE rotation, persisted: series.advance_rotation is the single source
                     # of truth (it was an unwired twin of the old inline advance — the

@@ -461,3 +461,66 @@ class SendToVisionary(unittest.TestCase):
             self.assertEqual(got["vid"], "dQw4w9WgXcQ")
             self.assertIsNone(youtube.locate_priority(
                 skip={"My Video [dQw4w9WgXcQ]"}))
+
+
+class PublishOrderAfterAPause(unittest.TestCase):
+    """A channel paused for weeks must resume at the NEWEST video and work back.
+    cached_videos is ordered by file mtime = WHEN YOUTARR FETCHED IT, so a channel
+    unpaused after a long gap backfills its missed videos with the newest mtimes; those
+    old videos sorted to the front and the pipeline carried on from where it paused
+    (user-reported 2026-08-17). Ordering is by PUBLISH date now."""
+
+    def _entry(self):
+        return {"channelId": "C1", "folder_name": "Chan", "scope": "all", "capped": False}
+
+    def _videos(self):
+        # mtime order (download order) is the INVERSE of publish order — the backfill case.
+        return [
+            {"vid": "old1", "name": "old1 [old1].mp4", "dir": "/d", "path": "/d/old1.mp4",
+             "mtime": 9000},          # backfilled last -> newest mtime
+            {"vid": "old2", "name": "old2 [old2].mp4", "dir": "/d", "path": "/d/old2.mp4",
+             "mtime": 8000},
+            {"vid": "new1", "name": "new1 [new1].mp4", "dir": "/d", "path": "/d/new1.mp4",
+             "mtime": 1000},          # downloaded before the pause -> oldest mtime
+        ]
+
+    def _pending(self, pubs):
+        with mock.patch.object(youtube, "cached_videos", return_value=self._videos()), \
+             mock.patch.object(youtube, "_durations", return_value={}), \
+             mock.patch.object(youtube, "_published", return_value=pubs), \
+             mock.patch.object(youtube, "get_done", return_value=set()), \
+             mock.patch.object(youtube, "resume_first", return_value=None), \
+             mock.patch.object(youtube, "video_title", side_effect=lambda n, f: n):
+            return [v["vid"] for v in youtube.channel_pending(self._entry())]
+
+    def test_publish_date_beats_download_time(self):
+        pubs = {"new1": 2_000_000, "old1": 1_000_000, "old2": 1_500_000}
+        self.assertEqual(self._pending(pubs), ["new1", "old2", "old1"])
+
+    def test_unknown_publish_dates_fall_back_to_mtime(self):
+        self.assertEqual(self._pending({}), ["old1", "old2", "new1"])   # mtime order
+
+
+class ResumePinExpires(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        p = mock.patch.object(youtube, "RESUME_FIRST_FILE",
+                              os.path.join(self.d, "rf.json"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_fresh_pin_is_honoured(self):
+        youtube.set_resume_first("Chan", "vid123")
+        self.assertEqual(youtube.resume_first("Chan"), "vid123")
+
+    def test_weeks_old_pin_expires(self):
+        youtube.set_resume_first("Chan", "vid123")
+        old = time.time() + youtube.RESUME_FIRST_MAX_AGE + 60
+        with mock.patch.object(youtube.time, "time", return_value=old):
+            self.assertIsNone(youtube.resume_first("Chan"))
+
+    def test_legacy_untimestamped_pin_is_treated_as_stale(self):
+        import json as _json
+        with open(youtube.RESUME_FIRST_FILE, "w") as f:
+            _json.dump({"Chan": "vid123"}, f)     # the old bare-string form
+        self.assertIsNone(youtube.resume_first("Chan"))

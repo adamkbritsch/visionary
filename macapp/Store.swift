@@ -200,6 +200,14 @@ final class AppStore: ObservableObject {
     func setYoutubeEveryTv(_ n: Int) async {
         await saveSettings(["youtube_every_tv_episodes": max(1, min(50, n))])
     }
+
+    /// BOTH whole-number knobs of the YouTube cadence in one write, so the dial can't
+    /// land on a torn pair (e.g. burst applied without every, briefly serving a burst
+    /// every N episodes when the user asked for N-per-episode).
+    func setYoutubeCadence(every: Int, burst: Int) async {
+        await saveSettings(["youtube_every_tv_episodes": max(1, min(50, every)),
+                            "youtube_videos_per_burst": max(1, min(10, burst))])
+    }
     // Put a show in round-robin slot `index` (replace that slot, or append for the empty slot).
     // Each show's own picker uses this — changing one slot leaves the others alone.
     func setSlot(_ index: Int, _ name: String) async {
