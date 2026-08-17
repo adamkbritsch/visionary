@@ -426,6 +426,40 @@ struct BordersStatusDTO: Codable {
     var chunk_frames: Int?
 }
 
+/// GET/POST /api/media-libraries — which NAS folders are TV / Movies / YouTube.
+struct MediaLocationDTO: Codable {
+    var container: String?     // Plex's own (container) path
+    var ftp: String?           // mapped NAS FTP path, nil when unmappable
+    var exists: Bool?          // verified by listing it over FTP
+}
+
+struct MediaLibraryDTO: Codable, Identifiable {
+    var key: String?           // Plex section key
+    var title: String?
+    var plex_type: String?     // show | movie | artist | photo
+    var routable: Bool?        // show/movie — the only types this pipeline can process
+    var default_kind: String?  // tv | movie | youtube | youtube_staging | nil
+    var locations: [MediaLocationDTO]?
+    var id: String { key ?? title ?? "" }
+}
+
+struct MediaAssignmentDTO: Codable {
+    var roots: [String]?
+    var source: String?        // plex | override | default
+}
+
+struct MediaLibrariesDTO: Codable {
+    var error: String?
+    var detail: String?
+    var libraries: [MediaLibraryDTO]?
+    var overrides: [String: String]?
+    var proposed: [String: MediaAssignmentDTO]?
+    var in_force: [String: [String]]?
+    var matches_in_force: Bool?
+    var restart_required: Bool?
+    var kinds: [String]?
+}
+
 struct DisplayDTO: Codable, Identifiable {
     var key: String?
     var name: String?

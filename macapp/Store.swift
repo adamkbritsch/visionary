@@ -43,6 +43,7 @@ final class AppStore: ObservableObject {
     @Published var configDTO: ConfigDTO?
     @Published var installStatus: InstallStatusDTO?
     @Published var bordersStatus: BordersStatusDTO?
+    @Published var mediaLibs: MediaLibrariesDTO?
     @Published var autoConnected: AutoConnectDTO?  // tokenless NAS-host service sweep
 
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
@@ -403,6 +404,28 @@ final class AppStore: ObservableObject {
         if let c: ConfigDTO = await get("/api/config") { configDTO = c }
         await fetchInstallStatus()
         await fetchBordersStatus()
+        await fetchMediaLibs()
+    }
+    /// Which NAS folders Plex says are TV / Movies / YouTube (+ overrides + what's live).
+    func fetchMediaLibs() async {
+        if let m: MediaLibrariesDTO = await get("/api/media-libraries") { mediaLibs = m }
+    }
+    /// Route one Plex library to a kind (nil/"" = back to Plex's default).
+    func setMediaLibKind(_ key: String, _ kind: String?) async {
+        var kinds = mediaLibs?.overrides ?? [:]
+        if let k = kind, !k.isEmpty { kinds[key] = k } else { kinds.removeValue(forKey: key) }
+        let (_, data) = await postResult("/api/media-libraries", ["kinds": kinds])
+        if let data, let m = try? JSONDecoder().decode(MediaLibrariesDTO.self, from: data) {
+            mediaLibs = m
+        }
+    }
+    /// Apply the detected folders (writes them to config; takes effect next launch).
+    func applyMediaLibs() async {
+        let (_, data) = await postResult("/api/media-libraries",
+                                        ["apply": true, "kinds": mediaLibs?.overrides ?? [:]])
+        if let data, let m = try? JSONDecoder().decode(MediaLibrariesDTO.self, from: data) {
+            mediaLibs = m
+        }
     }
     func fetchBordersStatus() async {
         if let b: BordersStatusDTO = await get("/api/borders/status") { bordersStatus = b }

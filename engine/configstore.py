@@ -27,7 +27,15 @@ CONFIG = os.path.expanduser("~/.topaz-pipeline/config.json")
 ALLOWED_KEYS = ("ftp_hosts", "ftp_port", "ftp_user", "ftp_pass",
                 "plex_url", "plex_token", "tmdb_api_key",
                 "youtarr_url", "youtarr_user", "youtarr_pass",
-                "shuttle_relay_url", "shuttle_relay_token")
+                "shuttle_relay_url", "shuttle_relay_token",
+                # Media-folder routing (Plex-detected, user-overridable). Both are dicts,
+                # not strings: media_lib_kinds = {plex section key: kind},
+                # media_roots = {kind: [ftp paths]} — the APPLIED answer transfer reads.
+                "media_lib_kinds", "media_roots")
+
+# Allowed but NOT part of the flat text-field surface: structured (dict) values the app
+# edits through their own endpoint, so `fields` stays a clean [String: String] for Swift.
+STRUCTURED_KEYS = frozenset({"media_lib_kinds", "media_roots"})
 
 # Values that must never be echoed back to any reader of the API.
 SECRET_KEYS = frozenset({"ftp_pass", "plex_token", "tmdb_api_key", "youtarr_pass",
@@ -83,6 +91,29 @@ def save(updates: dict) -> dict:
                 clean[k] = int(v)
             except (TypeError, ValueError):
                 ignored.append(k)                 # unparseable port — refuse silently
+        elif k == "media_lib_kinds":
+            # {plex section key: kind|None}. Dropping a key means "back to the default".
+            if not isinstance(v, dict):
+                ignored.append(k); continue
+            import medialibs
+            m = {str(sk): (str(kind) if kind else None) for sk, kind in v.items()
+                 if not kind or str(kind) in medialibs.KINDS}
+            clean[k] = {sk: kind for sk, kind in m.items() if kind} or None
+        elif k == "media_roots":
+            # {kind: [absolute ftp paths]} — anything relative or non-absolute is refused
+            # rather than half-applied, since a bad root silently empties a library.
+            if not isinstance(v, dict):
+                ignored.append(k); continue
+            import medialibs
+            m = {}
+            for kind, paths in v.items():
+                if str(kind) not in medialibs.KINDS:
+                    continue
+                lst = paths if isinstance(paths, list) else [paths]
+                good = [str(p).rstrip("/") for p in lst if str(p or "").startswith("/")]
+                if good:
+                    m[str(kind)] = good
+            clean[k] = m or None
         else:
             clean[k] = str(v).strip() or None
     if clean:
@@ -99,6 +130,8 @@ def read_redacted() -> dict:
     cfg = read()
     fields, secrets_set = {}, {}
     for k in ALLOWED_KEYS:
+        if k in STRUCTURED_KEYS:
+            continue          # dicts, not text fields — served by /api/media-libraries
         if k in SECRET_KEYS:
             fields[k] = ""
             secrets_set[k] = bool(cfg.get(k))

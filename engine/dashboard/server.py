@@ -1188,6 +1188,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(setup_jobs.status())
         elif path == "/api/borders/status":
             self._json(api_borders_status())
+        elif path == "/api/media-libraries":
+            # Which NAS folders are TV / Movies / YouTube, auto-decided from Plex's own
+            # library sections, plus the user's overrides and what is actually in force.
+            import medialibs
+            self._json(medialibs.status())
         elif path == "/api/show-profile":
             show = (parse_qs(urlparse(self.path).query).get("show") or [None])[0]
             self._json(show_profile_info(show))
@@ -1361,6 +1366,29 @@ class Handler(BaseHTTPRequestHandler):
             out = setup_jobs.start(what, argv=argv)
             _invalidate_preflight()          # a finished job re-detects on next preflight
             self._json(out, code=(409 if out.get("error") == "busy" else 200))
+        elif path == "/api/media-libraries":
+            # Save per-library kind overrides and/or APPLY the resulting roots. Applying
+            # writes media_roots, which transfer reads at import — so it takes effect on
+            # the next launch; the response says so rather than pretending otherwise.
+            import configstore, medialibs
+            body = body if isinstance(body, dict) else {}
+            updates = {}
+            if isinstance(body.get("kinds"), dict):
+                updates["media_lib_kinds"] = body["kinds"]
+            if updates:
+                configstore.save(updates)
+            if body.get("apply"):
+                st = medialibs.status()
+                roots = {k: v["roots"] for k, v in (st.get("proposed") or {}).items()
+                         if v.get("roots")}
+                if not roots:
+                    return self._json({"error": "nothing-detected",
+                                       "detail": st.get("detail") or
+                                                 "No Plex libraries resolved to NAS folders."}, 400)
+                configstore.save({"media_roots": roots})
+            out = medialibs.status()
+            out["restart_required"] = bool(body.get("apply")) and not out.get("matches_in_force")
+            self._json(out)
         elif path == "/api/borders/reset-set-book":
             # Forget a show's remembered wing inventions (set-reference book) — the
             # lever when the AI took a set a wrong direction. The next episode

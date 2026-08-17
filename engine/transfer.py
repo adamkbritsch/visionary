@@ -20,24 +20,55 @@ import json
 import os
 
 CONFIG_FILE = os.path.expanduser("~/.topaz-pipeline/config.json")
-NAS_FTP_TV_ROOT = os.environ.get("TOPAZ_NAS_FTP_TV", "/Media/TV-Shows")
-# TV shows also span several UGOS volumes; walk them all. First-listed wins a name collision, so
-# vol1 (the fuller copy) takes priority. Comma-separated env override.
-NAS_FTP_TV_ROOTS = [r.strip() for r in os.environ.get(
-    "TOPAZ_NAS_FTP_TV_ROOTS",
-    ",".join([NAS_FTP_TV_ROOT, "/MediaVolume2/TV-Shows", "/MediaVolume3/TV-Shows"])).split(",") if r.strip()]
-NAS_FTP_MOVIES_ROOT = os.environ.get("TOPAZ_NAS_FTP_MOVIES", "/Media/Movies")
-# The Movies library spans several UGOS volumes (each its own FTP share) — Plex indexes all of
-# them, so the pool must walk them all, not just vol1. Comma-separated env override.
-NAS_FTP_MOVIES_ROOTS = [r.strip() for r in os.environ.get(
-    "TOPAZ_NAS_FTP_MOVIES_ROOTS",
-    ",".join([NAS_FTP_MOVIES_ROOT, "/MediaVolume2/Movies", "/MediaVolume3/Movies"])).split(",") if r.strip()]
+# THE BUILT-IN LAYOUT — the fallback, and the exact behavior before media folders became
+# configurable. First-listed wins a name collision, so the primary volume takes priority
+# (it holds the fuller copy).
+DEFAULT_TV_ROOTS = ["/Media/TV-Shows", "/MediaVolume2/TV-Shows", "/MediaVolume3/TV-Shows"]
+DEFAULT_MOVIE_ROOTS = ["/Media/Movies", "/MediaVolume2/Movies", "/MediaVolume3/Movies"]
+DEFAULT_YOUTUBE_ROOT = "/Media/YouTube"
+DEFAULT_YOUTUBE_STAGING = "/Media/YouTube-raw"
+
+
+def _roots_from_config(kind):
+    """APPLIED media roots for `kind` from config.json (written by Setup after Plex
+    detection), or None. Read here — not imported from medialibs — so transfer stays
+    import-cycle-free and works with no Plex at all."""
+    try:
+        v = (_config().get("media_roots") or {}).get(kind)
+    except Exception:
+        return None
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list):
+        return None
+    paths = [str(x).rstrip("/") for x in v if str(x or "").startswith("/")]
+    return paths or None
+
+
+def _resolve_roots(kind, env_single, env_list, defaults):
+    """Precedence: explicit env override > config (Plex-detected/user-applied) > built-in.
+    Env stays first so an operator can always force a layout without touching config."""
+    if os.environ.get(env_list):
+        return [r.strip() for r in os.environ[env_list].split(",") if r.strip()]
+    if os.environ.get(env_single):
+        return [os.environ[env_single].rstrip("/")]
+    return _roots_from_config(kind) or list(defaults)
+
+
+NAS_FTP_TV_ROOTS = _resolve_roots("tv", "TOPAZ_NAS_FTP_TV", "TOPAZ_NAS_FTP_TV_ROOTS",
+                                  DEFAULT_TV_ROOTS)
+NAS_FTP_TV_ROOT = NAS_FTP_TV_ROOTS[0]
+NAS_FTP_MOVIES_ROOTS = _resolve_roots("movie", "TOPAZ_NAS_FTP_MOVIES",
+                                      "TOPAZ_NAS_FTP_MOVIES_ROOTS", DEFAULT_MOVIE_ROOTS)
+NAS_FTP_MOVIES_ROOT = NAS_FTP_MOVIES_ROOTS[0]
 # FOLDER-SPLIT. The Plex "YouTube" library is _ROOT — ONLY finished 4K DV masters land here.
 # youtarr's raw 1080p downloads go to _STAGING, a folder that is NOT a Plex library, so raw
 # downloads never show up in Plex (youtarr's data mount points at _STAGING; see the compose .env).
 # Visionary reads sources from _STAGING and publishes masters into _ROOT (mirrored path).
-NAS_FTP_YOUTUBE_ROOT = os.environ.get("TOPAZ_NAS_FTP_YOUTUBE", "/Media/YouTube")
-NAS_FTP_YOUTUBE_STAGING = os.environ.get("TOPAZ_NAS_FTP_YOUTUBE_STAGING", "/Media/YouTube-raw")
+NAS_FTP_YOUTUBE_ROOT = _resolve_roots("youtube", "TOPAZ_NAS_FTP_YOUTUBE", "",
+                                      [DEFAULT_YOUTUBE_ROOT])[0]
+NAS_FTP_YOUTUBE_STAGING = _resolve_roots("youtube_staging", "TOPAZ_NAS_FTP_YOUTUBE_STAGING",
+                                         "", [DEFAULT_YOUTUBE_STAGING])[0]
 MEDIA_OWNER = "1000:10"   # what FTP yields automatically (user gid 10 + umask 007)
 # A connection's timeout also becomes the per-block read/write timeout for RETR/STOR. The
 # 15 s default (fine for quick listings) would abort a multi-GB transfer on any brief

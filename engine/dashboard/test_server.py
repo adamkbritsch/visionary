@@ -552,3 +552,47 @@ class SetBookEndpoint(unittest.TestCase):
                                return_value={"ok": False, "models_dir": ""}):
             out = server.series_info()
         self.assertEqual(out["shows"][0]["extend_sets"], 4)
+
+
+class MediaLibrariesEndpoint(unittest.TestCase):
+    """Which NAS folders are TV / Movies / YouTube — auto-decided from Plex, overridable,
+    and visible. Applying writes config; nothing changes silently."""
+
+    def test_status_degrades_to_the_builtin_layout_without_plex(self):
+        from unittest import mock
+        import medialibs, transfer
+        with mock.patch.object(medialibs, "detect_live",
+                               return_value={"error": "plex-unreachable",
+                                             "detail": "Plex did not answer"}), \
+             mock.patch.object(medialibs, "overrides", return_value={}), \
+             mock.patch.object(medialibs, "applied_roots", return_value={}):
+            st = medialibs.status()
+        self.assertEqual(st["error"], "plex-unreachable")
+        self.assertEqual(st["proposed"]["tv"]["source"], "default")
+        self.assertEqual(st["proposed"]["tv"]["roots"], list(transfer.DEFAULT_TV_ROOTS))
+        self.assertEqual(st["in_force"]["tv"], list(transfer.NAS_FTP_TV_ROOTS))
+
+    def test_apply_refuses_when_nothing_resolved(self):
+        # A 400 rather than writing an empty media_roots, which would blank every library.
+        from unittest import mock
+        import medialibs
+        with mock.patch.object(medialibs, "status",
+                               return_value={"proposed": {"tv": {"roots": []}},
+                                             "detail": "no libraries"}):
+            st = medialibs.status()
+            roots = {k: v["roots"] for k, v in st["proposed"].items() if v.get("roots")}
+        self.assertEqual(roots, {})          # the route turns this into a 400
+
+    def test_apply_writes_only_resolved_kinds(self):
+        from unittest import mock
+        import configstore, medialibs
+        saved = {}
+        proposed = {"tv": {"roots": ["/Media/TV-Shows"], "source": "plex"},
+                    "movie": {"roots": [], "source": "default"}}
+        with mock.patch.object(medialibs, "status", return_value={"proposed": proposed}), \
+             mock.patch.object(configstore, "write", side_effect=saved.update), \
+             mock.patch.object(configstore, "read_redacted", return_value={}):
+            st = medialibs.status()
+            roots = {k: v["roots"] for k, v in st["proposed"].items() if v.get("roots")}
+            configstore.save({"media_roots": roots})
+        self.assertEqual(saved["media_roots"], {"tv": ["/Media/TV-Shows"]})

@@ -57,6 +57,7 @@ struct SetupSection: View {
                 VStack(alignment: .leading, spacing: 10) {
                     // REQUIRED first (user-dictated), optional integrations last.
                     NASGroup()
+                    MediaFoldersGroup()
                     DependenciesGroup()
                     ApplicationsGroup()
                     PermissionsGroup()
@@ -326,6 +327,135 @@ private struct DependenciesGroup: View {
             row("Command-line tools", check: "brew_tools", install: "brew_tools")
             row("Python OpenCV", check: "python_deps", install: "python_deps")
         }
+    }
+}
+
+// MARK: - media folders (which NAS folders are TV / Movies / YouTube)
+// Auto-decided from PLEX's own library sections — type gives the default, the folder
+// Locations give the paths, and each path is verified over FTP. Every library is listed
+// with a picker, so the answer is always visible AND overridable. Nothing changes until
+// "Use these folders" is pressed; the roots are read at launch, so it says so.
+private struct MediaFoldersGroup: View {
+    @EnvironmentObject var store: AppStore
+
+    private var m: MediaLibrariesDTO? { store.mediaLibs }
+    private static let kindLabels: [(String, String)] = [
+        ("", "Not used"), ("tv", "TV Shows"), ("movie", "Movies"),
+        ("youtube", "YouTube (masters)"), ("youtube_staging", "YouTube (raw downloads)"),
+    ]
+    private static func kindName(_ k: String?) -> String {
+        kindLabels.first { $0.0 == (k ?? "") }?.1 ?? (k ?? "Not used")
+    }
+
+    private func libRow(_ lib: MediaLibraryDTO) -> some View {
+        let key = lib.key ?? ""
+        let effective = m?.overrides?[key] ?? lib.default_kind
+        let overridden = m?.overrides?[key] != nil
+        let unresolved = (lib.locations ?? []).filter { ($0.ftp ?? "").isEmpty || $0.exists != true }
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                CheckDot(ok: (lib.locations ?? []).allSatisfy { $0.exists == true })
+                Text(lib.title ?? "—").font(.system(size: 12, weight: .medium))
+                Text(lib.plex_type ?? "").font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                if overridden {
+                    Text("overridden").font(.system(size: 10)).foregroundStyle(Color.brand)
+                }
+                Spacer()
+                if lib.routable == true {
+                    Picker("", selection: Binding(
+                        get: { effective ?? "" },
+                        set: { v in Task { await store.setMediaLibKind(key, v.isEmpty ? nil : v) } })) {
+                        ForEach(Self.kindLabels, id: \.0) { Text($0.1).tag($0.0) }
+                    }
+                    .labelsHidden().frame(width: 172).font(.system(size: 11))
+                } else {
+                    Text("not processed").font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+            }
+            ForEach(Array((lib.locations ?? []).enumerated()), id: \.offset) { _, loc in
+                HStack(spacing: 6) {
+                    Text(loc.ftp?.isEmpty == false ? (loc.ftp ?? "") : (loc.container ?? ""))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(loc.exists == true ? .secondary : DS.fault)
+                        .lineLimit(1)
+                    if loc.exists != true {
+                        Text(loc.ftp?.isEmpty == false ? "not found over FTP"
+                                                       : "couldn't map Plex's path")
+                            .font(.system(size: 10)).foregroundStyle(DS.fault)
+                    }
+                    Spacer()
+                }.padding(.leading, 20)
+            }
+            if !unresolved.isEmpty {
+                Text("Unverified folders are ignored — they never reach the library walk.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).padding(.leading, 20)
+            }
+        }
+    }
+
+    private func summaryRow(_ kind: String) -> some View {
+        let prop = m?.proposed?[kind]
+        let live = m?.in_force?[kind] ?? []
+        let roots = prop?.roots ?? []
+        let same = roots == live
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text(Self.kindName(kind)).font(.system(size: 12, weight: .medium))
+                Text(prop?.source ?? "default").font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                if !same {
+                    Text("differs from what's running").font(.system(size: 10))
+                        .foregroundStyle(DS.steelBright)
+                }
+                Spacer()
+            }
+            Text(roots.isEmpty ? "—" : roots.joined(separator: "   "))
+                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                .lineLimit(2).padding(.leading, 20)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "Media folders")
+            Text("Decided from your Plex libraries: each library's TYPE sets whether it is "
+                 + "processed as TV or Movies, and its folders are matched to NAS paths and "
+                 + "verified over FTP. Override any of them below.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            if let err = m?.error, !err.isEmpty {
+                HStack(spacing: 8) {
+                    CheckDot(ok: false)
+                    Text(m?.detail ?? err).font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Text("Using the built-in folder layout until Plex and the NAS both answer.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            ForEach(m?.libraries ?? []) { libRow($0) }
+            if !(m?.libraries ?? []).isEmpty {
+                Divider().padding(.vertical, 2)
+                ForEach(m?.kinds ?? [], id: \.self) { summaryRow($0) }
+                HStack(spacing: 8) {
+                    Button("Use these folders") { Task { await store.applyMediaLibs() } }
+                        .buttonStyle(SteelButtonStyle(lit: m?.matches_in_force != true))
+                        .disabled(m?.matches_in_force == true)
+                    Button("Re-detect") { Task { await store.fetchMediaLibs() } }
+                        .buttonStyle(SteelButtonStyle(lit: false))
+                    Spacer()
+                    if m?.matches_in_force == true {
+                        Text("already in use").font(.system(size: 11)).foregroundStyle(.secondary)
+                    } else if m?.restart_required == true {
+                        Text("saved — active after the next launch")
+                            .font(.system(size: 11)).foregroundStyle(DS.steelBright)
+                    }
+                }.padding(.top, 2)
+            }
+        }
+        .task { await store.fetchMediaLibs() }
     }
 }
 
