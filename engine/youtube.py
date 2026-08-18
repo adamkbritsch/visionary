@@ -552,6 +552,83 @@ def fetch_ahead(force=False) -> dict:
     return asked
 
 
+# ---- youtarr's own settings: the contract Visionary silently depends on ---------------
+# These were set BY HAND in youtarr's UI and nothing verified them. Get one wrong and the
+# failure is quiet and confusing: raw 1080p downloads showing up in the Plex library
+# (output directory pointing at the Plex root instead of staging), masters shipping with no
+# .nfo/poster/subtitle sidecars because youtarr never wrote them, or nothing to upscale at
+# all because youtarr's channel auto-download was off.
+
+def youtarr_contract(cfg=None) -> list:
+    """[{key, desired, current, ok, why}] — what Visionary needs from youtarr and how the
+    live settings compare. `desired=None` means "any value is fine, shown for context"."""
+    import transfer
+    cfg = cfg if cfg is not None else {}
+    staging = transfer.NAS_FTP_YOUTUBE_STAGING.rstrip("/")
+    outdir = str(cfg.get("youtubeOutputDirectory") or "")
+    # youtarr writes a HOST path (/volume1/Media/YouTube-raw) while Visionary reads the same
+    # folder over FTP (/Media/YouTube-raw), so compare by SUFFIX rather than demanding an
+    # exact match we cannot compute without knowing the share mount.
+    out_ok = bool(outdir) and outdir.rstrip("/").endswith(staging)
+    rows = [
+        {"key": "youtubeOutputDirectory", "current": outdir, "desired": None, "ok": out_ok,
+         "why": f"must be the STAGING folder ending in {staging} — the folder split keeps "
+                f"raw downloads out of the Plex library; only finished 4K masters go there"},
+        {"key": "channelAutoDownload", "current": cfg.get("channelAutoDownload"),
+         "desired": True, "ok": bool(cfg.get("channelAutoDownload")),
+         "why": "off means youtarr never fetches on its own and the queue only fills when "
+                "Visionary asks"},
+        {"key": "writeVideoNfoFiles", "current": cfg.get("writeVideoNfoFiles"),
+         "desired": True, "ok": bool(cfg.get("writeVideoNfoFiles")),
+         "why": "the .nfo is copied beside the master so Plex keeps the title/description"},
+        {"key": "writeVideoFanart", "current": cfg.get("writeVideoFanart"),
+         "desired": True, "ok": bool(cfg.get("writeVideoFanart")),
+         "why": "the thumbnail is copied beside the master"},
+        {"key": "writeChannelPosters", "current": cfg.get("writeChannelPosters"),
+         "desired": True, "ok": bool(cfg.get("writeChannelPosters")),
+         "why": "channel poster for the Plex folder"},
+        {"key": "subtitlesEnabled", "current": cfg.get("subtitlesEnabled"),
+         "desired": True, "ok": bool(cfg.get("subtitlesEnabled")),
+         "why": "subtitles are muxed into the master when present"},
+    ]
+    return rows
+
+
+def youtarr_config_status() -> dict:
+    """The Setup view: youtarr's live settings against the contract. Never raises."""
+    import youtarr
+    cfg = youtarr.get_config()
+    if cfg is None:
+        return {"error": "youtarr-unreachable",
+                "detail": "youtarr did not answer — check its URL and credentials above.",
+                "rows": [], "ok": False}
+    rows = youtarr_contract(cfg)
+    for r in rows:                       # the app decodes `current` as a String
+        c = r.get("current")
+        r["current"] = "" if c is None else ("on" if c is True else
+                                             "off" if c is False else str(c))
+    return {"rows": rows, "ok": all(r["ok"] for r in rows),
+            "output_dir": cfg.get("youtubeOutputDirectory")}
+
+
+def apply_youtarr_contract() -> dict:
+    """Set the settings Visionary requires. The output DIRECTORY is deliberately NOT
+    rewritten — only youtarr knows its own mount layout, and pointing it at the wrong
+    absolute path would silently strand every future download. That one is reported for the
+    user to fix in youtarr."""
+    import youtarr
+    cfg = youtarr.get_config()
+    if cfg is None:
+        return {"error": "youtarr-unreachable"}
+    patch = {r["key"]: r["desired"] for r in youtarr_contract(cfg)
+             if r["desired"] is not None and not r["ok"]}
+    if not patch:
+        return {"changed": {}, "ok": True}
+    ok = youtarr.update_config(patch)
+    return {"changed": patch if ok else {}, "ok": bool(ok),
+            **({} if ok else {"error": "update-failed"})}
+
+
 def _cap_secs():   # DEPRECATED — kept only so an old settings.json key stays readable
     import settings
     return int(settings.get_settings().get("max_youtube_minutes", 20)) * 60

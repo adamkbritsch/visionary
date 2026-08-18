@@ -64,6 +64,7 @@ struct SetupSection: View {
                     ResolveProjectsGroup()
                     BorderExtenderGroup()
                     OptionalConnectionsGroup()
+                    YoutarrSettingsGroup()
                     NASExtrasGroup()
                     HStack {
                         Button("Recheck everything") { Task { await store.recheckSetup() } }
@@ -327,6 +328,63 @@ private struct DependenciesGroup: View {
             row("Command-line tools", check: "brew_tools", install: "brew_tools")
             row("Python OpenCV", check: "python_deps", install: "python_deps")
         }
+    }
+}
+
+// MARK: - youtarr settings (the contract Visionary depends on)
+// These live in youtarr, not here, and used to be hand-set with nothing verifying them —
+// so a wrong one failed quietly: raw downloads landing in the Plex library, masters
+// shipping without their sidecars, or nothing downloading at all. Applied automatically
+// when youtarr connects in Setup; this shows the result and can re-apply.
+private struct YoutarrSettingsGroup: View {
+    @EnvironmentObject var store: AppStore
+    private var y: YoutarrConfigDTO? { store.youtarrConfig }
+
+    var body: some View {
+        let rows = y?.rows ?? []
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "youtarr settings")
+            if let err = y?.error, !err.isEmpty {
+                HStack(spacing: 8) {
+                    CheckDot(ok: false)
+                    Text(y?.detail ?? err).font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            } else if rows.isEmpty {
+                Text("Connect youtarr above and these are set for you.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
+                Text("Set automatically when youtarr connects — Visionary needs these to place "
+                     + "downloads and copy sidecars.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                ForEach(rows) { r in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 8) {
+                            CheckDot(ok: r.ok)
+                            Text(r.key ?? "").font(.system(size: 12, weight: .medium))
+                            Text(r.current ?? "").font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary).lineLimit(1)
+                            Spacer()
+                        }
+                        if r.ok != true, let why = r.why {
+                            Text(why).font(.system(size: 10)).foregroundStyle(.secondary)
+                                .padding(.leading, 20).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                HStack(spacing: 8) {
+                    Button("Apply") { Task { await store.applyYoutarrConfig() } }
+                        .buttonStyle(SteelButtonStyle(lit: y?.ok != true))
+                        .disabled(y?.ok == true)
+                    Button("Recheck") { Task { await store.fetchYoutarrConfig() } }
+                        .buttonStyle(SteelButtonStyle(lit: false))
+                    Spacer()
+                    if y?.ok == true {
+                        Text("all set").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }.padding(.top, 2)
+            }
+        }
+        .task { await store.fetchYoutarrConfig() }
     }
 }
 

@@ -44,6 +44,7 @@ final class AppStore: ObservableObject {
     @Published var installStatus: InstallStatusDTO?
     @Published var bordersStatus: BordersStatusDTO?
     @Published var mediaLibs: MediaLibrariesDTO?
+    @Published var youtarrConfig: YoutarrConfigDTO?
     @Published var autoConnected: AutoConnectDTO?  // tokenless NAS-host service sweep
 
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
@@ -418,6 +419,7 @@ final class AppStore: ObservableObject {
         await fetchInstallStatus()
         await fetchBordersStatus()
         await fetchMediaLibs()
+        await fetchYoutarrConfig()
     }
     /// Which NAS folders Plex says are TV / Movies / YouTube (+ overrides + what's live).
     func fetchMediaLibs() async {
@@ -439,6 +441,15 @@ final class AppStore: ObservableObject {
         if let data, let m = try? JSONDecoder().decode(MediaLibrariesDTO.self, from: data) {
             mediaLibs = m
         }
+    }
+    /// youtarr's own settings vs what Visionary requires (Setup shows the mismatches).
+    func fetchYoutarrConfig() async {
+        if let y: YoutarrConfigDTO = await get("/api/youtarr-config") { youtarrConfig = y }
+    }
+    func applyYoutarrConfig() async {
+        let (_, data) = await postResult("/api/youtarr-config", [:])
+        if let data, let w = try? JSONDecoder().decode(YoutarrApplyDTO.self, from: data),
+           let s = w.status { youtarrConfig = s } else { await fetchYoutarrConfig() }
     }
     func fetchBordersStatus() async {
         if let b: BordersStatusDTO = await get("/api/borders/status") { bordersStatus = b }

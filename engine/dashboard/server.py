@@ -969,7 +969,21 @@ def api_config_test(what):
                 return {"ok": False, "detail": "not configured"}
             for base in bases:
                 if youtarr._login(base):
-                    return {"ok": True, "detail": f"youtarr login ok at {base}"}
+                    # AUTOMATIC on connect (user-asked): youtarr's own settings are a
+                    # contract Visionary depends on — where downloads land, the sidecars it
+                    # copies, whether youtarr fetches at all — and they used to be hand-set
+                    # with nothing checking them. Bring them into line here, in the setup
+                    # step where the user is already connecting youtarr. The output
+                    # DIRECTORY is never rewritten (only youtarr knows its mount layout);
+                    # a wrong one is reported instead.
+                    fixed = {}
+                    try:
+                        import youtube as _yt
+                        fixed = (_yt.apply_youtarr_contract() or {}).get("changed") or {}
+                    except Exception:
+                        pass
+                    note = (" · set " + ", ".join(sorted(fixed))) if fixed else ""
+                    return {"ok": True, "detail": f"youtarr login ok at {base}{note}"}
             return {"ok": False, "detail": "youtarr login failed (check url/user/pass)"}
         if what == "relay":
             import companion
@@ -1240,6 +1254,9 @@ class Handler(BaseHTTPRequestHandler):
             # library sections, plus the user's overrides and what is actually in force.
             import medialibs
             self._json(medialibs.status())
+        elif path == "/api/youtarr-config":
+            import youtube as _yt
+            self._json(_yt.youtarr_config_status())
         elif path == "/api/show-profile":
             show = (parse_qs(urlparse(self.path).query).get("show") or [None])[0]
             self._json(show_profile_info(show))
@@ -1436,6 +1453,13 @@ class Handler(BaseHTTPRequestHandler):
             out = medialibs.status()
             out["restart_required"] = bool(body.get("apply")) and not out.get("matches_in_force")
             self._json(out)
+        elif path == "/api/youtarr-config":
+            # Apply the settings Visionary requires of youtarr (the same thing that runs
+            # automatically when youtarr is connected in Setup).
+            import youtube as _yt
+            out = _yt.apply_youtarr_contract()
+            out["status"] = _yt.youtarr_config_status()
+            self._json(out, code=(200 if not out.get("error") else 502))
         elif path == "/api/borders/reset-set-book":
             # Forget a show's remembered wing inventions (set-reference book) — the
             # lever when the AI took a set a wrong direction. The next episode

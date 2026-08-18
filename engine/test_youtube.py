@@ -664,3 +664,64 @@ class FetchAhead(unittest.TestCase):
              mock.patch.object(youtube, "get_queue", return_value=[]):
             youtube.fetch_ahead(force=True)          # stamps the clock
             self.assertEqual(youtube.fetch_ahead(), {})   # immediate re-tick does nothing
+
+
+class YoutarrContract(unittest.TestCase):
+    """youtarr's own settings are a contract Visionary depends on, and they used to be
+    hand-set with nothing checking them. A wrong one fails QUIETLY: raw downloads landing
+    in the Plex library, masters shipping without sidecars, or nothing downloading."""
+
+    GOOD = {"youtubeOutputDirectory": "/volume1/Media/YouTube-raw",
+            "channelAutoDownload": True, "writeVideoNfoFiles": True,
+            "writeVideoFanart": True, "writeChannelPosters": True,
+            "subtitlesEnabled": True}
+
+    def test_host_path_matches_the_ftp_staging_path_by_suffix(self):
+        # youtarr writes /volume1/Media/YouTube-raw; Visionary reads /Media/YouTube-raw over
+        # FTP. Demanding equality would fail forever on a correct setup.
+        rows = {r["key"]: r for r in youtube.youtarr_contract(self.GOOD)}
+        self.assertTrue(rows["youtubeOutputDirectory"]["ok"])
+
+    def test_output_pointing_at_the_plex_library_is_flagged(self):
+        bad = dict(self.GOOD, youtubeOutputDirectory="/volume1/Media/YouTube")
+        rows = {r["key"]: r for r in youtube.youtarr_contract(bad)}
+        self.assertFalse(rows["youtubeOutputDirectory"]["ok"])
+
+    def test_each_missing_toggle_is_reported(self):
+        for key in ("channelAutoDownload", "writeVideoNfoFiles", "writeVideoFanart",
+                    "writeChannelPosters", "subtitlesEnabled"):
+            rows = {r["key"]: r for r in youtube.youtarr_contract(dict(self.GOOD, **{key: False}))}
+            self.assertFalse(rows[key]["ok"], key)
+            self.assertTrue(rows[key]["why"], key)
+
+    def test_apply_patches_only_what_is_wrong(self):
+        sent = {}
+        bad = dict(self.GOOD, writeVideoFanart=False, subtitlesEnabled=False)
+        with mock.patch("youtarr.get_config", return_value=bad), \
+             mock.patch("youtarr.update_config",
+                        side_effect=lambda p, **k: sent.update(p) or True):
+            out = youtube.apply_youtarr_contract()
+        self.assertEqual(sent, {"writeVideoFanart": True, "subtitlesEnabled": True})
+        self.assertTrue(out["ok"])
+
+    def test_apply_never_rewrites_the_output_directory(self):
+        # Only youtarr knows its mount layout — writing an absolute path we guessed would
+        # strand every future download somewhere Visionary cannot read.
+        sent = {}
+        bad = dict(self.GOOD, youtubeOutputDirectory="/somewhere/else")
+        with mock.patch("youtarr.get_config", return_value=bad), \
+             mock.patch("youtarr.update_config",
+                        side_effect=lambda p, **k: sent.update(p) or True):
+            youtube.apply_youtarr_contract()
+        self.assertNotIn("youtubeOutputDirectory", sent)
+
+    def test_nothing_to_do_makes_no_call(self):
+        with mock.patch("youtarr.get_config", return_value=self.GOOD), \
+             mock.patch("youtarr.update_config",
+                        side_effect=AssertionError("must not write")):
+            self.assertEqual(youtube.apply_youtarr_contract(), {"changed": {}, "ok": True})
+
+    def test_unreachable_youtarr_is_reported_not_crashed(self):
+        with mock.patch("youtarr.get_config", return_value=None):
+            self.assertEqual(youtube.youtarr_config_status()["error"], "youtarr-unreachable")
+            self.assertEqual(youtube.apply_youtarr_contract()["error"], "youtarr-unreachable")

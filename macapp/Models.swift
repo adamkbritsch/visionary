@@ -460,6 +460,29 @@ struct MediaLibrariesDTO: Codable {
     var kinds: [String]?
 }
 
+/// GET/POST /api/youtarr-config — youtarr's own settings, which Visionary depends on.
+struct YoutarrRowDTO: Codable, Identifiable {
+    var key: String?
+    var current: String?      // stringified by the server-side encoder below
+    var ok: Bool?
+    var why: String?
+    var id: String { key ?? "" }
+}
+
+struct YoutarrConfigDTO: Codable {
+    var error: String?
+    var detail: String?
+    var ok: Bool?
+    var rows: [YoutarrRowDTO]?
+    var output_dir: String?
+}
+
+struct YoutarrApplyDTO: Codable {
+    var ok: Bool?
+    var error: String?
+    var status: YoutarrConfigDTO?
+}
+
 struct DisplayDTO: Codable, Identifiable {
     var key: String?
     var name: String?

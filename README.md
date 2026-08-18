@@ -444,6 +444,14 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
+- **youtarr configures itself**: several of youtarr's own settings are a contract Visionary
+  depends on — where downloads land (the folder split that keeps raw 1080p out of your Plex
+  library), the `.nfo`/poster/thumbnail/subtitle sidecars it copies beside each master, and
+  whether youtarr auto-downloads at all. They used to be set by hand with nothing checking
+  them, so a wrong one failed quietly. Setup now applies them the moment youtarr connects
+  and shows each one with a Recheck/Apply. The output *directory* is never rewritten — only
+  youtarr knows its own mount layout — so a wrong one is reported for you to fix there.
+
 - **Fetch-ahead** keeps the NAS stocked: Visionary used to only *subscribe* youtarr and then
   wait for its own schedule, so the upscale queue could run dry with the pipeline idle. It
   now asks youtarr for whatever each channel is short of — newest first, respecting the

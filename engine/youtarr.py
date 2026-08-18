@@ -127,6 +127,29 @@ def sync_subscriptions(desired, *, timeout=20):
     return _call("POST", "/updatechannels", {"add": add, "remove": remove}, timeout=timeout) is not None
 
 
+def get_config(*, timeout=12):
+    """youtarr's whole settings object (GET /getconfig), or None. Visionary depends on
+    several of these — where downloads land, whether the sidecars it copies get written,
+    whether youtarr auto-downloads at all — and they were previously set BY HAND in
+    youtarr's own UI, with nothing checking they matched."""
+    r = _call("GET", "/getconfig", timeout=timeout)
+    return r if isinstance(r, dict) else None
+
+
+def update_config(patch, *, timeout=20):
+    """PATCH youtarr's settings (POST /updateconfig with the FULL object, as its own UI
+    does — a partial post would blank everything absent). Returns True/None. Only the keys
+    in `patch` change; everything else is read back and sent unmodified."""
+    if not patch:
+        return True
+    cfg = get_config(timeout=timeout)
+    if cfg is None:
+        return None
+    merged = dict(cfg)
+    merged.update(patch)
+    return _call("POST", "/updateconfig", merged, timeout=timeout) is not None
+
+
 def download_videos(video_ids_or_urls, *, resolution="2160", timeout=20):
     """Download EXACTLY these videos (ids or watch URLs) via /triggerspecificdownloads — bypasses the
     download archive. Not used by the autonomous flow (youtarr auto-downloads the subscribed channels);
