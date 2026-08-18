@@ -347,13 +347,18 @@ def _save_queue(items) -> None:
         json.dump(items, f)
 
 
-def add_channel(channel_id, title, scope="popular") -> list:
-    """Queue a subscribed channel (no dups, no limit). Defaults scope 'popular' + the YouTube preset."""
+def add_channel(channel_id, title, scope="popular", *, via_link=False) -> list:
+    """Queue a subscribed channel (no dups, no limit). Defaults scope 'popular' + the YouTube preset.
+
+    via_link marks a channel added by PASTING A LINK that is not one of your YouTube
+    subscriptions — it behaves identically, but the app badges it so the list doesn't
+    silently imply you follow it (user-dictated)."""
     items = get_queue()
     if channel_id and not any(i.get("channelId") == channel_id for i in items):
         items.append({"channelId": channel_id, "title": title or channel_id, "folder_name": "",
                       "scope": scope if scope in ("popular", "all") else "popular",
-                      "capped": False, "paused": False, "max_age_days": 0})
+                      "capped": False, "paused": False, "max_age_days": 0,
+                      "via_link": bool(via_link)})
         _save_queue(items)
     return items
 
@@ -840,6 +845,9 @@ def all_pending(skip=()) -> list:
     cols = []
     for e in get_queue():
         cols.append([{**v, "secs": durs.get(v["vid"]) or 0} for v in channel_pending(e, skip)])
+    for col in _import_pending(skip):      # each IMPORT batch is one more column, so playlist
+        cols.append([{**v, "secs": durs.get(v["vid"]) or 0} for v in col])   # order holds WITHIN
+                                           # it while it interleaves evenly with the channels
     out, i = [], 0
     while any(i < len(col) for col in cols):          # take index i from every channel, then i+1, …
         for col in cols:
@@ -956,8 +964,10 @@ def queue_view() -> dict:
                       "output_mode": settings.get_show_output_mode(folder or ""),
                       # youtarr's downloads are SDR, so auto always means the 1000-nit ceiling
                       "output_mode_effective": settings.effective_output_mode(folder or "", False),
+                      "via_link": bool(e.get("via_link")),
                       "pending": len(channel_pending(e)), "downloaded": len(cached_videos(folder))})
-    return {"items": items, "count": len(items), "connected": _connected()}
+    return {"items": items, "count": len(items), "connected": _connected(),
+            "imports": imports_view()}
 
 
 def _connected() -> bool:
@@ -978,6 +988,16 @@ def _connected() -> bool:
 
 PRIORITY_FILE = os.path.expanduser("~/.topaz-pipeline/yt_priority.json")
 _PRIORITY_LOCK = threading.Lock()
+IMPORTS_FILE = os.path.expanduser("~/.topaz-pipeline/yt_imports.json")
+_IMPORTS_LOCK = threading.Lock()
+
+
+def _jumps(entry) -> bool:
+    """Does this priority-book entry PREEMPT the pipeline? True for send-to-Visionary (the
+    button IS the priority signal). False for a link IMPORT, which joins the ordinary YouTube
+    cadence between episodes instead (user-dictated). ABSENT means True so a book written
+    before imports existed keeps its old behaviour."""
+    return bool(entry.get("jump", True))
 _PRIORITY_SCAN_GAP = 45.0            # min seconds between staging-wide FTP locate scans
 _priority_scan_at = 0.0
 
@@ -1078,8 +1098,8 @@ def has_priority_ready(skip=()) -> bool:
     done = get_done()
     for e in _priority():
         p = e.get("path")
-        if not p or e.get("vid") in done:
-            continue
+        if not p or e.get("vid") in done or not _jumps(e):
+            continue        # imports are cadence-joiners, never preemptors
         if os.path.splitext(os.path.basename(p))[0] in (skip or ()):
             continue
         return True
@@ -1151,8 +1171,9 @@ def locate_priority(skip=()) -> dict | None:
     _locate_scan()
     for e in _priority():
         p = e.get("path")
-        if not p:
-            continue
+        if not p or not _jumps(e):
+            continue        # an IMPORT is located by _locate_scan above, then served by
+                            # all_pending() at ordinary cadence — it must not jump the queue
         stem = os.path.splitext(os.path.basename(p))[0]
         if stem in skip:
             continue
@@ -1162,3 +1183,209 @@ def locate_priority(skip=()) -> dict | None:
         return {"channel": e.get("channel"), "video_path": p,
                 "title": e.get("title"), "vid": e["vid"]}
     return None
+
+
+# ---- link imports (playlists / single videos) -----------------------------
+# A pasted link becomes ordinary priority-book entries with jump=False, so they inherit the
+# book's durable storage, its staging-wide locator (_locate_scan) and its retirement path
+# (mark_done -> _drop_priority) — but are served by all_pending() at NORMAL CADENCE instead
+# of preempting. The batch book below exists only so the app can show what was imported and
+# drop it again; it is never consulted for scheduling.
+
+
+def _imports() -> list:
+    try:
+        with open(IMPORTS_FILE) as f:
+            v = json.load(f)
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def _save_imports(items) -> None:
+    try:
+        os.makedirs(os.path.dirname(IMPORTS_FILE), exist_ok=True)
+        tmp = IMPORTS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(items, f)
+        os.replace(tmp, IMPORTS_FILE)
+    except OSError:
+        pass
+
+
+def _import_pending(skip=()) -> list:
+    """Located, not-yet-done imported videos as ONE COLUMN PER BATCH, in playlist order —
+    the shape all_pending()'s round-robin consumes. Same keys channel_pending() emits."""
+    done, cols = get_done(), {}
+    for e in _priority():
+        p = e.get("path")
+        if _jumps(e) or not p or e.get("vid") in done:
+            continue
+        if os.path.splitext(os.path.basename(p))[0] in (skip or ()):
+            continue
+        cols.setdefault(e.get("batch") or "", []).append(e)
+    out = []
+    for batch in sorted(cols):
+        rows = sorted(cols[batch], key=lambda e: e.get("seq") or 0)
+        out.append([{"channel": e.get("channel"), "source_name": os.path.basename(e["path"]),
+                     "nas_dir": os.path.dirname(e["path"]), "video_path": e["path"],
+                     "title": e.get("title") or video_title(os.path.basename(e["path"]),
+                                                            e.get("channel")),
+                     "vid": e["vid"], "batch": batch, "imported": True,
+                     "_pub": 0} for e in rows])
+    return out
+
+
+def resolve_link(url) -> dict:
+    """WHAT a pasted link points at, with titles and counts — and NO side effects. This is
+    what the app shows before committing, and the only place the video-vs-playlist ambiguity
+    of a `watch?v=…&list=…` URL is surfaced for the user to settle."""
+    import ytdata
+    import ytlinks
+    info = ytlinks.parse_link(url)
+    kind = info["kind"]
+    out = {"status": "ok", "kind": kind, "ambiguous": bool(info["ambiguous"]),
+           "video_id": info["video_id"], "playlist_id": info["playlist_id"],
+           "title": "", "count": 0, "channel_title": "", "subscribed": False}
+    if kind == "unknown":
+        return {"status": "bad-url", "kind": "unknown"}
+    if kind in ("channel", "handle"):
+        ch = ytdata.channel_for(info["channel_id"] or info["handle"])
+        if not ch:
+            return {"status": "channel-unresolved", "kind": kind}
+        subs = ytdata.subscriptions() or []
+        out.update(kind="channel", channel_id=ch["channelId"], title=ch["title"],
+                   subscribed=any(c.get("channelId") == ch["channelId"] for c in subs))
+        return out
+    if info["playlist_id"]:
+        meta = ytdata.playlist_meta(info["playlist_id"])
+        if meta:
+            out.update(title=meta["title"], count=meta["count"],
+                       channel_title=meta["channel_title"])
+        elif kind == "playlist":
+            return {"status": "playlist-unreadable", "kind": "playlist",
+                    "playlist_id": info["playlist_id"]}
+    if info["video_id"] and not out["title"]:
+        out["title"] = ""                      # the video's own title arrives with its file
+    return out
+
+
+def import_link(url, choice=None) -> dict:
+    """Commit a pasted link. `choice` settles an ambiguous watch?v=…&list=… URL: "video"
+    imports just that video, "playlist" imports the whole list. Channel links are queued as
+    channels instead (badged when they are not one of your subscriptions).
+
+    Imported videos join the ORDINARY YouTube cadence — the send-to-Visionary BUTTON is the
+    jump-the-queue path, this box is not (user-dictated).
+    """
+    import youtarr
+    import ytdata
+    import ytlinks
+    info = ytlinks.parse_link(url)
+    kind = info["kind"]
+    if kind == "unknown":
+        return {"status": "bad-url"}
+
+    if kind in ("channel", "handle"):
+        ch = ytdata.channel_for(info["channel_id"] or info["handle"])
+        if not ch:
+            return {"status": "channel-unresolved"}
+        subs = ytdata.subscriptions() or []
+        is_sub = any(c.get("channelId") == ch["channelId"] for c in subs)
+        add_channel(ch["channelId"], ch["title"], via_link=not is_sub)
+        return {"status": "channel-queued", "channelId": ch["channelId"],
+                "title": ch["title"], "subscribed": is_sub}
+
+    take_playlist = kind == "playlist" or (choice == "playlist" and info["playlist_id"])
+    if take_playlist:
+        pid = info["playlist_id"]
+        ids = ytdata.playlist_video_ids(pid)
+        if ids is None:
+            return {"status": "playlist-unreadable", "playlist_id": pid}
+        meta = ytdata.playlist_meta(pid) or {}
+        label = meta.get("title") or pid
+        total = int(meta.get("count") or len(ids))
+        src, batch_kind = "https://www.youtube.com/playlist?list=" + pid, "playlist"
+    else:
+        vid = info["video_id"]
+        if not vid:
+            return {"status": "bad-url"}
+        ids, label, total = [vid], "", 1
+        src, batch_kind = "https://www.youtube.com/watch?v=" + vid, "video"
+    if not ids:
+        return {"status": "empty", "title": label}
+
+    done = get_done()
+    batch = "imp%d" % int(time.time() * 1000)
+    added = 0
+    with _PRIORITY_LOCK:
+        book = _priority()
+        have = {e.get("vid") for e in book}
+        for i, vid in enumerate(ids):
+            if vid in done or vid in have:
+                continue                       # already upscaled, or already queued somehow
+            book.append({"vid": vid, "title": None, "sent_at": int(time.time()),
+                         "jump": False, "seq": i, "batch": batch})
+            have.add(vid)
+            added += 1
+        if added:
+            _save_priority(book)
+    if not added:
+        return {"status": "already-queued", "title": label, "count": len(ids)}
+    if not youtarr.download_videos(ids):
+        _drop_batch(batch)                     # nothing will ever arrive — don't strand the book
+        return {"status": "youtarr-unreachable"}
+    with _IMPORTS_LOCK:
+        rows = _imports()
+        rows.append({"id": batch, "kind": batch_kind, "title": label, "source_url": src,
+                     "count": added, "total": total, "added_at": int(time.time())})
+        _save_imports(rows)
+    return {"status": "queued", "batch": batch, "kind": batch_kind, "title": label,
+            "count": added, "total": total,
+            "truncated": bool(take_playlist and total > len(ids))}
+
+
+def _drop_batch(batch_id) -> int:
+    """Remove a batch's UN-PROCESSED book entries. Anything already upscaled stays retired."""
+    with _PRIORITY_LOCK:
+        book = _priority()
+        kept = [e for e in book if e.get("batch") != batch_id]
+        gone = len(book) - len(kept)
+        if gone:
+            _save_priority(kept)
+    return gone
+
+
+def drop_import(batch_id) -> dict:
+    """Forget an import: its still-pending videos leave the queue, its row leaves the list.
+    Videos it already upscaled are untouched — they are finished work."""
+    gone = _drop_batch(batch_id)
+    with _IMPORTS_LOCK:
+        rows = _imports()
+        kept = [r for r in rows if r.get("id") != batch_id]
+        if len(kept) != len(rows):
+            _save_imports(kept)
+    return {"status": "ok", "removed": gone}
+
+
+def imports_view() -> list:
+    """The 'Imported' group:each batch with how many of its videos are still to come. A batch
+    whose videos are all done is dropped — it has nothing left to manage."""
+    counts = {}
+    done = get_done()
+    for e in _priority():
+        if _jumps(e) or e.get("vid") in done:
+            continue
+        counts[e.get("batch") or ""] = counts.get(e.get("batch") or "", 0) + 1
+    out, stale = [], []
+    for r in _imports():
+        left = counts.get(r.get("id"), 0)
+        if not left:
+            stale.append(r.get("id"))
+            continue
+        out.append({**r, "remaining": left})
+    if stale:
+        with _IMPORTS_LOCK:
+            rows = [r for r in _imports() if r.get("id") not in stale]
+            _save_imports(rows)
+    return out

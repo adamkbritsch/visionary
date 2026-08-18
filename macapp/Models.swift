@@ -288,13 +288,55 @@ struct YouTubeChannelDTO: Codable, Identifiable {   // a queued channel (standin
     var output_mode_effective: String?   // auto already resolved (youtarr sources are SDR)
     var pending: Int?         // videos to upscale (within cap + scope, not done)
     var downloaded: Int?      // videos youtarr has on disk
+    var via_link: Bool?       // added by PASTING A LINK and not one of your real subscriptions —
+                              // behaves identically, but badged so the list doesn't imply you follow it
     var id: String { channelId ?? title ?? "" }
+}
+
+struct YTImportDTO: Codable, Identifiable {   // one batch imported from a pasted link
+    var id: String?
+    var kind: String?          // "playlist" | "video"
+    var title: String?         // the playlist's name ("" for a single video)
+    var source_url: String?
+    var count: Int?            // how many videos this import queued
+    var total: Int?            // the playlist's true length (> count if it was capped)
+    var remaining: Int?        // how many are still to upscale
+    var added_at: Int?
+}
+
+struct YTLinkResolveDTO: Codable {            // action: resolve_link — NO side effects
+    var status: String?        // ok | bad-url | playlist-unreadable | channel-unresolved
+    var kind: String?          // video | playlist | channel | unknown
+    var ambiguous: Bool?       // watch?v=…&list=… — the user picks which they meant
+    var video_id: String?
+    var playlist_id: String?
+    var channel_id: String?
+    var title: String?
+    var channel_title: String?
+    var count: Int?
+    var subscribed: Bool?      // a channel link that IS one of your subscriptions
+}
+
+struct YTImportResultDTO: Codable {           // action: import_link
+    var status: String?        // queued | already-queued | bad-url | youtarr-unreachable | channel-queued | empty
+    var batch: String?
+    var kind: String?
+    var title: String?
+    var count: Int?
+    var total: Int?
+    var truncated: Bool?
+    var subscribed: Bool?
+}
+
+struct YTImportEnvelopeDTO: Codable {   // import_link replies with the refreshed queue + this
+    var `import`: YTImportResultDTO?
 }
 
 struct YouTubeStateDTO: Codable {
     var items: [YouTubeChannelDTO]?       // the queued channels (unlimited)
     var count: Int?
     var connected: Bool?                  // is the YouTube account connected (OAuth)?
+    var imports: [YTImportDTO]?           // batches added by pasting a link (the "Imported" group)
 }
 
 struct YTSubscriptionDTO: Codable, Identifiable {   // one of the user's real subscriptions

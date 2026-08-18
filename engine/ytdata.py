@@ -229,3 +229,109 @@ def popular_videos(channel_id, max_secs=1200, n=50):
         return out
     except Exception:
         return None
+
+
+# ---- pasted-link resolution (playlists, channels by handle) ---------------
+# Used by the app's "import a YouTube link" box: ytlinks.parse_link() says WHAT a URL is,
+# these turn it into something queueable. All follow this module's convention — None on
+# failure, so the caller can tell "API said no" from "genuinely empty".
+
+PLAYLIST_PAGE_CAP = 20        # 20 x 50 = 1000 videos. Matches subscriptions()' cap. NOT silent:
+                              # playlist_meta()'s `count` is the true total, so the caller can see
+                              # (and say) that it fetched 1000 of N.
+
+
+def playlist_meta(playlist_id):
+    """{title, count, channel_title} for a playlist, or None. This is what the confirm step
+    shows ("24 videos from <title>") before anything is queued."""
+    tok = access_token()
+    if not (tok and playlist_id):
+        return None
+    try:
+        r = _get(API + "/playlists?" + urllib.parse.urlencode({
+            "part": "snippet,contentDetails", "id": playlist_id}), tok)
+        items = r.get("items") or []
+        if not items:
+            return None                        # private, deleted, or not a playlist id
+        sn = items[0].get("snippet") or {}
+        return {"title": sn.get("title") or playlist_id,
+                "channel_title": sn.get("channelTitle") or "",
+                "count": int((items[0].get("contentDetails") or {}).get("itemCount") or 0)}
+    except Exception:
+        return None
+
+
+def playlist_video_ids(playlist_id):
+    """A playlist's video ids IN PLAYLIST ORDER (not publish order — user-dictated), or None.
+
+    Skips private/deleted entries: they still occupy a position and still carry a videoId,
+    but nothing can ever download them, so queueing one would strand a slot forever.
+    """
+    tok = access_token()
+    if not (tok and playlist_id):
+        return None
+    out, page, seen = [], None, set()
+    try:
+        for _ in range(PLAYLIST_PAGE_CAP):
+            q = {"part": "contentDetails,status", "playlistId": playlist_id,
+                 "maxResults": "50"}
+            if page:
+                q["pageToken"] = page
+            r = _get(API + "/playlistItems?" + urllib.parse.urlencode(q), tok)
+            for it in r.get("items") or []:
+                if ((it.get("status") or {}).get("privacyStatus") or "").lower() == "private":
+                    continue
+                vid = (it.get("contentDetails") or {}).get("videoId")
+                if vid and vid not in seen:     # a playlist may list the same video twice
+                    seen.add(vid)
+                    out.append(vid)
+            page = r.get("nextPageToken")
+            if not page:
+                break
+        return out
+    except Exception:
+        return None
+
+
+def channel_for(handle_or_id):
+    """{channelId, title} for a channel id, an @handle or a legacy /c//user/ name; None if
+    it can't be resolved. A pasted /@handle URL carries no channel id, and every queue path
+    downstream keys on the id."""
+    tok = access_token()
+    h = str(handle_or_id or "").strip().lstrip("@")
+    if not (tok and h):
+        return None
+
+    def _first(params):
+        r = _get(API + "/channels?" + urllib.parse.urlencode(dict(params, part="snippet")), tok)
+        for it in r.get("items") or []:
+            cid = it.get("id")
+            if cid:
+                return {"channelId": cid,
+                        "title": (it.get("snippet") or {}).get("title") or cid}
+        return None
+
+    try:
+        if re.fullmatch(r"UC[0-9A-Za-z_-]{22}", h):
+            return _first({"id": h})
+        # forHandle is the modern lookup; forUsername still resolves old /user/ names.
+        return (_first({"forHandle": "@" + h}) or _first({"forUsername": h})
+                or _search_channel(h, tok))
+    except Exception:
+        return None
+
+
+def _search_channel(name, tok):
+    """Last resort for a /c/<name> vanity URL, which neither forHandle nor forUsername
+    resolves. Takes the top channel hit."""
+    try:
+        r = _get(API + "/search?" + urllib.parse.urlencode({
+            "part": "snippet", "q": name, "type": "channel", "maxResults": "1"}), tok)
+        for it in r.get("items") or []:
+            cid = (it.get("id") or {}).get("channelId")
+            if cid:
+                return {"channelId": cid,
+                        "title": (it.get("snippet") or {}).get("title") or cid}
+    except Exception:
+        pass
+    return None

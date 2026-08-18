@@ -411,12 +411,15 @@ def api_youtube_connect(body):
 def api_youtube_queue(body):
     """Manage the YouTube channel queue (unlimited standing subscriptions; no priority — videos
     round-robin across channels). action: add | remove | scope | cap | paused | clear | preset | delete.
+    resolve_link/import_link/drop_import handle a PASTED YouTube URL (playlist, video or
+    channel) — resolve first for the confirm step, then commit.
     add/remove/scope/cap/paused re-derive youtarr's config + meta. paused stops work on a channel without
     deleting its files; remove WIPES it. delete removes a single downloaded video + ignores it."""
     import youtube
     action = (body.get("action") or "").strip()
     cid = (body.get("channelId") or "").strip()
     reconfigure = False
+    imported = None
     if action == "add" and cid:
         youtube.add_channel(cid, (body.get("title") or "").strip() or cid,
                             (body.get("scope") or "popular").strip())
@@ -449,6 +452,20 @@ def api_youtube_queue(body):
         youtube.clear_queue(); reconfigure = True
     elif action == "preset":                    # preset keyed by the channel FOLDER name
         settings.set_show_preset((body.get("folder") or "").strip(), (body.get("preset") or "").strip())
+    elif action == "resolve_link":
+        # PHASE 1 of a link import: say WHAT the URL points at — real titles, real counts,
+        # and whether a watch?v=…&list=… is ambiguous — with NO side effects, so the user
+        # confirms against names instead of against a bare URL.
+        return youtube.resolve_link((body.get("url") or "").strip())
+    elif action == "import_link":
+        # PHASE 2: commit the chosen reading. `choice` ("video"/"playlist") settles an
+        # ambiguous link. Falls through so the refreshed queue + up-next come back with it.
+        imported = youtube.import_link((body.get("url") or "").strip(),
+                                       (body.get("choice") or "").strip() or None)
+        if imported.get("status") == "channel-queued":
+            reconfigure = True                  # a newly queued channel needs youtarr synced
+    elif action == "drop_import":
+        imported = youtube.drop_import((body.get("batch") or body.get("id") or "").strip())
     elif action == "prioritize":
         # "Run this video now": promote it to the priority book (cadence-exempt, ahead of
         # due movies) and ask the in-flight item to YIELD at its next safe boundary — a
@@ -491,7 +508,10 @@ def api_youtube_queue(body):
     if reconfigure:
         try: youtube.configure_youtarr()        # sync youtarr's subs + refresh scope/duration meta
         except Exception: pass
-    return {"youtube": youtube.queue_view(), "up_next": up_next(current=orchestrator.ORCH.snapshot().get("current"), inflight=orchestrator.ORCH.finisher_views())}
+    out = {"youtube": youtube.queue_view(), "up_next": up_next(current=orchestrator.ORCH.snapshot().get("current"), inflight=orchestrator.ORCH.finisher_views())}
+    if imported is not None:
+        out["import"] = imported
+    return out
 
 
 def api_mode(mode):

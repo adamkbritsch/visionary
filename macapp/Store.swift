@@ -325,6 +325,39 @@ final class AppStore: ObservableObject {
     func removeChannel(_ channelId: String) async {
         await post("/api/youtube-queue", ["action": "remove", "channelId": channelId]); await refresh()
     }
+
+    // ---- importing a pasted YouTube link ---------------------------------
+    /// PHASE 1: what does this URL point at? No side effects, so the user confirms against
+    /// a real playlist name and count rather than a bare URL.
+    func resolveYoutubeLink(_ url: String) async -> YTLinkResolveDTO? {
+        let u = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty else { return nil }
+        let (_, data) = await postResult("/api/youtube-queue",
+                                        ["action": "resolve_link", "url": u])
+        guard let data else { return nil }
+        return try? JSONDecoder().decode(YTLinkResolveDTO.self, from: data)
+    }
+
+    /// PHASE 2: commit it. `choice` ("video"/"playlist") settles a watch?v=…&list=… link.
+    /// Imported videos join the ordinary YouTube cadence — they do not jump the queue.
+    @discardableResult
+    func importYoutubeLink(_ url: String, choice: String? = nil) async -> YTImportResultDTO? {
+        let u = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty else { return nil }
+        var body: [String: Any] = ["action": "import_link", "url": u]
+        if let choice { body["choice"] = choice }
+        let (_, data) = await postResult("/api/youtube-queue", body)
+        await refresh()
+        guard let data else { return nil }
+        return try? JSONDecoder().decode(YTImportEnvelopeDTO.self, from: data).`import`
+    }
+
+    /// Forget an import: its still-pending videos leave the queue. Already-upscaled ones stay.
+    func dropYoutubeImport(_ batch: String) async {
+        guard !batch.isEmpty else { return }
+        await post("/api/youtube-queue", ["action": "drop_import", "batch": batch])
+        await refresh()
+    }
     // Skip/delete ONE video: aborts it if currently processing, deletes its download from
     // staging, and tells youtarr to forget + never re-download it.
     /// "Run this video now": jumps it ahead of everything and asks the in-flight item to

@@ -781,3 +781,149 @@ class YoutarrOutputDirIsDerivedNotGuessed(unittest.TestCase):
                         side_effect=lambda p, **k: sent.update(p) or True):
             youtube.apply_youtarr_contract()
         self.assertNotIn("youtubeOutputDirectory", sent)   # never point at a missing folder
+
+
+def _imp_entry(vid, seq, batch, path):
+    return {"vid": vid, "title": None, "sent_at": 1, "jump": False, "seq": seq,
+            "batch": batch, "channel": "Chan", "path": path}
+
+
+class LinkImports(unittest.TestCase):
+    """A pasted playlist/video link becomes ordinary priority-book entries with jump=False:
+    durable + locatable like send-to-Visionary, but served at NORMAL CADENCE instead of
+    preempting the pipeline (user-dictated)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+        youtube._DURATIONS = {}
+        self.addCleanup(lambda: setattr(youtube, "_DURATIONS", None))
+        self.addCleanup(youtube._VIDEO_CACHE.clear)
+        self.addCleanup(youtube._META.clear)
+
+    # ---- the load-bearing rule: imports must never preempt -----------------
+    def test_imports_never_jump_the_queue(self):
+        youtube._save_priority([_imp_entry("aaaaaaaaaa1", 0, "imp1", "/s/Chan/x/a.mp4")])
+        self.assertIsNone(youtube.locate_priority())      # not served as a priority interrupt
+        self.assertFalse(youtube.has_priority_ready())    # and never asks topaz to yield
+
+    def test_send_to_visionary_still_jumps(self):
+        youtube._save_priority([{"vid": "bbbbbbbbbb1", "title": "T", "sent_at": 1,
+                                 "jump": True, "channel": "Chan", "path": "/s/Chan/y/b.mp4"}])
+        self.assertTrue(youtube.has_priority_ready())
+        self.assertEqual((youtube.locate_priority() or {}).get("vid"), "bbbbbbbbbb1")
+
+    def test_a_book_written_before_imports_existed_still_jumps(self):
+        # no `jump` key at all — must default to the old preempting behaviour
+        youtube._save_priority([{"vid": "cccccccccc1", "title": "T", "sent_at": 1,
+                                 "channel": "Chan", "path": "/s/Chan/z/c.mp4"}])
+        self.assertTrue(youtube.has_priority_ready())
+        self.assertEqual((youtube.locate_priority() or {}).get("vid"), "cccccccccc1")
+
+    # ---- ordering ----------------------------------------------------------
+    def test_playlist_order_holds_through_all_pending(self):
+        youtube._save_priority([                       # deliberately stored out of order
+            _imp_entry("ddddddddd03", 2, "imp1", "/s/Chan/3/c.mp4"),
+            _imp_entry("ddddddddd01", 0, "imp1", "/s/Chan/1/a.mp4"),
+            _imp_entry("ddddddddd02", 1, "imp1", "/s/Chan/2/b.mp4")])
+        self.assertEqual([v["vid"] for v in youtube.all_pending()],
+                         ["ddddddddd01", "ddddddddd02", "ddddddddd03"])
+
+    def test_two_batches_interleave_like_channels_do(self):
+        youtube._save_priority([_imp_entry("eeeeeeeee01", 0, "impA", "/s/C/1/a.mp4"),
+                                _imp_entry("eeeeeeeee02", 1, "impA", "/s/C/2/b.mp4"),
+                                _imp_entry("fffffffff01", 0, "impB", "/s/C/3/c.mp4")])
+        self.assertEqual([v["vid"] for v in youtube.all_pending()],
+                         ["eeeeeeeee01", "fffffffff01", "eeeeeeeee02"])
+
+    def test_done_and_skipped_videos_drop_out(self):
+        youtube._save_priority([_imp_entry("ggggggggg01", 0, "imp1", "/s/C/1/a.mp4"),
+                                _imp_entry("ggggggggg02", 1, "imp1", "/s/C/2/b.mp4")])
+        youtube.mark_done("ggggggggg01")               # finished → retired from the book
+        self.assertEqual([v["vid"] for v in youtube.all_pending()], ["ggggggggg02"])
+        self.assertEqual(youtube.all_pending(skip={"b"}), [])   # skip keys are file STEMS
+
+    # ---- committing an import ---------------------------------------------
+    def test_import_link_queues_a_playlist_in_playlist_order(self):
+        import ytdata, youtarr
+        ids = ["hhhhhhhhh01", "hhhhhhhhh02", "hhhhhhhhh03"]
+        with mock.patch.object(ytdata, "playlist_video_ids", return_value=ids), \
+             mock.patch.object(ytdata, "playlist_meta",
+                               return_value={"title": "My List", "count": 3, "channel_title": "C"}), \
+             mock.patch.object(youtarr, "download_videos", return_value=True) as dl:
+            out = youtube.import_link("https://www.youtube.com/playlist?list=PLxyz")
+        self.assertEqual(out["status"], "queued")
+        self.assertEqual((out["count"], out["title"]), (3, "My List"))
+        book = youtube._priority()
+        self.assertEqual([e["vid"] for e in book], ids)
+        self.assertEqual([e["seq"] for e in book], [0, 1, 2])
+        self.assertTrue(all(e["jump"] is False for e in book))
+        dl.assert_called_once_with(ids)                # youtarr actually fetches them
+        self.assertEqual([r["title"] for r in youtube.imports_view()], ["My List"])
+
+    def test_unreachable_youtarr_does_not_strand_the_book(self):
+        import ytdata, youtarr
+        with mock.patch.object(ytdata, "playlist_video_ids", return_value=["iiiiiiiii01"]), \
+             mock.patch.object(ytdata, "playlist_meta", return_value={"title": "L", "count": 1,
+                                                                      "channel_title": "C"}), \
+             mock.patch.object(youtarr, "download_videos", return_value=False):
+            out = youtube.import_link("https://www.youtube.com/playlist?list=PLxyz")
+        self.assertEqual(out["status"], "youtarr-unreachable")
+        self.assertEqual(youtube._priority(), [])      # rolled back — nothing will ever arrive
+        self.assertEqual(youtube.imports_view(), [])
+
+    def test_ambiguous_link_honours_the_choice(self):
+        import ytdata, youtarr
+        url = "https://www.youtube.com/watch?v=jjjjjjjjj01&list=PLxyz"
+        with mock.patch.object(youtarr, "download_videos", return_value=True), \
+             mock.patch.object(ytdata, "playlist_video_ids", return_value=["k1", "k2"]), \
+             mock.patch.object(ytdata, "playlist_meta", return_value={"title": "L", "count": 2,
+                                                                      "channel_title": "C"}):
+            out = youtube.import_link(url, choice="video")
+            self.assertEqual([e["vid"] for e in youtube._priority()], ["jjjjjjjjj01"])
+            self.assertEqual(out["kind"], "video")
+            youtube._save_priority([])
+            out = youtube.import_link(url, choice="playlist")
+            self.assertEqual([e["vid"] for e in youtube._priority()], ["k1", "k2"])
+            self.assertEqual(out["kind"], "playlist")
+
+    # ---- managing imports --------------------------------------------------
+    def test_drop_import_removes_only_its_own_batch(self):
+        youtube._save_priority([_imp_entry("lllllllll01", 0, "impA", "/s/C/1/a.mp4"),
+                                _imp_entry("lllllllll02", 0, "impB", "/s/C/2/b.mp4")])
+        youtube._save_imports([{"id": "impA", "kind": "playlist", "title": "A", "count": 1},
+                               {"id": "impB", "kind": "playlist", "title": "B", "count": 1}])
+        self.assertEqual(youtube.drop_import("impA"), {"status": "ok", "removed": 1})
+        self.assertEqual([e["vid"] for e in youtube._priority()], ["lllllllll02"])
+        self.assertEqual([r["id"] for r in youtube.imports_view()], ["impB"])
+
+    def test_imports_view_forgets_a_finished_batch(self):
+        youtube._save_priority([_imp_entry("mmmmmmmmm01", 0, "impA", "/s/C/1/a.mp4")])
+        youtube._save_imports([{"id": "impA", "kind": "playlist", "title": "A", "count": 1}])
+        self.assertEqual([r["remaining"] for r in youtube.imports_view()], [1])
+        youtube.mark_done("mmmmmmmmm01")
+        self.assertEqual(youtube.imports_view(), [])   # nothing left to manage
+
+    # ---- channel links -----------------------------------------------------
+    def test_channel_link_badged_only_when_not_a_subscription(self):
+        import ytdata
+        ch = {"channelId": "UCaaaaaaaaaaaaaaaaaaaaaa", "title": "Chan"}
+        with mock.patch.object(ytdata, "channel_for", return_value=ch), \
+             mock.patch.object(ytdata, "subscriptions", return_value=[]):
+            out = youtube.import_link("https://www.youtube.com/@Chan")
+        self.assertEqual(out["status"], "channel-queued")
+        self.assertFalse(out["subscribed"])
+        self.assertTrue(youtube.get_queue()[0]["via_link"])          # badged
+        youtube._save_queue([])
+        with mock.patch.object(ytdata, "channel_for", return_value=ch), \
+             mock.patch.object(ytdata, "subscriptions", return_value=[ch]):
+            out = youtube.import_link("https://www.youtube.com/@Chan")
+        self.assertTrue(out["subscribed"])
+        self.assertFalse(youtube.get_queue()[0]["via_link"])         # an ordinary subscription
+
+    def test_junk_link_is_refused(self):
+        self.assertEqual(youtube.import_link("https://example.com/x")["status"], "bad-url")
+        self.assertEqual(youtube._priority(), [])

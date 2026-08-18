@@ -2594,6 +2594,174 @@ private struct VerdictCard: View {
 // YouTube mode: search youtarr's channels, queue channels to upscale. A queued channel's videos
 // (newest first) process as a priority tier ahead of TV; once a channel is done it drops off and
 // the TV show continues. Addable/reorderable any time, just like movies.
+// Paste any YouTube link — a playlist, a single video, or a channel. Two phases: RESOLVE
+// (no side effects) so the user confirms against a real name and count, then IMPORT. A
+// watch?v=…&list=… URL expresses both readings, so that one always asks which was meant
+// (user-dictated) instead of guessing. Imported videos join the ordinary cadence between
+// episodes — the companion app's send-to-Visionary button remains the jump-the-queue path.
+private struct LinkImportRow: View {
+    @EnvironmentObject var store: AppStore
+    @State private var url = ""
+    @State private var busy = false
+    @State private var confirming: YTLinkResolveDTO? = nil
+    @State private var confirmURL = ""
+    @State private var note: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "link").font(.system(size: 11)).foregroundStyle(.secondary)
+                    TextField("Paste a playlist, video or channel link\u{2026}", text: $url)
+                        .textFieldStyle(.plain).font(.system(size: 13))
+                        .onSubmit { Task { await resolve() } }
+                    if !url.isEmpty {
+                        Button { url = ""; note = nil; confirming = nil } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 9).padding(.vertical, 7)
+                .panel(8, inset: true)
+                Button { Task { await resolve() } } label: {
+                    Label("Import", systemImage: "arrow.down.circle")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(SteelButtonStyle(lit: !url.isEmpty))
+                .disabled(url.isEmpty || busy)
+            }
+            if let c = confirming { confirmPanel(c) }
+            if let n = note {
+                Text(n).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func confirmPanel(_ c: YTLinkResolveDTO) -> some View {
+        let count = c.count ?? 0
+        VStack(alignment: .leading, spacing: 8) {
+            if c.ambiguous == true {
+                Text("That link points at a video inside a playlist.")
+                    .font(.system(size: 12, weight: .medium))
+                Text(c.title.map { "Playlist: \($0)" } ?? "")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                HStack(spacing: 8) {
+                    Button("Just this video") { Task { await commit("video") } }
+                        .buttonStyle(SteelButtonStyle(lit: true))
+                    Button(count > 0 ? "Whole playlist (\(count))" : "Whole playlist") {
+                        Task { await commit("playlist") }
+                    }.buttonStyle(SteelButtonStyle(lit: false))
+                    Button("Cancel") { confirming = nil }.buttonStyle(.plain)
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+            } else {
+                Text(c.title ?? "Playlist").font(.system(size: 12, weight: .medium)).lineLimit(1)
+                Text(count > 0 ? "\(count) videos" : "playlist")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button(count > 0 ? "Import \(count) videos" : "Import") {
+                        Task { await commit("playlist") }
+                    }.buttonStyle(SteelButtonStyle(lit: true))
+                    Button("Cancel") { confirming = nil }.buttonStyle(.plain)
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10).panel(DS.radiusControl, inset: true)
+    }
+
+    private func resolve() async {
+        guard !url.isEmpty, !busy else { return }
+        busy = true; note = nil; confirming = nil
+        let r = await store.resolveYoutubeLink(url)
+        busy = false
+        guard let r else { note = "Couldn't reach the engine."; return }
+        switch r.status ?? "" {
+        case "bad-url":
+            note = "That doesn't look like a YouTube link."
+        case "playlist-unreadable":
+            note = "That playlist is private or unavailable."
+        case "channel-unresolved":
+            note = "Couldn't find that channel."
+        default:
+            // Ask when the link is ambiguous, and when it is a playlist (importing 200 videos
+            // by accident is the surprise this step exists to prevent). A single video or a
+            // channel is unambiguous and cheap, so it commits straight away.
+            if r.ambiguous == true || (r.kind ?? "") == "playlist" {
+                confirmURL = url; confirming = r
+            } else {
+                confirmURL = url
+                await commit(nil)
+            }
+        }
+    }
+
+    private func commit(_ choice: String?) async {
+        busy = true
+        let out = await store.importYoutubeLink(confirmURL.isEmpty ? url : confirmURL, choice: choice)
+        busy = false
+        confirming = nil
+        switch out?.status ?? "" {
+        case "queued":
+            let n = out?.count ?? 0
+            let name = (out?.title ?? "").isEmpty ? "video" : (out?.title ?? "")
+            note = n > 1 ? "Queued \(n) videos from \(name)." : "Queued 1 video."
+            if out?.truncated == true, let t = out?.total {
+                note = (note ?? "") + " That playlist has \(t); the rest weren't fetched."
+            }
+            url = ""; confirmURL = ""
+        case "channel-queued":
+            note = (out?.subscribed == true)
+                ? "Added \(out?.title ?? "that channel") from your subscriptions."
+                : "Added \(out?.title ?? "that channel") by link."
+            url = ""; confirmURL = ""
+        case "already-queued":
+            note = "Already queued."; url = ""; confirmURL = ""
+        case "youtarr-unreachable":
+            note = "youtarr didn't respond, so nothing was queued."
+        case "empty":
+            note = "That playlist has nothing to import."
+        case "bad-url":
+            note = "That doesn't look like a YouTube link."
+        default:
+            note = "Import failed."
+        }
+    }
+}
+
+// Videos added by pasting a link, grouped by the import they came from, so a playlist can be
+// dropped again as one thing. A batch disappears once all its videos are upscaled.
+private struct ImportedGroup: View {
+    @EnvironmentObject var store: AppStore
+    let imports: [YTImportDTO]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Imported").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                ForEach(imports) { imp in
+                    HStack(spacing: 9) {
+                        Image(systemName: (imp.kind ?? "") == "playlist" ? "list.bullet.rectangle" : "play.rectangle")
+                            .font(.system(size: 11)).foregroundStyle(DS.steelDim).frame(width: 16)
+                        Text((imp.title ?? "").isEmpty ? "Single video" : (imp.title ?? ""))
+                            .font(.system(size: 13)).lineLimit(1)
+                        Spacer()
+                        Pill(systemImage: "tray.full",
+                             text: "\(imp.remaining ?? 0) of \(imp.count ?? 0) left", tint: DS.steel)
+                        Button { Task { await store.dropYoutubeImport(imp.id ?? "") } } label: {
+                            Image(systemName: "trash").font(.system(size: 11))
+                        }.buttonStyle(.plain).foregroundStyle(.secondary)
+                            .help("Forget this import — its videos that haven't been upscaled yet leave the queue")
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                }
+            }.panel(DS.radiusControl, inset: true)
+        }
+    }
+}
+
 private struct YouTubeMode: View {
     @EnvironmentObject var store: AppStore
     let locked: Bool
@@ -2633,6 +2801,7 @@ private struct YouTubeMode: View {
                     }
                     LibraryRefreshButton(help: "Refresh subscriptions") { await store.fetchChannels() }
                 }
+                LinkImportRow()
                 if let pc = pending {
                     PresetChooser(title: pc.title ?? "", catalog: catalog, pick: $pick, confirmLabel: "Update preset") {
                         Task { await store.setChannelPreset(pc.folder_name ?? "", pick); pending = nil }
@@ -2659,6 +2828,7 @@ private struct YouTubeMode: View {
                         }
                     }.panel(DS.radiusControl, inset: true)
                 }
+                if let imps = yt?.imports, !imps.isEmpty { ImportedGroup(imports: imps) }
             }
         }
         .onAppear { Task { await store.fetchChannels() } }
@@ -2794,6 +2964,11 @@ private struct ChannelRow: View {
                                  : "Pause — stop downloading & upscaling this channel (keeps its files)")
                 Text(ch.title ?? ch.folder_name ?? "").font(.system(size: 13)).lineLimit(1)
                     .foregroundStyle(paused ? .secondary : .primary)
+                if ch.via_link == true {
+                    // Added by pasting a link and NOT one of your subscriptions — same behaviour,
+                    // but the list shouldn't imply you follow it (user-dictated).
+                    Pill(systemImage: "link", text: "added by link", tint: DS.steelDim)
+                }
                 Group {
                     Picker("", selection: Binding(get: { ch.scope ?? "popular" },
                                                   set: { s in Task { await store.setChannelScope(ch.channelId ?? "", s) } })) {
