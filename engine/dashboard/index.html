@@ -147,6 +147,20 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 .issue:first-child{border-top:0}
 .issue b{color:var(--fault);font-weight:600}
 
+.acts{display:flex;gap:2px;margin-left:auto;flex:0 0 auto}
+.act{display:grid;place-items:center;width:32px;height:30px;border:0;border-radius:8px;
+  background:transparent;color:var(--steel-dim);cursor:pointer;padding:0}
+.act:hover{background:rgba(255,255,255,.08);color:var(--steel-bright)}
+.act:disabled{opacity:.25;cursor:default;background:transparent}
+.act svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;
+  stroke-linecap:round;stroke-linejoin:round}
+.act.danger:hover{color:var(--fault)}
+.row.grp{cursor:pointer}
+.row.grp .chev{transition:transform .15s}
+.row.grp.open .chev{transform:rotate(180deg)}
+.row.kid{padding-left:34px;background:rgba(0,0,0,.14)}
+.badge{font-size:10px;font-weight:600;color:var(--steel-bright);padding:3px 7px;
+  border-radius:999px;background:rgba(255,255,255,.09);white-space:nowrap}
 .muted{color:var(--steel-dim);font-size:12.5px;padding:14px;text-align:center}
 .foot{margin-top:18px;text-align:center;font-size:11px;color:var(--steel-dim)}
 .off{opacity:.5}
@@ -163,6 +177,11 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
   <symbol id="i-play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></symbol>
   <symbol id="i-disk" viewBox="0 0 24 24"><rect x="3" y="13" width="18" height="6" rx="2"/><path d="M6 13l3-8h6l3 8M8 16h.01"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V6m0 0-6 6m6-6 6 6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v13m0 0 6-6m-6 6-6-6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-now" viewBox="0 0 24 24"><path d="M5 4h14"/><path d="M12 21V8m0 0-5 5m5-5 5 5"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
 </defs></svg>
 
@@ -332,13 +351,11 @@ function render(d){
   /* ---- queue --------------------------------------------------------- */
   var q = d.up_next || [];
   txt($("qCount"), q.length ? "(" + q.length + ")" : "");
-  $("queue").innerHTML = q.length ? q.map(function(u, i){
-    return '<div class="row"><span class="k mono">' + (i + 1) + '</span>' +
-           '<svg class="ic"><use href="' + iconFor(u.kind) + '"/></svg>' +
-           '<span class="t">' + esc(itemName(u)) + '</span>' +
-           (u.channel ? '<span class="c">' + esc(u.channel) + '</span>' : "") +
-           (u.priority ? '<span class="pill bright">next</span>' : "") + '</div>';
-  }).join("") : '<div class="muted">Nothing queued</div>';
+  /* Only redraw when the queue actually CHANGED: this polls every 2 s, and rebuilding the
+     list under a finger is how a tap lands on the wrong row. */
+  lastQ = q;
+  var sig = JSON.stringify(q.map(function(u){ return [u.kind, u.name, u.ep, u.priority]; }));
+  if (sig !== qSig){ qSig = sig; drawQueue(q); }
 
   /* ---- machine -------------------------------------------------------- */
   var pw = d.power || {}, sc = d.scratch || {}, wn = d.window || {};
@@ -365,9 +382,131 @@ function render(d){
     }).join("");
   }
 
-  var when = d.generated_at ? new Date(d.generated_at * 1000) : new Date();
+  /* generated_at is an ISO string from datetime.now() (local, no offset) — NOT epoch
+     seconds. Multiplying it gave NaN and the footer read "Invalid Date". */
+  var when = d.generated_at ? new Date(d.generated_at) : new Date();
+  if (isNaN(when.getTime())) when = new Date();
   txt($("foot"), "updated " + when.toLocaleTimeString());
 }
+
+var qSig = "", openGroups = {}, lastQ = [];
+
+/* Only TV EPISODES are numbered (as in the app): movies and videos ride along between
+   them, so numbering everything read as though a video were "item 4 of the show". */
+function episodeOrdinals(q){
+  var m = {}, n = 0;
+  q.forEach(function(u, i){ if (u.kind === "episode"){ n += 1; m[i] = n; } });
+  return m;
+}
+
+/* Runs of consecutive videos collapse into one expandable slot. Order is never changed —
+   only how it is drawn. */
+function grouped(q){
+  var out = [], i = 0;
+  while (i < q.length){
+    if (q[i].kind === "youtube"){
+      var j = i;
+      while (j < q.length && q[j].kind === "youtube") j++;
+      out.push({start: i, items: q.slice(i, j)});
+      i = j;
+    } else { out.push({start: i, items: [q[i]]}); i++; }
+  }
+  return out;
+}
+
+function act(sym, kind, o, opts){
+  var dis = opts && opts.disabled ? " disabled" : "";
+  var cls = "act" + (opts && opts.danger ? " danger" : "");
+  return '<button class="' + cls + '"' + dis + ' title="' + esc((opts || {}).help || "") + '"' +
+         ' data-act="' + kind + '" data-name="' + esc(o.name || "") + '"' +
+         ' data-ch="' + esc(o.channel || "") + '">' +
+         '<svg><use href="' + sym + '"/></svg></button>';
+}
+
+/* Movies: reorder through the WHOLE queue, or drop them (non-destructive — files stay).
+   Videos: jump the queue, or skip & DELETE (confirmed). Episodes are auto-generated and
+   carry no controls — exactly the split the app makes. */
+function controlsFor(u, idx, total){
+  if (u.kind === "movie"){
+    return '<span class="acts">' +
+      act("#i-up", "up", u, {disabled: idx === 0, help: "Move earlier"}) +
+      act("#i-down", "down", u, {disabled: idx === total - 1, help: "Move later"}) +
+      act("#i-x", "remove", u, {help: "Remove from the queue (the file stays)"}) + '</span>';
+  }
+  if (u.kind === "youtube"){
+    var lead = u.priority
+      ? '<span class="badge" title="Queued to jump — starts when the current segment finishes">running next</span>'
+      : act("#i-now", "now", u, {help: "Run this video now — the current segment finishes first"});
+    return '<span class="acts">' + lead +
+      act("#i-x", "del", u, {danger: true,
+          help: "Skip & delete — removes the download and youtarr never re-fetches it"}) + '</span>';
+  }
+  return "";
+}
+
+function rowHtml(u, idx, total, ord, kid){
+  return '<div class="row' + (kid ? " kid" : "") + '">' +
+    '<span class="k mono">' + (ord ? ord : "") + '</span>' +
+    '<svg class="ic"><use href="' + iconFor(u.kind) + '"/></svg>' +
+    '<span class="t">' + esc(itemName(u)) + '</span>' +
+    (u.channel ? '<span class="c">' + esc(u.channel) + '</span>' : "") +
+    controlsFor(u, idx, total) + '</div>';
+}
+
+function drawQueue(q){
+  if (!q.length){ $("queue").innerHTML = '<div class="muted">Nothing queued</div>'; return; }
+  var ord = episodeOrdinals(q);
+  $("queue").innerHTML = grouped(q).map(function(g){
+    if (g.items.length === 1){
+      var i = g.start;
+      return rowHtml(g.items[0], i, q.length, ord[i], false);
+    }
+    var gid = "g" + g.start + "-" + (g.items[0].name || "");
+    var open = !!openGroups[gid];
+    var head = '<div class="row grp' + (open ? " open" : "") + '" data-act="toggle" data-g="' +
+      esc(gid) + '"><span class="k"></span>' +
+      '<svg class="ic"><use href="#i-play"/></svg>' +
+      '<span class="t">' + g.items.length + ' videos</span>' +
+      '<svg class="ic chev"><use href="#i-chev"/></svg></div>';
+    var kids = open ? g.items.map(function(u, k){
+      return rowHtml(u, g.start + k, q.length, null, true);
+    }).join("") : "";
+    return head + kids;
+  }).join("");
+}
+
+/* Delegated, so a redraw never orphans a handler. */
+$("queue").addEventListener("click", async function(ev){
+  var b = ev.target.closest("[data-act]");
+  if (!b) return;
+  var a = b.dataset.act, name = b.dataset.name || "", ch = b.dataset.ch || "";
+  if (a === "toggle"){
+    openGroups[b.dataset.g] = !openGroups[b.dataset.g];
+    drawQueue(lastQ);            /* instant: display-only state, no round trip */
+    return;
+  }
+  if (b.disabled) return;
+  if (a === "del" && !confirm("Skip & delete this video?\n\nIt deletes the download and tells "
+      + "youtarr to forget it — it won't be re-downloaded or upscaled.")) return;
+  b.disabled = true;
+  try {
+    if (a === "up" || a === "down" || a === "remove"){
+      await fetch("/api/queue-action", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action: a, kind: "movie", name: name})});
+    } else if (a === "now"){
+      await fetch("/api/youtube-queue", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action: "prioritize", name: name})});
+    } else if (a === "del"){
+      await fetch("/api/youtube-queue", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action: "delete", channel: ch, name: name})});
+    }
+  } catch (e) { /* the poll resyncs */ }
+  qSig = "";
+  poll(true);
+});
 
 function esc(s){
   return String(s === null || s === undefined ? "" : s)
@@ -375,10 +514,11 @@ function esc(s){
 }
 
 var first = true;
-async function poll(){
-  /* A backgrounded phone tab shouldn't poll — but the FIRST load always must, or a tab
-     restored from the background sits blank until it is touched. */
-  if (busy || (document.hidden && !first)) return;
+async function poll(force){
+  /* A backgrounded phone tab shouldn't poll — but the FIRST load always must (or a tab
+     restored from the background sits blank), and so must a refresh the user just asked
+     for by tapping a control. */
+  if (busy || (document.hidden && !first && !force)) return;
   busy = true; first = false;
   try {
     var r = await fetch("/api/state", {cache: "no-store"});
@@ -407,7 +547,7 @@ $("arm").addEventListener("click", async function(){
   poll();
 });
 
-document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(); });
+document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(true); });
 poll();
 timer = setInterval(poll, 2000);
 </script>
