@@ -559,6 +559,70 @@ def fetch_ahead(force=False) -> dict:
 # .nfo/poster/subtitle sidecars because youtarr never wrote them, or nothing to upscale at
 # all because youtarr's channel auto-download was off.
 
+def _youtarr_host_prefix(current_dir) -> str | None:
+    """The prefix youtarr's HOST paths carry in front of the FTP path, OBSERVED from its own
+    current setting — never guessed.
+
+    The same folder has three names: youtarr writes `/volume1/Media/YouTube-raw`, Visionary
+    reads `/Media/YouTube-raw` over FTP, Plex sees `/media/YouTube`. Nothing can compute
+    that mapping from first principles, but youtarr's existing value reveals it: match its
+    TAIL against a media path we already know and whatever precedes it is the prefix.
+    Returns None when no known path matches — then the directory is reported, not rewritten,
+    because inventing an absolute path would strand every future download."""
+    import transfer
+    cur = str(current_dir or "").rstrip("/")
+    if not cur:
+        return None
+    known = [transfer.NAS_FTP_YOUTUBE_STAGING, transfer.NAS_FTP_YOUTUBE_ROOT,
+             *transfer.NAS_FTP_TV_ROOTS, *transfer.NAS_FTP_MOVIES_ROOTS]
+    for p in sorted({k.rstrip("/") for k in known if k}, key=len, reverse=True):
+        if cur.endswith(p):
+            return cur[: len(cur) - len(p)]        # "" is valid (youtarr uses FTP-style paths)
+    return None
+
+
+def youtarr_desired_output_dir(cfg) -> str | None:
+    """Where youtarr SHOULD write, in youtarr's own path space, or None if unknowable."""
+    import transfer
+    prefix = _youtarr_host_prefix((cfg or {}).get("youtubeOutputDirectory"))
+    if prefix is None:
+        return None
+    return prefix + transfer.NAS_FTP_YOUTUBE_STAGING.rstrip("/")
+
+
+def ensure_staging_dir() -> bool:
+    """Make sure the staging folder EXISTS on the NAS, so pointing youtarr at it can't fail
+    on a missing directory. Best-effort; True when it exists afterwards."""
+    import ftplib
+    import transfer
+    path = transfer.NAS_FTP_YOUTUBE_STAGING.rstrip("/")
+    try:
+        ftp = transfer.connect()
+    except Exception:
+        return False
+    try:
+        try:
+            ftp.cwd(path)
+            return True
+        except ftplib.all_errors:
+            pass
+        made, cur = True, ""
+        for part in [p for p in path.strip("/").split("/") if p]:
+            cur += "/" + part
+            try:
+                ftp.cwd(cur)
+            except ftplib.all_errors:
+                try:
+                    ftp.mkd(cur)
+                except ftplib.all_errors:
+                    made = False
+                    break
+        return made
+    finally:
+        try: ftp.quit()
+        except Exception: pass
+
+
 def youtarr_contract(cfg=None) -> list:
     """[{key, desired, current, ok, why}] — what Visionary needs from youtarr and how the
     live settings compare. `desired=None` means "any value is fine, shown for context"."""
@@ -570,10 +634,14 @@ def youtarr_contract(cfg=None) -> list:
     # folder over FTP (/Media/YouTube-raw), so compare by SUFFIX rather than demanding an
     # exact match we cannot compute without knowing the share mount.
     out_ok = bool(outdir) and outdir.rstrip("/").endswith(staging)
+    want_out = None if out_ok else youtarr_desired_output_dir(cfg)
     rows = [
-        {"key": "youtubeOutputDirectory", "current": outdir, "desired": None, "ok": out_ok,
-         "why": f"must be the STAGING folder ending in {staging} — the folder split keeps "
-                f"raw downloads out of the Plex library; only finished 4K masters go there"},
+        {"key": "youtubeOutputDirectory", "current": outdir, "desired": want_out, "ok": out_ok,
+         "why": (f"must be the STAGING folder ending in {staging} — the folder split keeps "
+                 f"raw downloads out of the Plex library; only finished 4K masters go there")
+                + ("" if (out_ok or want_out) else
+                   ". Its current value matches no known media folder, so the correct path "
+                   "cannot be derived — set it in youtarr.")},
         {"key": "channelAutoDownload", "current": cfg.get("channelAutoDownload"),
          "desired": True, "ok": bool(cfg.get("channelAutoDownload")),
          "why": "off means youtarr never fetches on its own and the queue only fills when "
@@ -603,10 +671,11 @@ def youtarr_config_status() -> dict:
                 "detail": "youtarr did not answer — check its URL and credentials above.",
                 "rows": [], "ok": False}
     rows = youtarr_contract(cfg)
-    for r in rows:                       # the app decodes `current` as a String
-        c = r.get("current")
-        r["current"] = "" if c is None else ("on" if c is True else
-                                             "off" if c is False else str(c))
+    for r in rows:                       # the app decodes these as Strings
+        for k in ("current", "desired"):
+            v = r.get(k)
+            r[k] = "" if v is None else ("on" if v is True else
+                                         "off" if v is False else str(v))
     return {"rows": rows, "ok": all(r["ok"] for r in rows),
             "output_dir": cfg.get("youtubeOutputDirectory")}
 
@@ -620,8 +689,13 @@ def apply_youtarr_contract() -> dict:
     cfg = youtarr.get_config()
     if cfg is None:
         return {"error": "youtarr-unreachable"}
-    patch = {r["key"]: r["desired"] for r in youtarr_contract(cfg)
-             if r["desired"] is not None and not r["ok"]}
+    rows = youtarr_contract(cfg)
+    patch = {r["key"]: r["desired"] for r in rows if r["desired"] is not None and not r["ok"]}
+    if "youtubeOutputDirectory" in patch:
+        # Point youtarr at staging only when the folder actually exists, so its next
+        # download cannot fail on a missing directory.
+        if not ensure_staging_dir():
+            patch.pop("youtubeOutputDirectory")
     if not patch:
         return {"changed": {}, "ok": True}
     ok = youtarr.update_config(patch)

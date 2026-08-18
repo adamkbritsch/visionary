@@ -725,3 +725,59 @@ class YoutarrContract(unittest.TestCase):
         with mock.patch("youtarr.get_config", return_value=None):
             self.assertEqual(youtube.youtarr_config_status()["error"], "youtarr-unreachable")
             self.assertEqual(youtube.apply_youtarr_contract()["error"], "youtarr-unreachable")
+
+
+class YoutarrOutputDirIsDerivedNotGuessed(unittest.TestCase):
+    """youtarr only has to EXIST — Visionary configures it, including where downloads land.
+    The same folder has three names (youtarr's host path, Visionary's FTP path, Plex's
+    container path) and nothing can compute that mapping from first principles. youtarr's
+    OWN current value reveals it: match its tail against a media path we know, and whatever
+    precedes it is the prefix. No match -> report, never invent an absolute path."""
+
+    def test_prefix_is_observed_from_the_current_value(self):
+        self.assertEqual(youtube._youtarr_host_prefix("/volume1/Media/YouTube-raw"), "/volume1")
+        self.assertEqual(youtube._youtarr_host_prefix("/Media/YouTube"), "")
+        self.assertIsNone(youtube._youtarr_host_prefix("/downloads/yt"))
+        self.assertIsNone(youtube._youtarr_host_prefix(""))
+
+    def test_the_plex_library_misconfiguration_is_retargeted_to_staging(self):
+        # The failure this prevents: raw 1080p downloads appearing in the Plex library.
+        want = youtube.youtarr_desired_output_dir(
+            {"youtubeOutputDirectory": "/volume1/Media/YouTube"})
+        self.assertEqual(want, "/volume1/Media/YouTube-raw")
+
+    def test_an_unrecognisable_path_is_never_rewritten(self):
+        cfg = {"youtubeOutputDirectory": "/downloads/yt", "channelAutoDownload": True,
+               "writeVideoNfoFiles": True, "writeVideoFanart": True,
+               "writeChannelPosters": True, "subtitlesEnabled": True}
+        row = {r["key"]: r for r in youtube.youtarr_contract(cfg)}["youtubeOutputDirectory"]
+        self.assertFalse(row["ok"])
+        self.assertIsNone(row["desired"])          # nothing to apply -> reported instead
+        self.assertIn("cannot be derived", row["why"])
+
+    def test_apply_creates_staging_before_pointing_youtarr_at_it(self):
+        order = []
+        cfg = {"youtubeOutputDirectory": "/volume1/Media/YouTube", "channelAutoDownload": True,
+               "writeVideoNfoFiles": True, "writeVideoFanart": True,
+               "writeChannelPosters": True, "subtitlesEnabled": True}
+        with mock.patch("youtarr.get_config", return_value=cfg), \
+             mock.patch.object(youtube, "ensure_staging_dir",
+                               side_effect=lambda: order.append("mkdir") or True), \
+             mock.patch("youtarr.update_config",
+                        side_effect=lambda p, **k: order.append(("set", p)) or True):
+            out = youtube.apply_youtarr_contract()
+        self.assertEqual(order[0], "mkdir")        # folder first, then the pointer
+        self.assertEqual(order[1][1]["youtubeOutputDirectory"], "/volume1/Media/YouTube-raw")
+        self.assertTrue(out["ok"])
+
+    def test_apply_skips_the_pointer_if_staging_cannot_be_created(self):
+        cfg = {"youtubeOutputDirectory": "/volume1/Media/YouTube", "channelAutoDownload": True,
+               "writeVideoNfoFiles": True, "writeVideoFanart": True,
+               "writeChannelPosters": True, "subtitlesEnabled": True}
+        sent = {}
+        with mock.patch("youtarr.get_config", return_value=cfg), \
+             mock.patch.object(youtube, "ensure_staging_dir", return_value=False), \
+             mock.patch("youtarr.update_config",
+                        side_effect=lambda p, **k: sent.update(p) or True):
+            youtube.apply_youtarr_contract()
+        self.assertNotIn("youtubeOutputDirectory", sent)   # never point at a missing folder

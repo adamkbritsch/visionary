@@ -464,6 +464,7 @@ struct MediaLibrariesDTO: Codable {
 struct YoutarrRowDTO: Codable, Identifiable {
     var key: String?
     var current: String?      // stringified by the server-side encoder below
+    var desired: String?      // what Setup will set it to ("" = nothing to change)
     var ok: Bool?
     var why: String?
     var id: String { key ?? "" }

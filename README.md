@@ -444,13 +444,19 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
-- **youtarr configures itself**: several of youtarr's own settings are a contract Visionary
-  depends on — where downloads land (the folder split that keeps raw 1080p out of your Plex
+- **youtarr only has to EXIST.** Run the container; Visionary does the rest — it discovers
+  the URL on your NAS, and once you've entered its login (youtarr requires auth, so that one
+  credential is unavoidable) it configures youtarr itself. Several of youtarr's own settings
+  are a contract Visionary depends on — where downloads land (the folder split that keeps raw 1080p out of your Plex
   library), the `.nfo`/poster/thumbnail/subtitle sidecars it copies beside each master, and
   whether youtarr auto-downloads at all. They used to be set by hand with nothing checking
   them, so a wrong one failed quietly. Setup now applies them the moment youtarr connects
-  and shows each one with a Recheck/Apply. The output *directory* is never rewritten — only
-  youtarr knows its own mount layout — so a wrong one is reported for you to fix there.
+  and shows each one with a Recheck/Apply. That includes **where downloads land**: the same
+  folder has three names (youtarr's host path, Visionary's FTP path, Plex's container path),
+  so the prefix is *observed* from youtarr's own current value rather than guessed — a
+  directory pointing at your Plex library gets retargeted to staging, the folder is created
+  first if missing, and a path matching nothing recognisable is reported instead of
+  overwritten with an invented one.
 
 - **Fetch-ahead** keeps the NAS stocked: Visionary used to only *subscribe* youtarr and then
   wait for its own schedule, so the upscale queue could run dry with the pipeline idle. It

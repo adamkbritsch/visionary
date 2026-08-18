@@ -353,8 +353,9 @@ private struct YoutarrSettingsGroup: View {
                 Text("Connect youtarr above and these are set for you.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             } else {
-                Text("Set automatically when youtarr connects — Visionary needs these to place "
-                     + "downloads and copy sidecars.")
+                Text("youtarr only has to EXIST — Visionary sets these itself when it connects, "
+                     + "so downloads land in staging (never your Plex library) and every master "
+                     + "keeps its sidecars.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 ForEach(rows) { r in
                     VStack(alignment: .leading, spacing: 2) {
@@ -364,6 +365,11 @@ private struct YoutarrSettingsGroup: View {
                             Text(r.current ?? "").font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(.secondary).lineLimit(1)
                             Spacer()
+                        }
+                        if r.ok != true, let want = r.desired, !want.isEmpty {
+                            Text("will set to  \(want)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(Color.brand).padding(.leading, 20)
                         }
                         if r.ok != true, let why = r.why {
                             Text(why).font(.system(size: 10)).foregroundStyle(.secondary)
