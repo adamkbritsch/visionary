@@ -1233,6 +1233,7 @@ def current_state():
 # exempt: the Mac app talks to us there and must keep working untouched.
 BIND_ADDR = os.environ.get("VISIONARY_BIND", "0.0.0.0")
 TOKEN_FILE = os.path.expanduser("~/.topaz-pipeline/remote_token")
+REMOTE_AWAKE_GRACE_SECS = 60 * 60      # a remote Deactivate keeps the Mac reachable this long
 _LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
 
@@ -1480,7 +1481,14 @@ class Handler(BaseHTTPRequestHandler):
                     orchestrator.ORCH.enable()
                 else:
                     settings.set_settings({"activated": False})
-                    orchestrator.ORCH.disable()
+                    # A Deactivate from OFF-MACHINE is remote by definition (the web UI is
+                    # only reachable over the tailnet), and a laptop that sleeps can't be
+                    # woken from away — so a remote stop would be a one-way door. Hold the
+                    # screen for a grace period so it can still be re-armed; the hold
+                    # refuses itself on battery (see ORCH.hold_awake).
+                    remote = (self.client_address or ("",))[0] not in _LOOPBACK
+                    orchestrator.ORCH.disable(
+                        keep_awake_secs=REMOTE_AWAKE_GRACE_SECS if remote else 0)
             self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/send-to-visionary":
             # The companion YouTube app's button. Off-machine callers need the remote

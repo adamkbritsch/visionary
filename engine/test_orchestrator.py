@@ -3364,3 +3364,71 @@ class YoutubePreemption(unittest.TestCase):
             o._process(p)
         self.assertEqual(held.get("code"), "yt-priority")
         self.assertIn("YouTube video you moved up next", held.get("msg") or "")
+
+
+class RemoteDeactivateKeepsItReachable(unittest.TestCase):
+    """Deactivating from the web UI is REMOTE by definition, and a laptop that sleeps can't
+    be woken from away — so a remote stop would be a one-way door. The screen is held for a
+    grace period so it can still be re-armed. On battery the hold refuses itself: draining
+    the machine with nobody there is worse than letting it sleep."""
+
+    def _orch(self, power="run"):
+        o = orch.Orchestrator()
+        o._caffeinate = mock.Mock()                      # pretend one is held
+        for name in ("_start_caffeinate", "_ensure"):
+            p = mock.patch.object(o, name); p.start(); self.addCleanup(p.stop)
+        p = mock.patch.object(o, "_power_ok", return_value=(power, None))
+        p.start(); self.addCleanup(p.stop)
+        return o
+
+    def test_hold_is_refused_on_battery(self):
+        o = self._orch(power="pause")
+        self.assertEqual(o.hold_awake(1200), 0.0)
+        self.assertEqual(o._awake_until, 0.0)
+
+    def test_hold_is_granted_on_mains(self):
+        o = self._orch()
+        until = o.hold_awake(1200)
+        self.assertGreater(until, time.time() + 1100)
+
+    def test_a_local_stop_still_releases_the_screen(self):
+        o = self._orch()
+        with mock.patch.object(o, "_stop_caffeinate") as stop:
+            o.disable(keep_awake_secs=0)
+        stop.assert_called_once()                        # the app on this Mac is unchanged
+
+    def test_a_remote_stop_keeps_the_screen(self):
+        o = self._orch()
+        with mock.patch.object(o, "_stop_caffeinate") as stop:
+            o.disable(keep_awake_secs=1200)
+        stop.assert_not_called()                         # held, so it can still be re-armed
+        self.assertGreater(o._awake_until, time.time() + 1100)
+
+    def test_a_remote_stop_on_battery_falls_back_to_sleeping(self):
+        o = self._orch(power="pause")
+        with mock.patch.object(o, "_stop_caffeinate") as stop:
+            o.disable(keep_awake_secs=1200)
+        stop.assert_called_once()
+
+    def test_the_hold_is_visible_in_state(self):
+        o = self._orch()
+        self.assertEqual(o.snapshot()["awake_hold_secs"], 0)
+        o.hold_awake(1200)
+        self.assertGreater(o.snapshot()["awake_hold_secs"], 1100)
+
+    def test_the_keeper_releases_when_it_expires(self):
+        o = self._orch()
+        o._awake_until = time.time() - 1                  # already expired
+        with mock.patch.object(o, "_stop_caffeinate") as stop:
+            o._awake_hold()
+        stop.assert_called_once()
+        self.assertEqual(o._awake_until, 0.0)
+
+    def test_the_keeper_hands_back_to_a_rearm(self):
+        o = self._orch()
+        o._awake_until = time.time() + 1200
+        o._enabled = True                                 # re-armed inside the window
+        with mock.patch.object(o, "_stop_caffeinate") as stop:
+            o._awake_hold()
+        stop.assert_not_called()                          # the run owns caffeinate again
+        self.assertGreater(o._awake_until, time.time())

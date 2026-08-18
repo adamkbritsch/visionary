@@ -861,6 +861,7 @@ class Orchestrator:
         self._lock = threading.Lock()
         self._abort = threading.Event()        # set on manual stop / power pause / quiet reclaim / item removal
         self._caffeinate = None                # held while running: display+system awake
+        self._awake_until = 0.0                # unix time an AWAKE HOLD expires (see hold_awake)
         self._drain_baseline = None            # battery % the current drain episode began at
         self._power_paused = False             # published by _run (single-writer): the prefetcher reads it
                                                # so its CFR encodes don't drain the battery mid-pause
@@ -1178,6 +1179,43 @@ class Orchestrator:
             try: self._caffeinate.terminate()
             except Exception: pass
             self._caffeinate = None
+
+    def hold_awake(self, seconds: float, why: str = "") -> float:
+        """Keep the Mac awake for `seconds` even though the run has stopped.
+
+        A Deactivate from the WEB UI is REMOTE by definition, and a sleeping laptop cannot
+        be reached over the tailnet — so deactivating remotely would otherwise be a one-way
+        door with no way to change your mind (user-dictated 2026-08-18). Honoured only while
+        the machine is fit to run anyway (mains power, or a desktop Mac): on battery the
+        right answer is to let it sleep rather than drain it with nobody there.
+
+        Returns the unix time the hold expires, or 0.0 when refused.
+        """
+        if seconds <= 0 or self._power_ok()[0] != "run":
+            return 0.0
+        self._awake_until = max(self._awake_until, time.time() + float(seconds))
+        if self._caffeinate is None:
+            self._start_caffeinate()
+        self._ensure("awake_hold", self._awake_hold)
+        logbook.event(f"screen held awake for {int(seconds // 60)} min"
+                      + (f" — {why}" if why else ""))
+        return self._awake_until
+
+    def _awake_hold(self):
+        """Release the screen when the grace expires — or hand it straight back to a re-arm."""
+        while True:
+            left = self._awake_until - time.time()
+            if left <= 0:
+                break
+            if self._enabled:
+                return                       # re-armed in time: the run owns caffeinate again
+            if self._power_ok()[0] != "run":
+                break                        # power went away — stop holding it awake
+            time.sleep(min(15.0, max(1.0, left)))
+        self._awake_until = 0.0
+        if not self._enabled:
+            self._stop_caffeinate()
+            logbook.event("awake hold expired — the Mac may sleep now")
 
     # ---- control ----
     def skip_current(self, source_basename: str) -> bool:
@@ -1619,7 +1657,7 @@ class Orchestrator:
                                  ("prefetch", self._prefetch), ("plex_monitor", self._plex_monitor)):
                 self._ensure(name, target)
 
-    def disable(self, reason="disabled by user"):
+    def disable(self, reason="disabled by user", keep_awake_secs=0):
         with self._lock:
             self._enabled = False
             self._abort.set()
@@ -1627,8 +1665,14 @@ class Orchestrator:
             self._resolve_active.clear()       # never leave the remux lanes held by a dead run
             self._extend_active.clear()
             self._resume_remuxes()             # ...nor frozen by one
-            self._stop_caffeinate()            # let the display sleep again
             self.state.update(enabled=False, ended_reason=reason)
+        # Caffeinate is released OUTSIDE the lock: a remote Deactivate asks us to keep the
+        # display alive a while longer so it can still be re-armed from away, and taking
+        # that decision here (rather than unconditionally dropping it above) is what makes
+        # the hold possible at all.
+        if not (keep_awake_secs and self.hold_awake(keep_awake_secs,
+                                                    "deactivated remotely")):
+            self._stop_caffeinate()            # let the display sleep again
         try:
             import topaz
             topaz.terminate_all()              # kill any in-flight encode at once (don't orphan it)
@@ -1637,7 +1681,12 @@ class Orchestrator:
         logbook.event(f"stopped — {reason}")
 
     def snapshot(self) -> dict:
-        return dict(self.state)
+        d = dict(self.state)
+        # Seconds of AWAKE HOLD left after a remote Deactivate — the web UI says so, since a
+        # hold you can't see is indistinguishable from the laptop being about to vanish.
+        left = self._awake_until - time.time()
+        d["awake_hold_secs"] = int(left) if left > 0 else 0
+        return d
 
     # ---- loop ----
     def _power_ok(self):
