@@ -1402,7 +1402,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ("/", "/index.html"):
             try:
                 with open(os.path.join(DASHBOARD_DIR, "index.html"), "rb") as f:
-                    extra = {}
+                    # NEVER let a browser hold the old UI: the page is redeployed under a
+                    # fixed URL, so a cached copy silently survives every deploy (user-hit
+                    # 2026-08-18 — the rebuilt dashboard looked unchanged until a hard reload).
+                    extra = {"Cache-Control": "no-store, must-revalidate"}
                     if getattr(self, "_token_via_query", False):
                         # Trade the one-time ?k= link for a cookie so the bookmark, the
                         # history entry and any shoulder-surfer never carry the secret.
