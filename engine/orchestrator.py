@@ -2484,7 +2484,12 @@ class Orchestrator:
         # only resolve+remux left), resume it: a fresh movie must NOT preempt it and strand its
         # ~190 GiB intermediate idle through the movie's whole run. (Live-hit: a deploy killed
         # S07E22 mid-resolve; on re-arm a due movie jumped the queue and its topaz sat unused.)
-        mid = None if gate_released else self._midpipeline_tv(skip)
+        # A DUE VIDEO also steps past the mid-pipeline preference. That preference exists so a
+        # ~190 GiB intermediate isn't stranded behind a fresh item — but a video is ~5 minutes
+        # and the episode's topaz segments stay on disk, so nothing is stranded by letting one
+        # through. Without this the episode is re-picked the instant its topaz yields and the
+        # yield accomplishes nothing.
+        mid = None if (gate_released or self._yt_cadence_due()) else self._midpipeline_tv(skip)
         if mid is not None:
             return mid, "ok"
         # SEND-TO-VISIONARY priority: a video the user explicitly pushed from the
@@ -2781,7 +2786,8 @@ class Orchestrator:
                                         # fast item, and to a "run this video now" request
                                         should_pause=lambda: (self._dual_remux_live()
                                                               or self._gate_release_pending()
-                                                              or self._yt_priority_waiting()))
+                                                              or self._yt_priority_waiting()
+                                                              or self._yt_cadence_due()))
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
@@ -2820,6 +2826,10 @@ class Orchestrator:
                         self._hold("resolve-gate",
                             f"{ep_disp}: topaz paused at a segment boundary — a waiting "
                             f"item's Resolve gets the machine (topaz resumes after)")
+                    elif self._yt_cadence_due():
+                        self._hold("yt-cadence",
+                            f"{ep_disp}: topaz paused at a segment boundary — a YouTube "
+                            f"video is due (topaz resumes after the burst)")
                     else:
                         self._hold("dual-remux",
                             f"{ep_disp}: topaz paused at a segment boundary — two remuxes running")
@@ -3039,6 +3049,37 @@ class Orchestrator:
         if self._drain_backlog() < 2:
             return False
         return (time.time() - self._last_resolve_at) < BACKLOG_WAIT_GRACE_SECONDS
+
+    def _yt_cadence_due(self) -> bool:
+        """A YouTube video is due by the cadence AND could actually make progress right now.
+
+        The second half is what stops this undoing the doorstep deferral: while a remux runs,
+        a video can only reach the Resolve doorstep and park, so interrupting a topaz for one
+        would trade real upscaling for nothing. Once the remux clears the video CAN run, and
+        then it should — that is what `youtube_videos_per_burst` means.
+
+        Needed because an episode is 'mid-pipeline' from its FIRST topaz segment until
+        hand-off (the segdir is created up front) and _midpipeline_tv is consulted before the
+        cadence gate — so an episode pinned the run thread for its whole multi-hour upscale
+        and the burst never got a turn (user-reported 2026-08-18: no video finished all day
+        with 22 pending and a burst of 10). Getting the episode's topaz started earlier is
+        exactly what made this bite.
+
+        Cheap enough to poll between topaz segments: caches only, never FTP.
+        """
+        try:
+            if self._tv_since_yt < self._yt_every_tv():
+                return False
+            if self._resolve_should_hold():
+                return False          # it could only park — let topaz keep the machine
+            import youtube
+            skip = self._parked | set(self._refused) | self._in_finisher_keys()
+            name = (self.state.get("current") or {}).get("name") or ""
+            if name:                  # never yield to the video already running — that loops
+                skip = skip | {os.path.splitext(os.path.basename(name))[0]}
+            return youtube.next_due(skip=skip) is not None
+        except Exception:
+            return False
 
     def _yt_priority_waiting(self) -> bool:
         """A YouTube video has been told to run NOW and is ready — so the in-flight item

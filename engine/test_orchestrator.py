@@ -1298,16 +1298,24 @@ class DoubleRemux(unittest.TestCase):
              mock.patch.object(o, "_hand_to_finisher"), \
              mock.patch("stages.run_stage", side_effect=spy):
             o._process(p)
-        # BEHAVIOR, not identity (the predicate is a lambda now — it also yields to a
-        # gate-released fast item): dual-remux → pause; gate release → pause; neither → run.
+        # BEHAVIOR, not identity (the predicate is a lambda): dual-remux → pause; gate
+        # release → pause; a DUE YouTube video → pause; none of them → run. Each is pinned
+        # explicitly, so this no longer depends on whatever the real YouTube queue holds.
         sp = seen.get("topaz")
-        with mock.patch.object(o, "_dual_remux_live", return_value=True):
+        quiet = {"_dual_remux_live": False, "_gate_release_pending": False,
+                 "_yt_cadence_due": False}
+        def with_(**over):
+            es = contextlib.ExitStack()
+            for k, v in dict(quiet, **over).items():
+                es.enter_context(mock.patch.object(o, k, return_value=v))
+            return es
+        with with_(_dual_remux_live=True):
             self.assertTrue(sp())
-        with mock.patch.object(o, "_dual_remux_live", return_value=False), \
-             mock.patch.object(o, "_gate_release_pending", return_value=True):
+        with with_(_gate_release_pending=True):
             self.assertTrue(sp())
-        with mock.patch.object(o, "_dual_remux_live", return_value=False), \
-             mock.patch.object(o, "_gate_release_pending", return_value=False):
+        with with_(_yt_cadence_due=True):
+            self.assertTrue(sp())                 # the burst gets its turn
+        with with_():
             self.assertFalse(sp())
 
     def test_topaz_pauses_whenever_both_remux_lanes_are_live(self):
@@ -3432,3 +3440,70 @@ class RemoteDeactivateKeepsItReachable(unittest.TestCase):
             o._awake_hold()
         stop.assert_not_called()                          # the run owns caffeinate again
         self.assertGreater(o._awake_until, time.time())
+
+
+class BurstActuallyGetsATurn(unittest.TestCase):
+    """An episode is 'mid-pipeline' from its FIRST topaz segment until hand-off, and that
+    preference is consulted BEFORE the YouTube cadence gate — so an episode pinned the run
+    thread for its whole multi-hour upscale and the configured burst never ran (live-hit
+    2026-08-18: no video finished all day with 22 pending and a burst of 10). A due video now
+    steps past it — but only when it could actually make progress."""
+
+    def _orch(self, *, since=5, every=1, holding=False, pending=True):
+        o = orch.Orchestrator()
+        o._tv_since_yt = since
+        es = contextlib.ExitStack(); self.addCleanup(es.close)
+        es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
+        es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=holding))
+        es.enter_context(mock.patch.object(o, "_in_finisher_keys", return_value=set()))
+        es.enter_context(mock.patch.object(orch.youtube, "next_due",
+                                           return_value={"channel": "C", "video_path": "/s/C/x/v.mp4",
+                                                         "title": "T"} if pending else None))
+        return o
+
+    def test_due_video_interrupts_a_pinned_episode(self):
+        self.assertTrue(self._orch()._yt_cadence_due())
+
+    def test_it_waits_while_a_remux_is_running(self):
+        # THE load-bearing qualifier: mid-remux a video could only park at the Resolve
+        # doorstep, so interrupting topaz for it would trade real upscaling for nothing —
+        # this is what keeps the doorstep-deferral fix intact.
+        self.assertFalse(self._orch(holding=True)._yt_cadence_due())
+
+    def test_not_due_before_the_cadence_is_reached(self):
+        self.assertFalse(self._orch(since=0, every=2)._yt_cadence_due())
+
+    def test_nothing_pending_is_not_due(self):
+        self.assertFalse(self._orch(pending=False)._yt_cadence_due())
+
+    def test_it_never_yields_to_the_video_already_running(self):
+        o = self._orch()
+        o.state["current"] = {"kind": "youtube", "name": "v.mp4"}
+        seen = {}
+        def next_due(skip=()):
+            seen["skip"] = set(skip)
+            return None
+        with mock.patch.object(orch.youtube, "next_due", side_effect=next_due):
+            self.assertFalse(o._yt_cadence_due())
+        self.assertIn("v", seen["skip"])              # its own stem is excluded, so it can't loop
+
+    def test_selection_skips_the_midpipeline_pin_when_a_video_is_due(self):
+        o = self._orch()
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv",
+                               side_effect=AssertionError("a due video must go first")), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=None), \
+             mock.patch.object(orch.movies, "next_due", return_value=None), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            ep, why = o._next_episode()
+        self.assertEqual(why, "ok")
+        self.assertTrue(ep.youtube)
+
+    def test_a_pinned_episode_still_wins_while_the_remux_runs(self):
+        # Part 2's whole point: the next episode's topaz fills the remux window.
+        o = self._orch(holding=True)
+        sentinel = object()
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=sentinel):
+            ep, why = o._next_episode()
+        self.assertIs(ep, sentinel)
