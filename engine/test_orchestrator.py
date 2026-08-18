@@ -19,6 +19,7 @@ _FINISHER_PATCH = None
 
 
 _REFUSED_PATCH = None
+_YT_PATCHES = []
 
 
 def setUpModule():
@@ -32,6 +33,15 @@ def setUpModule():
     # work-list: constructions load it, _park_permanent writes it — keep tests off the real one.
     _REFUSED_PATCH = mock.patch.object(orch, "REFUSED_FILE", _os.path.join(d, "refused.json"))
     _REFUSED_PATCH.start()
+    # SELECTION now consults the live YouTube queue (_yt_cadence_due lets a due video past a
+    # mid-pipeline episode), so without this every _next_episode test silently depends on
+    # whatever is actually queued on this machine — they passed or failed with the real
+    # cache. Point the books at a throwaway dir: next_due() finds nothing unless a test says
+    # otherwise, and the tests that DO want a video patch next_due themselves.
+    import youtube as _yt
+    for name, fn in (("QUEUE_FILE", "yt_queue.json"), ("DONE_FILE", "yt_done.json"),
+                     ("PRIORITY_FILE", "yt_priority.json"), ("IMPORTS_FILE", "yt_imports.json")):
+        p = mock.patch.object(_yt, name, _os.path.join(d, fn)); p.start(); _YT_PATCHES.append(p)
 
 
 def tearDownModule():
@@ -39,6 +49,8 @@ def tearDownModule():
         _FINISHER_PATCH.stop()
     if _REFUSED_PATCH is not None:
         _REFUSED_PATCH.stop()
+    for p in _YT_PATCHES:
+        p.stop()
 
 
 class Paths(unittest.TestCase):

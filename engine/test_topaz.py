@@ -379,3 +379,48 @@ class FrameCountTaglessMkv(unittest.TestCase):
             return types.SimpleNamespace(stdout="61536\n", returncode=0)
         with mock.patch.object(topaz.subprocess, "run", side_effect=fake_run):
             self.assertEqual(topaz._frame_count("/cfr.mp4"), 61536)
+
+
+class CfrHardwarePath(unittest.TestCase):
+    """A 4K VFR source (YouTube ships 2160p AV1) went through a near-lossless 4K x264 pass
+    under the prefetcher's background QoS clamp — hours of work that any interruption threw
+    away, since an unfinished convert has no moov atom and is treated as absent. Live-caught
+    2026-08-18: five failures in a day and a 250-byte output. Above CFR_HW_MIN_HEIGHT both
+    halves move to the media engine, which neither x265 nor Topaz contends for."""
+
+    def _cmd(self, height, pix="yuv420p10le"):
+        return topaz.build_cfr_command("/ff", "/in.mp4", "/out.mp4", rate="30000/1001",
+                                       pix=pix, low_prio=True, height=height)
+
+    def test_4k_uses_the_media_engine_at_both_ends(self):
+        c = self._cmd(2160)
+        self.assertIn("hevc_videotoolbox", c)
+        self.assertEqual(c[c.index("-hwaccel") + 1], "videotoolbox")
+        self.assertNotIn("libx264", c)
+        self.assertIn("-allow_sw", c)              # still works if the media engine is busy
+
+    def test_hd_is_untouched(self):
+        c = self._cmd(1080)
+        self.assertIn("libx264", c)                # the long-standing path, unchanged
+        self.assertNotIn("hevc_videotoolbox", c)
+        self.assertNotIn("-hwaccel", c)
+        self.assertIn("-threads", c)
+
+    def test_an_unknown_height_stays_on_the_old_path(self):
+        # a failed probe must never silently switch encoders
+        c = topaz.build_cfr_command("/ff", "/in.mp4", "/out.mp4", rate=None, pix="yuv420p")
+        self.assertIn("libx264", c)
+
+    def test_the_timing_contract_is_identical_on_both_paths(self):
+        # Resolve imports this file; the CFR cadence is the whole point of the stage
+        for h in (1080, 2160):
+            c = self._cmd(h)
+            self.assertEqual(c[c.index("-fps_mode") + 1], "cfr", h)
+            self.assertEqual(c[c.index("-r") + 1], "30000/1001", h)
+            self.assertEqual(c[c.index("-c:a") + 1], "copy", h)
+
+    def test_bit_depth_is_preserved_on_the_hardware_path(self):
+        self.assertEqual(self._cmd(2160, "yuv420p10le")[self._cmd(2160, "yuv420p10le").index("-pix_fmt") + 1],
+                         "p010le")
+        self.assertEqual(self._cmd(2160, "yuv420p")[self._cmd(2160, "yuv420p").index("-pix_fmt") + 1],
+                         "nv12")

@@ -31,6 +31,15 @@ FFPROBE_HB = "/opt/homebrew/bin/ffprobe"
 SEGMENT_TARGET_SECONDS = 90               # group scene-cut chunks to ~this length
 SCENE_STRONG_SCORE = 0.4                  # only checkpoint at strong cuts (clean reset)
 CFR_CRF = 14                              # near-lossless x264 for the VFR→CFR source pass
+# Above this height the software x264 pass stops being viable. A 4K VFR source (YouTube ships
+# 2160p AV1) at crf 14 is tens of thousands of frames of near-lossless 4K x264 — on the
+# prefetcher's background QoS that is HOURS, and because an interrupted convert is unusable
+# (no moov atom → is_cfr_ready False) every restart begins again from zero. Live-caught
+# 2026-08-18: an 18-minute 4K AV1 video failed its CFR five times in a day and produced 250
+# bytes. Hardware HEVC is ~20-50x faster and this file is a temporary intermediate that
+# cleanup deletes, so the extra bitrate costs nothing.
+CFR_HW_MIN_HEIGHT = 1440
+CFR_HW_KBPS = 80000
 
 # ProRes 422 HQ, 10-bit 4:2:2 (p210le) — the upscale intermediate. Was ProRes XQ 16-bit (p416le), but
 # the DV master out of Resolve is 10-bit, so XQ's 12/16-bit precision is unused on an 8-bit-sourced
@@ -244,7 +253,19 @@ def _cfr_pix_fmt(path, ffprobe=FFPROBE_HB):
     return "yuv420p10le" if "10" in out else "yuv420p"
 
 
-def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False):
+def _cfr_height(path, ffprobe=FFPROBE_HB) -> int:
+    """The source's height, to decide software vs hardware for the CFR pass. 0 when unknown —
+    which keeps the long-standing software path, never the newer one, on a bad probe."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=height", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        return int(out.splitlines()[0]) if out else 0
+    except Exception:
+        return 0
+
+
+def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False, height=0):
     """ffmpeg args for a VFR→CFR re-encode at `rate` (the source's OWN rate — same
     cadence, just constant). `-r <rate>` + `-fps_mode cfr` is the canonical recipe;
     near-lossless crf keeps the upscaler's input detail; bit depth + color tags are
@@ -260,16 +281,32 @@ def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False
     # P-cores and measurably slowed the live encode ~24% (6.7 → ~5.1 fps).
     prio = ["/usr/sbin/taskpolicy", "-c", "background"] if low_prio else []
     threads = ["-threads", "4"] if low_prio else []
+    # 4K → hardware HEVC on the media engine (see CFR_HW_MIN_HEIGHT). Same timing contract:
+    # the -r/-fps_mode cfr flags and the colour tags below are shared by both paths, so what
+    # Resolve imports is identical apart from the codec. `-allow_sw 1` keeps it working if
+    # the media engine is unavailable rather than failing the stage outright.
+    # Hardware DECODE matters as much as the encode: the source is 4K AV1, and software
+    # decoding that under the background QoS clamp is what actually stalls it (measured on a
+    # saturated machine: this pass held 37% CPU while the live x265 held 1060%). With both
+    # halves on the MEDIA ENGINE — which neither x265 (CPU) nor Topaz (GPU) contends for —
+    # it stops competing with the live encode instead of merely being throttled behind it.
+    # ffmpeg falls back to software decode by itself if the hwaccel cannot initialise.
+    accel = ["-hwaccel", "videotoolbox"] if (height or 0) >= CFR_HW_MIN_HEIGHT else []
+    hw = (["-c:v", "hevc_videotoolbox", "-b:v", f"{CFR_HW_KBPS}k",
+           "-pix_fmt", ("p010le" if "10" in (pix or "") else "nv12"),
+           "-tag:v", "hvc1", "-allow_sw", "1"]
+          if (height or 0) >= CFR_HW_MIN_HEIGHT else [])
     return [
         *prio,
         ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
+        *accel,
         "-i", src,
         "-map", "0:v:0", "-map", "0:a?",
         # `veryfast`: at a fixed crf the preset trades encode-speed for file SIZE only, not quality —
         # Topaz ingests identical pixels and this CFR file is deleted at cleanup, so a bigger temp is
         # irrelevant. ~3-5x faster than `medium`, so the prefetcher fills its buffer sooner.
-        "-c:v", "libx264", "-crf", str(CFR_CRF), "-preset", "veryfast", "-pix_fmt", pix,
-        *threads,
+        *(hw if hw else ["-c:v", "libx264", "-crf", str(CFR_CRF), "-preset", "veryfast",
+                         "-pix_fmt", pix, *threads]),
         *rate_flags, "-fps_mode", "cfr",
         *color_flags(color),
         "-c:a", "copy",
@@ -407,7 +444,7 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     else:
         cmd = build_cfr_command(FFMPEG_HB, source, dst, rate=rate,
                                 pix=_cfr_pix_fmt(source), color=source_color(source),
-                                low_prio=low_prio)
+                                low_prio=low_prio, height=_cfr_height(source))
     rc, frames, aborted, tail = _run_ffmpeg(cmd, os.environ.copy(),
                                             abort=abort, on_progress=on_progress)
     # A negative rc = the process was killed by a signal — that's ALWAYS our own stop/shutdown
