@@ -100,6 +100,11 @@ DEFAULT_SETTINGS = {
                                 # FAST-PATH (rpu-only/resolve-only) item's Resolve pass only.
     "max_youtube_minutes": 20,  # YouTube: the per-channel length-cap threshold (applied only to channels
                                 # whose 'capped' toggle is on).
+    "youtube_fetch_ahead": 12,  # FETCH-AHEAD: keep at least this many not-yet-upscaled videos
+                                # DOWNLOADED on the NAS per channel, asking youtarr for whatever is
+                                # missing (newest first) instead of waiting for its own schedule.
+                                # Visionary used to only SUBSCRIBE youtarr and wait, so the upscale
+                                # queue could run dry with the pipeline idle. 0 = off (old behavior).
     "youtube_videos_per_burst": 1,   # YouTube CADENCE, the OTHER direction: how many videos run
                                 # back-to-back once the gate fires. The pair expresses the whole dial
                                 # as WHOLE NUMBERS instead of a fraction (user-dictated 2026-08-17):
@@ -173,6 +178,7 @@ LIMITS = {
     "max_youtube_minutes": (1, 600),
     "youtube_every_tv_episodes": (1, 50),
     "youtube_videos_per_burst": (1, 10),
+    "youtube_fetch_ahead": (0, 100),
     "max_active_shows": (1, MAX_ACTIVE_CEILING),
     "finisher_lanes": (1, 2),
     "min_free_gb": (200, 2000),

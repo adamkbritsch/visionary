@@ -2119,6 +2119,10 @@ class Orchestrator:
                 self._yt_refresh_at = now + YT_REFRESH_SECONDS
             elif now >= self._yt_refresh_at:               # then a cheap live re-scan for new downloads
                 youtube.refresh_downloads()
+                # ...and TOP UP the staging buffer. Subscribing youtarr and waiting for its
+                # own schedule let the upscale queue run dry with the pipeline idle; this
+                # asks for whatever each channel is short of (rate-limited inside).
+                youtube.fetch_ahead()
                 self._yt_refresh_at = now + YT_REFRESH_SECONDS
         except Exception:
             pass

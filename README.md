@@ -444,6 +444,12 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
+- **Fetch-ahead** keeps the NAS stocked: Visionary used to only *subscribe* youtarr and then
+  wait for its own schedule, so the upscale queue could run dry with the pipeline idle. It
+  now asks youtarr for whatever each channel is short of — newest first, respecting the
+  channel's scope and max-age — to keep `youtube_fetch_ahead` (default 12) undownloaded
+  videos staged per channel. Set it to 0 for the old wait-and-see behaviour.
+
 - **Run a video now**: any pending YouTube video can jump the whole queue from its up-next
   row (the ↥ button) — cadence-exempt and ahead of due movies. The item processing
   **finishes its current segment first**, exactly like a deploy does, then yields and

@@ -585,3 +585,82 @@ class PrioritizePending(unittest.TestCase):
             self.assertTrue(youtube.has_priority_ready())
             # the video already running IS the priority pick — it must not yield to itself
             self.assertFalse(youtube.has_priority_ready(skip={"a2"}))
+
+
+class FetchAhead(unittest.TestCase):
+    """Visionary only SUBSCRIBED youtarr and waited for its schedule, so the upscale queue
+    could run dry with the pipeline idle and the NAS quiet. fetch_ahead tops each channel's
+    staging buffer up to a target, newest-first."""
+
+    def setUp(self):
+        self.entry = {"channelId": "C1", "folder_name": "Chan", "scope": "all"}
+        self.on_disk = [{"vid": "have1", "name": "a [have1].mp4", "dir": "/d",
+                         "path": "/d/a.mp4", "mtime": 1}]
+        self.known = ["new3", "new1", "have1", "new2", "old1"]
+        self.NOW = 1_000_000                       # a coherent clock for the age filter
+        self.pubs = {"new3": self.NOW - 100, "new1": self.NOW - 200,
+                     "have1": self.NOW - 300, "new2": self.NOW - 400,
+                     "old1": self.NOW - 5 * 86400}
+
+    def _wanted(self, target, done=(), max_age=None, scope="all", popular=None):
+        e = dict(self.entry, scope=scope)
+        if max_age:
+            e["max_age_days"] = max_age
+        with mock.patch.object(youtube, "cached_videos", return_value=self.on_disk), \
+             mock.patch.object(youtube, "get_done", return_value=set(done)), \
+             mock.patch.object(youtube, "_published", return_value=self.pubs), \
+             mock.patch.dict(youtube._META, {"C1": {"popular": popular or set()}}, clear=False), \
+             mock.patch("youtarr.channel_video_ids", return_value=self.known):
+            return youtube.wanted_ids(e, target)
+
+    def test_newest_first_excluding_what_is_already_there(self):
+        self.assertEqual(self._wanted(10), ["new3", "new1", "new2", "old1"])
+
+    def test_target_bounds_the_ask(self):
+        self.assertEqual(self._wanted(2), ["new3", "new1"])
+
+    def test_done_and_age_filters_apply(self):
+        self.assertNotIn("new3", self._wanted(10, done=["new3"]))
+        # old1 is 5 days old; a 1-day limit drops it and keeps the rest
+        with mock.patch.object(youtube.time, "time", return_value=self.NOW):
+            got = self._wanted(10, max_age=1)
+        self.assertNotIn("old1", got)
+        self.assertIn("new3", got)          # a recent one is still wanted
+
+    def test_popular_scope_only_asks_for_the_popular_set(self):
+        got = self._wanted(10, scope="popular", popular={"new2"})
+        self.assertEqual(got, ["new2"])
+
+    def test_paused_channel_is_never_fetched(self):
+        e = dict(self.entry, paused=True)
+        with mock.patch.object(youtube, "cached_videos", return_value=[]):
+            self.assertEqual(youtube.wanted_ids(e, 10), [])
+
+    def test_fetch_ahead_off_by_setting_asks_nothing(self):
+        import settings
+        with mock.patch.object(settings, "get_settings", return_value={"youtube_fetch_ahead": 0}), \
+             mock.patch("youtarr.download_videos",
+                        side_effect=AssertionError("must not ask youtarr")):
+            self.assertEqual(youtube.fetch_ahead(force=True), {})
+
+    def test_fetch_ahead_asks_only_for_the_shortfall(self):
+        import settings
+        asked = {}
+        with mock.patch.object(settings, "get_settings", return_value={"youtube_fetch_ahead": 3}), \
+             mock.patch.object(youtube, "get_queue", return_value=[self.entry]), \
+             mock.patch.object(youtube, "cached_videos", return_value=self.on_disk), \
+             mock.patch.object(youtube, "get_done", return_value=set()), \
+             mock.patch.object(youtube, "_published", return_value=self.pubs), \
+             mock.patch("youtarr.channel_video_ids", return_value=self.known), \
+             mock.patch("youtarr.download_videos",
+                        side_effect=lambda ids, **k: asked.update({"ids": list(ids)}) or True):
+            out = youtube.fetch_ahead(force=True)
+        self.assertEqual(asked["ids"], ["new3", "new1"])     # target 3, one already on disk
+        self.assertIn("Chan", out)
+
+    def test_rate_limited_between_ticks(self):
+        import settings
+        with mock.patch.object(settings, "get_settings", return_value={"youtube_fetch_ahead": 3}), \
+             mock.patch.object(youtube, "get_queue", return_value=[]):
+            youtube.fetch_ahead(force=True)          # stamps the clock
+            self.assertEqual(youtube.fetch_ahead(), {})   # immediate re-tick does nothing

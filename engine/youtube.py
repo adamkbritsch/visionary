@@ -460,6 +460,98 @@ def configure_youtarr():
     return ok
 
 
+# ---- FETCH-AHEAD: keep youtarr's staging folder stocked ------------------------------
+# Visionary subscribes youtarr to the queued channels and then WAITS for youtarr's own
+# schedule to fetch anything — nothing ever asked for a specific video (download_videos
+# existed only for the companion-app push). So the upscale queue could run dry purely
+# because nothing had been downloaded yet, with the pipeline idle and the NAS quiet.
+# This tops the staging buffer up to a target per channel, newest-first.
+_FETCH_LOCK = threading.Lock()
+_fetch_at = 0.0
+FETCH_GAP_SECONDS = 300.0        # don't hammer youtarr's trigger endpoint
+
+
+def _fetch_ahead_target() -> int:
+    try:
+        import settings
+        return max(0, int(settings.get_settings().get("youtube_fetch_ahead", 0)))
+    except Exception:
+        return 0
+
+
+def wanted_ids(entry, target) -> list:
+    """Video ids this channel SHOULD have on staging but doesn't: candidates newest-first,
+    minus what is already downloaded, done, or out of scope/age. Never raises."""
+    folder = entry.get("folder_name")
+    if not folder or entry.get("paused"):
+        return []
+    have = {v.get("vid") for v in cached_videos(folder)}
+    done = get_done()
+    scope = entry.get("scope", "popular")
+    popular = (_META.get(entry.get("channelId")) or {}).get("popular") or set()
+    pubs, max_age, now = _published(), _max_age_secs(entry), time.time()
+    # CANDIDATES. _META only ever holds the `popular` set, and a scope="all" channel has no
+    # set at all — so the ids come from youtarr, which already indexes every video it knows
+    # for a channel. Ordered newest-first by publish date where we know it (unknown dates
+    # sort last rather than jumping the queue on a 0).
+    try:
+        import youtarr
+        cands = [v if isinstance(v, str) else (v or {}).get("youtube_id") or (v or {}).get("id")
+                 for v in youtarr.channel_video_ids(entry["channelId"])]
+        cands = [v for v in cands if v]
+    except Exception:
+        cands = []
+    if not cands:
+        cands = list(popular)
+    cands.sort(key=lambda v: -(pubs.get(v) or 0))
+    out = []
+    for vid in cands:
+        if vid in have or vid in done:
+            continue
+        if scope == "popular" and popular and vid not in popular:
+            continue
+        pub = pubs.get(vid)
+        if max_age and pub and (now - pub) > max_age:
+            continue
+        out.append(vid)
+        if len(out) >= target:
+            break
+    return out
+
+
+def fetch_ahead(force=False) -> dict:
+    """Ask youtarr to download whatever the queue is short of, so the upscale stream never
+    starves waiting on youtarr's own cadence. {channel folder: [ids requested]}; {} when the
+    feature is off, rate-limited, or nothing is missing. Best-effort — never raises."""
+    global _fetch_at
+    target = _fetch_ahead_target()
+    if target <= 0:
+        return {}
+    with _FETCH_LOCK:
+        now = time.time()
+        if not force and (now - _fetch_at) < FETCH_GAP_SECONDS:
+            return {}
+        _fetch_at = now
+    import youtarr
+    asked = {}
+    for e in get_queue():
+        if e.get("paused") or not e.get("channelId"):
+            continue
+        folder = e.get("folder_name") or ""
+        try:
+            have = len([v for v in cached_videos(folder)
+                        if v.get("vid") not in get_done()]) if folder else 0
+            short = target - have
+            if short <= 0:
+                continue
+            ids = wanted_ids(e, short)
+            if ids and youtarr.download_videos(ids):
+                asked[folder or e["channelId"]] = ids
+        except Exception:
+            continue
+    return asked
+
+
 def _cap_secs():   # DEPRECATED — kept only so an old settings.json key stays readable
     import settings
     return int(settings.get_settings().get("max_youtube_minutes", 20)) * 60
