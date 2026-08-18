@@ -472,7 +472,9 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   discarding gigabytes. Because that wait can be a couple of minutes, the row says
   **running next** the moment you press it, and the pipeline card names what it is waiting
   for. Consecutive videos collapse into **one expandable slot** in the queue, so a burst of
-  them doesn't bury the shows and movies behind it.
+  them doesn't bury the shows and movies behind it. The queue always holds **ten TV
+  episodes** — movies and videos ride along between them without consuming that count, and
+  only the episodes are numbered.
 
 | Round-robin queue | Guardrails |
 |:---:|:---:|
