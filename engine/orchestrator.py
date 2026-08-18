@@ -711,6 +711,23 @@ def render_is_complete(p) -> bool:
 
 # ---- stage-done detection (resume) ---------------------------------------
 
+def topaz_is_noop(p: EpisodePaths) -> bool:
+    """True when this item's topaz stage does no upscaling work at all.
+
+    A YouTube video SKIPS Topaz outright (stages._topaz returns early — Resolve does the
+    scaling), so by the time it reaches the Resolve doorstep it has NOTHING invested and
+    must not pin the single run thread there behind the previous item's ~75-min remux. It
+    DEFERS instead, exactly like a fast-path item, so the next episode's topaz can run
+    meanwhile (see _gate_deferred / _process).
+
+    STRUCTURAL ONLY, deliberately: the selection loop calls this every iteration, and
+    plan.plan_for() shells out to an UNCACHED ffprobe (and would answer wrong anyway on a
+    source that hasn't downloaded yet). The OTHER no-op reason — a rpu-only/resolve-only
+    plan — is derived at the doorstep, where that probe is already being paid for.
+    """
+    return bool(getattr(p, "youtube", False))
+
+
 def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
     combine = getattr(p, "combine", False)   # duck-typed callers (tests) predate the field
     if stage == "download":
@@ -918,6 +935,12 @@ class Orchestrator:
                                                # meanwhile (user-dictated 2026-08-06); released the moment
                                                # the gating remux ends — the topaz then yields to them.
                                                # In-memory; self-heals like _resolve_deferred.
+        self._gate_deferred_yt = set()         # the YOUTUBE subset of the above. Only ONE video parks at
+                                               # the doorstep at a time (see _yt_parked): without that
+                                               # bound EVERY pending video would defer in turn before the
+                                               # next episode was ever reached, since youtube.next_due()
+                                               # honours the skip set. Self-prunes against _gate_deferred,
+                                               # so that set's existing clears own the reset.
         self._fail_counts = {}                 # skip-key -> consecutive genuine-failure count
         self._resolve_stall = set()            # items topaz'd but HELD before a STALLED Resolve (its update
                                                # prompt): buffered ahead down to STALL_FLOOR_GB, drained when
@@ -2440,7 +2463,12 @@ class Orchestrator:
         # The gate stays OPEN until the whole burst is served: `_yt_in_burst` counts how many
         # of this burst's videos have completed, and only the LAST one resets _tv_since_yt
         # (see _advance_cadence_at_handoff). burst=1 is the long-standing behavior exactly.
-        if yt is not None and self._tv_since_yt >= every:
+        # ...but NOT while a video is already parked at the Resolve doorstep: offering the
+        # next one would just pin the run thread on it, and the whole point of the deferral
+        # is that the next EPISODE's topaz gets to run meanwhile. Fall through to the TV
+        # rotation instead; the parked video takes first pick when the remux ends. (The two
+        # drain returns below stay unguarded — there, no TV work exists to fall through to.)
+        if yt is not None and self._tv_since_yt >= every and not self._yt_parked():
             return youtube_paths(yt["channel"], yt["video_path"], yt.get("title")), "ok"
         # Round-robin over the ACTIVE TV SERIES (one episode each in turn, looping). `_rr` advances only
         # on completion (series.advance_rotation at hand-off), so a retry re-serves the same series.
@@ -2572,6 +2600,7 @@ class Orchestrator:
                     self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
                 self._stall_probe = None                   # this IS the probe → fall through and re-test Resolve
             fast_resolve = False
+            defer_here = False
             if st == "resolve":
                 # Decided BEFORE the doorstep gate (and reused at the SIGSTOP decision):
                 # a fast-path item's Resolve may START while a remux runs — holding it at
@@ -2582,13 +2611,25 @@ class Orchestrator:
                     fast_resolve = _plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
                 except Exception:
                     pass
-            if st == "resolve" and fast_resolve and self._resolve_should_hold(fast_resolve):
+                # A YOUTUBE video's topaz was a no-op too (stages._topaz returns early —
+                # Resolve scales it), so it has nothing invested here either and defers the
+                # same way (user-caught 2026-08-18: three videos between two episodes each
+                # pinned the run thread for a whole remux while the Topaz GPU sat idle).
+                # Deliberately NOT folded into `fast_resolve`: that flag ALSO decides the
+                # SIGSTOP below, which is the separate question of whether a remux may keep
+                # running beside Resolve. Bounded to ONE parked video — youtube.next_due()
+                # honours the skip set, so an unbounded rule would defer every pending video
+                # in turn before the next episode was ever selected.
+                defer_here = fast_resolve or (topaz_is_noop(p) and not self._yt_parked())
+            if st == "resolve" and defer_here and self._resolve_should_hold(fast_resolve):
                 # A FAST-PATH item (its topaz was a no-op — nothing invested) must not
                 # idle the whole run thread behind the previous remux (user-dictated
                 # 2026-08-06): DEFER it and let the NEXT episode's topaz run meanwhile.
                 # The release preempts that topaz at its next segment boundary the moment
                 # the remux ends (see _gate_release_pending / _next_episode).
                 self._gate_deferred.add(self._skip_key(p))
+                if topaz_is_noop(p):
+                    self._gate_deferred_yt.add(self._skip_key(p))
                 self.state["current"] = None
                 self._hold("resolve-gate",
                     f"{ep_disp}: waiting for the remux to finish — the next episode "
@@ -2975,6 +3016,13 @@ class Orchestrator:
         while the remux still runs — the topaz keeps working through the wait."""
         return bool(self._gate_deferred) and not self._resolve_should_hold()
 
+    def _yt_parked(self) -> bool:
+        """True while a YouTube video is already parked at the Resolve doorstep. Self-prunes
+        against _gate_deferred so the two sets cannot drift — every existing clear of the
+        parent set (run start, gate release) implicitly clears this one too."""
+        self._gate_deferred_yt &= self._gate_deferred
+        return bool(self._gate_deferred_yt)
+
     def _dual_remux_live(self) -> bool:
         """Both remux lanes actually working right now."""
         return (self.state.get("finishing") is not None
@@ -2989,6 +3037,11 @@ class Orchestrator:
         boundary (user-caught: S08E04's topaz kept running through a dual remux because this
         selection-time gate can't see a stage that already started)."""
         if stage_done("topaz", ep):
+            return False
+        if topaz_is_noop(ep):
+            # NOTHING TO PROTECT: a YouTube video is scaled by Resolve, so holding it here
+            # waits on a remux lane for a stage it will never run. stage_done above can't
+            # see that — a YouTube item's segdir holds only scenes.json, never a manifest.
             return False
         return self._dual_remux_live() or self._drain_backlog() >= 2
 

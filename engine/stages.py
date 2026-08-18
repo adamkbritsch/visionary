@@ -706,6 +706,7 @@ def _topaz(p, abort, progress=None, should_pause=None):
         return True, pl["reason"] + " — skipping upscale" + note
     if p.youtube:
         # YOUTUBE SKIPS TOPAZ (user-dictated 2026-08-06): Resolve does the scaling
+        # (the scheduler reads this same fact via orchestrator.topaz_is_noop — keep in step)
         # instead — SuperScale 2x for 1080p sources (a scripting-API clip property, no
         # screen navigation), the 4K timeline's plain scaling otherwise. Scene-cut
         # planning still runs so the capped remux segments at real cuts.

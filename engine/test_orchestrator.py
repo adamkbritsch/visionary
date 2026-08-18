@@ -395,8 +395,10 @@ class YouTubeCadence(unittest.TestCase):
     `youtube_every_tv_episodes` TV episodes (not a round-robin peer, not a batch)."""
     VP = "/Media/YouTube-raw/Chan/Chan - T - abc/Chan - T [abc12345678].mp4"
 
-    def _decide(self, tv_since, *, yt=True, ep=True, active=("A",), every=2):
+    def _decide(self, tv_since, *, yt=True, ep=True, active=("A",), every=2, parked=False):
         o = orch.Orchestrator(); o._tv_since_yt = tv_since
+        if parked:                                    # a video already waiting at the Resolve doorstep
+            o._gate_deferred.add("parked-stem"); o._gate_deferred_yt.add("parked-stem")
         q = {"next": ({"ep": "S01E01", "source_name": SRC} if ep else None),
              "done_count": 0, "source_count": (5 if ep else 0)}
         v = {"channel": "Chan", "video_path": self.VP, "title": "T"} if yt else None
@@ -408,6 +410,9 @@ class YouTubeCadence(unittest.TestCase):
             s.enter_context(mock.patch.object(orch.series, "series_root", return_value="/Media/TV"))
             s.enter_context(mock.patch.object(orch.series, "episode_queue", return_value=q))
             s.enter_context(mock.patch.object(orch.youtube, "next_due", return_value=v))
+            if parked:      # it only STAYS parked while the gating remux is still running —
+                            # once that ends _next_episode releases it and it goes first
+                s.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=True))
             return o._next_episode()
 
     def test_tv_runs_until_cadence_reached(self):
@@ -416,6 +421,18 @@ class YouTubeCadence(unittest.TestCase):
 
     def test_youtube_fires_once_cadence_reached(self):
         p, why = self._decide(tv_since=2, every=2)         # 2 eps done → 1 YouTube video
+        self.assertEqual(why, "ok"); self.assertTrue(p.youtube)
+
+    def test_parked_video_stops_the_gate_offering_another(self):
+        # A video deferred at the doorstep means the NEXT EPISODE's topaz is what should run
+        # meanwhile — offering a second video would just pin the run thread on it again.
+        p, why = self._decide(tv_since=2, every=2, parked=True)
+        self.assertEqual(why, "ok"); self.assertFalse(p.youtube); self.assertEqual(p.ep, "S01E01")
+
+    def test_parked_video_still_drains_when_no_tv_is_ready(self):
+        # The drain path is unguarded: with no TV work to fall through to, holding the video
+        # back would idle the run thread for nothing.
+        p, why = self._decide(tv_since=2, ep=False, every=2, parked=True)
         self.assertEqual(why, "ok"); self.assertTrue(p.youtube)
 
     def test_cadence_reached_but_no_video_stays_on_tv(self):
@@ -2724,6 +2741,105 @@ class SendToVisionaryJumpsTheQueue(unittest.TestCase):
         self.assertEqual(why, "ok")
         self.assertTrue(ep.movie)
         nd.assert_called_once()
+
+
+class YouTubeDefersInsteadOfStallingTopaz(unittest.TestCase):
+    """A YouTube video skips Topaz entirely (Resolve scales it), so it has nothing invested
+    at the Resolve doorstep and must DEFER there like a fast-path item instead of pinning the
+    single run thread for the previous item's whole ~75-min remux with the GPU idle
+    (user-caught 2026-08-18: videos sitting between two episodes stalled the next episode's
+    topaz). Bounded to one parked video, so the episode is actually reached."""
+
+    VP = "/Media/YouTube-raw/Chan/Chan - T - abc/Chan - T [abc12345678].mp4"
+
+    def _video(self):
+        return orch.youtube_paths("Chan", self.VP, "T", scratch_dir="/tmp")
+
+    def _episode(self):
+        return orch.episode_paths("A", "S01E01", SRC, nas_tv_root="/Media/TV")
+
+    def _doorstep(self, o, p, plan_topaz="upscale", holds=True):
+        """Drive _process to the Resolve doorstep; return the stages it actually ran."""
+        ran = []
+        run = lambda st, *_a, **_k: ran.append(st) or (True, "ok")
+        hold = holds if isinstance(holds, list) else mock.DEFAULT
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(orch, "stage_done",
+                                               side_effect=lambda st, _p: st in ("download", "extend", "topaz")))
+            es.enter_context(mock.patch.object(orch, "apply_container", side_effect=lambda x: x))
+            es.enter_context(mock.patch.object(o, "_claim_prefetched"))
+            es.enter_context(mock.patch.object(o, "_reclaim_for_pipeline"))
+            es.enter_context(mock.patch.object(o, "_sleep"))
+            es.enter_context(mock.patch.object(orch.time, "sleep"))
+            es.enter_context(mock.patch.object(o, "_quiet_mode", return_value=False))
+            es.enter_context(mock.patch.object(o, "_suspend_remuxes"))
+            es.enter_context(mock.patch.object(o, "_resume_remuxes"))
+            if isinstance(holds, list):
+                es.enter_context(mock.patch.object(o, "_resolve_should_hold", side_effect=holds))
+            else:
+                es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=holds))
+            es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
+            import plan
+            es.enter_context(mock.patch.object(plan, "plan_for", return_value={"topaz": plan_topaz}))
+            es.enter_context(mock.patch("stages.run_stage", side_effect=run))
+            o._process(p)
+        return ran
+
+    def test_video_defers_and_frees_the_run_thread(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._video()
+        ran = self._doorstep(o, p)
+        self.assertNotIn("resolve", ran)                       # never spun on the doorstep
+        self.assertIn(o._skip_key(p), o._gate_deferred)        # parked, so the next episode runs
+        self.assertIn(o._skip_key(p), o._gate_deferred_yt)     # tracked as the ONE parked video
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
+
+    def test_ordinary_episode_still_blocks_at_the_doorstep(self):
+        # REGRESSION: an episode has ~190 GiB of topaz invested, so it must keep holding here
+        # (the remux gets the machine) rather than deferring.
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._episode()
+        ran = self._doorstep(o, p, holds=[True, False])
+        self.assertIn("resolve", ran)                          # held, then proceeded
+        self.assertEqual(o._gate_deferred, set())
+        self.assertEqual(o._gate_deferred_yt, set())
+
+    def test_only_one_video_parks_at_a_time(self):
+        # Unbounded, every pending video would defer in turn (next_due honours skip) and the
+        # episode would never be reached — the second video blocks instead.
+        o = orch.Orchestrator(); o._enabled = True
+        o._gate_deferred.add("already-parked"); o._gate_deferred_yt.add("already-parked")
+        p = self._video()
+        ran = self._doorstep(o, p, holds=[True, False])
+        self.assertNotIn(o._skip_key(p), o._gate_deferred)      # did NOT park behind the first
+        self.assertEqual(o._gate_deferred_yt, {"already-parked"})   # still exactly one
+        # It holds as an episode would, then the existing starvation guard steps it back to
+        # selection so the video parked AHEAD of it takes Resolve first — order preserved.
+        self.assertNotIn("resolve", ran)
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
+
+    def test_dual_remux_gate_ignores_a_video(self):
+        # The gate exists to stop a FRESH topaz landing on two live x265 encodes. A video has
+        # no topaz stage at all, so holding it waits on a lane for nothing.
+        o = orch.Orchestrator()
+        o.state["finishing"] = {"stage": "remux"}; o.state["finishing2"] = {"stage": "remux"}
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            self.assertFalse(o._dual_remux_pauses_topaz(self._video()))
+            self.assertTrue(o._dual_remux_pauses_topaz(self._episode()))
+
+    def test_yt_parked_self_prunes_with_the_parent_set(self):
+        o = orch.Orchestrator()
+        o._gate_deferred.add("stem"); o._gate_deferred_yt.add("stem")
+        self.assertTrue(o._yt_parked())
+        o._gate_deferred.clear()                               # the existing release path
+        self.assertFalse(o._yt_parked())                       # prunes itself — no drift
+        self.assertEqual(o._gate_deferred_yt, set())
+
+    def test_topaz_is_noop_only_for_youtube(self):
+        self.assertTrue(orch.topaz_is_noop(self._video()))
+        self.assertFalse(orch.topaz_is_noop(self._episode()))
+        self.assertFalse(orch.topaz_is_noop(
+            orch.movie_paths("M (2020).mkv", "/Media/Movies/M (2020)", "M", scratch_dir="/tmp")))
 
 
 class GateDeferralKeepsTopazBusy(unittest.TestCase):
