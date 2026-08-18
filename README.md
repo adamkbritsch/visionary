@@ -445,11 +445,14 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
 
 - **Run a video now**: any pending YouTube video can jump the whole queue from its up-next
-  row (the ↥ button) — cadence-exempt and ahead of due movies. Whatever is processing
-  **yields at its next safe boundary** and resumes afterwards: a Topaz segment boundary, so
-  at most one ~90-second segment is redone; never mid-Resolve (screen automation, not
-  resumable), and a download is left to finish rather than throwing away gigabytes. The
-  pipeline card says which of the three is happening and when the video will start.
+  row (the ↥ button) — cadence-exempt and ahead of due movies. The item processing
+  **finishes its current segment first**, exactly like a deploy does, then yields and
+  resumes afterwards — so no encoding work is thrown away. It is never cut off mid-Resolve
+  (screen automation, not resumable) and a download is left to finish rather than
+  discarding gigabytes. Because that wait can be a couple of minutes, the row says
+  **running next** the moment you press it, and the pipeline card names what it is waiting
+  for. Consecutive videos collapse into **one expandable slot** in the queue, so a burst of
+  them doesn't bury the shows and movies behind it.
 
 | Round-robin queue | Guardrails |
 |:---:|:---:|

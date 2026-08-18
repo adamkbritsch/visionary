@@ -596,3 +596,31 @@ class MediaLibrariesEndpoint(unittest.TestCase):
             roots = {k: v["roots"] for k, v in st["proposed"].items() if v.get("roots")}
             configstore.save({"media_roots": roots})
         self.assertEqual(saved["media_roots"], {"tv": ["/Media/TV-Shows"]})
+
+
+class UpNextMarksPriorityVideos(unittest.TestCase):
+    """A "run now" press only takes effect at the next Topaz segment boundary (the
+    in-flight segment finishes first — same as a deploy). That delay read as "not
+    working", so the up-next row has to SAY the video is queued to jump."""
+
+    def _run(self, prio_vids):
+        from unittest import mock
+        import movies, series, youtube
+        vids = [{"channel": "Chan", "source_name": "a [aaaaaaaaaa1].mp4",
+                 "title": "A", "vid": "aaaaaaaaaa1", "secs": 60},
+                {"channel": "Chan", "source_name": "b [aaaaaaaaaa2].mp4",
+                 "title": "B", "vid": "aaaaaaaaaa2", "secs": 60}]
+        book = [{"vid": v} for v in prio_vids]
+        with mock.patch.object(youtube, "all_pending", return_value=vids), \
+             mock.patch.object(youtube, "_priority", return_value=book), \
+             mock.patch.object(movies, "get_selected", return_value=[]), \
+             mock.patch.object(series, "get_active_series", return_value=[]), \
+             mock.patch.object(series, "get_rotation", return_value=0):
+            return [(o.get("title"), o.get("priority"))
+                    for o in server.up_next(limit=10) if o.get("kind") == "youtube"]
+
+    def test_flags_only_the_requested_video(self):
+        self.assertEqual(self._run(["aaaaaaaaaa2"]), [("A", False), ("B", True)])
+
+    def test_no_request_flags_nothing(self):
+        self.assertEqual(self._run([]), [("A", False), ("B", False)])

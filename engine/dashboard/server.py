@@ -1104,8 +1104,18 @@ def up_next(limit=10, current=None, inflight=None):
                             "title": transfer.display_name(m.get("title"))}
     ep_item = lambda e: {"kind": "episode", "ep": e.get("ep"), "series": e.get("series"),
                          "source_name": transfer.display_name(e.get("source_name"))}
+    # A video the user pressed "run now" on carries priority=True, so the row can SAY it is
+    # queued to jump. Without that the request looked inert: the pipeline only yields at the
+    # next Topaz segment boundary (deliberately — see the run-now docs), which can be a
+    # couple of minutes, and nothing in the UI acknowledged the press.
+    try:
+        import youtube as _yt
+        _prio_vids = {e.get("vid") for e in _yt._priority() if e.get("vid")}
+    except Exception:
+        _prio_vids = set()
     yt_item = lambda v: {"kind": "youtube", "channel": v.get("channel"),
-                         "name": v.get("source_name"), "title": v.get("title")}
+                         "name": v.get("source_name"), "title": v.get("title"),
+                         "priority": bool(v.get("vid") and v.get("vid") in _prio_vids)}
     out, mi, yi, ep_count = [], 0, 0, tv_since
     def _emit_yt_one():                                        # the single-video cadence insert
         nonlocal yi, ep_count

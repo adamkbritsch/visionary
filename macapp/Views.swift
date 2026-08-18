@@ -2852,8 +2852,67 @@ private struct ChannelRow: View {
     }
 }
 
+// ONE slot standing in for a run of consecutive YouTube videos. Collapsed it reads
+// "N YouTube videos" with the first title; expanded it is exactly the same rows with the
+// same per-video controls, so nothing about how they process changes.
+private struct VideoGroupRow: View {
+    let group: UpNextGroup
+    let parent: UpNextView
+    @State private var open = false
+
+    private var jumping: Int { group.items.filter { $0.priority == true }.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button { withAnimation(.easeInOut(duration: 0.15)) { open.toggle() } } label: {
+                HStack(spacing: 8) {
+                    Text("\(group.startIndex + 1)").font(.system(size: 11)).monospacedDigit()
+                        .foregroundStyle(.tertiary).frame(width: 18, alignment: .trailing)
+                    Image(systemName: "play.rectangle").font(.system(size: 11))
+                        .foregroundStyle(DS.steelDim)
+                    Text("\(group.items.count) YouTube videos")
+                        .font(.system(size: 13, weight: .medium))
+                    if jumping > 0 {
+                        Text(jumping == 1 ? "1 jumping the queue" : "\(jumping) jumping the queue")
+                            .font(.system(size: 10)).foregroundStyle(Color.brand)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                    }
+                    if !open, let first = group.items.first {
+                        Text(first.title ?? first.name ?? "").font(.system(size: 12))
+                            .foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                    Image(systemName: open ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            if open {
+                ForEach(Array(group.items.enumerated()), id: \.element.id) { off, it in
+                    HStack(spacing: 8) {
+                        Text("\(group.startIndex + off + 1)").font(.system(size: 11))
+                            .monospacedDigit().foregroundStyle(.tertiary)
+                            .frame(width: 18, alignment: .trailing)
+                        parent.row(it)
+                        Spacer()
+                        parent.controls(it, group.startIndex + off)
+                    }.font(.system(size: 13)).padding(.leading, 8)
+                }
+            }
+        }
+    }
+}
+
 // "Next up" — collapsed shows the next item; tap to expand the next ~10 that will actually
 // process (queued movies jump ahead of episodes).
+/// A run of consecutive up-next entries. A run of 2+ YouTube videos becomes ONE slot.
+struct UpNextGroup: Identifiable {
+    let startIndex: Int
+    let items: [UpNextDTO]
+    var isVideoGroup: Bool { items.count > 1 && items.allSatisfy { $0.kind == "youtube" } }
+    var id: String { "\(startIndex)|\(items.first?.id ?? "")|\(items.count)" }
+}
+
 private struct UpNextView: View {
     let items: [UpNextDTO]
     var showSeries: Bool = false        // round-robin: tag each episode with which show it's from
@@ -2880,15 +2939,22 @@ private struct UpNextView: View {
             .buttonStyle(.plain).disabled(items.count <= 1)
             if expanded {
                 // Full list in processing order. Movies (only) get controls: ↑/↓ move them
-                // anywhere — including between episodes — and × removes them.
-                ForEach(Array(items.enumerated()), id: \.element.id) { idx, it in
-                    HStack(spacing: 8) {
-                        Text("\(idx + 1)").font(.system(size: 11)).monospacedDigit()
-                            .foregroundStyle(.tertiary).frame(width: 18, alignment: .trailing)
-                        row(it)
-                        Spacer()
-                        controls(it, idx)
-                    }.font(.system(size: 13))
+                // anywhere — including between episodes — and × removes them. CONSECUTIVE
+                // YOUTUBE VIDEOS COLLAPSE into ONE slot (they arrive in bursts and used to
+                // dominate the list); the slot expands to the same rows with the same
+                // controls — purely presentational.
+                ForEach(Self.grouped(items)) { g in
+                    if g.isVideoGroup {
+                        VideoGroupRow(group: g, parent: self)
+                    } else if let it = g.items.first {
+                        HStack(spacing: 8) {
+                            Text("\(g.startIndex + 1)").font(.system(size: 11)).monospacedDigit()
+                                .foregroundStyle(.tertiary).frame(width: 18, alignment: .trailing)
+                            row(it)
+                            Spacer()
+                            controls(it, g.startIndex)
+                        }.font(.system(size: 13))
+                    }
                 }
                 if items.contains(where: { $0.kind == "movie" }) {
                     Text("Drag movies anywhere with ↑/↓ — they process in the slot you place them. × removes a movie.")
@@ -2941,11 +3007,21 @@ private struct UpNextView: View {
         } else if it.kind == "youtube" {
             // Run this one NOW: it jumps ahead of everything (cadence-exempt, ahead of due
             // movies) and the in-flight item yields at its next safe boundary.
-            iconButton("arrow.up.to.line", enabled: true,
-                       help: "Run this video now — pauses what's processing at its next "
-                           + "safe point (a Topaz segment boundary; Resolve is never cut off) "
-                           + "and resumes it afterwards") {
-                await store.runYoutubeNow(name: it.name ?? "")
+            if it.priority == true {
+                // Already queued to jump: SAY so. The pipeline only yields at the next Topaz
+                // segment boundary (deliberate — the in-flight segment finishes first), which
+                // can be a couple of minutes, and an unacknowledged press reads as broken.
+                Text("running next").font(.system(size: 10)).foregroundStyle(Color.brand)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .help("Queued to jump the queue — starts when the current segment finishes")
+            } else {
+                iconButton("arrow.up.to.line", enabled: true,
+                           help: "Run this video now — the current segment finishes first, "
+                               + "then this starts (Resolve is never cut off) and whatever "
+                               + "was running resumes afterwards") {
+                    await store.runYoutubeNow(name: it.name ?? "")
+                }
             }
             Button { confirmingVideoDelete = it } label: {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 12))
@@ -2968,6 +3044,25 @@ private struct UpNextView: View {
             }
         }
     }
+    /// Collapse runs of consecutive YouTube videos into one slot; everything else stays a
+    /// row of its own. Order is never changed — only how it is drawn.
+    static func grouped(_ items: [UpNextDTO]) -> [UpNextGroup] {
+        var out: [UpNextGroup] = []
+        var i = 0
+        while i < items.count {
+            if items[i].kind == "youtube" {
+                var j = i
+                while j < items.count && items[j].kind == "youtube" { j += 1 }
+                out.append(UpNextGroup(startIndex: i, items: Array(items[i..<j])))
+                i = j
+            } else {
+                out.append(UpNextGroup(startIndex: i, items: [items[i]]))
+                i += 1
+            }
+        }
+        return out
+    }
+
     @ViewBuilder func iconButton(_ sym: String, enabled: Bool, help: String,
                                  _ act: @escaping () async -> Void) -> some View {
         Button { Task { await act() } } label: {

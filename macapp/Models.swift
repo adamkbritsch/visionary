@@ -513,6 +513,7 @@ struct UpNextDTO: Codable, Identifiable {
     var title: String?         // movies + youtube videos
     var name: String?          // movies + youtube (basename → remove/reorder key)
     var channel: String?       // youtube: which channel
+    var priority: Bool?        // youtube: "run now" pressed — jumps the queue at the next boundary
     var id: String { [kind, series, channel, ep, title, source_name, name].compactMap { $0 }.joined(separator: "|") }
 }
 
