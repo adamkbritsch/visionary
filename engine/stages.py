@@ -1169,6 +1169,33 @@ def _remux(p, abort, progress=None, should_pause=None):
     # OFF -> None -> the boost-off bit-exact copy path remux already has.
     if lufs and p.series and not settings_mod.get_show_normalize_audio(p.series):
         lufs = None
+    # SEASON-SCOPED LOUDNESS FOR TV (user-dictated 2026-08-18). Measuring every episode on
+    # its own let two episodes of ONE season land on different gains, so the volume stepped
+    # mid-binge. A season from one source is one mastering job: its FIRST episode measures
+    # and records the gain, and every later episode from the same source reuses it. "Same
+    # source" is read off the filename, so a WEB-DL episode dropped into a BluRay season is
+    # measured on its own rather than inheriting a gain never meant for it. Movies (one item
+    # each) and YouTube (unrelated videos) keep measuring per item; the MKV path is exempt
+    # from boosting altogether, so it is not measured at all.
+    audio_gain = None
+    if lufs and not p.movie and not p.youtube and not str(p.final).lower().endswith(".mkv"):
+        import audiogain
+        gkey = audiogain.key_for(p.series, p.ep, p.source_basename)
+        if gkey:
+            audio_gain = audiogain.remembered(gkey)
+            season = audiogain.season_of(p.ep)
+            if audio_gain is None:
+                measured = remux.measure_lufs(p.source_cfr)
+                audio_gain = remux.boost_gain_db(measured, lufs)
+                # Recorded BEFORE the ~75-min remux, so a failure that retries reuses this
+                # decision instead of re-deciding from whichever episode runs next.
+                audiogain.remember(gkey, audio_gain, measured, p.source_basename, target=lufs)
+                logbook.event(f"audio {p.series} {season}: measured "
+                              f"{'?' if measured is None else round(measured, 1)} LUFS "
+                              f"-> +{audio_gain:.1f} dB (this season's decision)")
+            else:
+                logbook.event(f"audio {p.series} {season}: reusing +{audio_gain:.1f} dB "
+                              f"from the season's first episode")
     def _on_step(label, pct):
         # LABELED STEP progress for the fast (stream-copy) remuxes (user-asked): one bar
         # at a time — the current step's own percentage where a phase has a watchable
@@ -1297,7 +1324,8 @@ def _remux(p, abort, progress=None, should_pause=None):
                             should_pause=should_pause, on_repair=_on_repair)
         return _combine_result(res, combine_call["real_rpu"])
     res = remux.remux(p.dv_render, p.source_cfr, p.source, p.final,
-                      cap_mbps=cap, audio_target_lufs=lufs, boundaries=bounds, abort=abort,
+                      cap_mbps=cap, audio_target_lufs=lufs, audio_gain_db=audio_gain,
+                      boundaries=bounds, abort=abort,
                       on_progress=_prog, on_plan=_on_plan, should_pause=should_pause,
                       on_repair=_on_repair, encode_source=encode_source)
     return res.ok, res.reason

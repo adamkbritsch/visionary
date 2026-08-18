@@ -284,7 +284,8 @@ def _verify(output: str, ffprobe: str) -> RemuxResult:
 
 
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
-          cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None, boundaries=None,
+          cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
+          audio_gain_db=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
           encode_source=None, rpu_mode=None,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
@@ -363,7 +364,10 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             # SMART LOUDNESS BOOST: measure this item's integrated LUFS, gain to the target (boost-only,
             # limiter-capped). Validated on the cheap tracks file BEFORE the mux — a bad landing falls
             # back to a bit-exact copy of the original audio (never fails the 75-min x265 pass over audio).
-            gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
+            # `audio_gain_db` = a gain already decided for this item (TV: the SEASON's, set
+            # by its first episode — see audiogain). Only measure when nobody decided for us.
+            gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
+                    else boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs))
             tracks = output + ".tracks.mp4"   # temp, next to output (on scratch)
             subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):

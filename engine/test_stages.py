@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import audiogain
 import stages
 from orchestrator import episode_paths
 
@@ -10,6 +11,24 @@ from orchestrator import episode_paths
 def _paths(scratch):
     return episode_paths("Show", "S01E01", "ep (Extended Cut).mp4",
                          scratch_dir=scratch, nas_tv_root="/Media/TV-Shows")
+
+
+_BOOK_PATCH = None
+
+
+def setUpModule():
+    """_remux records the season's loudness decision. Redirect that book to a throwaway
+    path for the whole module — a test run must never write into ~/.topaz-pipeline."""
+    global _BOOK_PATCH
+    import tempfile as _tf, os as _os
+    _BOOK_PATCH = mock.patch.object(audiogain, "BOOK_FILE",
+                                    _os.path.join(_tf.mkdtemp(), "audio_gain.json"))
+    _BOOK_PATCH.start()
+
+
+def tearDownModule():
+    if _BOOK_PATCH is not None:
+        _BOOK_PATCH.stop()
 
 
 class Cleanup(unittest.TestCase):
@@ -67,7 +86,7 @@ class RemuxProgress(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         emitted = []
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None, audio_gain_db=None):
             on_plan([100, 200, 300], 300)      # 3 segments ending at 100/200/300 of 300 frames
             on_progress(0, 300)                # nothing done
             on_progress(150, 300)              # into segment 2 → 1 done
@@ -103,7 +122,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None, audio_gain_db=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[137, 402, 1000]), \
@@ -118,7 +137,7 @@ class TopazSegBounds(unittest.TestCase):
         import types, remux, settings
         p = _paths(tempfile.mkdtemp())
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None, audio_gain_db=None):
             got["b"] = boundaries
             return types.SimpleNamespace(ok=True, reason="ok")
         with mock.patch.object(stages, "_read_topaz_bounds", return_value=[]), \
@@ -187,7 +206,7 @@ class NormalizeAudioGate(unittest.TestCase):
     def _lufs_reaching_remux(self, p, *, per_item, target=-16):
         import types, remux, settings
         got = {}
-        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None):
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort, on_progress, on_plan, should_pause=None, on_repair=None, encode_source=None, audio_gain_db=None):
             got["lufs"] = audio_target_lufs
             return types.SimpleNamespace(ok=True, reason="ok")
         # A YouTube item tries the SHIP path first; send it to the capped path so the
@@ -973,7 +992,7 @@ class RepairProgressPlumbing(unittest.TestCase):
         emitted = []
         def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort,
                        on_progress, on_plan, should_pause=None, on_repair=None,
-                       encode_source=None):
+                       encode_source=None, audio_gain_db=None):
             on_plan([100, 200, 300], 300)
             on_progress(300, 300)                          # main encode done → bar at 100%
             on_repair(1, 2, 1, 0, 100)                     # re-capping segment index 1 (of 2 flagged)
@@ -1923,3 +1942,102 @@ class MezzaninePlansFromExactFrames(unittest.TestCase):
         self.assertTrue(exact.called)
         self.assertEqual(seen.get("frames"), 138196)   # the real count, not 138205
         est.assert_not_called()
+
+
+class SeasonScopedLoudness(unittest.TestCase):
+    """A season from one source is ONE mastering job: its FIRST episode measures the gain and
+    every later episode from the same source reuses it, so the volume can't step mid-binge.
+    A filename that clearly indicates a different master is measured on its own."""
+
+    BLURAY = "Lost (2004) - S04E%02d - Ep (1080p BluRay x265 Silence).mkv"
+    WEBDL = "Lost (2004) - S04E%02d - Ep (1080p WEB-DL DDP5.1 H.264-NTb).mkv"
+
+    def setUp(self):
+        import tempfile as _tf, os as _os
+        p = mock.patch.object(audiogain, "BOOK_FILE",
+                              _os.path.join(_tf.mkdtemp(), "b.json"))
+        p.start(); self.addCleanup(p.stop)      # each test starts from an empty book
+
+    def _run(self, ep, name, measured=-20.0, series="Lost (2004)"):
+        import types, remux, settings
+        p = episode_paths(series, ep, name.replace(".mkv", ".mp4"),
+                          scratch_dir=tempfile.mkdtemp(), nas_tv_root="/Media/TV-Shows")
+        seen = {}
+
+        def fake_remux(dv, cfr, orig, out, *, audio_gain_db=None, **kw):
+            seen["gain"] = audio_gain_db
+            return types.SimpleNamespace(ok=True, reason="ok")
+
+        with mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(remux, "measure_lufs", return_value=measured) as m, \
+             mock.patch.object(settings, "get_show_normalize_audio", return_value=True), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: None)
+        seen["ok"], seen["measured_times"] = ok, m.call_count
+        return seen
+
+    def test_first_episode_measures_and_the_next_reuses_it(self):
+        a = self._run("S04E01", self.BLURAY % 1, measured=-20.0)
+        self.assertTrue(a["ok"])
+        self.assertEqual(a["gain"], 4.0)              # -16 target from -20 measured
+        self.assertEqual(a["measured_times"], 1)
+        # a LOUDER second episode must still ship the season's gain, not its own
+        b = self._run("S04E02", self.BLURAY % 2, measured=-25.0)
+        self.assertEqual(b["gain"], 4.0)              # NOT 9.0
+        self.assertEqual(b["measured_times"], 0)      # and it didn't re-measure
+
+    def test_a_different_master_in_the_season_is_measured_on_its_own(self):
+        self._run("S04E01", self.BLURAY % 1, measured=-20.0)
+        web = self._run("S04E03", self.WEBDL % 3, measured=-25.0)
+        self.assertEqual(web["gain"], 9.0)            # its own measurement, not the BluRay 4.0
+        self.assertEqual(web["measured_times"], 1)
+
+    def test_the_next_season_decides_for_itself(self):
+        self._run("S04E01", self.BLURAY % 1, measured=-20.0)
+        s5 = self._run("S05E01", self.BLURAY % 1, measured=-25.0)
+        self.assertEqual(s5["gain"], 9.0)
+        self.assertEqual(s5["measured_times"], 1)
+
+    def test_movies_and_youtube_still_measure_per_item(self):
+        # no season -> no key -> stages passes None and remux measures for itself, as before
+        import types, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        p.movie, p.series = True, "Some Movie (2024)"
+        seen = {}
+
+        def fake_remux(dv, cfr, orig, out, *, audio_gain_db=None, **kw):
+            seen["gain"] = audio_gain_db
+            return types.SimpleNamespace(ok=True, reason="ok")
+
+        with mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(remux, "measure_lufs", return_value=-20.0) as m, \
+             mock.patch.object(settings, "get_show_normalize_audio", return_value=True), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: None)
+        self.assertTrue(ok)
+        self.assertIsNone(seen["gain"])               # remux decides, exactly as before
+        self.assertEqual(m.call_count, 0)             # and stages never measured
+
+    def test_normalize_off_skips_the_whole_thing(self):
+        import types, remux, settings
+        p = episode_paths("Lost (2004)", "S04E01", (self.BLURAY % 1).replace(".mkv", ".mp4"),
+                          scratch_dir=tempfile.mkdtemp(), nas_tv_root="/Media/TV-Shows")
+        seen = {}
+
+        def fake_remux(dv, cfr, orig, out, *, audio_target_lufs, audio_gain_db=None, **kw):
+            seen["lufs"], seen["gain"] = audio_target_lufs, audio_gain_db
+            return types.SimpleNamespace(ok=True, reason="ok")
+
+        with mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(remux, "measure_lufs", return_value=-20.0) as m, \
+             mock.patch.object(settings, "get_show_normalize_audio", return_value=False), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: None)
+        self.assertTrue(ok)
+        self.assertIsNone(seen["lufs"])               # the per-show gate still wins
+        self.assertIsNone(seen["gain"])
+        self.assertEqual(m.call_count, 0)             # nothing measured, nothing recorded
+        self.assertEqual(audiogain.view(), [])
