@@ -187,7 +187,7 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 </section>
 
 <section class="sec" id="laneSec" style="display:none">
-  <p class="lbl">Finishing</p>
+  <p class="lbl">Also running</p>
   <div class="panel well rows" id="lanes"></div>
 </section>
 
@@ -226,6 +226,31 @@ function itemName(o){
   var ep = o.ep || "", se = o.series || "";
   return se && ep ? se + " — " + ep : (ep || se || o.title || o.name || "item");
 }
+/* Everything currently tracked, ranked by how far through the WHOLE pipeline it is —
+   stage position first, then progress within that stage. An item in `upload` is closer to
+   landing than one at 60% of `topaz`, so it is the one worth showing big (user-dictated). */
+function pipelineItems(o){
+  var out = [], p = o.progress || {};
+  if (o.current){
+    out.push({o: o.current, stage: o.stage || "",
+              pct: (p.stage === o.stage && p.pct !== undefined) ? p.pct : null,
+              notches: (p.stage === o.stage) ? (p.notches || []) : []});
+  }
+  [o.finishing, o.finishing2].forEach(function(f){
+    if (!f) return;
+    out.push({o: {kind: f.youtube ? "youtube" : f.movie ? "movie" : "episode",
+                  ep: f.ep, series: f.series, title: f.title, name: f.source},
+              stage: f.stage || "", pct: (f.pct === undefined ? null : f.pct),
+              notches: f.notches || []});
+  });
+  out.forEach(function(c){
+    var i = ALL.indexOf(c.stage);
+    c.rank = i < 0 ? -1 : i + (c.pct === null ? 0 : Math.max(0, Math.min(100, c.pct)) / 100);
+  });
+  out.sort(function(a, b){ return b.rank - a.rank; });   /* nearest the finish first */
+  return out;
+}
+
 function iconFor(kind){
   return kind === "youtube" ? "#i-play" : kind === "movie" ? "#i-film" : "#i-tv";
 }
@@ -249,20 +274,23 @@ function render(d){
   arm.className = "btn" + (armed ? " lit" : "");
   txt(arm, armed ? "Deactivate" : "Activate");
 
-  /* ---- now ----------------------------------------------------------- */
-  var stage = o.stage || "";
-  var pct = (p.pct !== null && p.pct !== undefined && p.stage === stage) ? p.pct : null;
-  txt($("nowTtl"), cur ? itemName(cur) : (armed ? "Waiting for work" : "Not activated"));
+  /* ---- now: whichever tracked item is CLOSEST TO DONE ------------------ */
+  var items = pipelineItems(o), lead = items[0] || null;
+  var stage = lead ? lead.stage : "";
+  var pct = lead ? lead.pct : null;
+  txt($("nowTtl"), lead ? itemName(lead.o) : (armed ? "Waiting for work" : "Not activated"));
   var sub = (o.message || "").trim();
   if (hold) sub = ((o.hold || {}).msg || hold);
-  txt($("nowSub"), sub || (cur ? (stage || "—") : "—"));
+  /* the leader may be a finisher item, whose stage the run-thread message doesn't describe */
+  if (lead && lead.o !== cur) sub = itemName(lead.o) + ": " + (stage || "finishing");
+  txt($("nowSub"), sub || (lead ? (stage || "—") : "—"));
   txt($("nowPct"), pct === null ? "" : Math.round(pct) + "%");
-  $("nowSec").classList.toggle("off", !cur);
+  $("nowSec").classList.toggle("off", !lead);
 
   var bar = $("nowBar"), fill = bar.firstElementChild;
   fill.style.width = (pct === null ? 0 : Math.max(0, Math.min(100, pct))) + "%";
   /* scene-cut boundaries, exactly as the app ticks its own bar */
-  var want = (p.notches && p.stage === stage) ? p.notches : [];
+  var want = (lead && lead.notches) ? lead.notches : [];
   var have = bar.querySelectorAll("u");
   if (have.length !== want.length){
     for (var h = 0; h < have.length; h++) have[h].remove();
@@ -274,6 +302,7 @@ function render(d){
   }
 
   var st = $("stages"), at = ALL.indexOf(stage);
+  var haveLead = !!lead;
   if (st.children.length !== ALL.length){
     st.innerHTML = "";
     ALL.forEach(function(s){
@@ -283,21 +312,19 @@ function render(d){
   }
   for (var i = 0; i < ALL.length; i++){
     var cls = "stage";
-    if (cur && at >= 0){ if (i === at) cls += " on"; else if (i < at) cls += " done"; }
+    if (haveLead && at >= 0){ if (i === at) cls += " on"; else if (i < at) cls += " done"; }
     st.children[i].className = cls;
   }
 
-  /* ---- finisher lanes ------------------------------------------------ */
-  var lanes = [o.finishing, o.finishing2].filter(Boolean);
-  $("laneSec").style.display = lanes.length ? "" : "none";
-  if (lanes.length){
-    $("lanes").innerHTML = lanes.map(function(f){
-      var nm = itemName({kind: f.youtube ? "youtube" : f.movie ? "movie" : "episode",
-                         ep: f.ep, series: f.series, title: f.title, name: f.source});
-      var pc = (f.pct === null || f.pct === undefined) ? "" : Math.round(f.pct) + "%";
-      return '<div class="row"><svg class="ic"><use href="' + iconFor(f.youtube ? "youtube" : "episode") +
-             '"/></svg><span class="t">' + esc(nm) + '</span>' +
-             '<span class="pill dim">' + esc(f.stage || "") + '</span>' +
+  /* ---- everything else in flight, behind the leader -------------------- */
+  var rest = items.slice(1);
+  $("laneSec").style.display = rest.length ? "" : "none";
+  if (rest.length){
+    $("lanes").innerHTML = rest.map(function(c){
+      var pc = (c.pct === null) ? "" : Math.round(c.pct) + "%";
+      return '<div class="row"><svg class="ic"><use href="' + iconFor(c.o.kind) +
+             '"/></svg><span class="t">' + esc(itemName(c.o)) + '</span>' +
+             '<span class="pill dim">' + esc(c.stage || "") + '</span>' +
              '<span class="mono" style="color:var(--steel)">' + pc + '</span></div>';
     }).join("");
   }
