@@ -17,7 +17,8 @@ final class FirstMouseButton: NSButton {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+                         NSMenuDelegate, NSMenuItemValidation {
     var window: NSWindow!
     var server: Process?
     let store = AppStore()
@@ -108,40 +109,273 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         server = p
     }
 
+    // ---- menu bar -------------------------------------------------------
+    // Hand-built AppKit menus: there is no SwiftUI `Scene`/`.commands` here (the app boots
+    // through NSApplication.run() at the bottom of this file), and AppDelegate already holds
+    // the one AppStore, so menu items reach every action directly.
+    //
+    // The EDIT MENU IS LOAD-BEARING, not decoration: an app that installs its own
+    // NSApp.mainMenu dispatches ⌘X/⌘C/⌘V/⌘A/⌘Z through the main menu's key equivalents, so
+    // without these items PASTE DOES NOT WORK IN ANY TEXT FIELD (user-caught 2026-08-18 —
+    // the YouTube "paste a link" box is paste-first by design). Their target stays nil so
+    // AppKit routes them down the responder chain to the focused field editor; giving them a
+    // target would silently break them again.
+
+    // Items whose title/state follow the live pipeline (refreshed in menuNeedsUpdate).
+    private var runToggleItem: NSMenuItem?
+    private var skipVideoItem: NSMenuItem?
+    private var screenResumeItem: NSMenuItem?
+    private var modeItems: [String: NSMenuItem] = [:]
+
+    @discardableResult
+    private func add(_ menu: NSMenu, _ title: String, _ action: Selector?, _ key: String = "",
+                     _ mods: NSEvent.ModifierFlags = [.command],
+                     target: AnyObject? = nil, tag: Int = 0) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        if !key.isEmpty { it.keyEquivalentModifierMask = mods }
+        it.target = target                     // nil = responder chain (Edit, Hide, window ops)
+        it.tag = tag
+        menu.addItem(it)
+        return it
+    }
+
+    private func submenu(_ menu: NSMenu, in parent: NSMenu) {
+        let item = NSMenuItem(title: menu.title, action: nil, keyEquivalent: "")
+        item.submenu = menu
+        parent.addItem(item)
+    }
+
     func buildMenu() {
         let main = NSMenu()
+        let app = appMenu(), edit = editMenu(), view = viewMenu()
+        let run = runMenu(), win = windowMenu(), help = helpMenu()
+        for m in [app, edit, view, run, win, help] { submenu(m, in: main) }
 
-        let appItem = NSMenuItem(); main.addItem(appItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About Visionary",
-                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide Visionary",
-                        action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "Close to Dock",
-                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        appItem.submenu = appMenu
-
-        let runItem = NSMenuItem(); main.addItem(runItem)
-        let runMenu = NSMenu(title: "Run")
-        let toggle = NSMenuItem(title: "Activate / Deactivate", action: #selector(toggleRun), keyEquivalent: "r")
-        toggle.target = self; runMenu.addItem(toggle)
-        let refresh = NSMenuItem(title: "Refresh now", action: #selector(refreshNow), keyEquivalent: "")
-        refresh.target = self; runMenu.addItem(refresh)
-        runItem.submenu = runMenu
-
-        let winItem = NSMenuItem(); main.addItem(winItem)
-        let winMenu = NSMenu(title: "Window")
-        winMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        winMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        winItem.submenu = winMenu
+        // Live menus ask us for fresh titles as they open — far cheaper than redrawing them
+        // from the 1.5 s poll sink, which would churn menus nobody is looking at.
+        view.delegate = self
+        run.delegate = self
 
         NSApp.mainMenu = main
-        NSApp.windowsMenu = winMenu
+        NSApp.windowsMenu = win
+        NSApp.helpMenu = help
+    }
+
+    private func appMenu() -> NSMenu {
+        let m = NSMenu(title: "Visionary")
+        m.addItem(withTitle: "About Visionary",
+                  action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        m.addItem(.separator())
+        add(m, "Settings\u{2026}", #selector(openSettings), ",", target: self)
+        add(m, "Setup\u{2026}", #selector(openSetup), ",", [.command, .shift], target: self)
+        m.addItem(.separator())
+        let services = NSMenu(title: "Services")
+        submenu(services, in: m)
+        NSApp.servicesMenu = services
+        m.addItem(.separator())
+        add(m, "Hide Visionary", #selector(NSApplication.hide(_:)), "h")
+        add(m, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
+        add(m, "Show All", #selector(NSApplication.unhideAllApplications(_:)))
+        m.addItem(.separator())
+        // ⌘Q is deliberately NOT quit — applicationShouldTerminate turns a plain user quit
+        // into a minimize (a logout/shutdown still passes through). The appliance keeps running.
+        add(m, "Close to Dock", #selector(NSApplication.terminate(_:)), "q")
+        return m
+    }
+
+    private func editMenu() -> NSMenu {
+        let m = NSMenu(title: "Edit")
+        add(m, "Undo", Selector(("undo:")), "z")            // no public selector for these two
+        add(m, "Redo", Selector(("redo:")), "z", [.command, .shift])
+        m.addItem(.separator())
+        add(m, "Cut", #selector(NSText.cut(_:)), "x")
+        add(m, "Copy", #selector(NSText.copy(_:)), "c")
+        add(m, "Paste", #selector(NSText.paste(_:)), "v")
+        add(m, "Delete", #selector(NSText.delete(_:)))
+        m.addItem(.separator())
+        add(m, "Select All", #selector(NSText.selectAll(_:)), "a")
+        return m
+    }
+
+    private func viewMenu() -> NSMenu {
+        let m = NSMenu(title: "View")
+        // Same order as the in-window ModeNavBar, so ⌘1/2/3 match left-to-right.
+        modeItems["tv"] = add(m, "TV Shows", #selector(showTV), "1", target: self)
+        modeItems["youtube"] = add(m, "YouTube", #selector(showYouTube), "2", target: self)
+        modeItems["movie"] = add(m, "Movies", #selector(showMovies), "3", target: self)
+        m.addItem(.separator())
+        add(m, "Refresh Now", #selector(refreshNow), "r", [.command, .shift], target: self)
+        add(m, "Rescan Plex Libraries", #selector(rescanLibraries), "", target: self)
+        return m
+    }
+
+    private func runMenu() -> NSMenu {
+        let m = NSMenu(title: "Run")
+        // Title is replaced with the honest single verb on open (Activate / Deactivate).
+        runToggleItem = add(m, "Activate", #selector(toggleRun), "r", target: self)
+        m.addItem(.separator())
+        skipVideoItem = add(m, "Skip Current Video", #selector(skipCurrentVideo), "", target: self)
+        add(m, "Import YouTube Link from Clipboard", #selector(importFromClipboard),
+            "v", [.command, .shift], target: self)
+        m.addItem(.separator())
+        let sc = NSMenu(title: "Screen Control")
+        for (label, secs) in [("Pause 30 Minutes", 1800), ("Pause 1 Hour", 3600),
+                              ("Pause 2 Hours", 7200), ("Pause 4 Hours", 14400)] {
+            add(sc, label, #selector(pauseScreen(_:)), "", target: self, tag: secs)
+        }
+        sc.addItem(.separator())
+        screenResumeItem = add(sc, "Resume Now", #selector(resumeScreen), "", target: self)
+        submenu(sc, in: m)
+        m.addItem(.separator())
+        add(m, "Re-check Setup", #selector(recheckSetupNow), "", target: self)
+        return m
+    }
+
+    private func windowMenu() -> NSMenu {
+        let m = NSMenu(title: "Window")
+        add(m, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
+        add(m, "Close", #selector(NSWindow.performClose(_:)), "w")     // → minimize, see windowShouldClose
+        m.addItem(.separator())
+        add(m, "Bring All to Front", #selector(NSApplication.arrangeInFront(_:)))
+        return m
+    }
+
+    private func helpMenu() -> NSMenu {
+        let m = NSMenu(title: "Help")
+        add(m, "Open Dashboard in Browser", #selector(openDashboard), "", target: self)
+        m.addItem(.separator())
+        add(m, "Reveal Log in Finder", #selector(revealLog), "", target: self)
+        add(m, "Reveal Scratch Folder in Finder", #selector(revealScratch), "", target: self)
+        add(m, "Reveal Config Folder in Finder", #selector(revealConfig), "", target: self)
+        return m
+    }
+
+    // ---- live menu state -------------------------------------------------
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        switch menu.title {
+        case "View":
+            let mode = store.mode
+            for (key, item) in modeItems { item.state = (key == mode) ? .on : .off }
+        case "Run":
+            runToggleItem?.title = store.activated ? "Deactivate" : "Activate"
+            if let v = skippableVideo() {
+                skipVideoItem?.title = "Skip \u{201C}\(v.label)\u{201D}"
+            } else {
+                skipVideoItem?.title = "Skip Current Video"
+            }
+            screenResumeItem?.isHidden = (store.quietUntil == nil)
+        default:
+            break
+        }
+    }
+
+    /// The in-flight item IF it is a YouTube video — the only thing the pipeline can skip
+    /// (there is no per-item abort for TV or movies; those need Deactivate). Mirrors the
+    /// `skippable` rule the Pipeline card uses for its own skip button.
+    private func skippableVideo() -> (label: String, name: String, channel: String?)? {
+        guard store.state?.orchestrator?.running == true,
+              let cur = store.state?.orchestrator?.current,
+              cur.kind == "youtube",
+              let name = cur.name, !name.isEmpty else { return nil }
+        return (cur.title ?? name, name, cur.channel)
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(skipCurrentVideo) { return skippableVideo() != nil }
+        if item.action == #selector(resumeScreen) { return store.quietUntil != nil }
+        return true
+    }
+
+    // ---- menu actions ----------------------------------------------------
+
+    /// Every command that shows something must first bring the window back: the appliance
+    /// spends most of its life minimized, and Settings is a POPOVER anchored to the header
+    /// gear — setting its flag against a hidden window would do nothing visible.
+    private func revealWindow() {
+        guard let w = window else { return }
+        if w.isMiniaturized { w.deminiaturize(nil) }
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc func toggleRun() { Task { await store.toggleAutomation() } }
     @objc func refreshNow() { Task { await store.refresh() } }
+    @objc func rescanLibraries() { Task { await store.refreshLibrary() } }
+    @objc func recheckSetupNow() { revealWindow(); Task { await store.recheckSetup() } }
+
+    @objc func showTV() { switchMode("tv") }
+    @objc func showYouTube() { switchMode("youtube") }
+    @objc func showMovies() { switchMode("movie") }
+    private func switchMode(_ m: String) { revealWindow(); Task { await store.setMode(m) } }
+
+    @objc func openSettings() { revealWindow(); store.showSettings = true }
+    @objc func openSetup() { revealWindow(); store.revealSetup = true; store.showSettings = true }
+
+    @objc func pauseScreen(_ sender: NSMenuItem) {
+        Task { await store.pauseScreenControl(seconds: sender.tag) }
+    }
+    @objc func resumeScreen() { Task { await store.resumeScreenControl() } }
+
+    /// Deletes the download and tells youtarr to forget it, so it confirms first — the
+    /// in-window button already does, and a menu item must not be the one unguarded path
+    /// to a destructive action.
+    @objc func skipCurrentVideo() {
+        guard let v = skippableVideo() else { NSSound.beep(); return }
+        revealWindow()
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Skip this video?"
+        a.informativeText = "\u{201C}\(v.label)\u{201D} will be deleted from staging, and youtarr "
+            + "will be told not to download it again."
+        a.addButton(withTitle: "Skip and Delete")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        Task { await store.deleteYoutubeVideo(channel: v.channel, name: v.name) }
+    }
+
+    /// The one genuinely menu-native command: copy a link in a browser, ⇧⌘V, done. It hands
+    /// the URL to the YouTube tab's existing import field rather than building a second
+    /// import path, so the resolve → confirm flow is exactly the one already shipped.
+    @objc func importFromClipboard() {
+        let text = NSPasteboard.general.string(forType: .string)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { NSSound.beep(); return }
+        revealWindow()
+        store.pendingImportURL = text
+        Task { await store.setMode("youtube") }
+    }
+
+    @objc func openDashboard() {
+        if let u = URL(string: "http://127.0.0.1:8765") { NSWorkspace.shared.open(u) }
+    }
+    @objc func revealLog() { reveal("~/.topaz-pipeline/logs/upscaler.log") }
+    @objc func revealConfig() { reveal("~/.topaz-pipeline") }
+    @objc func revealScratch() {
+        reveal(store.state?.scratch?.path ?? "~/topaz-scratch")
+    }
+
+    /// Select the path in Finder, falling back to its parent folder so the item never
+    /// silently does nothing when a file hasn't been created yet.
+    private func reveal(_ path: String) {
+        let p = NSString(string: path).expandingTildeInPath
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: p, isDirectory: &isDir) {
+            if isDir.boolValue {
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: p)
+            } else {
+                NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "")
+            }
+            return
+        }
+        let parent = (p as NSString).deletingLastPathComponent
+        if fm.fileExists(atPath: parent) {
+            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: parent)
+        } else {
+            NSSound.beep()
+        }
+    }
 
     // ---- appliance lifecycle: open at login, never fully closes ----
 

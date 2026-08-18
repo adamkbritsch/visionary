@@ -2636,6 +2636,15 @@ private struct LinkImportRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .onChange(of: store.pendingImportURL) { pasted in
+            // Menu bar -> "Import YouTube Link from Clipboard". Fill this field and run the
+            // SAME resolve -> confirm flow a typed link takes, so there is only ever one
+            // import path (and the ambiguous case still asks).
+            guard let pasted, !pasted.isEmpty else { return }
+            url = pasted
+            store.pendingImportURL = nil
+            Task { await resolve() }
+        }
     }
 
     @ViewBuilder

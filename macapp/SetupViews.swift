@@ -92,6 +92,11 @@ struct SetupSection: View {
         .onChange(of: complete) { done in
             if done { expanded = false }                          // collapse on the green flip
         }
+        .onChange(of: store.revealSetup) { want in
+            // The menu bar's "Setup…" asked for this group specifically. Additive: the
+            // auto-open-until-healthy seeding above still owns the first-run case.
+            if want { expanded = true; store.revealSetup = false }
+        }
     }
 }
 

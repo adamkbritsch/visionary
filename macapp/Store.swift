@@ -38,6 +38,11 @@ final class AppStore: ObservableObject {
     // can open Settings programmatically; the setup payloads are fetched on demand
     // (popover open), never on the poll — /api/config stays off the state broadcast.
     @Published var showSettings = false
+    // Menu-bar entry points. "Setup…" opens Settings AND expands the Setup group inside it;
+    // "Import YouTube Link from Clipboard" hands a URL to the YouTube tab's existing import
+    // field rather than duplicating the resolve → confirm flow.
+    @Published var revealSetup = false
+    @Published var pendingImportURL: String? = nil
     @Published var lastError: String? = nil       // the app's first real error surface
     @Published var preflight: PreflightDTO?
     @Published var configDTO: ConfigDTO?
