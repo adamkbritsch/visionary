@@ -2,10 +2,25 @@
   <img src="docs/assets/visionary-lockup-v5.png" alt="Visionary" width="340">
 </p>
 
-**An overnight appliance that upscales your TV library to 4K Dolby Vision.**
-Optional AI border extension for 4:3 shows → Topaz Video AI → DaVinci Resolve (real Dolby
-Vision 8.1, not a tone-map) → peak-capped x265 remux → straight back into your NAS's Plex
-library, replacing the 1080p original. Arm it in the evening; wake up to finished episodes.
+**An overnight appliance that upscales your Plex library to 4K Dolby Vision — unattended.**
+
+Point Visionary at your TV shows, movies and YouTube channels, arm it, and walk away. It
+takes each one through Topaz Video AI, grades a **real Dolby Vision 8.1 master in DaVinci
+Resolve** — an actual per-shot DV grade, not an HDR tone-map — encodes a peak-capped x265,
+and files it back into your library in place of the 1080p original (or beside it, your
+call). Then it starts the next one. It stays out of your way while you're watching Plex,
+refuses to run on a machine that can't sustain the power draw, and picks up mid-episode
+after a restart without redoing finished work.
+
+The Dolby Vision step is the one that normally can't be automated at all. Resolve's
+*Analyze All Shots* cannot be driven by script, so Visionary clicks it — by matching a
+picture of the button against the live screen. That is why it pins exact Resolve and Topaz
+builds and asks for a Retina display, and it is what separates the output from the usual
+"HDR-ish" upscale.
+
+Optionally, AI border extension fills 4:3 shows out to 16:9 before upscaling.
+
+Arm it in the evening; wake up to finished episodes.
 
 <p align="center">
   <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one in Topaz while the previous one remuxes" width="820">
