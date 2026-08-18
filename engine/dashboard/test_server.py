@@ -626,23 +626,24 @@ class UpNextMarksPriorityVideos(unittest.TestCase):
         self.assertEqual(self._run([]), [("A", False), ("B", False)])
 
 
-class UpNextLimitCountsSlots(unittest.TestCase):
-    """The app collapses a run of consecutive YouTube videos into ONE expandable slot, so
-    `limit` has to count slots as drawn — counting raw entries made the list visibly short
-    (a burst of videos ate the budget and only a few rows appeared)."""
+class UpNextKeepsTenEpisodes(unittest.TestCase):
+    """`limit` counts TV EPISODES (user-dictated): the queue always shows ten episodes of
+    actual show, with movies and videos riding along BETWEEN them rather than consuming the
+    budget. Counting entries — or drawn slots — let a burst of videos eat the list."""
 
-    def _run(self, n_eps, n_videos, every=1, burst=1, limit=10):
+    def _run(self, n_eps, n_videos, n_movies=0, every=1, burst=1, limit=10):
         from unittest import mock
         import movies, series, settings, youtube
         eps = [{"ep": f"S01E{i:02d}", "source_name": f"e{i}.mkv"} for i in range(1, n_eps + 1)]
         vids = [{"channel": "Chan", "source_name": f"v{i} [aaaaaaaaa{i:02d}].mp4",
                  "title": f"V{i}", "vid": f"aaaaaaaaa{i:02d}", "secs": 60}
                 for i in range(1, n_videos + 1)]
+        mvs = [{"name": f"m{i}.mkv", "title": f"M{i}", "pos": i} for i in range(n_movies)]
         st = dict(settings.DEFAULT_SETTINGS)
         st.update({"youtube_every_tv_episodes": every, "youtube_videos_per_burst": burst})
         with mock.patch.object(youtube, "all_pending", return_value=vids), \
              mock.patch.object(youtube, "_priority", return_value=[]), \
-             mock.patch.object(movies, "get_selected", return_value=[]), \
+             mock.patch.object(movies, "get_selected", return_value=mvs), \
              mock.patch.object(series, "get_active_series", return_value=["show"]), \
              mock.patch.object(series, "get_rotation", return_value=0), \
              mock.patch.object(series, "cached_queue", return_value={"remaining_items": eps}), \
@@ -650,27 +651,27 @@ class UpNextLimitCountsSlots(unittest.TestCase):
             return server.up_next(limit=limit)
 
     @staticmethod
-    def _slots(out):
-        n = 0
-        for i, o in enumerate(out):
-            if o.get("kind") == "youtube" and i and out[i - 1].get("kind") == "youtube":
-                continue
-            n += 1
-        return n
+    def _eps(out):
+        return sum(1 for o in out if o.get("kind") == "episode")
 
-    def test_alternating_still_yields_ten_slots(self):
-        out = self._run(20, 20)
-        self.assertEqual(self._slots(out), 10)
+    def test_ten_episodes_even_with_a_video_between_each(self):
+        out = self._run(30, 30)
+        self.assertEqual(self._eps(out), 10)
+        self.assertGreater(len(out), 10)          # videos ride along, uncounted
 
-    def test_a_burst_of_videos_counts_as_one_slot_so_more_items_come_through(self):
-        # 3 videos per episode: each burst is ONE slot, so the list must reach further
-        # into the queue than 10 raw entries would.
-        out = self._run(20, 30, every=1, burst=3)
-        self.assertEqual(self._slots(out), 10)
-        self.assertGreater(len(out), 10)          # more entries than slots — the point
-        self.assertGreaterEqual(sum(1 for o in out if o.get("kind") == "episode"), 4)
+    def test_bursts_of_videos_do_not_eat_the_episode_budget(self):
+        out = self._run(30, 60, every=1, burst=3)
+        self.assertEqual(self._eps(out), 10)
+
+    def test_movies_do_not_eat_the_episode_budget_either(self):
+        out = self._run(30, 0, n_movies=4)
+        self.assertEqual(self._eps(out), 10)
+        self.assertEqual(sum(1 for o in out if o.get("kind") == "movie"), 4)
+
+    def test_fewer_episodes_available_returns_what_exists(self):
+        out = self._run(3, 5)
+        self.assertEqual(self._eps(out), 3)
 
     def test_a_long_video_tail_cannot_blow_up_the_payload(self):
-        # TV exhausted with a big backlog: one giant run must not return everything.
         out = self._run(0, 500, every=1, burst=1)
-        self.assertLessEqual(len(out), 60)
+        self.assertLessEqual(len(out), 80)

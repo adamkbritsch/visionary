@@ -1131,21 +1131,15 @@ def up_next(limit=10, current=None, inflight=None):
                          "name": v.get("source_name"), "title": v.get("title"),
                          "priority": bool(v.get("vid") and v.get("vid") in _prio_vids)}
     out, mi, yi, ep_count = [], 0, 0, tv_since
-    # `limit` counts SLOTS AS THE APP DRAWS THEM, not raw entries: a run of consecutive
-    # YouTube videos collapses into one expandable slot, so counting entries returned a
-    # visibly short list (8 pending videos could eat 8 of the 10 and show 3 rows). The
-    # entry ceiling stops a long tail — TV exhausted, dozens of videos left — from
-    # putting the whole backlog in one slot.
-    MAX_ENTRIES = max(limit * 6, 60)
-    def _slots() -> int:
-        n = 0
-        for i, o in enumerate(out):
-            if o.get("kind") == "youtube" and i and out[i - 1].get("kind") == "youtube":
-                continue                                       # same run -> same slot
-            n += 1
-        return n
+    # `limit` counts TV EPISODES (user-dictated): the queue always shows ten episodes of
+    # actual show, with movies and YouTube videos riding along BETWEEN them rather than
+    # consuming the budget. Counting entries (or drawn slots) meant a burst of videos ate
+    # the list and only a couple of episodes were visible. The entry ceiling still bounds
+    # the payload when a long tail of videos or movies interleaves.
+    MAX_ENTRIES = max(limit * 8, 80)
     def _full() -> bool:
-        return _slots() >= limit or len(out) >= MAX_ENTRIES
+        return (sum(1 for o in out if o.get("kind") == "episode") >= limit
+                or len(out) >= MAX_ENTRIES)
     def _emit_yt_one():                                        # the single-video cadence insert
         nonlocal yi, ep_count
         out.append(yt_item(yt_videos[yi])); yi += 1

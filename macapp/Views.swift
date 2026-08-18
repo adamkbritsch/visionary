@@ -2866,8 +2866,7 @@ private struct VideoGroupRow: View {
         VStack(alignment: .leading, spacing: 4) {
             Button { withAnimation(.easeInOut(duration: 0.15)) { open.toggle() } } label: {
                 HStack(spacing: 8) {
-                    Text("\(group.startIndex + 1)").font(.system(size: 11)).monospacedDigit()
-                        .foregroundStyle(.tertiary).frame(width: 18, alignment: .trailing)
+                    Color.clear.frame(width: 18, height: 1)      // videos are unnumbered
                     Image(systemName: "play.rectangle").font(.system(size: 11))
                         .foregroundStyle(DS.steelDim)
                     Text("\(group.items.count) YouTube videos")
@@ -2890,9 +2889,7 @@ private struct VideoGroupRow: View {
             if open {
                 ForEach(Array(group.items.enumerated()), id: \.element.id) { off, it in
                     HStack(spacing: 8) {
-                        Text("\(group.startIndex + off + 1)").font(.system(size: 11))
-                            .monospacedDigit().foregroundStyle(.tertiary)
-                            .frame(width: 18, alignment: .trailing)
+                        Color.clear.frame(width: 18, height: 1)
                         parent.row(it)
                         Spacer()
                         parent.controls(it, group.startIndex + off)
@@ -2946,12 +2943,16 @@ private struct UpNextView: View {
                 // YOUTUBE VIDEOS COLLAPSE into ONE slot (they arrive in bursts and used to
                 // dominate the list); the slot expands to the same rows with the same
                 // controls — purely presentational.
+                let ords = Self.episodeOrdinals(items)
                 ForEach(Self.grouped(items)) { g in
                     if g.isVideoGroup {
                         VideoGroupRow(group: g, parent: self)
                     } else if let it = g.items.first {
                         HStack(spacing: 8) {
-                            Text("\(g.startIndex + 1)").font(.system(size: 11)).monospacedDigit()
+                            // Only episodes carry a number; everything else keeps the
+                            // gutter width so the titles stay aligned.
+                            Text(ords[g.startIndex].map(String.init) ?? "")
+                                .font(.system(size: 11)).monospacedDigit()
                                 .foregroundStyle(.tertiary).frame(width: 18, alignment: .trailing)
                             row(it)
                             Spacer()
@@ -3047,6 +3048,19 @@ private struct UpNextView: View {
             }
         }
     }
+    /// Item index -> its EPISODE number. Only TV episodes are numbered (user-dictated):
+    /// movies and videos ride along between them, so numbering everything made the list
+    /// read as though a video were "item 4 of the show".
+    static func episodeOrdinals(_ items: [UpNextDTO]) -> [Int: Int] {
+        var m: [Int: Int] = [:]
+        var n = 0
+        for (i, it) in items.enumerated() where it.kind == "episode" {
+            n += 1
+            m[i] = n
+        }
+        return m
+    }
+
     /// Collapse runs of consecutive YouTube videos into one slot; everything else stays a
     /// row of its own. Order is never changed — only how it is drawn.
     static func grouped(_ items: [UpNextDTO]) -> [UpNextGroup] {
