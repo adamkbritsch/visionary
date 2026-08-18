@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -1224,6 +1225,39 @@ def current_state():
 
 # ---- HTTP -----------------------------------------------------------------
 
+# ---- remote access (Tailscale) -------------------------------------------
+# The server used to bind 127.0.0.1, so reaching it at all meant already being on this Mac.
+# It now binds every interface so the dashboard can be opened from a phone over the tailnet
+# — which means the port is no longer its own protection. This API can ARM, DISARM, SKIP and
+# DELETE, so everything arriving from off-machine must present a token. Loopback stays
+# exempt: the Mac app talks to us there and must keep working untouched.
+BIND_ADDR = os.environ.get("VISIONARY_BIND", "0.0.0.0")
+TOKEN_FILE = os.path.expanduser("~/.topaz-pipeline/remote_token")
+_LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
+def remote_token() -> str:
+    """The shared secret, generated once and kept 0600 in its own file (NOT config.json —
+    nothing that gets echoed into the UI or a bug report). Never logged: log_message is a
+    no-op, so the ?k= form can't leak into an access log."""
+    try:
+        with open(TOKEN_FILE) as fh:
+            tok = fh.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(24)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(tok)
+    except OSError:
+        pass
+    return tok
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype, extra_headers=None):
         self.send_response(code)
@@ -1237,7 +1271,37 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
+    def _authorized(self) -> bool:
+        """Loopback is trusted; anything else needs the token, via an Authorization header,
+        a ?k= query (so a phone can open one link), or the cookie that link then sets.
+        Compared with compare_digest — a plain == leaks the answer through timing."""
+        self._token_via_query = False
+        host = (self.client_address or ("",))[0]
+        if host in _LOOPBACK:
+            return True
+        want = remote_token()
+        if not want:
+            return False                      # couldn't establish a secret -> refuse, never open up
+        auth = self.headers.get("Authorization") or ""
+        got = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not got:
+            got = (parse_qs(urlparse(self.path).query).get("k") or [""])[0]
+            self._token_via_query = bool(got)
+        if not got:
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "vk":
+                    got = v
+                    break
+        return bool(got) and secrets.compare_digest(got, want)
+
+    def _deny(self):
+        self._send(401, b"unauthorized", "text/plain",
+                   {"WWW-Authenticate": "Bearer realm=\"Visionary\""})
+
     def do_GET(self):
+        if not self._authorized():
+            return self._deny()
         path = self.path.split("?")[0]
         if path == "/api/state":
             self._json(current_state())
@@ -1338,13 +1402,21 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ("/", "/index.html"):
             try:
                 with open(os.path.join(DASHBOARD_DIR, "index.html"), "rb") as f:
-                    self._send(200, f.read(), "text/html; charset=utf-8")
+                    extra = {}
+                    if getattr(self, "_token_via_query", False):
+                        # Trade the one-time ?k= link for a cookie so the bookmark, the
+                        # history entry and any shoulder-surfer never carry the secret.
+                        extra["Set-Cookie"] = ("vk=" + remote_token() + "; Path=/; Max-Age=31536000;"
+                                               " HttpOnly; SameSite=Lax")
+                    self._send(200, f.read(), "text/html; charset=utf-8", extra)
             except OSError:
                 self._send(404, b"index.html missing", "text/plain")
         else:
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if not self._authorized():
+            return self._deny()
         path = self.path.split("?")[0]
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -1408,8 +1480,9 @@ class Handler(BaseHTTPRequestHandler):
                     orchestrator.ORCH.disable()
             self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/send-to-visionary":
-            # The companion YouTube app's button (localhost only — the server binds
-            # 127.0.0.1). youtarr grabs exactly this video; the orchestrator serves it
+            # The companion YouTube app's button. Off-machine callers need the remote
+            # token (see _authorized); loopback is still open, so the app on this Mac is
+            # unaffected. youtarr grabs exactly this video; the orchestrator serves it
             # as the NEXT item once it lands on staging. Idempotent; the status string
             # is the button's feedback.
             import youtube
@@ -1659,7 +1732,7 @@ def main(port=8765):
             pass
     threading.Thread(target=_rearm_loop, daemon=True, name="rearm").start()
     print(f"Dashboard (automation_enabled={AUTOMATION_ENABLED}) on http://localhost:{port}")
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    ThreadingHTTPServer((BIND_ADDR, port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

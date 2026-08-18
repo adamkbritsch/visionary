@@ -675,3 +675,79 @@ class UpNextKeepsTenEpisodes(unittest.TestCase):
     def test_a_long_video_tail_cannot_blow_up_the_payload(self):
         out = self._run(0, 500, every=1, burst=1)
         self.assertLessEqual(len(out), 80)
+
+
+# ---- remote access -------------------------------------------------------
+
+class _Headers(dict):
+    """Just enough of http.client.HTTPMessage for _authorized()."""
+    def get(self, key, default=None):
+        return dict.get(self, key, default)
+
+
+def _req(host, path="/api/state", **headers):
+    """A Handler with only the attributes _authorized() reads — constructing a real one
+    would try to speak HTTP down a socket."""
+    h = server.Handler.__new__(server.Handler)
+    h.client_address = (host, 54321)
+    h.path = path
+    h.headers = _Headers(headers)
+    return h
+
+
+class RemoteAccess(unittest.TestCase):
+    """The server binds every interface now (so the dashboard opens from a phone over the
+    tailnet), which means the port is no longer the protection. This API can arm, disarm,
+    skip and DELETE — everything off-machine must carry the token."""
+
+    def setUp(self):
+        import os, tempfile
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        p = mock.patch.object(server, "TOKEN_FILE", os.path.join(d, "tok"))
+        p.start(); self.addCleanup(p.stop)
+        self.tok = server.remote_token()
+
+    def test_loopback_needs_no_token(self):
+        # the Mac app talks to us here and must keep working untouched
+        for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            self.assertTrue(_req(host)._authorized(), host)
+
+    def test_remote_without_a_token_is_refused(self):
+        self.assertFalse(_req("100.64.0.9")._authorized())
+        self.assertFalse(_req("192.168.1.50")._authorized())
+
+    def test_remote_with_a_wrong_token_is_refused(self):
+        self.assertFalse(_req("100.64.0.9", Authorization="Bearer nope")._authorized())
+        self.assertFalse(_req("100.64.0.9", path="/api/state?k=nope")._authorized())
+        self.assertFalse(_req("100.64.0.9", Cookie="vk=nope")._authorized())
+
+    def test_remote_with_the_token_is_allowed_three_ways(self):
+        self.assertTrue(_req("100.64.0.9", Authorization="Bearer " + self.tok)._authorized())
+        self.assertTrue(_req("100.64.0.9", path="/api/state?k=" + self.tok)._authorized())
+        self.assertTrue(_req("100.64.0.9", Cookie="vk=" + self.tok)._authorized())
+
+    def test_only_the_query_form_asks_for_a_cookie(self):
+        # the ?k= link is traded for a cookie so the bookmark never carries the secret
+        q = _req("100.64.0.9", path="/?k=" + self.tok)
+        self.assertTrue(q._authorized()); self.assertTrue(q._token_via_query)
+        c = _req("100.64.0.9", Cookie="vk=" + self.tok)
+        self.assertTrue(c._authorized()); self.assertFalse(c._token_via_query)
+
+    def test_a_missing_secret_refuses_rather_than_opens_up(self):
+        from unittest import mock
+        with mock.patch.object(server, "remote_token", return_value=""):
+            self.assertFalse(_req("100.64.0.9", Authorization="Bearer x")._authorized())
+            self.assertTrue(_req("127.0.0.1")._authorized())      # local still fine
+
+    def test_token_is_stable_and_private(self):
+        import os, stat
+        self.assertEqual(server.remote_token(), self.tok)          # not regenerated per call
+        self.assertGreaterEqual(len(self.tok), 24)
+        mode = stat.S_IMODE(os.stat(server.TOKEN_FILE).st_mode)
+        self.assertEqual(mode, 0o600, oct(mode))                   # not world-readable
+
+    def test_other_cookies_do_not_confuse_it(self):
+        self.assertTrue(_req("100.64.0.9",
+                             Cookie="theme=dark; vk=" + self.tok + "; x=1")._authorized())
+        self.assertFalse(_req("100.64.0.9", Cookie="theme=dark; x=1")._authorized())
