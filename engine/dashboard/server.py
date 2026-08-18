@@ -1345,7 +1345,8 @@ class Handler(BaseHTTPRequestHandler):
             # SEE THE SCREEN WITH THE LID CLOSED. Only this process holds the Screen
             # Recording grant (a plain shell's screencapture returns "could not create
             # image from display"), so remote debugging of the DV automation has to come
-            # from here. Localhost-only, like the rest of the API.
+            # from here — and from a phone, which is the whole point of the web UI. It is
+            # the remote TOKEN that protects this now, not the old loopback bind.
             # ?display=<key> captures a NON-main screen. Once Resolve can be hosted
             # elsewhere, a debugger that always shows the built-in is worse than useless.
             try:
@@ -1613,6 +1614,20 @@ class Handler(BaseHTTPRequestHandler):
             res = preflight.shim_smoke_scores(key)
             preflight.record_display_smoke(key, res)
             self._json({"result": res, "displays": displays_view()})
+        elif path == "/api/awake-hold":
+            # "Give me another hour." A remote Deactivate already holds the screen so the
+            # run can be re-armed from away; this extends that hold when the window is
+            # running out and the decision hasn't been made yet. Same refusal rules —
+            # ORCH.hold_awake declines on battery.
+            secs = body.get("seconds")
+            try:
+                secs = int(secs) if secs is not None else REMOTE_AWAKE_GRACE_SECS
+            except (TypeError, ValueError):
+                secs = REMOTE_AWAKE_GRACE_SECS
+            secs = max(60, min(int(secs), 4 * 3600))
+            until = orchestrator.ORCH.hold_awake(secs, "extended from the web UI")
+            self._json({"held": bool(until), "awake_hold_secs":
+                        orchestrator.ORCH.snapshot().get("awake_hold_secs", 0)})
         elif path == "/api/quiet-mode":
             # SCREEN CONTROL. `enabled` = quiet mode ON = the pipeline stops using the screen.
             # That is only ever TEMPORARY: `seconds` (or an `until` epoch) sets when it comes
