@@ -177,6 +177,23 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 .row.kid{padding-left:34px;background:rgba(0,0,0,.14)}
 .badge{font-size:10px;font-weight:600;color:var(--steel-bright);padding:3px 7px;
   border-radius:999px;background:rgba(255,255,255,.09);white-space:nowrap}
+.tabs{display:flex;gap:4px;margin-bottom:10px}
+.tab{flex:1;appearance:none;border:0;border-radius:8px;padding:8px 6px;font:inherit;
+  font-size:12px;font-weight:600;cursor:pointer;color:var(--steel-dim);
+  background:rgba(255,255,255,.05)}
+.tab.on{color:var(--graphite);background:linear-gradient(180deg,var(--silver),var(--steel))}
+.find{display:flex;align-items:center;gap:6px;padding:8px 10px;margin-bottom:8px}
+.find input{flex:1;background:transparent;border:0;outline:0;color:var(--steel-bright);
+  font:inherit;font-size:13px;min-width:0}
+.hits{max-height:290px;overflow:auto;-webkit-overflow-scrolling:touch}
+.hit{display:flex;align-items:center;gap:9px;padding:10px 12px;font-size:13px;
+  border-top:1px solid rgba(255,255,255,.05);cursor:pointer}
+.hit:first-child{border-top:0}
+.hit:hover{background:rgba(255,255,255,.05)}
+.hit .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hit .tag{font-size:10px;color:var(--steel-dim);white-space:nowrap}
+.hit.no{opacity:.45;cursor:default}
+.hit.no:hover{background:transparent}
 .notice{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;font-size:12.5px;
   color:var(--steel-bright);line-height:1.4}
 .notice .ic{margin-top:1px}
@@ -211,6 +228,9 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
   <symbol id="i-now" viewBox="0 0 24 24"><path d="M5 4h14"/><path d="M12 21V8m0 0-5 5m5-5 5 5"/></symbol>
   <symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-find" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="3"/></symbol>
   <symbol id="i-hand" viewBox="0 0 24 24"><path d="M9 11V5.5a1.5 1.5 0 0 1 3 0V11"/><path d="M12 11V4.5a1.5 1.5 0 0 1 3 0V11"/><path d="M15 11V6.5a1.5 1.5 0 0 1 3 0V13a7 7 0 0 1-7 7h-1a6 6 0 0 1-6-6v-3a1.5 1.5 0 0 1 3 0"/></symbol>
   <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3 2 20h20L12 3Z"/><path d="M12 10v4M12 17h.01"/></symbol>
@@ -259,6 +279,30 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 <section class="sec">
   <p class="lbl">Machine</p>
   <div class="grid" id="health"></div>
+</section>
+
+<section class="sec">
+  <p class="lbl">Add to the queue</p>
+  <div class="tabs">
+    <button class="tab on" data-tab="tv">TV Shows</button>
+    <button class="tab" data-tab="movie">Movies</button>
+    <button class="tab" data-tab="youtube">YouTube</button>
+  </div>
+  <div id="ytLink" style="display:none">
+    <div class="panel well find">
+      <svg class="ic"><use href="#i-link"/></svg>
+      <input id="linkIn" type="text" placeholder="Paste a playlist, video or channel link&hellip;">
+      <button class="mini" id="linkGo">Import</button>
+    </div>
+    <div class="panel notice" id="linkNote" style="display:none;margin-bottom:10px"></div>
+  </div>
+  <div class="panel well find">
+    <svg class="ic"><use href="#i-find"/></svg>
+    <input id="findIn" type="text" placeholder="Search&hellip;">
+  </div>
+  <div class="panel well hits" id="hits"></div>
+  <p class="lbl" style="margin-top:12px">In the queue <span id="queuedN" style="color:var(--steel-dim)"></span></p>
+  <div class="panel well rows" id="queued"></div>
 </section>
 
 <section class="sec">
@@ -479,6 +523,9 @@ function render(d){
 
   /* generated_at is an ISO string from datetime.now() (local, no offset) — NOT epoch
      seconds. Multiplying it gave NaN and the footer read "Invalid Date". */
+  lastState = d;
+  if (!$("hits").innerHTML) drawPicker();
+
   var when = d.generated_at ? new Date(d.generated_at) : new Date();
   if (isNaN(when.getTime())) when = new Date();
   txt($("foot"), "updated " + when.toLocaleTimeString());
@@ -601,6 +648,179 @@ $("queue").addEventListener("click", async function(ev){
   } catch (e) { /* the poll resyncs */ }
   qSig = "";
   poll(true);
+});
+
+/* ---- pick things to process, from away ------------------------------------
+   The library is ~400 movies and every show on the NAS, so this is search-first and caps
+   what it draws — a phone should never be handed 400 rows. Adds use the SAME endpoints the
+   Mac app uses, so nothing here is a second code path. */
+var pickTab = "tv", subs = null, movieLib = null, lastState = {};
+
+function tabHits(q){
+  var d = lastState, out = [];
+  q = (q || "").toLowerCase();
+  var match = function(s){ return !q || String(s || "").toLowerCase().indexOf(q) >= 0; };
+  if (pickTab === "tv"){
+    var titles = (d.series || {}).titles || {}, active = (d.series || {}).active || [];
+    Object.keys(titles).forEach(function(folder){
+      if (active.indexOf(folder) >= 0 || !(match(titles[folder]) || match(folder))) return;
+      out.push({label: titles[folder] || folder, add: {ep: "/api/select",
+                body: {series: folder, action: "add"}}});
+    });
+  } else if (pickTab === "movie"){
+    /* library is NULL until it has been built (peek_library), and `selected` is
+       {items,next,count} — not a list. Both cost a real bug if assumed. */
+    var lib = ((d.movies || {}).library) || (movieLib || []);
+    var sel = ((d.movies || {}).selected || {}).items || [];
+    var have = {}; sel.forEach(function(m){ have[m.name] = 1; });
+    lib.forEach(function(m){
+      if (have[m.name] || !match(m.title || m.name)) return;
+      out.push({label: m.title || m.name, tag: (m.tags || []).join(" · "),
+                blocked: m.has_dv ? "already Dolby Vision — pair a companion instead" : "",
+                add: {ep: "/api/movie-queue",
+                      body: {action: "add", name: m.name, dir: m.dir, title: m.title}}});
+    });
+  } else {
+    var chans = (subs || {}).channels || [], qd = ((d.youtube || {}).items || []);
+    var inq = {}; qd.forEach(function(c){ inq[c.channelId] = 1; });
+    chans.forEach(function(c){
+      if (inq[c.channelId] || !match(c.title)) return;
+      out.push({label: c.title, add: {ep: "/api/youtube-queue",
+                body: {action: "add", channelId: c.channelId, title: c.title}}});
+    });
+  }
+  out.sort(function(a, b){ return a.label.localeCompare(b.label); });
+  return out;
+}
+
+function drawPicker(){
+  var q = $("findIn").value, hits = tabHits(q), shown = hits.slice(0, 30);
+  $("hits").innerHTML = shown.length ? shown.map(function(h, i){
+    return '<div class="hit' + (h.blocked ? " no" : "") + '" data-hit="' + i + '">' +
+      '<svg class="ic"><use href="#i-' + (h.blocked ? "warn" : "plus") + '"/></svg>' +
+      '<span class="t">' + esc(h.label) + '</span>' +
+      (h.blocked ? '<span class="tag">' + esc(h.blocked) + '</span>'
+                 : (h.tag ? '<span class="tag">' + esc(h.tag) + '</span>' : "")) + '</div>';
+  }).join("") + (hits.length > shown.length
+      ? '<div class="muted">' + (hits.length - shown.length) + ' more — keep typing</div>' : "")
+    : '<div class="muted">' + ((pickTab === "youtube" && !subs) ? "Loading your subscriptions…"
+        : (pickTab === "movie" && !movieLib && !((lastState.movies || {}).library))
+          ? "Loading the movie library…" : "Nothing matches") + '</div>';
+  $("hits")._hits = shown;
+
+  var rows = [], d = lastState;
+  if (pickTab === "tv"){
+    rows = ((d.series || {}).active || []).map(function(f){
+      return {label: ((d.series || {}).titles || {})[f] || f,
+              rm: {ep: "/api/select", body: {series: f, action: "remove"}}};
+    });
+  } else if (pickTab === "movie"){
+    rows = (((d.movies || {}).selected || {}).items || []).map(function(m){
+      return {label: m.title || m.name,
+              rm: {ep: "/api/movie-queue", body: {action: "remove", name: m.name}}};
+    });
+  } else {
+    rows = ((d.youtube || {}).items || []).map(function(c){
+      return {label: c.title + (c.via_link ? "  (added by link)" : ""),
+              rm: {ep: "/api/youtube-queue", body: {action: "remove", channelId: c.channelId}}};
+    });
+  }
+  txt($("queuedN"), rows.length ? "(" + rows.length + ")" : "");
+  $("queued").innerHTML = rows.length ? rows.map(function(r, i){
+    return '<div class="row"><span class="t">' + esc(r.label) + '</span>' +
+      '<span class="acts"><button class="act danger" data-rm="' + i + '" title="Remove">' +
+      '<svg><use href="#i-x"/></svg></button></span></div>';
+  }).join("") : '<div class="muted">Nothing yet</div>';
+  $("queued")._rows = rows;
+}
+
+async function pickerPost(spec){
+  try {
+    var r = await fetch(spec.ep, {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(spec.body)});
+    var j = await r.json().catch(function(){ return {}; });
+    if (j && j.error) alert(j.error);
+  } catch (e) { /* the poll resyncs */ }
+  qSig = "";
+  await poll(true);
+  drawPicker();
+}
+
+document.querySelectorAll(".tab").forEach(function(t){
+  t.addEventListener("click", async function(){
+    document.querySelectorAll(".tab").forEach(function(x){ x.classList.toggle("on", x === t); });
+    pickTab = t.dataset.tab;
+    $("ytLink").style.display = pickTab === "youtube" ? "" : "none";
+    $("findIn").value = "";
+    drawPicker();
+    if (pickTab === "youtube" && !subs){
+      try { subs = await (await fetch("/api/channels")).json(); } catch (e) { subs = {}; }
+      drawPicker();
+    }
+    if (pickTab === "movie" && !movieLib){
+      try {
+        var mv = await (await fetch("/api/movies")).json();
+        movieLib = mv.library || [];      // api_movies(): {library, selected, reachable, titles}
+      } catch (e) { movieLib = []; }
+      drawPicker();
+    }
+  });
+});
+$("findIn").addEventListener("input", drawPicker);
+$("hits").addEventListener("click", function(ev){
+  var el = ev.target.closest("[data-hit]"); if (!el) return;
+  var h = ($("hits")._hits || [])[parseInt(el.dataset.hit, 10)];
+  if (h && !h.blocked) pickerPost(h.add);
+});
+$("queued").addEventListener("click", function(ev){
+  var el = ev.target.closest("[data-rm]"); if (!el) return;
+  var r = ($("queued")._rows || [])[parseInt(el.dataset.rm, 10)];
+  if (!r) return;
+  if (pickTab === "youtube" &&
+      !confirm("Remove this channel?\n\nIts downloaded videos and 4K masters are deleted too.")) return;
+  pickerPost(r.rm);
+});
+
+/* Paste a link — the same resolve -> confirm -> import flow the app uses. */
+async function importLink(choice){
+  var url = $("linkIn").value.trim(), note = $("linkNote");
+  if (!url) return;
+  note.style.display = ""; note.innerHTML = "Resolving\u2026";
+  var r = await (await fetch("/api/youtube-queue", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "resolve_link", url: url})})).json().catch(function(){ return {}; });
+  if (r.status !== "ok"){
+    note.innerHTML = esc({"bad-url": "That doesn\u2019t look like a YouTube link.",
+      "playlist-unreadable": "That playlist is private or unavailable.",
+      "channel-unresolved": "Couldn\u2019t find that channel."}[r.status] || "Couldn\u2019t resolve that link.");
+    return;
+  }
+  if (!choice && (r.ambiguous || r.kind === "playlist")){
+    var n = r.count || 0;
+    note.innerHTML = '<span class="grow">' + esc(r.title || "Playlist") +
+      (n ? " — " + n + " videos" : "") + '</span>' +
+      (r.ambiguous ? '<button class="mini" data-imp="video">Just this video</button>' : "") +
+      '<button class="mini" data-imp="playlist">Import' + (n ? " all " + n : "") + '</button>';
+    return;
+  }
+  note.innerHTML = "Importing\u2026";
+  var out = await (await fetch("/api/youtube-queue", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "import_link", url: url, choice: choice})})).json()
+    .catch(function(){ return {}; });
+  var imp = out["import"] || {};
+  note.innerHTML = esc({queued: "Queued " + (imp.count || 0) + " video(s).",
+    "channel-queued": "Added " + (imp.title || "that channel") + ".",
+    "already-queued": "Already queued.",
+    "youtarr-unreachable": "youtarr didn\u2019t respond \u2014 nothing was queued.",
+    empty: "Nothing to import."}[imp.status] || "Import failed.");
+  if (imp.status === "queued" || imp.status === "channel-queued") $("linkIn").value = "";
+  qSig = ""; await poll(true); drawPicker();
+}
+$("linkGo").addEventListener("click", function(){ importLink(null); });
+$("linkIn").addEventListener("keydown", function(e){ if (e.key === "Enter") importLink(null); });
+$("linkNote").addEventListener("click", function(ev){
+  var b = ev.target.closest("[data-imp]"); if (b) importLink(b.dataset.imp);
 });
 
 function pad(n){ return (n < 10 ? "0" : "") + n; }
