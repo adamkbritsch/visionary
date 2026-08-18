@@ -1117,11 +1117,26 @@ def up_next(limit=10, current=None, inflight=None):
                          "name": v.get("source_name"), "title": v.get("title"),
                          "priority": bool(v.get("vid") and v.get("vid") in _prio_vids)}
     out, mi, yi, ep_count = [], 0, 0, tv_since
+    # `limit` counts SLOTS AS THE APP DRAWS THEM, not raw entries: a run of consecutive
+    # YouTube videos collapses into one expandable slot, so counting entries returned a
+    # visibly short list (8 pending videos could eat 8 of the 10 and show 3 rows). The
+    # entry ceiling stops a long tail — TV exhausted, dozens of videos left — from
+    # putting the whole backlog in one slot.
+    MAX_ENTRIES = max(limit * 6, 60)
+    def _slots() -> int:
+        n = 0
+        for i, o in enumerate(out):
+            if o.get("kind") == "youtube" and i and out[i - 1].get("kind") == "youtube":
+                continue                                       # same run -> same slot
+            n += 1
+        return n
+    def _full() -> bool:
+        return _slots() >= limit or len(out) >= MAX_ENTRIES
     def _emit_yt_one():                                        # the single-video cadence insert
         nonlocal yi, ep_count
         out.append(yt_item(yt_videos[yi])); yi += 1
         ep_count = 0                                           # restart the N-episode countdown
-        return len(out) >= limit
+        return _full()
     def _emit_yt_burst():                                      # the WHOLE burst runs back-to-back
         for _ in range(burst):
             if yi >= len(yt_videos):
@@ -1142,16 +1157,16 @@ def up_next(limit=10, current=None, inflight=None):
     for ei in range(len(eps) + 1):
         while mi < len(mvs) and movies._pos(mvs[mi]) == ei:    # movies due right before episode ei (a movie
             out.append(movie_item(mvs[mi])); mi += 1           # does NOT count toward the YouTube cadence)
-            if len(out) >= limit: return out
+            if _full(): return out
         if ei < len(eps):
             out.append(ep_item(eps[ei]))
-            if len(out) >= limit: return out
+            if _full(): return out
             if _after_episode(): return out
     while yi < len(yt_videos):                                 # TV exhausted → drain remaining YouTube
         if _emit_yt_one(): return out
     while mi < len(mvs):                                       # movies parked past the last episode
         out.append(movie_item(mvs[mi])); mi += 1
-        if len(out) >= limit: return out
+        if _full(): return out
     return out
 
 

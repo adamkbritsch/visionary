@@ -2926,9 +2926,12 @@ private struct UpNextView: View {
                     Text("Next up").foregroundStyle(.secondary)
                     if !expanded, let first = items.first { row(first) }
                     Spacer()
-                    if items.count > 1 {
+                    // Count SLOTS, not entries — a run of videos draws as one row, so
+                    // "+N" has to match what expanding actually reveals.
+                    let slots = Self.grouped(items).count
+                    if slots > 1 {
                         if !expanded {
-                            Text("+\(items.count - 1)").font(.system(size: 11)).foregroundStyle(.tertiary)
+                            Text("+\(slots - 1)").font(.system(size: 11)).foregroundStyle(.tertiary)
                         }
                         Image(systemName: expanded ? "chevron.up" : "chevron.down")
                             .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
@@ -2936,7 +2939,7 @@ private struct UpNextView: View {
                 }
                 .font(.system(size: 13)).contentShape(Rectangle())
             }
-            .buttonStyle(.plain).disabled(items.count <= 1)
+            .buttonStyle(.plain).disabled(Self.grouped(items).count <= 1)
             if expanded {
                 // Full list in processing order. Movies (only) get controls: ↑/↓ move them
                 // anywhere — including between episodes — and × removes them. CONSECUTIVE
