@@ -320,6 +320,20 @@ struct HeaderBar: View {
             .popover(isPresented: $store.showSettings, arrowEdge: .bottom) {
                 SettingsPopover().environmentObject(store)
             }
+            Button(action: { store.showHistory.toggle() }) {
+                // FINISHED: the look-back. Same bare-glyph treatment as the gear — a way in,
+                // never an action competing with Activate on this bar.
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(DS.steel)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Finished — everything upscaled, and fix a file's audio")
+            .popover(isPresented: $store.showHistory, arrowEdge: .bottom) {
+                HistoryPopover().environmentObject(store)
+                    .task { await store.fetchHistory() }
+            }
             Button(action: { Task { await store.toggleAutomation() } }) {
                 HStack(spacing: 7) {
                     // APPLIANCE toggle: Activate arms the standing mode (the engine then runs
@@ -2767,6 +2781,106 @@ private struct ImportedGroup: View {
                     .padding(.horizontal, 10).padding(.vertical, 7)
                 }
             }.panel(DS.radiusControl, inset: true)
+        }
+    }
+}
+
+/// What Visionary has finished, and the one thing worth doing to a finished file: fixing
+/// its audio. The revision is IN PLACE and audio-only — by the time an item completes its
+/// source is usually gone (replace_source deletes the superseded original once the master
+/// verifies; a YouTube staging folder is purged at cleanup), so a re-run is not on the table.
+/// The master is re-measured, the loudness boost re-applied, and video + subtitles
+/// stream-copied, which leaves Dolby Vision untouched and takes minutes.
+struct HistoryPopover: View {
+    @EnvironmentObject var store: AppStore
+    @State private var confirming: HistoryItemDTO? = nil
+
+    private func when(_ ts: Int?) -> String {
+        guard let ts, ts > 0 else { return "" }
+        let d = Date(timeIntervalSince1970: TimeInterval(ts))
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDateInToday(d) ? "h:mm a" : "MMM d"
+        return f.string(from: d)
+    }
+
+    private func icon(_ kind: String?) -> String {
+        kind == "youtube" ? "play.rectangle" : kind == "movie" ? "film" : "tv"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Finished").font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Button(store.historyScanning ? "Searching…" : "Find finished files") {
+                    Task { await store.scanHistory() }
+                }
+                .buttonStyle(SteelButtonStyle(lit: false))
+                .disabled(store.historyScanning)
+                .help("Adopt masters upscaled before this list existed — it only records new work")
+            }
+            if store.history.isEmpty {
+                Text("Nothing recorded yet. \"Find finished files\" picks up everything already on the NAS.")
+                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.vertical, 6)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(store.history) { it in row(it) }
+                    }
+                }.frame(maxHeight: 320)
+                    .panel(DS.radiusControl, inset: true)
+            }
+        }
+        .padding(14).frame(width: 430)
+    }
+
+    @ViewBuilder private func row(_ it: HistoryItemDTO) -> some View {
+        let sub = [when(it.at), it.gain.map { "+\(String(format: "%.1f", $0)) dB" } ?? "",
+                   (it.revised ?? 0) > 0 ? "revised" : ""]
+            .filter { !$0.isEmpty }.joined(separator: " · ")
+        HStack(spacing: 9) {
+            Image(systemName: icon(it.kind)).font(.system(size: 11)).foregroundStyle(DS.steelDim)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(it.title ?? it.nas_path ?? "").font(.system(size: 12.5)).lineLimit(1)
+                if !sub.isEmpty {
+                    Text(sub).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 6)
+            if it.revising == true {
+                Text("fixing…").font(.system(size: 10)).foregroundStyle(DS.steelBright)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
+            } else if it.can_revise == true {
+                Button { confirming = it } label: {
+                    Image(systemName: "waveform").font(.system(size: 12))
+                        .frame(width: 26, height: 24).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help("Fix audio — re-measure this file and re-apply the loudness boost, in place")
+            } else {
+                // Say WHY rather than showing a dead control (hide-inert-UI): the only
+                // refusal is lossless audio, which the pipeline never re-encodes.
+                Text(it.why ?? "").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .lineLimit(1).frame(maxWidth: 130, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .overlay(alignment: .top) { Divider().opacity(0.35) }
+        .confirmationDialog("Fix the audio on \"\(confirming?.title ?? "this file")\"?",
+                            isPresented: Binding(get: { confirming?.id == it.id },
+                                                 set: { if !$0 { confirming = nil } }),
+                            titleVisibility: .visible) {
+            Button("Fix audio") {
+                Task { await store.reviseAudio(it) }
+                confirming = nil
+            }
+            Button("Cancel", role: .cancel) { confirming = nil }
+        } message: {
+            Text("Re-measures the published file and re-applies the loudness boost in place. "
+                 + "Video and subtitles are copied untouched, so it takes minutes.")
         }
     }
 }

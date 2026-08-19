@@ -328,6 +328,27 @@ struct YTImportResultDTO: Codable {           // action: import_link
     var subscribed: Bool?
 }
 
+struct HistoryItemDTO: Codable, Identifiable {   // one finished master (/api/history)
+    var nas_path: String?
+    var kind: String?          // episode | movie | youtube
+    var title: String?
+    var series: String?
+    var ep: String?
+    var gain: Double?          // the loudness boost that was applied, if any
+    var audio: String?         // probed codec — lossless is never re-encoded
+    var note: String?
+    var at: Int?
+    var revised: Int?
+    var revising: Bool?
+    var can_revise: Bool?
+    var why: String?           // why not, when it can't
+    var id: String { nas_path ?? title ?? "" }
+}
+
+struct HistoryDTO: Codable {
+    var items: [HistoryItemDTO]?
+}
+
 struct YTImportEnvelopeDTO: Codable {   // import_link replies with the refreshed queue + this
     var `import`: YTImportResultDTO?
 }

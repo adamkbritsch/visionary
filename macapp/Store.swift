@@ -41,6 +41,9 @@ final class AppStore: ObservableObject {
     // Menu-bar entry points. "Setup…" opens Settings AND expands the Setup group inside it;
     // "Import YouTube Link from Clipboard" hands a URL to the YouTube tab's existing import
     // field rather than duplicating the resolve → confirm flow.
+    @Published var showHistory = false          // the Finished popover
+    @Published var history: [HistoryItemDTO] = []
+    @Published var historyScanning = false
     @Published var revealSetup = false
     @Published var pendingImportURL: String? = nil
     @Published var lastError: String? = nil       // the app's first real error surface
@@ -327,6 +330,32 @@ final class AppStore: ObservableObject {
         await post("/api/youtube-queue", ["action": "add", "channelId": channelId,
                                           "title": title, "scope": scope]); await refresh()
     }
+    // ---- what has finished, and fixing a file's audio ---------------------
+    func fetchHistory() async {
+        if let d: HistoryDTO = await get("/api/history") { history = d.items ?? [] }
+    }
+
+    /// Re-measure a published master and re-apply the loudness boost IN PLACE. Audio only —
+    /// by the time an item finishes its source is usually gone (replaced or purged), so the
+    /// master is the only copy; video and subtitles are stream-copied, so DV is untouched.
+    func reviseAudio(_ item: HistoryItemDTO) async {
+        guard let p = item.nas_path, !p.isEmpty else { return }
+        let (_, data) = await postResult("/api/revise-audio", ["id": p])
+        if let data, let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data),
+           let err = e.error { lastError = e.detail ?? err }
+        await fetchHistory()
+    }
+
+    /// Adopt masters published BEFORE the history book existed — it records at upload, so
+    /// everything older is invisible to it until this walks the libraries for them.
+    func scanHistory() async {
+        historyScanning = true
+        await post("/api/history-scan", [:])
+        try? await Task.sleep(nanoseconds: 6_000_000_000)
+        await fetchHistory()
+        historyScanning = false
+    }
+
     func removeChannel(_ channelId: String) async {
         await post("/api/youtube-queue", ["action": "remove", "channelId": channelId]); await refresh()
     }
