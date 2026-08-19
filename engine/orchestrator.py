@@ -52,6 +52,7 @@ STAGES = ["download", "extend", "topaz", "resolve", "remux", "upload", "cleanup"
 # whose show OPTED IN and whose source actually probes 4:3 — see borders.extend_gate.
 RUN_STAGES = ["download", "extend", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
+YIELD_LIVELOCK_LIMIT = 3      # yields in a row with nothing else running -> the reason can't be met
 FINISHER_LANES = 2           # DEFAULT max concurrent remuxes ('finisher_lanes' setting — read via
                              # _finisher_lanes()). The 2nd lane runs whenever >=2 topaz-done items need
                              # finishing at once (an item queued behind a busy lane 1 — a re-picked movie
@@ -943,6 +944,8 @@ class Orchestrator:
                                                # honours the skip set. Self-prunes against _gate_deferred,
                                                # so that set's existing clears own the reset.
         self._fail_counts = {}                 # skip-key -> consecutive genuine-failure count
+        self._yield_streak = {}                # skip-key -> consecutive segment-boundary yields that
+        self._yield_block = set()              # handed off to NOBODY; past the limit we stop yielding
         self._resolve_stall = set()            # items topaz'd but HELD before a STALLED Resolve (its update
                                                # prompt): buffered ahead down to STALL_FLOOR_GB, drained when
                                                # Resolve recovers. In-memory; self-heals each run.
@@ -2489,7 +2492,15 @@ class Orchestrator:
         # and the episode's topaz segments stay on disk, so nothing is stranded by letting one
         # through. Without this the episode is re-picked the instant its topaz yields and the
         # yield accomplishes nothing.
-        mid = None if (gate_released or self._yt_cadence_due()) else self._midpipeline_tv(skip)
+        # ...and so does a SEND-TO-VISIONARY video. Without this the two halves fought:
+        # should_pause yielded the episode's topaz for the priority video, then this pinned
+        # the very same episode again (its segdir exists), whose topaz yielded again — a
+        # ~2-second livelock that did no work at all and never let the video through,
+        # because locate_priority below is not even reached while `mid` wins (live-hit
+        # 2026-08-18: the run thread span for hours and no video ran all day).
+        jump = self._yt_priority_waiting()
+        mid = (None if (gate_released or jump or self._yt_cadence_due())
+               else self._midpipeline_tv(skip))
         if mid is not None:
             return mid, "ok"
         # SEND-TO-VISIONARY priority: a video the user explicitly pushed from the
@@ -2785,9 +2796,10 @@ class Orchestrator:
                                         # topaz yields to 2 live remuxes, to a gate-released
                                         # fast item, and to a "run this video now" request
                                         should_pause=lambda: (self._dual_remux_live()
-                                                              or self._gate_release_pending()
-                                                              or self._yt_priority_waiting()
-                                                              or self._yt_cadence_due()))
+                                                              or ((self._skip_key(p) not in self._yield_block)
+                                                                  and (self._gate_release_pending()
+                                                                       or self._yt_priority_waiting()
+                                                                       or self._yt_cadence_due()))))
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
@@ -2808,6 +2820,8 @@ class Orchestrator:
             self.state.update(message=" ".join(f"{ep_disp}: {st} — {msg}".split()), progress=None)
             if ok:
                 self._fail_counts.pop(self._skip_key(p), None)   # any forward progress clears the fail streak
+                self._yield_streak.pop(self._skip_key(p), None)  # ...and the livelock guard
+                self._yield_block.discard(self._skip_key(p))
                 if st == "resolve":
                     self._resolve_fails.pop(self._skip_key(p), None)
                     if self._stall_active:          # Resolve works again → release the whole buffer to drain
@@ -2817,6 +2831,17 @@ class Orchestrator:
                 # return without a fail count — the run loop's dual gate holds this item until a
                 # lane frees, then it's re-selected and topaz resumes from its completed segments.
                 if str(msg).startswith("paused:"):
+                    # LIVELOCK GUARD. A yield is only worth anything if something else then
+                    # runs. If this same item keeps being re-selected and re-yielding with no
+                    # stage completing in between, the reason cannot be satisfied — stop
+                    # honouring it for this item and let it work (the fail streak already
+                    # clears on any forward progress, above).
+                    k = self._skip_key(p)
+                    self._yield_streak[k] = self._yield_streak.get(k, 0) + 1
+                    if self._yield_streak[k] >= YIELD_LIVELOCK_LIMIT:
+                        self._yield_block.add(k)
+                        logbook.event(f"{ep_disp}: yielded {self._yield_streak[k]} times with "
+                                      f"nothing else able to run — keeping the machine")
                     self.state["current"] = None
                     if self._yt_priority_waiting():
                         self._hold("yt-priority",

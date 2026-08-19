@@ -3519,3 +3519,61 @@ class BurstActuallyGetsATurn(unittest.TestCase):
              mock.patch.object(o, "_midpipeline_tv", return_value=sentinel):
             ep, why = o._next_episode()
         self.assertIs(ep, sentinel)
+
+
+class YieldLivelock(unittest.TestCase):
+    """A yield is only worth something if something else then runs. should_pause yielded the
+    episode's topaz for a send-to-Visionary video, then selection re-pinned the SAME episode
+    (its segdir exists, so _midpipeline_tv wins and locate_priority is never reached), whose
+    topaz yielded again — a ~2-second spin that did no work for hours and never let the video
+    through (live-hit 2026-08-18)."""
+
+    def test_a_priority_video_gets_past_the_midpipeline_pin(self):
+        o = orch.Orchestrator()
+        vid = {"channel": "C", "video_path": "/s/C/x/v.mp4", "title": "T", "vid": "v"}
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=True), \
+             mock.patch.object(o, "_midpipeline_tv",
+                               side_effect=AssertionError("the priority video must go first")), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=vid), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            ep, why = o._next_episode()
+        self.assertEqual(why, "ok")
+        self.assertTrue(ep.youtube)
+
+    def test_repeated_yields_with_nobody_to_run_stop_yielding(self):
+        o = orch.Orchestrator()
+        p = episode_paths("Show", "S01E01", SRC)
+        k = o._skip_key(p)
+        for _ in range(orch.YIELD_LIVELOCK_LIMIT):
+            o._yield_streak[k] = o._yield_streak.get(k, 0) + 1
+        self.assertLess(o._yield_streak[k] - 1, orch.YIELD_LIVELOCK_LIMIT + 1)
+        o._yield_block.add(k)
+        # with the item blocked, the reasons that can't be satisfied no longer pause it
+        sp = (lambda: (o._dual_remux_live()
+                       or ((o._skip_key(p) not in o._yield_block)
+                           and (o._gate_release_pending() or o._yt_priority_waiting()
+                                or o._yt_cadence_due()))))
+        with mock.patch.object(o, "_dual_remux_live", return_value=False), \
+             mock.patch.object(o, "_gate_release_pending", return_value=True), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=True), \
+             mock.patch.object(o, "_yt_cadence_due", return_value=True):
+            self.assertFalse(sp())              # blocked -> it keeps the machine and works
+        o._yield_block.discard(k)
+        with mock.patch.object(o, "_dual_remux_live", return_value=False), \
+             mock.patch.object(o, "_gate_release_pending", return_value=True), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=False), \
+             mock.patch.object(o, "_yt_cadence_due", return_value=False):
+            self.assertTrue(sp())               # unblocked -> it yields again
+
+    def test_a_dual_remux_pause_is_never_suppressed(self):
+        # that one protects two live x265 encodes — it must fire even for a blocked item
+        o = orch.Orchestrator()
+        p = episode_paths("Show", "S01E01", SRC)
+        o._yield_block.add(o._skip_key(p))
+        sp = (lambda: (o._dual_remux_live()
+                       or ((o._skip_key(p) not in o._yield_block)
+                           and (o._gate_release_pending() or o._yt_priority_waiting()
+                                or o._yt_cadence_due()))))
+        with mock.patch.object(o, "_dual_remux_live", return_value=True):
+            self.assertTrue(sp())
