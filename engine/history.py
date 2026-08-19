@@ -168,6 +168,20 @@ def adopt(nas_path: str, *, kind="", title="", probe=True) -> dict:
     return {"status": "ok", "nas_path": nas_path, "audio": codec}
 
 
+# ONLY the pipeline's own output. orchestrator.DV_TAG / SDR_TAG are the full tags it appends
+# to everything it produces. series.MASTER_MARKS is the SHORT form ("hdr10 dv") and is right
+# where it is used — inside one show's folder, against that show's own files — but it is
+# catastrophic across whole libraries: every natively-Dolby-Vision release carries "HDR10 DV"
+# in its name. Scanning with the short mark adopted 200 untouched UHD remuxes, filled the
+# book to its cap, and evicted the real master someone had asked for (live-hit 2026-08-18).
+OUR_TAGS = ("hdr10 dv upscaled", "sdr upscaled")
+
+
+def is_our_master(name: str) -> bool:
+    n = (name or "").lower()
+    return any(t in n for t in OUR_TAGS)
+
+
 def _kind_of(nas_path: str) -> str:
     p = (nas_path or "").lower()
     if "/youtube" in p:
@@ -178,13 +192,11 @@ def _kind_of(nas_path: str) -> str:
 def scan(limit: int = 400) -> dict:
     """Find masters the pipeline has already published and adopt any that are missing.
 
-    Detection is the pipeline's OWN naming (series.is_master_name — the "HDR10 DV upscaled"
-    / "SDR upscaled" marks that done-detection already keys on), so this can never mistake a
-    source for a deliverable. Audio is NOT probed here: that is a few MB per file and this
-    walks whole libraries — the revision re-checks authoritatively anyway.
+    Detection is the pipeline's own OUTPUT TAG in full — see is_our_master. Audio is NOT
+    probed here: that is a few MB per file and this walks whole libraries; the revision
+    re-checks authoritatively anyway.
     """
     import ftplib
-    import series
     import transfer
     known = {r.get("nas_path") for r in _read()}
     found, added = 0, 0
@@ -204,7 +216,7 @@ def scan(limit: int = 400) -> dict:
                     continue
                 for name in entries:
                     full = d.rstrip("/") + "/" + name
-                    if series.is_master_name(name):
+                    if is_our_master(name):
                         found += 1
                         if full not in known:
                             record(nas_path=full, kind=_kind_of(full),

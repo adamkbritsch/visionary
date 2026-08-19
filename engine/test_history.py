@@ -183,3 +183,36 @@ class Adopt(unittest.TestCase):
         self.assertEqual(history._kind_of("/Media/TV-Shows/Lost/x.mkv"), "episode")
         self.assertEqual(history._kind_of("/Media/Movies/x.mkv"), "movie")
         self.assertEqual(history._kind_of("/Media/YouTube/Chan/x.mp4"), "youtube")
+
+
+class OnlyOurOwnMasters(unittest.TestCase):
+    """The scan must match the pipeline's OUTPUT TAG in full. series.MASTER_MARKS is the short
+    form ("hdr10 dv") and is correct where it is used — inside one show's folder against that
+    show's own files — but across whole libraries it matches every natively-Dolby-Vision
+    release. Scanning with it adopted 198 untouched UHD remuxes, filled the book to its cap,
+    and evicted the real master that had been asked for (live-hit 2026-08-18)."""
+
+    OURS = [
+        "Good Will Hunting (1997) [2160p BluRay HEVC 10bit AAC 5.1] HDR10 DV upscaled.mkv",
+        "Lost (2004) - S04E10 [2160p] HDR10 DV upscaled.mp4",
+        "Show - S01E01 SDR upscaled.mp4",                    # the pinned-SDR variant
+    ]
+    THEIRS = [
+        "Zootopia (2016) [2160p UHD BluRay REMUX HDR10 DV HEVC 10bit TrueHD 7.1 Atmos]-FraMeSToR.mkv",
+        "21 Jump Street (2012) [2160p BluRay HDR10 DV HEVC 10bit TrueHD 7.1].mkv",
+        "Marvel One-Shot - Agent Carter (2013) [2160p BluRay HDR10 DV HEVC 10bit DTS 5.1].mkv",
+        "Some Movie (2020) 1080p BluRay x264.mkv",
+    ]
+
+    def test_our_output_is_recognised(self):
+        for n in self.OURS:
+            self.assertTrue(history.is_our_master(n), n)
+
+    def test_native_dolby_vision_releases_are_not(self):
+        # these carry "HDR10 DV" but were never produced by the pipeline
+        for n in self.THEIRS:
+            self.assertFalse(history.is_our_master(n), n)
+
+    def test_the_short_mark_alone_is_not_enough(self):
+        self.assertFalse(history.is_our_master("Thing [HDR10 DV].mkv"))
+        self.assertTrue(history.is_our_master("Thing HDR10 DV upscaled.mkv"))
