@@ -91,6 +91,12 @@ body{
 .btn.lit{color:var(--graphite);border-color:rgba(255,255,255,.45);
   background:linear-gradient(180deg,var(--silver),var(--steel))}
 .btn[disabled]{opacity:.45;cursor:default}
+/* secondary header action: reads as a button, never competes with Activate */
+.btn.ghost{font-weight:500;color:var(--steel);border-color:rgba(255,255,255,.14);
+  background:rgba(255,255,255,.04)}
+.btn.ghost:hover{color:var(--steel-bright);background:rgba(255,255,255,.09)}
+.btn.ghost.on{color:var(--steel-bright);background:rgba(255,255,255,.12);
+  border-color:rgba(255,255,255,.3)}
 
 /* ---- header ---- */
 header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
@@ -242,8 +248,9 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 <header>
   <div class="brand"><h1>Visionary</h1><span class="sub" id="mode"></span></div>
   <span class="pill" id="status"><span class="dot"></span><span>Connecting</span></span>
-  <button class="act" id="histBtn" title="What Visionary has finished"
-          style="width:34px;height:32px"><svg><use href="#i-hist"/></svg></button>
+  <button class="btn ghost" id="histBtn" title="Everything Visionary has finished — and fix a file's audio">
+    <svg class="ic" style="vertical-align:-3px;color:inherit"><use href="#i-hist"/></svg>
+    <span style="margin-left:5px">Finished</span></button>
   <button class="btn" id="arm" disabled>&mdash;</button>
 </header>
 
@@ -885,8 +892,9 @@ $("histScan").addEventListener("click", async function(){
 
 $("histBtn").addEventListener("click", function(){
   histOpen = !histOpen;
+  $("histBtn").classList.toggle("on", histOpen);
   $("histSec").style.display = histOpen ? "" : "none";
-  if (histOpen) drawHistory();
+  if (histOpen){ drawHistory(); $("histSec").scrollIntoView({behavior: "smooth", block: "start"}); }
 });
 
 $("hist").addEventListener("click", async function(ev){

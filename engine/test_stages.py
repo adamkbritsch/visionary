@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 import audiogain
+import history
 import stages
 from orchestrator import episode_paths
 
@@ -14,6 +15,7 @@ def _paths(scratch):
 
 
 _BOOK_PATCH = None
+_HIST_PATCH = None
 
 
 def setUpModule():
@@ -21,14 +23,22 @@ def setUpModule():
     path for the whole module — a test run must never write into ~/.topaz-pipeline."""
     global _BOOK_PATCH
     import tempfile as _tf, os as _os
+    d = _tf.mkdtemp()
     _BOOK_PATCH = mock.patch.object(audiogain, "BOOK_FILE",
-                                    _os.path.join(_tf.mkdtemp(), "audio_gain.json"))
+                                    _os.path.join(d, "audio_gain.json"))
     _BOOK_PATCH.start()
+    # _upload records into the history book as well — same rule, same throwaway dir. Test
+    # fixtures ("S01E01", "ep (Extended Cut)") reached the REAL book before this existed.
+    global _HIST_PATCH
+    _HIST_PATCH = mock.patch.object(history, "BOOK_FILE", _os.path.join(d, "history.json"))
+    _HIST_PATCH.start()
 
 
 def tearDownModule():
     if _BOOK_PATCH is not None:
         _BOOK_PATCH.stop()
+    if _HIST_PATCH is not None:
+        _HIST_PATCH.stop()
 
 
 class Cleanup(unittest.TestCase):
