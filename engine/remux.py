@@ -142,18 +142,56 @@ def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks
     ]
 
 
+LOSSLESS_AUDIO = ("truehd", "mlp", "flac", "alac")
+
+
+def is_lossless_audio_codec(codec: str, profile: str = "") -> bool:
+    """Audio we will never transcode. Plain DTS core is lossy; DTS-HD MA is not."""
+    c, p = (codec or "").lower(), (profile or "").lower()
+    if any(c.startswith(x) for x in LOSSLESS_AUDIO) or c.startswith("pcm"):
+        return True
+    return c.startswith("dts") and ("ma" in p or "lossless" in p)
+
+
+def has_lossless_audio(path: str, ffprobe=FFPROBE) -> bool:
+    """True if ANY audio track is lossless — then none of them are touched. Unknown counts as
+    lossless: refusing to boost is recoverable (the Finished list can revise it later),
+    transcoding a TrueHD track is not."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
+                              "-show_entries", "stream=codec_name,profile",
+                              "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+    except Exception:
+        return True
+    if not out:
+        return True
+    for line in out.splitlines():
+        parts = line.split(",")
+        if is_lossless_audio_codec(parts[0], parts[1] if len(parts) > 1 else ""):
+            return True
+    return False
+
+
 def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
-                          orig_source: str, output: str) -> list:
+                          orig_source: str, output: str, gain_db: float = 0.0) -> list:
     """Single-pass ffmpeg mux for the MKV master: DV video (copy) + audio (from the CFR file) +
     ALL subtitles (from the original, incl. bitmap PGS). Unlike its mp4/mov muxer — which drops the
     Dolby Vision config box (that's why the MP4 path needs MP4Box) — ffmpeg's **Matroska** muxer
     PRESERVES the DOVI configuration record on copy. Validated on a real 8.1 master: DV + AAC + PGS
     all survive. Matroska also holds lossless audio (TrueHD/DTS-HD MA/PCM/FLAC) + bitmap subs, which
     is exactly why these titles route here instead of MP4."""
+    # SMART LOUDNESS BOOST reaches the MKV path too (user-caught 2026-08-18: a 4K master
+    # with AAC 5.1 shipped unboosted and was simply quiet). This branch used to skip the
+    # boost outright because Matroska is where LOSSLESS audio lives — but the rule is about
+    # the CODEC, not the container, and most MKV masters here carry AAC/AC3. The caller only
+    # passes a gain once has_lossless_audio() says every track is lossy.
+    boost = (["-filter:a", build_audio_boost_filter(gain_db),
+              "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
     return [ffmpeg, "-hide_banner", "-nostdin", "-y",
             "-i", dv_video, "-i", cfr_source, "-i", orig_source,
             "-map", "0:v:0", "-map", "1:a", "-map", "2:s?",   # video / all audio / all subs
-            "-c", "copy",
+            "-c", "copy", *boost,
             output]
 
 _MP4BOX_UNSAFE = re.compile(r"[+#:,@]")
@@ -433,10 +471,27 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                     capture_output=True, text=True, timeout=timeout)
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-                mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                    capture_output=True, text=True, timeout=timeout)
-                if mx.returncode != 0:
-                    return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
+                mkv_gain = 0.0
+                if audio_target_lufs and not has_lossless_audio(cfr_source, ffprobe):
+                    mkv_gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
+                                else boost_gain_db(measure_lufs(cfr_source, ffmpeg),
+                                                   audio_target_lufs))
+                for attempt in ([mkv_gain, 0.0] if mkv_gain > 0 else [0.0]):
+                    mx = subprocess.run(
+                        build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output,
+                                              gain_db=attempt),
+                        capture_output=True, text=True, timeout=timeout)
+                    if mx.returncode != 0:
+                        return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
+                    if attempt <= 0:
+                        break
+                    # Same landing rule as the MP4 path: a boost that misses is not shipped —
+                    # the copy-mux retry costs seconds because gain 0 stream-copies again.
+                    landed = measure_lufs(output, ffmpeg)
+                    if landed is not None and abs(landed - float(audio_target_lufs)) <= 1.5:
+                        audio_note = f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
+                        break
+                    audio_note = " · audio unboosted (landing off target — kept original)"
             else:
                 with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
                     mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output),

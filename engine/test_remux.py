@@ -621,3 +621,46 @@ class AudioDonorSyncGate(unittest.TestCase):
             res = remux.combine("winner.mkv", "donor.mkv", "winner.mkv", "o.mkv",
                                 rpu_profile="7.x", capped=False)
         self.assertTrue(res.ok)
+
+
+class MkvLoudnessBoost(unittest.TestCase):
+    """The MKV branch skipped the loudness boost outright because Matroska is where LOSSLESS
+    audio lives — but the rule is about the CODEC, not the container, and most masters here
+    carry AAC or AC3. A 4K master with AAC 5.1 shipped simply quiet (user-caught 2026-08-18)."""
+
+    def test_lossless_codecs_are_identified(self):
+        for c, p in (("truehd", ""), ("mlp", ""), ("flac", ""), ("alac", ""),
+                     ("pcm_s24le", ""), ("dts", "DTS-HD MA")):
+            self.assertTrue(remux.is_lossless_audio_codec(c, p), c)
+
+    def test_lossy_codecs_are_not(self):
+        for c, p in (("aac", "LC"), ("aac", "HE-AAC"), ("ac3", ""), ("eac3", ""),
+                     ("dts", "DTS"), ("opus", "")):
+            self.assertFalse(remux.is_lossless_audio_codec(c, p), c)
+
+    def test_a_gain_re_encodes_only_the_audio(self):
+        c = remux.build_mkv_mux_command("/ff", "/v.mp4", "/a.mkv", "/o.mkv", "/out.mkv", gain_db=6.0)
+        self.assertEqual(c[c.index("-c") + 1], "copy")          # video + subs untouched (DV survives)
+        self.assertEqual(c[c.index("-c:a") + 1], "aac_at")
+        self.assertIn("-filter:a", c)
+
+    def test_no_gain_is_a_pure_copy_mux(self):
+        c = remux.build_mkv_mux_command("/ff", "/v.mp4", "/a.mkv", "/o.mkv", "/out.mkv")
+        self.assertNotIn("aac_at", c)
+        self.assertNotIn("-filter:a", c)
+
+    def test_any_lossless_track_blocks_the_whole_boost(self):
+        # a lossy commentary beside a TrueHD main mix must not cause a transcode
+        with mock.patch.object(remux.subprocess, "run",
+                               return_value=mock.Mock(stdout="truehd,\naac,LC\n")):
+            self.assertTrue(remux.has_lossless_audio("/x.mkv"))
+        with mock.patch.object(remux.subprocess, "run",
+                               return_value=mock.Mock(stdout="aac,LC\naac,HE-AAC\n")):
+            self.assertFalse(remux.has_lossless_audio("/x.mkv"))
+
+    def test_an_unreadable_probe_refuses_to_boost(self):
+        # refusing is recoverable (revise it later); transcoding a TrueHD track is not
+        with mock.patch.object(remux.subprocess, "run", side_effect=OSError("nope")):
+            self.assertTrue(remux.has_lossless_audio("/x.mkv"))
+        with mock.patch.object(remux.subprocess, "run", return_value=mock.Mock(stdout="")):
+            self.assertTrue(remux.has_lossless_audio("/x.mkv"))
