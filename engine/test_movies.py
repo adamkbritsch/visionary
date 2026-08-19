@@ -278,10 +278,15 @@ class DvRowVisibility(unittest.TestCase):
         self.assertIn("DvMatch (2003) [2160p].mkv", names)         # counterpart known
         self.assertNotIn("DvNoMatch (2002) [2160p].mkv", names)    # no counterpart yet
         self.assertNotIn("DvAtmos (2004) [2160p TrueHD Atmos].mkv", names)  # goal reached
-        # the sweep got the DV rows WITHOUT Atmos (never wastes searches on done movies)
+        # EVERY movie is swept now, not just the DV ones — a 1080p movie has the most to
+        # gain from a combine and could never learn a counterpart existed. The one exclusion
+        # stands: an already-Atmos DV movie has nothing left to gain, so it burns no search.
         swept = [e["name"] for e in sw.call_args.args[0]]
         self.assertEqual(sorted(swept),
-                         ["DvMatch (2003) [2160p].mkv", "DvNoMatch (2002) [2160p].mkv"])
+                         ["DvMatch (2003) [2160p].mkv", "DvNoMatch (2002) [2160p].mkv",
+                          "Plain (2001) [2160p HDR10 TrueHD Atmos].mkv"])
+        # and each entry carries whether it is DV, so the sweep knows when to Atmos-probe
+        self.assertTrue(all("has_dv" in e for e in sw.call_args.args[0]))
 
 
 class NameAdvertisedDv(unittest.TestCase):

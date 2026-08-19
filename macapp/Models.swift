@@ -213,6 +213,8 @@ struct MovieItemDTO: Codable, Identifiable {
     var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
     var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
     var has_dv: Bool?      // already Dolby Vision — badged, combine-only (no plain add)
+    var companion: Bool?   // a seedbox counterpart is KNOWN to exist, so the best-of combine is
+                           // worth offering on this row whatever its resolution
     var combine: Bool?     // queued as a COMPANION COMBINE (best-of merge with a seedbox copy)
     var id: String { name ?? title ?? "" }
 

@@ -2271,7 +2271,11 @@ private struct MovieMode: View {
                                                 detail: m.has_dv == true
                                                     ? [m.pipelineHint, "already DV — companion on the seedbox"]
                                                         .filter { !$0.isEmpty }.joined(separator: " — ")
-                                                    : m.pipelineHint)
+                                                    : [m.pipelineHint,
+                                                       // the combine is no longer DV-only: say so where a
+                                                       // counterpart is actually known to exist
+                                                       m.companion == true ? "seedbox companion available" : ""]
+                                                        .filter { !$0.isEmpty }.joined(separator: " — "))
                                  },
                                  disabled: !store.moviesReachable) { id in
                     if let m = store.movieLibrary.first(where: { $0.id == id }) {
@@ -2387,7 +2391,8 @@ private struct MovieRow: View {
                         .font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.steelBright)
                         .padding(.horizontal, 7).padding(.vertical, 2)
                         .background(Capsule().fill(Color.white.opacity(0.07)))
-                        .help("Best-of merge with its seedbox companion (DV + best audio)")
+                        .help("Best-of merge with its seedbox companion — the better video base, "
+                              + "real DV if either copy has it, and the best audio of the two")
                 } else {
                     Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
                         .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)

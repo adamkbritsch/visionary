@@ -630,7 +630,7 @@ def _probe_nas_atmos(m: dict) -> bool | None:
 
 
 def sweep_counterparts(entries: list, on_update=None) -> None:
-    """Background: for each DV movie, (1) PROBE whether its audio is already Dolby Atmos
+    """Background: for each movie, (1) for DV rows only, PROBE whether the audio is already Dolby Atmos
     (goal reached → hidden, and the seedbox search is skipped entirely) and (2) ask the
     seedbox for a counterpart. Drives the picker's DV-row visibility (user-dictated:
     Atmos movies and counterpart-less DV movies are not listed). One daemon at a time,
@@ -650,7 +650,11 @@ def sweep_counterparts(entries: list, on_update=None) -> None:
                 e = entry(m["name"])
                 if e.get("status"):           # active pairing — don't interfere
                     continue
-                if e.get("nas_atmos") is None:
+                # The Atmos probe exists to decide whether a DV row is worth showing — an
+                # already-Atmos DV movie has nothing left to gain. It says nothing about a
+                # non-DV movie, whose combine is about the VIDEO, so skip it there rather
+                # than burning a head-probe per title and skipping the search on a hit.
+                if m.get("has_dv") and e.get("nas_atmos") is None:
                     atmos = _probe_nas_atmos(m)
                     if atmos is not None:
                         mark(m["name"], None, nas_atmos=atmos,
@@ -660,7 +664,7 @@ def sweep_counterparts(entries: list, on_update=None) -> None:
                         e = entry(m["name"])
                     if atmos:
                         continue              # already Atmos — hidden; don't burn a search
-                elif e.get("nas_atmos"):
+                elif m.get("has_dv") and e.get("nas_atmos"):
                     continue
                 if time.time() - (e.get("counterpart_at") or 0) < COUNTERPART_TTL:
                     continue

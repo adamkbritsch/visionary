@@ -400,7 +400,7 @@ class CounterpartSweep(unittest.TestCase):
             companion.sweep_counterparts(entries, on_update=on_update)
 
     def test_sweep_caches_the_answer(self):
-        self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m"}],
+        self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m", "has_dv": True}],
                     [[{"name": "a REMUX.mkv", "path": "/seedbox/a", "size": 9,
                        "is_dir": False}]])
         e = companion.entry("a.mkv")
@@ -411,18 +411,18 @@ class CounterpartSweep(unittest.TestCase):
         self.assertTrue(companion.counterparts()["a.mkv"]["counterpart"])
 
     def test_no_match_caches_false(self):
-        self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m"}], [[]])
+        self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m", "has_dv": True}], [[]])
         self.assertFalse(companion.entry("b.mkv")["counterpart"])
 
     def test_fresh_answers_are_not_reswept(self):
         companion.mark("c.mkv", None, counterpart=True, counterpart_at=__import__("time").time())
-        self._sweep([{"name": "c.mkv", "title": "C", "dir": "/m"}],
+        self._sweep([{"name": "c.mkv", "title": "C", "dir": "/m", "has_dv": True}],
                     AssertionError("fresh answer must not re-search"))
         self.assertTrue(companion.entry("c.mkv")["counterpart"])
 
     def test_active_pairing_is_never_touched(self):
         companion.mark("d.mkv", "ready", verdict={"video_from": "nas"})
-        self._sweep([{"name": "d.mkv", "title": "D", "dir": "/m"}],
+        self._sweep([{"name": "d.mkv", "title": "D", "dir": "/m", "has_dv": True}],
                     AssertionError("active flow must not be swept"))
         self.assertEqual(companion.entry("d.mkv")["status"], "ready")
 
@@ -468,7 +468,7 @@ class AtmosProbeInSweep(unittest.TestCase):
 
     def test_atmos_movie_is_marked_and_never_searched(self):
         ticks = []
-        self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m"}],
+        self._sweep([{"name": "a.mkv", "title": "A", "dir": "/m", "has_dv": True}],
                     AssertionError("Atmos movie must not burn a search"),
                     atmos=True, on_update=lambda: ticks.append(1))
         e = companion.entry("a.mkv")
@@ -479,7 +479,7 @@ class AtmosProbeInSweep(unittest.TestCase):
 
     def test_non_atmos_movie_is_probed_then_searched(self):
         ticks = []
-        self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m"}],
+        self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m", "has_dv": True}],
                     [[{"name": "b REMUX.mkv", "path": "/seedbox/b", "size": 9,
                        "is_dir": False}]],
                     atmos=False, on_update=lambda: ticks.append(1))
@@ -489,7 +489,8 @@ class AtmosProbeInSweep(unittest.TestCase):
         self.assertEqual(len(ticks), 2)          # once per answer
 
     def test_probe_failure_leaves_atmos_unknown_for_retry(self):
-        self._sweep([{"name": "c.mkv", "title": "C", "dir": "/m"}], [[]], atmos=None)
+        self._sweep([{"name": "c.mkv", "title": "C", "dir": "/m", "has_dv": True}], [[]],
+                    atmos=None)
         e = companion.entry("c.mkv")
         self.assertNotIn("nas_atmos", e)         # unanswered → re-probed next sweep
         self.assertFalse(e["counterpart"])       # the search still ran (fail-open on probe)
@@ -530,3 +531,50 @@ class ImaxPriority(unittest.TestCase):
                                     "a IMAX 2160p REMUX.mkv", "b 2160p WEB.mkv")
         self.assertIn("IMAX", v["specs"]["nas"])
         self.assertNotIn("IMAX", v["specs"]["remote"])
+
+
+class CombineAppliesToEveryMovie(unittest.TestCase):
+    """The best-of combine was reachable for any queued movie, but nothing ever LOOKED for a
+    seedbox copy unless the NAS copy was already Dolby Vision — so a 1080p movie could never
+    learn a better counterpart existed, which is the case with the MOST to gain
+    (user-dictated 2026-08-19)."""
+
+    def setUp(self):
+        import tempfile, os
+        p = mock.patch.object(companion, "BOOK_FILE",
+                              os.path.join(tempfile.mkdtemp(), "c.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def _sweep(self, entries, results):
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        probed = []
+        with mock.patch.object(companion, "configured", return_value=True), \
+             mock.patch.object(companion.threading, "Thread", T), \
+             mock.patch.object(companion.time, "sleep", lambda s: None), \
+             mock.patch.object(companion, "_probe_nas_atmos",
+                               side_effect=lambda m: probed.append(m["name"]) or False), \
+             mock.patch.object(companion, "search", side_effect=results):
+            companion.sweep_counterparts(entries)
+        return probed
+
+    def test_a_1080p_movie_gets_a_counterpart_search(self):
+        hit = [[{"name": "x 2160p REMUX.mkv", "path": "/seedbox/x", "size": 9, "is_dir": False}]]
+        self._sweep([{"name": "x (1999) [1080p BluRay].mkv", "title": "X", "dir": "/m",
+                      "has_dv": False}], hit)
+        e = companion.entry("x (1999) [1080p BluRay].mkv")
+        self.assertTrue(e["counterpart"])
+        self.assertTrue(companion.counterparts()["x (1999) [1080p BluRay].mkv"]["counterpart"])
+
+    def test_a_non_dv_row_is_not_atmos_probed(self):
+        # the probe only decides whether a DV row is worth showing; a non-DV combine is about
+        # the VIDEO, so probing every title would burn a head-read per movie for nothing
+        probed = self._sweep([{"name": "y [1080p].mkv", "title": "Y", "dir": "/m",
+                               "has_dv": False}], [[]])
+        self.assertEqual(probed, [])
+
+    def test_a_dv_row_is_still_atmos_probed(self):
+        probed = self._sweep([{"name": "z [2160p].mkv", "title": "Z", "dir": "/m",
+                               "has_dv": True}], [[]])
+        self.assertEqual(probed, ["z [2160p].mkv"])

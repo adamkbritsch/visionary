@@ -222,14 +222,23 @@ def refresh_library() -> list:
         wm = None
     movies = parse_movies(list_movie_entries(), load_movies_dv_manifest(), watched_map=wm)
     import companion
-    companion.sweep_counterparts([{"name": m["name"], "title": m["title"], "dir": m["dir"]}
+    # EVERY movie gets a counterpart search, not just the DV ones (user-dictated
+    # 2026-08-19). The combine was reachable for any queued movie all along — but nothing
+    # ever LOOKED for a seedbox copy unless the NAS copy was already Dolby Vision, so a
+    # 1080p movie could never learn it had a better counterpart sitting there. That is the
+    # case with the most to gain from a combine, not the least.
+    companion.sweep_counterparts([{"name": m["name"], "title": m["title"], "dir": m["dir"],
+                                   "has_dv": m["has_dv"]}
                                   for m in movies
-                                  if m["has_dv"] and not has_atmos_name(m["name"])],
+                                  if not (m["has_dv"] and has_atmos_name(m["name"]))],
                                  on_update=_refilter_lib)
     cmap = companion.counterparts()
     _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
                       "watched": m["watched"], "tags": m["tags"], "route": m["route"],
-                      "has_dv": m["has_dv"]}
+                      "has_dv": m["has_dv"],
+                      # a seedbox copy is KNOWN to exist -> the combine is worth offering on
+                      # this row, whatever its resolution
+                      "companion": bool((cmap.get(m["name"]) or {}).get("counterpart"))}
                      for m in movies
                      if not m["has_dv"] or _dv_row_visible(m, cmap)]
     return _CACHE["lib"]
