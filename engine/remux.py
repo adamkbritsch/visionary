@@ -95,6 +95,24 @@ def parse_integrated_lufs(ebur_stderr: str):
     return float(m.group(1)) if m else None
 
 
+def landing_ok(landed, target, gain, measured=None, tol: float = 1.5) -> bool:
+    """Did the boost do what it was TOLD, rather than reach a goal it could not?
+
+    The test used to be "did it land on target", which is unreachable whenever the gain hits
+    AUDIO_MAX_GAIN_DB: a -30 LUFS mix boosted the full +12 lands at -18, misses a +/-1.5
+    window around -16, and the perfectly good result is discarded — so the file ships at -30,
+    the quietest possible outcome (live-caught 2026-08-19 on a film mix under -28 LUFS, which
+    is exactly the case a boost exists for). A CAPPED boost is judged on whether the level
+    moved by the amount asked for; only an uncapped one is expected to hit the target.
+    """
+    if landed is None:
+        return False
+    if gain >= AUDIO_MAX_GAIN_DB and measured is not None:
+        return abs(float(landed) - (float(measured) + float(gain))) <= tol
+    return abs(float(landed) - float(target)) <= tol
+
+
+
 def boost_gain_db(measured, target, max_gain: float = AUDIO_MAX_GAIN_DB) -> float:
     """Gain to reach `target` LUFS — boost-only, clamped, 0.0 when unknown/off/negligible."""
     if measured is None or not target:
@@ -404,8 +422,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             # back to a bit-exact copy of the original audio (never fails the 75-min x265 pass over audio).
             # `audio_gain_db` = a gain already decided for this item (TV: the SEASON's, set
             # by its first episode — see audiogain). Only measure when nobody decided for us.
+            measured_lufs = measure_lufs(cfr_source, ffmpeg)
             gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
-                    else boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs))
+                    else boost_gain_db(measured_lufs, audio_target_lufs))
             tracks = output + ".tracks.mp4"   # temp, next to output (on scratch)
             subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
@@ -427,7 +446,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     break
                 landed = measure_lufs(tracks, ffmpeg)
                 want = float(audio_target_lufs)
-                if landed is not None and abs(landed - want) <= 1.5:
+                if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
                 audio_note = " · audio unboosted (landing off target — kept original)"
@@ -471,10 +490,11 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                     capture_output=True, text=True, timeout=timeout)
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-                mkv_gain = 0.0
+                mkv_gain, mkv_measured = 0.0, None
                 if audio_target_lufs and not has_lossless_audio(cfr_source, ffprobe):
+                    mkv_measured = measure_lufs(cfr_source, ffmpeg)
                     mkv_gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
-                                else boost_gain_db(measure_lufs(cfr_source, ffmpeg),
+                                else boost_gain_db(mkv_measured,
                                                    audio_target_lufs))
                 for attempt in ([mkv_gain, 0.0] if mkv_gain > 0 else [0.0]):
                     mx = subprocess.run(
@@ -488,7 +508,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     # Same landing rule as the MP4 path: a boost that misses is not shipped —
                     # the copy-mux retry costs seconds because gain 0 stream-copies again.
                     landed = measure_lufs(output, ffmpeg)
-                    if landed is not None and abs(landed - float(audio_target_lufs)) <= 1.5:
+                    if landing_ok(landed, float(audio_target_lufs), attempt, measured=mkv_measured):
                         audio_note = f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
                         break
                     audio_note = " · audio unboosted (landing off target — kept original)"

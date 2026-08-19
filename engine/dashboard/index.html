@@ -932,6 +932,11 @@ function elapsedClock(secs){
    being re-encoded is cut back out and refills with its real frame progress. */
 function drawBar(lead){
   var bar = $("nowBar");
+  // NO BAR WITHOUT A NUMBER: a phase that can't report progress drew an empty track for as
+  // long as it ran, which reads as a stall. The step label already says what is happening.
+  var known = lead && lead.pct !== null && lead.pct !== undefined;
+  bar.style.display = known ? "" : "none";
+  if (!known) return;
   var live = document.querySelector("#nowBar .live"), done = document.querySelector("#nowBar .done");
   var notch = bar.querySelector("u"), cut = bar.querySelector(".cut"), refill = bar.querySelector(".refill");
   var pct = lead && lead.pct !== null ? Math.max(0, Math.min(1, lead.pct / 100)) : 0;

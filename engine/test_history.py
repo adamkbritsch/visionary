@@ -63,17 +63,23 @@ class Revise(unittest.TestCase):
         def fake_download(remote, ldir, **kw):
             return True, local, "ok"
 
-        def fake_run(cmd, **kw):
+        seen["pcts"] = []
+
+        def fake_run(cmd, total, on_pct):
             seen["cmd"] = cmd
-            open(cmd[-1], "wb").write(b"y")
-            return mock.Mock(returncode=0, stderr="")
+            with open(cmd[-1], "wb") as fh:
+                fh.write(b"y")
+            on_pct(25.0); on_pct(75.0)          # the pass reports as it goes
+            seen["pcts"].append(total)
+            return 0, ""
 
         with mock.patch.object(transfer, "download", side_effect=fake_download), \
              mock.patch.object(transfer, "upload",
                                return_value=(up, "/Media/TV/S04E10.revised.mp4", "ok")), \
              mock.patch.object(history, "_swap_in", return_value=(swap, "swapped in")) as sw, \
              mock.patch.object(remux, "measure_lufs", side_effect=[measured, landed]), \
-             mock.patch.object(history.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(history, "_run_with_progress", side_effect=fake_run), \
+             mock.patch.object(history, "_duration", return_value=7200.0), \
              mock.patch.object(settings, "get_settings",
                                return_value={"audio_target_lufs": -16}):
             out = history.revise_audio("/Media/TV/S04E10.mp4", scratch_dir=self.d)
@@ -216,3 +222,42 @@ class OnlyOurOwnMasters(unittest.TestCase):
     def test_the_short_mark_alone_is_not_enough(self):
         self.assertFalse(history.is_our_master("Thing [HDR10 DV].mkv"))
         self.assertTrue(history.is_our_master("Thing HDR10 DV upscaled.mkv"))
+
+
+class RevisionProgress(unittest.TestCase):
+    """The audio pass is the long pole — a full re-encode across a two-hour film — and it
+    reported nothing, so the pipeline row sat with a frozen bar for minutes while work was
+    happening. A bar that cannot move should not be drawn; better still, make it move."""
+
+    def test_the_audio_pass_publishes_real_percentages(self):
+        seen = []
+        with mock.patch.object(history, "_publish", side_effect=lambda i: seen.append(i)):
+            history._step("X", "remux", pct=41.5, step="applying +12.0 dB")
+        self.assertEqual(seen[0]["pct"], 41.5)
+        self.assertEqual(seen[0]["stage"], "remux")
+
+    def test_progress_parsing_turns_out_time_into_a_percentage(self):
+        import subprocess
+        pcts = []
+        fake = mock.Mock()
+        fake.stdout = iter(["out_time_ms=0\n", "out_time_ms=3600000000\n",
+                            "frame=1\n", "out_time_ms=7200000000\n"])
+        fake.stderr = mock.Mock(read=lambda: "")
+        fake.returncode = 0
+        fake.wait = lambda: None
+        with mock.patch.object(subprocess, "Popen", return_value=fake):
+            rc, _tail = history._run_with_progress(["ff"], 7200.0, pcts.append)
+        self.assertEqual(rc, 0)
+        self.assertEqual(pcts, [0.0, 50.0, 99.0])     # capped at 99 until it really finishes
+
+    def test_an_unknown_duration_reports_no_number_rather_than_a_fake_one(self):
+        import subprocess
+        pcts = []
+        fake = mock.Mock()
+        fake.stdout = iter(["out_time_ms=3600000000\n"])
+        fake.stderr = mock.Mock(read=lambda: "")
+        fake.returncode = 0
+        fake.wait = lambda: None
+        with mock.patch.object(subprocess, "Popen", return_value=fake):
+            history._run_with_progress(["ff"], 0.0, pcts.append)
+        self.assertEqual(pcts, [])

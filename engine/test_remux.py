@@ -664,3 +664,27 @@ class MkvLoudnessBoost(unittest.TestCase):
             self.assertTrue(remux.has_lossless_audio("/x.mkv"))
         with mock.patch.object(remux.subprocess, "run", return_value=mock.Mock(stdout="")):
             self.assertTrue(remux.has_lossless_audio("/x.mkv"))
+
+
+class CappedBoostLanding(unittest.TestCase):
+    """A boost that hits AUDIO_MAX_GAIN_DB cannot reach the target, and demanding it did threw
+    the work away: a -30 LUFS mix boosted the full +12 lands at -18, missed a +/-1.5 window
+    around -16, and shipped UNBOOSTED at -30 — the quietest possible outcome, in exactly the
+    case a boost exists for (live-caught 2026-08-19 on a film mix under -28)."""
+
+    def test_a_capped_boost_is_judged_on_movement(self):
+        self.assertTrue(remux.landing_ok(-18.0, -16.0, remux.AUDIO_MAX_GAIN_DB, measured=-30.0))
+
+    def test_a_capped_boost_that_did_nothing_still_fails(self):
+        self.assertFalse(remux.landing_ok(-29.5, -16.0, remux.AUDIO_MAX_GAIN_DB, measured=-30.0))
+
+    def test_an_uncapped_boost_must_still_hit_the_target(self):
+        self.assertTrue(remux.landing_ok(-16.2, -16.0, 6.0, measured=-22.0))
+        self.assertFalse(remux.landing_ok(-11.0, -16.0, 6.0, measured=-22.0))   # overshot
+
+    def test_no_measurement_is_a_failure(self):
+        self.assertFalse(remux.landing_ok(None, -16.0, 6.0))
+
+    def test_a_capped_boost_without_a_reference_falls_back_to_the_target(self):
+        # no `measured` to compare against -> the old, stricter rule
+        self.assertFalse(remux.landing_ok(-18.0, -16.0, remux.AUDIO_MAX_GAIN_DB))

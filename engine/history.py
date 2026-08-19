@@ -141,6 +141,48 @@ def _mark(nas_path, **fields) -> None:
         _write(rows)
 
 
+def _duration(path) -> float:
+    """Seconds, for turning ffmpeg's out_time into a percentage. 0 when unknown — the caller
+    then reports no number at all rather than a fabricated one."""
+    import subprocess as sp
+    try:
+        out = sp.run(["/opt/homebrew/bin/ffprobe", "-v", "error", "-show_entries",
+                      "format=duration", "-of", "csv=p=0", path],
+                     capture_output=True, text=True, timeout=60).stdout.strip()
+        return float(out or 0)
+    except Exception:
+        return 0.0
+
+
+def _run_with_progress(cmd, total_secs, on_pct):
+    """Run ffmpeg and report REAL progress from its -progress stream.
+
+    This pass is the long pole — a full audio re-encode across a two-hour film — and it used
+    to report nothing at all, so the bar sat frozen for minutes while work was happening. A
+    bar that cannot move should not be drawn; the fix is to make it move.
+    Returns (returncode, stderr_tail).
+    """
+    import subprocess as sp
+    p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, text=True, bufsize=1)
+    last = -1.0
+    try:
+        for line in p.stdout:
+            if not line.startswith("out_time_ms=") or total_secs <= 0:
+                continue
+            try:
+                secs = int(line.split("=", 1)[1].strip()) / 1_000_000.0
+            except ValueError:
+                continue
+            pct = max(0.0, min(99.0, secs / total_secs * 100))
+            if pct - last >= 0.5:                 # don't spam the state dict every frame
+                last = pct
+                on_pct(round(pct, 1))
+    finally:
+        p.wait()
+        tail = (p.stderr.read() or "") if p.stderr else ""
+    return p.returncode, tail
+
+
 def _probe_local_audio(path) -> tuple:
     import subprocess
     try:
@@ -331,18 +373,21 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
 
         stem, ext = os.path.splitext(os.path.basename(nas_path))
         fixed = os.path.join(d, stem + ".revised" + ext)
-        cmd = [remux.FFMPEG, "-hide_banner", "-nostdin", "-y", "-i", work,
+        cmd = [remux.FFMPEG, "-hide_banner", "-nostdin", "-y",
+               "-progress", "pipe:1", "-nostats", "-i", work,
                "-map", "0", "-c", "copy",                 # keep video + subs bit-exact (DV intact)
                "-c:a", "aac_at", "-b:a", "384k",
                "-filter:a", remux.build_audio_boost_filter(gain), fixed]
-        _step(label, "remux", step=f"applying +{gain:.1f} dB", kind=kind)
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        if r.returncode != 0 or not os.path.exists(fixed):
-            return {"status": "remux-failed", "detail": (r.stderr or "")[-300:]}
+        _step(label, "remux", pct=0, step=f"applying +{gain:.1f} dB", kind=kind)
+        rc, tail = _run_with_progress(
+            cmd, _duration(work),
+            lambda pct: _step(label, "remux", pct=pct, step=f"applying +{gain:.1f} dB", kind=kind))
+        if rc != 0 or not os.path.exists(fixed):
+            return {"status": "remux-failed", "detail": tail[-300:]}
 
         _step(label, "remux", step="verifying the new level", kind=kind)
         landed = remux.measure_lufs(fixed)
-        if landed is None or abs(landed - float(target)) > 1.5:
+        if not remux.landing_ok(landed, float(target), gain, measured=measured):
             # Same rule the remux stage uses: a bad landing is not shipped.
             return {"status": "landing-off", "measured": measured, "landed": landed,
                     "target": target}

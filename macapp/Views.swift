@@ -1261,8 +1261,14 @@ private struct LaneProgress: View {
                 Text(step).font(.system(size: 11, weight: .medium))
                     .foregroundStyle(DS.steel).lineLimit(1)
             }
-            SteelBar(completed: completed, live: live, notches: notches, flashKey: done,
-                     repairLo: rLo, repairHi: rHi, repairFrac: rFrac)
+            // NO BAR WITHOUT A NUMBER (user-dictated 2026-08-19). A phase that cannot report
+            // progress used to draw an empty track for as long as it ran, which reads as a
+            // stalled encode rather than as "this step has no percentage" — the step label
+            // already says what is happening, so the track just lies.
+            if !stepOnly {
+                SteelBar(completed: completed, live: live, notches: notches, flashKey: done,
+                         repairLo: rLo, repairHi: rHi, repairFrac: rFrac)
+            }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(stepOnly ? "—" : String(format: "%.0f%%", pct))
                     .font(.system(size: primary ? 17 : 13, weight: .semibold)).monospacedDigit()
