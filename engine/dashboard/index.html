@@ -379,7 +379,7 @@ function pipelineItems(o){
               pct: (same && p.pct !== undefined) ? p.pct : null,
               notches: same ? (p.notches || []) : [], raw: same ? p : {}});
   }
-  [o.finishing, o.finishing2].forEach(function(f){
+  [o.finishing, o.finishing2, o.revising].forEach(function(f){
     if (!f) return;
     out.push({o: {kind: f.youtube ? "youtube" : f.movie ? "movie" : "episode",
                   ep: f.ep, series: f.series, title: f.title, name: f.source},
@@ -901,10 +901,7 @@ $("hist").addEventListener("click", async function(ev){
   var b = ev.target.closest("[data-rev]"); if (!b) return;
   var r = ($("hist")._rows || [])[parseInt(b.dataset.rev, 10)];
   if (!r) return;
-  if (!confirm("Fix the audio on \u201C" + (r.title || "this file") + "\u201D?\n\n" +
-               "It re-measures the published file and re-applies the loudness boost in " +
-               "place. Video and subtitles are copied untouched, so it takes minutes.")) return;
-  b.disabled = true;
+  b.disabled = true;   // no prompt: it starts at once and shows up in the pipeline above
   try {
     var out = await (await fetch("/api/revise-audio", {method: "POST",
       headers: {"Content-Type": "application/json"},

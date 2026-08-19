@@ -81,6 +81,8 @@ struct OrchestratorDTO: Codable {
                                // as channel+title, not the next TV episode inferred from up-next)
     var finishing: FinishingDTO?   // the item the FINISHER thread is draining (remux/upload/cleanup)
     var finishing2: FinishingDTO?  // the 2nd remux lane (backlog drain only — usually nil)
+    var revising: FinishingDTO?    // an audio revision from Finished — deliberately lane-SHAPED so
+                                   // the existing lane view renders it with no new code
     var plex_playing: Bool?        // a Plex client is streaming → the prefetcher is standing down
 }
 

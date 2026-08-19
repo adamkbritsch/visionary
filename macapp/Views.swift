@@ -758,7 +758,7 @@ struct PipelineCard: View {
         // win, so a still-remuxing lane 2 was drawn under UPLOAD, segment counter and all,
         // reading as if two episodes were being uploaded at once. Nothing was: the engine had
         // them on separate stages and _upload_lock serializes NAS pushes anyway.
-        let finStages: Set<String> = Set([o?.finishing, o?.finishing2]
+        let finStages: Set<String> = Set([o?.finishing, o?.finishing2, o?.revising]
             .compactMap { PipelineCard.laneLive($0) ? $0?.stage : nil })
         let activeCount = (runStage != nil ? 1 : 0) + finStages.subtracting([runStage ?? ""]).count
         let twoUp = activeCount >= 2
@@ -868,7 +868,7 @@ struct PipelineCard: View {
     /// EVERY place that reads both lanes goes through this, so the card rows and the
     /// header's dual percentage can never disagree on which lane is which.
     static func lanesInDisplayOrder(_ o: OrchestratorDTO?) -> [FinishingDTO] {
-        let lanes = [o?.finishing, o?.finishing2].compactMap { $0 }
+        let lanes = [o?.finishing, o?.finishing2, o?.revising].compactMap { $0 }
         return lanes.enumerated().sorted { a, b in
             switch (a.element.episodeOrdinal, b.element.episodeOrdinal) {
             case let (x?, y?): return x == y ? a.offset < b.offset
@@ -2362,7 +2362,7 @@ private struct MovieRow: View {
     private var inFlight: Bool {
         let o = store.state?.orchestrator
         if o?.current?.kind == "movie" && o?.current?.name == m.name { return true }
-        for f in [o?.finishing, o?.finishing2] {
+        for f in [o?.finishing, o?.finishing2, o?.revising] {
             if let f, f.movie == true, f.source == m.name { return true }
         }
         return false
@@ -2793,7 +2793,6 @@ private struct ImportedGroup: View {
 /// stream-copied, which leaves Dolby Vision untouched and takes minutes.
 struct HistoryPopover: View {
     @EnvironmentObject var store: AppStore
-    @State private var confirming: HistoryItemDTO? = nil
 
     private func when(_ ts: Int?) -> String {
         guard let ts, ts > 0 else { return "" }
@@ -2854,12 +2853,13 @@ struct HistoryPopover: View {
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(Capsule().fill(Color.white.opacity(0.08)))
             } else if it.can_revise == true {
-                Button { confirming = it } label: {
+                Button { Task { await store.reviseAudio(it) } } label: {
                     Image(systemName: "waveform").font(.system(size: 12))
                         .frame(width: 26, height: 24).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
-                .help("Fix audio — re-measure this file and re-apply the loudness boost, in place")
+                .help("Fix audio now — re-measures this file and re-applies the loudness boost "
+                      + "in place; watch it in the pipeline")
             } else {
                 // Say WHY rather than showing a dead control (hide-inert-UI): the only
                 // refusal is lossless audio, which the pipeline never re-encodes.
@@ -2869,19 +2869,6 @@ struct HistoryPopover: View {
         }
         .padding(.horizontal, 10).padding(.vertical, 8)
         .overlay(alignment: .top) { Divider().opacity(0.35) }
-        .confirmationDialog("Fix the audio on \"\(confirming?.title ?? "this file")\"?",
-                            isPresented: Binding(get: { confirming?.id == it.id },
-                                                 set: { if !$0 { confirming = nil } }),
-                            titleVisibility: .visible) {
-            Button("Fix audio") {
-                Task { await store.reviseAudio(it) }
-                confirming = nil
-            }
-            Button("Cancel", role: .cancel) { confirming = nil }
-        } message: {
-            Text("Re-measures the published file and re-applies the loudness boost in place. "
-                 + "Video and subtitles are copied untouched, so it takes minutes.")
-        }
     }
 }
 

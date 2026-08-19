@@ -230,6 +230,23 @@ def scan(limit: int = 400) -> dict:
     return {"status": "ok", "found": found, "added": added}
 
 
+def _publish(info) -> None:
+    """Put the running revision on the PIPELINE surface, shaped exactly like a finisher lane
+    ({ep, stage, pct, step}). Both front ends already render those lanes, so a revision shows
+    up where the work shows up instead of only as a badge in a list — and `None` clears it.
+    Best-effort: a display failure must never affect the revision itself."""
+    try:
+        import orchestrator
+        orchestrator.ORCH.state["revising"] = info
+    except Exception:
+        pass
+
+
+def _step(title, stage, *, pct=None, step=None, kind="movie") -> None:
+    _publish({"ep": title, "stage": stage, "pct": pct, "step": step,
+              "movie": kind == "movie", "youtube": kind == "youtube", "revise": True})
+
+
 def _swap_in(revised_remote: str, original_remote: str) -> tuple:
     """Put the revised file in the master's place: verify it is on the NAS at the expected
     size, then delete the original and rename over it. Verification first, because the
@@ -280,23 +297,32 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
         _revising.add(nas_path)
     work = ""
     fixed = ""
+    label = row.get("title") or os.path.basename(nas_path)
+    kind = row.get("kind") or "movie"
     try:
         target = settings.get_settings().get("audio_target_lufs", -16) or -16
         d = scratch_dir or scratch_mod.default_scratch()
         _mark(nas_path, revising_note="downloading")
-        got, work, msg = transfer.download(nas_path, d)
+        _step(label, "download", pct=0, step="fetching the master", kind=kind)
+        got, work, msg = transfer.download(
+            nas_path, d,
+            on_progress=lambda done, total: _step(
+                label, "download", pct=(round(done / total * 100, 1) if total else None),
+                step="fetching the master", kind=kind))
         if not got:
             return {"status": "download-failed", "detail": msg}
 
         # AUTHORITATIVE lossless check — the file is here now, so stop guessing from the
         # name. Refusing here costs a download; shipping a transcoded lossless track would
         # cost the track.
+        _step(label, "remux", step="checking the audio track", kind=kind)
         codec, profile = _probe_local_audio(work)
         if is_lossless(codec, profile):
             _mark(nas_path, audio=codec, audio_profile=profile)
             return {"status": "refused", "detail": f"lossless audio ({codec}) — never re-encoded"}
         _mark(nas_path, audio=codec, audio_profile=profile)
 
+        _step(label, "remux", step="measuring loudness", kind=kind)
         measured = remux.measure_lufs(work)
         gain = remux.boost_gain_db(measured, target)
         if gain <= 0:
@@ -309,10 +335,12 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
                "-map", "0", "-c", "copy",                 # keep video + subs bit-exact (DV intact)
                "-c:a", "aac_at", "-b:a", "384k",
                "-filter:a", remux.build_audio_boost_filter(gain), fixed]
+        _step(label, "remux", step=f"applying +{gain:.1f} dB", kind=kind)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if r.returncode != 0 or not os.path.exists(fixed):
             return {"status": "remux-failed", "detail": (r.stderr or "")[-300:]}
 
+        _step(label, "remux", step="verifying the new level", kind=kind)
         landed = remux.measure_lufs(fixed)
         if landed is None or abs(landed - float(target)) > 1.5:
             # Same rule the remux stage uses: a bad landing is not shipped.
@@ -325,7 +353,12 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
         # then — the sole exposed window is a delete+rename measured in milliseconds, and a
         # failure leaves the revised file plainly named on the NAS rather than a hole.
         _mark(nas_path, revising_note="uploading")
-        up, revised_remote, umsg = transfer.upload(fixed, os.path.dirname(nas_path))
+        _step(label, "upload", pct=0, step="putting it back", kind=kind)
+        up, revised_remote, umsg = transfer.upload(
+            fixed, os.path.dirname(nas_path),
+            on_progress=lambda done, total: _step(
+                label, "upload", pct=(round(done / total * 100, 1) if total else None),
+                step="putting it back", kind=kind))
         if not up:
             return {"status": "upload-failed", "detail": umsg}
         sok, smsg = _swap_in(revised_remote, nas_path)
@@ -340,6 +373,7 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
         logbook.exception("revise_audio", e)
         return {"status": "error", "detail": f"{e.__class__.__name__}: {e}"}
     finally:
+        _publish(None)                      # off the pipeline surface, whatever happened
         for f in (work, fixed):
             try:
                 if f and os.path.exists(f):
