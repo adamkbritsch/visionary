@@ -77,16 +77,59 @@ def view(limit: int = 60) -> list:
     return rows
 
 
+# The pipeline never transcodes LOSSLESS audio, so a revision must not either — re-encoding
+# TrueHD or DTS-HD MA to AAC to make it louder would throw away the thing that made it worth
+# keeping. Judged by the actual codec, NOT by the container: an MKV routinely carries lossy
+# AAC (live-caught 2026-08-18 — a 5.1 AAC master was refused purely for being .mkv, and it
+# was exactly the file whose audio needed fixing).
+LOSSLESS = ("truehd", "mlp", "flac", "alac")
+
+
+def is_lossless(codec: str, profile: str = "") -> bool:
+    c, p = (codec or "").lower(), (profile or "").lower()
+    if any(c.startswith(x) for x in LOSSLESS) or c.startswith("pcm"):
+        return True
+    return c.startswith("dts") and ("ma" in p or "lossless" in p)   # DTS-HD MA, not DTS core
+
+
 def can_revise(row) -> tuple:
-    """(bool, reason). MKV masters carry LOSSLESS audio (TrueHD/DTS-HD MA) and the pipeline
-    deliberately never transcodes those — normalising one would mean throwing that away, so
-    it is refused rather than silently degrading the track."""
-    path = (row or {}).get("nas_path") or ""
-    if not path:
+    """(bool, reason). Unknown audio is allowed through: the revision downloads the file
+    anyway and re-checks there, which is authoritative — refusing on a guess is what went
+    wrong before."""
+    row = row or {}
+    if not row.get("nas_path"):
         return False, "no published path recorded"
-    if path.lower().endswith(".mkv"):
-        return False, "lossless audio (MKV) — not re-encoded by design"
+    if is_lossless(row.get("audio") or "", row.get("audio_profile") or ""):
+        return False, "lossless audio — never re-encoded"
     return True, ""
+
+
+def probe_audio(nas_path, *, bytes_=12_000_000) -> tuple:
+    """(codec, profile) of the master's first audio track, from a HEAD download — the stream
+    headers live at the front of both MP4 and MKV, so this costs a few MB rather than the
+    whole file. ('', '') when it can't be determined."""
+    import subprocess
+    import tempfile
+    import transfer
+    tmp = os.path.join(tempfile.gettempdir(), "_vis_probe" + os.path.splitext(nas_path)[1])
+    try:
+        ok, _msg = transfer.download_head(nas_path, tmp, bytes_, timeout=60)
+        if not ok:
+            return "", ""
+        out = subprocess.run(["/opt/homebrew/bin/ffprobe", "-v", "error", "-select_streams",
+                              "a:0", "-show_entries", "stream=codec_name,profile",
+                              "-of", "csv=p=0", tmp],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        parts = (out.splitlines() or [""])[0].split(",")
+        return (parts[0] if parts else ""), (parts[1] if len(parts) > 1 else "")
+    except Exception:
+        return "", ""
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _mark(nas_path, **fields) -> None:
@@ -96,6 +139,83 @@ def _mark(nas_path, **fields) -> None:
             if r.get("nas_path") == nas_path:
                 r.update(fields)
         _write(rows)
+
+
+def _probe_local_audio(path) -> tuple:
+    import subprocess
+    try:
+        out = subprocess.run(["/opt/homebrew/bin/ffprobe", "-v", "error", "-select_streams",
+                              "a:0", "-show_entries", "stream=codec_name,profile",
+                              "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=120).stdout.strip()
+        parts = (out.splitlines() or [""])[0].split(",")
+        return (parts[0] if parts else ""), (parts[1] if len(parts) > 1 else "")
+    except Exception:
+        return "", ""
+
+
+def adopt(nas_path: str, *, kind="", title="", probe=True) -> dict:
+    """Put an ALREADY-PUBLISHED master into the book. History only records what the pipeline
+    finishes from now on, so everything upscaled before it existed was unreachable —
+    including, inevitably, the file whose audio you actually want to fix."""
+    if not nas_path:
+        return {"status": "no-path"}
+    base = os.path.basename(nas_path)
+    codec, profile = probe_audio(nas_path) if probe else ("", "")
+    record(nas_path=nas_path, kind=(kind or _kind_of(nas_path)),
+           title=(title or os.path.splitext(base)[0]), note="adopted")
+    _mark(nas_path, audio=codec, audio_profile=profile)
+    return {"status": "ok", "nas_path": nas_path, "audio": codec}
+
+
+def _kind_of(nas_path: str) -> str:
+    p = (nas_path or "").lower()
+    if "/youtube" in p:
+        return "youtube"
+    return "episode" if "tv-show" in p or "/tv" in p else "movie"
+
+
+def scan(limit: int = 400) -> dict:
+    """Find masters the pipeline has already published and adopt any that are missing.
+
+    Detection is the pipeline's OWN naming (series.is_master_name — the "HDR10 DV upscaled"
+    / "SDR upscaled" marks that done-detection already keys on), so this can never mistake a
+    source for a deliverable. Audio is NOT probed here: that is a few MB per file and this
+    walks whole libraries — the revision re-checks authoritatively anyway.
+    """
+    import ftplib
+    import series
+    import transfer
+    known = {r.get("nas_path") for r in _read()}
+    found, added = 0, 0
+    try:
+        ftp = transfer.connect(timeout=30)
+    except Exception as e:
+        return {"status": "unreachable", "detail": str(e)}
+    try:
+        roots = list(transfer.NAS_FTP_MOVIES_ROOTS) + list(transfer.NAS_FTP_TV_ROOTS)
+        for root in roots:
+            stack = [root]
+            while stack and found < limit:
+                d = stack.pop()
+                try:
+                    entries = transfer.ftp_listdir(ftp, d)
+                except ftplib.all_errors:
+                    continue
+                for name in entries:
+                    full = d.rstrip("/") + "/" + name
+                    if series.is_master_name(name):
+                        found += 1
+                        if full not in known:
+                            record(nas_path=full, kind=_kind_of(full),
+                                   title=os.path.splitext(name)[0], note="found on the NAS")
+                            added += 1
+                    elif "." not in name:                  # a directory (show / movie folder)
+                        stack.append(full)
+    finally:
+        try: ftp.quit()
+        except Exception: pass
+    return {"status": "ok", "found": found, "added": added}
 
 
 def _swap_in(revised_remote: str, original_remote: str) -> tuple:
@@ -155,6 +275,15 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
         got, work, msg = transfer.download(nas_path, d)
         if not got:
             return {"status": "download-failed", "detail": msg}
+
+        # AUTHORITATIVE lossless check — the file is here now, so stop guessing from the
+        # name. Refusing here costs a download; shipping a transcoded lossless track would
+        # cost the track.
+        codec, profile = _probe_local_audio(work)
+        if is_lossless(codec, profile):
+            _mark(nas_path, audio=codec, audio_profile=profile)
+            return {"status": "refused", "detail": f"lossless audio ({codec}) — never re-encoded"}
+        _mark(nas_path, audio=codec, audio_profile=profile)
 
         measured = remux.measure_lufs(work)
         gain = remux.boost_gain_db(measured, target)

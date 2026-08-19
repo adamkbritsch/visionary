@@ -34,15 +34,14 @@ class Book(unittest.TestCase):
             history.record(nas_path="/m/%d.mp4" % i, kind="movie", title=str(i))
         self.assertLessEqual(len(history._read()), history.MAX_ENTRIES)
 
-    def test_lossless_mkv_masters_are_refused(self):
-        # MKV masters carry TrueHD/DTS-HD MA and the pipeline never transcodes those
-        ok, why = history.can_revise({"nas_path": "/m/x.mkv"})
-        self.assertFalse(ok)
-        self.assertIn("lossless", why)
+    def test_lossless_masters_are_refused_by_codec_not_container(self):
+        self.assertFalse(history.can_revise({"nas_path": "/m/x.mkv", "audio": "truehd"})[0])
+        self.assertTrue(history.can_revise({"nas_path": "/m/x.mkv", "audio": "aac"})[0])
         self.assertTrue(history.can_revise({"nas_path": "/m/x.mp4"})[0])
 
     def test_view_exposes_whether_a_row_can_be_revised(self):
         history.record(nas_path="/m/x.mkv", kind="movie", title="x")
+        history._mark("/m/x.mkv", audio="truehd")
         self.assertFalse(history.view()[0]["can_revise"])
 
 
@@ -110,11 +109,77 @@ class Revise(unittest.TestCase):
         history._revising.add("/Media/TV/S04E10.mp4")
         self.assertEqual(history.revise_audio("/Media/TV/S04E10.mp4")["status"], "already-running")
 
-    def test_unknown_items_and_mkv_are_refused(self):
+    def test_an_unknown_item_is_refused(self):
         self.assertEqual(history.revise_audio("/nope.mp4")["status"], "unknown-item")
+
+    def test_a_known_lossless_master_is_refused_before_any_download(self):
         history.record(nas_path="/m/x.mkv", kind="movie", title="x")
+        history._mark("/m/x.mkv", audio="truehd")
         self.assertEqual(history.revise_audio("/m/x.mkv")["status"], "refused")
+
+    def test_lossless_found_only_after_download_is_refused_there(self):
+        # the authoritative check: the name said nothing, the file says TrueHD
+        import transfer
+        local = os.path.join(self.d, "S04E10.mp4")
+        open(local, "wb").close()
+        with mock.patch.object(transfer, "download", return_value=(True, local, "ok")), \
+             mock.patch.object(history, "_probe_local_audio", return_value=("truehd", "")), \
+             mock.patch.object(history, "_swap_in") as sw:
+            out = history.revise_audio("/Media/TV/S04E10.mp4", scratch_dir=self.d)
+        self.assertEqual(out["status"], "refused")
+        self.assertIn("truehd", out["detail"])
+        sw.assert_not_called()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LosslessRule(unittest.TestCase):
+    """The pipeline never transcodes lossless audio, so a revision must not either. Judged by
+    the actual CODEC, not the container — an MKV routinely carries lossy AAC, and refusing on
+    the extension blocked exactly the 5.1-AAC master whose audio needed fixing (2026-08-18)."""
+
+    def test_lossless_codecs_are_refused(self):
+        for c, p in (("truehd", ""), ("mlp", ""), ("flac", ""), ("alac", ""),
+                     ("pcm_s24le", ""), ("dts", "DTS-HD MA")):
+            self.assertTrue(history.is_lossless(c, p), c)
+
+    def test_lossy_codecs_are_allowed(self):
+        for c, p in (("aac", "LC"), ("aac", "HE-AAC"), ("ac3", ""), ("eac3", ""),
+                     ("opus", ""), ("dts", "DTS")):     # plain DTS core is lossy
+            self.assertFalse(history.is_lossless(c, p), c)
+
+    def test_an_mkv_with_lossy_audio_is_revisable(self):
+        row = {"nas_path": "/m/Good Will Hunting HDR10 DV upscaled.mkv",
+               "audio": "aac", "audio_profile": "LC"}
+        self.assertTrue(history.can_revise(row)[0])
+
+    def test_an_mkv_with_lossless_audio_is_not(self):
+        row = {"nas_path": "/m/x.mkv", "audio": "truehd"}
+        ok, why = history.can_revise(row)
+        self.assertFalse(ok); self.assertIn("lossless", why)
+
+    def test_unknown_audio_is_allowed_and_checked_later(self):
+        # refusing on a guess is what went wrong; the revision re-checks after download
+        self.assertTrue(history.can_revise({"nas_path": "/m/x.mkv"})[0])
+
+
+class Adopt(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        p = mock.patch.object(history, "BOOK_FILE", os.path.join(d, "h.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_adopting_records_the_probed_codec(self):
+        with mock.patch.object(history, "probe_audio", return_value=("aac", "LC")):
+            out = history.adopt("/Media/Movies/X HDR10 DV upscaled.mkv")
+        self.assertEqual(out["status"], "ok")
+        row = history.view()[0]
+        self.assertEqual(row["audio"], "aac")
+        self.assertTrue(row["can_revise"])
+
+    def test_kind_is_inferred_from_the_path(self):
+        self.assertEqual(history._kind_of("/Media/TV-Shows/Lost/x.mkv"), "episode")
+        self.assertEqual(history._kind_of("/Media/Movies/x.mkv"), "movie")
+        self.assertEqual(history._kind_of("/Media/YouTube/Chan/x.mp4"), "youtube")

@@ -248,7 +248,8 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 </header>
 
 <section class="sec" id="histSec" style="display:none">
-  <p class="lbl">Finished <span id="histN" style="color:var(--steel-dim)"></span></p>
+  <p class="lbl">Finished <span id="histN" style="color:var(--steel-dim)"></span>
+     <button class="mini" id="histScan" style="float:right;margin-top:-4px">Find finished files</button></p>
   <div class="panel well rows" id="hist"><div class="muted">Loading&hellip;</div></div>
 </section>
 
@@ -871,6 +872,16 @@ async function drawHistory(){
   }).join("") : '<div class="muted">Nothing finished yet</div>';
   $("hist")._rows = rows;
 }
+
+$("histScan").addEventListener("click", async function(){
+  // Everything upscaled before the history book existed is invisible to it — this walks the
+  // libraries for the pipeline's own master naming and adopts what is missing.
+  var b = $("histScan");
+  b.disabled = true; b.textContent = "Searching\u2026";
+  try { await fetch("/api/history-scan", {method: "POST",
+        headers: {"Content-Type": "application/json"}, body: "{}"}); } catch (e) {}
+  setTimeout(function(){ b.disabled = false; b.textContent = "Find finished files"; drawHistory(); }, 6000);
+});
 
 $("histBtn").addEventListener("click", function(){
   histOpen = !histOpen;

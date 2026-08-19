@@ -1617,6 +1617,13 @@ class Handler(BaseHTTPRequestHandler):
             res = preflight.shim_smoke_scores(key)
             preflight.record_display_smoke(key, res)
             self._json({"result": res, "displays": displays_view()})
+        elif path == "/api/history-scan":
+            # Adopt masters the pipeline published BEFORE the history book existed. Detection
+            # is the pipeline's own naming (series.is_master_name), so a source can never be
+            # mistaken for a deliverable. Backgrounded: it walks whole libraries over FTP.
+            import history
+            threading.Thread(target=history.scan, daemon=True, name="history-scan").start()
+            self._json({"status": "started"})
         elif path == "/api/revise-audio":
             # Send a FINISHED master back through for its audio only. In place, on a daemon
             # thread: it re-measures the published file and re-applies the boost, so it takes
