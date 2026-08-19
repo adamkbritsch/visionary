@@ -1310,6 +1310,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_series())
         elif path == "/api/movies":
             self._json(api_movies())
+        elif path == "/api/history":
+            import history
+            self._json({"items": history.view()})
         elif path == "/api/channels":
             self._json(api_channels())
         elif path == "/api/settings":
@@ -1614,6 +1617,22 @@ class Handler(BaseHTTPRequestHandler):
             res = preflight.shim_smoke_scores(key)
             preflight.record_display_smoke(key, res)
             self._json({"result": res, "displays": displays_view()})
+        elif path == "/api/revise-audio":
+            # Send a FINISHED master back through for its audio only. In place, on a daemon
+            # thread: it re-measures the published file and re-applies the boost, so it takes
+            # minutes rather than the hours a full re-run would — and a re-run is usually
+            # impossible anyway, the source having been replaced or purged.
+            import history
+            nas = (body.get("id") or body.get("nas_path") or "").strip()
+            row = next((r for r in history.view(500) if r.get("nas_path") == nas), None)
+            if not row:
+                self._json({"error": "unknown item"}, code=404)
+            elif not row.get("can_revise"):
+                self._json({"error": row.get("why") or "cannot revise this item"}, code=400)
+            else:
+                threading.Thread(target=history.revise_audio, args=(nas,),
+                                 daemon=True, name="revise").start()
+                self._json({"status": "started", "id": nas})
         elif path == "/api/awake-hold":
             # "Give me another hour." A remote Deactivate already holds the screen so the
             # run can be re-armed from away; this extends that hold when the window is

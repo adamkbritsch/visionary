@@ -228,6 +228,8 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
   <symbol id="i-now" viewBox="0 0 24 24"><path d="M5 4h14"/><path d="M12 21V8m0 0-5 5m5-5 5 5"/></symbol>
   <symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-hist" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v4h4"/><path d="M12 8v5l3 2"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24"><path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 12h2"/></symbol>
   <symbol id="i-find" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
@@ -240,8 +242,15 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 <header>
   <div class="brand"><h1>Visionary</h1><span class="sub" id="mode"></span></div>
   <span class="pill" id="status"><span class="dot"></span><span>Connecting</span></span>
+  <button class="act" id="histBtn" title="What Visionary has finished"
+          style="width:34px;height:32px"><svg><use href="#i-hist"/></svg></button>
   <button class="btn" id="arm" disabled>&mdash;</button>
 </header>
+
+<section class="sec" id="histSec" style="display:none">
+  <p class="lbl">Finished <span id="histN" style="color:var(--steel-dim)"></span></p>
+  <div class="panel well rows" id="hist"><div class="muted">Loading&hellip;</div></div>
+</section>
 
 <section class="sec" id="holdSec" style="display:none">
   <div class="panel notice" id="hold"></div>
@@ -524,6 +533,7 @@ function render(d){
   /* generated_at is an ISO string from datetime.now() (local, no offset) — NOT epoch
      seconds. Multiplying it gave NaN and the footer read "Invalid Date". */
   lastState = d;
+  if (histOpen) drawHistory();
   if (!$("hits").innerHTML) drawPicker();
 
   var when = d.generated_at ? new Date(d.generated_at) : new Date();
@@ -821,6 +831,68 @@ $("linkGo").addEventListener("click", function(){ importLink(null); });
 $("linkIn").addEventListener("keydown", function(e){ if (e.key === "Enter") importLink(null); });
 $("linkNote").addEventListener("click", function(ev){
   var b = ev.target.closest("[data-imp]"); if (b) importLink(b.dataset.imp);
+});
+
+/* ---- what has finished, and sending one back for its audio ----------------
+   Kept behind an icon: it is a look-back, not something you watch. The revision is audio
+   ONLY and happens in place — by the time an item finishes its source is usually gone
+   (replaced or purged), so re-running it is not an option; the published master is the
+   only copy, and video/subs are stream-copied so Dolby Vision is untouched. */
+var histOpen = false;
+
+function histWhen(ts){
+  if (!ts) return "";
+  var d = new Date(ts * 1000), now = new Date();
+  var sameDay = d.toDateString() === now.toDateString();
+  return sameDay ? d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})
+                 : d.toLocaleDateString([], {month: "short", day: "numeric"});
+}
+
+async function drawHistory(){
+  if (!histOpen) return;
+  var rows;
+  try { rows = (await (await fetch("/api/history")).json()).items || []; }
+  catch (e) { $("hist").innerHTML = '<div class="muted">Couldn\u2019t load</div>'; return; }
+  txt($("histN"), rows.length ? "(" + rows.length + ")" : "");
+  $("hist").innerHTML = rows.length ? rows.map(function(r, i){
+    var sub = [histWhen(r.at), (r.gain ? "+" + r.gain + " dB" : ""),
+               (r.revised ? "revised" : "")].filter(Boolean).join(" · ");
+    var btn = r.revising
+      ? '<span class="badge">fixing\u2026</span>'
+      : (r.can_revise
+          ? '<button class="act" data-rev="' + i + '" title="Re-measure and re-apply the ' +
+            'loudness boost to this file, in place">' +
+            '<svg><use href="#i-wave"/></svg></button>'
+          : '<span class="tag" title="' + esc(r.why || "") + '">' + esc(r.why || "") + '</span>');
+    return '<div class="row"><svg class="ic"><use href="' + iconFor(r.kind) + '"/></svg>' +
+      '<span class="t">' + esc(r.title || r.nas_path) + '</span>' +
+      '<span class="c">' + esc(sub) + '</span>' +
+      '<span class="acts">' + btn + '</span></div>';
+  }).join("") : '<div class="muted">Nothing finished yet</div>';
+  $("hist")._rows = rows;
+}
+
+$("histBtn").addEventListener("click", function(){
+  histOpen = !histOpen;
+  $("histSec").style.display = histOpen ? "" : "none";
+  if (histOpen) drawHistory();
+});
+
+$("hist").addEventListener("click", async function(ev){
+  var b = ev.target.closest("[data-rev]"); if (!b) return;
+  var r = ($("hist")._rows || [])[parseInt(b.dataset.rev, 10)];
+  if (!r) return;
+  if (!confirm("Fix the audio on \u201C" + (r.title || "this file") + "\u201D?\n\n" +
+               "It re-measures the published file and re-applies the loudness boost in " +
+               "place. Video and subtitles are copied untouched, so it takes minutes.")) return;
+  b.disabled = true;
+  try {
+    var out = await (await fetch("/api/revise-audio", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: r.nas_path})})).json();
+    if (out.error) alert(out.error);
+  } catch (e) { /* the refresh below resyncs */ }
+  drawHistory();
 });
 
 function pad(n){ return (n < 10 ? "0" : "") + n; }

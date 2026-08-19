@@ -2041,3 +2041,29 @@ class SeasonScopedLoudness(unittest.TestCase):
         self.assertIsNone(seen["gain"])
         self.assertEqual(m.call_count, 0)             # nothing measured, nothing recorded
         self.assertEqual(audiogain.view(), [])
+
+
+class YouTubeRenderBitrate(unittest.TestCase):
+    """The YouTube render target exists to land the render's PEAK under max_peak_mbps so the
+    remux can stream-copy it — Resolve's VideoToolbox export has no peak control, so the
+    target is the only lever. A NATIVE 4K source bursts much further above the target than a
+    1080p one: live-measured, an 18-minute 4K video at 20 Mbps peaked at 59.9 against a 50
+    cap, lost the gate, and took the hour-class capped re-encode the fast path exists to
+    avoid."""
+
+    def test_upscaled_1080p_sources_keep_the_tuned_target(self):
+        for h in (0, 720, 1080, 1200, 1440):
+            self.assertEqual(stages.youtube_render_kbps(h), stages.YOUTUBE_RENDER_KBPS, h)
+
+    def test_native_4k_renders_lower(self):
+        for h in (1700, 2160, 4320):
+            self.assertEqual(stages.youtube_render_kbps(h), stages.YOUTUBE_RENDER_KBPS_4K, h)
+
+    def test_the_4k_target_leaves_peak_headroom(self):
+        # the observed burst ratio was ~3x (20 -> 59.9); the 4K target must project inside
+        # the default 50 Mbps cap at that ratio, or it buys nothing
+        self.assertLess(stages.YOUTUBE_RENDER_KBPS_4K * 3 / 1000.0, 50)
+        self.assertLess(stages.YOUTUBE_RENDER_KBPS_4K, stages.YOUTUBE_RENDER_KBPS)
+
+    def test_an_unknown_height_is_treated_as_the_common_case(self):
+        self.assertEqual(stages.youtube_render_kbps(None), stages.YOUTUBE_RENDER_KBPS)

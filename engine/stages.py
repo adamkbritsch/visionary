@@ -58,6 +58,19 @@ def _resolve_budget(p) -> int:
     return min(3600 + int(dur * 1.8) + 1200, 6 * 3600)
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 EXPORT_BITRATE_FLOOR_KBPS = 60000   # render preset's default; the export matches the intake above this
+YOUTUBE_NATIVE_4K_MIN_HEIGHT = 1700  # above this the source IS 4K, not a 1080p upscale
+YOUTUBE_RENDER_KBPS_4K = 14000       # ...and a NATIVE 4K source renders lower (user-dictated
+                                     # 2026-08-18). The 20 Mbps below is tuned for the normal
+                                     # case — a 1080p web source Resolve upscales. Real 4K
+                                     # detail is far harder to encode, so at the same target
+                                     # its peaks run much higher: measured live, an 18-minute
+                                     # native-4K video rendered at 20 Mbps peaked at 59.9 and
+                                     # lost the gate ("render-over-cap: 59.9 > 50"), costing
+                                     # the whole hour the fast path exists to save. At 14 the
+                                     # same ~3x burst ratio projects ~42 Mbps — inside the 50
+                                     # cap with room to spare, so these ship stream-copied
+                                     # like every other video instead of taking the
+                                     # hour-class capped re-encode.
 YOUTUBE_RENDER_KBPS = 20000         # YouTube renders target THIS instead of the floor, so the render
                                     # IS the deliverable: its 1-s peaks land under the cap, which lets
                                     # the remux SHIP its video stream-copied (remux_ship_render) in
@@ -995,6 +1008,7 @@ def _resolve(p, abort, progress=None):
     yt = bool(p.youtube)
     single = fast or yt or p.combine
     ss = "-"
+    h = 0
     if yt:
         try:
             h = int((pl.get("input") or {}).get("height") or 0)
@@ -1007,7 +1021,7 @@ def _resolve(p, abort, progress=None):
     # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
     # (A mezzanine retry keeps this same value — the inflated mezz bitrate is not quality.)
     bitrate = (EXPORT_BITRATE_FLOOR_KBPS if (pl.get("topaz") == "rpu-only" or p.combine)
-               else YOUTUBE_RENDER_KBPS if yt
+               else youtube_render_kbps(h) if yt
                else max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS))
 
     def _run(video_in):
@@ -1147,6 +1161,16 @@ def _combine_result(res, real_rpu_donor):
             (real_rpu_donor and ("frame mismatch" in low or "fps mismatch" in low)):
         return False, "permanent: companion is a different cut — " + r
     return False, r
+
+
+def youtube_render_kbps(height) -> int:
+    """What a YouTube item exports from Resolve at. A NATIVE 4K source gets a lower target
+    than a 1080p one, because the point of the number is not picture quality in isolation —
+    it is landing the render's PEAK under max_peak_mbps so the remux can stream-copy it.
+    Resolve's VideoToolbox export has no peak control whatsoever, so the only lever is the
+    target, and a more detailed source bursts further above it."""
+    return (YOUTUBE_RENDER_KBPS_4K if (height or 0) >= YOUTUBE_NATIVE_4K_MIN_HEIGHT
+            else YOUTUBE_RENDER_KBPS)
 
 
 def _remux(p, abort, progress=None, should_pause=None):
@@ -1331,6 +1355,23 @@ def _remux(p, abort, progress=None, should_pause=None):
     return res.ok, res.reason
 
 
+def _remember_finished(p, nas_path):
+    """Record the verified master in the history book. Nothing else knows WHERE a finished
+    item landed — the log only says an upload happened — so without this there is nothing to
+    point a later fix at (see history.revise_audio). Best-effort: a bookkeeping failure must
+    never fail an upload that actually succeeded."""
+    try:
+        import audiogain
+        import history
+        gain = audiogain.remembered(audiogain.key_for(p.series, p.ep, p.source_basename))
+        title = (getattr(p, "title", "") or "").strip() or p.ep
+        history.record(nas_path=nas_path, kind=("youtube" if p.youtube else
+                                                "movie" if p.movie else "episode"),
+                       title=title, series=(p.series or ""), ep=(p.ep or ""), gain=gain)
+    except Exception:
+        pass
+
+
 def _upload(p, abort, progress=None):
     """final master -> NAS library (FTP STOR, owner 1000:10, size-verified), then the
     per-item `replace_source` setting decides the source's fate (user-dictated,
@@ -1348,10 +1389,13 @@ def _upload(p, abort, progress=None):
         # cleanup (resume-safe), never here — so a re-run can always re-pull the source if needed.
         ok, _remote, reason = transfer.publish_master(
             p.final, p.nas_final, p.sidecar_dir, os.path.dirname(p.source), on_progress=on_prog)
+        if ok:
+            _remember_finished(p, p.nas_final)
         return ok, reason
     ok, remote, reason = transfer.upload(p.final, p.nas_dir, on_progress=on_prog)
     if not ok:
         return False, reason
+    _remember_finished(p, remote)
     import settings as settings_mod
     if settings_mod.get_show_replace_source(p.series):
         rok, rmsg = transfer.replace_original(remote, p.nas_source, p.final)
