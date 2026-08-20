@@ -1,4 +1,6 @@
 import unittest
+from unittest import mock
+
 import plex
 
 
@@ -69,3 +71,30 @@ class MovieTitles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class YouTubeChannelCollections(unittest.TestCase):
+    """That library held 102 per-channel collections with nothing in any of them, while the
+    videos themselves carried no collection tag at all — the grouping had never been applied
+    to what Visionary publishes. The channel comes from the FILE PATH, which is the folder
+    the publish writes into, so it cannot disagree with where the file actually lives."""
+
+    def test_channel_comes_from_the_publish_folder(self):
+        self.assertEqual(
+            plex.channel_of("/media/YouTube/Almost Friday TV/AFTV - x - id/AFTV - x [id].mp4"),
+            "Almost Friday TV")
+        self.assertEqual(
+            plex.channel_of("/Media/YouTube/DIY Perks/DIY - y - id/DIY - y [id].mp4"),
+            "DIY Perks")
+
+    def test_non_youtube_paths_yield_nothing(self):
+        for p in ("/media/Movies/Some Movie.mkv", "/media/TV-Shows/Lost/S01E01.mkv", "", None):
+            self.assertEqual(plex.channel_of(p), "")
+
+    def test_a_file_directly_under_youtube_is_not_a_channel(self):
+        # no video folder beneath it -> the segment is the FILE, not a channel
+        self.assertEqual(plex.channel_of("/media/YouTube/loose-file.mp4"), "")
+
+    def test_no_token_reports_rather_than_guesses(self):
+        with mock.patch.object(plex, "plex_token", return_value=""):
+            self.assertIn("error", plex.sync_youtube_collections())

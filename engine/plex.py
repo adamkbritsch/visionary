@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -398,3 +399,75 @@ if __name__ == "__main__":   # manual check: python3 plex.py "<series dir name>"
         print(f"{len(m)} episodes · watched {w} · unwatched {len(m) - w}")
         for name, watched in list(m.items())[:8]:
             print(("  [x] " if watched else "  [ ] ") + name)
+
+
+# ---- YouTube channel collections (the only WRITE in this module) -----------
+# Everything above is read-only. This is not: it sets a video's Collection tag so the
+# YouTube library groups by channel. It exists because 102 per-channel collections were
+# sitting in that library with nothing in them while the videos themselves carried no
+# collection tag at all — the grouping had simply never been applied to what Visionary
+# publishes. Derived from the FILE PATH (…/YouTube/<channel>/<video folder>/<file>), which
+# is the folder Visionary publishes into, so it cannot disagree with where the file lives.
+
+YOUTUBE_SECTION = 10
+
+
+def channel_of(path: str) -> str:
+    """The channel folder from a published YouTube path, '' if the path isn't one."""
+    parts = [p for p in str(path or "").replace("\\", "/").split("/") if p]
+    for i, p in enumerate(parts):
+        if p.lower() == "youtube" and i + 1 < len(parts) - 1:
+            return parts[i + 1]
+    return ""
+
+
+def _set_collection(base, token, rating_key, name, section=YOUTUBE_SECTION, timeout=15) -> bool:
+    q = urllib.parse.urlencode({"type": 1, "id": rating_key,
+                                "collection[0].tag.tag": name, "collection.locked": 1})
+    req = urllib.request.Request("%s/library/sections/%s/all?%s" % (base, section, q),
+                                 method="PUT", headers={"X-Plex-Token": token})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status in (200, 201, 204)
+
+
+def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
+    """Put every YouTube video in a collection named after its channel.
+
+    A SWEEP rather than a per-publish call on purpose: Plex only creates the item some time
+    after the file lands, so tagging at upload would race the scan and silently miss. This
+    re-checks everything and is a no-op for items already tagged, so it is safe to run
+    whenever — after a publish, or to repair a library by hand.
+    Returns {tagged, already, skipped, failed} (or {error} when Plex can't be reached).
+    """
+    token = plex_token()
+    if not token:
+        return {"error": "no plex token"}
+    for base in plex_base_urls():
+        try:
+            root = ET.fromstring(_get(base, "/library/sections/%s/all" % section, token,
+                                      timeout=timeout))
+        except Exception:
+            continue
+        out = {"tagged": 0, "already": 0, "skipped": 0, "failed": 0}
+        for v in root.findall(".//Video"):
+            rk = v.get("ratingKey")
+            try:
+                meta = ET.fromstring(_get(base, "/library/metadata/%s" % rk, token, timeout=timeout))
+            except Exception:
+                out["failed"] += 1
+                continue
+            part = meta.find(".//Part")
+            chan = channel_of(part.get("file") if part is not None else "")
+            if not chan:
+                out["skipped"] += 1
+                continue
+            have = {c.get("tag") for c in meta.findall(".//Collection")}
+            if chan in have:
+                out["already"] += 1
+                continue
+            try:
+                out["tagged" if _set_collection(base, token, rk, chan, section) else "failed"] += 1
+            except Exception:
+                out["failed"] += 1
+        return out
+    return {"error": "plex unreachable"}

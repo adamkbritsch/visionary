@@ -52,6 +52,7 @@ STAGES = ["download", "extend", "topaz", "resolve", "remux", "upload", "cleanup"
 # whose show OPTED IN and whose source actually probes 4:3 — see borders.extend_gate.
 RUN_STAGES = ["download", "extend", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
+PLEX_COLLECTION_SYNC_DELAY = 90   # let Plex's scan create the item before tagging it
 YIELD_LIVELOCK_LIMIT = 3      # yields in a row with nothing else running -> the reason can't be met
 FINISHER_LANES = 2           # DEFAULT max concurrent remuxes ('finisher_lanes' setting — read via
                              # _finisher_lanes()). The 2nd lane runs whenever >=2 topaz-done items need
@@ -3181,6 +3182,24 @@ class Orchestrator:
             return False
         return self._dual_remux_live() or self._drain_backlog() >= 2
 
+    def _sync_youtube_collections(self) -> None:
+        """Group published videos under their channel in Plex, on a delay.
+
+        Plex creates the item some time AFTER the file lands, so tagging the moment the
+        upload verifies would race its scan and silently miss — which is how that library
+        ended up with 102 per-channel collections and not one video in any of them. A
+        delayed SWEEP re-checks everything instead, so a miss is repaired by the next video
+        rather than being permanent, and it is a no-op for anything already tagged.
+        """
+        def work():
+            try:
+                import plex
+                time.sleep(PLEX_COLLECTION_SYNC_DELAY)
+                plex.sync_youtube_collections()
+            except Exception:
+                pass                      # cosmetic grouping — never disturb a finished upload
+        threading.Thread(target=work, daemon=True, name="yt-collections").start()
+
     def _advance_cadence_at_handoff(self, p: EpisodePaths):
         """Scheduling FAIRNESS (cadence counters + round-robin) advances the moment an item's
         GPU work completes — at hand-off, on the RUN thread, synchronously BEFORE the next
@@ -3567,6 +3586,7 @@ class Orchestrator:
                         youtube.mark_done(vid)
                         youtube.clear_resume_first(p.series)  # completed → no longer 'first on resume'
                         youtube.refresh_videos(p.series)      # channel stays queued (standing sub)
+                        self._sync_youtube_collections()      # group it under its channel in Plex
                     elif p.movie:                             # a queued movie finished (keyed off the
                         movies.remove_selected(p.source_basename)   # ITEM, not queue membership — a movie
                         movies.refresh_library()                    # removed mid-pipeline is still a movie,
