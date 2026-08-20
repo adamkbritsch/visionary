@@ -20,6 +20,7 @@ _FINISHER_PATCH = None
 
 _REFUSED_PATCH = None
 _YT_PATCHES = []
+_CADENCE_PATCH = None
 
 
 def setUpModule():
@@ -39,6 +40,13 @@ def setUpModule():
     # cache. Point the books at a throwaway dir: next_due() finds nothing unless a test says
     # otherwise, and the tests that DO want a video patch next_due themselves.
     import youtube as _yt
+    # The cadence counters + their "already advanced" set persist too, and
+    # _advance_cadence_at_handoff writes them: a test that hands an item off wrote v0.mp4…
+    # into the REAL orch_cadence.json, after which the live guard refused to re-count them.
+    global _CADENCE_PATCH
+    _CADENCE_PATCH = mock.patch.object(orch, "CADENCE_FILE",
+                                       _os.path.join(d, "orch_cadence.json"))
+    _CADENCE_PATCH.start()
     for name, fn in (("QUEUE_FILE", "yt_queue.json"), ("DONE_FILE", "yt_done.json"),
                      ("PRIORITY_FILE", "yt_priority.json"), ("IMPORTS_FILE", "yt_imports.json")):
         p = mock.patch.object(_yt, name, _os.path.join(d, fn)); p.start(); _YT_PATCHES.append(p)
@@ -51,6 +59,8 @@ def tearDownModule():
         _REFUSED_PATCH.stop()
     for p in _YT_PATCHES:
         p.stop()
+    if _CADENCE_PATCH is not None:
+        _CADENCE_PATCH.stop()
 
 
 class Paths(unittest.TestCase):
@@ -3511,14 +3521,18 @@ class BurstActuallyGetsATurn(unittest.TestCase):
         self.assertEqual(why, "ok")
         self.assertTrue(ep.youtube)
 
-    def test_a_pinned_episode_still_wins_while_the_remux_runs(self):
-        # Part 2's whole point: the next episode's topaz fills the remux window.
-        o = self._orch(holding=True)
+    def test_a_pinned_episode_wins_only_when_no_video_is_owed(self):
+        # Part 2's point (the next episode's topaz fills the remux window) is preserved by
+        # should_pause, NOT by selection: an owed video is picked mid-remux on purpose — it
+        # downloads, parks at the doorstep, and hands the machine straight back. What must
+        # still resume a pinned episode is a cadence that owes nothing.
+        o = self._orch(since=0, every=2, holding=True)
         sentinel = object()
         with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
              mock.patch.object(o, "_midpipeline_tv", return_value=sentinel):
             ep, why = o._next_episode()
         self.assertIs(ep, sentinel)
+        self.assertFalse(o._yt_cadence_due())      # ...and topaz is never interrupted mid-remux
 
 
 class YieldLivelock(unittest.TestCase):
