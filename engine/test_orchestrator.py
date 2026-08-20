@@ -2479,7 +2479,11 @@ class PermanentRefusal(unittest.TestCase):
         self.assertFalse(os.path.exists(p.source_cfr))    # its scratch bytes are dead weight
 
     def test_a_refused_youtube_video_restarts_the_cadence(self):
-        o = orch.Orchestrator()
+        import tempfile as _tf, os as _os
+        cp = mock.patch.object(orch, "CADENCE_FILE",
+                               _os.path.join(_tf.mkdtemp(), "cadence.json"))
+        cp.start(); self.addCleanup(cp.stop)   # handing items off persists an "already
+        o = orch.Orchestrator()                # advanced" set — never share one between tests
         o._tv_since_yt = 3
         v = youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T")
         with mock.patch.object(o, "_save_cadence"), \
@@ -3472,7 +3476,11 @@ class BurstActuallyGetsATurn(unittest.TestCase):
     steps past it — but only when it could actually make progress."""
 
     def _orch(self, *, since=5, every=1, holding=False, pending=True):
-        o = orch.Orchestrator()
+        import tempfile as _tf, os as _os
+        cp = mock.patch.object(orch, "CADENCE_FILE",
+                               _os.path.join(_tf.mkdtemp(), "cadence.json"))
+        cp.start(); self.addCleanup(cp.stop)   # handing items off persists an "already
+        o = orch.Orchestrator()                # advanced" set — never share one between tests
         o._tv_since_yt = since
         es = contextlib.ExitStack(); self.addCleanup(es.close)
         es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
@@ -3601,7 +3609,11 @@ class BurstRunsToItsSetSize(unittest.TestCase):
     episode had run, wiping the burst every time (user-reported 2026-08-19)."""
 
     def _orch(self, *, since=5, every=1, holding=False, pending=True):
-        o = orch.Orchestrator()
+        import tempfile as _tf, os as _os
+        cp = mock.patch.object(orch, "CADENCE_FILE",
+                               _os.path.join(_tf.mkdtemp(), "cadence.json"))
+        cp.start(); self.addCleanup(cp.stop)   # handing items off persists an "already
+        o = orch.Orchestrator()                # advanced" set — never share one between tests
         o._tv_since_yt = since
         es = contextlib.ExitStack(); self.addCleanup(es.close)
         es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
@@ -3655,3 +3667,70 @@ class BurstRunsToItsSetSize(unittest.TestCase):
             o._advance_cadence_at_handoff(p)
         self.assertEqual(o._yt_in_burst, 0)              # burst complete
         self.assertEqual(o._tv_since_yt, 0)              # ...now the episode countdown restarts
+
+
+class BurstStopsAtItsSetSize(unittest.TestCase):
+    """The other half of the burst rule: ten means ten AND THEN STOP. After the last video of
+    a burst the episode countdown restarts, so the next pick is TV — a burst must never turn
+    into "YouTube forever"."""
+
+    VID = {"channel": "C", "video_path": "/s/C/x/v.mp4", "title": "T"}
+
+    def _orch(self, *, burst=10, every=1):
+        import tempfile as _tf, os as _os
+        cp = mock.patch.object(orch, "CADENCE_FILE",
+                               _os.path.join(_tf.mkdtemp(), "cadence.json"))
+        cp.start(); self.addCleanup(cp.stop)   # handing items off persists an "already
+        o = orch.Orchestrator()                # advanced" set — never share one between tests
+        o._tv_since_yt, o._yt_in_burst = every, 0
+        es = contextlib.ExitStack(); self.addCleanup(es.close)
+        es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
+        es.enter_context(mock.patch.object(o, "_yt_burst", return_value=burst))
+        es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=False))
+        es.enter_context(mock.patch.object(o, "_in_finisher_keys", return_value=set()))
+        es.enter_context(mock.patch.object(orch.youtube, "next_due", return_value=self.VID))
+        return o
+
+    def _handoff_video(self, o, i):
+        o._advance_cadence_at_handoff(
+            orch.youtube_paths("C", "/s/C/x/v%d.mp4" % i, "T", scratch_dir="/tmp"))
+
+    def _pick(self, o):
+        q = {"next": {"ep": "S01E01", "source_name": SRC}, "done_count": 0, "source_count": 5}
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=None), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=None), \
+             mock.patch.object(orch.movies, "next_due", return_value=None), \
+             mock.patch.object(orch.series, "get_active_series", return_value=["A"]), \
+             mock.patch.object(orch.series, "series_root", return_value="/Media/TV"), \
+             mock.patch.object(orch.series, "episode_queue", return_value=q), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            return o._next_episode()[0]
+
+    def test_ten_videos_then_the_next_pick_is_tv(self):
+        o = self._orch(burst=10)
+        for i in range(9):
+            self.assertTrue(self._pick(o).youtube, "video %d should still be a video" % (i + 1))
+            self._handoff_video(o, i)
+        self.assertTrue(self._pick(o).youtube)        # the tenth
+        self._handoff_video(o, 9)
+        self.assertEqual((o._yt_in_burst, o._tv_since_yt), (0, 0))
+        ep = self._pick(o)
+        self.assertFalse(ep.youtube)                  # ELEVENTH pick is the episode
+        self.assertEqual(ep.ep, "S01E01")
+
+    def test_a_burst_of_one_still_alternates(self):
+        o = self._orch(burst=1)
+        self.assertTrue(self._pick(o).youtube)
+        self._handoff_video(o, 0)
+        self.assertFalse(self._pick(o).youtube)       # straight back to TV
+
+    def test_an_episode_restarts_the_countdown_not_the_burst_size(self):
+        o = self._orch(burst=10)
+        before = o._tv_since_yt
+        self._handoff_video(o, 0)
+        self.assertEqual(o._yt_in_burst, 1)
+        o._advance_cadence_at_handoff(
+            episode_paths("A", "S01E01", SRC, nas_tv_root="/Media/TV"))
+        self.assertEqual(o._yt_in_burst, 0)              # a partial burst is over
+        self.assertEqual(o._tv_since_yt, before + 1)     # ...and that episode counts toward the next
