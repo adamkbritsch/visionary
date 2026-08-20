@@ -392,6 +392,7 @@ struct SettingsDTO: Codable {
     var max_peak_mbps: Int?               // hard 1-second peak-bitrate ceiling on every shipped master
     var audio_target_lufs: Int?           // smart loudness boost target (measured per item; 0 = off)
     var max_youtube_minutes: Int?
+    var refocus_app_on_steps: Bool?       // raise the app at the Resolve step's boundaries
     var youtube_every_tv_episodes: Int?   // serve 1 YouTube video per this many TV episodes
     var youtube_videos_per_burst: Int?    // ...or this many videos back-to-back per firing
     var min_adapter_watts: Int?           // power sufficiency = a brick of at least this wattage

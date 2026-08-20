@@ -71,6 +71,14 @@ DEFAULT_SETTINGS = {
                                 # (no drain to remux/upload/cleanup) → the run pauses on low disk until off.
     "min_adapter_watts": 140,   # power SUFFICIENCY = the brick: >= this wattage adapter → run;
                                 # anything less (hub/monitor PD, battery) → full passive pause
+    "refocus_app_on_steps": True,   # The Resolve stage raises Visionary at two points: once the
+                                    # DV pass has Resolve on its pinned display, and again when the
+                                    # headless render starts (no UI automation is needed past that).
+                                    # Both are for WATCHING the run — on a machine being used for
+                                    # anything else they are a stolen keyboard mid-sentence, so this
+                                    # turns them off. It has no effect on the automation itself:
+                                    # goto_dolby_vision re-activates RESOLVE before every click and
+                                    # the analysis watcher re-raises it whenever it leaves frame.
     "poll_minutes": 30,
     "dim_after_minutes": 15,    # AUTO-DIM: after this many minutes with no user input (while a run holds
                                 # the display caffeinated), drop the backlight to 0 to save the panel.

@@ -27,6 +27,19 @@ LIB = RESOLVE_APP + "/Contents/Libraries/Fusion/fusionscript.so"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 
 
+
+def _refocus_enabled() -> bool:
+    """Should the Resolve step raise Visionary at its boundaries? Off by request on a machine
+    that is also being used for other things — a stolen keyboard mid-sentence is worse than
+    not seeing the progress. Never gates the AUTOMATION: Resolve is re-activated before every
+    click regardless (goto_dolby_vision), and the analysis watcher re-raises it whenever it
+    leaves frame. Defaults ON so nothing changes for anyone who has not turned it off."""
+    try:
+        import settings
+        return bool(settings.get_settings().get("refocus_app_on_steps", True))
+    except Exception:
+        return True
+
 def _analysis_budget(path) -> float:
     """DV "Analyze All Shots" wall-clock cap, scaled with CONTENT length. The flat hour
     is right for episodes and ordinary films; a 4-hour fan cut (Ep III Siege of
@@ -289,8 +302,9 @@ def _place_now():
         # click, and the analysis watcher re-activates it whenever it leaves its screen.
         # Host-pinned case ONLY — with Resolve on the main display, raising Visionary
         # would cover the very window the templates need to see.
-        subprocess.run(["osascript", "-e", 'tell application "Visionary" to activate'],
-                       check=False, timeout=10)
+        if _refocus_enabled():
+            subprocess.run(["osascript", "-e", 'tell application "Visionary" to activate'],
+                           check=False, timeout=10)
     except Exception as e:
         print(f"placement at setup deferred ({e.__class__.__name__}: {e}) — "
               "the DV step will retry", flush=True)
@@ -428,9 +442,12 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
     proj.StartRendering(jid)
     # Rendering now runs headless in Resolve — bring the app back to the front so its
     # progress is what's on screen (no more UI automation is needed past this point).
-    subprocess.run(["open", "-a", "Visionary"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"[{time.strftime('%H:%M:%S')}] rendering started — refocused the app", flush=True)
+    if _refocus_enabled():
+        subprocess.run(["open", "-a", "Visionary"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[{time.strftime('%H:%M:%S')}] rendering started — refocused the app", flush=True)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] rendering started (refocus off)", flush=True)
     t0 = time.time(); last = -1
     while proj.IsRenderingInProgress():
         st = proj.GetRenderJobStatus(jid); p = st.get("CompletionPercentage")

@@ -567,6 +567,17 @@ struct ResolveHostSection: View {
             Text("The mouse pointer is shared by every screen — moving Resolve stops it "
                  + "covering your work, but the pipeline still borrows the pointer to click.")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
+            Toggle(isOn: Binding(get: { store.state?.settings?.refocus_app_on_steps ?? true },
+                                 set: { v in Task { await store.setRefocusOnSteps(v) } })) {
+                Text("Bring Visionary forward at step boundaries").font(.system(size: 12))
+            }
+            Text("The Resolve step raises this app twice — once its own window is on the pinned "
+                 + "display, and again when the headless render starts. That is for watching the "
+                 + "run; if you are working on this Mac it is a stolen keyboard mid-sentence.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+            Text("Turning it off never affects the automation: Resolve is re-activated before "
+                 + "every click, and re-raised whenever it leaves its screen.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
         }
     }
 }

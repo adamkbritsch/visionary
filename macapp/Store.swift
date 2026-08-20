@@ -133,6 +133,12 @@ final class AppStore: ObservableObject {
     func setDisplayPriority(_ keys: [String]) async {
         await post("/api/displays", ["priority": keys]); await fetchDisplays()
     }
+    /// Raise Visionary at the Resolve step's boundaries? Off is for a machine being used for
+    /// other things — it never affects the automation, which re-activates RESOLVE itself.
+    func setRefocusOnSteps(_ on: Bool) async {
+        await saveSettings(["refocus_app_on_steps": on])
+    }
+
     func setTakeoverWarning(_ on: Bool) async {
         await post("/api/displays", ["warn_takeover": on]); await fetchDisplays()
     }
