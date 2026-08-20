@@ -23,9 +23,9 @@ Optionally, AI border extension fills 4:3 shows out to 16:9 before upscaling.
 Arm it in the evening; wake up to finished episodes.
 
 <p align="center">
-  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one in Topaz while the previous one remuxes" width="820">
+  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one upscaling in Topaz while the previous one's Dolby Vision remux runs beside it" width="820">
 </p>
-<p align="center"><sub><b>Two episodes in flight at once</b> — S07E21 upscaling in Topaz while S07E20's Dolby Vision remux runs beside it, each with its own segmented, resumable progress.</sub></p>
+<p align="center"><sub><b>Two episodes in flight at once</b> — S05E02 upscaling in Topaz while S05E01's Dolby Vision remux runs beside it, each with its own segmented, resumable progress and its own estimate.</sub></p>
 
 > [!IMPORTANT]
 > **Visionary drives the DaVinci Resolve interface by looking at the screen, and runs the
