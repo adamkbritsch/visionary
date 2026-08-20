@@ -165,7 +165,7 @@ class Gate(unittest.TestCase):
         o = orch.Orchestrator()
         with mock.patch.object(orch.power, "has_battery", return_value=battery), \
              mock.patch.object(orch.power, "read_power", return_value=self.R(ext)), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=watts), \
+             mock.patch.object(orch.power, "adapter_watts_sustained", return_value=watts), \
              mock.patch.object(orch.settings, "get_settings", return_value={}):
             return o._power_ok()
 
@@ -199,7 +199,7 @@ class Gate(unittest.TestCase):
         o = orch.Orchestrator()
         with mock.patch.object(orch.power, "has_battery", return_value=True), \
              mock.patch.object(orch.power, "read_power", return_value=self.R(True)), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=96), \
+             mock.patch.object(orch.power, "adapter_watts_sustained", return_value=96), \
              mock.patch.object(orch.settings, "get_settings",
                                return_value={"min_adapter_watts": 90}):
             self.assertEqual(o._power_ok()[0], "run")    # 96 clears a lowered 90 W bar
@@ -2355,7 +2355,7 @@ class DesktopPowerGate(unittest.TestCase):
         with mock.patch.object(orch.power, "has_battery", return_value=False), \
              mock.patch.object(orch.power, "read_power",
                                return_value=orch.power.PowerReading(False, False, -1, 0)), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=None):
+             mock.patch.object(orch.power, "adapter_watts_sustained", return_value=None):
             status, msg = o._power_ok()
         self.assertEqual(status, "run")
         self.assertIsNone(msg)
@@ -2365,7 +2365,7 @@ class DesktopPowerGate(unittest.TestCase):
         with mock.patch.object(orch.power, "has_battery", return_value=True), \
              mock.patch.object(orch.power, "read_power",
                                return_value=orch.power.PowerReading(False, False, 80, -1200)), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=None):
+             mock.patch.object(orch.power, "adapter_watts_sustained", return_value=None):
             status, msg = o._power_ok()
         self.assertEqual(status, "pause")
         self.assertIn("battery", msg)
@@ -2375,7 +2375,7 @@ class DesktopPowerGate(unittest.TestCase):
         with mock.patch.object(orch.power, "has_battery", return_value=True), \
              mock.patch.object(orch.power, "read_power",
                                return_value=orch.power.PowerReading(True, True, 80, 500)), \
-             mock.patch.object(orch.power, "adapter_watts", return_value=96):
+             mock.patch.object(orch.power, "adapter_watts_sustained", return_value=96):
             status, msg = o._power_ok()
         self.assertEqual(status, "pause")
         self.assertIn("96", msg)

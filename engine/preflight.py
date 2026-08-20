@@ -263,7 +263,7 @@ def check_power_adapter():
                       f"Visionary needs a Mac that sustains {need} W: a 140 W-class MacBook "
                       f"Pro (16-inch Apple Silicon) on its own brick, or any desktop Mac.")
     known = model in versions.MODELS_140W
-    w = power.adapter_watts()
+    w = power.adapter_watts_sustained()
     fix = (f"Plug in the {need} W adapter. Smaller bricks cannot power the Topaz stage; the "
            f"pipeline will refuse to run on them.")
     if known and w is None:

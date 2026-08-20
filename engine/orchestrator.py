@@ -1709,7 +1709,8 @@ class Orchestrator:
         if not r.external_connected:
             return "pause", "paused — on battery (waiting for the 140 W adapter)"
         need = self._min_watts()
-        w = power.adapter_watts()
+        w = power.adapter_watts_sustained()   # peak-held per adapter: a 140 W brick that dips
+                                              # to 120 and back must not pause a live run
         if (w or 0) >= need:
             return "run", None
         return "pause", (f"paused — {w} W adapter connected, needs {need} W" if w
@@ -1775,7 +1776,7 @@ class Orchestrator:
                 # external_connected=False, count down, and ABORT every stage it ran.
                 sufficient = (not power.has_battery()) or (
                     bool(power.read_power().external_connected)
-                    and (power.adapter_watts() or 0) >= self._min_watts())
+                    and (power.adapter_watts_sustained() or 0) >= self._min_watts())
             else:
                 sufficient = True
             action, unplug_since, remaining = unplug_decision(

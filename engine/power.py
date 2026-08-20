@@ -109,15 +109,57 @@ def model_id() -> str:
     except (subprocess.TimeoutExpired, OSError):
         return ""
 
-def adapter_watts():
-    """The connected power adapter's wattage (int), or None if on battery / unknown.
-    The Topaz stage needs >= ~140 W or an M3-Max encode drains the battery."""
+def adapter_report() -> dict:
+    """{"watts": int|None, "family": str} straight from pmset — the instantaneous read."""
     try:
         out = subprocess.run(["pmset", "-g", "adapter"], capture_output=True, text=True).stdout
-        m = re.search(r"Wattage\s*=\s*(\d+)", out)
-        return int(m.group(1)) if m else None
     except Exception:
+        return {"watts": None, "family": ""}
+    m = re.search(r"Wattage\s*=\s*(\d+)", out)
+    fam = re.search(r"Family\s*Code\s*=\s*(\S+)", out)
+    return {"watts": int(m.group(1)) if m else None, "family": fam.group(1) if fam else ""}
+
+
+def adapter_watts():
+    """The connected power adapter's wattage (int), or None if on battery / unknown.
+    The Topaz stage needs >= ~140 W or an M3-Max encode drains the battery.
+    The RAW read — see adapter_watts_sustained for what the run gate should use."""
+    return adapter_report()["watts"]
+
+
+# Highest wattage the CURRENTLY-CONNECTED adapter has advertised, and which adapter that was.
+_PEAK = {"family": None, "watts": 0}
+
+
+def reset_adapter_peak() -> None:
+    _PEAK.update(family=None, watts=0)
+
+
+def adapter_watts_sustained():
+    """The adapter's wattage, held at the highest value THIS adapter has advertised while it
+    has stayed plugged in.
+
+    Some chargers renegotiate downward for a moment under load and report a lower figure —
+    live-caught 2026-08-20 on a 140 W brick that flips to 120 and back. The run gate compares
+    an instantaneous read against min_adapter_watts, so a dip like that reads as "a weaker
+    charger appeared" and pauses a run that has lost nothing.
+
+    This is NOT a relaxation of the wattage rule (see CLAUDE.md): the peak can only ever be a
+    value the adapter itself advertised, so a brick that never reports 140 W never reaches
+    140 W here. The peak is tied to the adapter's Family Code and cleared the moment nothing
+    is plugged in or a DIFFERENT adapter appears, so a weaker charger can never inherit a
+    stronger one's number.
+    """
+    r = adapter_report()
+    w, fam = r["watts"], r["family"]
+    if w is None:                      # unplugged / unknown -> forget the last adapter
+        reset_adapter_peak()
         return None
+    if _PEAK["family"] != fam:         # a different adapter -> start its own history
+        _PEAK.update(family=fam, watts=w)
+    elif w > _PEAK["watts"]:
+        _PEAK["watts"] = w
+    return _PEAK["watts"]
 
 
 if __name__ == "__main__":

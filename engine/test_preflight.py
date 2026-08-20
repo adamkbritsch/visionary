@@ -125,7 +125,7 @@ class PowerRule(unittest.TestCase):
         import power
         with mock.patch.object(power, "has_battery", return_value=battery), \
              mock.patch.object(power, "model_id", return_value=model), \
-             mock.patch.object(power, "adapter_watts", return_value=watts):
+             mock.patch.object(power, "adapter_watts_sustained", return_value=watts):
             return preflight.check_power_adapter()
 
     def test_desktop_passes_with_no_adapter_reading(self):

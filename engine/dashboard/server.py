@@ -107,10 +107,11 @@ def _is_draining(reading):
 # ---- real collectors (I/O glue) -------------------------------------------
 
 def read_adapter_watts():
+    """The SAME number the run gate judges by (power.adapter_watts_sustained) — a second copy
+    of the pmset parse used to live here, so a charger that dips to 120 and back made the
+    header disagree with the gate and read as though power had failed."""
     try:
-        out = subprocess.run(["pmset", "-g", "adapter"], capture_output=True, text=True).stdout
-        m = re.search(r"Wattage\s*=\s*(\d+)", out)
-        return int(m.group(1)) if m else None
+        return power.adapter_watts_sustained()
     except Exception:
         return None
 
