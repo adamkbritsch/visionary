@@ -33,6 +33,9 @@ class UpNextCadence(unittest.TestCase):
             s.enter_context(mock.patch.object(settings, "get_settings",
                                               return_value={"youtube_every_tv_episodes": every}))
             s.enter_context(mock.patch.object(orchestrator.ORCH, "_tv_since_yt", tv_since))
+            # up_next now reads the burst position too — pin it, or these read whatever the
+            # LIVE pipeline happens to be part-way through
+            s.enter_context(mock.patch.object(orchestrator.ORCH, "_yt_in_burst", 0))
             s.enter_context(mock.patch.object(orchestrator.ORCH, "_parked", set(parked)))
             return [it["kind"] for it in server.up_next(limit=limit, current=current)]
 

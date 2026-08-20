@@ -1119,8 +1119,9 @@ def up_next(limit=10, current=None, inflight=None):
         import orchestrator as _orch                           # done since the last YouTube video) + the
         tv_since = max(0, int(getattr(_orch.ORCH, "_tv_since_yt", 0)))   # PARKED set (skipped like reality)
         parked = getattr(_orch.ORCH, "_parked", None) or set()
+        in_burst = max(0, int(getattr(_orch.ORCH, "_yt_in_burst", 0)))   # of THIS burst, already done
     except Exception:
-        tv_since, parked = 0, set()
+        tv_since, parked, in_burst = 0, set(), 0
     mvs = sorted(movies.get_selected(), key=movies._pos)        # stable by slot, then add-order
     mvs = [m for m in mvs if m.get("name") not in mv_excl]      # in-flight movies are not "next"
     _st = settings.get_settings()
@@ -1128,9 +1129,23 @@ def up_next(limit=10, current=None, inflight=None):
     burst = max(1, int(_st.get("youtube_videos_per_burst", 1) or 1))   # videos per firing
     yt_videos = list(youtube.all_pending(skip=parked))         # flat, newest-first — 1 served per `every` eps
     yt_videos = [v for v in yt_videos if v.get("source_name") not in yt_excl]   # in-flight videos not "next"
-    if cur_kind == "youtube":
-        tv_since = 0                                           # after this video completes, the counter resets
-    elif cur_kind == "episode":
+    # WHERE THE CURRENT BURST STANDS. `_yt_in_burst` counts videos that have HANDED OFF; a
+    # video on the run thread right now has not, and is excluded from yt_videos anyway, so it
+    # still occupies one of the burst's slots.
+    burst_done = in_burst + (1 if cur_kind == "youtube" else 0)
+    if burst_done >= burst:
+        # That burst finishes with the current video, so the countdown restarts (exactly what
+        # _advance_cadence_at_handoff does) and the NEXT group of videos is a whole fresh burst.
+        if cur_kind == "youtube":
+            tv_since = 0
+        first_burst = burst
+    else:
+        # Mid-burst: what runs before the next episode is the REMAINDER, not a fresh burst —
+        # ten set, four done, six shown (user-dictated 2026-08-19). The countdown is NOT reset
+        # here: resetting it after every video modelled a burst as though it were always one
+        # video, so mid-burst the queue claimed TV came next when the rest of the burst does.
+        first_burst = burst - burst_done
+    if cur_kind == "episode":
         tv_since += 1                                          # after this episode completes, it advances
     tv_since += sum(1 for c in (inflight or []) if c.get("kind") == "episode")   # finisher eps complete too
     # 'title'/'source_name' are DISPLAY fields → wire-decoded; 'name'/'ep' are ACTION KEYS
@@ -1166,8 +1181,12 @@ def up_next(limit=10, current=None, inflight=None):
         out.append(yt_item(yt_videos[yi])); yi += 1
         ep_count = 0                                           # restart the N-episode countdown
         return _full()
-    def _emit_yt_burst():                                      # the WHOLE burst runs back-to-back
-        for _ in range(burst):
+    led_once = False
+    def _emit_yt_burst():          # first group = the remainder above; later ones = whole bursts
+        nonlocal led_once
+        n = burst if led_once else first_burst
+        led_once = True
+        for _ in range(n):
             if yi >= len(yt_videos):
                 break
             if _emit_yt_one():

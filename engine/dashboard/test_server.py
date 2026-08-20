@@ -641,8 +641,11 @@ class UpNextKeepsTenEpisodes(unittest.TestCase):
         mvs = [{"name": f"m{i}.mkv", "title": f"M{i}", "pos": i} for i in range(n_movies)]
         st = dict(settings.DEFAULT_SETTINGS)
         st.update({"youtube_every_tv_episodes": every, "youtube_videos_per_burst": burst})
+        import orchestrator as _orch
         with mock.patch.object(youtube, "all_pending", return_value=vids), \
              mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(_orch.ORCH, "_yt_in_burst", 0, create=True), \
+             mock.patch.object(_orch.ORCH, "_tv_since_yt", 1, create=True), \
              mock.patch.object(movies, "get_selected", return_value=mvs), \
              mock.patch.object(series, "get_active_series", return_value=["show"]), \
              mock.patch.object(series, "get_rotation", return_value=0), \
@@ -751,3 +754,74 @@ class RemoteAccess(unittest.TestCase):
         self.assertTrue(_req("100.64.0.9",
                              Cookie="theme=dark; vk=" + self.tok + "; x=1")._authorized())
         self.assertFalse(_req("100.64.0.9", Cookie="theme=dark; x=1")._authorized())
+
+
+class UpNextShowsWhatIsLeftOfTheBurst(unittest.TestCase):
+    """The first group of videos is the REMAINDER of the burst already in flight, not a fresh
+    one. With a burst of ten and four already done, six run before the next episode — so the
+    queue has to say six, not ten (user-dictated 2026-08-19)."""
+
+    def _run(self, *, burst=10, in_burst=0, tv_since=1, every=1, cur=None, n_videos=30):
+        from unittest import mock
+        import movies, series, settings, youtube
+        import orchestrator as _orch
+        eps = [{"ep": "S01E%02d" % i, "source_name": "e%d.mkv" % i} for i in range(1, 13)]
+        vids = [{"channel": "Chan", "source_name": "v%d [aaaaaaaaa%02d].mp4" % (i, i),
+                 "title": "V%d" % i, "vid": "aaaaaaaaa%02d" % i, "secs": 60}
+                for i in range(1, n_videos + 1)]
+        st = dict(settings.DEFAULT_SETTINGS)
+        st.update({"youtube_every_tv_episodes": every, "youtube_videos_per_burst": burst})
+        with mock.patch.object(youtube, "all_pending", return_value=vids), \
+             mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(movies, "get_selected", return_value=[]), \
+             mock.patch.object(series, "get_active_series", return_value=["show"]), \
+             mock.patch.object(series, "get_rotation", return_value=0), \
+             mock.patch.object(series, "cached_queue", return_value={"remaining_items": eps}), \
+             mock.patch.object(settings, "get_settings", return_value=st), \
+             mock.patch.object(_orch.ORCH, "_tv_since_yt", tv_since, create=True), \
+             mock.patch.object(_orch.ORCH, "_yt_in_burst", in_burst, create=True), \
+             mock.patch.object(_orch.ORCH, "_parked", set(), create=True):
+            return server.up_next(limit=10, current=cur)
+
+    @staticmethod
+    def _lead_videos(out):
+        """How many videos sit before the first episode."""
+        n = 0
+        for o in out:
+            if o.get("kind") == "episode":
+                break
+            if o.get("kind") == "youtube":
+                n += 1
+        return n
+
+    def test_four_done_of_ten_shows_six(self):
+        self.assertEqual(self._lead_videos(self._run(burst=10, in_burst=4)), 6)
+
+    def test_a_fresh_burst_shows_all_ten(self):
+        self.assertEqual(self._lead_videos(self._run(burst=10, in_burst=0)), 10)
+
+    def test_the_video_on_the_run_thread_counts_too(self):
+        # it has not handed off (so _yt_in_burst has not counted it) and it is excluded from
+        # the pending list — but it is still one of the ten
+        out = self._run(burst=10, in_burst=4, cur={"kind": "youtube", "name": "v99.mp4"})
+        self.assertEqual(self._lead_videos(out), 5)
+
+    def test_later_groups_are_whole_bursts_again(self):
+        out = self._run(burst=3, in_burst=2, n_videos=30)
+        self.assertEqual(self._lead_videos(out), 1)          # remainder of the burst in flight
+        # the NEXT group, after an episode, is a full three
+        seen_ep, group = False, 0
+        for o in out:
+            if o.get("kind") == "episode":
+                if group:
+                    break
+                seen_ep = True
+            elif seen_ep and o.get("kind") == "youtube":
+                group += 1
+        self.assertEqual(group, 3)
+
+    def test_a_finished_burst_does_not_lead_with_videos(self):
+        # counters reset at the end of a burst -> the next thing is TV
+        out = self._run(burst=10, in_burst=0, tv_since=0, every=1)
+        self.assertEqual(self._lead_videos(out), 0)
+        self.assertEqual(out[0].get("kind"), "episode")
