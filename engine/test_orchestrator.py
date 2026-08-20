@@ -3577,3 +3577,67 @@ class YieldLivelock(unittest.TestCase):
                                 or o._yt_cadence_due()))))
         with mock.patch.object(o, "_dual_remux_live", return_value=True):
             self.assertTrue(sp())
+
+
+class BurstRunsToItsSetSize(unittest.TestCase):
+    """youtube_videos_per_burst=10 means ten videos before the next episode. It was producing
+    episode, video, episode, video: after a video handed off, its OWN remux was running, the
+    selection test asked "could a video run this second" and answered no, a part-processed
+    episode won — and _advance_cadence_at_handoff then reset yt_in_burst to 0 because an
+    episode had run, wiping the burst every time (user-reported 2026-08-19)."""
+
+    def _orch(self, *, since=5, every=1, holding=False, pending=True):
+        o = orch.Orchestrator()
+        o._tv_since_yt = since
+        es = contextlib.ExitStack(); self.addCleanup(es.close)
+        es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
+        es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=holding))
+        es.enter_context(mock.patch.object(o, "_in_finisher_keys", return_value=set()))
+        es.enter_context(mock.patch.object(orch.youtube, "next_due",
+                                           return_value={"channel": "C", "video_path": "/s/C/x/v.mp4",
+                                                         "title": "T"} if pending else None))
+        return o
+
+    def test_a_video_is_still_owed_while_its_predecessors_remux(self):
+        # THE bug: mid-remux the cadence is still owed, even though nothing can start yet
+        o = self._orch(holding=True)
+        self.assertTrue(o._yt_cadence_owed())
+        self.assertFalse(o._yt_cadence_due())     # ...but do not interrupt a topaz for it
+
+    def test_selection_keeps_the_burst_going_through_a_remux(self):
+        o = self._orch(holding=True)
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv",
+                               side_effect=AssertionError("the owed video must go first")), \
+             mock.patch.object(orch.youtube, "locate_priority", return_value=None), \
+             mock.patch.object(orch.movies, "next_due", return_value=None), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value="/scratch"):
+            ep, why = o._next_episode()
+        self.assertEqual(why, "ok")
+        self.assertTrue(ep.youtube)
+
+    def test_nothing_owed_lets_a_part_processed_episode_resume(self):
+        o = self._orch(since=0, every=2)          # cadence not reached
+        sentinel = object()
+        with mock.patch.object(orch.series, "promote_finished_slots", return_value=[]), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=sentinel):
+            ep, _why = o._next_episode()
+        self.assertIs(ep, sentinel)
+
+    def test_no_videos_left_is_not_owed(self):
+        self.assertFalse(self._orch(pending=False)._yt_cadence_owed())
+
+    def test_the_burst_counter_survives_ten_videos(self):
+        # the accounting itself was never wrong — it was reset by the episode that should
+        # not have been picked
+        o = self._orch()
+        with mock.patch.object(o, "_yt_burst", return_value=10):
+            for i in range(9):
+                p = orch.youtube_paths("C", "/s/C/x/v%d.mp4" % i, "T", scratch_dir="/tmp")
+                o._advance_cadence_at_handoff(p)
+            self.assertEqual(o._yt_in_burst, 9)
+            self.assertEqual(o._tv_since_yt, 5)          # countdown not restarted mid-burst
+            p = orch.youtube_paths("C", "/s/C/x/v9.mp4", "T", scratch_dir="/tmp")
+            o._advance_cadence_at_handoff(p)
+        self.assertEqual(o._yt_in_burst, 0)              # burst complete
+        self.assertEqual(o._tv_since_yt, 0)              # ...now the episode countdown restarts

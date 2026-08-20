@@ -2499,7 +2499,7 @@ class Orchestrator:
         # because locate_priority below is not even reached while `mid` wins (live-hit
         # 2026-08-18: the run thread span for hours and no video ran all day).
         jump = self._yt_priority_waiting()
-        mid = (None if (gate_released or jump or self._yt_cadence_due())
+        mid = (None if (gate_released or jump or self._yt_cadence_owed())
                else self._midpipeline_tv(skip))
         if mid is not None:
             return mid, "ok"
@@ -3075,6 +3075,34 @@ class Orchestrator:
             return False
         return (time.time() - self._last_resolve_at) < BACKLOG_WAIT_GRACE_SECONDS
 
+    def _yt_cadence_owed(self) -> bool:
+        """The cadence says a video is due and one is ready — regardless of whether it could
+        start this second.
+
+        SELECTION uses this. _yt_cadence_due() adds "and it could make progress right now",
+        which is the correct question when deciding whether to INTERRUPT a running topaz, and
+        the wrong one when deciding what to pick next: after a video hands off, its OWN remux
+        is running, so the stricter test said "not due" and a part-processed episode won —
+        then _advance_cadence_at_handoff reset yt_in_burst to 0 because an episode had run,
+        wiping the burst every time. With youtube_videos_per_burst=10 the queue produced
+        episode, video, episode, video (user-reported 2026-08-19).
+
+        Picking the video is still right mid-remux: it downloads (real work), then parks at
+        the Resolve doorstep, which hands the machine back for the episode's topaz — and the
+        video resolves the moment the remux clears.
+        """
+        try:
+            if self._tv_since_yt < self._yt_every_tv():
+                return False
+            import youtube
+            skip = self._parked | set(self._refused) | self._in_finisher_keys()
+            name = (self.state.get("current") or {}).get("name") or ""
+            if name:
+                skip = skip | {os.path.splitext(os.path.basename(name))[0]}
+            return youtube.next_due(skip=skip) is not None
+        except Exception:
+            return False
+
     def _yt_cadence_due(self) -> bool:
         """A YouTube video is due by the cadence AND could actually make progress right now.
 
@@ -3093,16 +3121,9 @@ class Orchestrator:
         Cheap enough to poll between topaz segments: caches only, never FTP.
         """
         try:
-            if self._tv_since_yt < self._yt_every_tv():
-                return False
             if self._resolve_should_hold():
                 return False          # it could only park — let topaz keep the machine
-            import youtube
-            skip = self._parked | set(self._refused) | self._in_finisher_keys()
-            name = (self.state.get("current") or {}).get("name") or ""
-            if name:                  # never yield to the video already running — that loops
-                skip = skip | {os.path.splitext(os.path.basename(name))[0]}
-            return youtube.next_due(skip=skip) is not None
+            return self._yt_cadence_owed()
         except Exception:
             return False
 
