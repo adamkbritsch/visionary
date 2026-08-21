@@ -81,6 +81,9 @@ final class AppStore: ObservableObject {
     // reads
     func refresh() async {
         if let s: StateDTO = await get("/api/state") { self.state = s }
+        // Keep the Finished list live only while it is actually open — a revision's row says
+        // "fixing…" and would otherwise sit stale until reopened. Costs nothing when closed.
+        if showHistory { await fetchHistory() }
     }
     func fetchSeries() async {
         if let d: SeriesListDTO = await get("/api/series") {

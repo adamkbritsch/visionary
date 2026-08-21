@@ -320,7 +320,14 @@ struct HeaderBar: View {
             .popover(isPresented: $store.showSettings, arrowEdge: .bottom) {
                 SettingsPopover().environmentObject(store)
             }
-            Button(action: { store.showHistory.toggle() }) {
+            Button(action: {
+                // Load BEFORE presenting. A popover measures its content ONCE, as it opens —
+                // with the list still empty it sized itself to the placeholder, and the rows
+                // that arrived a moment later were left in a one-row sliver until it was
+                // closed and reopened (user-caught 2026-08-20).
+                if store.showHistory { store.showHistory = false; return }
+                Task { await store.fetchHistory(); store.showHistory = true }
+            }) {
                 // FINISHED: the look-back. Same bare-glyph treatment as the gear — a way in,
                 // never an action competing with Activate on this bar.
                 Image(systemName: "clock.arrow.circlepath")
@@ -332,7 +339,6 @@ struct HeaderBar: View {
             .help("Finished — everything upscaled, and fix a file's audio")
             .popover(isPresented: $store.showHistory, arrowEdge: .bottom) {
                 HistoryPopover().environmentObject(store)
-                    .task { await store.fetchHistory() }
             }
             Button(action: { Task { await store.toggleAutomation() } }) {
                 HStack(spacing: 7) {
@@ -2849,7 +2855,7 @@ struct HistoryPopover: View {
                     VStack(spacing: 0) {
                         ForEach(store.history) { it in row(it) }
                     }
-                }.frame(maxHeight: 320)
+                }.frame(height: min(max(CGFloat(store.history.count) * 44, 88), 320))
                     .panel(DS.radiusControl, inset: true)
             }
         }
