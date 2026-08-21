@@ -261,12 +261,13 @@ class Connect(unittest.TestCase):
             def login(self, *a, **k): pass
             def set_pasv(self, v): pass
         rec = Rec()
-        with mock.patch.object(transfer.ftplib, "FTP", return_value=rec), \
+        with mock.patch.object(transfer, "_WireFTP", return_value=rec), \
              mock.patch.object(transfer, "ftp_hosts", return_value=["h"]), \
              mock.patch.object(transfer, "ftp_settings",
                                return_value={"port": 21, "user": "u", "passwd": "p"}):
             ftp = transfer.connect()
-        self.assertEqual(ftp.encoding, "latin-1")
+        self.assertEqual(ftp.encoding, "latin-1")   # both directions, unchanged: stray NAS
+                                                    # bytes must still round-trip exactly
 
 
 if __name__ == "__main__":
@@ -322,3 +323,42 @@ class UploadIdempotency(unittest.TestCase):
             self.assertIn(final, f.stored)
         finally:
             os.remove(local)
+
+
+class UnicodePathsOnTheWire(unittest.TestCase):
+    """connect() reads latin-1 so any stray NAS byte round-trips — but latin-1 cannot ENCODE
+    above U+00FF, so a path built from real Unicode raised on every command that touched it.
+    Adding "Kurzgesagt – In a Nutshell" (en dash) therefore crashed the whole state poll, and
+    a UI that cannot refresh cannot clear a pending tab switch either — the app froze on the
+    YouTube tab and the channel never appeared (live-caught 2026-08-20)."""
+
+    NAME = "Kurzgesagt – In a Nutshell"
+
+    def test_ascii_is_untouched(self):
+        for n in ("Plain Name", "DIY Perks", "a/b/c.mp4", ""):
+            self.assertEqual(transfer.to_wire(n), n)
+
+    def test_real_unicode_becomes_latin1_safe(self):
+        w = transfer.to_wire(self.NAME)
+        w.encode("latin-1")                      # must not raise — this is the whole point
+        self.assertNotEqual(w, self.NAME)
+
+    def test_it_is_the_inverse_of_display_name(self):
+        self.assertEqual(transfer.display_name(transfer.to_wire(self.NAME)), self.NAME)
+
+    def test_an_already_wire_string_passes_through(self):
+        w = transfer.to_wire(self.NAME)
+        self.assertEqual(transfer.to_wire(w), w)   # idempotent — never double-encodes
+
+    def test_the_ftp_subclass_converts_command_lines(self):
+        sent = []
+        ftp = transfer._WireFTP()
+        with mock.patch.object(transfer.ftplib.FTP, "putcmd",
+                               side_effect=lambda line: sent.append(line)):
+            ftp.putcmd("CWD /YouTube-raw/" + self.NAME)
+        self.assertEqual(len(sent), 1)
+        sent[0].encode("latin-1")                # would have raised before
+        self.assertIn("Kurzgesagt", sent[0])
+
+    def test_non_strings_are_left_alone(self):
+        self.assertIsNone(transfer.to_wire(None))

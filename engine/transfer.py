@@ -113,6 +113,15 @@ def ftp_hosts() -> list:
     return nas_hosts()
 
 
+class _WireFTP(ftplib.FTP):
+    """FTP that can carry a path containing real Unicode. Everything else about the
+    connection is unchanged — latin-1 in both directions — but a command line that latin-1
+    cannot encode is converted to its wire bytes first (see to_wire) instead of raising."""
+
+    def putcmd(self, line):
+        super().putcmd(to_wire(line))
+
+
 def connect(timeout=15):
     """Open an FTP connection, trying each host in order."""
     s = ftp_settings()
@@ -124,7 +133,7 @@ def connect(timeout=15):
     last = None
     for host in hosts:
         try:
-            ftp = ftplib.FTP()
+            ftp = _WireFTP()
             # latin-1 decodes ANY byte 0-255 without error and round-trips bytes
             # exactly, so a filename with a stray non-UTF-8 byte (e.g. 0xa1 '¡' in
             # an episode title) can't crash mlsd()/listings — and RETR/STOR/SIZE
@@ -137,6 +146,35 @@ def connect(timeout=15):
         except ftplib.all_errors as e:
             last = e
     raise last or ftplib.error_temp("no FTP host reachable")
+
+
+def to_wire(s):
+    """A path built from REAL Unicode, converted to the form connect()'s latin-1 encoding
+    puts on the wire. The inverse of display_name.
+
+    connect() reads latin-1 so any stray byte round-trips — but latin-1 cannot ENCODE
+    anything above U+00FF, so a single en dash in a path made every command that touched it
+    raise UnicodeEncodeError. That took down the whole state poll, and with it the app's
+    ability to refresh at all (live-caught 2026-08-20: adding "Kurzgesagt – In a Nutshell"
+    froze the UI on the YouTube tab, because the failing poll could never clear the pending
+    mode switch).
+
+    ASCII and already-wire strings are returned untouched, so nothing that worked before
+    changes. UTF-8 is tried first, matching display_name's decode order — the NAS disk is
+    clean UTF-8; GB18030 is what smbftpd hands back."""
+    if not s or not isinstance(s, str):
+        return s
+    try:
+        s.encode("latin-1")
+        return s                       # already wire-safe
+    except UnicodeEncodeError:
+        pass
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return s.encode(enc).decode("latin-1")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return s
 
 
 def display_name(s):
