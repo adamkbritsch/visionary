@@ -265,7 +265,100 @@ def _cfr_height(path, ffprobe=FFPROBE_HB) -> int:
         return 0
 
 
-def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False, height=0):
+# How far the container may outrun the VIDEO before we cap the CFR's length, and the slack
+# left above the video when we do. Don't Look Up's source carries ~5 minutes of audio past
+# the end of its picture; Resolve took its TIMELINE length from the container, so it rendered
+# 206,200 frames for a 199,144-frame movie — five minutes of nothing on the end, which then
+# could not align to the RPU and parked the movie at the remux (live-caught 2026-08-21).
+# The slack is deliberately a whole second: `-t` must never shave a real trailing frame, and
+# a second of overshoot is nowhere near enough to matter to anything downstream.
+CFR_TAIL_SLOP_SECS = 2.0
+CFR_TAIL_KEEP_SECS = 1.0
+
+
+def video_duration(path, ffprobe=FFPROBE_HB):
+    """Length of the VIDEO stream in seconds — frames / rate where both are known (exact),
+    else the stream's own duration tag. None when neither is readable."""
+    from fractions import Fraction
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=nb_frames,duration,r_frame_rate", "-of", "json", path],
+            capture_output=True, text=True, timeout=60).stdout
+        st = (json.loads(out).get("streams") or [{}])[0]
+    except Exception:
+        return None
+    try:
+        n, r = int(st.get("nb_frames") or 0), Fraction(st.get("r_frame_rate") or "0/0")
+        if n > 0 and r > 0:
+            return n / float(r)
+    except Exception:
+        pass
+    try:
+        d = float(st.get("duration"))
+        if d > 0:
+            return d
+    except (TypeError, ValueError):
+        pass
+    return _last_video_pts(path, ffprobe)
+
+
+def _last_video_pts(path, ffprobe=FFPROBE_HB):
+    """Where the picture actually ENDS, for containers that publish neither a frame count
+    nor a stream duration — Matroska routinely publishes neither. Seeks to just before the
+    container's end and reads what remains: seeking PAST the end of a short video stream
+    lands on its last keyframe, so the tail is read either way, and it costs one seek
+    (~0.3 s on a 19 GB file) rather than a full decode."""
+    box = _container_duration(path, ffprobe)
+    if not box:
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-read_intervals", f"{max(0.0, box - 60):.3f}%",
+             "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=180).stdout
+    except Exception:
+        return None
+    last, step = None, 0.0
+    for ln in out.splitlines():
+        parts = ln.split(",")
+        try:
+            last = float(parts[0])
+        except (ValueError, IndexError):
+            continue
+        try:
+            step = float(parts[1])
+        except (ValueError, IndexError):
+            pass
+    # the last frame is still ON SCREEN for its own duration, so the picture ends after it
+    return (last + step) if last is not None else None
+
+
+def _container_duration(path, ffprobe=FFPROBE_HB):
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of",
+             "default=nw=1:nk=1", path], capture_output=True, text=True, timeout=60).stdout
+        d = float((out.splitlines() or ["0"])[0].strip())
+        return d if d > 0 else None
+    except Exception:
+        return None
+
+
+def cfr_duration_cap(source, ffprobe=FFPROBE_HB):
+    """The `-t` to give the CFR pass so its container cannot outrun its picture, or None
+    when the source is already honest (the overwhelmingly common case). Only ever LONGER
+    than the video, so it can never truncate one."""
+    vid = video_duration(source, ffprobe)
+    box = _container_duration(source, ffprobe)
+    if not vid or not box or box <= vid + CFR_TAIL_SLOP_SECS:
+        return None
+    return vid + CFR_TAIL_KEEP_SECS
+
+
+def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False,
+                     height=0, duration_cap=None):
     """ffmpeg args for a VFR→CFR re-encode at `rate` (the source's OWN rate — same
     cadence, just constant). `-r <rate>` + `-fps_mode cfr` is the canonical recipe;
     near-lossless crf keeps the upscaler's input detail; bit depth + color tags are
@@ -310,6 +403,7 @@ def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False
         *rate_flags, "-fps_mode", "cfr",
         *color_flags(color),
         "-c:a", "copy",
+        *(["-t", f"{duration_cap:.3f}"] if duration_cap else []),
         dst,
     ]
 
@@ -384,7 +478,7 @@ def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
             and _period_exact_in_timebase(r, s.get("time_base")))
 
 
-def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False):
+def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False, duration_cap=None):
     """Fast path for an already-CFR 4:2:0 source (see _is_already_cfr): stream-COPY the video
     (+audio) into the CFR file — no re-encode. Subtitles stay out (PGS can't ride the CFR and
     aren't needed; the remux re-attaches them from the original). `-progress` still lets
@@ -396,6 +490,7 @@ def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False):
         "-i", src,
         "-map", "0:v:0", "-map", "0:a?",
         "-c", "copy",
+        *(["-t", f"{duration_cap:.3f}"] if duration_cap else []),
         dst,
     ]
 
@@ -439,12 +534,18 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     either way) plus decoded frames for scene-cut planning. Hours of libx264 on a 4K movie
     whose video bytes nothing reads (live-caught 2026-08-06, a 60 GB REMUX)."""
     rate = _fps_fraction(source)
+    cap = cfr_duration_cap(source)     # see CFR_TAIL_SLOP_SECS — a container longer than its
+    if cap:                            # own picture becomes Resolve's timeline length
+        logbook.event(f"CFR {os.path.basename(source)}: container runs "
+                      f"past the picture — capping the CFR at {cap:.1f}s")
     if copy_only or _is_already_cfr(source):
-        cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio)
+        cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio,
+                                     duration_cap=cap)
     else:
         cmd = build_cfr_command(FFMPEG_HB, source, dst, rate=rate,
                                 pix=_cfr_pix_fmt(source), color=source_color(source),
-                                low_prio=low_prio, height=_cfr_height(source))
+                                low_prio=low_prio, height=_cfr_height(source),
+                                duration_cap=cap)
     rc, frames, aborted, tail = _run_ffmpeg(cmd, os.environ.copy(),
                                             abort=abort, on_progress=on_progress)
     # A negative rc = the process was killed by a signal — that's ALWAYS our own stop/shutdown

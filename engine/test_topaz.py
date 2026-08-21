@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest import mock
 import topaz
 from topaz import build_filter, build_command, build_env, summarize, is_valid_upscale
@@ -424,3 +425,66 @@ class CfrHardwarePath(unittest.TestCase):
                          "p010le")
         self.assertEqual(self._cmd(2160, "yuv420p")[self._cmd(2160, "yuv420p").index("-pix_fmt") + 1],
                          "nv12")
+
+
+class ContainerMustNotOutrunThePicture(unittest.TestCase):
+    """Don't Look Up's source carries ~5 minutes of audio past the end of its picture
+    (video 8297.7s, container 8591.6s). Resolve took its TIMELINE length from the
+    container and rendered 206,200 frames for a 199,144-frame movie; the extra five
+    minutes could not align to the RPU, and the movie parked at the remux after five
+    identical failures (live-caught 2026-08-21). The CFR now caps its own length."""
+
+    def _cap(self, video, box, frames=None, rate="24/1"):
+        st = {"duration": str(video) if video is not None else "N/A", "r_frame_rate": rate}
+        if frames is not None:
+            st["nb_frames"] = str(frames)
+
+        def run(cmd, **kw):
+            out = (json.dumps({"streams": [st]}) if "-of" in cmd and "json" in cmd
+                   else str(box))
+            return mock.Mock(stdout=out, returncode=0)
+        with mock.patch.object(topaz.subprocess, "run", side_effect=run):
+            return topaz.cfr_duration_cap("/in.mkv")
+
+    def test_an_honest_container_is_left_alone(self):
+        self.assertIsNone(self._cap(2591.55, 2591.616))
+
+    def test_five_minutes_of_extra_audio_is_capped(self):
+        cap = self._cap(8297.667, 8591.648)
+        self.assertIsNotNone(cap)
+        self.assertAlmostEqual(cap, 8298.667, places=2)
+
+    def test_the_cap_is_always_longer_than_the_picture(self):
+        # -t must never shave a real trailing frame off the end of the movie
+        cap = self._cap(8297.667, 8591.648)
+        self.assertGreater(cap, 8297.667)
+
+    def test_a_container_SHORTER_than_the_video_is_never_capped(self):
+        self.assertIsNone(self._cap(8297.667, 8000.0))
+
+    def test_an_unreadable_duration_is_never_capped(self):
+        self.assertIsNone(self._cap(None, 8591.648))
+
+    def test_frames_over_rate_wins_over_the_duration_tag(self):
+        # exact when the container publishes a frame count; 199144/24 = 8297.667
+        cap = self._cap(1.0, 8591.648, frames=199144)
+        self.assertAlmostEqual(cap, 8298.667, places=2)
+
+    def test_the_copy_builder_carries_the_cap_before_the_output(self):
+        cmd = topaz.build_cfr_copy_command("/ff", "/in.mkv", "/out.mkv", duration_cap=8298.667)
+        self.assertIn("-t", cmd)
+        self.assertEqual(cmd[cmd.index("-t") + 1], "8298.667")
+        self.assertLess(cmd.index("-t"), cmd.index("/out.mkv"))
+
+    def test_the_reencode_builder_carries_the_cap_before_the_output(self):
+        cmd = topaz.build_cfr_command("/ff", "/in.mp4", "/out.mp4", rate="24/1",
+                                      pix="yuv420p10le", duration_cap=8298.667)
+        self.assertIn("-t", cmd)
+        self.assertEqual(cmd[cmd.index("-t") + 1], "8298.667")
+        self.assertLess(cmd.index("-t"), cmd.index("/out.mp4"))
+
+    def test_no_cap_means_no_flag_at_all(self):
+        for cmd in (topaz.build_cfr_copy_command("/ff", "/in.mkv", "/out.mkv"),
+                    topaz.build_cfr_command("/ff", "/in.mp4", "/out.mp4",
+                                            rate="24/1", pix="yuv420p")):
+            self.assertNotIn("-t", cmd)
