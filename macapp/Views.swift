@@ -2971,21 +2971,23 @@ private struct YouTubeMode: View {
 // far slower than a 1080p episode, so this throttles them so they don't crowd out TV.
 // ONE dial spanning BOTH directions of the cadence as whole numbers (user-dictated
 // 2026-08-17): "3 videos per episode" ... "1 per episode" ... "1 video every 10 episodes".
-// A single Int position maps onto the engine's two whole-number knobs — no fractions:
-//   position < 0  ->  every = 1,        burst = -position + 1   (K videos per episode)
-//   position >= 0 ->  every = position + 1, burst = 1           (1 video per N episodes)
+// A single Int position maps onto the engine's two whole-number knobs — no fractions.
+// UP IS MORE YOUTUBE (user-dictated 2026-08-20): the stepper's increment has to move toward
+// more videos, so the position axis runs the same way the dial reads.
+//   position > 0  ->  every = 1,           burst = position + 1  (K videos per episode)
+//   position <= 0 ->  every = -position + 1, burst = 1           (1 video per N episodes)
 private struct CadenceControl: View {
     let every: Int
     let burst: Int
     let onChange: (Int, Int) -> Void          // (every, burst)
 
-    private static let minPos = -9            // 10 videos per episode
-    private static let maxPos = 49            // 1 video per 50 episodes
+    private static let minPos = -49           // DOWN: 1 video per 50 episodes
+    private static let maxPos = 9             // UP:   10 videos per episode
 
-    private var position: Int { burst > 1 ? -(burst - 1) : every - 1 }
+    private var position: Int { burst > 1 ? (burst - 1) : -(every - 1) }
 
     private static func knobs(_ pos: Int) -> (Int, Int) {
-        pos < 0 ? (1, -pos + 1) : (pos + 1, 1)
+        pos > 0 ? (1, pos + 1) : (-pos + 1, 1)
     }
 
     private var summary: String {
