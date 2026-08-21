@@ -3734,3 +3734,51 @@ class BurstStopsAtItsSetSize(unittest.TestCase):
             episode_paths("A", "S01E01", SRC, nas_tv_root="/Media/TV"))
         self.assertEqual(o._yt_in_burst, 0)              # a partial burst is over
         self.assertEqual(o._tv_since_yt, before + 1)     # ...and that episode counts toward the next
+
+
+class RenderMustMatchTheSource(unittest.TestCase):
+    """render_is_complete only ever asked "is it truncated?", so a render of something OTHER
+    than the source passed. Don't Look Up rendered 206,200 frames at 23.976 from a
+    199,144-frame 24 fps source, sailed through to the remux, failed its RPU alignment five
+    times and PARKED (live-caught 2026-08-21). An RPU is aligned frame-by-frame, so a render
+    at the wrong rate can never align — judged here it is a retryable resolve instead."""
+
+    def _p(self, tmp):
+        p = episode_paths("Show", "S01E01", SRC, scratch_dir=tmp, nas_tv_root="/Media/TV")
+        return p
+
+    def _check(self, want, got, src_fps="24/1", ren_fps="24/1"):
+        tmp = tempfile.mkdtemp()
+        p = self._p(tmp)
+        fr = {p.source_cfr: want, p.dv_render: got}
+        fps = {p.source_cfr: src_fps, p.dv_render: ren_fps}
+        from fractions import Fraction
+        with mock.patch.object(orch, "_nb_frames", side_effect=lambda x: fr.get(x)), \
+             mock.patch.object(orch, "_fps_fraction_of",
+                               side_effect=lambda x: Fraction(fps[x]) if x in fps else None), \
+             mock.patch.object(orch, "combine_winner_path", return_value=None):
+            return orch.render_is_complete(p)
+
+    def test_a_matching_render_passes(self):
+        self.assertTrue(self._check(199144, 199144))
+
+    def test_a_truncated_render_fails(self):
+        self.assertFalse(self._check(199144, 120000))
+
+    def test_a_render_LONGER_than_the_source_fails(self):
+        # the actual failure: a whole timeline's worth more than the source has
+        self.assertFalse(self._check(199144, 206200))
+
+    def test_a_render_at_the_wrong_rate_fails(self):
+        self.assertFalse(self._check(199144, 199144, src_fps="24/1", ren_fps="24000/1001"))
+
+    def test_tiny_probe_noise_is_tolerated_both_ways(self):
+        self.assertTrue(self._check(199144, 199100))     # a hair short
+        self.assertTrue(self._check(199144, 199300))     # a hair long
+
+    def test_an_unreadable_probe_never_fails_a_good_render(self):
+        tmp = tempfile.mkdtemp()
+        p = self._p(tmp)
+        with mock.patch.object(orch, "_nb_frames", return_value=None), \
+             mock.patch.object(orch, "combine_winner_path", return_value=None):
+            self.assertTrue(orch.render_is_complete(p))

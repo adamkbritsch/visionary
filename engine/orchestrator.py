@@ -648,6 +648,7 @@ def _has_audio(streams) -> bool:
 
 
 RENDER_SHORT_TOLERANCE = 0.995   # a render this fraction of the source's frames is complete
+RENDER_LONG_TOLERANCE = 1.005    # ...and no more than this, or the timeline wasn't the source
 
 
 def _nb_frames(path):
@@ -704,11 +705,50 @@ def render_is_complete(p) -> bool:
     Compares against the CFR source, which is what Resolve ingested (a combine item's
     Resolve fallback ingests the verdict WINNER instead — no CFR exists there). Unknown on
     either side means "don't judge" — this must never fail a good render on a probe hiccup."""
-    want = _nb_frames(combine_winner_path(p) or getattr(p, "source_cfr", None))
+    src = combine_winner_path(p) or getattr(p, "source_cfr", None)
+    want = _nb_frames(src)
     got = _nb_frames(getattr(p, "dv_render", None))
     if not want or not got:
         return True
-    return got >= want * RENDER_SHORT_TOLERANCE
+    if got < want * RENDER_SHORT_TOLERANCE:
+        return False
+    # ...and NOT MATERIALLY LONGER. This only ever asked about truncation, so a render of
+    # something OTHER than the source passed: Don't Look Up rendered 206,200 frames from a
+    # 199,144-frame source (a whole timeline's worth more) at the wrong rate, sailed through
+    # to the remux, failed its RPU alignment five times and parked (live-caught 2026-08-21).
+    # Judged here it is a retryable resolve, not a dead item.
+    if got > want * RENDER_LONG_TOLERANCE:
+        return False
+    return _fps_matches(src, getattr(p, "dv_render", None))
+
+
+def _fps_matches(src, render) -> bool:
+    """Does the render run at the SOURCE's frame rate? An RPU is aligned frame-by-frame, so a
+    render at 23.976 against a true-24 source can never align and the remux ships nothing.
+    Nothing checked this: resolve_pipeline only PRINTS the rate, against a hardcoded
+    "want 24000/1001". Unknown on either side means don't judge — never fail a good render on
+    a probe hiccup."""
+    a, b = _fps_fraction_of(src), _fps_fraction_of(render)
+    if a is None or b is None:
+        return True
+    return a == b
+
+
+def _fps_fraction_of(path):
+    from fractions import Fraction
+    if not (path and os.path.exists(path)):
+        return None
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60).stdout
+        # csv=p=0 emits a TRAILING COMMA, so Fraction() raised on "24000/1001," and the
+        # mismatch was swallowed as "unknown" — take the first field of the first line.
+        tok = (out.splitlines() or [""])[0].split(",")[0].strip()
+        return Fraction(tok) if tok and tok != "0/0" else None
+    except Exception:
+        return None
 
 
 # ---- stage-done detection (resume) ---------------------------------------

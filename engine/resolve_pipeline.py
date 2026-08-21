@@ -472,6 +472,27 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
     return 0
 
 
+def _probe_fps(path):
+    """The file's true frame rate as a Fraction, from ffprobe. None when unreadable."""
+    from fractions import Fraction
+    try:
+        out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=60).stdout
+        tok = (out.splitlines() or [""])[0].split(",")[0].strip()   # csv=p=0 trails a comma
+        return Fraction(tok) if tok and tok != "0/0" else None
+    except Exception:
+        return None
+
+
+def _fps_setting(fr) -> str:
+    """A Fraction as Resolve wants timelineFrameRate: '24' for exact rates, '23.976' for the
+    NTSC ones. Resolve treats 24 and 23.976 as different timelines — which is the whole
+    point here — so this must not round them together."""
+    v = float(fr)
+    return str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.3f}"
+
+
 def setup_single(video, mode=MODE_DV2000, superscale=0):
     """Single-file variant of setup() for the HIGH-BITRATE 4K FAST PATH: the ORIGINAL source
     goes on the timeline as ONE clip (no topaz segments exist — the source picture is the
@@ -523,10 +544,26 @@ def setup_single(video, mode=MODE_DV2000, superscale=0):
                   f"readback={clips[0].GetClipProperty('Super Scale')!r}", flush=True)
         except Exception as e:
             print(f"SUPERSCALE UNAVAILABLE: {e.__class__.__name__}: {e}", flush=True)
-    src_fps = clips[0].GetClipProperty("FPS")   # Resolve's own notion (e.g. '23.976') — no
-    if not src_fps:                             # fraction-vs-decimal format mismatch possible
+    # THE TIMELINE IS SET FROM THE FILE, NOT FROM RESOLVE'S READING OF IT. This used to take
+    # GetClipProperty("FPS") and then verify the timeline against that same number — Resolve
+    # validated against itself, so a clip it read wrongly produced a timeline that "matched"
+    # and a render at the wrong rate. A true-24 movie rendered at 23.976, and because an RPU
+    # aligns frame-by-frame the remux could never ship it (live-caught 2026-08-21:
+    # Don't Look Up parked after five RPU-alignment failures).
+    true_fps = _probe_fps(video)
+    src_fps = clips[0].GetClipProperty("FPS")   # kept for the log — Resolve's own notion
+    if true_fps is None and not src_fps:
         print("FPS UNREADABLE from the imported clip"); return 1
-    proj.SetSetting("timelineFrameRate", str(src_fps))   # BEFORE the timeline exists
+    want_fps = _fps_setting(true_fps) if true_fps is not None else str(src_fps)
+    if true_fps is not None and src_fps:
+        try:
+            if abs(float(src_fps) - float(true_fps)) > 0.01:
+                print(f"CLIP FPS DISAGREES: resolve={src_fps!r} file={float(true_fps):.3f} "
+                      f"— using the FILE", flush=True)
+        except (TypeError, ValueError):
+            pass
+    proj.SetSetting("timelineFrameRate", want_fps)   # BEFORE the timeline exists
+    src_fps = want_fps
     print(f"[{time.strftime('%H:%M:%S')}] single clip @ {src_fps}fps | "
           f"INHERITED color out={proj.GetSetting('colorSpaceOutput')!r}", flush=True)
     tl = mp.CreateTimelineFromClips("_tl", clips)
