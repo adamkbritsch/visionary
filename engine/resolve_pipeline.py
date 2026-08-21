@@ -467,9 +467,31 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
         print(f"OUTPUT {os.path.getsize(out)/1e9:.1f}GB | {v.get('codec_name')}/{v.get('profile')} "
               f"{v.get('width')}x{v.get('height')} @ {v.get('r_frame_rate')} "
               f"{v.get('color_transfer')}/{v.get('color_primaries')}", flush=True)
-        print(f"FRAME RATE: {v.get('r_frame_rate')} (want 24000/1001)", flush=True)
+        # Compare against the TIMELINE, not a hardcoded rate. This line used to read
+        # "(want 24000/1001)" for every render regardless of the movie, so a true-24 title
+        # rendering at 23.976 printed its own wrong answer as the expected one.
+        _fr = _fps_from_rate(v.get("r_frame_rate"))
+        _tl = _fps_from_rate(fps)
+        if _fr is not None and _tl is not None and abs(_fr - _tl) > 0.01:
+            print(f"FRAME RATE MISMATCH: rendered {v.get('r_frame_rate')} but the timeline "
+                  f"is {fps} — an RPU aligns frame-by-frame and cannot fix this", flush=True)
+        else:
+            print(f"FRAME RATE: {v.get('r_frame_rate')} (timeline {fps})", flush=True)
         print(f"DOLBY VISION: {('YES p'+str(dv[0]['dv_profile'])+' compat'+str(dv[0].get('dv_bl_signal_compatibility_id'))) if dv else 'NO RPU'}", flush=True)
     return 0
+
+
+def _fps_from_rate(val):
+    """A frame rate as a float, from either form ffprobe/Resolve hand back: '24000/1001'
+    or '23.976'. None when it is neither."""
+    try:
+        t = str(val).strip()
+        if "/" in t:
+            n, d = t.split("/", 1)
+            return float(n) / float(d) if float(d) else None
+        return float(t)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
 
 
 def _probe_fps(path):
