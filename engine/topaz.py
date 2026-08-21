@@ -224,6 +224,8 @@ class CfrResult:
     frames: int
     rate: str
     error_tail: str
+    capped_secs: float = 0.0     # >0 when the source's container outran its own picture
+                                 # and the pass was bounded (see cfr_duration_cap)
 
 
 def _fps_fraction(path, ffprobe=FFPROBE_HB):
@@ -535,9 +537,7 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     whose video bytes nothing reads (live-caught 2026-08-06, a 60 GB REMUX)."""
     rate = _fps_fraction(source)
     cap = cfr_duration_cap(source)     # see CFR_TAIL_SLOP_SECS — a container longer than its
-    if cap:                            # own picture becomes Resolve's timeline length
-        logbook.event(f"CFR {os.path.basename(source)}: container runs "
-                      f"past the picture — capping the CFR at {cap:.1f}s")
+                                       # own picture becomes Resolve's timeline length
     if copy_only or _is_already_cfr(source):
         cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio,
                                      duration_cap=cap)
@@ -559,7 +559,8 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     if ok and not frames:            # a stream copy may not emit frame= progress → re-probe
         frames = _frame_count(dst)
     return CfrResult(ok=ok, frames=frames, rate=(rate or "source"),
-                     error_tail=("aborted" if aborted else tail))
+                     error_tail=("aborted" if aborted else tail),
+                     capped_secs=float(cap or 0.0))
 
 
 # In-flight Topaz ffmpeg subprocesses, so a run-stop or app shutdown can kill them —

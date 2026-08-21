@@ -488,3 +488,20 @@ class ContainerMustNotOutrunThePicture(unittest.TestCase):
                     topaz.build_cfr_command("/ff", "/in.mp4", "/out.mp4",
                                             rate="24/1", pix="yuv420p")):
             self.assertNotIn("-t", cmd)
+
+
+class TheCapIsReportedNotLogged(unittest.TestCase):
+    """topaz is a leaf module — it does not import logbook, and a logbook call added here
+    crashed the download stage outright (live-caught 2026-08-21: NameError killed the very
+    movie the cap exists for). The cap rides back on the result instead; stages logs it."""
+
+    def test_topaz_does_not_import_logbook(self):
+        import os.path
+        src = open(os.path.join(os.path.dirname(topaz.__file__), "topaz.py")).read()
+        self.assertNotIn("logbook", src)
+
+    def test_the_result_carries_the_cap(self):
+        self.assertEqual(topaz.CfrResult(ok=True, frames=1, rate="24/1",
+                                         error_tail="").capped_secs, 0.0)
+        self.assertEqual(topaz.CfrResult(ok=True, frames=1, rate="24/1", error_tail="",
+                                         capped_secs=8298.667).capped_secs, 8298.667)

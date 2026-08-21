@@ -421,6 +421,12 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
                        low_prio=low_prio, copy_only=fast)
     if not res.ok:
         return False, f"CFR convert failed: {_err_tail(res.error_tail)}"
+    if res.capped_secs:
+        # Worth saying out loud: the source's container ran past its own picture, so the CFR
+        # was bounded to the picture. Unbounded, Resolve takes the CONTAINER's length as the
+        # timeline and renders minutes of nothing onto the end (see topaz.cfr_duration_cap).
+        logbook.event(f"download {p.ep}: container runs past the picture — "
+                      f"CFR capped at {res.capped_secs:.1f}s")
     return True, f"downloaded + CFR @ {res.rate} ({res.frames} frames)"
 
 
