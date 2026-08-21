@@ -825,3 +825,65 @@ class UpNextShowsWhatIsLeftOfTheBurst(unittest.TestCase):
         out = self._run(burst=10, in_burst=0, tv_since=0, every=1)
         self.assertEqual(self._lead_videos(out), 0)
         self.assertEqual(out[0].get("kind"), "episode")
+
+
+class ADueMovieOutranksTheBurst(unittest.TestCase):
+    """_next_target offers movies.next_due() BEFORE the YouTube cadence gate, so a movie at
+    pos 0 runs ahead of the next set of videos. The preview used to lead with the burst and
+    list the movie after it — the opposite of what the engine would do (live-caught
+    2026-08-21: eight videos shown above Don't Look Up, which was in fact next)."""
+
+    def _run(self, *, movie_pos=0, burst=8, in_burst=0, tv_since=1, every=1, cur=None):
+        from unittest import mock
+        import movies, series, settings, youtube
+        import orchestrator as _orch
+        eps = [{"ep": "S01E%02d" % i, "source_name": "e%d.mkv" % i} for i in range(1, 13)]
+        vids = [{"channel": "Chan", "source_name": "v%d [aaaaaaaaa%02d].mp4" % (i, i),
+                 "title": "V%d" % i, "vid": "aaaaaaaaa%02d" % i, "secs": 60}
+                for i in range(1, 21)]
+        mvs = [{"name": "m.mkv", "dir": "/Media/Movies", "title": "The Movie", "pos": movie_pos}]
+        st = dict(settings.DEFAULT_SETTINGS)
+        st.update({"youtube_every_tv_episodes": every, "youtube_videos_per_burst": burst})
+        with mock.patch.object(youtube, "all_pending", return_value=vids), \
+             mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(movies, "get_selected", return_value=mvs), \
+             mock.patch.object(series, "get_active_series", return_value=["show"]), \
+             mock.patch.object(series, "get_rotation", return_value=0), \
+             mock.patch.object(series, "cached_queue", return_value={"remaining_items": eps}), \
+             mock.patch.object(settings, "get_settings", return_value=st), \
+             mock.patch.object(_orch.ORCH, "_tv_since_yt", tv_since, create=True), \
+             mock.patch.object(_orch.ORCH, "_yt_in_burst", in_burst, create=True), \
+             mock.patch.object(_orch.ORCH, "_parked", set(), create=True):
+            return server.up_next(limit=10, current=cur)
+
+    def test_a_pos_zero_movie_leads_a_due_burst(self):
+        self.assertEqual(self._run()[0]["kind"], "movie")
+
+    def test_the_burst_still_follows_the_movie_whole(self):
+        out = self._run(burst=8)
+        kinds = [o["kind"] for o in out]
+        self.assertEqual(kinds[0], "movie")
+        self.assertEqual(kinds[1:9], ["youtube"] * 8)          # a movie advances no counter
+        self.assertEqual(kinds[9], "episode")
+
+    def test_a_mid_burst_remainder_still_follows_the_movie(self):
+        kinds = [o["kind"] for o in self._run(burst=10, in_burst=4)]
+        self.assertEqual(kinds[0], "movie")
+        self.assertEqual(kinds[1:7], ["youtube"] * 6)          # six left of ten, not a fresh ten
+        self.assertEqual(kinds[7], "episode")
+
+    def test_a_movie_further_back_does_NOT_jump_the_burst(self):
+        # pos 1 means "after one more episode" — the user put it behind, so it stays behind
+        kinds = [o["kind"] for o in self._run(movie_pos=1)]
+        self.assertEqual(kinds[0], "youtube")
+        self.assertIn("movie", kinds)
+        self.assertLess(kinds.index("episode"), kinds.index("movie"))
+
+    def test_no_burst_due_still_puts_the_movie_first(self):
+        kinds = [o["kind"] for o in self._run(every=5, tv_since=0)]
+        self.assertEqual(kinds[0], "movie")
+        self.assertEqual(kinds[1], "episode")
+
+    def test_the_movie_is_not_emitted_twice(self):
+        out = self._run()
+        self.assertEqual(sum(1 for o in out if o.get("kind") == "movie"), 1)

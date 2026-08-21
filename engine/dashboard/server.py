@@ -1199,14 +1199,27 @@ def up_next(limit=10, current=None, inflight=None):
         if ep_count >= every and yi < len(yt_videos):
             return _emit_yt_burst()
         return False
+    def _emit_movies_at(ei) -> bool:                          # movies due right before episode ei (a movie
+        nonlocal mi                                           # does NOT count toward the YouTube cadence)
+        while mi < len(mvs) and movies._pos(mvs[mi]) == ei:
+            out.append(movie_item(mvs[mi])); mi += 1
+            if _full():
+                return True
+        return False
+    # A DUE MOVIE OUTRANKS THE BURST. _next_target offers movies.next_due() BEFORE the YouTube
+    # cadence gate, so a movie at pos 0 runs ahead of the next set of videos — but this preview
+    # used to lead with the burst and show the movie after it, which is the opposite of what
+    # then happened (live-caught 2026-08-21: eight videos listed above Don't Look Up, which the
+    # engine would in fact have picked first). Movies at the front go first here too. A movie
+    # advances neither counter (_advance_cadence_at_handoff), so the burst below is untouched:
+    # it simply starts after the movie.
+    if _emit_movies_at(0): return out
     # Counter already saturated (after `current` completes) → the orchestrator's gate serves a
     # YouTube video BEFORE the TV rotation — lead with it to match.
     if ep_count >= every and yi < len(yt_videos):
         if _emit_yt_burst(): return out
     for ei in range(len(eps) + 1):
-        while mi < len(mvs) and movies._pos(mvs[mi]) == ei:    # movies due right before episode ei (a movie
-            out.append(movie_item(mvs[mi])); mi += 1           # does NOT count toward the YouTube cadence)
-            if _full(): return out
+        if _emit_movies_at(ei): return out
         if ei < len(eps):
             out.append(ep_item(eps[ei]))
             if _full(): return out
