@@ -1,10 +1,29 @@
 import os
+import shutil
 import tempfile
 import time
 import unittest
 from unittest import mock
 
 import youtube
+
+_ROTATION_PATCH = None
+
+
+def setUpModule():
+    """all_pending() consults the persisted channel-rotation pointer, so without this the
+    order every test in this module sees depends on whatever this machine last upscaled —
+    and any test that advances it writes a fake channel into the live pointer."""
+    global _ROTATION_PATCH
+    _ROTATION_PATCH = mock.patch.object(youtube, "ROTATION_FILE",
+                                        os.path.join(tempfile.mkdtemp(), "yt_rotation.json"))
+    _ROTATION_PATCH.start()
+
+
+def tearDownModule():
+    if _ROTATION_PATCH is not None:
+        _ROTATION_PATCH.stop()
+
 
 
 class Helpers(unittest.TestCase):
@@ -927,3 +946,83 @@ class LinkImports(unittest.TestCase):
     def test_junk_link_is_refused(self):
         self.assertEqual(youtube.import_link("https://example.com/x")["status"], "bad-url")
         self.assertEqual(youtube._priority(), [])
+
+
+class ChannelsMustActuallyTakeTurns(unittest.TestCase):
+    """Seven channels were queued, "one video of each, looping" — and ~90% of everything
+    upscaled came from one channel (live-caught 2026-08-21). all_pending() interleaved the
+    columns correctly, but next_due() takes the HEAD of that list, and the head is always
+    the first channel's next video: serve one, rebuild, serve the same channel again. The
+    fair-looking list was never a rotation, because nothing advanced the head."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._rot = youtube.ROTATION_FILE
+        youtube.ROTATION_FILE = os.path.join(self.tmp, "rot.json")   # never the live pointer
+
+    def tearDown(self):
+        youtube.ROTATION_FILE = self._rot
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pending(self, chans):
+        """chans = {folder: n_videos}. Returns all_pending() against that fake queue."""
+        q = [{"folder_name": c} for c in chans]
+        per = {c: [{"vid": "%s%02d" % (c, i), "channel": c, "source_name": "%s-%d.mp4" % (c, i),
+                    "nas_dir": "/s/" + c, "video_path": "/s/%s/%s-%d.mp4" % (c, c, i),
+                    "title": "%s %d" % (c, i)} for i in range(n)]
+               for c, n in chans.items()}
+        with mock.patch.object(youtube, "get_queue", return_value=q), \
+             mock.patch.object(youtube, "channel_pending",
+                               side_effect=lambda e, skip=(): per[e["folder_name"]]), \
+             mock.patch.object(youtube, "_import_pending", return_value=[]), \
+             mock.patch.object(youtube, "_durations", return_value={}):
+            return youtube.all_pending()
+
+    def _next(self, chans):
+        out = self._pending(chans)
+        return out[0]["channel"] if out else None
+
+    def test_serving_a_channel_moves_the_head_to_the_next_one(self):
+        chans = {"a": 5, "b": 5, "c": 5}
+        self.assertEqual(self._next(chans), "a")
+        youtube.advance_rotation("a")
+        self.assertEqual(self._next(chans), "b")
+        youtube.advance_rotation("b")
+        self.assertEqual(self._next(chans), "c")
+        youtube.advance_rotation("c")
+        self.assertEqual(self._next(chans), "a")      # loops
+
+    def test_seven_channels_each_get_one_before_any_gets_two(self):
+        chans = {c: 9 for c in "abcdefg"}
+        served = []
+        for _ in range(7):
+            c = self._next(chans)
+            served.append(c)
+            youtube.advance_rotation(c)
+        self.assertEqual(sorted(served), sorted("abcdefg"))   # each exactly once
+
+    def test_an_exhausted_channel_is_skipped_not_stalled_on(self):
+        chans = {"a": 0, "b": 3, "c": 3}
+        youtube.advance_rotation("c")                  # next in line is 'a', which has nothing
+        self.assertEqual(self._next(chans), "b")
+
+    def test_an_unknown_pointer_falls_back_to_the_front(self):
+        youtube.advance_rotation("gone")               # channel removed from the queue
+        self.assertEqual(self._next({"a": 2, "b": 2}), "a")
+
+    def test_the_pointer_survives_a_relaunch(self):
+        youtube.advance_rotation("b")
+        self.assertEqual(youtube.get_rotation(), "b")  # read back from disk, not memory
+
+    def test_a_single_channel_is_unaffected(self):
+        youtube.advance_rotation("a")
+        self.assertEqual(self._next({"a": 3}), "a")
+
+    def test_the_whole_list_still_interleaves(self):
+        out = self._pending({"a": 2, "b": 2, "c": 2})
+        self.assertEqual([v["channel"] for v in out], ["a", "b", "c", "a", "b", "c"])
+
+    def test_advancing_with_no_channel_is_a_no_op(self):
+        youtube.advance_rotation("b")
+        youtube.advance_rotation(None)
+        self.assertEqual(youtube.get_rotation(), "b")

@@ -836,18 +836,58 @@ def video_secs(vid) -> int:
     return _durations().get(vid, 0)
 
 
+ROTATION_FILE = os.path.expanduser("~/.topaz-pipeline/youtube_rotation.json")
+
+
+def get_rotation():
+    """The channel served LAST, so the next pick starts AFTER it. Persisted (like
+    series.get_rotation) so the rotation survives relaunches instead of snapping back to
+    the first channel every time the app restarts."""
+    try:
+        with open(ROTATION_FILE) as f:
+            d = json.load(f)
+        return d.get("last") if isinstance(d, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def advance_rotation(channel) -> None:
+    """Record the channel a video was just served from. Called at HAND-OFF, on the run
+    thread, before the next selection — the same moment the TV rotation advances."""
+    if not channel:
+        return
+    try:
+        os.makedirs(os.path.dirname(ROTATION_FILE), exist_ok=True)
+        with open(ROTATION_FILE, "w") as f:
+            json.dump({"last": channel}, f)
+    except OSError:
+        pass
+
+
 def all_pending(skip=()) -> list:
     """Every pending-to-upscale video across the queued channels, ROUND-ROBINED across channels — one
     from each channel in turn (newest-first within a channel), so NO channel has priority and all
     channels' videos interleave evenly. Each is annotated with its duration ('secs'). This is the
     stream that gets grouped into ~length-cap batches."""
     durs = _durations()
-    cols = []
+    cols, keys = [], []
     for e in get_queue():
         cols.append([{**v, "secs": durs.get(v["vid"]) or 0} for v in channel_pending(e, skip)])
+        keys.append(e.get("folder_name"))
     for col in _import_pending(skip):      # each IMPORT batch is one more column, so playlist
         cols.append([{**v, "secs": durs.get(v["vid"]) or 0} for v in col])   # order holds WITHIN
-                                           # it while it interleaves evenly with the channels
+        keys.append(col[0].get("channel") if col else None)   # it while it interleaves evenly
+    # START AFTER THE CHANNEL SERVED LAST. The interleave below alone is NOT a rotation: it
+    # builds a fairly-ordered LIST, but next_due() takes its head, and the head is always the
+    # first channel's next video. So one video from channel 1 was served, then the list was
+    # rebuilt from channel 1, and channel 1 was served again — for as long as it had videos.
+    # Seven channels were queued and ~90% of everything upscaled came from one of them
+    # (live-caught 2026-08-21). The pointer makes the HEAD advance, which is what "one video
+    # of each, looping" actually requires. The preview reads the same order, so the two agree.
+    last = get_rotation()
+    if len(cols) > 1 and last in keys:
+        s = (keys.index(last) + 1) % len(cols)
+        cols = cols[s:] + cols[:s]
     out, i = [], 0
     while any(i < len(col) for col in cols):          # take index i from every channel, then i+1, …
         for col in cols:

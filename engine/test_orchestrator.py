@@ -47,8 +47,12 @@ def setUpModule():
     _CADENCE_PATCH = mock.patch.object(orch, "CADENCE_FILE",
                                        _os.path.join(d, "orch_cadence.json"))
     _CADENCE_PATCH.start()
+    # ROTATION_FILE too: _advance_cadence_at_handoff records the channel it just served, so a
+    # test handing a video off wrote a fake channel name into the REAL pointer — which then
+    # re-ordered all_pending() for everything afterwards, live and in other test modules.
     for name, fn in (("QUEUE_FILE", "yt_queue.json"), ("DONE_FILE", "yt_done.json"),
-                     ("PRIORITY_FILE", "yt_priority.json"), ("IMPORTS_FILE", "yt_imports.json")):
+                     ("PRIORITY_FILE", "yt_priority.json"), ("IMPORTS_FILE", "yt_imports.json"),
+                     ("ROTATION_FILE", "yt_rotation.json")):
         p = mock.patch.object(_yt, name, _os.path.join(d, fn)); p.start(); _YT_PATCHES.append(p)
 
 

@@ -3255,6 +3255,14 @@ class Orchestrator:
                                     # (fail / power requeue / disable / restart) must not re-count it
                 self._cadence_advanced.add(p.source_basename)
                 if p.youtube:
+                    # CHANNEL ROTATION, like the TV one: record the channel just served so the
+                    # next pick starts after it. all_pending() interleaves channels, but
+                    # next_due() takes its HEAD — without this pointer the head was always the
+                    # first channel and every other channel starved (live-caught 2026-08-21).
+                    try:
+                        youtube.advance_rotation(p.series)
+                    except Exception:
+                        pass
                     # One video of the burst done. Only when the burst is COMPLETE does the
                     # N-episode countdown restart; until then the gate re-fires immediately
                     # and the next video runs back-to-back.
