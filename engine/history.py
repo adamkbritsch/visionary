@@ -92,6 +92,11 @@ def is_lossless(codec: str, profile: str = "") -> bool:
     return c.startswith("dts") and ("ma" in p or "lossless" in p)   # DTS-HD MA, not DTS core
 
 
+def remux_mod():
+    import remux
+    return remux
+
+
 def can_revise(row) -> tuple:
     """(bool, reason). Unknown audio is allowed through: the revision downloads the file
     anyway and re-checks there, which is authoritative — refusing on a guess is what went
@@ -99,6 +104,8 @@ def can_revise(row) -> tuple:
     row = row or {}
     if not row.get("nas_path"):
         return False, "no published path recorded"
+    if remux_mod().is_atmos_audio(row.get("audio_profile") or ""):
+        return False, "Atmos — left untouched"
     return True, ""
 
 
@@ -362,6 +369,10 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
         # lossy copy leads and the originals ride along behind it, non-default (user-dictated
         # 2026-08-21). This used to refuse outright, so a quiet DTS-HD MA master had no
         # remedy at all: the row could only explain why nothing would happen.
+        # ATMOS IS LEFT ALONE ENTIRELY (user-dictated 2026-08-22). A revision re-encodes the
+        # audio, and there is no re-encode of an Atmos track that keeps the Atmos.
+        if remux.is_atmos_audio(profile) or remux.atmos_audio_index(work) is not None:
+            return {"status": "refused", "detail": "Atmos — left untouched"}
         keep = remux.audio_track_count(work) if is_lossless(codec, profile) else 0
 
         _step(label, "remux", step="measuring loudness", kind=kind)

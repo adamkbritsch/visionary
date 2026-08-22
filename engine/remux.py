@@ -135,7 +135,8 @@ def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
 
 
 def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_out: str,
-                          gain_db: float = 0.0, include_subs: bool = True) -> list:
+                          gain_db: float = 0.0, include_subs: bool = True,
+                          atmos_lead=None, n_audio: int = 0) -> list:
     """Pull audio from the CFR file (input 0) + text subtitles from the ORIGINAL (input 1) into an
     MP4 track file. Subtitles come from the original because the CFR pass no longer carries them
     (they don't need frame-rate re-timing); bitmap subs never reach the MP4 path (they force MKV).
@@ -147,14 +148,24 @@ def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks
     packet to the muxer: Invalid argument"). The flag recomputes cue durations at decode.
     `include_subs=False` is the last-resort retry: ship the master without subs rather than
     park the episode over a subtitle track."""
-    audio = (["-filter:a", build_audio_boost_filter(gain_db),
-              "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
+    # ATMOS IS NEVER TOUCHED, and it LEADS. The boost re-encodes every audio track to AAC,
+    # which silently discarded the Atmos metadata on any title that carried it — Don't Look
+    # Up shipped with its 'Dolby Digital Plus + Dolby Atmos' track flattened to AAC LC
+    # (user-caught 2026-08-22). When an Atmos track exists nothing is re-encoded at all, and
+    # it is mapped first so it is the track a player picks.
+    if atmos_lead is not None:
+        amaps = audio_map_args(0, n_audio, atmos_lead)
+        audio = lead_track_disposition_args(n_audio)
+    else:
+        amaps = ["-map", "0:a"]            # ALL audio tracks from CFR, in their own order
+        audio = (["-filter:a", build_audio_boost_filter(gain_db),
+                  "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
     subs = (["-map", "1:s?"] if include_subs else [])
     subs_codec = (["-c:s", "mov_text"] if include_subs else [])
     return [
         ffmpeg, "-hide_banner", "-nostdin", "-y",
         "-i", cfr_source, "-fix_sub_duration", "-i", orig_source,
-        "-map", "0:a", *subs,              # ALL audio tracks from CFR, subs (optional) from the original
+        *amaps, *subs,                      # audio from the CFR, subs (optional) from the original
         "-c", "copy", *audio, *subs_codec,  # subs -> mp4 timed text
         tracks_out,
     ]
@@ -189,6 +200,53 @@ def has_lossless_audio(path: str, ffprobe=FFPROBE) -> bool:
         if is_lossless_audio_codec(parts[0], parts[1] if len(parts) > 1 else ""):
             return True
     return False
+
+
+def is_atmos_audio(profile: str = "") -> bool:
+    """Atmos rides in ffprobe's PROFILE string — 'Dolby Digital Plus + Dolby Atmos' for
+    E-AC-3 JOC, 'Dolby TrueHD + Dolby Atmos' for a TrueHD bed. There is no codec_name that
+    says it, which is why this reads the profile and nothing else."""
+    return "atmos" in (profile or "").lower()
+
+
+def atmos_audio_index(path: str, ffprobe=FFPROBE):
+    """Position of the first Atmos track AMONG THE AUDIO TRACKS (0-based), or None. That
+    position is what -map 0:a:<i> takes, which is rarely the stream index: on Don't Look Up
+    the Atmos track is stream 3 but audio track 2."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
+                              "-show_entries", "stream=profile", "-of", "json", path],
+                             capture_output=True, text=True, timeout=60).stdout
+        streams = json.loads(out).get("streams") or []
+    except Exception:
+        return None
+    for i, st in enumerate(streams):
+        if is_atmos_audio(st.get("profile") or ""):
+            return i
+    return None
+
+
+def audio_map_args(input_idx: int, n_audio: int, lead: int = 0) -> list:
+    """-map args putting track `lead` FIRST and keeping the rest in their original order.
+    Every track is named explicitly — mapping the lead and then `:a` as a group would carry
+    the lead twice."""
+    if n_audio <= 0:
+        return ["-map", f"{input_idx}:a"]
+    order = [lead] + [i for i in range(n_audio) if i != lead]
+    args = []
+    for i in order:
+        args += ["-map", f"{input_idx}:a:{i}"]
+    return args
+
+
+def lead_track_disposition_args(n_audio: int) -> list:
+    """First audio track is the default, every other one is not. Written per track rather
+    than as a blanket clear plus an override — when two per-stream options match the same
+    stream, which wins is ffmpeg trivia."""
+    args = ["-disposition:a:0", "default"]
+    for i in range(1, max(0, n_audio)):
+        args += [f"-disposition:a:{i}", "0"]
+    return args
 
 
 def audio_track_count(path: str, ffprobe=FFPROBE) -> int:
@@ -229,7 +287,8 @@ def boost_keeping_original_args(gain_db: float, n_audio: int, bitrate: str = "38
 
 def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
                           orig_source: str, output: str, gain_db: float = 0.0,
-                          keep_original_audio: int = 0) -> list:
+                          keep_original_audio: int = 0,
+                          atmos_lead=None, n_audio: int = 0) -> list:
     """Single-pass ffmpeg mux for the MKV master: DV video (copy) + audio (from the CFR file) +
     ALL subtitles (from the original, incl. bitmap PGS). Unlike its mp4/mov muxer — which drops the
     Dolby Vision config box (that's why the MP4 path needs MP4Box) — ffmpeg's **Matroska** muxer
@@ -244,7 +303,11 @@ def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
     # LOSSLESS SOURCES KEEP THEIR ORIGINAL TRACK. `keep_original_audio` = how many audio
     # tracks the source has; when set, a boosted copy of the first one leads and all the
     # originals follow untouched (see boost_keeping_original_args).
-    if gain_db > 0 and keep_original_audio > 0:
+    if atmos_lead is not None:
+        # Atmos: nothing re-encoded, and it leads (see build_extract_command).
+        amaps = audio_map_args(1, n_audio, atmos_lead)
+        boost = lead_track_disposition_args(n_audio)
+    elif gain_db > 0 and keep_original_audio > 0:
         amaps = ["-map", "1:a:0", "-map", "1:a"]      # boosted copy first, then the originals
         boost = boost_keeping_original_args(gain_db, keep_original_audio)
     elif gain_db > 0:
@@ -469,14 +532,24 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             # back to a bit-exact copy of the original audio (never fails the 75-min x265 pass over audio).
             # `audio_gain_db` = a gain already decided for this item (TV: the SEASON's, set
             # by its first episode — see audiogain). Only measure when nobody decided for us.
+            # ATMOS OUTRANKS THE BOOST: an Atmos title is left exactly as it is (user-dictated
+            # 2026-08-22), with the Atmos track promoted to first so players pick it. The
+            # boost re-encodes EVERY audio track to AAC, which silently flattened the
+            # 'Dolby Digital Plus + Dolby Atmos' track on Don't Look Up's master.
+            atmos_lead = atmos_audio_index(cfr_source, ffprobe)
+            n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
             measured_lufs = measure_lufs(cfr_source, ffmpeg)
-            gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
-                    else boost_gain_db(measured_lufs, audio_target_lufs))
+            gain = 0.0 if atmos_lead is not None else (
+                round(float(audio_gain_db), 2) if audio_gain_db is not None
+                else boost_gain_db(measured_lufs, audio_target_lufs))
+            if atmos_lead is not None:
+                audio_note = " · audio untouched (Atmos, now the main track)"
             tracks = output + ".tracks.mp4"   # temp, next to output (on scratch)
             subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
-                                                          gain_db=attempt_gain),
+                                                          gain_db=attempt_gain,
+                                                          atmos_lead=atmos_lead, n_audio=n_audio),
                                     capture_output=True, text=True, timeout=timeout)
                 if ex.returncode != 0:
                     # LAST-RESORT RETRY, no subs: a still-broken subtitle track (even past
@@ -484,7 +557,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     # subs are not. Same gain; the landing check below still applies.
                     ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
                                                               tracks, gain_db=attempt_gain,
-                                                              include_subs=False),
+                                                              include_subs=False,
+                                                              atmos_lead=atmos_lead,
+                                                              n_audio=n_audio),
                                         capture_output=True, text=True, timeout=timeout)
                     if ex.returncode != 0:
                         return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
@@ -538,7 +613,11 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
                 mkv_gain, mkv_measured, keep = 0.0, None, 0
-                if audio_target_lufs:
+                mkv_atmos = atmos_audio_index(cfr_source, ffprobe)
+                mkv_n = audio_track_count(cfr_source, ffprobe) if mkv_atmos is not None else 0
+                if mkv_atmos is not None:
+                    audio_note = " · audio untouched (Atmos, now the main track)"
+                elif audio_target_lufs:
                     # LOSSLESS IS BOOSTED TOO NOW, keeping its original track (user-dictated
                     # 2026-08-21). It used to be skipped outright, so a quiet DTS-HD MA or
                     # TrueHD master just stayed quiet with nothing to be done about it.
@@ -552,7 +631,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     mx = subprocess.run(
                         build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output,
                                               gain_db=attempt,
-                                              keep_original_audio=(keep if attempt > 0 else 0)),
+                                              keep_original_audio=(keep if attempt > 0 else 0),
+                                              atmos_lead=mkv_atmos, n_audio=mkv_n),
                         capture_output=True, text=True, timeout=timeout)
                     if mx.returncode != 0:
                         # A failed BOOST must not fail the master. aac_at can refuse an exotic
@@ -769,19 +849,27 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             # the CFR gate guarantees cfr audio is a bit-exact stream copy of the source's
             if on_step:
                 on_step("preparing audio", None)
-            gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
+            atmos_lead = atmos_audio_index(cfr_source, ffprobe)      # see the cap path
+            n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
+            gain = (0.0 if atmos_lead is not None
+                    else boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs))
+            if atmos_lead is not None:
+                audio_note = " · audio untouched (Atmos, now the main track)"
             tracks = output + ".tracks.mp4"
             subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
-                                                          gain_db=attempt_gain),
+                                                          gain_db=attempt_gain,
+                                                          atmos_lead=atmos_lead, n_audio=n_audio),
                                     capture_output=True, text=True, timeout=timeout)
                 if ex.returncode != 0:
                     # LAST-RESORT RETRY, no subs (same rule as the cap path): a broken
                     # subtitle track must not park a fast-path item over nice-to-haves.
                     ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
                                                               tracks, gain_db=attempt_gain,
-                                                              include_subs=False),
+                                                              include_subs=False,
+                                                              atmos_lead=atmos_lead,
+                                                              n_audio=n_audio),
                                         capture_output=True, text=True, timeout=timeout)
                     if ex.returncode != 0:
                         return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
@@ -946,17 +1034,25 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             # same audio machinery as the cap/inject paths (boost validated, falls back to copy)
             if on_step:
                 on_step("preparing audio", None)
-            gain = boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs)
+            atmos_lead = atmos_audio_index(cfr_source, ffprobe)      # see the cap path
+            n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
+            gain = (0.0 if atmos_lead is not None
+                    else boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs))
+            if atmos_lead is not None:
+                audio_note = " · audio untouched (Atmos, now the main track)"
             tracks = output + ".tracks.mp4"
             subs_note = ""
             for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
-                                                          gain_db=attempt_gain),
+                                                          gain_db=attempt_gain,
+                                                          atmos_lead=atmos_lead, n_audio=n_audio),
                                     capture_output=True, text=True, timeout=timeout)
                 if ex.returncode != 0:
                     ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
                                                               tracks, gain_db=attempt_gain,
-                                                              include_subs=False),
+                                                              include_subs=False,
+                                                              atmos_lead=atmos_lead,
+                                                              n_audio=n_audio),
                                         capture_output=True, text=True, timeout=timeout)
                     if ex.returncode != 0:
                         return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))

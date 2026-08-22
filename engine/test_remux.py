@@ -748,3 +748,69 @@ class LosslessIsBoostedButKeptWhole(unittest.TestCase):
         self.assertTrue(remux.is_lossless_audio_codec("pcm_s24le"))
         self.assertFalse(remux.is_lossless_audio_codec("dts", "DTS"))
         self.assertFalse(remux.is_lossless_audio_codec("aac", "LC"))
+
+
+class AtmosIsLeftAlone(unittest.TestCase):
+    """The boost re-encodes EVERY audio track to AAC 384k, which silently flattened Don't
+    Look Up's 'Dolby Digital Plus + Dolby Atmos' track — the master shipped 1.25 GB smaller
+    than its source with no Atmos in it (user-caught 2026-08-22). An Atmos title is now left
+    exactly as it is, with the Atmos track promoted to first so players pick it."""
+
+    def test_atmos_is_read_from_the_profile_not_the_codec(self):
+        self.assertTrue(remux.is_atmos_audio("Dolby Digital Plus + Dolby Atmos"))
+        self.assertTrue(remux.is_atmos_audio("Dolby TrueHD + Dolby Atmos"))
+        self.assertFalse(remux.is_atmos_audio(""))
+        self.assertFalse(remux.is_atmos_audio("Dolby Digital Plus"))
+        self.assertFalse(remux.is_atmos_audio(None))
+
+    def test_the_index_is_the_AUDIO_position_not_the_stream_index(self):
+        # Don't Look Up: Atmos is stream 3 but audio track 2 — -map 0:a:N takes the latter
+        js = json.dumps({"streams": [{"profile": None}, {"profile": None},
+                                     {"profile": "Dolby Digital Plus + Dolby Atmos"},
+                                     {"profile": None}]})
+        with mock.patch.object(remux.subprocess, "run", return_value=mock.Mock(stdout=js)):
+            self.assertEqual(remux.atmos_audio_index("/x.mkv"), 2)
+
+    def test_no_atmos_is_None(self):
+        js = json.dumps({"streams": [{"profile": None}, {"profile": "LC"}]})
+        with mock.patch.object(remux.subprocess, "run", return_value=mock.Mock(stdout=js)):
+            self.assertIsNone(remux.atmos_audio_index("/x.mkv"))
+
+    def test_the_atmos_track_leads_and_nothing_is_duplicated(self):
+        m = remux.audio_map_args(0, 4, 2)
+        self.assertEqual(m, ["-map", "0:a:2", "-map", "0:a:0",
+                             "-map", "0:a:1", "-map", "0:a:3"])
+        self.assertEqual(len([x for x in m if x == "-map"]), 4)   # every track exactly once
+
+    def test_the_extract_copies_atmos_instead_of_boosting_it(self):
+        c = remux.build_extract_command("/ff", "/cfr", "/orig", "/t.mp4",
+                                        gain_db=10.9, atmos_lead=2, n_audio=4)
+        self.assertNotIn("aac_at", c)              # nothing re-encoded
+        self.assertNotIn("-filter:a", c)           # no gain applied
+        self.assertEqual(c[c.index("-c") + 1], "copy")
+        self.assertLess(c.index("0:a:2"), c.index("0:a:0"))       # Atmos first
+        self.assertEqual(c[c.index("-disposition:a:0") + 1], "default")
+
+    def test_the_mkv_mux_does_the_same(self):
+        c = remux.build_mkv_mux_command("/ff", "/dv", "/cfr", "/orig", "/o.mkv",
+                                        gain_db=10.9, atmos_lead=2, n_audio=4)
+        self.assertNotIn("aac_at", c)
+        self.assertLess(c.index("1:a:2"), c.index("1:a:0"))
+        self.assertEqual(c[c.index("-disposition:a:0") + 1], "default")
+
+    def test_atmos_outranks_keeping_a_lossless_original(self):
+        # a TrueHD Atmos bed is BOTH — untouched wins over boost-and-keep
+        c = remux.build_mkv_mux_command("/ff", "/dv", "/cfr", "/orig", "/o.mkv",
+                                        gain_db=10.9, keep_original_audio=2,
+                                        atmos_lead=0, n_audio=2)
+        self.assertNotIn("aac_at", c)
+
+    def test_a_non_atmos_title_is_completely_unchanged(self):
+        c = remux.build_extract_command("/ff", "/cfr", "/orig", "/t.mp4", gain_db=10.9)
+        self.assertIn("aac_at", c)
+        self.assertIn("-map", c)
+        self.assertIn("0:a", c)
+        self.assertNotIn("-disposition:a:0", c)
+
+    def test_an_unreadable_track_count_still_maps_every_track(self):
+        self.assertEqual(remux.audio_map_args(1, 0, 0), ["-map", "1:a"])
