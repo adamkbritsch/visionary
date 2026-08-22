@@ -1524,6 +1524,12 @@ struct SearchablePicker: View {
     let placeholder: String
     let options: [PickOption]
     var disabled = false
+    // Normally the list appears only once you type — with ~400 movies and every show on the
+    // NAS behind it, dumping the whole pool on open is exactly what this control exists to
+    // avoid. A caller that has ALREADY narrowed the options (the Movies filter line) opts in,
+    // because then the list IS the answer to the filter you just picked. Default false, so
+    // the TV and YouTube pickers behave exactly as before.
+    var showsAllWhenEmpty = false
     let onSelect: (String) -> Void
     @State private var query = ""
     var body: some View {
@@ -1539,7 +1545,7 @@ struct SearchablePicker: View {
             .padding(.horizontal, 9).padding(.vertical, 7)
             .panel(8, inset: true)                     // recessed input well
             .opacity(disabled ? 0.5 : 1).disabled(disabled)
-            if !query.isEmpty && !disabled {
+            if (showsAllWhenEmpty || !query.isEmpty) && !disabled {
                 let matches = options.filter { $0.label.localizedCaseInsensitiveContains(query) }
                 let shown = Array(matches.prefix(50))
                 VStack(alignment: .leading, spacing: 0) {
@@ -2270,6 +2276,111 @@ private struct OutputModeRow: View {
 // Movie mode: search the library and queue specific movies, each with its own preset chosen
 // in the add step. Movies can be added ANY time (even during a run) — they jump ahead of the
 // next TV episode, then the TV show continues.
+/// WHAT THE PIPELINE WILL DO WITH A MOVIE, as far as the row can know before it is probed.
+///
+/// These read the SAME filename-parsed tags the row already shows in its own `pipelineHint`
+/// ("4K · HDR · HEVC — fast path ~2.5× runtime"), so a chip predicts a path, it does not
+/// promise one: the real routing is decided by plan.choose_plan AFTER the source is probed.
+/// Judged on `tags` rather than `route`, because route_hint only has two values and cannot
+/// separate the passthrough (no re-encode at all) from the 4K SDR conversion.
+private enum MovieFilter: String, CaseIterable {
+    case all, passthrough, convert, upscale, unwatched
+
+    var label: String {
+        switch self {
+        case .all:         return "All"
+        case .passthrough: return "Passthrough"
+        case .convert:     return "Convert"
+        case .upscale:     return "Upscale"
+        case .unwatched:   return "Unwatched"
+        }
+    }
+
+    /// What the chip means, for the tooltip — the counts alone don't say why you'd pick one.
+    var hint: String {
+        switch self {
+        case .all:         return "Every movie the library can offer"
+        case .passthrough: return "4K HDR — the original stream is kept and only the Dolby "
+                                + "Vision layer is added, so these are the quick ones"
+        case .convert:     return "4K without HDR — Resolve converts it, so the video is "
+                                + "re-encoded under the peak cap"
+        case .upscale:     return "1080p and below — a full Topaz upscale, roughly 5× runtime"
+        case .unwatched:   return "Not yet watched, according to Plex"
+        }
+    }
+
+    func matches(_ m: MovieItemDTO) -> Bool {
+        let t = Set(m.tags ?? [])
+        switch self {
+        case .all:         return true
+        case .passthrough: return t.contains("4K") && t.contains("HDR")
+        case .convert:     return t.contains("4K") && !t.contains("HDR")
+        case .upscale:     return !t.contains("4K")
+        case .unwatched:   return m.watched != true
+        }
+    }
+}
+
+/// The filter line above the movie search. Same shape as ModeNavBar (which is hard-wired to
+/// store.mode, so this is a sibling rather than a reuse): a recessed track with one raised
+/// chip that SLIDES to whatever you click.
+private struct MovieFilterBar: View {
+    let library: [MovieItemDTO]
+    @Binding var filter: MovieFilter
+    @Namespace private var chipNS
+
+    /// Hide a chip that can't do anything (the hide-inert-UI rule). `unwatched` needs a
+    /// second test: when Plex is unreachable movie_watched_map() returns None and EVERY row
+    /// comes back watched:false, which would make "Unwatched" silently mean "All". One
+    /// watched row anywhere is the proof the map actually loaded.
+    private func shown() -> [(MovieFilter, Int)] {
+        let anyWatched = library.contains { $0.watched == true }
+        return MovieFilter.allCases.compactMap { f in
+            if f == .unwatched && !anyWatched { return nil }
+            let n = library.filter(f.matches).count
+            return (f == .all || n > 0) ? (f, n) : nil
+        }
+    }
+
+    var body: some View {
+        let chips = shown()
+        if chips.count > 1 {                       // one lone "All" chip filters nothing
+            HStack(spacing: 4) {
+                ForEach(chips, id: \.0) { f, n in seg(f, n) }
+            }
+            .padding(4)
+            .panel(DS.radiusControl, inset: true)
+            .animation(.spring(response: 0.32, dampingFraction: 0.82), value: filter)
+        }
+    }
+
+    @ViewBuilder private func seg(_ f: MovieFilter, _ n: Int) -> some View {
+        let on = filter == f
+        Button { filter = f } label: {
+            HStack(spacing: 5) {
+                Text(f.label).font(.system(size: 12, weight: .semibold))
+                Text("\(n)").font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(on ? DS.steel : DS.steelDim.opacity(0.7))
+            }
+            .foregroundStyle(on ? DS.steelBright : DS.steelDim)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 5)
+            .background {
+                if on {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.10))
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
+                        .matchedGeometryEffect(id: "movieFilterChip", in: chipNS)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(f.hint)
+    }
+}
+
 private struct MovieMode: View {
     @EnvironmentObject var store: AppStore
     let locked: Bool
@@ -2277,13 +2388,18 @@ private struct MovieMode: View {
     // STORE, not view @State — this view is recreated on every tab switch, and view-local
     // state silently dropped a mid-detection or awaiting-confirm add (the reported "added
     // a movie, switched tabs, it never showed up" bug).
+    // The FILTER is deliberately view-local: it resets to All when you leave the tab, and a
+    // filter that survived a relaunch would read as a library that had lost movies.
+    @State private var filter: MovieFilter = .all
     var body: some View {
         let items = store.state?.movies?.selected?.items ?? []
         let catalog = store.presetCatalog
+        let pool = store.movieLibrary.filter(filter.matches)
         VStack(alignment: .leading, spacing: 12) {
+            MovieFilterBar(library: store.movieLibrary, filter: $filter)
             HStack(alignment: .top, spacing: 8) {
                 SearchablePicker(placeholder: "Search movies to add…",   // never locked — addable mid-run
-                                 options: store.movieLibrary.map { m in
+                                 options: pool.map { m in
                                      PickOption(id: m.id, label: store.movieTitle(m.name, m.title ?? m.name),
                                                 detail: m.has_dv == true
                                                     ? [m.pipelineHint, "already DV — companion on the seedbox"]
@@ -2294,7 +2410,11 @@ private struct MovieMode: View {
                                                        m.companion == true ? "seedbox companion available" : ""]
                                                         .filter { !$0.isEmpty }.joined(separator: " — "))
                                  },
-                                 disabled: !store.moviesReachable) { id in
+                                 disabled: !store.moviesReachable,
+                                 // an explicit filter IS the query — show what it selected
+                                 // without making you type. "All" stays search-first, since
+                                 // 400 unfiltered rows is what that rule exists to prevent.
+                                 showsAllWhenEmpty: filter != .all) { id in
                     if let m = store.movieLibrary.first(where: { $0.id == id }) {
                         if m.has_dv == true {
                             // DV-badged movies are COMBINE-ONLY (user-dictated): the tap
