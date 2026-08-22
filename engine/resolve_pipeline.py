@@ -451,6 +451,28 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
     print(f"[{time.strftime('%H:%M:%S')}] export bitrate: {int(bitrate)} Kb/s", flush=True)
     jid = proj.AddRenderJob()
     print(f"[{time.strftime('%H:%M:%S')}] render job {jid} @ {fps}fps", flush=True)
+    # READ THE QUEUED JOB BACK BEFORE SPENDING HOURS ON IT. The rate we ask for and the rate
+    # the job carries were never compared, and when they disagreed the only symptom was a
+    # finished render at the wrong rate 2.5 hours later — which an RPU cannot align to, so
+    # the whole pass was wasted (2026-08-21). If the preset pins the rate and refuses ours,
+    # that is a one-time fix in Resolve's own preset, and this says so instead of guessing.
+    want_rate = _fps_from_rate(fps)
+    try:
+        job = next((j for j in (proj.GetRenderJobList() or [])
+                    if str(j.get("JobId")) == str(jid)), None)
+        got_rate = _fps_from_rate(job.get("FrameRate")) if job else None
+    except Exception:
+        got_rate = None
+    if want_rate and got_rate and abs(got_rate - want_rate) > 0.01:
+        print(f"RENDER RATE PINNED: the queued job is {got_rate:g}fps but the timeline is "
+              f"{want_rate:g}fps. An RPU aligns frame-by-frame, so this render could not be "
+              f"used. Fix it once in Resolve: Deliver -> set the render preset's frame rate "
+              f"to follow the timeline, then Save As New Render Preset over '{DV_PRESET}'.")
+        try:
+            proj.DeleteAllRenderJobs()
+        except Exception:
+            pass
+        return 1
     proj.StartRendering(jid)
     # Rendering now runs headless in Resolve — bring the app back to the front so its
     # progress is what's on screen (no more UI automation is needed past this point).

@@ -314,3 +314,29 @@ class TheRenderRateFollowsTheTimeline(unittest.TestCase):
     def test_an_unreadable_rate_degrades_to_todays_behaviour(self):
         import resolve_pipeline as rp
         self.assertIsNone(rp._fps_from_rate("weird"))     # -> falls back to str(fps)
+
+
+class TheQueuedJobIsCheckedBeforeRendering(unittest.TestCase):
+    """The rate we ask SetRenderSettings for and the rate the queued job actually carries
+    were never compared. When they disagreed the only symptom was a finished render at the
+    wrong rate 2.5 hours later — unusable, because an RPU aligns frame-by-frame."""
+
+    def test_a_pinned_rate_fails_before_StartRendering(self):
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp.render)
+        # the readback must sit BETWEEN queuing the job and starting it
+        self.assertLess(src.index("GetRenderJobList"), src.index("StartRendering"))
+        self.assertIn("RENDER RATE PINNED", src)
+
+    def test_the_message_names_the_one_time_fix(self):
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp.render)
+        self.assertIn("Save As New Render Preset", src)   # actionable, not just "mismatch"
+
+    def test_an_unreadable_job_list_does_not_block_the_render(self):
+        # Older Resolve builds may not expose FrameRate on the job — that must degrade to
+        # today's behaviour (render, then let the post-render check judge), never to a stall.
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp.render)
+        self.assertIn("except Exception:\n        got_rate = None", src)
+        self.assertIn("if want_rate and got_rate", src)
