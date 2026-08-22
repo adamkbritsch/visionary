@@ -1782,15 +1782,32 @@ class Orchestrator:
         run ends (the `finally`), and step aside if the user raises the brightness themselves. Only
         runs while caffeinated — the loop condition."""
         import brightness
-        saved = None
+        saved, said = None, None
         try:
             while self._enabled and self._caffeinate is not None:
                 cur = brightness.get_brightness()
+                # WATCHING SOMETHING IS NOT BEING IDLE. This loop measures HID idle, and
+                # watching a video is the one activity with no input at all — sit still for
+                # 15 minutes and the screen went dark mid-episode (user-caught 2026-08-22).
+                # Every player takes the same PreventUserIdleDisplaySleep assertion macOS
+                # itself honours, so reading it means the dimmer never overrides what the
+                # system would have allowed anyway.
+                holder = brightness.display_awake_holder()
+                if holder != said:            # once per change, so the log says WHY it stopped
+                    if holder:
+                        logbook.event(f"not dimming — {holder} is holding the display awake")
+                    elif said:
+                        logbook.event(f"{said} released the display — dimming again after "
+                                      f"{int(self._dim_after_secs() // 60)} min idle")
+                    said = holder
                 action = brightness.dim_tick(brightness.idle_seconds(), self._dim_after_secs(),
-                                             cur, saved is not None)
+                                             cur, saved is not None, others_awake=bool(holder))
                 if action == "dim":
                     saved = cur
                     brightness.set_brightness(0.0)
+                elif action == "restore":            # playback began while we held it dark
+                    brightness.set_brightness(saved if saved is not None else 0.6)
+                    saved = None
                 elif action == "release":            # user raised it themselves → forget our level
                     saved = None
                 time.sleep(10)
