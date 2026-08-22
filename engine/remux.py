@@ -202,6 +202,54 @@ def has_lossless_audio(path: str, ffprobe=FFPROBE) -> bool:
     return False
 
 
+MAX_INTERLEAVE_GAP_MB = 8.0     # a master past this stalls players that stream it
+
+
+def interleave_gap_mb(path: str, ffprobe=FFPROBE, at=(60, 300, 1200, 3600)) -> float:
+    """Worst distance IN THE FILE between video and its own audio at the same instant, in MB.
+    A well-interleaved master keeps this well under a megabyte; the value grows with the
+    interleave window, so this is the number that says whether a player can stream it without
+    holding the gap in memory. -1.0 when it cannot be measured (never fail a master on a
+    probe that did not run)."""
+    def _pos(sel, t):
+        try:
+            out = subprocess.run([ffprobe, "-v", "error", "-select_streams", sel,
+                                  "-read_intervals", "%d%%+1" % t,
+                                  "-show_entries", "packet=pts_time,pos",
+                                  "-of", "csv=p=0", path],
+                                 capture_output=True, text=True, timeout=120).stdout
+        except Exception:
+            return None
+        for ln in out.splitlines():
+            part = ln.split(",")
+            try:
+                return int(part[1])
+            except (ValueError, IndexError):
+                continue
+        return None
+
+    worst = -1.0
+    for t in at:
+        pv, pa = _pos("v:0", t), _pos("a:0", t)
+        if pv is None or pa is None:
+            continue                      # past the end, or unreadable — not a failure
+        worst = max(worst, abs(pv - pa) / 1e6)
+    return worst
+
+
+def _gate_interleave(res, output: str, ffprobe=FFPROBE):
+    """Refuse a master whose audio sits too far from its own video. Verified the same way the
+    hvc1 check is — on the SHIPPED file, not on what we meant to write — because this is a
+    property of the mux, and the one that shipped was measured at 115 MB by 20 minutes in."""
+    gap = interleave_gap_mb(output, ffprobe)
+    if gap > MAX_INTERLEAVE_GAP_MB:
+        res.ok = False
+        res.reason = (f"badly interleaved: audio sits {gap:.1f} MB from its own video "
+                      f"(max {MAX_INTERLEAVE_GAP_MB:.0f}) — players stall on this")
+        _rm(output)
+    return res
+
+
 def is_atmos_audio(profile: str = "") -> bool:
     """Atmos rides in ffprobe's PROFILE string — 'Dolby Digital Plus + Dolby Atmos' for
     E-AC-3 JOC, 'Dolby TrueHD + Dolby Atmos' for a TrueHD bed. There is no codec_name that
@@ -349,8 +397,21 @@ def mp4box_safe_input(path: str):
         except OSError: pass
 
 
+# INTERLEAVE WINDOW. 500 ms looked harmless and was not: with SUBTITLE tracks in the mux the
+# audio drifts away from its own video and keeps drifting — measured on Don't Look Up's master
+# at 5.7 MB by 1 minute, 12 MB by 2, 32 MB by 5 and 115 MB by 20. A player has to hold that
+# whole span to keep picture and sound together, so the SHIELD stalled and rebuffered from
+# about 1:45 on (live-caught 2026-08-22) while the NAS was serving that byte range at
+# 154 MB/s. Small AAC audio mostly hid it (other masters measured 1-3 MB); four full-bitrate
+# stream-copied tracks did not. Measured, same file, same mux:
+#     audio only,  -inter 500 -> 0.0 / 1.5 / 0.9 MB
+#     + subtitles, -inter 500 -> 0.2 / 5.7 / 8.4 MB     <- what shipped
+#     + subtitles, -inter 100 -> 0.0 / 0.0 / 0.0 MB
+MUX_INTERLEAVE_MS = 100
+
+
 def build_capped_mux_command(mp4box: str, hevc_es: str, fps: str, tracks: str, output: str,
-                             interleave_ms: int = 500) -> list:
+                             interleave_ms: int = MUX_INTERLEAVE_MS) -> list:
     """MP4Box mux for the CAPPED raw HEVC ES (x265 output). `:dvp=8.1` writes the DV config box
     signaling the RPUs x265 interleaved; `:fps=` is REQUIRED — a raw ES carries no container
     timing, so MP4Box would otherwise assume 25 fps and silently desync the master. NO
@@ -669,6 +730,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
                     _rm(output)
                     return res
+                res = _gate_interleave(res, output, ffprobe)
+                if not res.ok:
+                    return res
             buckets = dvcap.video_peak_buckets(output, ffprobe)   # re-measure the SHIPPED file
             peak = max(buckets.values()) if buckets else 0.0
             if dvcap.peak_ok(peak, cap_mbps):
@@ -901,6 +965,9 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
                 _rm(output)
                 return res
+            res = _gate_interleave(res, output, ffprobe)
+            if not res.ok:
+                return res
         # NO peak gate here: the caller gated the source's peaks before choosing this path.
         if skip_inject and convert_es:
             note = " · original stream, DV converted to 8.1 (no re-encode)"
@@ -1083,6 +1150,9 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                 res.ok = False
                 res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
                 _rm(output)
+                return res
+            res = _gate_interleave(res, output, ffprobe)
+            if not res.ok:
                 return res
         shipped = dvcap.video_peak_1s_mbps(output, ffprobe)   # belt: same bits, re-measured
         if not dvcap.peak_ok(shipped, cap_mbps):

@@ -814,3 +814,74 @@ class AtmosIsLeftAlone(unittest.TestCase):
 
     def test_an_unreadable_track_count_still_maps_every_track(self):
         self.assertEqual(remux.audio_map_args(1, 0, 0), ["-map", "1:a"])
+
+
+class MastersMustBeInterleaved(unittest.TestCase):
+    """Don't Look Up's master streamed at 154 MB/s from the NAS and still stalled the SHIELD
+    from ~1:45 on. Its audio drifted away from its own video and kept drifting — 5.7 MB by
+    1 minute, 12 by 2, 32 by 5, 115 by 20 — so a player had to hold that whole span to keep
+    picture and sound together. The mux's 500 ms interleave window did it, and only with
+    SUBTITLE tracks present; small AAC audio hid it (other masters measured 1-3 MB), four
+    full-bitrate stream-copied tracks did not. Measured on the same file, same mux:
+        audio only,  -inter 500 -> 0.0 / 1.5 / 0.9 MB
+        + subtitles, -inter 500 -> 0.2 / 5.7 / 8.4 MB    <- what shipped
+        + subtitles, -inter 100 -> 0.0 / 0.0 / 0.0 MB
+    (live-caught 2026-08-22)"""
+
+    def test_the_mux_interleaves_tightly(self):
+        self.assertEqual(remux.MUX_INTERLEAVE_MS, 100)
+        c = remux.build_capped_mux_command("/mp4box", "/es.hevc", "24", "/t.mp4", "/o.mp4")
+        self.assertEqual(c[c.index("-inter") + 1], "100")
+
+    def test_the_window_comes_before_the_output(self):
+        c = remux.build_capped_mux_command("/mp4box", "/es.hevc", "24", "/t.mp4", "/o.mp4")
+        self.assertLess(c.index("-inter"), c.index("-new"))
+
+    def _gap(self, positions):
+        """positions: {(stream, t): byte_pos}"""
+        def run(cmd, **kw):
+            sel = cmd[cmd.index("-select_streams") + 1]
+            t = int(cmd[cmd.index("-read_intervals") + 1].split("%")[0])
+            p = positions.get((sel, t))
+            return mock.Mock(stdout="" if p is None else "%d.0,%d\n" % (t, p))
+        with mock.patch.object(remux.subprocess, "run", side_effect=run):
+            return remux.interleave_gap_mb("/x.mp4", at=(60, 300))
+
+    def test_a_tight_file_measures_near_zero(self):
+        self.assertLess(self._gap({("v:0", 60): 100_000_000, ("a:0", 60): 100_200_000,
+                                   ("v:0", 300): 500_000_000, ("a:0", 300): 500_100_000}), 0.5)
+
+    def test_a_drifting_file_reports_the_WORST_gap(self):
+        g = self._gap({("v:0", 60): 100_000_000, ("a:0", 60): 105_700_000,
+                       ("v:0", 300): 500_000_000, ("a:0", 300): 532_600_000})
+        self.assertAlmostEqual(g, 32.6, places=1)          # the worst, not the first or the mean
+
+    def test_an_unmeasurable_file_never_fails_a_master(self):
+        self.assertEqual(self._gap({}), -1.0)
+
+    def test_the_gate_rejects_a_drifting_master_and_removes_it(self):
+        res = remux.RemuxResult(True, "/o.mp4")
+        with mock.patch.object(remux, "interleave_gap_mb", return_value=115.6), \
+             mock.patch.object(remux, "_rm") as rm:
+            out = remux._gate_interleave(res, "/o.mp4")
+        self.assertFalse(out.ok)
+        self.assertIn("115.6 MB", out.reason)
+        rm.assert_called_once_with("/o.mp4")               # never leave a bad master on disk
+
+    def test_the_gate_passes_a_tight_master(self):
+        res = remux.RemuxResult(True, "/o.mp4")
+        with mock.patch.object(remux, "interleave_gap_mb", return_value=0.03), \
+             mock.patch.object(remux, "_rm") as rm:
+            self.assertTrue(remux._gate_interleave(res, "/o.mp4").ok)
+        rm.assert_not_called()
+
+    def test_an_unmeasurable_gap_passes_rather_than_parking_the_item(self):
+        res = remux.RemuxResult(True, "/o.mp4")
+        with mock.patch.object(remux, "interleave_gap_mb", return_value=-1.0), \
+             mock.patch.object(remux, "_rm"):
+            self.assertTrue(remux._gate_interleave(res, "/o.mp4").ok)
+
+    def test_the_threshold_sits_between_what_shipped_and_what_works(self):
+        # 8.4 MB was already stalling; 0.03 MB is the fixed mux. The gate has to split them.
+        self.assertGreater(remux.MAX_INTERLEAVE_GAP_MB, 0.03)
+        self.assertLessEqual(remux.MAX_INTERLEAVE_GAP_MB, 8.4)
