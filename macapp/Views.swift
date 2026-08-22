@@ -1546,7 +1546,13 @@ struct SearchablePicker: View {
             .panel(8, inset: true)                     // recessed input well
             .opacity(disabled ? 0.5 : 1).disabled(disabled)
             if (showsAllWhenEmpty || !query.isEmpty) && !disabled {
-                let matches = options.filter { $0.label.localizedCaseInsensitiveContains(query) }
+                // An EMPTY query means "everything", not "nothing" —
+                // localizedCaseInsensitiveContains("") is FALSE (it forwards to
+                // range(of:), which finds no range for an empty needle), so filtering an
+                // empty query dropped every row and each filter chip read "No matches"
+                // (live-caught 2026-08-22). Only the typed case filters.
+                let matches = query.isEmpty ? options
+                    : options.filter { $0.label.localizedCaseInsensitiveContains(query) }
                 let shown = Array(matches.prefix(50))
                 VStack(alignment: .leading, spacing: 0) {
                     if shown.isEmpty {
