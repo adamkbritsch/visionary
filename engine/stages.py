@@ -1110,9 +1110,20 @@ def _resolve(p, abort, progress=None):
         whole = render_is_complete(p) if dv else True
         ok = dv and whole
         if dv and not whole:
-            logbook.failure(f"resolve {p.ep}: TRUNCATED render "
-                            f"({_nb_frames(p.dv_render)} of {_nb_frames(p.source_cfr)} frames)")
-            return False, out, "resolve produced a SHORT render — not accepting it"
+            # WRONG-LENGTH, not merely short: a render can also come back LONGER than the
+            # source (a stale timeline, a container that outran its picture), and calling
+            # that "TRUNCATED" sent the diagnosis in exactly the wrong direction for a day.
+            got, want = _nb_frames(p.dv_render), _nb_frames(p.source_cfr)
+            how = ("LONG" if (got or 0) > (want or 0) else "SHORT")
+            logbook.failure(f"resolve {p.ep}: {how} render ({got} of {want} frames) — "
+                            f"the render is not this source")
+            # The subprocess's own diagnostics (timeline length, clip fps, OUTPUT line) are
+            # the only record of WHY, and they were dropped with the rest of stdout.
+            for ln in out.splitlines():
+                if any(k in ln for k in ("timeline = ", "CLIP FPS DISAGREES", "FRAME RATE",
+                                         "FRAME-RATE CONFORM", "TIMELINE LENGTH", "RESUME:")):
+                    logbook.event(f"resolve {p.ep}: {ln.strip()[:200]}")
+            return False, out, f"resolve produced a {how} render — not accepting it"
         if not ok:
             logbook.failure(f"resolve {p.ep}: rc={proc.returncode} :: {tail}")
         return ok, out, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")

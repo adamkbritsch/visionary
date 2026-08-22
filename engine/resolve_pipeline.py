@@ -217,6 +217,12 @@ def _validate_resume_single(proj, video, marker) -> bool:
         frames = tl.GetEndFrame() - tl.GetStartFrame() + 1
         if frames != int(marker.get("frames") or -1):
             return False
+        # ...and against the FILE. Checking the timeline against the marker alone is the
+        # marker checking itself: a marker written from a wrong timeline validates that same
+        # wrong timeline forever, and resuming skips the rebuild that would have fixed it.
+        want = _probe_frames(video)
+        if want and abs(frames - want) > TIMELINE_FRAME_SLACK:
+            return False
         items = tl.GetItemListInTrack("video", 1) or []
         if len(items) < 2:        # scene cuts leave >=2 shots; a bare clip is not our state
             return False
@@ -481,6 +487,35 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
     return 0
 
 
+def _probe_frames(path):
+    """The file's true frame count. nb_frames when the container publishes one (our mp4 CFRs
+    always do), else duration x rate. None when neither is readable — the caller then skips
+    its check rather than guessing."""
+    try:
+        out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=nb_frames,duration,r_frame_rate",
+                              "-of", "json", path],
+                             capture_output=True, text=True, timeout=60).stdout
+        st = (json.loads(out).get("streams") or [{}])[0]
+    except Exception:
+        return None
+    try:
+        n = int(st.get("nb_frames") or 0)
+        if n > 0:
+            return n
+    except (TypeError, ValueError):
+        pass
+    try:
+        r = _fps_from_rate(st.get("r_frame_rate"))
+        d = float(st.get("duration"))
+        return int(round(d * r)) if r and d > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+TIMELINE_FRAME_SLACK = 2      # Resolve rounds an edge frame; anything more is a wrong timeline
+
+
 def _fps_from_rate(val):
     """A frame rate as a float, from either form ffprobe/Resolve hand back: '24000/1001'
     or '23.976'. None when it is neither."""
@@ -599,6 +634,16 @@ def setup_single(video, mode=MODE_DV2000, superscale=0):
             return 1
         got = tl.GetEndFrame() - tl.GetStartFrame() + 1
         print(f"[{time.strftime('%H:%M:%S')}] timeline = 1 clip, {got} frames", flush=True)
+        # AND IT MUST BE THIS SOURCE'S LENGTH. The segment path has checked assembled-vs-source
+        # frames for a year; the single path only PRINTED its number, so a timeline of the
+        # wrong length sailed through setup, through DV analysis, through a 2.5-hour render,
+        # and was caught only by the frame count of the finished 56 GB file — which the RPU
+        # then could not align (live-caught 2026-08-21: 206,200 frames rendered for a
+        # 199,144-frame movie, five times over). Cheap here, ruinous later.
+        want = _probe_frames(video)
+        if want and abs(got - want) > TIMELINE_FRAME_SLACK:
+            print(f"TIMELINE LENGTH MISMATCH: timeline {got} != source {want} frames")
+            return 1
     except Exception as e:
         print(f"[{time.strftime('%H:%M:%S')}] (timeline integrity unverifiable: {e})", flush=True)
     resolve.OpenPage("color")

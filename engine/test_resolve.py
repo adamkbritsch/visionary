@@ -179,3 +179,77 @@ class ResumeValidation(unittest.TestCase):
             self.assertLess(src.index("_resume_reset"), src.index("_clear_project(proj)"), fn.__name__)
         self.assertIn("_mark_analyzed", inspect.getsource(rp.single))
         self.assertIn("_mark_analyzed", inspect.getsource(rp.episode))
+
+
+class TheTimelineMustBeThisSourcesLength(unittest.TestCase):
+    """Don't Look Up rendered 206,200 frames for a 199,144-frame movie, five times over.
+    Nothing between the import and the finished 56 GB file ever compared the timeline to the
+    SOURCE: setup_single printed its frame count without checking it, and the resume
+    validator compared the timeline to its own marker — a marker written from a wrong
+    timeline blesses that same wrong timeline forever (live-caught 2026-08-21)."""
+
+    def setUp(self):
+        import tempfile, resolve_pipeline as rp
+        d = tempfile.mkdtemp()
+        p = mock.patch.object(rp, "_RESUME_FILE", os.path.join(d, "r.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def _proj(self, frames=1000):
+        return _FakeProj([_FakeClip("/scratch/movie.mkv")], 1, _FakeTL(frames, 12))
+
+    MARKER = {"ident": "x", "frames": 1000, "scenes": True}
+
+    def _resume(self, *, timeline, source):
+        import resolve_pipeline as rp
+        with mock.patch.object(rp, "_probe_frames", return_value=source):
+            return rp._validate_resume_single(self._proj(timeline),
+                                              "/scratch/movie.mkv",
+                                              {**self.MARKER, "frames": timeline})
+
+    def test_a_timeline_longer_than_the_source_is_not_resumed(self):
+        self.assertFalse(self._resume(timeline=206200, source=199144))
+
+    def test_a_timeline_shorter_than_the_source_is_not_resumed(self):
+        self.assertFalse(self._resume(timeline=120000, source=199144))
+
+    def test_a_matching_timeline_resumes(self):
+        self.assertTrue(self._resume(timeline=199144, source=199144))
+
+    def test_an_edge_frame_of_rounding_is_tolerated(self):
+        self.assertTrue(self._resume(timeline=199145, source=199144))
+
+    def test_an_unreadable_source_never_breaks_a_good_resume(self):
+        self.assertTrue(self._resume(timeline=199144, source=None))
+
+    def test_setup_single_checks_the_built_timeline_against_the_source(self):
+        # Source-pin, like the reset-before-clear one above: this check is the difference
+        # between failing in seconds at setup and failing after a 2.5-hour render.
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp.setup_single)
+        self.assertIn("TIMELINE LENGTH MISMATCH", src)
+        self.assertIn("_probe_frames(video)", src)
+
+
+class ProbeFrames(unittest.TestCase):
+    def _probe(self, st):
+        import json as _json, resolve_pipeline as rp
+        with mock.patch.object(rp.subprocess, "run",
+                               return_value=mock.Mock(stdout=_json.dumps({"streams": [st]}))):
+            return rp._probe_frames("/x.mp4")
+
+    def test_a_published_frame_count_wins(self):
+        self.assertEqual(self._probe({"nb_frames": "199144", "duration": "1.0",
+                                      "r_frame_rate": "24/1"}), 199144)
+
+    def test_duration_times_rate_when_the_container_publishes_no_count(self):
+        self.assertEqual(self._probe({"nb_frames": "N/A", "duration": "8297.667",
+                                      "r_frame_rate": "24/1"}), 199144)
+
+    def test_neither_readable_is_None_not_a_guess(self):
+        self.assertIsNone(self._probe({"nb_frames": "N/A", "duration": "N/A",
+                                       "r_frame_rate": "0/0"}))
+
+    def test_a_probe_that_blows_up_is_None(self):
+        import resolve_pipeline as rp
+        with mock.patch.object(rp.subprocess, "run", side_effect=OSError):
+            self.assertIsNone(rp._probe_frames("/x.mp4"))
