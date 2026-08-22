@@ -191,6 +191,9 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 .find{display:flex;align-items:center;gap:6px;padding:8px 10px;margin-bottom:8px}
 .find input{flex:1;background:transparent;border:0;outline:0;color:var(--steel-bright);
   font:inherit;font-size:13px;min-width:0}
+.find.tiny{padding:5px 8px;margin-bottom:6px}
+.find.tiny input{font-size:12px}
+.find.tiny .ic{width:13px;height:13px}
 .hits{max-height:290px;overflow:auto;-webkit-overflow-scrolling:touch}
 .hit{display:flex;align-items:center;gap:9px;padding:10px 12px;font-size:13px;
   border-top:1px solid rgba(255,255,255,.05);cursor:pointer}
@@ -257,6 +260,10 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 <section class="sec" id="histSec" style="display:none">
   <p class="lbl">Finished <span id="histN" style="color:var(--steel-dim)"></span>
      <button class="mini" id="histScan" style="float:right;margin-top:-4px">Find finished files</button></p>
+  <div class="panel well find tiny" id="histFindWrap" style="display:none">
+    <svg class="ic"><use href="#i-find"/></svg>
+    <input id="histFind" type="text" placeholder="Search finished&hellip;">
+  </div>
   <div class="panel well rows" id="hist"><div class="muted">Loading&hellip;</div></div>
 </section>
 
@@ -856,12 +863,47 @@ function histWhen(ts){
                  : d.toLocaleDateString([], {month: "short", day: "numeric"});
 }
 
+var histRows = [];
+
+/* Fold like the app's archive search: case- AND diacritic-insensitive, so a channel with a
+   real accent or en dash (Kurzgesagt, Pok\u00e9mon) is still findable by plain typing. */
+function histFold(v){
+  return String(v || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+/* Every whitespace-separated word must appear somewhere in the row, in any order — so
+   "wizards dating" finds "Wizards with Guns - Dating in 2026" and "look up" finds
+   "Don't Look Up" without typing the apostrophe. */
+function histMatches(rows){
+  var terms = histFold(($("histFind") || {}).value).split(/\s+/).filter(Boolean);
+  if (!terms.length) return rows;
+  return rows.filter(function(r){
+    var hay = histFold([r.title, r.series, r.ep, r.kind, r.nas_path].filter(Boolean).join(" "));
+    return terms.every(function(t){ return hay.indexOf(t) >= 0; });
+  });
+}
+
 async function drawHistory(){
   if (!histOpen) return;
-  var rows;
-  try { rows = (await (await fetch("/api/history")).json()).items || []; }
+  try { histRows = (await (await fetch("/api/history")).json()).items || []; }
   catch (e) { $("hist").innerHTML = '<div class="muted">Couldn\u2019t load</div>'; return; }
-  txt($("histN"), rows.length ? "(" + rows.length + ")" : "");
+  renderHistory();
+}
+
+/* Draw only — no fetch, so typing filters instantly instead of hitting the NAS per keystroke. */
+function renderHistory(){
+  var all = histRows, rows = histMatches(all);
+  // The search bar is hidden while there is nothing to search (an empty box that filters an
+  // empty list is just a dead control).
+  $("histFindWrap").style.display = all.length ? "" : "none";
+  txt($("histN"), !all.length ? ""
+      : (rows.length === all.length ? "(" + all.length + ")"
+                                    : "(" + rows.length + " of " + all.length + ")"));
+  if (all.length && !rows.length){
+    $("hist").innerHTML = '<div class="muted">No matches</div>';
+    $("hist")._rows = [];
+    return;
+  }
   $("hist").innerHTML = rows.length ? rows.map(function(r, i){
     var sub = [histWhen(r.at), (r.gain ? "+" + r.gain + " dB" : ""),
                (r.revised ? "revised" : "")].filter(Boolean).join(" · ");
@@ -877,8 +919,10 @@ async function drawHistory(){
       '<span class="c">' + esc(sub) + '</span>' +
       '<span class="acts">' + btn + '</span></div>';
   }).join("") : '<div class="muted">Nothing finished yet</div>';
-  $("hist")._rows = rows;
+  $("hist")._rows = rows;          // data-rev indexes THIS array, so it must be the drawn one
 }
+
+$("histFind").addEventListener("input", renderHistory);
 
 $("histScan").addEventListener("click", async function(){
   // Everything upscaled before the history book existed is invisible to it — this walks the

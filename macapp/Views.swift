@@ -2821,6 +2821,25 @@ private struct ImportedGroup: View {
 /// stream-copied, which leaves Dolby Vision untouched and takes minutes.
 struct HistoryPopover: View {
     @EnvironmentObject var store: AppStore
+    @State private var query = ""
+
+    /// The archive filtered by the search box. Every whitespace-separated word must appear
+    /// SOMEWHERE in the row, in any order — so "wizards dating" finds "Wizards with Guns -
+    /// Dating in 2026" and "look up" finds "Don't Look Up" without typing the apostrophe.
+    /// Folding is case- AND diacritic-insensitive: channel titles here carry real accents
+    /// (Kurzgesagt's en dash, "Pokémon"), and a search that misses them would look broken.
+    private var matches: [HistoryItemDTO] {
+        let terms = query.folding(options: [.caseInsensitive, .diacriticInsensitive],
+                                  locale: .current)
+            .split(whereSeparator: { $0.isWhitespace })
+        if terms.isEmpty { return store.history }
+        return store.history.filter { it in
+            let hay = [it.title, it.series, it.ep, it.kind, it.nas_path]
+                .compactMap { $0 }.joined(separator: " ")
+                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            return terms.allSatisfy { hay.contains($0) }
+        }
+    }
 
     private func when(_ ts: Int?) -> String {
         guard let ts, ts > 0 else { return "" }
@@ -2838,6 +2857,10 @@ struct HistoryPopover: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("Finished").font(.system(size: 13, weight: .semibold))
+                if !query.isEmpty {
+                    Text("\(matches.count) of \(store.history.count)")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
                 Spacer()
                 Button(store.historyScanning ? "Searching…" : "Find finished files") {
                     Task { await store.scanHistory() }
@@ -2851,15 +2874,46 @@ struct HistoryPopover: View {
                     .font(.system(size: 11.5)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.vertical, 6)
             } else {
+                searchField
                 ScrollView {
                     VStack(spacing: 0) {
-                        ForEach(store.history) { it in row(it) }
+                        if matches.isEmpty {
+                            Text("No matches").font(.system(size: 11.5))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 22)
+                        } else {
+                            ForEach(matches) { it in row(it) }
+                        }
                     }
-                }.frame(height: min(max(CGFloat(store.history.count) * 44, 88), 320))
-                    .panel(DS.radiusControl, inset: true)
+                }
+                // Height comes from the WHOLE archive, not the filtered rows: a popover that
+                // resizes on every keystroke jumps around under the pointer while you type.
+                .frame(height: min(max(CGFloat(store.history.count) * 44, 88), 320))
+                .panel(DS.radiusControl, inset: true)
             }
         }
         .padding(14).frame(width: 430)
+    }
+
+    /// Deliberately small — it sits inside a popover, above the list it filters, and should
+    /// read as part of the archive rather than as a second control competing with the header.
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass").font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            TextField("Search finished", text: $query)
+                .textFieldStyle(.plain).font(.system(size: 11.5))
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 10.5))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help("Clear the search")
+            }
+        }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .panel(7, inset: true)                     // same recessed well as the other searches
     }
 
     @ViewBuilder private func row(_ it: HistoryItemDTO) -> some View {
