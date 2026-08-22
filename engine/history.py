@@ -99,8 +99,6 @@ def can_revise(row) -> tuple:
     row = row or {}
     if not row.get("nas_path"):
         return False, "no published path recorded"
-    if is_lossless(row.get("audio") or "", row.get("audio_profile") or ""):
-        return False, "lossless audio — never re-encoded"
     return True, ""
 
 
@@ -359,10 +357,12 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
         # cost the track.
         _step(label, "remux", step="checking the audio track", kind=kind)
         codec, profile = _probe_local_audio(work)
-        if is_lossless(codec, profile):
-            _mark(nas_path, audio=codec, audio_profile=profile)
-            return {"status": "refused", "detail": f"lossless audio ({codec}) — never re-encoded"}
         _mark(nas_path, audio=codec, audio_profile=profile)
+        # LOSSLESS IS REVISED TOO NOW — but never at the cost of the lossless track. A boosted
+        # lossy copy leads and the originals ride along behind it, non-default (user-dictated
+        # 2026-08-21). This used to refuse outright, so a quiet DTS-HD MA master had no
+        # remedy at all: the row could only explain why nothing would happen.
+        keep = remux.audio_track_count(work) if is_lossless(codec, profile) else 0
 
         _step(label, "remux", step="measuring loudness", kind=kind)
         measured = remux.measure_lufs(work)
@@ -373,11 +373,20 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
 
         stem, ext = os.path.splitext(os.path.basename(nas_path))
         fixed = os.path.join(d, stem + ".revised" + ext)
+        if keep:
+            # video / boosted copy of the first track / every original track / subs — the map
+            # ORDER is what puts the normalized track first, which is what players pick.
+            maps = ["-map", "0:v", "-map", "0:a:0", "-map", "0:a", "-map", "0:s?",
+                    "-map", "0:t?"]
+            enc = remux.boost_keeping_original_args(gain, keep)
+        else:
+            maps = ["-map", "0"]
+            enc = ["-c:a", "aac_at", "-b:a", "384k",
+                   "-filter:a", remux.build_audio_boost_filter(gain)]
         cmd = [remux.FFMPEG, "-hide_banner", "-nostdin", "-y",
                "-progress", "pipe:1", "-nostats", "-i", work,
-               "-map", "0", "-c", "copy",                 # keep video + subs bit-exact (DV intact)
-               "-c:a", "aac_at", "-b:a", "384k",
-               "-filter:a", remux.build_audio_boost_filter(gain), fixed]
+               *maps, "-c", "copy",                       # keep video + subs bit-exact (DV intact)
+               *enc, fixed]
         _step(label, "remux", pct=0, step=f"applying +{gain:.1f} dB", kind=kind)
         rc, tail = _run_with_progress(
             cmd, _duration(work),

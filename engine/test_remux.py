@@ -688,3 +688,63 @@ class CappedBoostLanding(unittest.TestCase):
     def test_a_capped_boost_without_a_reference_falls_back_to_the_target(self):
         # no `measured` to compare against -> the old, stricter rule
         self.assertFalse(remux.landing_ok(-18.0, -16.0, remux.AUDIO_MAX_GAIN_DB))
+
+
+class LosslessIsBoostedButKeptWhole(unittest.TestCase):
+    """The rule used to be "never touch lossless", so a quiet DTS-HD MA or TrueHD master
+    simply stayed quiet — Lost in Translation could only be told why nothing would happen.
+    It is boosted now, and the original lossless track rides along behind the normalized
+    one rather than being replaced (user-dictated 2026-08-21)."""
+
+    def _cmd(self, gain=6.0, keep=2):
+        return remux.build_mkv_mux_command("/ff", "/dv.mp4", "/cfr.mkv", "/orig.mkv",
+                                           "/out.mkv", gain_db=gain, keep_original_audio=keep)
+
+    def test_the_boosted_copy_comes_first(self):
+        c = self._cmd()
+        self.assertLess(c.index("1:a:0"), c.index("1:a"))     # map order decides track order
+
+    def test_every_original_track_is_still_there(self):
+        self.assertIn("1:a", self._cmd())
+
+    def test_only_the_first_track_is_re_encoded(self):
+        c = self._cmd()
+        self.assertIn("-c:a:0", c)
+        self.assertIn("aac_at", c)
+        self.assertNotIn("-c:a", c)          # never a blanket audio encoder over the originals
+
+    def test_the_originals_are_copied_bit_exact(self):
+        c = self._cmd()
+        self.assertEqual(c[c.index("-c") + 1], "copy")
+
+    def test_the_normalized_track_is_the_default_and_the_rest_are_not(self):
+        c = self._cmd(keep=2)
+        self.assertEqual(c[c.index("-disposition:a:0") + 1], "default")
+        self.assertEqual(c[c.index("-disposition:a:1") + 1], "0")
+        self.assertEqual(c[c.index("-disposition:a:2") + 1], "0")
+
+    def test_dispositions_cover_exactly_the_tracks_that_exist(self):
+        c = self._cmd(keep=3)
+        self.assertIn("-disposition:a:3", c)
+        self.assertNotIn("-disposition:a:4", c)
+
+    def test_a_lossy_source_is_unchanged(self):
+        # keep=0 -> the long-standing single-track boost, byte for byte as before
+        c = remux.build_mkv_mux_command("/ff", "/dv.mp4", "/c", "/o", "/out.mkv", gain_db=6.0)
+        self.assertIn("-c:a", c)
+        self.assertNotIn("1:a:0", c)
+        self.assertNotIn("-disposition:a:0", c)
+
+    def test_no_gain_means_no_encoder_and_no_duplicate_track(self):
+        c = remux.build_mkv_mux_command("/ff", "/dv.mp4", "/c", "/o", "/out.mkv",
+                                        gain_db=0.0, keep_original_audio=2)
+        self.assertNotIn("aac_at", c)
+        self.assertNotIn("1:a:0", c)
+
+    def test_the_lossless_check_itself_is_unchanged(self):
+        # keeping the original depends on correctly RECOGNISING lossless
+        self.assertTrue(remux.is_lossless_audio_codec("truehd"))
+        self.assertTrue(remux.is_lossless_audio_codec("dts", "DTS-HD MA"))
+        self.assertTrue(remux.is_lossless_audio_codec("pcm_s24le"))
+        self.assertFalse(remux.is_lossless_audio_codec("dts", "DTS"))
+        self.assertFalse(remux.is_lossless_audio_codec("aac", "LC"))

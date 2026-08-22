@@ -191,8 +191,45 @@ def has_lossless_audio(path: str, ffprobe=FFPROBE) -> bool:
     return False
 
 
+def audio_track_count(path: str, ffprobe=FFPROBE) -> int:
+    """How many audio tracks the file carries (0 when it can't be read)."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
+                              "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return 0
+    return len([ln for ln in out.splitlines() if ln.strip()])
+
+
+def boost_keeping_original_args(gain_db: float, n_audio: int, bitrate: str = "384k") -> list:
+    """Encoder args for LOSSLESS sources: a boosted lossy copy of the first track leads, and
+    every original track rides along untouched behind it, marked non-default.
+
+    The old rule refused lossless outright, so a quiet DTS-HD MA or TrueHD master simply
+    stayed quiet and the Finished list could only say "never re-encoded" (user-dictated
+    change, 2026-08-21: boost it, but never at the cost of the lossless track). Nothing is
+    lost — the original bits are still in the file, one track over — and players that pick
+    the default get the normalized one.
+
+    Output audio is laid out [boosted, original 0, original 1, ...]; the caller's -map order
+    has to match. `-c copy` covers the originals, so only track 0 names an encoder."""
+    args = ["-c:a:0", "aac_at", "-b:a:0", bitrate,
+            "-filter:a:0", build_audio_boost_filter(gain_db),
+            "-metadata:s:a:0", "title=Normalized",
+            "-disposition:a:0", "default"]
+    # Explicit per-track dispositions rather than a blanket "-disposition:a 0" followed by an
+    # override: when two per-stream options both match a stream, which one wins is ffmpeg
+    # trivia, and a master whose lossless track claims `default` is the failure this exists
+    # to avoid.
+    for i in range(1, n_audio + 1):
+        args += [f"-disposition:a:{i}", "0"]
+    return args
+
+
 def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
-                          orig_source: str, output: str, gain_db: float = 0.0) -> list:
+                          orig_source: str, output: str, gain_db: float = 0.0,
+                          keep_original_audio: int = 0) -> list:
     """Single-pass ffmpeg mux for the MKV master: DV video (copy) + audio (from the CFR file) +
     ALL subtitles (from the original, incl. bitmap PGS). Unlike its mp4/mov muxer — which drops the
     Dolby Vision config box (that's why the MP4 path needs MP4Box) — ffmpeg's **Matroska** muxer
@@ -204,11 +241,21 @@ def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
     # boost outright because Matroska is where LOSSLESS audio lives — but the rule is about
     # the CODEC, not the container, and most MKV masters here carry AAC/AC3. The caller only
     # passes a gain once has_lossless_audio() says every track is lossy.
-    boost = (["-filter:a", build_audio_boost_filter(gain_db),
-              "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
+    # LOSSLESS SOURCES KEEP THEIR ORIGINAL TRACK. `keep_original_audio` = how many audio
+    # tracks the source has; when set, a boosted copy of the first one leads and all the
+    # originals follow untouched (see boost_keeping_original_args).
+    if gain_db > 0 and keep_original_audio > 0:
+        amaps = ["-map", "1:a:0", "-map", "1:a"]      # boosted copy first, then the originals
+        boost = boost_keeping_original_args(gain_db, keep_original_audio)
+    elif gain_db > 0:
+        amaps = ["-map", "1:a"]
+        boost = ["-filter:a", build_audio_boost_filter(gain_db),
+                 "-c:a", "aac_at", "-b:a", "384k"]
+    else:
+        amaps, boost = ["-map", "1:a"], []
     return [ffmpeg, "-hide_banner", "-nostdin", "-y",
             "-i", dv_video, "-i", cfr_source, "-i", orig_source,
-            "-map", "0:v:0", "-map", "1:a", "-map", "2:s?",   # video / all audio / all subs
+            "-map", "0:v:0", *amaps, "-map", "2:s?",          # video / audio / all subs
             "-c", "copy", *boost,
             output]
 
@@ -490,8 +537,13 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                     capture_output=True, text=True, timeout=timeout)
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-                mkv_gain, mkv_measured = 0.0, None
-                if audio_target_lufs and not has_lossless_audio(cfr_source, ffprobe):
+                mkv_gain, mkv_measured, keep = 0.0, None, 0
+                if audio_target_lufs:
+                    # LOSSLESS IS BOOSTED TOO NOW, keeping its original track (user-dictated
+                    # 2026-08-21). It used to be skipped outright, so a quiet DTS-HD MA or
+                    # TrueHD master just stayed quiet with nothing to be done about it.
+                    if has_lossless_audio(cfr_source, ffprobe):
+                        keep = audio_track_count(cfr_source, ffprobe)
                     mkv_measured = measure_lufs(cfr_source, ffmpeg)
                     mkv_gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
                                 else boost_gain_db(mkv_measured,
@@ -499,9 +551,17 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 for attempt in ([mkv_gain, 0.0] if mkv_gain > 0 else [0.0]):
                     mx = subprocess.run(
                         build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output,
-                                              gain_db=attempt),
+                                              gain_db=attempt,
+                                              keep_original_audio=(keep if attempt > 0 else 0)),
                         capture_output=True, text=True, timeout=timeout)
                     if mx.returncode != 0:
+                        # A failed BOOST must not fail the master. aac_at can refuse an exotic
+                        # layout (a 7.1 TrueHD bed), and before the boost reached lossless at
+                        # all these titles simply muxed straight through — so fall back to
+                        # exactly that rather than parking the item over loudness.
+                        if attempt > 0:
+                            audio_note = " · audio unboosted (encoder refused the track)"
+                            continue
                         return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
                     if attempt <= 0:
                         break
@@ -509,7 +569,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     # the copy-mux retry costs seconds because gain 0 stream-copies again.
                     landed = measure_lufs(output, ffmpeg)
                     if landing_ok(landed, float(audio_target_lufs), attempt, measured=mkv_measured):
-                        audio_note = f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
+                        audio_note = (f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
+                                      + (" · original lossless kept" if keep else ""))
                         break
                     audio_note = " · audio unboosted (landing off target — kept original)"
             else:

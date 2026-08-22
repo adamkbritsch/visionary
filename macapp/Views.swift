@@ -2449,9 +2449,9 @@ private struct MovieRow: View {
                                     : "Tap to change this movie's Topaz preset")
             // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
             // Change buttons must not trigger it. Keyed by TITLE (the movie's settings key).
-            // COMBINE rows hide the inert controls (user rule): no Topaz/Resolve encode to
-            // range-pin, and MKV lossless audio is never boosted — only the source's fate
-            // is still a real choice.
+            // COMBINE rows hide the inert controls (user rule): a combine has no
+            // Topaz/Resolve encode to range-pin, so only the source's fate is still a real
+            // choice.
             if m.combine != true {
                 OutputModeRow(key: m.title ?? m.name ?? "", effective: m.output_mode_effective ?? "dv1000")
                     .padding(.horizontal, 10)
@@ -2943,8 +2943,9 @@ struct HistoryPopover: View {
                 .help("Fix audio now — re-measures this file and re-applies the loudness boost "
                       + "in place; watch it in the pipeline")
             } else {
-                // Say WHY rather than showing a dead control (hide-inert-UI): the only
-                // refusal is lossless audio, which the pipeline never re-encodes.
+                // Say WHY rather than showing a dead control (hide-inert-UI). Lossless is
+                // no longer a refusal — it is boosted with its original track kept — so what
+                // reaches here is a row with nowhere to write back to.
                 Text(it.why ?? "").font(.system(size: 10)).foregroundStyle(.tertiary)
                     .lineLimit(1).frame(maxWidth: 130, alignment: .trailing)
             }

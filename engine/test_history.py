@@ -34,15 +34,20 @@ class Book(unittest.TestCase):
             history.record(nas_path="/m/%d.mp4" % i, kind="movie", title=str(i))
         self.assertLessEqual(len(history._read()), history.MAX_ENTRIES)
 
-    def test_lossless_masters_are_refused_by_codec_not_container(self):
-        self.assertFalse(history.can_revise({"nas_path": "/m/x.mkv", "audio": "truehd"})[0])
+    def test_lossless_masters_are_revisable_now_too(self):
+        # Lossless used to be refused outright, so a quiet DTS-HD MA or TrueHD master had no
+        # remedy at all. It is boosted like anything else now — the original track is kept in
+        # the file behind the normalized one (user-dictated 2026-08-21).
+        self.assertTrue(history.can_revise({"nas_path": "/m/x.mkv", "audio": "truehd"})[0])
         self.assertTrue(history.can_revise({"nas_path": "/m/x.mkv", "audio": "aac"})[0])
         self.assertTrue(history.can_revise({"nas_path": "/m/x.mp4"})[0])
+        # a row with nowhere to write back is still the one real refusal
+        self.assertFalse(history.can_revise({"audio": "aac"})[0])
 
     def test_view_exposes_whether_a_row_can_be_revised(self):
         history.record(nas_path="/m/x.mkv", kind="movie", title="x")
         history._mark("/m/x.mkv", audio="truehd")
-        self.assertFalse(history.view()[0]["can_revise"])
+        self.assertTrue(history.view()[0]["can_revise"])      # lossless included now
 
 
 class Revise(unittest.TestCase):
@@ -118,23 +123,39 @@ class Revise(unittest.TestCase):
     def test_an_unknown_item_is_refused(self):
         self.assertEqual(history.revise_audio("/nope.mp4")["status"], "unknown-item")
 
-    def test_a_known_lossless_master_is_refused_before_any_download(self):
+    def test_a_known_lossless_master_is_no_longer_refused_up_front(self):
         history.record(nas_path="/m/x.mkv", kind="movie", title="x")
         history._mark("/m/x.mkv", audio="truehd")
-        self.assertEqual(history.revise_audio("/m/x.mkv")["status"], "refused")
+        self.assertNotEqual(history.revise_audio("/m/x.mkv")["status"], "refused")
 
-    def test_lossless_found_only_after_download_is_refused_there(self):
-        # the authoritative check: the name said nothing, the file says TrueHD
-        import transfer
+    def test_lossless_found_after_download_keeps_its_original_track(self):
+        # the authoritative check: the name said nothing, the file says TrueHD. It is boosted
+        # now, and the command has to carry the originals through alongside the boosted copy.
+        import transfer, remux
         local = os.path.join(self.d, "S04E10.mp4")
         open(local, "wb").close()
+        seen = {}
+
+        def run(cmd, total, cb):
+            seen["cmd"] = cmd
+            return 1, "stop here"          # fail the encode: we only care what it TRIED
+
         with mock.patch.object(transfer, "download", return_value=(True, local, "ok")), \
              mock.patch.object(history, "_probe_local_audio", return_value=("truehd", "")), \
+             mock.patch.object(remux, "audio_track_count", return_value=2), \
+             mock.patch.object(remux, "measure_lufs", return_value=-31.0), \
+             mock.patch.object(history, "_duration", return_value=100.0), \
+             mock.patch.object(history, "_run_with_progress", side_effect=run), \
              mock.patch.object(history, "_swap_in") as sw:
             out = history.revise_audio("/Media/TV/S04E10.mp4", scratch_dir=self.d)
-        self.assertEqual(out["status"], "refused")
-        self.assertIn("truehd", out["detail"])
-        sw.assert_not_called()
+        self.assertNotEqual(out["status"], "refused")
+        cmd = seen["cmd"]
+        self.assertIn("0:a:0", cmd)                     # the copy that gets boosted
+        self.assertIn("0:a", cmd)                       # every original track, carried
+        self.assertIn("-disposition:a:0", cmd)          # normalized track is the default
+        self.assertIn("-disposition:a:1", cmd)          # originals are not
+        self.assertIn("-disposition:a:2", cmd)
+        sw.assert_not_called()                          # encode failed, so nothing swapped
 
 
 if __name__ == "__main__":
@@ -161,10 +182,16 @@ class LosslessRule(unittest.TestCase):
                "audio": "aac", "audio_profile": "LC"}
         self.assertTrue(history.can_revise(row)[0])
 
-    def test_an_mkv_with_lossless_audio_is_not(self):
+    def test_an_mkv_with_lossless_audio_is_revisable_and_keeps_its_track(self):
         row = {"nas_path": "/m/x.mkv", "audio": "truehd"}
         ok, why = history.can_revise(row)
-        self.assertFalse(ok); self.assertIn("lossless", why)
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+        # is_lossless still has to KNOW it is lossless — that is what triggers keeping the
+        # original track rather than replacing it.
+        self.assertTrue(history.is_lossless("truehd", ""))
+        self.assertTrue(history.is_lossless("dts", "DTS-HD MA"))
+        self.assertFalse(history.is_lossless("aac", "LC"))
 
     def test_unknown_audio_is_allowed_and_checked_later(self):
         # refusing on a guess is what went wrong; the revision re-checks after download
