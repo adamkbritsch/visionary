@@ -389,7 +389,12 @@ class FastPathDispatch(unittest.TestCase):
         self.assertFalse(ok)                              # launch failed on purpose — we only
         cmd = seen["cmd"]                                 # care what it TRIED to run
         self.assertIn("single", cmd)
-        self.assertIn(p.source, cmd)                      # the ORIGINAL file, not the segdir
+        # A FILE, not the segdir — and specifically the CFR, which is what render_is_complete
+        # and the remux's RPU alignment measure. This asserted p.source until 2026-08-21,
+        # pinning the divergence that made Don't Look Up render 206,200 frames for a
+        # 199,144-frame movie (see stages.resolve_input).
+        self.assertIn(p.source_cfr, cmd)
+        self.assertNotIn(p.source, cmd)
         self.assertNotIn(p.segdir, cmd)
         # 2000-nit is MANUAL-ONLY now (user-dictated 2026-08-09): auto = dv1000
         # whatever the intake range.
@@ -2077,3 +2082,55 @@ class YouTubeRenderBitrate(unittest.TestCase):
 
     def test_an_unknown_height_is_treated_as_the_common_case(self):
         self.assertEqual(stages.youtube_render_kbps(None), stages.YOUTUBE_RENDER_KBPS)
+
+
+class ResolveRendersTheFileTheGatesMeasure(unittest.TestCase):
+    """The fast path handed Resolve p.source while render_is_complete() and the remux's RPU
+    alignment both measure p.source_cfr — two different files. Don't Look Up's original
+    carries ~294s of audio past the end of its picture, so Resolve took the clip length from
+    the CONTAINER: 8591.648s x 24 is exactly the 206,200 frames it rendered for a
+    199,144-frame movie, five times over (live-caught 2026-08-21)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.p = _paths(self.tmp)
+
+    def _with_cfr(self):
+        open(self.p.source_cfr, "w").close()
+        return self.p
+
+    def test_the_cfr_is_what_goes_on_the_timeline(self):
+        p = self._with_cfr()
+        self.assertEqual(stages.resolve_input(p), p.source_cfr)
+
+    def test_it_is_NOT_the_original_source(self):
+        p = self._with_cfr()
+        self.assertNotEqual(stages.resolve_input(p), p.source)
+
+    def test_there_is_no_silent_fallback_to_the_source(self):
+        # Even with nothing on disk it names the CFR. A fallback would quietly reintroduce
+        # the divergence; stage_done("download") already guarantees the file is there.
+        self.assertEqual(stages.resolve_input(self.p), self.p.source_cfr)
+
+    def test_a_youtube_item_is_unchanged(self):
+        # YouTube already rendered from its CFR — that behaviour must survive the fix
+        p = episode_paths("Show", "S01E01", "e.mp4", scratch_dir=self.tmp,
+                          nas_tv_root="/Media/TV")
+        open(p.source_cfr, "w").close()
+        self.assertEqual(stages.resolve_input(p), p.source_cfr)
+
+    def test_a_combine_item_still_renders_its_verdict_winner(self):
+        from orchestrator import movie_paths
+        p = movie_paths("m.mkv", "/Media/Movies", "M", scratch_dir=self.tmp, combine=True)
+        open(p.source_cfr, "w").close()          # even with one on disk, combine wins
+        self.assertTrue(p.combine)               # the fixture is really a combine item
+        import orchestrator
+        with mock.patch.object(orchestrator, "combine_winner_path", return_value="/w/win.mkv"):
+            self.assertEqual(stages.resolve_input(p), "/w/win.mkv")
+
+    def test_a_plain_movie_takes_the_cfr(self):
+        from orchestrator import movie_paths
+        p = movie_paths("m.mkv", "/Media/Movies", "M", scratch_dir=self.tmp)
+        open(p.source_cfr, "w").close()
+        self.assertFalse(p.combine)
+        self.assertEqual(stages.resolve_input(p), p.source_cfr)

@@ -182,6 +182,30 @@ def _peak_of(path, key):
     return mbps
 
 
+def resolve_input(p):
+    """WHICH FILE RESOLVE PUTS ON THE TIMELINE — and it must be the file the gates measure.
+    This used to hand Resolve the ORIGINAL source for everything except YouTube, while
+    render_is_complete() and the remux's RPU alignment both measure p.source_cfr. Two
+    different files. Don't Look Up's original carries ~294s of audio past the end of its
+    picture, so Resolve took the clip length from the container: 8591.648s x 24 is exactly
+    the 206,200 frames it rendered for a 199,144-frame movie, and an RPU aligned
+    frame-by-frame could never land on it (live-caught 2026-08-21).
+
+    The CFR is the pipeline's canonical timing, and for an already-CFR source its video is a
+    stream COPY — so the fast path still puts the original's own pixels on the timeline,
+    just in a container that tells the truth about where the picture ends. Combine items
+    have no CFR (the remux reads both originals) and keep their verdict winner.
+
+    There is deliberately NO "fall back to the source if the CFR is missing": a silent
+    fallback is how the two files diverged in the first place. It cannot fire anyway —
+    stage_done("download") already gates on topaz.is_cfr_ready(p.source_cfr), so resolve
+    never starts without one."""
+    from orchestrator import combine_winner_path
+    if p.combine:
+        return combine_winner_path(p)
+    return p.source_cfr
+
+
 def _plan_fast_path_bounds(p, progress=None, src=None) -> str:
     """RESOLVE-ONLY fast path: no upscale, but the capped remux still re-encodes — so run
     topaz's PLANNING front half (scene detect + ~90 s grouping, the exact same utilities)
@@ -1130,8 +1154,7 @@ def _resolve(p, abort, progress=None):
 
     try:
         from orchestrator import combine_winner_path
-        video_in = (combine_winner_path(p) if p.combine
-                    else p.source_cfr if yt else p.source)
+        video_in = resolve_input(p)
         if p.combine and not video_in:
             return False, "permanent: combine verdict lost — re-pair the companion"
         ok, out, reason = _run(video_in)

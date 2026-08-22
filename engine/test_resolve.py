@@ -253,3 +253,64 @@ class ProbeFrames(unittest.TestCase):
         import resolve_pipeline as rp
         with mock.patch.object(rp.subprocess, "run", side_effect=OSError):
             self.assertIsNone(rp._probe_frames("/x.mp4"))
+
+
+class MatroskaMustNotBlindTheGuard(unittest.TestCase):
+    """The timeline-length guard probes the file Resolve imports. Matroska publishes neither
+    nb_frames nor a video duration, so both branches came back empty and the guard silently
+    passed on every .mkv — including the one it exists for. The fallback is the last video
+    PACKET, never the container: on that file the container is the very thing that lies
+    (294s of audio past the last frame)."""
+
+    def _probe(self, st, *, box=None, last=None, step=None):
+        import json as _json, resolve_pipeline as rp
+
+        def run(cmd, **kw):
+            if "packet=pts_time,duration_time" in cmd:
+                return mock.Mock(stdout="" if last is None else f"{last},{step}\n")
+            if "format=duration" in cmd:
+                return mock.Mock(stdout=("" if box is None else f"{box}\n"))
+            return mock.Mock(stdout=_json.dumps({"streams": [st]}))
+        with mock.patch.object(rp.subprocess, "run", side_effect=run):
+            return rp._probe_frames("/x.mkv")
+
+    MKV = {"nb_frames": "N/A", "duration": "N/A", "r_frame_rate": "24/1"}
+
+    def test_the_picture_end_gives_the_frame_count(self):
+        # last frame starts at 8297.625 and lasts 1/24 -> 8297.667 * 24 = 199144
+        self.assertEqual(self._probe(self.MKV, box=8591.648, last=8297.625,
+                                     step=0.0416667), 199144)
+
+    def test_the_lying_container_is_NOT_used(self):
+        # 8591.648 * 24 = 206200 — the wrong answer that has to stay wrong
+        self.assertNotEqual(self._probe(self.MKV, box=8591.648, last=8297.625,
+                                        step=0.0416667), 206200)
+
+    def test_no_packets_at_all_is_None_not_a_guess(self):
+        self.assertIsNone(self._probe(self.MKV, box=8591.648, last=None))
+
+    def test_a_published_count_still_short_circuits(self):
+        st = {"nb_frames": "199144", "duration": "N/A", "r_frame_rate": "24/1"}
+        self.assertEqual(self._probe(st, box=8591.648, last=1.0, step=0.04), 199144)
+
+
+class TheRenderRateFollowsTheTimeline(unittest.TestCase):
+    """FrameRate was passed to SetRenderSettings as a STRING and the render came back at the
+    preset's rate instead of the timeline's. Invisible for years — every episode and the
+    preset are both 23.976 — and only exposed by a true-24 movie (2026-08-21)."""
+
+    def test_the_rate_is_sent_as_a_number(self):
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp.render)
+        self.assertIn('"FrameRate": (_fps_from_rate(fps) or str(fps))', src)
+        self.assertNotIn('"FrameRate": str(fps)', src)
+
+    def test_both_rate_spellings_convert(self):
+        import resolve_pipeline as rp
+        self.assertEqual(rp._fps_from_rate("24"), 24.0)
+        self.assertAlmostEqual(rp._fps_from_rate("23.976"), 23.976)
+        self.assertAlmostEqual(rp._fps_from_rate("24000/1001"), 23.976, places=3)
+
+    def test_an_unreadable_rate_degrades_to_todays_behaviour(self):
+        import resolve_pipeline as rp
+        self.assertIsNone(rp._fps_from_rate("weird"))     # -> falls back to str(fps)

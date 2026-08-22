@@ -439,8 +439,14 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
               f"Dolby Vision Profile to 8.1 with HW accel ON → Save As New Render Preset). "
               f"Without it the render embeds NO Dolby Vision."); return 1
     proj.LoadRenderPreset(DV_PRESET)
+    # FrameRate as a NUMBER. It was passed as a string, and the render came back at the
+    # PRESET's rate instead of the timeline's — invisible for years because every episode
+    # and the preset are both 23.976, and only exposed by a true-24 movie (2026-08-21).
+    # No worse either way: if Resolve declines the numeric form it falls back to the
+    # preset exactly as it did before, and the post-render check below catches a mismatch.
     proj.SetRenderSettings({"TargetDir": out_dir, "CustomName": name,
-                            "ExportVideo": True, "ExportAudio": False, "FrameRate": str(fps),
+                            "ExportVideo": True, "ExportAudio": False,
+                            "FrameRate": (_fps_from_rate(fps) or str(fps)),
                             "VideoQuality": int(bitrate)})   # Kb/s — overrides the preset's 60000 to match a higher-bitrate intake
     print(f"[{time.strftime('%H:%M:%S')}] export bitrate: {int(bitrate)} Kb/s", flush=True)
     jid = proj.AddRenderJob()
@@ -505,12 +511,50 @@ def _probe_frames(path):
             return n
     except (TypeError, ValueError):
         pass
+    r = _fps_from_rate(st.get("r_frame_rate"))
     try:
-        r = _fps_from_rate(st.get("r_frame_rate"))
         d = float(st.get("duration"))
-        return int(round(d * r)) if r and d > 0 else None
+        if r and d > 0:
+            return int(round(d * r))
     except (TypeError, ValueError):
+        pass
+    # Matroska publishes NEITHER a frame count nor a video duration, so both branches above
+    # come back empty and the check that uses this would silently pass on every .mkv. Fall
+    # back to where the picture actually ends. NOT the container duration: on the file this
+    # guard exists for, the container is the very thing that lies (294s of audio past the
+    # last frame).
+    end = _last_video_end(path)
+    return int(round(end * r)) if (end and r) else None
+
+
+def _last_video_end(path):
+    """Seconds at which the picture ends, from the last video packet. One seek — seeking past
+    the end of a short video stream lands on its last keyframe, so the tail is read either
+    way."""
+    try:
+        box = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", path],
+                             capture_output=True, text=True, timeout=60).stdout
+        box = float((box.splitlines() or ["0"])[0].strip())
+        out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                              "-read_intervals", f"{max(0.0, box - 60):.3f}%",
+                              "-show_entries", "packet=pts_time,duration_time",
+                              "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=180).stdout
+    except Exception:
         return None
+    last, step = None, 0.0
+    for ln in out.splitlines():
+        parts = ln.split(",")
+        try:
+            last = float(parts[0])
+        except (ValueError, IndexError):
+            continue
+        try:
+            step = float(parts[1])
+        except (ValueError, IndexError):
+            pass
+    return (last + step) if last is not None else None
 
 
 TIMELINE_FRAME_SLACK = 2      # Resolve rounds an edge frame; anything more is a wrong timeline
