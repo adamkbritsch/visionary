@@ -986,6 +986,12 @@ struct StageView: View {
                     Image(systemName: info.symbol).font(.system(size: 14, weight: .medium))
                         .frame(width: 30, height: 30)
                         .foregroundStyle(isActive ? DS.steelBright : DS.steelDim)
+                    // A step that ISN'T running has nothing else on its row — no pulse, no
+                    // episode — so its title centres in the space between the icon and the
+                    // card's right edge instead of hugging the icon with a wide gap after it
+                    // (user-dictated 2026-08-23). The running step keeps its title left,
+                    // where the pulse and the episode follow it.
+                    if !isActive { Spacer(minLength: 0) }
                     // The step TITLE only — uppercased and two points down from the rest of
                     // the card, so the name reads as a label rather than competing with the
                     // episode and the `how` line beneath it (user-dictated 2026-08-22).
