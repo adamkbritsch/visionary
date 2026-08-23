@@ -52,6 +52,10 @@ enum DS {
 
     static let radiusCard: CGFloat = 16
     static let radiusControl: CGFloat = 10
+    // Buttons, chips and badges: a SLIGHTLY curved rectangle, still elongated — not the
+    // capsule they used to be (user-dictated 2026-08-23). One token so the whole theme
+    // moves together.
+    static let radiusChip: CGFloat = 6
 }
 
 extension View {
@@ -124,12 +128,12 @@ struct SteelButtonStyle: ButtonStyle {
             .foregroundStyle(lit ? DS.graphiteText : DS.steelBright)
             .background {
                 if lit {                                  // lit plate = a cutout of the shared header surface
-                    GeometryReader { g in Capsule().fill(headerSurfaceGradient(height: g.size.height)) }
+                    GeometryReader { g in RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(headerSurfaceGradient(height: g.size.height)) }
                 } else {
-                    Capsule().fill(Color.white.opacity(configuration.isPressed ? 0.12 : 0.07))
+                    RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(configuration.isPressed ? 0.12 : 0.07))
                 }
             }
-            .overlay(Capsule().strokeBorder(LinearGradient(
+            .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(LinearGradient(
                 colors: [.white.opacity(lit ? 0.45 : 0.20), .white.opacity(lit ? 0.15 : 0.05)],
                 startPoint: .top, endPoint: .bottom), lineWidth: 1))
             .shadow(color: .black.opacity(0.25), radius: 4, y: 1)
@@ -246,8 +250,8 @@ struct Pill: View {
         }
         .foregroundStyle(tint)
         .padding(.horizontal, iconOnly ? 7 : 11).padding(.vertical, 6)
-        .background(Capsule().fill(Color.white.opacity(0.05)))
-        .overlay(Capsule().strokeBorder(LinearGradient(              // glass capsule bevel
+        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(LinearGradient(              // glass capsule bevel
             colors: [.white.opacity(0.18), .white.opacity(0.05)],
             startPoint: .top, endPoint: .bottom), lineWidth: 0.7))
         .help(iconOnly ? text : "")
@@ -644,8 +648,8 @@ struct ScreenControlSection: View {
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DS.steelBright)
                         .padding(.horizontal, 9).padding(.vertical, 4)
-                        .background(Capsule().fill(Color.white.opacity(0.07)))
-                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
+                        .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
                 }
             } else {
                 // ON: the only way to switch it off is to say for how long.
@@ -657,8 +661,8 @@ struct ScreenControlSection: View {
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(DS.steelBright)
                             .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Capsule().fill(Color.white.opacity(0.07)))
-                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
+                            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
+                            .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
                     }
                 }
                 HStack(spacing: 6) {
@@ -679,8 +683,8 @@ struct ScreenControlSection: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DS.steelBright)
                     .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
-                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
+                    .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
                     Spacer()
                 }
                 Text("Longest pause is 4 hours — beyond that, held items fill the disk and the run stalls.")
@@ -987,7 +991,8 @@ struct StageView: View {
                     // episode and the `how` line beneath it (user-dictated 2026-08-22).
                     Text(info.name.uppercased())
                         .font(.system(size: isActive ? 13 : 11, weight: .bold))
-                        .foregroundStyle(isActive ? DS.steelBright : Color.labelC)
+                        // a step that isn't running sits back a little (user-dictated)
+                        .foregroundStyle(isActive ? DS.steelBright : Color.labelC.opacity(0.6))
                     if isActive { PulseDot() }
                     Spacer(minLength: 4)
                     // top-right: this card's EPISODE while active. The step's ORDINAL used
@@ -1751,7 +1756,7 @@ private struct TVMode: View {
                     Text(catalog.first { $0.key == key }?.label ?? (key.isEmpty ? "—" : key))
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                         .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                         .help("Topaz preset")
                     if !(show.configured ?? false) {
                         Text("(default)").font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -1894,7 +1899,7 @@ private struct NormalizeAudioRow: View {
             Text(on ? "Normalized audio" : "Original audio")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                 .help("Remux audio: normalized = quiet audio boosted to the loudness target; original = bit-exact copy")
             Button("Change") { confirming = true }
                 .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
@@ -1952,7 +1957,7 @@ private struct ExtendBordersRow: View {
             Text(on ? "Extends to 16:9" : "Keeps 4:3")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                 .help(helpText)
             Button("Change") { confirming = true }
                 .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
@@ -2096,7 +2101,7 @@ private struct NextUpRow: View {
                              ?? (profile?.preset ?? "—"))
                             .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                             .padding(.horizontal, 7).padding(.vertical, 2)
-                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                             .help("Topaz preset for the queued show")
                         if !(profile?.configured ?? false) {
                             Text("(default)").font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -2166,7 +2171,7 @@ private struct NextUpRow: View {
                 Text("Up next: \(store.seriesTitle(n))")
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel).lineLimit(1)
                     .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                     .help("Takes this slot the moment the current show finishes")
                 if armed {
                     Text("ready").font(.system(size: 11, weight: .medium)).foregroundStyle(Color.brand)
@@ -2202,7 +2207,7 @@ private struct ReplaceSourceRow: View {
             Text(on ? "Replaces source" : "Keeps source")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                 .help("Upload policy: replace = delete the source once the 4K master is verified on the NAS; keep = Plex serves both versions and the source stays for a future re-run")
             Button("Change") { confirming = true }
                 .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
@@ -2255,7 +2260,7 @@ private struct OutputModeRow: View {
             Text(Self.label(current))
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                 .help("What Resolve masters this as. Left alone everything masters to "
                       + "1000-nit Dolby Vision; the 2000-nit target and SDR are manual "
                       + "choices only.")
@@ -2535,14 +2540,14 @@ private struct MovieRow: View {
                     Text("COMBINE")
                         .font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.steelBright)
                         .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                         .help("Best-of merge with its seedbox companion — the better video base, "
                               + "real DV if either copy has it, and the best audio of the two")
                 } else {
                     Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
                         .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
                         .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                     Button {
                         Task { await store.companionAction("search", name: m.name ?? "",
                                                            dir: m.dir, title: m.title) }
@@ -3061,7 +3066,7 @@ struct HistoryPopover: View {
             if it.revising == true {
                 Text("fixing…").font(.system(size: 10)).foregroundStyle(DS.steelBright)
                     .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.white.opacity(0.08)))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.08)))
             } else if it.can_revise == true {
                 Button { Task { await store.reviseAudio(it) } } label: {
                     Image(systemName: "waveform").font(.system(size: 12))
@@ -3280,8 +3285,8 @@ private struct ChannelRow: View {
                         .frame(width: 76)   // fits "Resume" + icon; fixed so both states align across rows
                         .foregroundStyle(paused ? DS.steelBright : DS.steelDim)
                         .padding(.vertical, 4)
-                        .background(Capsule().fill(Color.white.opacity(paused ? 0.10 : 0.05)))
-                        .overlay(Capsule().strokeBorder(Color.white.opacity(paused ? 0.25 : 0.10), lineWidth: 0.7))
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(paused ? 0.10 : 0.05)))
+                        .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(paused ? 0.25 : 0.10), lineWidth: 0.7))
                 }.buttonStyle(.plain)
                     .help(paused ? "Resume — youtarr downloads + upscaling restart"
                                  : "Pause — stop downloading & upscaling this channel (keeps its files)")
@@ -3316,7 +3321,7 @@ private struct ChannelRow: View {
                 Text(catalog.first { $0.key == ch.preset }?.label ?? (ch.preset ?? "—"))
                     .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
                     .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                     .opacity(paused ? 0.35 : 1)
                     .onTapGesture { if !paused { onTap() } }
                 Button { confirmingRemove = true } label: {
@@ -3373,7 +3378,7 @@ private struct VideoGroupRow: View {
                         Text(jumping == 1 ? "1 jumping the queue" : "\(jumping) jumping the queue")
                             .font(.system(size: 10)).foregroundStyle(Color.brand)
                             .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                     }
                     if !open, let first = group.items.first {
                         Text(first.title ?? first.name ?? "").font(.system(size: 12))
@@ -3476,7 +3481,7 @@ private struct UpNextView: View {
             if let ch = it.channel, !ch.isEmpty {
                 Text(ch).font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.08))).foregroundStyle(DS.steel)
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.08))).foregroundStyle(DS.steel)
                     .lineLimit(1).layoutPriority(-1)
             }
             Text(it.title ?? it.name ?? "").fontWeight(.semibold).lineLimit(1)
@@ -3484,12 +3489,12 @@ private struct UpNextView: View {
             if showSeries, let sname = it.series, !sname.isEmpty {
                 Text(store.seriesTitle(sname)).font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.08))).foregroundStyle(DS.steelDim)
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.08))).foregroundStyle(DS.steelDim)
                     .lineLimit(1).layoutPriority(-1)
             }
             Text(it.ep ?? "").font(.system(.caption, design: .monospaced).weight(.bold))
                 .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Capsule().fill(Color.white.opacity(0.08))).foregroundStyle(DS.steelBright)
+                .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.08))).foregroundStyle(DS.steelBright)
             Text(epTitle(it.source_name)).fontWeight(.semibold).lineLimit(1)
         }
     }
@@ -3515,7 +3520,7 @@ private struct UpNextView: View {
                 // can be a couple of minutes, and an unacknowledged press reads as broken.
                 Text("running next").font(.system(size: 10)).foregroundStyle(Color.brand)
                     .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                     .help("Queued to jump the queue — starts when the current segment finishes")
             } else {
                 iconButton("arrow.up.to.line", enabled: true,

@@ -428,7 +428,7 @@ private struct MediaFoldersGroup: View {
                 Text(lib.plex_type ?? "").font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                 if overridden {
                     Text("overridden").font(.system(size: 10)).foregroundStyle(Color.brand)
                 }
@@ -476,7 +476,7 @@ private struct MediaFoldersGroup: View {
                 Text(prop?.source ?? "default").font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                 if !same {
                     Text("differs from what's running").font(.system(size: 10))
                         .foregroundStyle(DS.steelBright)
