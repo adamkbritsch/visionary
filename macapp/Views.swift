@@ -966,10 +966,12 @@ struct StageView: View {
     var body: some View {
         if condensed {
             // Just the icon — two stages need the room. Name/desc live in the tooltip.
+            // No chip behind the glyph — it sits directly on the card, like the text
+            // (user-dictated 2026-08-22). The 30x30 frame stays: it is what keeps every
+            // step's icon on the same baseline, and what the chevrons' .padding(.top, 21)
+            // between cards is aligned against.
             Image(systemName: info.symbol).font(.system(size: 14, weight: .medium))
                 .frame(width: 30, height: 30)
-                .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Color.white.opacity(0.05)))
                 .foregroundStyle(DS.steelDim)
                 .frame(width: 46, height: 58, alignment: .center)
                 .panel(DS.radiusControl, tint: nil, inset: true)
@@ -980,14 +982,12 @@ struct StageView: View {
                 HStack(spacing: 9) {
                     Image(systemName: info.symbol).font(.system(size: 14, weight: .medium))
                         .frame(width: 30, height: 30)
-                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .fill(Color.white.opacity(isActive ? 0.10 : 0.05)))
                         .foregroundStyle(isActive ? DS.steelBright : DS.steelDim)
                     // The step TITLE only — uppercased and two points down from the rest of
                     // the card, so the name reads as a label rather than competing with the
                     // episode and the `how` line beneath it (user-dictated 2026-08-22).
                     Text(info.name.uppercased())
-                        .font(.system(size: isActive ? 13 : 11, weight: .semibold))
+                        .font(.system(size: isActive ? 13 : 11, weight: .bold))
                         .foregroundStyle(isActive ? DS.steelBright : Color.labelC)
                     if isActive { PulseDot() }
                     Spacer(minLength: 4)
