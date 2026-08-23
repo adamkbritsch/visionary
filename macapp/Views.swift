@@ -274,7 +274,6 @@ struct MarqueeText: View {
     var gap: CGFloat = 34
 
     @State private var textWidth: CGFloat = 0
-    @State private var rolling = false
 
     private var font: Font {
         monospaced ? .system(size: size, weight: weight, design: .monospaced)
@@ -283,20 +282,33 @@ struct MarqueeText: View {
 
     var body: some View {
         GeometryReader { geo in
-            let overflows = textWidth > geo.size.width + 0.5
-            HStack(spacing: gap) {
-                label
-                if overflows { label }          // the chaser, so the wrap is seamless
+            let span = textWidth + gap
+            let overflows = textWidth > geo.size.width + 0.5 && span > 0
+            Group {
+                if overflows {
+                    // The offset is a PURE FUNCTION OF TIME, not animated @State. Driving it
+                    // with .animation(value:) desynchronised the two copies and drew them on
+                    // top of each other (user-caught 2026-08-23): textWidth is measured AFTER
+                    // the animation is already running, so the target moved with nothing to
+                    // carry it, and the 1.5s state poll re-evaluated the whole thing on every
+                    // tick. Derived from the clock instead, a re-render cannot disturb it and
+                    // the wrap is exact — at t = span the chaser sits precisely where the
+                    // first copy began.
+                    TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { tl in
+                        let travelled = tl.date.timeIntervalSinceReferenceDate * pointsPerSecond
+                        let x = -CGFloat(travelled.truncatingRemainder(dividingBy: Double(span)))
+                        HStack(spacing: gap) {
+                            label
+                            label                      // the chaser, so the loop is seamless
+                        }
+                        .offset(x: x)
+                    }
+                } else {
+                    label                              // fits: nothing moves, nothing repeats
+                }
             }
-            .offset(x: (rolling && overflows) ? -(textWidth + gap) : 0)
-            .animation(overflows
-                       ? .linear(duration: Double(textWidth + gap) / pointsPerSecond)
-                           .repeatForever(autoreverses: false)
-                       : nil,
-                       value: rolling)
             .frame(width: geo.size.width, alignment: .leading)
             .clipped()
-            .onAppear { rolling = true }
         }
         // GeometryReader would otherwise claim the whole height it is offered.
         .frame(height: size * 1.35)
