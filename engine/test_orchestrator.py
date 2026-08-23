@@ -1194,8 +1194,11 @@ class DoubleRemux(unittest.TestCase):
             sd = _os.path.join(d, f"X S01E{i}_prob4_upscaled.segments")
             _os.makedirs(sd)
             open(_os.path.join(sd, "seg_0000.mov"), "w").close()   # real upscaled work
+            open(_os.path.join(sd, "DONE"), "w").close()            # ...and it FINISHED
         o = orch.Orchestrator()
-        with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
+        _done = lambda sd: _os.path.exists(_os.path.join(sd, "DONE"))
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d), \
+             mock.patch("topaz.segments_complete", side_effect=_done):
             self.assertEqual(o._drain_backlog(), 3)
             o.enable()                       # the "dismiss the prompt, press Start" gesture
             self.assertEqual(o._drain_backlog(), 3, "Start must no longer erase the backlog")
@@ -1224,10 +1227,16 @@ class DoubleRemux(unittest.TestCase):
             with mock.patch.object(orch, "stage_done", return_value=False):
                 self.assertFalse(o._dual_remux_pauses_topaz(p),
                                  "plan-only segdirs must never wedge the run thread")
-            # ...and a real segment still counts.
+            # ...and a real segment is still not enough on its own — the topaz has to be
+            # FINISHED, or an aborted one wedges the gate exactly the same way.
             sd = _os.path.join(d, "Borat_prob4_upscaled.segments")
             open(_os.path.join(sd, "seg_0000.mov"), "w").close()
-            self.assertEqual(o._drain_backlog(), 1)
+            self.assertEqual(o._drain_backlog(), 0)
+            # ...and once THAT one's topaz finishes, it — and only it — is a buffer.
+            open(_os.path.join(sd, "DONE"), "w").close()
+            _done = lambda x: _os.path.exists(_os.path.join(x, "DONE"))
+            with mock.patch("topaz.segments_complete", side_effect=_done):
+                self.assertEqual(o._drain_backlog(), 1)
 
     def test_resolve_gate_keeps_single_timing_when_not_draining(self):
         o = orch.Orchestrator(); o._drain_backlog = lambda: 1
@@ -3319,7 +3328,10 @@ class ParkSweepsItsWorkingSet(unittest.TestCase):
         d = tempfile.mkdtemp()
         o = orch.Orchestrator()
         p = self._item(d)
-        with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
+        # A FINISHED topaz is what the gate counts, so that is what the park has to clear.
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d), \
+             mock.patch("topaz.segments_complete",
+                        side_effect=lambda x: os.path.isdir(x)):
             self.assertEqual(o._drain_backlog(), 1)      # the segdir counts before
             with mock.patch.object(o, "_hold"):
                 o._park_item(p, "S01E01", 5, "topaz", "boom")

@@ -2979,6 +2979,7 @@ class Orchestrator:
         reopen, because the items owning those dirs are the ones it was blocking. The
         seg_ test also excludes the extend stage's own `<stem>_wide.mp4.segments` chunk
         dir, which holds `wide_NNNN.mp4` and is likewise not a topaz buffer."""
+        import topaz as _topaz
         try:
             base = scratch.default_scratch()
             n = 0
@@ -2986,8 +2987,17 @@ class Orchestrator:
                 d = os.path.join(base, name)
                 if not (name.endswith(".segments") and os.path.isdir(d)):
                     continue
+                # ...and the topaz must be FINISHED. "Has a segment in it" is not the same
+                # as buffered work: an ABORTED topaz leaves real seg_NNNN.mov files behind
+                # and is the very item still waiting to be upscaled. Two of those (a deploy
+                # killed topaz twice in three minutes) counted as a two-item backlog, so
+                # _dual_remux_pauses_topaz held every fresh item under "two remuxes running"
+                # with ZERO remuxes live — and nothing could clear it, because clearing it
+                # means resolving them, and resolve needs the topaz these two are blocked
+                # from finishing (live-caught 2026-08-23). Same deadlock the plan-only dirs
+                # caused; the seg_ test closed that hole and left this one.
                 try:
-                    if any(f.startswith("seg_") and f.endswith(".mov") for f in os.listdir(d)):
+                    if _topaz.segments_complete(d):
                         n += 1
                 except OSError:
                     pass

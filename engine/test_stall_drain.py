@@ -31,20 +31,26 @@ class DrainBacklog(unittest.TestCase):
     """Derived from the DISK, because the in-memory version was destroyed by the very
     recovery gesture the user is told to perform (dismiss the prompt, press Start)."""
 
-    def _with_segdirs(self, n, extra=()):
+    def _with_segdirs(self, n, extra=(), done=True):
         d = tempfile.mkdtemp()
         for i in range(n):
             sd = os.path.join(d, f"Show S01E{i:02d}_prob4_upscaled.segments")
             os.makedirs(sd)
-            # A segdir is a BUFFER only once it holds real upscaled work — see
-            # test_plan_only_segdirs_never_count below.
+            # A segdir is a BUFFER only once its topaz is FINISHED — a real segment alone
+            # is not enough (see test_a_partly_upscaled_segdir_is_not_a_backlog).
             open(os.path.join(sd, "seg_0000.mov"), "w").close()
+            if done:
+                open(os.path.join(sd, "DONE"), "w").close()
         for name in extra:
             open(os.path.join(d, name), "w").close()
         return d
 
     def _count(self, d):
-        with mock.patch.object(orch.scratch, "default_scratch", return_value=d):
+        # segments_complete() probes every chunk's real frame count, so it is stubbed on the
+        # fixture's marker: what is under test here is WHICH dirs the orchestrator counts.
+        done = lambda sd: os.path.exists(os.path.join(sd, "DONE"))
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d), \
+             mock.patch("topaz.segments_complete", side_effect=done):
             return orch.Orchestrator.__new__(orch.Orchestrator)._drain_backlog()
 
     def test_one_segdir_is_the_normal_steady_state_not_a_backlog(self):
@@ -72,8 +78,28 @@ class DrainBacklog(unittest.TestCase):
             with open(os.path.join(sd, "scenes.json"), "w") as f:
                 f.write("[]")
         self.assertEqual(self._count(d), 0)
-        open(os.path.join(d, "Borat_prob4_upscaled.segments", "seg_0000.mov"), "w").close()
-        self.assertEqual(self._count(d), 1)      # a real segment makes it a buffer
+        sd = os.path.join(d, "Borat_prob4_upscaled.segments")
+        open(os.path.join(sd, "seg_0000.mov"), "w").close()
+        self.assertEqual(self._count(d), 0)      # a segment alone is work in PROGRESS
+        open(os.path.join(sd, "DONE"), "w").close()
+        self.assertEqual(self._count(d), 1)      # finished topaz is what makes it a buffer
+
+    def test_a_partly_upscaled_segdir_is_not_a_backlog(self):
+        """The 2026-08-23 deadlock. A deploy killed topaz twice in three minutes, leaving two
+        segdirs holding real seg_NNNN.mov files with the upscale unfinished. Counting those
+        as a two-item backlog shut _dual_remux_pauses_topaz on every fresh item — "two
+        remuxes running" with ZERO remuxes live — and nothing could clear it, because
+        clearing it means resolving them and resolve needs the topaz they were blocked from
+        finishing. Same shape as the plan-only deadlock above; the seg_ test closed that
+        hole and left this one."""
+        self.assertEqual(self._count(self._with_segdirs(2, done=False)), 0)
+        # ...and the gate stays open for a fresh item while they sit there
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._drain_backlog = lambda: 0
+        o.state = {"finishing": None, "finishing2": None}
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "topaz_is_noop", return_value=False):
+            self.assertFalse(o._dual_remux_pauses_topaz(object()))
 
     def test_extend_chunk_dirs_never_count(self):
         """The extend stage's own resume dir also ends in .segments and shares the scratch,

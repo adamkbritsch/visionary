@@ -819,7 +819,7 @@ struct PipelineCard: View {
                 ForEach(Array(stages.enumerated()), id: \.offset) { i, st in
                     let role: StageRole = (st.key == runStage) ? .run
                         : finStages.contains(st.key) ? .finisher : .inactive
-                    StageView(index: i + 1, info: st, role: role, twoUp: twoUp,
+                    StageView(info: st, role: role, twoUp: twoUp,
                               episode: episodeLabel(role, stageKey: st.key))
                     if i < stages.count - 1 {
                         Image(systemName: "chevron.right").font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -955,7 +955,6 @@ struct PipelineCard: View {
 }
 
 struct StageView: View {
-    let index: Int
     let info: StageInfo
     var role: StageRole = .inactive
     var twoUp: Bool = false            // two stages live at once → inactive cards condense to icons
@@ -991,14 +990,13 @@ struct StageView: View {
                         .foregroundStyle(isActive ? DS.steelBright : Color.labelC)
                     if isActive { PulseDot() }
                     Spacer(minLength: 4)
-                    // top-right: this card's EPISODE while active, else the stage index number
+                    // top-right: this card's EPISODE while active. The step's ORDINAL used
+                    // to sit here when it wasn't — the arrows between the cards already say
+                    // the order (user-dictated 2026-08-22).
                     if isActive, let ep = episode, !ep.isEmpty {
                         Text(ep).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                             .foregroundStyle(DS.steelBright).lineLimit(1)
                             .help("Now in \(info.name): \(ep)")
-                    } else {
-                        Text("\(index)").font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(isActive ? DS.steelBright : DS.steelDim)
                     }
                 }
                 if isActive {
