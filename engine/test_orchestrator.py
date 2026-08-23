@@ -3798,3 +3798,48 @@ class RenderMustMatchTheSource(unittest.TestCase):
         with mock.patch.object(orch, "_nb_frames", return_value=None), \
              mock.patch.object(orch, "combine_winner_path", return_value=None):
             self.assertTrue(orch.render_is_complete(p))
+
+
+class TVIsNotAPrerequisite(unittest.TestCase):
+    """An empty TV section must not stop the run: due movies and the YouTube queue are both
+    selected ahead of the TV rotation, so the pipeline keeps going with no show active at
+    all. Only a genuinely empty everything is a stop (user-dictated 2026-08-23)."""
+
+    def _pick(self, *, movie=None, video=None):
+        import movies as _movies, series as _series, youtube as _yt
+        o = orch.Orchestrator()
+        o._parked, o._refused = set(), set()
+        with mock.patch.object(_series, "get_active_series", return_value=[]), \
+             mock.patch.object(o, "_participants", return_value=[]), \
+             mock.patch.object(_movies, "next_due", return_value=movie), \
+             mock.patch.object(_yt, "next_due", return_value=video), \
+             mock.patch.object(_yt, "locate_priority", return_value=None), \
+             mock.patch.object(o, "_midpipeline_tv", return_value=None):
+            return o._next_episode()
+
+    MOVIE = {"source_name": "m.mkv", "nas_dir": "/Media/Movies", "title": "A Movie"}
+    VIDEO = {"channel": "Chan", "video_path": "/s/Chan/v.mp4", "title": "A Video"}
+
+    def test_a_movie_runs_with_no_show_active(self):
+        p, why = self._pick(movie=self.MOVIE)
+        self.assertEqual(why, "ok")
+        self.assertTrue(p.movie)
+
+    def test_a_video_runs_with_no_show_active(self):
+        p, why = self._pick(video=self.VIDEO)
+        self.assertEqual(why, "ok")
+        self.assertTrue(p.youtube)
+
+    def test_only_a_truly_empty_queue_stops(self):
+        p, why = self._pick()
+        self.assertIsNone(p)
+        self.assertEqual(why, "no-series")
+
+    def test_the_message_does_not_send_you_off_to_add_a_show(self):
+        import inspect
+        # CODE only: the comment above that branch quotes the old wording to explain why it
+        # changed, and a naive source grep would trip over its own documentation.
+        src = "\n".join(l for l in inspect.getsource(orch.Orchestrator._run).splitlines()
+                         if not l.strip().startswith("#"))
+        self.assertNotIn("no series selected", src)
+        self.assertIn("add a TV show, a movie", src)

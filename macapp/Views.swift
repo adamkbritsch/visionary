@@ -1201,9 +1201,19 @@ struct StageView: View {
                         // aligned against, while letting the glyph sit immediately beside
                         // the word instead of floating in a 30pt box.
                         Spacer(minLength: 0)
-                        HStack(spacing: 7) {
-                            icon.frame(height: 30)
-                            title
+                        // When the live card expands it takes width from these, and a name
+                        // like DOWNLOAD then wraps to two lines. Rather than wrap, the card
+                        // drops to the glyph alone — the layout decides that per card, so it
+                        // holds for any squeeze, not just a hover (user-dictated
+                        // 2026-08-23). fixedSize on the title is what makes the measurement
+                        // honest: without it the text would "fit" by wrapping, which is the
+                        // outcome being avoided.
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 7) {
+                                icon.frame(height: 30)
+                                title.fixedSize(horizontal: true, vertical: false)
+                            }
+                            icon.frame(height: 30).help(info.name)
                         }
                         Spacer(minLength: 0)
                     }

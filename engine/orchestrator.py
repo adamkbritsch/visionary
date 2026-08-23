@@ -1955,8 +1955,14 @@ class Orchestrator:
                         self._hold("nas", msg)
                         self._sleep(DRAIN_POLL_SECONDS)
                     elif why == "no-series":
+                        # A TV show is NOT a prerequisite: with none active, selection still
+                        # serves due movies and the YouTube queue (see _next_episode's tail).
+                        # This branch is only reached when there is nothing ANYWHERE, so
+                        # saying "no series selected" sent people off to add a show when a
+                        # movie or a channel would do just as well (user-caught 2026-08-23).
                         self.state["episode"] = None
-                        self._hold("empty", "no series selected")
+                        self._hold("empty", "nothing queued — add a TV show, a movie, "
+                                            "or a YouTube channel")
                         self._sleep(self._retry_seconds())
                     elif self._resolve_deferred or self._gate_deferred:
                         # NOT complete — every remaining item is just held before Resolve by
