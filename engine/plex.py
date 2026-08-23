@@ -412,6 +412,15 @@ if __name__ == "__main__":   # manual check: python3 plex.py "<series dir name>"
 YOUTUBE_SECTION = 10
 
 
+_YT_ID = re.compile(r"\[([0-9A-Za-z_-]{11})\]")   # the [VIDEOID] youtarr embeds in the name
+
+
+def youtube_video_id(path: str) -> str:
+    """The 11-char id from a published YouTube filename, '' when it carries none."""
+    m = _YT_ID.search(os.path.basename(str(path or "")))
+    return m.group(1) if m else ""
+
+
 def channel_of(path: str) -> str:
     """The channel folder from a published YouTube path, '' if the path isn't one."""
     parts = [p for p in str(path or "").replace("\\", "/").split("/") if p]
@@ -421,9 +430,16 @@ def channel_of(path: str) -> str:
     return ""
 
 
-def _set_collection(base, token, rating_key, name, section=YOUTUBE_SECTION, timeout=15) -> bool:
-    q = urllib.parse.urlencode({"type": 1, "id": rating_key,
-                                "collection[0].tag.tag": name, "collection.locked": 1})
+def _set_collection(base, token, rating_key, names, section=YOUTUBE_SECTION, timeout=15) -> bool:
+    """Set the item's collections to exactly `names`. It has to be ONE request: the field is
+    locked, and a second PUT naming one collection REPLACES the first rather than adding to
+    it — which is why a playlist tag cannot simply be applied on top of the channel tag."""
+    if isinstance(names, str):
+        names = [names]
+    fields = {"type": 1, "id": rating_key, "collection.locked": 1}
+    for i, n in enumerate(names):
+        fields["collection[%d].tag.tag" % i] = n
+    q = urllib.parse.urlencode(fields)
     req = urllib.request.Request("%s/library/sections/%s/all?%s" % (base, section, q),
                                  method="PUT", headers={"X-Plex-Token": token})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -431,7 +447,8 @@ def _set_collection(base, token, rating_key, name, section=YOUTUBE_SECTION, time
 
 
 def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
-    """Put every YouTube video in a collection named after its channel.
+    """Put every YouTube video in a collection named after its channel — and, when it came
+    in as an imported PLAYLIST, in one named after that playlist too.
 
     A SWEEP rather than a per-publish call on purpose: Plex only creates the item some time
     after the file lands, so tagging at upload would race the scan and silently miss. This
@@ -448,6 +465,12 @@ def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
                                       timeout=timeout))
         except Exception:
             continue
+        # Loaded ONCE per sweep, not per item: this walks the whole library.
+        try:
+            import youtube
+            playlists = youtube.playlist_title_by_vid()
+        except Exception:
+            playlists = {}                 # no imports book yet — channels only, as before
         out = {"tagged": 0, "already": 0, "skipped": 0, "failed": 0}
         for v in root.findall(".//Video"):
             rk = v.get("ratingKey")
@@ -457,16 +480,24 @@ def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
                 out["failed"] += 1
                 continue
             part = meta.find(".//Part")
-            chan = channel_of(part.get("file") if part is not None else "")
+            path = part.get("file") if part is not None else ""
+            chan = channel_of(path)
             if not chan:
                 out["skipped"] += 1
                 continue
+            # A playlist import ALSO gets a collection of its own. Its videos usually span
+            # several channels, so the channel tag alone scatters a playlist with nothing
+            # recording that they arrived together (user-dictated 2026-08-23).
+            want = [chan]
+            pl = playlists.get(youtube_video_id(path))
+            if pl and pl != chan:
+                want.append(pl)
             have = {c.get("tag") for c in meta.findall(".//Collection")}
-            if chan in have:
+            if set(want) <= have:
                 out["already"] += 1
                 continue
             try:
-                out["tagged" if _set_collection(base, token, rk, chan, section) else "failed"] += 1
+                out["tagged" if _set_collection(base, token, rk, want, section) else "failed"] += 1
             except Exception:
                 out["failed"] += 1
         return out

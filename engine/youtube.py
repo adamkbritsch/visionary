@@ -1233,6 +1233,26 @@ def locate_priority(skip=()) -> dict | None:
 # drop it again; it is never consulted for scheduling.
 
 
+def playlist_title_by_vid() -> dict:
+    """{video id: playlist title} for everything imported as a PLAYLIST.
+
+    Read by the Plex collection sweep so a playlist's videos can be grouped under its own
+    name as well as their channels'. Single-video imports are excluded: they have no title
+    and are not a set. Built from the imports book, which is never pruned — the priority
+    book cannot answer this, because mark_done() drops a video's entry as it finishes.
+    """
+    out = {}
+    for row in _imports():
+        if row.get("kind") != "playlist":
+            continue
+        title = (row.get("title") or "").strip()
+        if not title:
+            continue
+        for vid in (row.get("vids") or []):
+            out[vid] = title
+    return out
+
+
 def _imports() -> list:
     try:
         with open(IMPORTS_FILE) as f:
@@ -1358,6 +1378,7 @@ def import_link(url, choice=None) -> dict:
     done = get_done()
     batch = "imp%d" % int(time.time() * 1000)
     added = 0
+    queued_vids = []
     with _PRIORITY_LOCK:
         book = _priority()
         have = {e.get("vid") for e in book}
@@ -1367,6 +1388,7 @@ def import_link(url, choice=None) -> dict:
             book.append({"vid": vid, "title": None, "sent_at": int(time.time()),
                          "jump": False, "seq": i, "batch": batch})
             have.add(vid)
+            queued_vids.append(vid)
             added += 1
         if added:
             _save_priority(book)
@@ -1377,7 +1399,11 @@ def import_link(url, choice=None) -> dict:
         return {"status": "youtarr-unreachable"}
     with _IMPORTS_LOCK:
         rows = _imports()
+        # `vids` is what lets Plex put a playlist's videos in a collection of their own long
+        # after the fact: mark_done() drops each video's priority entry the moment it
+        # finishes, so the vid -> batch link only survives here. This book is never pruned.
         rows.append({"id": batch, "kind": batch_kind, "title": label, "source_url": src,
+                     "vids": queued_vids,
                      "count": added, "total": total, "added_at": int(time.time())})
         _save_imports(rows)
     return {"status": "queued", "batch": batch, "kind": batch_kind, "title": label,

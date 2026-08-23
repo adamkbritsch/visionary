@@ -98,3 +98,54 @@ class YouTubeChannelCollections(unittest.TestCase):
     def test_no_token_reports_rather_than_guesses(self):
         with mock.patch.object(plex, "plex_token", return_value=""):
             self.assertIn("error", plex.sync_youtube_collections())
+
+
+class PlaylistImportsGetTheirOwnCollection(unittest.TestCase):
+    """A playlist's videos usually span several channels, so tagging by channel alone
+    scattered them with nothing recording that they arrived together (user-dictated
+    2026-08-23). They now carry the playlist's name as well as their channel's."""
+
+    def test_the_id_comes_out_of_the_published_name(self):
+        self.assertEqual(
+            plex.youtube_video_id("/Media/YouTube/DIY Perks/f/DIY Perks - X [Z6z_feacXW8].mp4"),
+            "Z6z_feacXW8")
+
+    def test_a_name_without_an_id_is_empty_not_a_guess(self):
+        self.assertEqual(plex.youtube_video_id("/Media/Movies/Some Movie (2021).mkv"), "")
+        self.assertEqual(plex.youtube_video_id(""), "")
+
+    def test_both_names_go_in_ONE_request(self):
+        # The field is locked, so a second PUT naming one collection REPLACES the first —
+        # applying the playlist tag on top of the channel tag would silently drop the channel.
+        seen = {}
+
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            return Resp()
+
+        with mock.patch.object(plex.urllib.request, "urlopen", side_effect=urlopen):
+            ok = plex._set_collection("http://p:32400", "tok", "3017",
+                                      ["DIY Perks", "Best Builds"])
+        self.assertTrue(ok)
+        self.assertIn("collection%5B0%5D.tag.tag=DIY+Perks", seen["url"])
+        self.assertIn("collection%5B1%5D.tag.tag=Best+Builds", seen["url"])
+        self.assertIn("collection.locked=1", seen["url"])
+
+    def test_a_bare_string_still_works(self):
+        seen = {}
+
+        class Resp:
+            status = 204
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with mock.patch.object(plex.urllib.request, "urlopen",
+                               side_effect=lambda req, timeout=None: (seen.update(url=req.full_url), Resp())[1]):
+            plex._set_collection("http://p:32400", "tok", "1", "Just One")
+        self.assertIn("collection%5B0%5D.tag.tag=Just+One", seen["url"])
+        self.assertNotIn("collection%5B1%5D", seen["url"])

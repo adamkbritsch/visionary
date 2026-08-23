@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -1026,3 +1027,49 @@ class ChannelsMustActuallyTakeTurns(unittest.TestCase):
         youtube.advance_rotation("b")
         youtube.advance_rotation(None)
         self.assertEqual(youtube.get_rotation(), "b")
+
+
+class ImportsRememberWhichVideosTheyContained(unittest.TestCase):
+    """The Plex sweep runs long after a video finishes, and mark_done() drops that video's
+    priority entry as it completes — so the vid -> batch link only survives on the imports
+    book, which is never pruned."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._p = youtube.IMPORTS_FILE
+        youtube.IMPORTS_FILE = os.path.join(self.tmp, "imports.json")
+
+    def tearDown(self):
+        youtube.IMPORTS_FILE = self._p
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, rows):
+        with open(youtube.IMPORTS_FILE, "w") as f:
+            json.dump(rows, f)
+
+    def test_a_playlists_videos_map_to_its_title(self):
+        self._write([{"id": "imp1", "kind": "playlist", "title": "Best Builds",
+                      "vids": ["aaaaaaaaaaa", "bbbbbbbbbbb"]}])
+        self.assertEqual(youtube.playlist_title_by_vid(),
+                         {"aaaaaaaaaaa": "Best Builds", "bbbbbbbbbbb": "Best Builds"})
+
+    def test_a_single_video_import_is_not_a_playlist(self):
+        self._write([{"id": "imp2", "kind": "video", "title": "", "vids": ["ccccccccccc"]}])
+        self.assertEqual(youtube.playlist_title_by_vid(), {})
+
+    def test_an_untitled_playlist_is_skipped_rather_than_named_blank(self):
+        self._write([{"id": "imp3", "kind": "playlist", "title": "  ", "vids": ["ddddddddddd"]}])
+        self.assertEqual(youtube.playlist_title_by_vid(), {})
+
+    def test_a_book_written_before_vids_existed_does_not_crash(self):
+        self._write([{"id": "imp4", "kind": "playlist", "title": "Old One"}])
+        self.assertEqual(youtube.playlist_title_by_vid(), {})
+
+    def test_no_book_at_all_is_empty(self):
+        self.assertEqual(youtube.playlist_title_by_vid(), {})
+
+    def test_import_records_the_vids_it_queued(self):
+        import inspect
+        src = inspect.getsource(youtube)
+        self.assertIn('"vids": queued_vids', src)
+        self.assertIn("queued_vids.append(vid)", src)
