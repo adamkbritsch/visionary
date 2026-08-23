@@ -3577,6 +3577,12 @@ private struct ChannelRow: View {
 // "N YouTube videos" with the first title; expanded it is exactly the same rows with the
 // same per-video controls, so nothing about how they process changes.
 private struct VideoGroupRow: View {
+    // A batch is a SET riding between episodes, not a peer of them, so the whole group —
+    // its header and its videos — sits in from the rows either side (user-dictated
+    // 2026-08-23). The videos are unnumbered, so the ordinal gutter it keeps is empty
+    // space; the indent is what says "these belong together".
+    static let indent: CGFloat = 12
+
     let group: UpNextGroup
     let parent: UpNextView
     @State private var open = false
@@ -3618,6 +3624,7 @@ private struct VideoGroupRow: View {
                 }
             }
         }
+        .padding(.leading, Self.indent)
     }
 }
 
@@ -3669,6 +3676,7 @@ private struct UpNextView: View {
                     if g.isVideoGroup {
                         VideoGroupRow(group: g, parent: self)
                     } else if let it = g.items.first {
+                        let isMovie = it.kind == "movie"
                         HStack(spacing: 8) {
                             // Only episodes carry a number; everything else keeps the
                             // gutter width so the titles stay aligned.
@@ -3678,7 +3686,19 @@ private struct UpNextView: View {
                             row(it)
                             Spacer()
                             controls(it, g.startIndex)
-                        }.font(.system(size: 13))
+                        }
+                        .font(.system(size: 13))
+                        // A movie is the odd one out in a list of episodes — it gets a tint
+                        // rather than another glyph. VERTICAL padding only: the background
+                        // spans the row without moving its content off the left edge the
+                        // episodes share (user-dictated 2026-08-23).
+                        .padding(.vertical, isMovie ? 3 : 0)
+                        .background {
+                            if isMovie {
+                                RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous)
+                                    .fill(Color.white.opacity(0.05))
+                            }
+                        }
                     }
                 }
                 if items.contains(where: { $0.kind == "movie" }) {
