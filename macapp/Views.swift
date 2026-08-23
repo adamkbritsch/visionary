@@ -966,6 +966,21 @@ struct StageView: View {
     @EnvironmentObject var store: AppStore
     var isActive: Bool { role != .inactive }
     var condensed: Bool { role == .inactive && twoUp }
+
+    /// Shared by both layouts below, so the running and idle cards can't drift apart.
+    private var icon: some View {
+        Image(systemName: info.symbol).font(.system(size: 14, weight: .medium))
+            .foregroundStyle(isActive ? DS.steelBright : DS.steelDim)
+    }
+
+    /// The step TITLE — uppercased and two points down from the rest of the card, so the
+    /// name reads as a label rather than competing with the episode and the `how` line
+    /// beneath it. A step that isn't running also sits back a little.
+    private var title: some View {
+        Text(info.name.uppercased())
+            .font(.system(size: isActive ? 13 : 11, weight: .bold))
+            .foregroundStyle(isActive ? DS.steelBright : Color.labelC.opacity(0.6))
+    }
     var body: some View {
         if condensed {
             // Just the icon — two stages need the room. Name/desc live in the tooltip.
@@ -983,31 +998,33 @@ struct StageView: View {
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 9) {
-                    Image(systemName: info.symbol).font(.system(size: 14, weight: .medium))
-                        .frame(width: 30, height: 30)
-                        .foregroundStyle(isActive ? DS.steelBright : DS.steelDim)
-                    // A step that ISN'T running has nothing else on its row — no pulse, no
-                    // episode — so its title centres in the space between the icon and the
-                    // card's right edge instead of hugging the icon with a wide gap after it
-                    // (user-dictated 2026-08-23). The running step keeps its title left,
-                    // where the pulse and the episode follow it.
-                    if !isActive { Spacer(minLength: 0) }
-                    // The step TITLE only — uppercased and two points down from the rest of
-                    // the card, so the name reads as a label rather than competing with the
-                    // episode and the `how` line beneath it (user-dictated 2026-08-22).
-                    Text(info.name.uppercased())
-                        .font(.system(size: isActive ? 13 : 11, weight: .bold))
-                        // a step that isn't running sits back a little (user-dictated)
-                        .foregroundStyle(isActive ? DS.steelBright : Color.labelC.opacity(0.6))
-                    if isActive { PulseDot() }
-                    Spacer(minLength: 4)
-                    // top-right: this card's EPISODE while active. The step's ORDINAL used
-                    // to sit here when it wasn't — the arrows between the cards already say
-                    // the order (user-dictated 2026-08-22).
-                    if isActive, let ep = episode, !ep.isEmpty {
-                        Text(ep).font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                            .foregroundStyle(DS.steelBright).lineLimit(1)
-                            .help("Now in \(info.name): \(ep)")
+                    if isActive {
+                        icon.frame(width: 30, height: 30)
+                        title
+                        PulseDot()
+                        Spacer(minLength: 4)
+                        // top-right: this card's EPISODE while active. The step's ORDINAL
+                        // used to sit here when it wasn't — the arrows between the cards
+                        // already say the order (user-dictated 2026-08-22).
+                        if let ep = episode, !ep.isEmpty {
+                            Text(ep).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                                .foregroundStyle(DS.steelBright).lineLimit(1)
+                                .help("Now in \(info.name): \(ep)")
+                        }
+                    } else {
+                        // A step that ISN'T running has nothing else on its row — no pulse,
+                        // no episode — so the icon and the name travel together as one unit
+                        // and that PAIR centres in the card (user-dictated 2026-08-23).
+                        // Height-only frame on the icon: it keeps the row exactly as tall as
+                        // the running card's, which is what the chevrons between cards are
+                        // aligned against, while letting the glyph sit immediately beside
+                        // the word instead of floating in a 30pt box.
+                        Spacer(minLength: 0)
+                        HStack(spacing: 7) {
+                            icon.frame(height: 30)
+                            title
+                        }
+                        Spacer(minLength: 0)
                     }
                 }
                 if isActive {
