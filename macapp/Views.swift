@@ -373,22 +373,22 @@ struct HeaderBar: View {
             }
             Spacer()
             PowerPill()
-            Button(action: { store.showSettings.toggle() }) {
-                // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
-                // giving it a button chrome made it compete with Activate. Screen Control lives
-                // inside the popup now, so the gear carries its one at-a-glance signal: it goes
-                // red while the pipeline is holding off the screen, since that state pauses
-                // Resolve and is easy to forget about.
-                Image(systemName: "gearshape.fill")
+            Button(action: {
+                // The working folder, straight to Finder. Same bare-glyph treatment as the
+                // gear and the archive — a way OUT of the app, never an action on this bar.
+                // Reads the live scratch path so it follows a moved scratch, and falls back
+                // to the default only when the state has not arrived yet.
+                let path = store.state?.scratch?.path
+                    ?? NSString(string: "~/topaz-scratch").expandingTildeInPath
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+            }) {
+                Image(systemName: "folder.fill")
                     .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(store.quietMode ? DS.quietRedLight : DS.steel)
-                    .contentShape(Rectangle())           // keep the whole glyph box clickable
+                    .foregroundStyle(DS.steel)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Settings")
-            .popover(isPresented: $store.showSettings, arrowEdge: .bottom) {
-                SettingsPopover().environmentObject(store)
-            }
+            .help("Open the working folder in Finder")
             Button(action: {
                 // Load BEFORE presenting. A popover measures its content ONCE, as it opens —
                 // with the list still empty it sized itself to the placeholder, and the rows
@@ -409,22 +409,22 @@ struct HeaderBar: View {
             .popover(isPresented: $store.showHistory, arrowEdge: .bottom) {
                 HistoryPopover().environmentObject(store)
             }
-            Button(action: {
-                // The working folder, straight to Finder. Same bare-glyph treatment as the
-                // gear and the archive — a way OUT of the app, never an action on this bar.
-                // Reads the live scratch path so it follows a moved scratch, and falls back
-                // to the default only when the state has not arrived yet.
-                let path = store.state?.scratch?.path
-                    ?? NSString(string: "~/topaz-scratch").expandingTildeInPath
-                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
-            }) {
-                Image(systemName: "folder.fill")
+            Button(action: { store.showSettings.toggle() }) {
+                // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
+                // giving it a button chrome made it compete with Activate. Screen Control lives
+                // inside the popup now, so the gear carries its one at-a-glance signal: it goes
+                // red while the pipeline is holding off the screen, since that state pauses
+                // Resolve and is easy to forget about.
+                Image(systemName: "gearshape.fill")
                     .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(DS.steel)
-                    .contentShape(Rectangle())
+                    .foregroundStyle(store.quietMode ? DS.quietRedLight : DS.steel)
+                    .contentShape(Rectangle())           // keep the whole glyph box clickable
             }
             .buttonStyle(.plain)
-            .help("Open the working folder in Finder")
+            .help("Settings")
+            .popover(isPresented: $store.showSettings, arrowEdge: .bottom) {
+                SettingsPopover().environmentObject(store)
+            }
             Button(action: { Task { await store.toggleAutomation() } }) {
                 HStack(spacing: 7) {
                     // APPLIANCE toggle: Activate arms the standing mode (the engine then runs
@@ -867,7 +867,7 @@ struct PipelineCard: View {
         // The current-episode name MOVES into each active card's top-right (below). The header
         // hint is only the idle next-up preview now — nil while anything is processing.
         let headerHint: String? = (runStage != nil || !finStages.isEmpty) ? nil : nowProcessing
-        Card(title: "The pipeline", systemImage: "arrow.triangle.branch", hint: headerHint,
+        Card(title: "Pipeline", hint: headerHint,
              accessory: skippable ? AnyView(
                 Button { confirmingSkip = true } label: {
                     Label("Skip", systemImage: "forward.end")
@@ -1094,9 +1094,28 @@ struct StageView: View {
                                                       Double(bytes) / 1e9))
                 }
                 if !dest.isEmpty { detailRow("arrow.right.circle", dest) }
+                // THE CURRENT SEGMENT'S COUNTDOWN, ungated. The card's own line hides it
+                // until the segment's projected total passes 'seg_eta_after_minutes', so a
+                // short segment shows nothing — worth suppressing on a card you glance at,
+                // but the whole point of opening this one is to ask (user-dictated
+                // 2026-08-23). Run-thread only: a finisher lane reports no per-segment eta.
+                if role == .run, let pr = store.state?.orchestrator?.progress,
+                   pr.stage == info.key, let e = pr.seg_eta_secs, e > 0,
+                   let d = pr.seg_done, let t = pr.seg_total, t > 0 {
+                    detailRow("timer", "segment \(min(d + 1, t))/\(t) · \(shortEta(e)) left")
+                }
             }
             .transition(.opacity.combined(with: .move(edge: .top)))
         }
+    }
+
+    /// "~45s" / "~7 min" / "~1h 12m". StageProgress has its own etaSuffix, but that is a
+    /// method on that view — this is the same shape without reaching across for it.
+    private func shortEta(_ secs: Double) -> String {
+        let t = Int(secs.rounded())
+        if t < 90 { return "~\(t)s" }
+        if t < 5400 { return "~\(Int((secs / 60).rounded())) min" }
+        return "~\(t / 3600)h \((t % 3600) / 60)m"
     }
 
     @ViewBuilder private func detailRow(_ symbol: String, _ text: String,
