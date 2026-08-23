@@ -983,7 +983,11 @@ struct StageView: View {
                         .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
                             .fill(Color.white.opacity(isActive ? 0.10 : 0.05)))
                         .foregroundStyle(isActive ? DS.steelBright : DS.steelDim)
-                    Text(info.name).font(.system(size: isActive ? 15 : 13, weight: .semibold))
+                    // The step TITLE only — uppercased and two points down from the rest of
+                    // the card, so the name reads as a label rather than competing with the
+                    // episode and the `how` line beneath it (user-dictated 2026-08-22).
+                    Text(info.name.uppercased())
+                        .font(.system(size: isActive ? 13 : 11, weight: .semibold))
                         .foregroundStyle(isActive ? DS.steelBright : Color.labelC)
                     if isActive { PulseDot() }
                     Spacer(minLength: 4)
