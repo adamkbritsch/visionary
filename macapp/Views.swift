@@ -983,6 +983,61 @@ struct StageView: View {
     var isActive: Bool { role != .inactive }
     var condensed: Bool { role == .inactive && twoUp }
 
+    @State private var hovering = false
+
+    /// WHAT THIS STEP IS ACTUALLY TOUCHING, revealed on hover. The card already says how far
+    /// along it is; this says what "it" IS — the working file, what it currently weighs on
+    /// the scratch, and where it is bound. Files are grouped by the SAME stem rule the
+    /// Scratch contents card uses (ScratchContentsCard.stem), so the two can never disagree
+    /// about which files belong to an item.
+    @ViewBuilder private var liveDetail: some View {
+        let cur = store.state?.orchestrator?.current
+        let fin: FinishingDTO? = role == .finisher
+            ? [store.state?.orchestrator?.finishing, store.state?.orchestrator?.finishing2]
+                .compactMap({ $0 }).first(where: { $0.stage == info.key })
+            : nil
+        // the finisher lane names its own source; the run thread's item comes from `current`
+        let file = fin?.source ?? cur?.source_name ?? cur?.name ?? cur?.title ?? ""
+        // Where it is bound. An episode's `series` IS its NAS folder and a video has its
+        // channel, but a MOVIE carries neither — its folder lives on the queue entry, so it
+        // is looked up by name there rather than left blank.
+        let dest: String = {
+            if let d = fin?.series ?? cur?.series ?? cur?.channel, !d.isEmpty { return d }
+            let key = cur?.name ?? cur?.source_name ?? ""
+            return (store.state?.movies?.selected?.items ?? [])
+                .first { $0.name == key }?.dir ?? ""
+        }()
+        let bytes: Int = {
+            guard !file.isEmpty else { return 0 }
+            let key = ScratchContentsCard.stem(file)
+            return (store.state?.scratch_contents ?? [])
+                .filter { ScratchContentsCard.stem($0.name ?? "") == key }
+                .reduce(0) { $0 + ($1.bytes ?? 0) }
+        }()
+        if !file.isEmpty {
+            VStack(alignment: .leading, spacing: 5) {
+                Divider().opacity(0.35)
+                detailRow("doc", file)
+                if bytes > 0 {
+                    detailRow("internaldrive", String(format: bytes >= 100_000_000_000
+                                                      ? "%.0f GB on scratch" : "%.1f GB on scratch",
+                                                      Double(bytes) / 1e9))
+                }
+                if !dest.isEmpty { detailRow("arrow.right.circle", dest) }
+            }
+            .transition(.opacity.combined(with: .move(edge: .top)))
+        }
+    }
+
+    private func detailRow(_ symbol: String, _ text: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol).font(.system(size: 9)).foregroundStyle(DS.steelDim)
+                .frame(width: 11)
+            Text(text).font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+        }
+    }
+
     /// Shared by both layouts below, so the running and idle cards can't drift apart.
     private var icon: some View {
         Image(systemName: info.symbol).font(.system(size: 14, weight: .medium))
@@ -1060,12 +1115,22 @@ struct StageView: View {
                         }
                         if role == .finisher { FinisherProgress(stageKey: info.key) }
                         else { StageProgress(stageKey: info.key) }     // reads orchestrator.progress
+                        // HOVER: the card grows in place to say what it is working ON. Only
+                        // while it is live — an idle step has no file to name.
+                        if hovering { liveDetail }
                     }
                 }
             }
             .padding(13)
             .frame(minWidth: isActive ? (twoUp ? 220 : 280) : 90, maxWidth: .infinity, alignment: .topLeading)
             .panel(DS.radiusControl, tint: isActive ? DS.steelBright : nil, inset: !isActive)
+            .onHover { inside in
+                // Only the LIVE card expands: the idle ones are a row of labels and would
+                // just jitter the layout under a passing pointer.
+                guard isActive else { return }
+                hovering = inside
+            }
+            .animation(.easeOut(duration: 0.16), value: hovering)
             .overlay {
                 if isActive {                                   // a quiet steel edge marks the live stage
                     RoundedRectangle(cornerRadius: DS.radiusControl, style: .continuous)
