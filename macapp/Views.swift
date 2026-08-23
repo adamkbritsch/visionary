@@ -1099,28 +1099,9 @@ struct StageView: View {
                                                       Double(bytes) / 1e9))
                 }
                 if !dest.isEmpty { detailRow("arrow.right.circle", dest) }
-                // THE CURRENT SEGMENT'S COUNTDOWN, ungated. The card's own line hides it
-                // until the segment's projected total passes 'seg_eta_after_minutes', so a
-                // short segment shows nothing — worth suppressing on a card you glance at,
-                // but the whole point of opening this one is to ask (user-dictated
-                // 2026-08-23). Run-thread only: a finisher lane reports no per-segment eta.
-                if role == .run, let pr = store.state?.orchestrator?.progress,
-                   pr.stage == info.key, let e = pr.seg_eta_secs, e > 0,
-                   let d = pr.seg_done, let t = pr.seg_total, t > 0 {
-                    detailRow("timer", "segment \(min(d + 1, t))/\(t) · \(shortEta(e)) left")
-                }
             }
             .transition(.opacity.combined(with: .move(edge: .top)))
         }
-    }
-
-    /// "~45s" / "~7 min" / "~1h 12m". StageProgress has its own etaSuffix, but that is a
-    /// method on that view — this is the same shape without reaching across for it.
-    private func shortEta(_ secs: Double) -> String {
-        let t = Int(secs.rounded())
-        if t < 90 { return "~\(t)s" }
-        if t < 5400 { return "~\(Int((secs / 60).rounded())) min" }
-        return "~\(t / 3600)h \((t % 3600) / 60)m"
     }
 
     @ViewBuilder private func detailRow(_ symbol: String, _ text: String,
@@ -1234,7 +1215,10 @@ struct StageView: View {
                             ResolvePreview()
                         }
                         if role == .finisher { FinisherProgress(stageKey: info.key) }
-                        else { StageProgress(stageKey: info.key) }     // reads orchestrator.progress
+                        // `alwaysSegEta` while the card is open: the segment countdown belongs
+                        // in the SAME place it sits when the gate lets it through, not in a
+                        // row of its own further down (user-dictated 2026-08-23).
+                        else { StageProgress(stageKey: info.key, alwaysSegEta: hovering) }
                         // HOVER: the card grows in place to say what it is working ON. Only
                         // while it is live — an idle step has no file to name.
                         if hovering { liveDetail }
@@ -1566,6 +1550,9 @@ private struct LaneProgress: View {
 
 struct StageProgress: View {
     let stageKey: String
+    /// Show the CURRENT segment's countdown whatever 'seg_eta_after_minutes' says — set
+    /// while the step's card is expanded.
+    var alwaysSegEta: Bool = false
     @EnvironmentObject var store: AppStore
     var body: some View {
         let pr = store.state?.orchestrator?.progress
@@ -1598,9 +1585,12 @@ struct StageProgress: View {
                         // on the segment itself rather than an average across segments, and on its
                         // total rather than its remainder, so the number stays put for the whole
                         // segment instead of disappearing right as it counts down to zero.
+                        // ...unless the card is expanded, which is a deliberate ask rather
+                        // than a glance, so the gate is bypassed and the number appears in
+                        // this exact spot.
                         let segGate = Double(store.state?.settings?.seg_eta_after_minutes ?? 15) * 60
                         let segEta: String = {
-                            guard (pr.seg_secs ?? 0) > segGate,
+                            guard alwaysSegEta || (pr.seg_secs ?? 0) > segGate,
                                   let e = pr.seg_eta_secs, e > 0 else { return "" }
                             return etaSuffix(e).replacingOccurrences(of: " left", with: "")
                         }()

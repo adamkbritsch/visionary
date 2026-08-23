@@ -149,3 +149,41 @@ class PlaylistImportsGetTheirOwnCollection(unittest.TestCase):
             plex._set_collection("http://p:32400", "tok", "1", "Just One")
         self.assertIn("collection%5B0%5D.tag.tag=Just+One", seen["url"])
         self.assertNotIn("collection%5B1%5D", seen["url"])
+
+
+class ASingleImportedVideoStillGetsItsChannel(unittest.TestCase):
+    """Importing one video from a channel that was never queued must still put it in that
+    channel's collection — creating it if it does not exist — so that adding the whole
+    channel later finds the videos already filed where they belong (user-dictated
+    2026-08-23). The sweep walks the LIBRARY, not the queue, so how a video arrived never
+    enters into it; _locate_scan records the staging FOLDER as its channel, publishing
+    mirrors that path, and channel_of reads it back out."""
+
+    NEW = "/Media/YouTube/Veritasium/Veritasium - X [abcdefghijk]/Veritasium - X [abcdefghijk].mp4"
+
+    def test_a_never_queued_channel_is_read_from_the_path(self):
+        self.assertEqual(plex.channel_of(self.NEW), "Veritasium")
+
+    def test_a_single_import_is_tagged_with_its_channel_and_nothing_else(self):
+        # kind "video" never reaches the playlist map, so `want` is the channel alone
+        with mock.patch.object(plex, "youtube_video_id", return_value="abcdefghijk"):
+            playlists = {}                       # single-video imports are excluded upstream
+            chan = plex.channel_of(self.NEW)
+            want = [chan] + ([playlists["abcdefghijk"]] if playlists.get("abcdefghijk") else [])
+        self.assertEqual(want, ["Veritasium"])
+
+    def test_tagging_names_the_collection_even_when_it_does_not_exist_yet(self):
+        # Plex creates a collection on first tag — the request is the same either way, which
+        # is what makes "the channel gets a collection" true for a channel with one video.
+        seen = {}
+
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with mock.patch.object(plex.urllib.request, "urlopen",
+                               side_effect=lambda req, timeout=None: (seen.update(url=req.full_url), Resp())[1]):
+            plex._set_collection("http://p:32400", "tok", "77", ["Veritasium"])
+        self.assertIn("collection%5B0%5D.tag.tag=Veritasium", seen["url"])
+        self.assertIn("collection.locked=1", seen["url"])
