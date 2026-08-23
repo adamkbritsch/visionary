@@ -187,3 +187,87 @@ class ASingleImportedVideoStillGetsItsChannel(unittest.TestCase):
             plex._set_collection("http://p:32400", "tok", "77", ["Veritasium"])
         self.assertIn("collection%5B0%5D.tag.tag=Veritasium", seen["url"])
         self.assertIn("collection.locked=1", seen["url"])
+
+
+class APlaylistIsBothItsOwnCollectionAndItsChannels(unittest.TestCase):
+    """A playlist's videos belong in TWO places at once: the playlist, and whichever channel
+    each one came from. Tagging only the playlist would lose the channel grouping the
+    library is otherwise organised by; tagging only the channel is what scattered them in
+    the first place (user-dictated 2026-08-23).
+
+    Drives the real sweep against a fake Plex so the assertion is on the request that would
+    actually go out, not on a re-derivation of the rule.
+    """
+
+    LIB = ('<MediaContainer>'
+           '<Video ratingKey="1"/><Video ratingKey="2"/><Video ratingKey="3"/>'
+           '</MediaContainer>')
+
+    def meta(self, path, collections=()):
+        cols = "".join('<Collection tag="%s"/>' % c for c in collections)
+        return ('<MediaContainer><Video>%s<Media><Part file="%s"/></Media></Video>'
+                '</MediaContainer>' % (cols, path))
+
+    # one playlist, two different channels — plus an unrelated video from a third
+    P1 = "/Media/YouTube/DIY Perks/a [aaaaaaaaaaa]/a [aaaaaaaaaaa].mp4"
+    P2 = "/Media/YouTube/Veritasium/b [bbbbbbbbbbb]/b [bbbbbbbbbbb].mp4"
+    OTHER = "/Media/YouTube/Auto Focus/c [ccccccccccc]/c [ccccccccccc].mp4"
+
+    def _sweep(self, already=()):
+        puts = []
+        paths = {"1": self.P1, "2": self.P2, "3": self.OTHER}
+
+        def get(base, path, token, timeout=20):
+            if path.endswith("/all"):
+                return self.LIB.encode()
+            rk = path.rsplit("/", 1)[-1]
+            return self.meta(paths[rk], already).encode()
+
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def urlopen(req, timeout=None):
+            puts.append(req.full_url)
+            return Resp()
+
+        import youtube
+        with mock.patch.object(plex, "_get", side_effect=get), \
+             mock.patch.object(plex, "plex_token", return_value="tok"), \
+             mock.patch.object(plex, "plex_base_urls", return_value=["http://p:32400"]), \
+             mock.patch.object(youtube, "playlist_title_by_vid",
+                               return_value={"aaaaaaaaaaa": "Best Builds",
+                                             "bbbbbbbbbbb": "Best Builds"}), \
+             mock.patch.object(plex.urllib.request, "urlopen", side_effect=urlopen):
+            res = plex.sync_youtube_collections()
+        return res, puts
+
+    def test_each_playlist_video_gets_its_own_channel_AND_the_playlist(self):
+        res, puts = self._sweep()
+        self.assertEqual(res["tagged"], 3)
+        self.assertIn("collection%5B0%5D.tag.tag=DIY+Perks", puts[0])
+        self.assertIn("collection%5B1%5D.tag.tag=Best+Builds", puts[0])
+        self.assertIn("collection%5B0%5D.tag.tag=Veritasium", puts[1])
+        self.assertIn("collection%5B1%5D.tag.tag=Best+Builds", puts[1])
+
+    def test_the_channel_comes_first_so_it_is_never_the_one_dropped(self):
+        _res, puts = self._sweep()
+        for p in puts[:2]:
+            self.assertLess(p.index("collection%5B0%5D"), p.index("collection%5B1%5D"))
+
+    def test_a_video_outside_the_playlist_is_untouched_by_it(self):
+        _res, puts = self._sweep()
+        self.assertIn("collection%5B0%5D.tag.tag=Auto+Focus", puts[2])
+        self.assertNotIn("Best+Builds", puts[2])
+
+    def test_a_second_sweep_is_a_no_op_once_both_tags_are_on(self):
+        res, puts = self._sweep(already=("DIY Perks", "Veritasium", "Auto Focus", "Best Builds"))
+        self.assertEqual(res["already"], 3)
+        self.assertEqual(puts, [])
+
+    def test_having_only_the_channel_still_triggers_the_playlist_tag(self):
+        # the repair case: videos tagged before playlists existed
+        res, _puts = self._sweep(already=("DIY Perks", "Veritasium", "Auto Focus"))
+        self.assertEqual(res["tagged"], 2)      # the two playlist videos; the third is done
+        self.assertEqual(res["already"], 1)
