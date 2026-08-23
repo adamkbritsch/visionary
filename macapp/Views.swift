@@ -258,6 +258,59 @@ struct Pill: View {
     }
 }
 
+/// A one-line label that CAROUSELS when it does not fit: two copies chase each other past
+/// a gap, so the loop is seamless rather than snapping back at the end. Titles in the
+/// pipeline are episode names and release filenames — routinely longer than the card — and
+/// truncating them hid the part that identifies the item (user-dictated 2026-08-23).
+///
+/// Nothing moves when the text fits, which is the common case; the animation is only ever
+/// attached to a label that actually overflows.
+struct MarqueeText: View {
+    let text: String
+    var size: CGFloat = 11
+    var weight: Font.Weight = .semibold
+    var monospaced: Bool = false
+    var pointsPerSecond: Double = 24
+    var gap: CGFloat = 34
+
+    @State private var textWidth: CGFloat = 0
+    @State private var rolling = false
+
+    private var font: Font {
+        monospaced ? .system(size: size, weight: weight, design: .monospaced)
+                   : .system(size: size, weight: weight)
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let overflows = textWidth > geo.size.width + 0.5
+            HStack(spacing: gap) {
+                label
+                if overflows { label }          // the chaser, so the wrap is seamless
+            }
+            .offset(x: (rolling && overflows) ? -(textWidth + gap) : 0)
+            .animation(overflows
+                       ? .linear(duration: Double(textWidth + gap) / pointsPerSecond)
+                           .repeatForever(autoreverses: false)
+                       : nil,
+                       value: rolling)
+            .frame(width: geo.size.width, alignment: .leading)
+            .clipped()
+            .onAppear { rolling = true }
+        }
+        // GeometryReader would otherwise claim the whole height it is offered.
+        .frame(height: size * 1.35)
+    }
+
+    private var label: some View {
+        Text(text).font(font).fixedSize().lineLimit(1)
+            .background(GeometryReader { t in
+                Color.clear.onAppear { textWidth = t.size.width }
+                    .onChange(of: t.size.width) { textWidth = $0 }
+            })
+    }
+}
+
 struct PulseDot: View {
     var color: Color = DS.steelBright.opacity(DS.dotQuiet)   // matches the header puck's dot
     @State private var on = false
@@ -1017,7 +1070,12 @@ struct StageView: View {
         if !file.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
                 Divider().opacity(0.35)
-                detailRow("doc", file)
+                // What this step DOES — the one thing the live card never showed. There is
+                // room for it once the card widens.
+                Text(info.desc).font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                detailRow("doc", file, marquee: true)
                 if bytes > 0 {
                     detailRow("internaldrive", String(format: bytes >= 100_000_000_000
                                                       ? "%.0f GB on scratch" : "%.1f GB on scratch",
@@ -1029,12 +1087,18 @@ struct StageView: View {
         }
     }
 
-    private func detailRow(_ symbol: String, _ text: String) -> some View {
+    @ViewBuilder private func detailRow(_ symbol: String, _ text: String,
+                                       marquee: Bool = false) -> some View {
         HStack(spacing: 6) {
             Image(systemName: symbol).font(.system(size: 9)).foregroundStyle(DS.steelDim)
                 .frame(width: 11)
-            Text(text).font(.system(size: 10.5, design: .monospaced))
-                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            if marquee {
+                MarqueeText(text: text, size: 10.5, weight: .regular, monospaced: true)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(text).font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
         }
     }
 
@@ -1078,9 +1142,19 @@ struct StageView: View {
                         // used to sit here when it wasn't — the arrows between the cards
                         // already say the order (user-dictated 2026-08-22).
                         if let ep = episode, !ep.isEmpty {
-                            Text(ep).font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                                .foregroundStyle(DS.steelBright).lineLimit(1)
-                                .help("Now in \(info.name): \(ep)")
+                            // A movie or a video title runs far past this corner. ViewThatFits
+                            // keeps a SHORT label its natural size — a marquee here
+                            // unconditionally would park "S05E08" at the left of a fixed box,
+                            // floating away from the card's edge — and only falls through to
+                            // the carousel when the name genuinely does not fit.
+                            ViewThatFits(in: .horizontal) {
+                                Text(ep).font(.system(size: 11, weight: .semibold))
+                                    .monospacedDigit().lineLimit(1)
+                                MarqueeText(text: ep, size: 11, weight: .semibold)
+                            }
+                            .foregroundStyle(DS.steelBright)
+                            .frame(maxWidth: hovering ? 260 : 150, alignment: .trailing)
+                            .help("Now in \(info.name): \(ep)")
                         }
                     } else {
                         // A step that ISN'T running has nothing else on its row — no pulse,
@@ -1122,7 +1196,11 @@ struct StageView: View {
                 }
             }
             .padding(13)
-            .frame(minWidth: isActive ? (twoUp ? 220 : 280) : 90, maxWidth: .infinity, alignment: .topLeading)
+            // HOVER GROWS IT BOTH WAYS. The cards share the row's width, so raising the
+            // live card's minimum takes room from its neighbours and gives the detail
+            // somewhere to sit (user-dictated 2026-08-23).
+            .frame(minWidth: isActive ? (hovering ? (twoUp ? 340 : 440) : (twoUp ? 220 : 280)) : 90,
+                   maxWidth: .infinity, alignment: .topLeading)
             .panel(DS.radiusControl, tint: isActive ? DS.steelBright : nil, inset: !isActive)
             .onHover { inside in
                 // Only the LIVE card expands: the idle ones are a row of labels and would
