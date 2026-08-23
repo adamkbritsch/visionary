@@ -3689,7 +3689,10 @@ private struct UpNextView: View {
         }
     }
     // Monochrome: an item's KIND is its SF symbol + chip shape, not a hue — film = movie,
-    // play.rectangle = youtube (channel chip), mono ep-code chip = episode.
+    // play.rectangle = youtube (channel chip), tv = episode. The episode row used to lead
+    // with its series chip and let the mono ep-code chip stand for the kind; it now carries
+    // the same `tv` glyph the nav bar uses for the TV section, so all three kinds announce
+    // themselves the same way (user-dictated 2026-08-23).
     @ViewBuilder func row(_ it: UpNextDTO) -> some View {
         if it.kind == "movie" {
             Image(systemName: "film").font(.system(size: 11)).foregroundStyle(DS.steel)
@@ -3704,6 +3707,7 @@ private struct UpNextView: View {
             }
             Text(it.title ?? it.name ?? "").fontWeight(.semibold).lineLimit(1)
         } else {
+            Image(systemName: "tv").font(.system(size: 11)).foregroundStyle(DS.steel)
             if showSeries, let sname = it.series, !sname.isEmpty {
                 Text(store.seriesTitle(sname)).font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 6).padding(.vertical, 1)
