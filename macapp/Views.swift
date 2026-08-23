@@ -344,6 +344,22 @@ struct HeaderBar: View {
             .popover(isPresented: $store.showHistory, arrowEdge: .bottom) {
                 HistoryPopover().environmentObject(store)
             }
+            Button(action: {
+                // The working folder, straight to Finder. Same bare-glyph treatment as the
+                // gear and the archive — a way OUT of the app, never an action on this bar.
+                // Reads the live scratch path so it follows a moved scratch, and falls back
+                // to the default only when the state has not arrived yet.
+                let path = store.state?.scratch?.path
+                    ?? NSString(string: "~/topaz-scratch").expandingTildeInPath
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+            }) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(DS.steel)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Open the working folder in Finder")
             Button(action: { Task { await store.toggleAutomation() } }) {
                 HStack(spacing: 7) {
                     // APPLIANCE toggle: Activate arms the standing mode (the engine then runs
@@ -3626,9 +3642,30 @@ private struct QueueCounts: View {
     let q: QueueDTO?
     var body: some View {
         if let q {
-            Pill(systemImage: "tray.full", text: "\(q.remaining_count ?? 0) to upscale", tint: DS.steelDim)
-            Pill(systemImage: "checkmark", text: "\(q.done_count ?? 0) done", tint: DS.steel)
+            // ONE box, split by a hairline — the two halves are the same fact counted from
+            // either end (what is left, what is finished), so they read as a pair rather
+            // than as two unrelated badges (user-dictated 2026-08-23).
+            HStack(spacing: 9) {
+                half("tray.full", "\(q.remaining_count ?? 0) to upscale", DS.steelDim)
+                Rectangle().fill(Color.white.opacity(0.14))
+                    .frame(width: 1, height: 12)
+                half("checkmark", "\(q.done_count ?? 0) done", DS.steel)
+            }
+            .padding(.horizontal, 11).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous)
+                .fill(Color.white.opacity(0.05)))
+            .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous)
+                .strokeBorder(LinearGradient(colors: [.white.opacity(0.18), .white.opacity(0.05)],
+                                             startPoint: .top, endPoint: .bottom), lineWidth: 0.7))
         }
+    }
+
+    private func half(_ symbol: String, _ text: String, _ tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol).font(.system(size: 11))
+            Text(text).font(.system(size: 12, weight: .medium))
+        }
+        .foregroundStyle(tint)
     }
 }
 
