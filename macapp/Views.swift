@@ -382,8 +382,13 @@ struct HeaderBar: View {
                     ?? NSString(string: "~/topaz-scratch").expandingTildeInPath
                 NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
             }) {
+                // 13pt, not the 15 its neighbours use. Measured at 15pt, folder.fill lays
+                // down 220 pt² of ink against the gear's 160 and the clock outline's 109 —
+                // a solid, wide glyph reads far heavier than a circular or stroked one at
+                // the same point size. 13pt puts it at 167 pt², within 4% of the gear, which
+                // is what makes the three look like one set.
                 Image(systemName: "folder.fill")
-                    .font(.system(size: 15, weight: .regular))
+                    .font(.system(size: 13, weight: .regular))
                     .foregroundStyle(DS.steel)
                     .contentShape(Rectangle())
             }
