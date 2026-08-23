@@ -364,7 +364,7 @@ struct HeaderBar: View {
         // it on the lights' visual line. The bottom keeps its full breathing room
         // against the pipeline card.
         .padding(.leading, 84).padding(.trailing, 20)
-        .padding(.top, 2).padding(.bottom, 13)
+        .padding(.top, 2).padding(.bottom, 16)
         .frame(maxWidth: .infinity)
         .background(LinearGradient(colors: [DS.bgTop, DS.bgBase],     // graphite glass bar
                                    startPoint: .top, endPoint: .bottom))
