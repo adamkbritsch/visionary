@@ -4132,7 +4132,13 @@ struct ScratchPowerCard: View {
             VStack(spacing: 0) {
                 KV("Connection", (sc?.connected ?? false) ? "Always mounted" : "Disconnected",
                    color: (sc?.connected ?? false) ? DS.steel : DS.steelBright)
-                KV("Free space", sc?.free_gb.map { "\(Int($0)) GB free" } ?? "—")
+                // TWO numbers, because they answer different questions. What the disk has
+                // right now, with the pipeline's working files still sitting on it; and what
+                // the pipeline actually has to play with, which counts those files as
+                // available since cleanup recycles them at every item. A single line showing
+                // only the second read as more room than the volume really has.
+                KV("On the disk now", sc?.disk_free_gb.map { "\(Int($0)) GB free" } ?? "—")
+                KV("Free once these clear", sc?.free_gb.map { "\(Int($0)) GB" } ?? "—")
                 KV("Power", powerText,
                    color: (p?.adequate ?? false) && (p?.external_connected ?? false) ? DS.steel : DS.steelBright)
                 KV("Battery", "\(p?.capacity ?? 0)%" + ((p?.charging ?? false) ? " (charging)" : ""))

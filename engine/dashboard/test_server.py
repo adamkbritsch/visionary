@@ -1,5 +1,6 @@
 import datetime
 import unittest
+from unittest import mock
 
 import server
 from power import PowerReading
@@ -887,3 +888,29 @@ class ADueMovieOutranksTheBurst(unittest.TestCase):
     def test_the_movie_is_not_emitted_twice(self):
         out = self._run()
         self.assertEqual(sum(1 for o in out if o.get("kind") == "movie"), 1)
+
+
+class ScratchReportsBothFreeNumbers(unittest.TestCase):
+    """Two numbers answering two questions. `free_gb` counts the pipeline's own working files
+    as available — cleanup recycles them at every item — while `disk_free_gb` is what the
+    volume actually reports with those files still on it. Sending only the first read as far
+    more room than the disk has (live: 937 vs 198 GB, a 739 GB working set)."""
+
+    def test_both_are_sent(self):
+        import scratch
+        with mock.patch.object(scratch, "default_scratch", return_value="/s"), \
+             mock.patch.object(scratch, "available_gb", return_value=937), \
+             mock.patch.object(scratch, "physical_free_gb", return_value=198):
+            out = server.collect_scratch()
+        self.assertEqual(out["free_gb"], 937)
+        self.assertEqual(out["disk_free_gb"], 198)
+
+    def test_an_unreadable_disk_sends_nulls_not_zero(self):
+        # zero would read as "the disk is full", which is a very different thing
+        import scratch
+        with mock.patch.object(scratch, "default_scratch", return_value="/s"), \
+             mock.patch.object(scratch, "available_gb", return_value=None), \
+             mock.patch.object(scratch, "physical_free_gb", return_value=None):
+            out = server.collect_scratch()
+        self.assertIsNone(out["free_gb"])
+        self.assertIsNone(out["disk_free_gb"])

@@ -18,7 +18,8 @@ struct ScratchDTO: Codable {
     var name: String?
     var connected: Bool?
     var path: String?
-    var free_gb: Double?
+    var free_gb: Double?         // free + the working files (cleanup recycles them each item)
+    var disk_free_gb: Double?    // what the disk reports right now, those files still on it
     var source: String?
 }
 

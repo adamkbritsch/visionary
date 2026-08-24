@@ -124,8 +124,13 @@ def collect_scratch():
     # Space left for the project = physical free + topaz-scratch's own usage (its recyclable
     # working files), so a partially-filled scratch isn't counted against the pipeline.
     free_gb = scratch.available_gb(path)
+    # BOTH numbers, because they answer different questions. `free_gb` is what the pipeline
+    # has to play with — it counts the working files as available, since cleanup recycles them
+    # every item. `disk_free_gb` is what the DISK says right now, with those files still on it.
+    # One line showing only the first read as more room than the volume actually has.
     return {"name": "Internal SSD", "connected": True, "path": path,
-            "free_gb": free_gb, "source": "internal"}
+            "free_gb": free_gb, "disk_free_gb": scratch.physical_free_gb(path),
+            "source": "internal"}
 
 
 def series_info():
