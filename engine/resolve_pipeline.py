@@ -83,6 +83,14 @@ def target_nits(mode) -> int:
 
 
 DV_PRESET = "OvernightDV"        # global render preset carrying DV Profile 8.1 (survives Resolve quits)
+
+# A CLEANUP GRADE for YouTube, in the same spirit as DV_PRESET: made once by hand in Resolve,
+# inherited here, never authored by the pipeline. YouTube is the one path with nothing between
+# the source and the deliverable — it skips Topaz on purpose, so its VP9/AV1 banding, mosquito
+# noise and block edges ride straight into the master. Deband + a small spatial NR (and a light
+# sharpen to put back the edge NR takes) fixes most of it for a fraction of what an upscale
+# costs. ABSENT = the long-standing behaviour, ungraded; this must never be a requirement.
+CLEANUP_DRX = os.path.expanduser("~/.topaz-pipeline/youtube_cleanup.drx")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import resolve as R  # noqa: E402
 
@@ -616,7 +624,37 @@ def _fps_setting(fr) -> str:
     return str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.3f}"
 
 
-def setup_single(video, mode=MODE_DV2000, superscale=0):
+def apply_cleanup_grade(tl, shots, wanted: bool) -> bool:
+    """Put the saved cleanup grade on every shot. True when it went on.
+
+    Applied AFTER DetectSceneCuts on purpose: the cuts turn one clip into one timeline item
+    per shot, and a grade applied before them lands on the single item that no longer exists.
+    gradeMode 0 = "No keyframes" — this is a static correction, not a timecode-aligned grade.
+
+    BEST-EFFORT BY DESIGN. A missing or unreadable .drx renders the video ungraded, exactly as
+    it did before this existed. Nothing here may fail the stage: it is a nice-to-have on a path
+    whose whole point is being cheap, and parking a video over it would be absurd.
+    """
+    if not wanted:
+        return False
+    if not os.path.exists(CLEANUP_DRX):
+        print(f"[{time.strftime('%H:%M:%S')}] no cleanup grade at {CLEANUP_DRX} — "
+              f"rendering ungraded", flush=True)
+        return False
+    if not shots:
+        return False
+    try:
+        ok = bool(tl.ApplyGradeFromDRX(CLEANUP_DRX, 0, list(shots)))
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] cleanup grade FAILED to apply "
+              f"({e.__class__.__name__}: {e}) — rendering ungraded", flush=True)
+        return False
+    print(f"[{time.strftime('%H:%M:%S')}] cleanup grade applied={ok} to {len(shots)} shot(s) "
+          f"from {os.path.basename(CLEANUP_DRX)}", flush=True)
+    return ok
+
+
+def setup_single(video, mode=MODE_DV2000, superscale=0, cleanup=False):
     """Single-file variant of setup() for the HIGH-BITRATE 4K FAST PATH: the ORIGINAL source
     goes on the timeline as ONE clip (no topaz segments exist — the source picture is the
     deliverable; Resolve runs only to produce the DV analysis/conversion). Same persistent
@@ -718,6 +756,7 @@ def setup_single(video, mode=MODE_DV2000, superscale=0):
     shots = tl.GetItemListInTrack("video", 1)
     print(f"[{time.strftime('%H:%M:%S')}] DetectSceneCuts={ok} ({(time.time()-t)/60:.1f}min) "
           f"shots={len(shots) if shots else 0}", flush=True)
+    apply_cleanup_grade(tl, shots, cleanup)     # AFTER the cuts: every shot is its own item
     try:                        # step COMPLETE → durable: a killed pass resumes past it
         frames = tl.GetEndFrame() - tl.GetStartFrame() + 1
         _resume_put(video, mode, ident=_src_ident(video), frames=int(frames),
@@ -728,10 +767,10 @@ def setup_single(video, mode=MODE_DV2000, superscale=0):
     return 0
 
 
-def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0):
+def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0, cleanup=False):
     """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
     (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
-    rc = setup_single(video, mode, superscale)
+    rc = setup_single(video, mode, superscale, cleanup=cleanup)
     if rc != 0:
         return rc
     if not is_dv_mode(mode):
@@ -840,9 +879,13 @@ if __name__ == "__main__":
                              int(a[3]) if len(a) > 3 else 60000))
         # 6th positional (index 5) = SuperScale factor for single mode; "-" = none.
         _ss = a[5] if len(a) > 5 else "-"
+        # 7th (index 6) = apply the YouTube cleanup grade; "-"/absent = no. APPENDED, never
+        # inserted: an older stages.py simply omits it and gets the old behaviour.
+        _cl = a[6] if len(a) > 6 else "-"
         sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else MODE_DV2000,
                         int(a[3]) if len(a) > 3 else 60000,
-                        superscale=int(_ss) if _ss.isdigit() else 0))
+                        superscale=int(_ss) if _ss.isdigit() else 0,
+                        cleanup=(_cl == "1")))
     else:
         print("usage: resolve_pipeline.py setup <src> [mode] | render <out> [mode] [kbps] "
               "| episode <prores> <out> [mode] [kbps] | single <video> <out> [mode] [kbps]")

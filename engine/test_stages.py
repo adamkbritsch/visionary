@@ -7,6 +7,7 @@ import audiogain
 import history
 import stages
 from orchestrator import episode_paths
+from orchestrator import youtube_paths as orch_youtube_paths
 
 
 def _paths(scratch):
@@ -1105,16 +1106,18 @@ class YouTubeSkipsTopaz(unittest.TestCase):
         self.assertIn("single", cmd)              # no Topaz segdir — single-clip mode
         self.assertIn(p.source_cfr, cmd)          # the TRUE-CFR file, not the raw source
         self.assertNotIn(p.segdir, cmd)
-        self.assertEqual(cmd[-1], "2")            # SuperScale 2x
+        # index 8, NOT [-1]: the cleanup flag is appended after it, and indexing from the
+        # end silently followed every future argument added to the tail.
+        self.assertEqual(cmd[8], "2")             # SuperScale 2x
 
     def test_720p_youtube_scales_plainly(self):
         cmd, _p = self._resolve_cmd(720)
         self.assertIn("single", cmd)
-        self.assertEqual(cmd[-1], "-")            # no SuperScale below ~1080p
+        self.assertEqual(cmd[8], "-")             # no SuperScale below ~1080p
 
     def test_4k_youtube_no_superscale(self):
         cmd, _p = self._resolve_cmd(2160)
-        self.assertEqual(cmd[-1], "-")
+        self.assertEqual(cmd[8], "-")
 
     def test_tv_episode_keeps_the_topaz_path(self):
         import plan, preflight, settings
@@ -2134,3 +2137,54 @@ class ResolveRendersTheFileTheGatesMeasure(unittest.TestCase):
         open(p.source_cfr, "w").close()
         self.assertFalse(p.combine)
         self.assertEqual(stages.resolve_input(p), p.source_cfr)
+
+
+class TheCleanupFlagReachesResolve(unittest.TestCase):
+    """Only a YouTube item, only with the setting on, and only once a grade actually exists."""
+
+    def _argv(self, *, youtube, setting=True, drx=True):
+        import plan, preflight, settings as st, stages as S
+        seen = {}
+        tmp = tempfile.mkdtemp()
+        # a REAL file, so nothing has to patch os.path.exists — patching it globally broke
+        # every other existence check in the stage and never reached Popen at all
+        drx_path = os.path.join(tmp, "cleanup.drx")
+        if drx:
+            open(drx_path, "w").close()
+        p = (_paths(tmp) if not youtube
+             else orch_youtube_paths("Chan", os.path.join(tmp, "v [aaaaaaaaaaa].mp4"), "V",
+                                     scratch_dir=tmp))
+
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+
+        conf = dict(st.DEFAULT_SETTINGS)
+        conf["youtube_cleanup_grade"] = setting
+        with mock.patch.object(plan, "plan_for",
+                               return_value={"topaz": "upscale", "resolve": "add_hdr_dv",
+                                             "input": {"height": 1080}}), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(st, "get_settings", return_value=conf), \
+             mock.patch.object(S, "resolve_pipeline_cleanup_drx", return_value=drx_path), \
+             mock.patch.object(S, "_quit_resolve_focus_app"), \
+             mock.patch.object(S.subprocess, "Popen", side_effect=boom):
+            S.run_stage("resolve", p)
+        return seen["cmd"]
+    def test_a_youtube_item_with_a_saved_grade_asks_for_it(self):
+        self.assertEqual(self._argv(youtube=True)[-1], "1")
+
+    def test_no_saved_grade_means_no(self):
+        self.assertEqual(self._argv(youtube=True, drx=False)[-1], "-")
+
+    def test_the_setting_can_turn_it_off(self):
+        self.assertEqual(self._argv(youtube=True, setting=False)[-1], "-")
+
+    def test_an_episode_never_asks_for_it(self):
+        self.assertEqual(self._argv(youtube=False)[-1], "-")
+
+    def test_it_is_the_LAST_arg_so_older_builds_ignore_it(self):
+        cmd = self._argv(youtube=True)
+        # py, script, phase, in, out, mode, kbps, host, ss, cleanup
+        self.assertEqual(len(cmd), 10)
+        self.assertEqual(cmd[8], "2")          # superscale kept ITS place (1080p -> 2x)

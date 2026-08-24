@@ -1036,6 +1036,11 @@ def _resolve(p, abort, progress=None):
     # sources are routinely VFR, and the render-completeness gate counts frames against
     # source_cfr. SuperScale 2x only for ~1080p sources (user-dictated).
     yt = bool(p.youtube)
+    # THE CLEANUP GRADE, for YouTube only. It is the one path with nothing between the source
+    # and the deliverable — it skips Topaz by design, so the source's banding and block noise
+    # scale up 2x and freeze into the master. Off unless the user has actually saved a grade.
+    cleanup = "1" if (yt and _st.get_settings().get("youtube_cleanup_grade", True)
+                      and os.path.exists(resolve_pipeline_cleanup_drx())) else "-"
     single = fast or yt or p.combine
     ss = "-"
     h = 0
@@ -1063,8 +1068,10 @@ def _resolve(p, abort, progress=None):
                (video_in if single else p.segdir), p.dv_render, mode, str(bitrate),
                # 6th arg: the display to drive. "-" = the main display (every older
                # behaviour). 7th: SuperScale factor for single mode ("-" = none).
+               # 8th: apply the YouTube cleanup grade ("1"/"-"). APPENDED, never inserted —
+               # an older resolve_pipeline.py just ignores a trailing arg.
                # Both files deploy together, so argv lockstep is fine.
-               (host.get("key") if host else "-"), ss]
+               (host.get("key") if host else "-"), ss, cleanup]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
@@ -1201,6 +1208,13 @@ def _combine_result(res, real_rpu_donor):
             (real_rpu_donor and ("frame mismatch" in low or "fps mismatch" in low)):
         return False, "permanent: companion is a different cut — " + r
     return False, r
+
+
+def resolve_pipeline_cleanup_drx() -> str:
+    """Where the YouTube cleanup grade lives. Imported lazily: resolve_pipeline pulls in the
+    Resolve scripting module at import time, and this runs inside the orchestrator."""
+    import resolve_pipeline
+    return resolve_pipeline.CLEANUP_DRX
 
 
 def youtube_render_kbps(height) -> int:

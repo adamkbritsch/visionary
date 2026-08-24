@@ -88,6 +88,13 @@ DEFAULT_SETTINGS = {
                                 # integrated LUFS and boosts (never attenuates) to this, limiter at
                                 # -2 dB. MP4/AAC path only (MKV = lossless audio, never transcoded).
                                 # 0 = off. Derived from the Office pilot (-23 LUFS measured).
+    "youtube_cleanup_grade": True,  # Apply the saved cleanup grade to YouTube videos. YouTube is
+                                # the one path with nothing between the source and the deliverable
+                                # (it skips Topaz on purpose), so its VP9/AV1 banding and block noise
+                                # scale up and freeze into the master. Deband + a small spatial NR
+                                # costs a fraction of an upscale. INERT until the grade exists at
+                                # resolve_pipeline.CLEANUP_DRX — made once by hand in Resolve, like
+                                # the DV render preset; on its own this setting changes nothing.
     "max_peak_mbps": 50,        # PEAK BITRATE CAP for every shipped master: the remux stage re-encodes
                                 # the Resolve DV render through x265 with a hard VBV ceiling at this
                                 # rate (dvcap.py). Resolve's VideoToolbox export spikes to ~139 Mbps on

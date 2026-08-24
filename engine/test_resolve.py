@@ -69,7 +69,7 @@ class SuperScaleThreading(unittest.TestCase):
     def test_single_threads_it_through(self):
         import inspect, resolve_pipeline
         src = inspect.getsource(resolve_pipeline.single)
-        self.assertIn("setup_single(video, mode, superscale)", src)
+        self.assertIn("setup_single(video, mode, superscale", src)
 
 
 class RefocusAfterPlacement(unittest.TestCase):
@@ -340,3 +340,75 @@ class TheQueuedJobIsCheckedBeforeRendering(unittest.TestCase):
         src = inspect.getsource(rp.render)
         self.assertIn("except Exception:\n        got_rate = None", src)
         self.assertIn("if want_rate and got_rate", src)
+
+
+class YouTubeCleanupGrade(unittest.TestCase):
+    """YouTube is the one path with nothing between the source and the deliverable — it skips
+    Topaz by design, so the source's VP9/AV1 banding and block noise scale up 2x and freeze
+    into the master. A grade saved once in Resolve (Deband + a small spatial NR) is applied to
+    every shot. Inherited exactly like DV_PRESET: the pipeline never authors it, and its
+    absence is the long-standing ungraded behaviour rather than a failure."""
+
+    def _tl(self, ok=True, boom=False):
+        calls = []
+
+        class TL:
+            def ApplyGradeFromDRX(self, path, mode, items):
+                if boom:
+                    raise RuntimeError("resolve said no")
+                calls.append((path, mode, list(items)))
+                return ok
+        return TL(), calls
+
+    def test_it_is_applied_to_every_shot_with_no_keyframes(self):
+        import resolve_pipeline as rp
+        tl, calls = self._tl()
+        shots = ["a", "b", "c"]
+        with mock.patch.object(rp.os.path, "exists", return_value=True):
+            self.assertTrue(rp.apply_cleanup_grade(tl, shots, True))
+        self.assertEqual(len(calls), 1)
+        path, mode, items = calls[0]
+        self.assertEqual(path, rp.CLEANUP_DRX)
+        self.assertEqual(mode, 0)                 # "No keyframes" — a static correction
+        self.assertEqual(items, shots)            # every shot, not just the first
+
+    def test_a_non_youtube_item_is_never_graded(self):
+        import resolve_pipeline as rp
+        tl, calls = self._tl()
+        with mock.patch.object(rp.os.path, "exists", return_value=True):
+            self.assertFalse(rp.apply_cleanup_grade(tl, ["a"], False))
+        self.assertEqual(calls, [])
+
+    def test_no_saved_grade_means_no_call_and_no_failure(self):
+        import resolve_pipeline as rp
+        tl, calls = self._tl()
+        with mock.patch.object(rp.os.path, "exists", return_value=False):
+            self.assertFalse(rp.apply_cleanup_grade(tl, ["a"], True))
+        self.assertEqual(calls, [])
+
+    def test_resolve_refusing_it_never_raises(self):
+        import resolve_pipeline as rp
+        tl, _ = self._tl(boom=True)
+        with mock.patch.object(rp.os.path, "exists", return_value=True):
+            self.assertFalse(rp.apply_cleanup_grade(tl, ["a"], True))   # swallowed, not raised
+
+    def test_an_empty_shot_list_is_a_no_op(self):
+        import resolve_pipeline as rp
+        tl, calls = self._tl()
+        with mock.patch.object(rp.os.path, "exists", return_value=True):
+            self.assertFalse(rp.apply_cleanup_grade(tl, [], True))
+        self.assertEqual(calls, [])
+
+    def test_it_runs_AFTER_scene_detection(self):
+        # The cuts turn one clip into one item per shot; grading before them lands on an item
+        # that no longer exists.
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp.setup_single)
+        self.assertLess(src.index("DetectSceneCuts"), src.index("apply_cleanup_grade"))
+
+    def test_the_flag_rides_the_argv_tail(self):
+        # APPENDED, never inserted — an older resolve_pipeline.py must just ignore it.
+        import inspect, resolve_pipeline as rp
+        src = inspect.getsource(rp)
+        self.assertIn('_cl = a[6] if len(a) > 6 else "-"', src)
+        self.assertIn('_ss = a[5] if len(a) > 5 else "-"', src)   # superscale kept its index
