@@ -1245,7 +1245,11 @@ struct StageView: View {
                         .strokeBorder(DS.steelBright.opacity(0.35), lineWidth: 1)
                 }
             }
-            .help("\(info.desc)  (\(info.how))")
+            // The LIVE card explains itself: hovering it opens the description and the
+            // `how` line right there, so the tooltip saying the same two things on top of
+            // that is just noise (user-caught 2026-08-24). Empty string = no tooltip, the
+            // same idiom Pill uses. An idle card still gets one — it shows neither.
+            .help(isActive ? "" : "\(info.desc)  (\(info.how))")
             .animation(.easeInOut(duration: 0.22), value: isActive)
         }
     }
