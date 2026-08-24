@@ -15,7 +15,8 @@ import json
 import os
 import re
 
-from transfer import connect as ftp_connect, ftp_listdir, NAS_FTP_MOVIES_ROOT, NAS_FTP_MOVIES_ROOTS
+from transfer import (connect as ftp_connect, ftp_listdir, ftp_listdir_sized,
+                      NAS_FTP_MOVIES_ROOT, NAS_FTP_MOVIES_ROOTS)
 from series import MANIFEST_DIR, _DV_MARK, is_master_name as series_mod_is_master
 
 # Any container ffmpeg can decode is fine — the pipeline re-encodes to a CFR intermediate first.
@@ -90,6 +91,17 @@ def route_hint(tags) -> str:
     return "full upscale ~5× runtime"
 
 
+def _as_bytes(v) -> int:
+    """A listing's size as an int, 0 when it is missing or not a number. 0 means "the server
+    did not say" — the UI shows nothing rather than "0 GB", which would read as a broken file.
+    """
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
 def parse_movies(entries, dv_map=None, watched_map=None) -> list:
     """entries = [{name, dir}] -> [{name, dir, title, has_dv, watched, tags, route}] sorted
     by title. A movie 'has DV' if the NAS-probed dv_map says so, OR the name carries the
@@ -106,6 +118,7 @@ def parse_movies(entries, dv_map=None, watched_map=None) -> list:
             has_dv = has_dv or bool(dv_map.get(n))
         out.append({"name": n, "dir": e["dir"], "title": movie_title(n), "has_dv": has_dv,
                     "watched": bool(watched_map.get(n)) if watched_map else False,
+                    "bytes": _as_bytes(e.get("bytes")),
                     "tags": tags, "route": route_hint(tags)})
     return sorted(out, key=lambda m: m["title"].lower())
 
@@ -114,7 +127,9 @@ def parse_movies(entries, dv_map=None, watched_map=None) -> list:
 
 def _walk_movies(ftp, root) -> list:
     """Video files under the Movies root: flat files AND one level into per-movie subfolders.
-    [{name, dir}] (dir = the file's FTP parent). MLSD types when available, else NLST by ext."""
+    [{name, dir, bytes}] (dir = the file's FTP parent). MLSD types when available, else NLST
+    by ext. `bytes` rides along free — MLSD already carries the size fact and this listing has
+    to happen anyway; 0 means the server did not say, never "empty"."""
     root = root.rstrip("/")
     out = []
     try:
@@ -127,19 +142,23 @@ def _walk_movies(ftp, root) -> list:
                 continue
             t = facts.get("type")
             if t == "file" and _is_movie_video(name):
-                out.append({"name": name, "dir": root})
+                try:
+                    size = int(facts.get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                out.append({"name": name, "dir": root, "bytes": size})
             elif t == "dir":
-                for sub in ftp_listdir(ftp, root + "/" + name):
+                for sub, size in ftp_listdir_sized(ftp, root + "/" + name):
                     if _is_movie_video(sub):
-                        out.append({"name": sub, "dir": root + "/" + name})
+                        out.append({"name": sub, "dir": root + "/" + name, "bytes": size})
     else:                                          # NLST fallback: guess dir-vs-file by ext
-        for name in ftp_listdir(ftp, root):
+        for name, size in ftp_listdir_sized(ftp, root):
             if _is_movie_video(name):
-                out.append({"name": name, "dir": root})
+                out.append({"name": name, "dir": root, "bytes": size})
             elif "." not in name:                  # looks like a folder → look one level in
-                for sub in ftp_listdir(ftp, root + "/" + name):
+                for sub, ssize in ftp_listdir_sized(ftp, root + "/" + name):
                     if _is_movie_video(sub):
-                        out.append({"name": sub, "dir": root + "/" + name})
+                        out.append({"name": sub, "dir": root + "/" + name, "bytes": ssize})
     return out
 
 
@@ -235,7 +254,7 @@ def refresh_library() -> list:
     cmap = companion.counterparts()
     _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
                       "watched": m["watched"], "tags": m["tags"], "route": m["route"],
-                      "has_dv": m["has_dv"],
+                      "has_dv": m["has_dv"], "bytes": m.get("bytes") or 0,
                       # a seedbox copy is KNOWN to exist -> the combine is worth offering on
                       # this row, whatever its resolution
                       "companion": bool((cmap.get(m["name"]) or {}).get("counterpart"))}

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import transfer
 import movies
 
 
@@ -306,3 +307,56 @@ class NameAdvertisedDv(unittest.TestCase):
         ms = movies.parse_movies([{"name": "M (2026) [2160p WEB-DL HDR10 HEVC].mkv",
                                    "dir": "/m"}])
         self.assertFalse(ms[0]["has_dv"])
+
+
+class MovieRowsCarryTheirSize(unittest.TestCase):
+    """The library listing already had the size and threw it away: MLSD carries a `size` fact
+    and ftp_listdir returned names only. It rides along now, so the movies tab can say how big
+    a title is without a second round trip (user-dictated 2026-08-23)."""
+
+    def test_the_size_reaches_the_row(self):
+        rows = movies.parse_movies([{"name": "A (2020) [2160p BluRay HEVC].mkv",
+                                     "dir": "/Media/Movies", "bytes": 18905767804}])
+        self.assertEqual(rows[0]["bytes"], 18905767804)
+
+    def test_a_listing_without_sizes_reads_as_unknown_not_empty(self):
+        # 0 must mean "the server didn't say", and the UI shows nothing rather than "0 GB"
+        rows = movies.parse_movies([{"name": "B (2020).mkv", "dir": "/m"}])
+        self.assertEqual(rows[0]["bytes"], 0)
+
+    def test_a_junk_size_does_not_break_the_listing(self):
+        rows = movies.parse_movies([{"name": "C (2020).mkv", "dir": "/m", "bytes": "big"}])
+        self.assertEqual(rows[0]["bytes"], 0)
+
+
+class SizedListing(unittest.TestCase):
+    """ftp_listdir_sized keeps the MLSD size fact ftp_listdir discards."""
+
+    class FakeFTP:
+        def __init__(self, entries, blow_up=False):
+            self._e, self._boom = entries, blow_up
+        def mlsd(self, path):
+            if self._boom:
+                raise transfer.ftplib.error_perm("no MLSD here")
+            return iter(self._e)
+        def nlst(self, path):
+            return [path + "/" + n for n, _ in self._e if n not in (".", "..")]
+
+    def test_sizes_come_back_with_the_names(self):
+        ftp = self.FakeFTP([("a.mkv", {"type": "file", "size": "123"}),
+                            ("b.mkv", {"type": "file", "size": "456"})])
+        self.assertEqual(transfer.ftp_listdir_sized(ftp, "/m"), [("a.mkv", 123), ("b.mkv", 456)])
+
+    def test_dot_entries_are_skipped(self):
+        ftp = self.FakeFTP([(".", {"type": "cdir"}), ("..", {"type": "pdir"}),
+                            ("a.mkv", {"type": "file", "size": "7"})])
+        self.assertEqual(transfer.ftp_listdir_sized(ftp, "/m"), [("a.mkv", 7)])
+
+    def test_a_missing_or_junk_size_is_zero_not_a_crash(self):
+        ftp = self.FakeFTP([("a.mkv", {"type": "file"}),
+                            ("b.mkv", {"type": "file", "size": "??"})])
+        self.assertEqual(transfer.ftp_listdir_sized(ftp, "/m"), [("a.mkv", 0), ("b.mkv", 0)])
+
+    def test_no_MLSD_falls_back_to_names_with_unknown_sizes(self):
+        ftp = self.FakeFTP([("a.mkv", {}), ("b.mkv", {})], blow_up=True)
+        self.assertEqual(transfer.ftp_listdir_sized(ftp, "/m"), [("a.mkv", 0), ("b.mkv", 0)])

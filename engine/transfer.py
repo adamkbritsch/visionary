@@ -216,6 +216,26 @@ def remote_mtime(ftp, path):
         return None
 
 
+def ftp_listdir_sized(ftp, path) -> list:
+    """[(basename, bytes)] for one FTP dir. MLSD already carries a `size` fact and
+    ftp_listdir throws it away — this keeps it, so a listing that had to happen anyway also
+    answers "how big is it" with no extra round trip. 0 when the server omits the fact or
+    only NLST is available: a missing size must read as unknown, never as an empty file.
+    """
+    try:
+        out = []
+        for name, facts in ftp.mlsd(path):
+            if name in (".", ".."):
+                continue
+            try:
+                out.append((name, int(facts.get("size") or 0)))
+            except (TypeError, ValueError):
+                out.append((name, 0))
+        return out
+    except ftplib.all_errors:
+        return [(n, 0) for n in ftp_listdir(ftp, path)]
+
+
 def ftp_listdir(ftp, path) -> list:
     """Entry basenames in an FTP dir (MLSD preferred, NLST fallback)."""
     try:

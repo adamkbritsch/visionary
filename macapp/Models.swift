@@ -211,6 +211,7 @@ struct MovieItemDTO: Codable, Identifiable {
     var replace_source: Bool?    // per-movie upload policy (keyed by title, like preset)
     var output_mode: String?     // per-movie output range (keyed by title, like preset)
     var output_mode_effective: String?  // auto already resolved against the source range
+    var bytes: Int?        // the file's size on the NAS (0/nil = the listing didn't say)
     var tags: [String]?    // filename-parsed routing tags: 4K/1080p, HDR/DV, codec, REMUX
     var route: String?     // approximate route + duration hint ("fast path ~2.5× runtime")
     var has_dv: Bool?      // already Dolby Vision — badged, combine-only (no plain add)
@@ -219,9 +220,19 @@ struct MovieItemDTO: Codable, Identifiable {
     var combine: Bool?     // queued as a COMPANION COMBINE (best-of merge with a seedbox copy)
     var id: String { name ?? title ?? "" }
 
-    // "4K · HDR · HEVC — fast path ~2.5× runtime" (empty when the name carries no tags)
+    /// "18.9 GB" — empty when the listing carried no size, so an unknown reads as absent
+    /// rather than as "0 GB", which would look like a broken file.
+    var sizeLabel: String {
+        guard let b = bytes, b > 0 else { return "" }
+        let gb = Double(b) / 1e9
+        return gb >= 100 ? String(format: "%.0f GB", gb) : String(format: "%.1f GB", gb)
+    }
+
+    // "4K · HDR · HEVC · 18.9 GB — fast path ~2.5× runtime" (empty when the name carries
+    // no tags and the listing gave no size)
     var pipelineHint: String {
-        let t = (tags ?? []).joined(separator: " · ")
+        let t = ([tags ?? [], [sizeLabel]].flatMap { $0 }).filter { !$0.isEmpty }
+            .joined(separator: " · ")
         let parts = [t, route ?? ""].filter { !$0.isEmpty }
         return parts.joined(separator: " — ")
     }
