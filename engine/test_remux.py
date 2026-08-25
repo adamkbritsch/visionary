@@ -943,3 +943,59 @@ class NormalizeAudioHasToActuallyNormalize(unittest.TestCase):
 
     def test_the_refusal_survives_a_missing_measurement(self):
         self.assertIn("?", remux._unboosted_note(None, -23.8, -16))
+
+
+class AacAtCannotBeTrustedWithExoticLayouts(unittest.TestCase):
+    """AudioToolbox mangles layouts it doesn't handle instead of refusing them: fed the 6.1
+    film audio it returned a file ~8 dB QUIETER than its input at any bitrate, so A.I.'s
+    +8.8 dB boost measured -1.9 after encode and the landing check rightly refused it —
+    twice (isolated 2026-08-24: volume-only +8.4, +limiter +6.1, +aac_at -1.9; the same
+    chain on 5.1 is perfect). Exotic layouts are folded to an EXPLICIT target before the
+    encoder. Explicit, because handing aformat a list and letting ffmpeg negotiate picked
+    MONO for the 6.1 film, whatever the list's order."""
+
+    def _target(self, channels, layout):
+        with mock.patch.object(remux.subprocess, "run",
+                               return_value=mock.Mock(stdout=f"{channels},{layout}\n")):
+            return remux.aac_at_target_layout("/x.mkv")
+
+    def test_the_61_film_folds_to_51(self):
+        self.assertEqual(self._target(7, "6.1(back)"), "5.1")
+
+    def test_71_folds_to_51(self):
+        self.assertEqual(self._target(8, "7.1"), "5.1")
+
+    def test_an_exotic_THREE_channel_folds_to_stereo(self):
+        self.assertEqual(self._target(3, "3.0"), "stereo")
+
+    def test_the_safe_layouts_are_left_alone(self):
+        for ch, lay in ((1, "mono"), (2, "stereo"), (6, "5.1"), (6, "5.1(side)")):
+            self.assertIsNone(self._target(ch, lay), lay)
+
+    def test_an_unreadable_probe_changes_nothing(self):
+        with mock.patch.object(remux.subprocess, "run", side_effect=OSError):
+            self.assertIsNone(remux.aac_at_target_layout("/x.mkv"))
+        self.assertIsNone(remux.aac_at_target_layout(None))
+
+    def test_the_fold_leads_the_chain(self):
+        # downmixing AFTER the limiter measured 4.7 dB worse on the same input
+        with mock.patch.object(remux, "aac_at_target_layout", return_value="5.1"):
+            f = remux.build_audio_boost_filter(8.8, src="/x.mkv")
+        self.assertTrue(f.startswith("aformat=channel_layouts=5.1,volume=8.80dB"))
+        self.assertNotIn("|", f)                  # ONE explicit layout — never a list
+
+    def test_a_safe_source_gets_the_plain_chain(self):
+        with mock.patch.object(remux, "aac_at_target_layout", return_value=None):
+            f = remux.build_audio_boost_filter(8.8, src="/x.mkv")
+        self.assertTrue(f.startswith("volume=8.80dB"))
+        self.assertNotIn("aformat", f)
+
+    def test_every_boost_call_site_names_its_source(self):
+        import inspect, history
+        for mod, fn in ((remux, None), (history, None)):
+            src = open(mod.__file__.replace(".pyc", ".py")).read()
+        r = open(remux.__file__).read()
+        h = open(history.__file__).read()
+        self.assertEqual(r.count("build_audio_boost_filter(gain_db, src="), 3)
+        self.assertEqual(h.count("build_audio_boost_filter(gain, src=work)"), 1)
+        self.assertEqual(h.count("boost_keeping_original_args(gain, keep, src=work)"), 1)

@@ -166,8 +166,48 @@ def boost_gain_db(measured, target, max_gain: float = AUDIO_MAX_GAIN_DB) -> floa
     return round(gain, 2) if gain >= AUDIO_MIN_GAIN_DB else 0.0
 
 
-def build_audio_boost_filter(gain_db: float) -> str:
-    return f"volume={gain_db:.2f}dB,{AUDIO_LIMITER}"
+# Channel layouts aac_at is TRUSTED with. AudioToolbox mangles exotic layouts instead of
+# refusing them: fed 6.1(back) it returns a file ~8 dB QUIETER than its input — at any
+# bitrate — so a +8.8 dB boost measured -1.9 after encode and every landing check rightly
+# refused it (A.I. Artificial Intelligence, isolated 2026-08-24: volume-only +8.4, +limiter
+# +6.1, +aac_at -1.9; the same chain on 5.1 lands perfectly). Anything else is folded to an
+# EXPLICIT safe layout before the encoder sees it: a lossy re-encode is happening
+# regardless, and a correct 5.1 beats a broken 6.1.
+#
+# The target must be a single explicit layout, chosen per source. Handing aformat a LIST and
+# letting ffmpeg negotiate picked MONO for the 6.1 film — whatever the list's order — and
+# the constraint has to sit AHEAD of the boost: downmixing after the limiter measured
+# 4.7 dB worse on the same input.
+AAC_AT_SAFE_LAYOUTS = ("mono", "stereo", "5.1", "5.1(side)")
+
+
+def aac_at_target_layout(src, ffprobe=FFPROBE):
+    """The explicit layout to fold `src`'s first audio track to before aac_at — or None when
+    it is already one the encoder handles (the overwhelmingly common case: nothing moves).
+    Unreadable probes return None too: the old behaviour, never a surprise downmix."""
+    if not src:
+        return None
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a:0",
+                              "-show_entries", "stream=channels,channel_layout",
+                              "-of", "csv=p=0", str(src)],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        parts = (out.splitlines() or [""])[0].split(",")
+        channels = int(parts[0] or 0)
+        layout = parts[1].strip() if len(parts) > 1 else ""
+    except Exception:
+        return None
+    if not channels or layout in AAC_AT_SAFE_LAYOUTS:
+        return None
+    return "5.1" if channels >= 5 else "stereo"
+
+
+def build_audio_boost_filter(gain_db: float, src=None) -> str:
+    """The boost chain. `src` = the file whose audio will be encoded — when its layout is one
+    aac_at mishandles, an explicit downmix is prepended (see aac_at_target_layout)."""
+    fold = aac_at_target_layout(src)
+    prefix = f"aformat=channel_layouts={fold}," if fold else ""
+    return f"{prefix}volume={gain_db:.2f}dB,{AUDIO_LIMITER}"
 
 
 def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
@@ -203,7 +243,7 @@ def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks
         audio = lead_track_disposition_args(n_audio)
     else:
         amaps = ["-map", "0:a"]            # ALL audio tracks from CFR, in their own order
-        audio = (["-filter:a", build_audio_boost_filter(gain_db),
+        audio = (["-filter:a", build_audio_boost_filter(gain_db, src=cfr_source),
                   "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
     subs = (["-map", "1:s?"] if include_subs else [])
     subs_codec = (["-c:s", "mov_text"] if include_subs else [])
@@ -353,7 +393,8 @@ def audio_track_count(path: str, ffprobe=FFPROBE) -> int:
     return len([ln for ln in out.splitlines() if ln.strip()])
 
 
-def boost_keeping_original_args(gain_db: float, n_audio: int, bitrate: str = "384k") -> list:
+def boost_keeping_original_args(gain_db: float, n_audio: int, bitrate: str = "384k",
+                                src=None) -> list:
     """Encoder args for LOSSLESS sources: a boosted lossy copy of the first track leads, and
     every original track rides along untouched behind it, marked non-default.
 
@@ -366,7 +407,7 @@ def boost_keeping_original_args(gain_db: float, n_audio: int, bitrate: str = "38
     Output audio is laid out [boosted, original 0, original 1, ...]; the caller's -map order
     has to match. `-c copy` covers the originals, so only track 0 names an encoder."""
     args = ["-c:a:0", "aac_at", "-b:a:0", bitrate,
-            "-filter:a:0", build_audio_boost_filter(gain_db),
+            "-filter:a:0", build_audio_boost_filter(gain_db, src=src),
             "-metadata:s:a:0", "title=Normalized",
             "-disposition:a:0", "default"]
     # Explicit per-track dispositions rather than a blanket "-disposition:a 0" followed by an
@@ -402,10 +443,10 @@ def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
         boost = lead_track_disposition_args(n_audio)
     elif gain_db > 0 and keep_original_audio > 0:
         amaps = ["-map", "1:a:0", "-map", "1:a"]      # boosted copy first, then the originals
-        boost = boost_keeping_original_args(gain_db, keep_original_audio)
+        boost = boost_keeping_original_args(gain_db, keep_original_audio, src=cfr_source)
     elif gain_db > 0:
         amaps = ["-map", "1:a"]
-        boost = ["-filter:a", build_audio_boost_filter(gain_db),
+        boost = ["-filter:a", build_audio_boost_filter(gain_db, src=cfr_source),
                  "-c:a", "aac_at", "-b:a", "384k"]
     else:
         amaps, boost = ["-map", "1:a"], []

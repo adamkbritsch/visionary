@@ -412,11 +412,11 @@ def _revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
             # ORDER is what puts the normalized track first, which is what players pick.
             maps = ["-map", "0:v", "-map", "0:a:0", "-map", "0:a", "-map", "0:s?",
                     "-map", "0:t?"]
-            enc = remux.boost_keeping_original_args(gain, keep)
+            enc = remux.boost_keeping_original_args(gain, keep, src=work)
         else:
             maps = ["-map", "0"]
             enc = ["-c:a", "aac_at", "-b:a", "384k",
-                   "-filter:a", remux.build_audio_boost_filter(gain)]
+                   "-filter:a", remux.build_audio_boost_filter(gain, src=work)]
         cmd = [remux.FFMPEG, "-hide_banner", "-nostdin", "-y",
                "-progress", "pipe:1", "-nostats", "-i", work,
                *maps, "-c", "copy",                       # keep video + subs bit-exact (DV intact)
