@@ -3028,7 +3028,10 @@ class Orchestrator:
         # in parallel — which is the whole point of having two lanes.
         if self._drain_backlog() >= 2:
             return False
-        return resolve_must_wait(self.state.get("finishing"), self._finish_q.qsize(),
+        # The pure rule holds while a remux is queued — so give it the count of queued items
+        # that actually NEED one. An upload-only item (master already on disk, waiting out a
+        # NAS outage) is no reason to stop the next item's Resolve.
+        return resolve_must_wait(self.state.get("finishing"), self._queued_needing_remux(),
                                  self.state.get("finishing2"),
                                  incoming_fast=incoming_fast, share=self._share_remuxes())
 
@@ -3050,7 +3053,46 @@ class Orchestrator:
         # conversions that free the space.
         if self._drain_backlog() >= 2:
             return False
-        return self._finish_q.qsize() >= 2
+        # Upload-only items don't count: the backlog gate exists so WORKING SETS don't stack,
+        # and an item waiting out a NAS outage holds ~10 GB and no machine time. Counting
+        # them froze download/topaz for as long as the outage lasted.
+        return self._queued_needing_remux() >= 2
+
+    def _queued_needing_remux(self) -> int:
+        """How many queued finisher items still need their REMUX — the count the pacing gates
+        actually care about. An item whose master is already on disk is upload-only work:
+        network I/O, no claim on the machine. Counting those held the NEXT item at the
+        Resolve doorstep whenever an upload was stuck retrying against an unreachable NAS —
+        the stuck item cycled between its lane and the queue, and either state read as "a
+        remux is pending" (user-caught 2026-08-25: Brokeback Mountain retried its upload
+        through a NAS outage while everything behind it froze).
+
+        Unknown counts as needing work — the conservative side for a pacing gate."""
+        with self._finish_q.mutex:                 # snapshot only; probe AFTER releasing
+            items = list(self._finish_q.queue)
+        n = 0
+        for p in items:
+            try:
+                if not stage_done("remux", p):
+                    n += 1
+            except Exception:
+                n += 1
+        return n
+
+    def _nas_unreachable(self) -> bool:
+        """Can the NAS be reached AT ALL right now? Used to tell an environmental upload
+        failure (outage — hold, don't count) from a genuine one (reachable NAS refusing the
+        file — count toward the park). Verified independently of the failure message, which
+        would be brittle to match on."""
+        try:
+            ftp = transfer.connect(timeout=8)
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return True
 
     def _lane2_should_help(self) -> bool:
         """The 2nd remux lane pulls work whenever an item is QUEUED behind a busy primary lane. Any
@@ -3681,6 +3723,17 @@ class Orchestrator:
             if not ok:
                 if self._finish_abort.is_set() or not self._enabled:
                     return                                # stop/pause abort — not an episode failure
+                # AN OUTAGE IS NOT THE ITEM'S FAULT. A finished master failing to upload
+                # because the NAS is unreachable burned a fail count per attempt and parked
+                # in ~10 minutes of network blip (Brokeback Mountain, 2026-08-25) — the run
+                # thread's downloads have had a no-fault "NAS unreachable — retrying" hold
+                # for months; the finisher now gets the same. Verified by probing the NAS,
+                # not by matching the failure message. Genuine refusals still count.
+                if st == "upload" and self._nas_unreachable():
+                    logbook.event(f"{ep_disp}: upload waiting — NAS unreachable "
+                                  f"(not counted against the item)")
+                    time.sleep(30)
+                    return
                 n = self._fail_counts.get(self._skip_key(p), 0) + 1
                 self._fail_counts[self._skip_key(p)] = n
                 if n >= _max_episode_fails():

@@ -50,13 +50,26 @@ def setUpModule():
     # ROTATION_FILE too: _advance_cadence_at_handoff records the channel it just served, so a
     # test handing a video off wrote a fake channel name into the REAL pointer — which then
     # re-ordered all_pending() for everything afterwards, live and in other test modules.
+    # _finish_item probes REAL NAS reachability on a failed upload (the outage/no-fault
+    # hold). In a test that is a live 8-second FTP attempt per failing-upload case — the
+    # suite ran 5x slower with the NAS down. Reachable-by-default keeps every pre-existing
+    # test's semantics (failures count); tests about the outage path mock it per-instance.
+    global _NAS_PATCH
+    _NAS_PATCH = mock.patch.object(orch.Orchestrator, "_nas_unreachable",
+                                   lambda self: False)
+    _NAS_PATCH.start()
     for name, fn in (("QUEUE_FILE", "yt_queue.json"), ("DONE_FILE", "yt_done.json"),
                      ("PRIORITY_FILE", "yt_priority.json"), ("IMPORTS_FILE", "yt_imports.json"),
                      ("ROTATION_FILE", "yt_rotation.json")):
         p = mock.patch.object(_yt, name, _os.path.join(d, fn)); p.start(); _YT_PATCHES.append(p)
 
 
+_NAS_PATCH = None
+
+
 def tearDownModule():
+    if _NAS_PATCH is not None:
+        _NAS_PATCH.stop()
     if _FINISHER_PATCH is not None:
         _FINISHER_PATCH.stop()
     if _REFUSED_PATCH is not None:
@@ -3843,3 +3856,80 @@ class TVIsNotAPrerequisite(unittest.TestCase):
                          if not l.strip().startswith("#"))
         self.assertNotIn("no series selected", src)
         self.assertIn("add a TV show, a movie", src)
+
+
+class StuckUploadsDoNotFreezeThePipeline(unittest.TestCase):
+    """Brokeback Mountain's finished master retried its upload through a NAS outage — and
+    everything behind it froze, because a queued upload-only item read as "a remux is
+    pending" to both pacing gates, and each failed attempt burned a park count until the
+    item parked after ~10 minutes of network blip (user-caught 2026-08-25)."""
+
+    def _paths(self, d, ep="S01E01"):
+        return episode_paths("Show", ep, SRC, scratch_dir=d, nas_tv_root="/Media/TV")
+
+    def test_an_upload_only_item_does_not_hold_the_resolve_doorstep(self):
+        import tempfile
+        o = orch.Orchestrator()
+        o._finish_q.put(self._paths(tempfile.mkdtemp()))
+        with mock.patch.object(orch, "stage_done", return_value=True):    # remux already done
+            self.assertEqual(o._queued_needing_remux(), 0)
+            self.assertFalse(o._resolve_should_hold())
+
+    def test_an_item_still_needing_remux_holds_it_as_before(self):
+        import tempfile
+        o = orch.Orchestrator()
+        o._finish_q.put(self._paths(tempfile.mkdtemp()))
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            self.assertEqual(o._queued_needing_remux(), 1)
+            self.assertTrue(o._resolve_should_hold())
+
+    def test_an_unprobeable_item_counts_as_needing_work(self):
+        import tempfile
+        o = orch.Orchestrator()
+        o._finish_q.put(self._paths(tempfile.mkdtemp()))
+        with mock.patch.object(orch, "stage_done", side_effect=OSError("probe died")):
+            self.assertEqual(o._queued_needing_remux(), 1)
+
+    def test_two_upload_only_items_are_not_a_backlog(self):
+        import tempfile
+        o = orch.Orchestrator()
+        d = tempfile.mkdtemp()
+        o._finish_q.put(self._paths(d, "S01E01"))
+        o._finish_q.put(self._paths(d, "S01E02"))
+        with mock.patch.object(orch, "stage_done", return_value=True):
+            self.assertFalse(o._finisher_backlogged())    # network waiters stack no working sets
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            self.assertTrue(o._finisher_backlogged())     # two REAL remuxes still are one
+
+    def _fail_upload(self, o, p, unreachable):
+        seen = {}
+
+        def run_stage(st, item, abort=None, progress=None):
+            seen["st"] = st
+            return False, "FTP connect/login failed: [Errno 8] nodename nor servname"
+        with mock.patch.object(orch, "stage_done",
+                               side_effect=lambda st, q: st == "remux"), \
+             mock.patch.object(o, "_nas_unreachable", return_value=unreachable), \
+             mock.patch.object(o, "_remux_must_wait", return_value=False), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(orch.time, "sleep"), \
+             mock.patch("plan.plan_for", return_value={"topaz": "upscale"}):
+            o._finish_item(p, run_stage)
+        return seen
+
+    def test_an_outage_failure_is_not_counted_and_never_parks(self):
+        import tempfile
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._paths(tempfile.mkdtemp())
+        for _ in range(8):                        # far past max_episode_fails
+            seen = self._fail_upload(o, p, unreachable=True)
+        self.assertEqual(seen["st"], "upload")
+        self.assertEqual(o._fail_counts, {})
+        self.assertNotIn(o._skip_key(p), o._parked)
+
+    def test_a_genuine_refusal_with_the_nas_UP_still_counts(self):
+        import tempfile
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._paths(tempfile.mkdtemp())
+        self._fail_upload(o, p, unreachable=False)
+        self.assertEqual(o._fail_counts.get(o._skip_key(p)), 1)

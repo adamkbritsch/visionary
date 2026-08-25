@@ -227,6 +227,10 @@ class DrainConvertsEverythingFirst(unittest.TestCase):
         o._drain_backlog = lambda: backlog
         o.state = {"finishing": finishing, "finishing2": finishing2}
         o._finish_q = mock.Mock(qsize=lambda: qsize)
+        # The gates read the queue through _queued_needing_remux now (an upload-only item no
+        # longer counts). These tests model queued items as remux-needing work — which is
+        # what qsize used to mean — so fake that seam directly.
+        o._queued_needing_remux = lambda: qsize
         o._in_finisher = set()
         o._finisher_lock = mock.MagicMock()
         o._finisher_lock.__enter__ = lambda *_a: None
