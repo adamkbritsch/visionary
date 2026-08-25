@@ -885,3 +885,61 @@ class MastersMustBeInterleaved(unittest.TestCase):
         # 8.4 MB was already stalling; 0.03 MB is the fixed mux. The gate has to split them.
         self.assertGreater(remux.MAX_INTERLEAVE_GAP_MB, 0.03)
         self.assertLessEqual(remux.MAX_INTERLEAVE_GAP_MB, 8.4)
+
+
+class NormalizeAudioHasToActuallyNormalize(unittest.TestCase):
+    """A.I. Artificial Intelligence shipped unboosted with normalize-audio ON and a plain AAC
+    track — the case the feature exists for (user-caught 2026-08-24). The boost was computed,
+    applied, measured, and then thrown away because it missed a +/-1.5 window around the
+    target, so the file shipped at its original quiet level: the worst of both outcomes.
+
+    The limiter is why an ordinary, uncapped boost lands short — it pulls peaks down, so a
+    wide-range film mix never reaches the arithmetic prediction. The question is not "did it
+    hit the target" but "is this better than what we started with"."""
+
+    T = -16.0
+
+    def test_a_limiter_shortfall_is_kept(self):
+        # the A.I. shape: boosted well up, still short of target, and plainly better
+        self.assertTrue(remux.landing_ok(-18.5, self.T, 8.0, measured=-24.0))
+
+    def test_a_capped_boost_is_still_kept(self):
+        # the 2026-08-19 case this rule was first widened for
+        self.assertTrue(remux.landing_ok(-18.7, self.T, 12.0, measured=-30.4))
+
+    def test_landing_on_target_is_kept_without_needing_a_before(self):
+        self.assertTrue(remux.landing_ok(-16.2, self.T, 4.0, measured=None))
+
+    def test_a_boost_that_achieved_nothing_is_discarded(self):
+        # 0.2 dB is not worth a lossy re-encode — AUDIO_MIN_GAIN_DB is the same threshold
+        # that decides a boost is worth doing at all
+        self.assertFalse(remux.landing_ok(-23.8, self.T, 8.0, measured=-24.0))
+
+    def test_an_overshoot_past_the_target_is_discarded(self):
+        self.assertFalse(remux.landing_ok(-6.0, self.T, 8.0, measured=-24.0))
+
+    def test_a_pass_that_delivered_almost_none_of_its_gain_is_discarded(self):
+        # asked for +4 and moved 0.5: the limiter shaves the top off a peaky mix, it does not
+        # eat 88% of the gain. That is a broken pass, and a lossy re-encode is too high a
+        # price for 0.5 dB.
+        self.assertFalse(remux.landing_ok(-19.5, self.T, 4.0, measured=-20.0))
+
+    def test_landing_louder_than_the_target_is_never_kept(self):
+        # "closer" is not the whole test — past the target is past it, and that way lies
+        # clipping. -11 against a -16 target is closer than -22 was, and still wrong.
+        self.assertFalse(remux.landing_ok(-11.0, self.T, 6.0, measured=-22.0))
+
+    def test_an_unmeasurable_landing_is_never_shipped(self):
+        self.assertFalse(remux.landing_ok(None, self.T, 8.0, measured=-24.0))
+
+    def test_no_before_and_off_target_stays_strict(self):
+        self.assertFalse(remux.landing_ok(-22.0, self.T, 4.0, measured=None))
+
+    def test_the_refusal_says_what_it_measured(self):
+        note = remux._unboosted_note(-24.0, -23.8, -16)
+        self.assertIn("-24.0", note)
+        self.assertIn("-23.8", note)
+        self.assertIn("-16.0", note)
+
+    def test_the_refusal_survives_a_missing_measurement(self):
+        self.assertIn("?", remux._unboosted_note(None, -23.8, -16))

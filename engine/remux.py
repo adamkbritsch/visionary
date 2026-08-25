@@ -82,6 +82,11 @@ def container_ext(source: str, ffprobe: str = FFPROBE) -> str:
 # it exists to preserve LOSSLESS audio (TrueHD/DTS-HD MA), which we will not transcode.
 AUDIO_MAX_GAIN_DB = 12.0
 AUDIO_MIN_GAIN_DB = 0.5           # under this, not worth a lossy AAC re-encode
+# How much of the REQUESTED gain a pass has to actually deliver to be believed. The alimiter
+# shaves the top off a wide-range film mix, so landing short is normal and expected; landing
+# almost nowhere means the filter did not do its job, and shipping a lossy re-encode for that
+# is a bad trade. Half is generous to the limiter and still catches a broken pass.
+ACHIEVED_FRACTION = 0.5
 AUDIO_LIMITER = "alimiter=limit=0.794:attack=5:release=80:level=false"   # -2 dB ceiling
 
 
@@ -95,21 +100,61 @@ def parse_integrated_lufs(ebur_stderr: str):
     return float(m.group(1)) if m else None
 
 
-def landing_ok(landed, target, gain, measured=None, tol: float = 1.5) -> bool:
-    """Did the boost do what it was TOLD, rather than reach a goal it could not?
+def _unboosted_note(measured, landed, target) -> str:
+    """The remux line when a boost is measured and then declined. Says the NUMBERS: "landing
+    off target" with nothing to check it against is unfalsifiable from the log, and what it
+    measured and where it went is exactly what you want when a file ships quiet."""
+    def db(v):
+        try:
+            return f"{float(v):.1f}"
+        except (TypeError, ValueError):
+            return "?"
+    return (f" · audio unboosted ({db(measured)} → {db(landed)} LUFS, "
+            f"no closer to {db(target)} — kept original)")
 
-    The test used to be "did it land on target", which is unreachable whenever the gain hits
+
+def landing_ok(landed, target, gain, measured=None, tol: float = 1.5) -> bool:
+    """Is the boosted audio BETTER than what we started with?
+
+    That is the whole question, and the previous two answers both got it wrong by asking
+    something narrower.
+
+    First it asked "did it land on target", which is unreachable whenever the gain hits
     AUDIO_MAX_GAIN_DB: a -30 LUFS mix boosted the full +12 lands at -18, misses a +/-1.5
-    window around -16, and the perfectly good result is discarded — so the file ships at -30,
-    the quietest possible outcome (live-caught 2026-08-19 on a film mix under -28 LUFS, which
-    is exactly the case a boost exists for). A CAPPED boost is judged on whether the level
-    moved by the amount asked for; only an uncapped one is expected to hit the target.
+    window around -16, and the good result is discarded — so the file ships at -30, the
+    quietest possible outcome (live-caught 2026-08-19).
+
+    Then it asked "did the level move by the amount asked for" for capped boosts only. That
+    still failed the ordinary case, because the alimiter pulls peaks down and a wide-range
+    film mix therefore lands SHORT of the arithmetic prediction without being capped at all.
+    A.I. Artificial Intelligence shipped unboosted for exactly that reason (user-caught
+    2026-08-24) — with "normalize audio" ON and a plain AAC track, which is the case the
+    feature exists for.
+
+    So: keep the boost when it got CLOSER to the target. On target within `tol` is success;
+    otherwise it has to have closed at least AUDIO_MIN_GAIN_DB of the gap, which is the same
+    threshold that decides a boost was worth doing at all. Anything that landed no nearer —
+    or overshot past the target by more than it started away from it — is not an improvement
+    and the original ships.
     """
     if landed is None:
         return False
-    if gain >= AUDIO_MAX_GAIN_DB and measured is not None:
-        return abs(float(landed) - (float(measured) + float(gain))) <= tol
-    return abs(float(landed) - float(target)) <= tol
+    landed, target = float(landed), float(target)
+    if landed > target + tol:
+        return False                      # LOUDER than asked is not normalising, however
+                                          # much "closer" it is — that way lies clipping
+    if abs(landed - target) <= tol:
+        return True                       # on target: the ordinary success
+    if measured is None:
+        return False                      # nothing to compare against — stay strict
+    measured = float(measured)
+    achieved = landed - measured          # what the pass actually moved it by
+    if achieved < AUDIO_MIN_GAIN_DB:
+        return False                      # it did nothing; not worth a lossy re-encode
+    if gain and achieved < ACHIEVED_FRACTION * float(gain):
+        return False                      # asked for +12 and got +0.5 — that is a broken
+                                          # pass, not a limiter shaving the top off
+    return abs(landed - target) <= abs(measured - target) - AUDIO_MIN_GAIN_DB
 
 
 
@@ -632,7 +677,10 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
-                audio_note = " · audio unboosted (landing off target — kept original)"
+                # SAY THE NUMBERS. "landing off target" with nothing to check it
+                # against is unfalsifiable from the log — the one thing you want
+                # when a file ships quiet is what it measured and where it went.
+                audio_note = _unboosted_note(mkv_measured, landed, audio_target_lufs)
             audio_note += subs_note
         # ---- mux + verify + PEAK GATE, with a tightening ladder on a peak miss ------------------
         # VBV bufsize == maxrate legally allows a 1-second burst past cap × tolerance, and an
@@ -713,7 +761,10 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                         audio_note = (f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
                                       + (" · original lossless kept" if keep else ""))
                         break
-                    audio_note = " · audio unboosted (landing off target — kept original)"
+                    # SAY THE NUMBERS. "landing off target" with nothing to check it
+                    # against is unfalsifiable from the log — the one thing you want
+                    # when a file ships quiet is what it measured and where it went.
+                    audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)
             else:
                 with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
                     mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output),
@@ -945,7 +996,10 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 if landed is not None and abs(landed - want) <= 1.5:
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
-                audio_note = " · audio unboosted (landing off target — kept original)"
+                # SAY THE NUMBERS. "landing off target" with nothing to check it
+                # against is unfalsifiable from the log — the one thing you want
+                # when a file ships quiet is what it measured and where it went.
+                audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)
             audio_note += subs_note
             with _StepWatch(on_step, "muxing the master", output, _fsize(inj_es)), \
                  mp4box_safe_input(inj_es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
@@ -1131,7 +1185,10 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                 if landed is not None and abs(landed - want) <= 1.5:
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
-                audio_note = " · audio unboosted (landing off target — kept original)"
+                # SAY THE NUMBERS. "landing off target" with nothing to check it
+                # against is unfalsifiable from the log — the one thing you want
+                # when a file ships quiet is what it measured and where it went.
+                audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)
             audio_note += subs_note
             with _StepWatch(on_step, "muxing the master", output, _fsize(es)), \
                  mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
