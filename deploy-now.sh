@@ -28,6 +28,25 @@ fi
 echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 APP="$ROOT/Visionary.app"
+
+# THE BUNDLE MUST BE THE THING YOU JUST COMMITTED. build.sh is what rsyncs engine/ into the
+# app; this script only installs whatever the bundle already holds. Committing an engine fix
+# and running deploy-now.sh WITHOUT building deploys the old code — silently, with a DONE at
+# the end and every sign of success. That happened twice on 2026-08-24: two audio-revision
+# fixes sat uncommitted-to-the-bundle while the user ran the feature twice and got the old
+# behaviour both times. Refuse instead of lying about it.
+if [ -d "$ROOT/engine" ] && [ -d "$APP/Contents/Resources/engine" ]; then
+  stale=$(cd "$ROOT/engine" && for p in *.py dashboard/*.py; do
+            b="$APP/Contents/Resources/engine/$p"
+            [ -f "$p" ] || continue
+            if [ ! -f "$b" ] || ! cmp -s "$p" "$b"; then echo "$p"; fi
+          done)
+  if [ -n "$stale" ]; then
+    echo "REFUSING: the app bundle's engine differs from engine/ — run 'bash macapp/build.sh' first." >&2
+    echo "$stale" | sed 's/^/  stale: /' >&2
+    exit 4
+  fi
+fi
 LOG="$ROOT/.deploy-dockbar.log"
 BIN="Visionary.app/Contents/MacOS/Visionary"
 API=http://127.0.0.1:8765
