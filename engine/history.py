@@ -326,7 +326,30 @@ def revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
     Audio only: the video and subtitle streams are stream-copied, so Dolby Vision survives
     untouched and this costs minutes rather than the hours a re-run would. Returns a
     JSON-able status; runs on the caller's thread (the server hands it to a daemon).
+
+    EVERY OUTCOME IS LOGGED. Only success and exceptions used to be, so a revision that
+    declined — already-normalized, landing-off, a failed download — returned its reason to an
+    HTTP caller nobody was reading and left no trace at all. A.I. Artificial Intelligence was
+    put through and silently did nothing (user-caught 2026-08-24); the book still said
+    "downloading" and the log said nothing whatsoever.
     """
+    out = _revise_audio(nas_path, scratch_dir=scratch_dir)
+    status = (out or {}).get("status")
+    if status not in ("ok", None):          # "ok" logs its own line, with the numbers
+        bits = [f"{k}={out[k]}" for k in ("measured", "landed", "target", "detail")
+                if out.get(k) is not None]
+        logbook.event(f"audio revision {status}: {os.path.basename(nas_path)}"
+                      + (" — " + ", ".join(str(b)[:120] for b in bits) if bits else ""))
+        # a stale marker outlives the attempt otherwise, and the row reads as mid-flight
+        # forever (Lost in Translation still says "downloading" from an old one)
+        try:
+            _mark(nas_path, revising_note="")
+        except Exception:
+            pass
+    return out
+
+
+def _revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
     import remux
     import scratch as scratch_mod
     import settings

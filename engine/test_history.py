@@ -288,3 +288,50 @@ class RevisionProgress(unittest.TestCase):
         with mock.patch.object(subprocess, "Popen", return_value=fake):
             history._run_with_progress(["ff"], 0.0, pcts.append)
         self.assertEqual(pcts, [])
+
+
+class EveryRevisionOutcomeIsLogged(unittest.TestCase):
+    """Only success and exceptions were logged, so a revision that DECLINED returned its
+    reason to an HTTP caller nobody reads and left no trace. A.I. Artificial Intelligence was
+    put through and silently did nothing — the book still said "downloading" and the log said
+    nothing at all (user-caught 2026-08-24)."""
+
+    def _run(self, result):
+        import logbook
+        said = []
+        with mock.patch.object(history, "_revise_audio", return_value=result), \
+             mock.patch.object(history, "_mark") as marked, \
+             mock.patch.object(logbook, "event", side_effect=lambda m: said.append(m)):
+            out = history.revise_audio("/Media/Movies/A Film.mkv")
+        return out, said, marked
+
+    def test_a_declined_revision_says_why(self):
+        _out, said, _m = self._run({"status": "already-normalized",
+                                    "measured": -15.2, "target": -16})
+        self.assertEqual(len(said), 1)
+        self.assertIn("already-normalized", said[0])
+        self.assertIn("A Film.mkv", said[0])
+        self.assertIn("-15.2", said[0])
+
+    def test_a_landing_refusal_carries_its_numbers(self):
+        _out, said, _m = self._run({"status": "landing-off", "measured": -24.0,
+                                    "landed": -23.8, "target": -16})
+        self.assertIn("landing-off", said[0])
+        self.assertIn("-23.8", said[0])
+
+    def test_a_declined_revision_clears_the_stale_marker(self):
+        # the row read as mid-flight forever otherwise
+        _out, _said, marked = self._run({"status": "download-failed", "detail": "boom"})
+        marked.assert_called_once()
+        self.assertEqual(marked.call_args.kwargs.get("revising_note"), "")
+
+    def test_success_is_left_to_log_its_own_line(self):
+        _out, said, marked = self._run({"status": "ok", "gain": 6.0,
+                                        "measured": -22.0, "landed": -16.1})
+        self.assertEqual(said, [])            # the inner function already logged it
+        marked.assert_not_called()
+
+    def test_the_result_is_passed_through_untouched(self):
+        out, _said, _m = self._run({"status": "landing-off", "measured": -24.0})
+        self.assertEqual(out["status"], "landing-off")
+        self.assertEqual(out["measured"], -24.0)
