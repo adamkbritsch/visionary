@@ -1073,3 +1073,52 @@ class ImportsRememberWhichVideosTheyContained(unittest.TestCase):
         src = inspect.getsource(youtube)
         self.assertIn('"vids": queued_vids', src)
         self.assertIn("queued_vids.append(vid)", src)
+
+
+class VideoCacheMissesNeverBlockThePoll(unittest.TestCase):
+    """Same live-caught disease as series.cached_queue (2026-08-25): the miss path listed the
+    channel's staging folder over FTP, and queue_view walks EVERY queued channel — so a cold
+    process during a NAS outage hung /api/state on the first poll."""
+
+    def setUp(self):
+        youtube._VIDEO_CACHE.clear()
+        with youtube._VIDEO_WARM_LOCK:
+            youtube._VIDEO_WARMING.clear()
+
+    def test_a_miss_is_instant_and_the_warm_lands_behind(self):
+        import threading, time
+        ev = threading.Event()
+        def slow(folder):
+            ev.wait(0.4)
+            return [{"vid": "aaaaaaaaaaa"}]
+        with mock.patch.object(youtube, "list_video_files", side_effect=slow):
+            t0 = time.time()
+            self.assertEqual(youtube.cached_videos("Chan"), [])
+            self.assertLess(time.time() - t0, 0.05)
+            ev.set(); time.sleep(0.25)
+            self.assertEqual(youtube.cached_videos("Chan"), [{"vid": "aaaaaaaaaaa"}])
+
+    def test_one_warmer_per_folder(self):
+        import threading, time
+        ev, calls = threading.Event(), []
+        with mock.patch.object(youtube, "list_video_files",
+                               side_effect=lambda f: (calls.append(f), ev.wait(0.3), [])[2]):
+            for _ in range(4):
+                youtube.cached_videos("Chan")
+            ev.set(); time.sleep(0.2)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_crashed_warm_releases_its_slot_and_caches_nothing(self):
+        import time
+        with mock.patch.object(youtube, "list_video_files", side_effect=OSError("nas gone")):
+            self.assertEqual(youtube.cached_videos("Chan"), [])
+            time.sleep(0.15)
+        self.assertNotIn("Chan", youtube._VIDEO_CACHE)
+        with youtube._VIDEO_WARM_LOCK:
+            self.assertNotIn("Chan", youtube._VIDEO_WARMING)
+
+    def test_a_warm_cache_is_served_synchronously(self):
+        youtube._VIDEO_CACHE["Chan"] = [{"vid": "x"}]
+        with mock.patch.object(youtube, "list_video_files",
+                               side_effect=AssertionError("must not list")):
+            self.assertEqual(youtube.cached_videos("Chan"), [{"vid": "x"}])

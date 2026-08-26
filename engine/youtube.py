@@ -197,10 +197,41 @@ def video_published(vid) -> int:
     return _published().get(vid, 0)
 
 
+_VIDEO_WARMING = set()
+_VIDEO_WARM_LOCK = threading.Lock()
+
+
 def cached_videos(folder) -> list:
-    if folder and folder not in _VIDEO_CACHE:
-        _VIDEO_CACHE[folder] = list_video_files(folder)
-    return _VIDEO_CACHE.get(folder) or []
+    """POLL-SAFE, like series.cached_queue and for the same live-caught reason (2026-08-25):
+    the miss path listed the channel's staging folder over FTP, so a freshly relaunched app
+    during a NAS outage hung every /api/state poll on socket.create_connection — the state
+    builder walks EVERY queued channel through here via queue_view. A miss now returns []
+    immediately and warms in the background, one warmer per folder; the selection loop's own
+    refresh (_refresh_youtube -> refresh_downloads) still lists live, as it always did."""
+    if not folder:
+        return []
+    got = _VIDEO_CACHE.get(folder)
+    if got is not None:
+        return got
+    with _VIDEO_WARM_LOCK:
+        if folder in _VIDEO_WARMING:
+            return []
+        _VIDEO_WARMING.add(folder)
+
+    def warm():
+        try:
+            r = list_video_files(folder)
+            if r is not None:
+                _VIDEO_CACHE[folder] = r
+        except Exception:
+            pass                            # not cached — the next miss retries
+        finally:
+            with _VIDEO_WARM_LOCK:
+                _VIDEO_WARMING.discard(folder)
+
+    threading.Thread(target=warm, daemon=True,
+                     name="videos-warm-" + str(folder)[:24]).start()
+    return []
 
 
 def refresh_videos(folder) -> list:

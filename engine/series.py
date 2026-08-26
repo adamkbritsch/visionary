@@ -293,18 +293,44 @@ def episode_queue(series, skip=()) -> dict:
 _QUEUE_CACHE = {}
 
 
+_QUEUE_WARMING = set()
+_QUEUE_WARM_LOCK = threading.Lock()
+
+
 def cached_queue(series_name):
-    """The series' queue from cache (no NAS I/O — fast for state polling). Computes +
-    caches on first request. A failed computation (NAS unreadable) is NOT cached — the
-    next call retries instead of serving a phantom empty queue for the rest of the run."""
+    """The series' queue from cache — POLL-SAFE for real now. The docstring always promised
+    "no NAS I/O", but the miss path computed the queue LIVE, and episode_queue is an FTP
+    listing. On a warm process nobody noticed; a freshly relaunched one during a NAS outage
+    hung every /api/state poll inside socket.create_connection for minutes, so the whole app
+    sat on a blank screen for as long as the outage lasted (live-caught 2026-08-25 — the
+    pre-outage process answered fine, which is what hid it: only a COLD cache walks the NAS).
+
+    A miss now returns None immediately and warms in the BACKGROUND, one warmer per series;
+    every caller already tolerates None (`or {}` at each site) and picks the queue up on a
+    later call. A failed computation is still not cached — the next miss retries — and
+    refresh_queue keeps its synchronous behaviour for callers that genuinely want to wait."""
     if not series_name:
         return None
-    if series_name not in _QUEUE_CACHE:
-        q = episode_queue(series_name)
-        if q is None:
-            return None
-        _QUEUE_CACHE[series_name] = q
-    return _QUEUE_CACHE.get(series_name)
+    q = _QUEUE_CACHE.get(series_name)
+    if q is not None:
+        return q
+    with _QUEUE_WARM_LOCK:
+        if series_name in _QUEUE_WARMING:
+            return None                    # a warmer is already on it — never stack them
+        _QUEUE_WARMING.add(series_name)
+
+    def warm():
+        try:
+            r = episode_queue(series_name)
+            if r is not None:
+                _QUEUE_CACHE[series_name] = r
+        finally:
+            with _QUEUE_WARM_LOCK:
+                _QUEUE_WARMING.discard(series_name)
+
+    threading.Thread(target=warm, daemon=True,
+                     name="queue-warm-" + series_name[:24]).start()
+    return None
 
 
 def refresh_queue(series_name):

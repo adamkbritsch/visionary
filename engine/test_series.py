@@ -516,13 +516,78 @@ class UnreachableIsNotEmpty(unittest.TestCase):
                 "remaining_items": [{"ep": "S01E01", "source_name": "x.mkv"}],
                 "remaining": ["S01E01"], "remaining_count": 1, "done_count": 0,
                 "unwatched_count": 1, "featurette_count": 0, "source_count": 1}
+        import time as _t
+
+        def _settled():
+            # a miss WARMS IN THE BACKGROUND now — wait for the warmer to finish before
+            # judging what it did or didn't cache
+            for _ in range(50):
+                with series._QUEUE_WARM_LOCK:
+                    if "Show" not in series._QUEUE_WARMING:
+                        return
+                _t.sleep(0.02)
+
         series._QUEUE_CACHE.pop("Show", None)
         with mock.patch.object(series, "episode_queue", return_value=None):
-            self.assertIsNone(series.cached_queue("Show"))          # not cached
-            self.assertNotIn("Show", series._QUEUE_CACHE)           # ...so it retries later
+            self.assertIsNone(series.cached_queue("Show"))          # the poll never blocks
+            _settled()
+            self.assertNotIn("Show", series._QUEUE_CACHE)           # ...and a failure retries later
         with mock.patch.object(series, "episode_queue", return_value=good):
+            series.cached_queue("Show")                             # kicks the warm
+            _settled()
             self.assertEqual(series.cached_queue("Show"), good)
         with mock.patch.object(series, "episode_queue", return_value=None):
             self.assertEqual(series.refresh_queue("Show"), good)    # keeps the good one
             self.assertEqual(series.cached_queue("Show"), good)
         series._QUEUE_CACHE.pop("Show", None)
+
+
+class StatePollingNeverWalksTheNAS(unittest.TestCase):
+    """cached_queue's docstring always promised "no NAS I/O", but its miss path computed the
+    queue LIVE over FTP. A freshly relaunched app during a NAS outage therefore hung every
+    /api/state poll inside socket.create_connection — blank app for the whole outage
+    (live-caught 2026-08-25). Only a COLD cache walks the NAS, which is what hid it."""
+
+    def setUp(self):
+        series._QUEUE_CACHE.clear()
+        with series._QUEUE_WARM_LOCK:
+            series._QUEUE_WARMING.clear()
+
+    def test_a_miss_returns_immediately_and_warms_behind(self):
+        import threading, time
+        ev = threading.Event()
+        def slow(name):
+            ev.wait(0.5)
+            return {"remaining_items": [1]}
+        with mock.patch.object(series, "episode_queue", side_effect=slow):
+            t0 = time.time()
+            self.assertIsNone(series.cached_queue("Show"))
+            self.assertLess(time.time() - t0, 0.05)     # the poll never blocks
+            ev.set(); time.sleep(0.3)
+            self.assertIsNotNone(series.cached_queue("Show"))
+
+    def test_polls_during_the_warm_do_not_stack_warmers(self):
+        import threading, time
+        ev, calls = threading.Event(), []
+        def slow(name):
+            calls.append(name); ev.wait(0.4)
+            return {}
+        with mock.patch.object(series, "episode_queue", side_effect=slow):
+            for _ in range(5):
+                series.cached_queue("Show")
+            ev.set(); time.sleep(0.2)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failed_warm_is_not_cached_so_the_next_miss_retries(self):
+        import time
+        with mock.patch.object(series, "episode_queue", return_value=None):
+            series.cached_queue("Show"); time.sleep(0.1)
+        self.assertNotIn("Show", series._QUEUE_CACHE)
+        with series._QUEUE_WARM_LOCK:
+            self.assertNotIn("Show", series._QUEUE_WARMING)   # the slot was released
+
+    def test_a_warm_cache_is_served_synchronously_as_before(self):
+        series._QUEUE_CACHE["Show"] = {"remaining_items": [1, 2]}
+        with mock.patch.object(series, "episode_queue",
+                               side_effect=AssertionError("must not compute")):
+            self.assertEqual(series.cached_queue("Show"), {"remaining_items": [1, 2]})
