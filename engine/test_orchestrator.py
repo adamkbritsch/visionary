@@ -3933,3 +3933,81 @@ class StuckUploadsDoNotFreezeThePipeline(unittest.TestCase):
         p = self._paths(tempfile.mkdtemp())
         self._fail_upload(o, p, unreachable=False)
         self.assertEqual(o._fail_counts.get(o._skip_key(p)), 1)
+
+
+class AnOutageNeverDestroysFinishedWork(unittest.TestCase):
+    """Brokeback Mountain, 2026-08-25. Its remux was FINISHED and waiting out a NAS outage
+    when a re-arm cleared its park; the run thread re-picked it, the download stage failed
+    five times on "cannot verify against the NAS", the item parked at download, and the park
+    swept 62 GB — the completed master included. Annie lost 147 GB the same morning. Two
+    rules close it: an unreachable-NAS download failure is held, not counted; and a park
+    never sweeps a finished master."""
+
+    def _paths(self, d):
+        return episode_paths("Show", "S01E01", SRC, scratch_dir=d, nas_tv_root="/Media/TV")
+
+    def test_an_unreachable_download_failure_is_held_not_counted(self):
+        import tempfile
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._paths(tempfile.mkdtemp())
+        o._nas_unreachable = lambda: True      # setUpModule pins the class attr; go per-instance
+        with mock.patch.object(o, "_hold") as held, \
+             mock.patch.object(o, "_sleep"), \
+             mock.patch.object(o, "_park_item") as parked, \
+             mock.patch("stages.run_stage",
+                        return_value=(False, "NAS unreachable — cannot verify")), \
+             mock.patch.object(orch, "stage_done", return_value=False):
+            for _ in range(12):                     # far past max_episode_fails
+                o._process(p)
+        self.assertEqual(o._fail_counts, {})
+        parked.assert_not_called()
+        self.assertIn("nas", [c.args[0] for c in held.call_args_list])
+
+    def test_a_genuine_download_failure_with_the_nas_up_still_counts(self):
+        import tempfile
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._paths(tempfile.mkdtemp())
+        o._nas_unreachable = lambda: False
+        with mock.patch.object(o, "_hold"), \
+             mock.patch.object(o, "_sleep"), \
+             mock.patch("stages.run_stage", return_value=(False, "checksum mismatch")), \
+             mock.patch.object(orch, "stage_done", return_value=False):
+            o._process(p)
+        self.assertEqual(o._fail_counts.get(o._skip_key(p)), 1)
+
+    def test_the_sweep_spares_a_finished_master(self):
+        import tempfile, os as _os
+        o = orch.Orchestrator()
+        d = tempfile.mkdtemp()
+        p = self._paths(d)
+        for f in (p.source, p.source_cfr, p.dv_render, p.final):
+            open(f, "w").write("x" * 2048)
+        _os.makedirs(p.segdir, exist_ok=True)
+        open(_os.path.join(p.segdir, "seg_0000.mov"), "w").write("x")
+        with mock.patch.object(orch, "stage_done",
+                               side_effect=lambda st, q: st == "remux"):
+            o._sweep_parked_files(p, "S01E01")
+        self.assertTrue(_os.path.exists(p.final), "the finished master must survive a park")
+        for f in (p.source, p.source_cfr, p.dv_render):
+            self.assertFalse(_os.path.exists(f), f)     # intermediates still sweep
+        self.assertFalse(_os.path.isdir(p.segdir))
+
+    def test_no_finished_master_means_the_old_sweep_exactly(self):
+        import tempfile, os as _os
+        o = orch.Orchestrator()
+        p = self._paths(tempfile.mkdtemp())
+        for f in (p.source, p.source_cfr, p.final):
+            open(f, "w").write("x")
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            o._sweep_parked_files(p, "S01E01")
+        for f in (p.source, p.source_cfr, p.final):
+            self.assertFalse(_os.path.exists(f), f)     # a half-written final is a leak, not a master
+
+    def test_an_unverifiable_master_falls_back_to_sweeping(self):
+        import tempfile, os as _os
+        o = orch.Orchestrator()
+        p = self._paths(tempfile.mkdtemp())
+        open(p.final, "w").write("x")
+        with mock.patch.object(orch, "stage_done", side_effect=OSError("probe died")):
+            o._sweep_parked_files(p, "S01E01")
+        self.assertFalse(_os.path.exists(p.final))

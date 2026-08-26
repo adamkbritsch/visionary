@@ -2047,7 +2047,24 @@ class Orchestrator:
             if d and os.path.isdir(d):
                 freed += self._dir_gb(d)
                 _shutil.rmtree(d, ignore_errors=True)
+        # A FINISHED MASTER IS NEVER SWEPT. Parking means "skip this for now", and the
+        # master is the deliverable — the one file where hours of topaz, resolve and remux
+        # are already condensed into ~10 GB that stage_done("remux") will simply reuse on
+        # the next attempt. Sweeping it turned a park into "destroy the product": Brokeback
+        # Mountain's completed master was deleted at a park whose failures were a NAS
+        # outage's, not the item's (live-caught 2026-08-25). Intermediates still sweep —
+        # they are the disk-filling leak the sweep exists for.
+        keep = set()
+        try:
+            if stage_done("remux", p):
+                keep.add(p.final)
+                logbook.event(f"parked {ep_disp}: keeping the finished master "
+                              f"({os.path.basename(p.final)}) — only intermediates swept")
+        except Exception:
+            pass                            # unverifiable master -> old behaviour
         for f in p.working_files():
+            if f in keep:
+                continue
             try:
                 if os.path.exists(f):
                     freed += os.path.getsize(f) / (1024 ** 3)
@@ -2938,6 +2955,21 @@ class Orchestrator:
                     # Resolve failed. Retry the same item a few times (fluke window); once confirmed a real
                     # stall, hold it and buffer the next upscales (down to STALL_FLOOR_GB) instead of parking.
                     self._on_resolve_failure(p, ep_disp, msg)
+                    return
+                # AN OUTAGE IS NOT THE ITEM'S FAULT — the run thread's twin of the finisher's
+                # upload rule. A download that fails because the NAS cannot even be REACHED
+                # (including "cannot verify the local source is complete") burned a park
+                # count per attempt; five attempts into today's outage that parked Brokeback
+                # Mountain — whose remux was FINISHED and waiting to upload — and the park
+                # swept 62 GB including the completed master (live-caught 2026-08-25; Annie
+                # lost 147 GB the same morning). Verified by probing the NAS, never by
+                # matching the failure message; a reachable NAS refusing the file is still a
+                # genuine failure and still counts.
+                if st == "download" and self._nas_unreachable():
+                    logbook.event(f"{ep_disp}: download waiting — NAS unreachable "
+                                  f"(not counted against the item)")
+                    self._hold("nas", "NAS unreachable — retrying")
+                    self._sleep(DRAIN_POLL_SECONDS)
                     return
                 n = self._fail_counts.get(self._skip_key(p), 0) + 1
                 self._fail_counts[self._skip_key(p)] = n

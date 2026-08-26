@@ -1949,7 +1949,7 @@ private struct TVMode: View {
                 // search bar disappears and the settings collapse to one line), so the badge
                 // was labelling an absence.
                 if index == 0 && !store.seriesReachable {
-                    Pill(systemImage: "wifi.slash", text: "NAS unreachable", tint: DS.steelBright, iconOnly: true)
+                    Pill(systemImage: "externaldrive.badge.xmark", text: "NAS unreachable", tint: DS.steelBright, iconOnly: true)
                 }
                 Spacer()
                 QueueCounts(q: show.queue)
@@ -2703,7 +2703,7 @@ private struct MovieMode: View {
             }
             HStack(spacing: 12) {
                 if !store.moviesReachable {
-                    Pill(systemImage: "wifi.slash", text: "NAS unreachable", tint: DS.steelBright, iconOnly: true)
+                    Pill(systemImage: "externaldrive.badge.xmark", text: "NAS unreachable", tint: DS.steelBright, iconOnly: true)
                 } else {
                     // the library now lists EVERYTHING (DV titles are combine-only) — the
                     // count that matters is still how many have no DV yet
