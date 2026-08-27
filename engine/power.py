@@ -12,6 +12,8 @@ hard. `normalize_amperage` reinterprets it as signed.
 """
 from __future__ import annotations
 import re
+import json
+import os
 import subprocess
 from dataclasses import dataclass
 
@@ -130,6 +132,38 @@ def adapter_watts():
 # Highest wattage the CURRENTLY-CONNECTED adapter has advertised, and which adapter that was.
 _PEAK = {"family": None, "watts": 0}
 
+# ...and the DURABLE version, per adapter family, surviving relaunches. The in-memory peak
+# assumed the brick would flip back to 140 within one process's lifetime. The UGREEN brick
+# does worse than dip: it can NEGOTIATE 120 W and settle there for the whole session — and
+# every deploy restarts this process, so the 140 it advertised last week is unwitnessable.
+# The user's standing rule (2026-08-22, repeated 2026-08-27): this IS the 140 W charger;
+# count it as one. The book records the best wattage each FAMILY CODE has ever advertised,
+# so a genuinely weaker charger (its own family) still reads as itself — this is identity
+# memory, not a relaxation of the wattage pin.
+PEAKS_FILE = os.path.expanduser("~/.topaz-pipeline/adapter_peaks.json")
+
+
+def _peaks_book() -> dict:
+    try:
+        with open(PEAKS_FILE) as fh:
+            v = json.load(fh)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _remember_peak(family: str, watts: int) -> None:
+    try:
+        book = _peaks_book()
+        if watts > int(book.get(family) or 0):
+            book[family] = watts
+            tmp = PEAKS_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(book, fh)
+            os.replace(tmp, PEAKS_FILE)
+    except Exception:
+        pass                               # the in-memory peak still works this session
+
 
 def reset_adapter_peak() -> None:
     _PEAK.update(family=None, watts=0)
@@ -159,7 +193,10 @@ def adapter_watts_sustained():
         _PEAK.update(family=fam, watts=w)
     elif w > _PEAK["watts"]:
         _PEAK["watts"] = w
-    return _PEAK["watts"]
+    _remember_peak(fam, _PEAK["watts"])
+    # The BOOK can lift a settled reading: this family once advertised more, and the user's
+    # rule is that the adapter's identity decides, not today's negotiation.
+    return max(_PEAK["watts"], int(_peaks_book().get(fam) or 0))
 
 
 if __name__ == "__main__":
