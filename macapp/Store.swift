@@ -396,6 +396,11 @@ final class AppStore: ObservableObject {
     }
 
     /// Forget an import: its still-pending videos leave the queue. Already-upscaled ones stay.
+    func pauseYoutubeImport(_ batch: String, _ on: Bool) async {
+        await post("/api/youtube-queue", ["action": "pause_import", "batch": batch, "paused": on])
+        await refresh()
+    }
+
     func dropYoutubeImport(_ batch: String) async {
         guard !batch.isEmpty else { return }
         await post("/api/youtube-queue", ["action": "drop_import", "batch": batch])

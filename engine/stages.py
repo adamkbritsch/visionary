@@ -182,6 +182,24 @@ def _peak_of(path, key):
     return mbps
 
 
+def _settings_scope(p) -> str:
+    """The key an item's settings live under. p.series for everything — TV series name,
+    movie title, channel folder — EXCEPT a YouTube video that belongs to an import batch,
+    whose settings are the BATCH's ("import:<id>"): an imported playlist is its own
+    configurable thing, like a queued channel, and must not silently inherit whatever
+    channel folder its files land in on staging (user-asked 2026-08-28). Falls back to
+    p.series whenever the lookup finds nothing, so nothing else changes."""
+    if getattr(p, "youtube", False):
+        try:
+            import youtube
+            scope = youtube.settings_scope_for_vid(youtube.video_id(p.source_basename))
+            if scope:
+                return scope
+        except Exception:
+            pass
+    return p.series
+
+
 def resolve_input(p):
     """WHICH FILE RESOLVE PUTS ON THE TIMELINE — and it must be the file the gates measure.
     This used to hand Resolve the ORIGINAL source for everything except YouTube, while
@@ -1006,7 +1024,7 @@ def _resolve(p, abort, progress=None):
     # "sdr" is the only value that produces a non-DV master, and the only one whose Resolve
     # stage needs no screen automation at all.
     import settings as _st
-    override = _st.get_show_output_mode(p.series)
+    override = _st.get_show_output_mode(_settings_scope(p))
     # The setting's values ARE the Resolve modes now ("sdr" / "dv1000" / "dv2000"), so there is
     # no translation table to get wrong. "auto" = ALWAYS 1000 nits (user-dictated
     # 2026-08-09): the 2000-nit project stays available as an explicit per-item override,
@@ -1245,7 +1263,7 @@ def _remux(p, abort, progress=None, should_pause=None):
     # Per-item "Normalize audio" gate — p.series is the item's settings key for ALL kinds
     # (TV series name / movie title / channel folder — the same key its preset uses).
     # OFF -> None -> the boost-off bit-exact copy path remux already has.
-    if lufs and p.series and not settings_mod.get_show_normalize_audio(p.series):
+    if lufs and p.series and not settings_mod.get_show_normalize_audio(_settings_scope(p)):
         lufs = None
     # SEASON-SCOPED LOUDNESS FOR TV (user-dictated 2026-08-18). Measuring every episode on
     # its own let two episodes of ONE season land on different gains, so the volume stepped

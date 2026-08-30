@@ -1393,11 +1393,16 @@ def _save_imports(items) -> None:
 
 def _import_pending(skip=()) -> list:
     """Located, not-yet-done imported videos as ONE COLUMN PER BATCH, in playlist order —
-    the shape all_pending()'s round-robin consumes. Same keys channel_pending() emits."""
+    the shape all_pending()'s round-robin consumes. Same keys channel_pending() emits.
+    A PAUSED batch's videos stay in the book but are not served — the same meaning a
+    paused channel has."""
     done, cols = get_done(), {}
+    paused = {r.get("id") for r in _imports() if r.get("paused")}
     for e in _priority():
         p = e.get("path")
         if _jumps(e) or not p or e.get("vid") in done:
+            continue
+        if e.get("batch") in paused:
             continue
         if os.path.splitext(os.path.basename(p))[0] in (skip or ()):
             continue
@@ -1557,24 +1562,85 @@ def drop_import(batch_id) -> dict:
     return {"status": "ok", "removed": gone}
 
 
+# An import batch's SETTINGS live under this key in the ordinary show-profiles store, so
+# the existing /api/show-profile endpoint and settings getters work unchanged — the app
+# just sends show="import:<batch-id>". Keyed by batch id, not title: titles collide and
+# playlists get renamed.
+IMPORT_KEY_PREFIX = "import:"
+
+
+def import_settings_key(batch_id) -> str:
+    return IMPORT_KEY_PREFIX + str(batch_id or "")
+
+
+def settings_scope_for_vid(vid):
+    """The settings key governing an imported video, or None for everything else.
+
+    An imported playlist is its own configurable thing — like a queued channel is — so its
+    videos read normalize/output settings from the BATCH's key rather than whatever channel
+    folder they happen to land in on staging (user-asked 2026-08-28: imported content must
+    be as configurable as subscriptions). Works because the imports book keeps every batch's
+    `vids` forever; the priority book cannot answer this — mark_done prunes it."""
+    if not vid:
+        return None
+    for r in _imports():
+        if vid in (r.get("vids") or []):
+            return import_settings_key(r.get("id"))
+    return None
+
+
+def set_import_paused(batch_id, paused) -> dict:
+    """Pause/resume ONE import batch. Paused = its pending videos stay in the book but are
+    not served (same meaning as a paused channel). Idempotent."""
+    hit = False
+    with _IMPORTS_LOCK:
+        rows = _imports()
+        for r in rows:
+            if r.get("id") == batch_id:
+                r["paused"] = bool(paused)
+                hit = True
+        if hit:
+            _save_imports(rows)
+    return {"status": "ok" if hit else "unknown-batch", "paused": bool(paused)}
+
+
 def imports_view() -> list:
-    """The 'Imported' group:each batch with how many of its videos are still to come. A batch
-    whose videos are all done is dropped — it has nothing left to manage."""
+    """The 'Imported' group: each batch with how many of its videos are still to come, plus
+    its own settings surface (normalize/output/paused — the same controls a queued channel
+    has, keyed by import_settings_key).
+
+    A batch whose videos are all done leaves the VIEW but stays in the BOOK, marked
+    archived. It used to be deleted — which silently broke the Plex playlist collections:
+    playlist_title_by_vid reads the book long after completion (Plex creates items late,
+    the sweep is delayed on purpose), so pruning at the state poll meant the LAST video of
+    every playlist lost its collection tag forever."""
+    import settings
     counts = {}
     done = get_done()
     for e in _priority():
         if _jumps(e) or e.get("vid") in done:
             continue
         counts[e.get("batch") or ""] = counts.get(e.get("batch") or "", 0) + 1
-    out, stale = [], []
+    out, finished = [], []
     for r in _imports():
         left = counts.get(r.get("id"), 0)
         if not left:
-            stale.append(r.get("id"))
+            if not r.get("archived"):
+                finished.append(r.get("id"))
             continue
-        out.append({**r, "remaining": left})
-    if stale:
+        key = import_settings_key(r.get("id"))
+        out.append({**r, "remaining": left,
+                    "settings_key": key,
+                    "paused": bool(r.get("paused")),
+                    "normalize_audio": settings.get_show_normalize_audio(key),
+                    "output_mode": settings.get_show_output_mode(key),
+                    # youtarr's downloads are SDR, so auto always means the 1000-nit ceiling
+                    "output_mode_effective": settings.effective_output_mode(key, False)})
+    if finished:
         with _IMPORTS_LOCK:
-            rows = [r for r in _imports() if r.get("id") not in stale]
+            rows = _imports()
+            for r in rows:
+                if r.get("id") in finished:
+                    r["archived"] = True       # out of the view, NEVER out of the book
             _save_imports(rows)
     return out

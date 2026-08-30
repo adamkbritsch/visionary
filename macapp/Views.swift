@@ -3154,14 +3154,34 @@ private struct ImportedGroup: View {
                         Text((imp.title ?? "").isEmpty ? "Single video" : (imp.title ?? ""))
                             .font(.system(size: 13)).lineLimit(1)
                         Spacer()
+                        if imp.paused == true {
+                            Pill(systemImage: "pause.fill", text: "paused", tint: DS.steelDim, iconOnly: true)
+                        }
                         Pill(systemImage: "tray.full",
                              text: "\(imp.remaining ?? 0) of \(imp.count ?? 0) left", tint: DS.steel)
+                        Button { Task { await store.pauseYoutubeImport(imp.id ?? "", imp.paused != true) } } label: {
+                            Image(systemName: imp.paused == true ? "play.fill" : "pause.fill")
+                                .font(.system(size: 11))
+                        }.buttonStyle(.plain).foregroundStyle(.secondary)
+                            .help(imp.paused == true
+                                  ? "Resume — its videos rejoin the cadence"
+                                  : "Pause — its videos stay queued but stop being served")
                         Button { Task { await store.dropYoutubeImport(imp.id ?? "") } } label: {
                             Image(systemName: "trash").font(.system(size: 11))
                         }.buttonStyle(.plain).foregroundStyle(.secondary)
                             .help("Forget this import — its videos that haven't been upscaled yet leave the queue")
                     }
                     .padding(.horizontal, 10).padding(.vertical, 7)
+                    // The batch is as configurable as a queued channel (user-asked
+                    // 2026-08-28): the SAME rows channels use, keyed by the batch's own
+                    // settings key. No preset row — YouTube items skip Topaz, so a preset
+                    // here would be an inert control.
+                    if let key = imp.settings_key {
+                        OutputModeRow(key: key, effective: imp.output_mode_effective ?? "dv1000")
+                            .padding(.leading, 35).padding(.bottom, 2)
+                        NormalizeAudioRow(key: key, on: imp.normalize_audio ?? true)
+                            .padding(.leading, 35).padding(.bottom, 6)
+                    }
                 }
             }.panel(DS.radiusControl, inset: true)
         }

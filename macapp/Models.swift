@@ -318,6 +318,13 @@ struct YTImportDTO: Codable, Identifiable {   // one batch imported from a paste
     var total: Int?            // the playlist's true length (> count if it was capped)
     var remaining: Int?        // how many are still to upscale
     var added_at: Int?
+    // A batch is as configurable as a queued channel (user-asked 2026-08-28): its settings
+    // live under settings_key ("import:<id>") in the ordinary show-profiles store.
+    var settings_key: String?
+    var paused: Bool?
+    var normalize_audio: Bool?
+    var output_mode: String?
+    var output_mode_effective: String?
 }
 
 struct YTLinkResolveDTO: Codable {            // action: resolve_link — NO side effects

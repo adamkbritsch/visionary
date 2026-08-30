@@ -473,6 +473,11 @@ def api_youtube_queue(body):
             reconfigure = True                  # a newly queued channel needs youtarr synced
     elif action == "drop_import":
         imported = youtube.drop_import((body.get("batch") or body.get("id") or "").strip())
+    elif action == "pause_import":
+        # Pause/resume ONE import batch — the same lever a channel's pause is. Its videos
+        # stay in the book; they just stop being served until resumed.
+        imported = youtube.set_import_paused(
+            (body.get("batch") or body.get("id") or "").strip(), bool(body.get("paused")))
     elif action == "prioritize":
         # "Run this video now": promote it to the priority book (cadence-exempt, ahead of
         # due movies) and ask the in-flight item to YIELD at its next safe boundary — a

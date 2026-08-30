@@ -2188,3 +2188,41 @@ class TheCleanupFlagReachesResolve(unittest.TestCase):
         # py, script, phase, in, out, mode, kbps, host, ss, cleanup
         self.assertEqual(len(cmd), 10)
         self.assertEqual(cmd[8], "2")          # superscale kept ITS place (1080p -> 2x)
+
+
+class ImportedVideosUseTheirBatchSettings(unittest.TestCase):
+    """Stage-time settings for a YouTube video that arrived in an import batch come from the
+    batch's key ("import:<id>"), not the staging channel folder — an imported playlist is
+    its own configurable thing (user-asked 2026-08-28). Everything else keeps p.series."""
+
+    def _yt(self, vid="aaaaaaaaaa1"):
+        import tempfile
+        return orch_youtube_paths("Chan", "/s/Chan/x/v [%s].mp4" % vid, "V",
+                                  scratch_dir=tempfile.mkdtemp())
+
+    def test_a_batch_video_scopes_to_the_batch(self):
+        import youtube
+        p = self._yt()
+        with mock.patch.object(youtube, "settings_scope_for_vid",
+                               return_value="import:imp9"):
+            self.assertEqual(stages._settings_scope(p), "import:imp9")
+
+    def test_a_channel_video_keeps_the_channel(self):
+        import youtube
+        p = self._yt()
+        with mock.patch.object(youtube, "settings_scope_for_vid", return_value=None):
+            self.assertEqual(stages._settings_scope(p), "Chan")
+
+    def test_non_youtube_items_never_even_look(self):
+        import tempfile, youtube
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(youtube, "settings_scope_for_vid",
+                               side_effect=AssertionError("must not be consulted")):
+            self.assertEqual(stages._settings_scope(p), "Show")
+
+    def test_a_broken_lookup_falls_back_to_the_series(self):
+        import youtube
+        p = self._yt()
+        with mock.patch.object(youtube, "settings_scope_for_vid",
+                               side_effect=OSError("book unreadable")):
+            self.assertEqual(stages._settings_scope(p), "Chan")

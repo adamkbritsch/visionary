@@ -1250,3 +1250,74 @@ class SendToVisionaryCollections(unittest.TestCase):
 
     def test_garbage_is_bad_url(self):
         self.assertEqual(youtube.send_to_visionary("not a url")["status"], "bad-url")
+
+
+class ImportedContentIsConfigurable(unittest.TestCase):
+    """An imported playlist is its own configurable thing — the same normalize/output/pause
+    levers a queued channel has (user-asked 2026-08-28). Its settings live under
+    "import:<batch-id>" in the ordinary show-profiles store, and its VIDEOS resolve their
+    stage-time settings through that key rather than whatever channel folder they land in."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+
+    def _batch(self, bid="imp1", vids=("aaaaaaaaaa1", "aaaaaaaaaa2"), **extra):
+        with youtube._IMPORTS_LOCK:
+            rows = youtube._imports()
+            rows.append({"id": bid, "kind": "playlist", "title": "Best Builds",
+                         "vids": list(vids), **extra})
+            youtube._save_imports(rows)
+        with youtube._PRIORITY_LOCK:
+            book = youtube._priority()
+            for i, v in enumerate(vids):
+                book.append({"vid": v, "jump": False, "seq": i, "batch": bid,
+                             "channel": "Chan", "path": "/s/Chan/x/%s [%s].mp4" % (v, v)})
+            youtube._save_priority(book)
+
+    def test_a_batch_video_resolves_to_the_batch_key(self):
+        self._batch()
+        self.assertEqual(youtube.settings_scope_for_vid("aaaaaaaaaa2"), "import:imp1")
+        self.assertIsNone(youtube.settings_scope_for_vid("bbbbbbbbbb1"))
+
+    def test_the_view_carries_the_channel_grade_controls(self):
+        self._batch()
+        row = youtube.imports_view()[0]
+        self.assertEqual(row["settings_key"], "import:imp1")
+        for k in ("normalize_audio", "output_mode", "output_mode_effective", "paused"):
+            self.assertIn(k, row)
+
+    def test_pausing_a_batch_stops_serving_but_keeps_the_book(self):
+        self._batch()
+        self.assertEqual(sum(len(c) for c in youtube._import_pending()), 2)
+        youtube.set_import_paused("imp1", True)
+        self.assertEqual(youtube._import_pending(), [])            # not served
+        self.assertEqual(len(youtube._priority()), 2)              # not dropped
+        youtube.set_import_paused("imp1", False)
+        self.assertEqual(sum(len(c) for c in youtube._import_pending()), 2)
+
+    def test_pausing_an_unknown_batch_is_not_ok(self):
+        self.assertEqual(youtube.set_import_paused("nope", True)["status"], "unknown-batch")
+
+    def test_a_finished_batch_is_archived_never_deleted(self):
+        # THE PLEX PIN: playlist_title_by_vid reads the imports book long after completion
+        # (Plex creates items late; the sweep is delayed on purpose). imports_view used to
+        # DELETE a finished batch at the state poll, so the last video of every playlist
+        # lost its collection tag forever.
+        self._batch()
+        youtube._save_done({"aaaaaaaaaa1", "aaaaaaaaaa2"})         # everything upscaled
+        self.assertEqual(youtube.imports_view(), [])               # out of the VIEW
+        rows = youtube._imports()
+        self.assertEqual(len(rows), 1)                             # still in the BOOK
+        self.assertTrue(rows[0]["archived"])
+        self.assertEqual(youtube.playlist_title_by_vid(),
+                         {"aaaaaaaaaa1": "Best Builds", "aaaaaaaaaa2": "Best Builds"})
+
+    def test_drop_still_deletes_outright(self):
+        # the trash button means FORGET — that one should remove the row
+        self._batch()
+        youtube.drop_import("imp1")
+        self.assertEqual(youtube._imports(), [])
