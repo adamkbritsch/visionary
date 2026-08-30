@@ -24,7 +24,7 @@ import re
 import threading
 import time
 
-from transfer import (connect as ftp_connect, ftp_listdir, remote_mtime,
+from transfer import (connect as ftp_connect, ftp_listdir, remote_mtime, to_wire,
                       NAS_FTP_YOUTUBE_STAGING, NAS_FTP_YOUTUBE_ROOT)
 
 _VID = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".avi", ".mpv")
@@ -62,7 +62,16 @@ def video_title(name: str, channel: str = None) -> str:
 def _channel_base(folder):
     # youtarr's raw downloads live in the STAGING library (not the Plex "YouTube" lib) — that's
     # what Visionary scans for videos to upscale. Masters are published to the Plex lib on finish.
-    return NAS_FTP_YOUTUBE_STAGING.rstrip("/") + "/" + folder
+    #
+    # WIRE FORM, because everything built on top of it is concatenated with names that came
+    # BACK from a listing — and those are always wire form. Mixing the two is unfixable
+    # downstream: to_wire sees a string it cannot latin-1 encode, re-encodes the whole
+    # thing as UTF-8, and double-encodes the half that was already wire
+    # ("â\x80\x93" -> "Ã¢Â\x80Â\x93"), so every per-video listdir answered "No such file or
+    # directory" and the channel reported 0 pending videos (user-caught 2026-08-29:
+    # Kurzgesagt sat eight days with 12 videos downloaded). Wire + wire concatenates
+    # cleanly and to_wire then passes it through untouched.
+    return to_wire(NAS_FTP_YOUTUBE_STAGING.rstrip("/") + "/" + folder)
 
 
 def list_video_files(folder, *, timeout=40) -> list:

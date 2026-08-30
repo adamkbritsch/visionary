@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest import mock
 
+import transfer
 import youtube
 
 _ROTATION_PATCH = None
@@ -1415,3 +1416,83 @@ class PlaylistsAreNeverDownloadedAsPlaylists(unittest.TestCase):
              mock.patch.object(youtarr, "download_videos", return_value=True):
             youtube.send_collection("https://www.youtube.com/playlist?list=PLabc123_-x")
         self.assertEqual(youtube.get_queue(), [])
+
+
+class NonAsciiChannelFoldersResolve(unittest.TestCase):
+    """The Kurzgesagt channel (an en dash in its name) reported 0 pending videos for eight
+    days while 12 sat downloaded on staging (user-caught 2026-08-29). Two independent
+    faults, both reachable only through a non-ASCII folder name:
+
+    1. We never sent OPTS UTF8 ON (ftplib only sends it when ITS encoding is utf-8, and ours
+       is deliberately latin-1), so smbftpd transcoded names to GB18030 on the wire --
+       the en dash encodes to b'\\xa8C' in gbk -- and a lookup by the real spelling never
+       matched anything the server would answer to.
+    2. _channel_base built the base path in DISPLAY form, then concatenated names that came
+       back from a listing in WIRE form. to_wire cannot latin-1 encode the mixed result, so
+       it re-encoded the whole string as UTF-8 and DOUBLE-encoded the half that was already
+       wire; every per-video listdir then answered "No such file or directory".
+    """
+
+    FOLDER = "Kurzgesagt – In a Nutshell"
+    WIRE_DASH = "\u00e2\u0080\u0093"     # the en dash's UTF-8 bytes, seen through latin-1
+
+    def test_the_base_path_is_wire_form(self):
+        base = youtube._channel_base(self.FOLDER)
+        base.encode("latin-1")                        # would raise if it were display form
+        self.assertIn(self.WIRE_DASH, base)
+
+    def test_wire_base_concatenated_with_a_wire_listing_stays_stable(self):
+        # THE REGRESSION: to_wire must pass the joined path through untouched. A display-form
+        # base made this double-encode, which is what produced "No such file or directory".
+        base = youtube._channel_base(self.FOLDER)
+        sub = "Kurzgesagt %s In a Nutshell - GERMANY IS OVER - n-gYFcVx-8Y" % self.WIRE_DASH
+        joined = base + "/" + sub
+        self.assertEqual(transfer.to_wire(joined), joined)
+        self.assertEqual(joined.encode("latin-1").decode("utf-8"),
+                         "/Media/YouTube-raw/%s/%s" % (
+                             self.FOLDER, sub.encode("latin-1").decode("utf-8")))
+
+    def test_an_ascii_folder_is_completely_unchanged(self):
+        self.assertEqual(youtube._channel_base("DIY Perks"),
+                         "/Media/YouTube-raw/DIY Perks")
+
+    def test_the_walk_finds_videos_under_a_non_ascii_folder(self):
+        base = youtube._channel_base(self.FOLDER)
+        leaf = "Kurzgesagt %s In a Nutshell - X - Cyl3X88KEgg" % self.WIRE_DASH
+        vdir = base + "/" + leaf
+        listings = {base: [leaf], vdir: ["Kurzgesagt - X [Cyl3X88KEgg].mp4"]}
+        with mock.patch.object(youtube, "ftp_connect", return_value=mock.MagicMock()), \
+             mock.patch.object(youtube, "ftp_listdir",
+                               side_effect=lambda f, d: listings.get(d, [])), \
+             mock.patch.object(youtube, "remote_mtime", return_value=1):
+            out = youtube.list_video_files(self.FOLDER)
+        self.assertEqual([v["vid"] for v in out], ["Cyl3X88KEgg"])
+
+
+class TheFtpSessionNegotiatesUtf8(unittest.TestCase):
+    """Without OPTS UTF8 ON the NAS answers in its legacy codepage, so every non-ASCII
+    filename on the wire is GB18030 while the disk is clean UTF-8 (verified live 2026-08-29:
+    the same LIST returned the gbk bytes before and the utf-8 bytes after). ftplib will not
+    send it for us -- it only does so when its own encoding is utf-8, and ours is
+    deliberately latin-1 so stray bytes round-trip."""
+
+    def _connect(self, sendcmd):
+        ftp = mock.MagicMock()
+        ftp.sendcmd = sendcmd
+        with mock.patch.object(transfer, "_WireFTP", return_value=ftp), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["nas"]), \
+             mock.patch.object(transfer, "ftp_settings",
+                               return_value={"port": 21, "user": "u", "passwd": "p"}):
+            return transfer.connect(timeout=1), ftp
+
+    def test_it_asks_for_utf8_after_login(self):
+        got, ftp = self._connect(mock.Mock(return_value="200 OK, UTF-8 enabled"))
+        ftp.sendcmd.assert_called_once_with("OPTS UTF8 ON")
+        self.assertEqual(ftp.encoding, "latin-1")     # byte round-trip is unchanged
+        ftp.login.assert_called_once()
+
+    def test_a_server_without_the_extension_still_connects(self):
+        import ftplib as _f
+        got, ftp = self._connect(mock.Mock(side_effect=_f.error_perm("500 unknown")))
+        self.assertIs(got, ftp)                       # best-effort, never fatal
+        ftp.set_pasv.assert_called_once_with(True)

@@ -141,6 +141,22 @@ def connect(timeout=15):
             ftp.encoding = "latin-1"
             ftp.connect(host, s["port"], timeout=timeout)
             ftp.login(s["user"], s["passwd"])
+            # ASK FOR UTF-8 EXPLICITLY. ftplib only sends this itself when its encoding is
+            # utf-8, and ours is deliberately latin-1 (above) — so we never asked, and
+            # smbftpd fell back to its configured legacy codepage and transcoded every
+            # non-ASCII filename to GB18030 on the wire. The disk is clean UTF-8, so a name
+            # LOOKED UP by its real spelling never matched what the server would answer to:
+            # "Kurzgesagt – In a Nutshell" listed as "Kurzgesagt \xa8C In a Nutshell"
+            # ('–'.encode('gbk') == b'\xa8C'), so the channel reported 0 pending videos and
+            # sat unprocessed for eight days with 12 videos already downloaded (user-caught
+            # 2026-08-29). The 2026-08-20 fix for the same channel stopped the crash it
+            # caused but not this silent half of it.
+            # Best-effort: a server without the extension keeps the old behaviour, and
+            # to_wire/display_name still carry their GB18030 fallbacks for stray bytes.
+            try:
+                ftp.sendcmd("OPTS UTF8 ON")
+            except ftplib.all_errors:
+                pass
             ftp.set_pasv(True)   # passive (smbftpd PassiveModePortRange 40000-50000)
             return ftp
         except ftplib.all_errors as e:

@@ -256,9 +256,10 @@ class Connect(unittest.TestCase):
         # A stray non-UTF-8 filename byte (0xa1) must not crash mlsd()/listings —
         # latin-1 decodes any byte and round-trips, so connect() must set it.
         class Rec:
-            def __init__(self): self.encoding = "utf-8"
+            def __init__(self): self.encoding = "utf-8"; self.cmds = []
             def connect(self, *a, **k): pass
             def login(self, *a, **k): pass
+            def sendcmd(self, c): self.cmds.append(c); return "200 ok"
             def set_pasv(self, v): pass
         rec = Rec()
         with mock.patch.object(transfer, "_WireFTP", return_value=rec), \
@@ -268,6 +269,9 @@ class Connect(unittest.TestCase):
             ftp = transfer.connect()
         self.assertEqual(ftp.encoding, "latin-1")   # both directions, unchanged: stray NAS
                                                     # bytes must still round-trip exactly
+        # ...and BECAUSE the encoding is latin-1, ftplib will not negotiate UTF-8 for us, so
+        # connect() must ask explicitly or the server answers in its legacy codepage
+        self.assertIn("OPTS UTF8 ON", rec.cmds)
 
 
 if __name__ == "__main__":
