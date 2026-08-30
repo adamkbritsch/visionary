@@ -1321,3 +1321,46 @@ class ImportedContentIsConfigurable(unittest.TestCase):
         self._batch()
         youtube.drop_import("imp1")
         self.assertEqual(youtube._imports(), [])
+
+
+class SingleVideoImportsNameThemselves(unittest.TestCase):
+    """"Single video" told you nothing (user-asked 2026-08-28). The batch takes the sender's
+    title when one came with the send, and an untitled batch fills in from the located
+    file's own name — youtarr embeds the real title in the filename."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+
+    def _single(self, title="", path=None, entry_title=None):
+        with youtube._IMPORTS_LOCK:
+            youtube._save_imports([{"id": "imp1", "kind": "video", "title": title,
+                                    "vids": ["aaaaaaaaaa1"]}])
+        with youtube._PRIORITY_LOCK:
+            youtube._save_priority([{"vid": "aaaaaaaaaa1", "jump": False, "seq": 0,
+                                     "batch": "imp1", "channel": "DIY Perks",
+                                     "title": entry_title, "path": path}])
+
+    def test_a_stored_title_is_shown_as_is(self):
+        self._single(title="True Wireless Power")
+        self.assertEqual(youtube.imports_view()[0]["title"], "True Wireless Power")
+
+    def test_an_untitled_single_takes_the_located_files_name(self):
+        self._single(path="/s/DIY Perks/x/DIY Perks - True Wireless Power [aaaaaaaaaa1].mp4")
+        self.assertEqual(youtube.imports_view()[0]["title"], "True Wireless Power")
+
+    def test_not_yet_located_stays_blank_rather_than_guessing(self):
+        self._single(path=None)
+        self.assertEqual(youtube.imports_view()[0]["title"], "")
+
+    def test_import_link_stores_the_senders_title_for_a_single(self):
+        import youtarr, ytdata
+        with mock.patch.object(youtarr, "download_videos", return_value=True), \
+             mock.patch.object(ytdata, "playlist_video_ids", return_value=None):
+            out = youtube.import_link("https://youtu.be/bbbbbbbbbb1",
+                                      title_hint="A Sent Video")
+        self.assertEqual(out["status"], "queued")
+        self.assertEqual(youtube._imports()[0]["title"], "A Sent Video")

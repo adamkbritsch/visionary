@@ -468,7 +468,10 @@ def api_youtube_queue(body):
         # PHASE 2: commit the chosen reading. `choice` ("video"/"playlist") settles an
         # ambiguous link. Falls through so the refreshed queue + up-next come back with it.
         imported = youtube.import_link((body.get("url") or "").strip(),
-                                       (body.get("choice") or "").strip() or None)
+                                       (body.get("choice") or "").strip() or None,
+                                       # the resolve step already showed the user a title —
+                                       # keep it, so a single video's batch is named
+                                       title_hint=(body.get("title") or "").strip() or None)
         if imported.get("status") == "channel-queued":
             reconfigure = True                  # a newly queued channel needs youtarr synced
     elif action == "drop_import":

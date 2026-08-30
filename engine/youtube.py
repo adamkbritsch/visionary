@@ -1495,7 +1495,10 @@ def import_link(url, choice=None, title_hint=None) -> dict:
         vid = info["video_id"]
         if not vid:
             return {"status": "bad-url"}
-        ids, label, total = [vid], "", 1
+        # A single video's batch is named by the sender's title when one came along —
+        # SmartTube and the resolve step both pass it — so the Imported list can say what
+        # the video IS instead of "Single video".
+        ids, label, total = [vid], (title_hint or ""), 1
         src, batch_kind = "https://www.youtube.com/watch?v=" + vid, "video"
     if not ids:
         return {"status": "empty", "title": label}
@@ -1629,7 +1632,20 @@ def imports_view() -> list:
                 finished.append(r.get("id"))
             continue
         key = import_settings_key(r.get("id"))
-        out.append({**r, "remaining": left,
+        # A single-video batch imported before titles were stored (or sent without one)
+        # reads as "Single video" in the app. Once youtarr's file lands, the FILENAME
+        # carries the real title — fill it in from the located priority entry.
+        title = r.get("title") or ""
+        if not title and r.get("kind") == "video":
+            want = set(r.get("vids") or [])
+            for e in _priority():
+                if e.get("vid") in want:
+                    p = e.get("path")
+                    title = (e.get("title")
+                             or (video_title(os.path.basename(p), e.get("channel"))
+                                 if p else ""))
+                    break
+        out.append({**r, "title": title, "remaining": left,
                     "settings_key": key,
                     "paused": bool(r.get("paused")),
                     "normalize_audio": settings.get_show_normalize_audio(key),
