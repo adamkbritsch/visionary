@@ -152,8 +152,15 @@ def update_config(patch, *, timeout=20):
 
 def download_videos(video_ids_or_urls, *, resolution="2160", timeout=20):
     """Download EXACTLY these videos (ids or watch URLs) via /triggerspecificdownloads — bypasses the
-    download archive. Not used by the autonomous flow (youtarr auto-downloads the subscribed channels);
-    kept for an optional manual 'grab this now' affordance."""
+    download archive. Used by send-to-Visionary and every playlist/link import.
+
+    LOAD-BEARING INVARIANT (user-dictated 2026-08-28): a playlist is always expanded to
+    individual WATCH URLs before it reaches here — never sent as a playlist URL. Per-video
+    downloads file each video under its OWN UPLOADER's folder on staging, publishing mirrors
+    that path, and Plex's channel collections read it back — so a compiler's playlist lands
+    as PewDiePie/Paint/etc., and the playlist AUTHOR's name appears nowhere unless it is
+    part of the playlist's own title. Handing youtarr the playlist URL instead would file
+    everything under one folder and put the author's name across youtarr and Plex."""
     urls = [v if str(v).startswith("http") else f"https://www.youtube.com/watch?v={v}"
             for v in (video_ids_or_urls or [])]
     if not urls:

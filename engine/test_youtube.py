@@ -11,19 +11,30 @@ import youtube
 _ROTATION_PATCH = None
 
 
+_BOOK_PATCHES = []
+
+
 def setUpModule():
-    """all_pending() consults the persisted channel-rotation pointer, so without this the
-    order every test in this module sees depends on whatever this machine last upscaled —
-    and any test that advances it writes a fake channel into the live pointer."""
-    global _ROTATION_PATCH
-    _ROTATION_PATCH = mock.patch.object(youtube, "ROTATION_FILE",
-                                        os.path.join(tempfile.mkdtemp(), "yt_rotation.json"))
-    _ROTATION_PATCH.start()
+    """EVERY persisted book is redirected module-wide. all_pending() consults the rotation
+    pointer AND — via _import_pending — the priority and imports books, so a test that
+    doesn't redirect them inherits whatever is genuinely queued on this machine. That hole
+    was latent for as long as the live books were empty; the first real playlist import
+    put PewDiePie videos into three unrelated tests' expected orderings (2026-08-28).
+    Classes that want their own books still override per-test; this is the floor."""
+    d = tempfile.mkdtemp()
+    for name, fn in (("ROTATION_FILE", "yt_rotation.json"),
+                     ("PRIORITY_FILE", "yt_priority.json"),
+                     ("IMPORTS_FILE", "yt_imports.json"),
+                     ("DONE_FILE", "yt_done.json"),
+                     ("QUEUE_FILE", "yt_queue.json")):
+        p = mock.patch.object(youtube, name, os.path.join(d, fn))
+        p.start()
+        _BOOK_PATCHES.append(p)
 
 
 def tearDownModule():
-    if _ROTATION_PATCH is not None:
-        _ROTATION_PATCH.stop()
+    for p in _BOOK_PATCHES:
+        p.stop()
 
 
 
@@ -1364,3 +1375,43 @@ class SingleVideoImportsNameThemselves(unittest.TestCase):
                                       title_hint="A Sent Video")
         self.assertEqual(out["status"], "queued")
         self.assertEqual(youtube._imports()[0]["title"], "A Sent Video")
+
+
+class PlaylistsAreNeverDownloadedAsPlaylists(unittest.TestCase):
+    """A playlist reaches youtarr as INDIVIDUAL watch URLs, never as its list URL. Per-video
+    downloads file each video under its own UPLOADER on staging; publishing mirrors that
+    path; Plex channel collections read it back. So a compiler's playlist lands under
+    PewDiePie/Paint/etc. and the playlist AUTHOR's name appears nowhere — verified live
+    2026-08-28 on a compiler playlist whose staging folders were exactly the uploaders.
+    The playlist itself still exists as its own Plex collection (playlist_title_by_vid);
+    the author would only ever appear if their name is part of the playlist's title."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+
+    def test_the_download_request_is_per_video_watch_urls(self):
+        import youtarr, ytdata
+        ids = ["aaaaaaaaaa1", "aaaaaaaaaa2", "aaaaaaaaaa3"]
+        seen = {}
+        with mock.patch.object(ytdata, "playlist_video_ids", return_value=ids), \
+             mock.patch.object(ytdata, "playlist_meta", return_value={"title": "Comp"}), \
+             mock.patch.object(youtarr, "download_videos",
+                               side_effect=lambda v, **k: seen.update(got=list(v)) or True):
+            out = youtube.import_link("https://www.youtube.com/playlist?list=PLabc123_-x")
+        self.assertEqual(out["status"], "queued")
+        self.assertEqual(seen["got"], ids)                 # ids, one per video
+        for v in seen["got"]:
+            self.assertNotIn("list=", str(v))              # never the playlist URL
+
+    def test_no_channel_is_ever_queued_for_a_playlist_send(self):
+        # the compiler must not become a youtarr subscription or a queued channel
+        import youtarr, ytdata
+        with mock.patch.object(ytdata, "playlist_video_ids", return_value=["bbbbbbbbbb1"]), \
+             mock.patch.object(ytdata, "playlist_meta", return_value={"title": "Comp"}), \
+             mock.patch.object(youtarr, "download_videos", return_value=True):
+            youtube.send_collection("https://www.youtube.com/playlist?list=PLabc123_-x")
+        self.assertEqual(youtube.get_queue(), [])
