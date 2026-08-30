@@ -1533,14 +1533,16 @@ class Handler(BaseHTTPRequestHandler):
                         keep_awake_secs=REMOTE_AWAKE_GRACE_SECS if remote else 0)
             self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/send-to-visionary":
-            # The companion YouTube app's button. Off-machine callers need the remote
+            # The companion YouTube app's buttons. Off-machine callers need the remote
             # token (see _authorized); loopback is still open, so the app on this Mac is
-            # unaffected. youtarr grabs exactly this video; the orchestrator serves it
-            # as the NEXT item once it lands on staging. Idempotent; the status string
-            # is the button's feedback.
+            # unaffected. Routed by URL kind: a VIDEO jumps the queue (youtarr grabs it,
+            # the orchestrator serves it next); a PLAYLIST joins the ordinary cadence as
+            # an import batch; a CHANNEL is queued like one added in the app. Idempotent;
+            # the status string is the button's feedback, and queue_view advertises which
+            # kinds exist via send_capabilities.
             import youtube
-            self._json(youtube.send_priority((body.get("url") or body.get("id") or ""),
-                                             title=body.get("title")))
+            self._json(youtube.send_to_visionary((body.get("url") or body.get("id") or ""),
+                                                 title=body.get("title")))
         elif path == "/api/config":
             # values are never logged (log_message is a no-op; keep it that way) and the
             # response is the redacted view, so a secret can't round-trip out

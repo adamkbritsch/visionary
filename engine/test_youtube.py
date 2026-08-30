@@ -1122,3 +1122,131 @@ class VideoCacheMissesNeverBlockThePoll(unittest.TestCase):
         with mock.patch.object(youtube, "list_video_files",
                                side_effect=AssertionError("must not list")):
             self.assertEqual(youtube.cached_videos("Chan"), [{"vid": "x"}])
+
+
+class SendToVisionaryCollections(unittest.TestCase):
+    """The companion app gained playlist/channel Send buttons, capability-gated on the
+    engine advertising them. Contract: the button POSTs once and re-POSTs on retry, so
+    every path is idempotent; a collection send must NEVER flood — a playlist joins the
+    ordinary cadence as an import batch (jump=False) and a channel becomes a queued
+    channel, only the per-video button preempts. Statuses stay in the app's vocabulary."""
+
+    PL = "https://www.youtube.com/playlist?list=PLabc123_-xyzABC456"
+    IDS = ["aaaaaaaaaa%d" % i for i in range(1, 4)]
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+
+    def _send(self, url, *, ids=None, meta=None, download_ok=True, title=None,
+              channel=None, subs=None):
+        import ytdata, youtarr
+        with mock.patch.object(ytdata, "playlist_video_ids", return_value=ids), \
+             mock.patch.object(ytdata, "playlist_meta", return_value=meta or {}), \
+             mock.patch.object(ytdata, "channel_for", return_value=channel), \
+             mock.patch.object(ytdata, "subscriptions", return_value=subs or []), \
+             mock.patch.object(youtarr, "download_videos", return_value=download_ok):
+            return youtube.send_to_visionary(url, title=title)
+
+    # ---- capability advertisement ------------------------------------------
+    def test_the_state_advertises_exactly_what_the_router_delivers(self):
+        self.assertEqual(youtube.SEND_CAPABILITIES, ("video", "playlist", "channel"))
+        with mock.patch.object(youtube, "_connected", return_value=True), \
+             mock.patch.object(youtube, "imports_view", return_value=[]):
+            view = youtube.queue_view()
+        self.assertEqual(view["send_capabilities"], ["video", "playlist", "channel"])
+
+    # ---- playlists -----------------------------------------------------------
+    def test_a_playlist_queues_as_a_cadence_batch_never_a_jump(self):
+        out = self._send(self.PL, ids=self.IDS, meta={"title": "Best Builds", "count": 3})
+        self.assertEqual(out["status"], "queued")
+        self.assertEqual(out["count"], 3)
+        book = youtube._priority()
+        self.assertEqual(len(book), 3)
+        self.assertTrue(all(e.get("jump") is False for e in book))   # rides the cadence
+        self.assertFalse(youtube.has_priority_ready())               # never preempts topaz
+
+    def test_resending_the_same_playlist_is_already_queued(self):
+        self._send(self.PL, ids=self.IDS, meta={"title": "Best Builds"})
+        out = self._send(self.PL, ids=self.IDS, meta={"title": "Best Builds"})
+        self.assertEqual(out["status"], "already-queued")
+        self.assertEqual(len(youtube._priority()), 3)                # nothing duplicated
+
+    def test_a_fully_upscaled_playlist_says_already_upscaled(self):
+        youtube._save_done(set(self.IDS))
+        out = self._send(self.PL, ids=self.IDS, meta={"title": "Best Builds"})
+        self.assertEqual(out["status"], "already-upscaled")
+
+    def test_private_and_session_lists_are_bad_url(self):
+        for pid in ("WL", "LL", "LM", "RDaaaaaaaaaa1", "RDMM"):
+            out = self._send("https://www.youtube.com/playlist?list=" + pid, ids=self.IDS)
+            self.assertEqual(out["status"], "bad-url", pid)
+        self.assertEqual(youtube._priority(), [])                    # nothing leaked in
+
+    def test_albums_and_uploads_lists_are_public_enough(self):
+        for n, pid in enumerate(("OLAK5uy_abcdefghij123456789012345678901",
+                                 "UUabcdefghijklmnopqrstuv")):
+            out = self._send("https://www.youtube.com/playlist?list=" + pid,
+                             ids=["bbbbbbbbb%02d" % n], meta={"title": "X"})
+            self.assertEqual(out["status"], "queued", pid)
+
+    def test_an_unreadable_playlist_is_bad_url(self):
+        # ids=None = the API could not list it: private or deleted
+        out = self._send(self.PL, ids=None)
+        self.assertEqual(out["status"], "bad-url")
+
+    def test_youtarr_down_reports_and_strands_nothing(self):
+        out = self._send(self.PL, ids=self.IDS, meta={"title": "X"}, download_ok=False)
+        self.assertEqual(out["status"], "youtarr-unreachable")
+        self.assertEqual(youtube._priority(), [])                    # batch rolled back
+
+    def test_the_senders_title_names_an_untitled_batch(self):
+        self._send(self.PL, ids=self.IDS, meta={}, title="From SmartTube")
+        rows = youtube._imports()
+        self.assertEqual(rows[0]["title"], "From SmartTube")
+
+    # ---- channels ------------------------------------------------------------
+    CH = {"channelId": "UC" + "a" * 22, "title": "Veritasium"}
+
+    def test_a_channel_send_becomes_a_queued_channel(self):
+        out = self._send("https://www.youtube.com/channel/" + self.CH["channelId"],
+                         channel=self.CH)
+        self.assertEqual(out["status"], "queued")
+        q = youtube.get_queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["channelId"], self.CH["channelId"])
+        self.assertTrue(q[0]["via_link"])            # not a subscription -> badged
+        self.assertEqual(youtube._priority(), [])    # a channel is never a bulk enqueue
+
+    def test_resending_the_channel_is_already_queued(self):
+        url = "https://www.youtube.com/channel/" + self.CH["channelId"]
+        self._send(url, channel=self.CH)
+        out = self._send(url, channel=self.CH)
+        self.assertEqual(out["status"], "already-queued")
+        self.assertEqual(len(youtube.get_queue()), 1)
+
+    def test_a_subscribed_channel_is_not_badged_via_link(self):
+        self._send("https://www.youtube.com/channel/" + self.CH["channelId"],
+                   channel=self.CH, subs=[self.CH])
+        self.assertFalse(youtube.get_queue()[0]["via_link"])
+
+    def test_a_malformed_channel_id_is_bad_url_before_any_api_call(self):
+        out = self._send("https://www.youtube.com/channel/UCtooshort", channel=self.CH)
+        self.assertEqual(out["status"], "bad-url")
+
+    # ---- routing -------------------------------------------------------------
+    def test_a_video_url_still_takes_the_jump_path(self):
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos", return_value=True):
+            out = youtube.send_to_visionary("https://youtu.be/cccccccccc1", title="V")
+        self.assertEqual(out["status"], "queued")
+        self.assertTrue(youtube.has_priority_ready is not None)
+        book = youtube._priority()
+        self.assertEqual(len(book), 1)
+        self.assertNotIn("jump", book[0])            # the classic entry shape = preempts
+
+    def test_garbage_is_bad_url(self):
+        self.assertEqual(youtube.send_to_visionary("not a url")["status"], "bad-url")

@@ -1038,6 +1038,10 @@ def queue_view() -> dict:
                       "via_link": bool(e.get("via_link")),
                       "pending": len(channel_pending(e)), "downloaded": len(cached_videos(folder))})
     return {"items": items, "count": len(items), "connected": _connected(),
+            # Capability gate for the companion app's Send-to-Visionary buttons: one button
+            # per entry, hidden otherwise. An engine without this field is treated as
+            # ["video"], so the list must only ever name what send_to_visionary delivers.
+            "send_capabilities": list(SEND_CAPABILITIES),
             "imports": imports_view()}
 
 
@@ -1103,6 +1107,89 @@ def _save_priority(items) -> None:
         os.replace(tmp, PRIORITY_FILE)
     except OSError:
         pass
+
+
+# What /api/send-to-visionary genuinely accepts. Advertised in /api/state's youtube object;
+# the companion app shows one button per entry and treats an engine without the field as
+# ["video"], so this list must never claim a kind the router below cannot deliver.
+SEND_CAPABILITIES = ("video", "playlist", "channel")
+
+# Public, shareable list classes only: PL (ordinary playlists), OLAK (auto-generated
+# albums), UU (a channel's uploads list). WL/LL/LM are per-account, RD* are per-session
+# mixes — the app never offers buttons for them, but the server validates anyway: a
+# private list would just die later in the API with a less honest error.
+_PUBLIC_LIST = re.compile(r"^(PL|OLAK|UU)[0-9A-Za-z_-]+$")
+_UC_ID = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
+
+
+def send_to_visionary(url_or_id, title=None) -> dict:
+    """THE /api/send-to-visionary router. Videos keep the long-standing jump-the-queue
+    path (send_priority); playlists and channels go to send_collection. A watch?v=…&list=…
+    link routes as a VIDEO — the app's per-video button sends those, and the playlist
+    button sends a pure playlist URL, so the ambiguity is the button's to resolve, not ours."""
+    import ytlinks
+    kind = ytlinks.parse_link(url_or_id)["kind"]
+    if kind == "video":
+        return send_priority(url_or_id, title=title)
+    if kind in ("playlist", "channel", "handle"):
+        return send_collection(url_or_id, title=title)
+    return {"status": "bad-url"}
+
+
+def send_collection(url, title=None) -> dict:
+    """Send-to-Visionary for a PLAYLIST or CHANNEL. Idempotent; answers in the app's
+    existing status vocabulary (queued | already-queued | already-upscaled | bad-url |
+    youtarr-unreachable) wherever one honestly fits.
+
+    WHAT "queued" MEANS FOR A COLLECTION (deliberate, documented): the videos join the
+    ORDINARY YouTube cadence as an import batch (jump=False) — playlist order preserved,
+    served N-per-burst between episodes, never preempting the pipeline. A 200-video send
+    tells youtarr to fetch everything up front, but the upscale queue drains at the same
+    pace it always does; only the per-video button jumps. A channel send is lighter still:
+    it becomes a queued CHANNEL (like adding it in the app), so its videos flow through
+    the channel rotation rather than a bulk enqueue.
+    """
+    import ytdata
+    import ytlinks
+    info = ytlinks.parse_link(url)
+    kind = info["kind"]
+
+    if kind == "playlist":
+        pid = info["playlist_id"]
+        if not _PUBLIC_LIST.match(pid or ""):
+            return {"status": "bad-url"}          # WL/LL/RD and friends: per-account/session
+        out = import_link("https://www.youtube.com/playlist?list=" + pid,
+                          title_hint=(title or "").strip() or None)
+        st = out.get("status")
+        if st == "already-queued":
+            # every video already known: DONE across the board is the app's
+            # "already-upscaled"; any still queued means the batch is in flight
+            return {"status": "already-upscaled" if out.get("all_done") else "already-queued",
+                    "title": out.get("title"), "count": out.get("count")}
+        if st in ("playlist-unreadable", "empty"):
+            # unreadable = private/deleted per the API; empty has nothing to queue —
+            # both are "this URL holds nothing for me"
+            return {"status": "bad-url"}
+        return out                                # queued / youtarr-unreachable pass through
+
+    if kind in ("channel", "handle"):
+        if kind == "channel" and not _UC_ID.match(info["channel_id"] or ""):
+            return {"status": "bad-url"}
+        ch = ytdata.channel_for(info["channel_id"] or info["handle"])
+        if not ch:
+            # could be a dead handle or the API being down — indistinguishable here; the
+            # app renders unknown statuses as a generic failure, which is the honest label
+            return {"status": "channel-unresolved"}
+        if any(i.get("channelId") == ch["channelId"] for i in get_queue()):
+            return {"status": "already-queued", "channelId": ch["channelId"],
+                    "title": ch["title"]}
+        subs = ytdata.subscriptions() or []
+        is_sub = any(c.get("channelId") == ch["channelId"] for c in subs)
+        add_channel(ch["channelId"], (title or "").strip() or ch["title"],
+                    via_link=not is_sub)
+        return {"status": "queued", "channelId": ch["channelId"], "title": ch["title"]}
+
+    return {"status": "bad-url"}
 
 
 def send_priority(url_or_id, title=None) -> dict:
@@ -1361,7 +1448,7 @@ def resolve_link(url) -> dict:
     return out
 
 
-def import_link(url, choice=None) -> dict:
+def import_link(url, choice=None, title_hint=None) -> dict:
     """Commit a pasted link. `choice` settles an ambiguous watch?v=…&list=… URL: "video"
     imports just that video, "playlist" imports the whole list. Channel links are queued as
     channels instead (badged when they are not one of your subscriptions).
@@ -1394,7 +1481,9 @@ def import_link(url, choice=None) -> dict:
         if ids is None:
             return {"status": "playlist-unreadable", "playlist_id": pid}
         meta = ytdata.playlist_meta(pid) or {}
-        label = meta.get("title") or pid
+        # title_hint: the sender's display name (SmartTube passes one), used only when the
+        # API meta has none — it names the imports-book batch and thus the Plex collection.
+        label = meta.get("title") or title_hint or pid
         total = int(meta.get("count") or len(ids))
         src, batch_kind = "https://www.youtube.com/playlist?list=" + pid, "playlist"
     else:
@@ -1424,7 +1513,10 @@ def import_link(url, choice=None) -> dict:
         if added:
             _save_priority(book)
     if not added:
-        return {"status": "already-queued", "title": label, "count": len(ids)}
+        # all_done lets send_collection tell "everything already UPSCALED" apart from
+        # "the batch is still in flight" — the app shows different labels for those.
+        return {"status": "already-queued", "title": label, "count": len(ids),
+                "all_done": all(v in done for v in ids)}
     if not youtarr.download_videos(ids):
         _drop_batch(batch)                     # nothing will ever arrive — don't strand the book
         return {"status": "youtarr-unreachable"}
