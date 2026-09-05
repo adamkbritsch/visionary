@@ -460,6 +460,30 @@ class SendToVisionary(unittest.TestCase):
         dl.assert_called_once_with(["dQw4w9WgXcQ"])
         self.assertEqual(youtube._priority()[0]["title"], "A Video")
 
+    def test_send_goes_to_the_FRONT_so_it_actually_runs_next(self):
+        """locate_priority() serves the first eligible entry in book order, so a send that is
+        appended sits behind everything already queued — with a book full of link-imports the
+        button would not run next in any meaningful sense. Most recent send wins."""
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos", return_value=True):
+            youtube.send_priority("dQw4w9WgXcQ", title="first")
+            youtube.send_priority("aaaaaaaaaaa", title="second")
+        book = youtube._priority()
+        self.assertEqual([e["vid"] for e in book], ["aaaaaaaaaaa", "dQw4w9WgXcQ"])
+        self.assertEqual(book[0]["title"], "second")
+
+    def test_send_preempts_an_import_already_in_the_book(self):
+        """A link IMPORT does not jump the queue; a send must land ahead of one regardless of
+        when each arrived."""
+        import youtarr
+        youtube._save_priority([{"vid": "imported0001", "jump": False, "batch": "b", "seq": 1}])
+        with mock.patch.object(youtarr, "download_videos", return_value=True):
+            youtube.send_priority("dQw4w9WgXcQ", title="sent")
+        book = youtube._priority()
+        self.assertEqual(book[0]["vid"], "dQw4w9WgXcQ")
+        self.assertTrue(youtube._jumps(book[0]))
+        self.assertFalse(youtube._jumps(book[1]))
+
     def test_send_reports_youtarr_down_and_records_nothing(self):
         import youtarr
         with mock.patch.object(youtarr, "download_videos", return_value=None):

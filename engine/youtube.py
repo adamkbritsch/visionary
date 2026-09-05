@@ -1220,8 +1220,13 @@ def send_priority(url_or_id, title=None) -> dict:
     with _PRIORITY_LOCK:
         book = _priority()
         if not any(e.get("vid") == vid for e in book):     # re-check under the lock
-            book.append({"vid": vid, "title": (title or "").strip() or None,
-                         "sent_at": int(time.time())})
+            # FRONT, not append. locate_priority() serves the first eligible entry in book
+            # order, so appending put a send behind everything already queued — with hundreds
+            # of link-imports in the book a video sent from the app would not run next in any
+            # meaningful sense. The button IS the "do this now" signal, so the most recent send
+            # wins, matching prioritize_pending()'s user-dictated behaviour.
+            book.insert(0, {"vid": vid, "title": (title or "").strip() or None,
+                            "sent_at": int(time.time())})
             _save_priority(book)
     return {"status": "queued", "id": vid}
 
