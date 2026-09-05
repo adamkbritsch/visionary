@@ -520,3 +520,39 @@ class ManualOnly2000Nits(unittest.TestCase):
         import settings as s
         self.assertEqual(s.effective_output_mode("unpinned-title", True), "dv1000")
         self.assertEqual(s.effective_output_mode("unpinned-title", False), "dv1000")
+
+
+class DoFeaturettesReplacesFeaturettesLast(unittest.TestCase):
+    """The per-show toggle changed meaning (user-dictated 2026-09-05): it used to choose the
+    ORDER of season-00 specials, it now chooses whether they are upscaled at all. The old
+    `featurettes_last` value must NOT carry over — BOTH of its states meant "process them",
+    so neither maps onto "skip them", and inheriting False would silently stop upscaling
+    specials for any show that had picked numeric order."""
+
+    def setUp(self):
+        # HERMETIC: per-show settings live in show_profiles.json (PROFILES_FILE), NOT in
+        # SETTINGS_FILE — redirecting the latter is not enough, and without this these
+        # tests write fake shows into the real profile store (caught doing exactly that).
+        import tempfile, os as _os
+        p = mock.patch.object(settings, "PROFILES_FILE",
+                              _os.path.join(tempfile.mkdtemp(), "show_profiles.json"))
+        p.start(); self.addCleanup(p.stop)
+        settings.all_profiles.cache_clear() if hasattr(settings.all_profiles, "cache_clear") else None
+
+    def test_it_defaults_to_on(self):
+        self.assertTrue(settings.get_show_do_featurettes("Some Show"))
+
+    def test_an_old_featurettes_last_false_does_not_become_skip(self):
+        settings._update_show("Legacy Show", featurettes_last=False)
+        self.assertTrue(settings.get_show_do_featurettes("Legacy Show"))
+
+    def test_it_round_trips(self):
+        settings.set_show_do_featurettes("Some Show", False)
+        self.assertFalse(settings.get_show_do_featurettes("Some Show"))
+        settings.set_show_do_featurettes("Some Show", True)
+        self.assertTrue(settings.get_show_do_featurettes("Some Show"))
+
+    def test_it_is_per_show(self):
+        settings.set_show_do_featurettes("A", False)
+        self.assertFalse(settings.get_show_do_featurettes("A"))
+        self.assertTrue(settings.get_show_do_featurettes("B"))

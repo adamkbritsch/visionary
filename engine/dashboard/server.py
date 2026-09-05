@@ -150,7 +150,7 @@ def series_info():
         shows.append({"name": nm, "preset": settings.show_preset_key(nm),
                       "configured": settings.get_show_preset(nm) is not None,
                       "unwatched_first": settings.get_show_unwatched_first(nm),
-                      "featurettes_last": settings.get_show_featurettes_last(nm),
+                      "do_featurettes": settings.get_show_do_featurettes(nm),
                       "normalize_audio": settings.get_show_normalize_audio(nm),
                       "replace_source": settings.get_show_replace_source(nm),
                       "output_mode": settings.get_show_output_mode(nm),
@@ -661,7 +661,7 @@ def show_settings_view(name) -> dict:
     return {"preset": settings.show_preset_key(name),
             "configured": settings.get_show_preset(name) is not None,
             "unwatched_first": settings.get_show_unwatched_first(name),
-            "featurettes_last": settings.get_show_featurettes_last(name),
+            "do_featurettes": settings.get_show_do_featurettes(name),
             # only shows the toggle when the show actually HAS season-00 specials
             "has_featurettes": int((series.cached_queue(name) or {}).get("featurette_count", 0)) > 0,
             "normalize_audio": settings.get_show_normalize_audio(name),
@@ -1801,8 +1801,8 @@ class Handler(BaseHTTPRequestHandler):
                 # (title) and YouTube channels (folder) reuse this endpoint verbatim. No
                 # queue refresh: audio doesn't affect ordering.
                 settings.set_show_normalize_audio(show, bool(body.get("normalize_audio")))
-            if "featurettes_last" in body:
-                settings.set_show_featurettes_last(show, bool(body.get("featurettes_last")))
+            if "do_featurettes" in body:
+                settings.set_show_do_featurettes(show, bool(body.get("do_featurettes")))
                 try: series.refresh_queue(show)      # re-order the queue with the new setting
                 except Exception: pass
             if "replace_source" in body:

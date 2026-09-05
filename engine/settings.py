@@ -484,15 +484,23 @@ def set_show_extend_prompt(key: str, value) -> str:
     return v
 
 
-def get_show_featurettes_last(key: str) -> bool:
-    """Per-show: process season-00 specials/featurettes AFTER the whole show (True,
-    default) or leave them in numeric order, where "S00" sorts ahead of "S01" and they
-    would be upscaled BEFORE the show itself."""
-    return bool(_show_entry(key).get("featurettes_last", True))
+def get_show_do_featurettes(key: str) -> bool:
+    """Per-show: upscale the season-00 specials/featurettes AT ALL (True, default).
+
+    This replaced a "featurettes last" ORDERING toggle (user-dictated 2026-09-05):
+    running them after the whole show is simply always right — "S00" sorts ahead of
+    "S01", so numeric order put bonus features before the show itself, which nobody
+    wanted. The real question is whether to spend hours of Topaz on them, so that is
+    what the toggle asks now, and last-place ordering is unconditional.
+
+    The old `featurettes_last` key is deliberately NOT migrated: BOTH of its states
+    meant "process them", only in a different order, so neither maps to "skip them".
+    Everyone therefore starts at the honest default of True."""
+    return bool(_show_entry(key).get("featurettes", True))
 
 
-def set_show_featurettes_last(key: str, value) -> bool:
-    _update_show(key, featurettes_last=bool(value))
+def set_show_do_featurettes(key: str, value) -> bool:
+    _update_show(key, featurettes=bool(value))
     return bool(value)
 
 

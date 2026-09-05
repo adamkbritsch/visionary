@@ -256,11 +256,12 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": show, "unwatched_first": on]); await refresh()
     }
 
-    // Per-show: run season-00 specials/featurettes AFTER the whole show (on) vs in numeric
-    // order, where "S00" sorts ahead of "S01" and they'd be upscaled first.
-    func setFeaturettesLast(_ show: String, _ on: Bool) async {
+    // Per-show: upscale the season-00 specials/featurettes AT ALL. They always run after
+    // the whole show now — the ordering was never a real choice (user-dictated 2026-09-05);
+    // the hours of Topaz they cost is.
+    func setShowDoFeaturettes(_ show: String, _ on: Bool) async {
         guard !show.isEmpty else { return }
-        await post("/api/show-profile", ["show": show, "featurettes_last": on]); await refresh()
+        await post("/api/show-profile", ["show": show, "do_featurettes": on]); await refresh()
     }
     // Per-item (TV show / movie title / channel folder — the item's show_profiles key):
     // apply the smart loudness boost during remux (on) vs keep audio bit-exact (off).

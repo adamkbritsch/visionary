@@ -2002,8 +2002,8 @@ private struct TVMode: View {
                 }
             }
             if (show.queue?.featurette_count ?? 0) > 0 {
-                FeaturettesLastRow(key: name, on: show.featurettes_last ?? true,
-                                   count: show.queue?.featurette_count ?? 0)
+                FeaturettesRow(key: name, on: show.do_featurettes ?? true,
+                               count: show.queue?.featurette_count ?? 0)
             }
             UnwatchedFirstRow(key: name, on: show.unwatched_first ?? true)
             NextUpRow(show: name, next: show.next_up, armed: show.next_up_armed ?? false,
@@ -2072,21 +2072,26 @@ private struct LockedSettingsLine: View {
 // Compact per-show checkbox — under each show's preset so it's set per show, not global.
 // A standalone view (not a TVMode method) so the QUEUED follow-up show can carry the same
 // control: it keys on the show NAME, so it is settable before that show is ever active.
-// Season-00 specials (Lost's "Missing Pieces" mobisodes, featurettes) are real SxxExx
-// files, and "S00" sorts before "S01" — so without this they get upscaled BEFORE the show
-// itself. Shown ONLY when the show actually has some (inert noise otherwise).
-private struct FeaturettesLastRow: View {
+// Season-00 specials (Lost's "Missing Pieces" mobisodes, featurettes) are real SxxExx files.
+// They ALWAYS run after the whole show — "S00" sorts before "S01", so any other order puts
+// bonus features ahead of the show itself, which is never what anyone wants. What IS worth
+// choosing is whether to spend the Topaz hours on them at all (user-dictated 2026-09-05).
+// Shown ONLY when the show actually has some (inert noise otherwise).
+private struct FeaturettesRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
     let on: Bool
     let count: Int
     var body: some View {
         Toggle(isOn: Binding(get: { on },
-                             set: { v in Task { await store.setFeaturettesLast(key, v) } })) {
-            Text("Featurettes last").font(.system(size: 12)).foregroundStyle(.secondary)
+                             set: { v in Task { await store.setShowDoFeaturettes(key, v) } })) {
+            Text("Upscale featurettes").font(.system(size: 12)).foregroundStyle(.secondary)
         }
-        .help("On: the \(count) season-00 special\(count == 1 ? "" : "s") run after the whole "
-              + "show. Off: they keep numeric order, which puts them FIRST.")
+        .help(count > 0
+              ? "On: the \(count) season-00 special\(count == 1 ? "" : "s") are upscaled too, "
+                + "after the whole show. Off: they are left alone."
+              : "On: season-00 specials are upscaled too, after the whole show. "
+                + "Off: they are left alone.")
     }
 }
 
@@ -2349,7 +2354,7 @@ private struct NextUpRow: View {
                         }
                     }
                     if profile?.has_featurettes == true {
-                        FeaturettesLastRow(key: n, on: profile?.featurettes_last ?? true, count: 0)
+                        FeaturettesRow(key: n, on: profile?.do_featurettes ?? true, count: 0)
                     }
                     UnwatchedFirstRow(key: n, on: profile?.unwatched_first ?? true)
                 }
@@ -4005,7 +4010,7 @@ private struct SettingsGroupLabel: View {
 }
 
 // The header gear's popup. Everything in it is UNIVERSAL — per-show options (preset, normalize
-// audio, replaces source, unwatched first, featurettes last, up next) live on each show's block.
+// audio, replaces source, unwatched first, upscale featurettes, up next) live on each show's block.
 // Nothing here changes how a file is ENCODED: the loudness target and the peak bitrate cap stay
 // engine-only on purpose. These knobs decide what runs, when, how much at once, and what qualifies.
 struct SettingsPopover: View {

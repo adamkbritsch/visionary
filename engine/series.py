@@ -87,16 +87,23 @@ def is_featurette(ep_key: str) -> bool:
     return str(ep_key or "").upper().startswith("S00")
 
 
-def build_queue(names, dv_map=None, watched_map=None, skip=(), featurettes_last=True) -> dict:
+def build_queue(names, dv_map=None, watched_map=None, skip=(), do_featurettes=True) -> dict:
     """Queue = episodes with a non-DV source and no DV anywhere yet. Ordered UNWATCHED-FIRST
     then watched, numeric within each group (do the episodes the user hasn't seen yet before
     the ones they have). With no watched_map it's plain numeric order. `skip` excludes ep keys
-    from `next` (e.g. episodes the orchestrator PARKED after repeated failures)."""
+    from `next` (e.g. episodes the orchestrator PARKED after repeated failures).
+
+    Season-00 specials ALWAYS sort last — that is no longer a choice (user-dictated
+    2026-09-05). `do_featurettes=False` drops them from the queue entirely instead: the
+    question worth asking is whether to spend the hours, not what order to spend them in.
+    They still count in `featurette_count`, which is what tells the UI to offer the toggle."""
     eps = parse_episodes(names, dv_map, watched_map)
     remaining = [e for e in eps if e["has_source"] and not e["has_dv"]]
+    if not do_featurettes:
+        remaining = [e for e in remaining if not is_featurette(e["ep"])]
     # Sort is STABLE, so numeric order survives inside every group. Featurettes-last
     # dominates (they belong after the whole show); unwatched-first applies within each.
-    remaining.sort(key=lambda e: ((1 if (featurettes_last and is_featurette(e["ep"])) else 0),
+    remaining.sort(key=lambda e: (1 if is_featurette(e["ep"]) else 0,
                                   1 if e.get("watched") else 0))
     nextable = [e for e in remaining if e["ep"] not in skip]
     return {
@@ -107,7 +114,8 @@ def build_queue(names, dv_map=None, watched_map=None, skip=(), featurettes_last=
         "remaining_count": len(remaining),
         "unwatched_count": sum(1 for e in remaining if not e.get("watched")),
         "done_count": sum(1 for e in eps if e["has_dv"]),
-        # >0 means the show HAS specials, which is what makes the UI toggle relevant
+        # >0 means the show HAS specials, which is what makes the UI toggle relevant —
+        # counted over ALL episodes, so turning them off never hides the toggle itself
         "featurette_count": sum(1 for e in eps if is_featurette(e["ep"])),
         "source_count": sum(1 for e in eps if e["has_source"]),
     }
@@ -279,14 +287,14 @@ def episode_queue(series, skip=()) -> dict:
         wm = None
     try:
         import settings
-        feat_last = settings.get_show_featurettes_last(series)
+        do_feat = settings.get_show_do_featurettes(series)
     except Exception:
-        feat_last = True
+        do_feat = True
     names = list_episode_files(series)
     if names is None:
         return None                # NAS unreadable — "unknown", never "finished" (see above)
     return build_queue(names, load_dv_manifest(series),
-                       watched_map=wm, skip=skip, featurettes_last=feat_last)
+                       watched_map=wm, skip=skip, do_featurettes=do_feat)
 
 
 # ---- queue cache (so /api/state polling never hits the NAS) ---------------

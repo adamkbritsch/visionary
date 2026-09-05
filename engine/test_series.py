@@ -461,23 +461,43 @@ class SeriesRootCache(unittest.TestCase):
         self.assertEqual(series.series_root("B"), V3)
 
 
-class FeaturettesLast(unittest.TestCase):
+class Featurettes(unittest.TestCase):
     """Season 00 = specials/featurettes. They are real SxxExx files and "S00" sorts before
-    "S01", so by default they would be upscaled BEFORE the show itself."""
+    "S01", so untouched they would be upscaled BEFORE the show itself.
+
+    Last place is now UNCONDITIONAL and the toggle asks whether to upscale them at all
+    (user-dictated 2026-09-05): the ordering was never a real choice, the Topaz hours are."""
 
     NAMES = ["Lost - S00E17 - Missing Pieces.mkv", "Lost - S00E18 - More Pieces.mkv",
              "Lost - S01E01 - Pilot.mkv", "Lost - S01E02 - Tabula Rasa.mkv"]
 
-    def test_on_by_default_pushes_specials_to_the_end(self):
+    def test_specials_go_last_by_default(self):
         q = build_queue(self.NAMES)
         self.assertEqual(q["remaining"], ["S01E01", "S01E02", "S00E17", "S00E18"])
         self.assertEqual(q["next"]["ep"], "S01E01")     # a REAL episode, not a mobisode
         self.assertEqual(q["featurette_count"], 2)
 
-    def test_off_restores_plain_numeric_order(self):
-        q = build_queue(self.NAMES, featurettes_last=False)
-        self.assertEqual(q["remaining"], ["S00E17", "S00E18", "S01E01", "S01E02"])
-        self.assertEqual(q["next"]["ep"], "S00E17")
+    def test_specials_go_last_even_when_that_is_not_asked_for(self):
+        # there is no longer any input that puts a season-00 ahead of the show
+        q = build_queue(self.NAMES, do_featurettes=True)
+        self.assertEqual(q["remaining"][:2], ["S01E01", "S01E02"])
+
+    def test_off_drops_them_from_the_queue_entirely(self):
+        q = build_queue(self.NAMES, do_featurettes=False)
+        self.assertEqual(q["remaining"], ["S01E01", "S01E02"])
+        self.assertEqual(q["next"]["ep"], "S01E01")
+        self.assertEqual(q["remaining_count"], 2)
+        self.assertEqual([i["ep"] for i in q["remaining_items"]], ["S01E01", "S01E02"])
+
+    def test_off_still_reports_the_count_so_the_toggle_stays_visible(self):
+        # the UI shows the row only when featurette_count > 0 — turning them off must not
+        # hide the control that turns them back on
+        self.assertEqual(build_queue(self.NAMES, do_featurettes=False)["featurette_count"], 2)
+
+    def test_off_on_a_show_that_is_ONLY_specials_leaves_nothing_to_do(self):
+        q = build_queue(self.NAMES[:2], do_featurettes=False)
+        self.assertEqual(q["remaining"], [])
+        self.assertIsNone(q["next"])
 
     def test_zero_count_when_a_show_has_no_specials(self):
         self.assertEqual(build_queue(self.NAMES[2:])["featurette_count"], 0)
