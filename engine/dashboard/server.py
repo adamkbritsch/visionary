@@ -1098,6 +1098,46 @@ def api_install_dv_probe():
 
 
 def up_next(limit=10, current=None, inflight=None):
+    """The queue as the pipeline will actually serve it: the PRIORITY BOOK first, then the
+    ordinary cadence (`_up_next_cadence`).
+
+    Sent-to-Visionary videos were effectively invisible here (user-caught 2026-09-04: of 8
+    sends, 1 appeared anywhere, one of them at position 62 of 80 — while being the very next
+    thing the pipeline would run). The cadence view is built from each channel's cached
+    staging listing, round-robined across channels; the book was only ever read to decorate
+    rows that happened to already be there, and it is the book — not the listing — that
+    decides what runs next. Two ways a send went missing: its channel's column had dozens of
+    older videos ahead of it, and that cache is only re-listed inside the selection loop, so
+    a video downloaded during a long encode was not in the listing at all yet.
+
+    The book is prepended in book order (front = next) and any duplicate is REMOVED from the
+    cadence tail, so a jumping video appears once, at the top, where it will actually run."""
+    rows = _up_next_cadence(limit=limit, current=current, inflight=inflight)
+    try:
+        import youtube as _yt
+        book, done = _yt._priority(), _yt.get_done()
+    except Exception:
+        return rows
+    cur_name = (current or {}).get("name") or ""
+    lead, seen = [], set()
+    for e in book:
+        path = e.get("path")
+        if not path or not _yt._jumps(e) or e.get("vid") in done:
+            continue                       # unlocated, or an import (a cadence-joiner, not a jump)
+        name = os.path.basename(path)
+        if name == cur_name or name in seen:
+            continue                       # already running, or listed twice in the book
+        seen.add(name)
+        lead.append({"kind": "youtube", "channel": e.get("channel"), "name": name,
+                     "title": e.get("title") or _yt.video_title(name, e.get("channel")),
+                     "priority": True})
+    if not lead:
+        return rows
+    return lead + [r for r in rows
+                   if not (r.get("kind") == "youtube" and r.get("name") in seen)]
+
+
+def _up_next_cadence(limit=10, current=None, inflight=None):
     """The next ≤`limit` UPCOMING items in PROCESSING order — the active series ROUND-ROBINED
     (one episode each from the rotation pointer, looping), with movies interleaved by their slot
     (movies.pos = episodes ahead). EVERYTHING already IN the pipeline is EXCLUDED in every form

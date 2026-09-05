@@ -55,7 +55,10 @@ class UpNext(unittest.TestCase):
         # HERMETIC: without this the tests read the REAL YouTube queue off this machine and
         # assert against whatever happens to be pending. They only passed before because the
         # (now-removed) per-channel length cap filtered that live data to empty.
-        with mock.patch.object(youtube, "all_pending", return_value=[]), \
+        # ...and up_next LEADS with the priority book now, which is live state too: with real
+        # sends queued these read the machine's actual book instead of the cadence under test.
+        with mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(youtube, "all_pending", return_value=[]), \
              mock.patch.object(movies, "get_selected", return_value=movies_list), \
              mock.patch.object(series, "get_active_series", return_value=["show"]), \
              mock.patch.object(series, "get_rotation", return_value=0), \
@@ -66,7 +69,8 @@ class UpNext(unittest.TestCase):
     def _rr(self, active, queues, rotation=0, limit=10):   # multi-series round-robin, no movies
         import movies, series, youtube
         from unittest import mock
-        with mock.patch.object(youtube, "all_pending", return_value=[]), \
+        with mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(youtube, "all_pending", return_value=[]), \
              mock.patch.object(movies, "get_selected", return_value=[]), \
              mock.patch.object(series, "get_active_series", return_value=active), \
              mock.patch.object(series, "get_rotation", return_value=rotation), \

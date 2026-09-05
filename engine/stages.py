@@ -294,9 +294,32 @@ def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pau
     # A clean segment-boundary pause is NOT a failure — log it as an event so it never
     # shows up in the red "Recent issues" banner. Same for a "permanent:" refusal
     # (already-DV source): expected behavior, and the park logs its own single line.
-    benign = (not ok) and (str(msg).startswith("paused:") or str(msg).startswith("permanent:"))
+    # "interrupted:" is the third benign class: WE stopped the work (a stop/deploy, a Plex
+    # stream starting, the run thread claiming an item the prefetcher was mid-way through).
+    # Nothing is wrong with the item and the next attempt just redoes it — but it was logged
+    # as a red FAIL, so one long video accumulated six "CFR convert failed" lines in an
+    # evening and read like a broken file (user-caught 2026-09-04). Kept distinct from
+    # "paused:", which the run loop treats as a segment-boundary YIELD and does bookkeeping for.
+    benign = (not ok) and (str(msg).startswith("paused:") or str(msg).startswith("permanent:")
+                           or str(msg).startswith("interrupted:"))
     (logbook.event if (ok or benign) else logbook.failure)(f"{stage} {ep}: {msg}")
     return ok, msg
+
+
+def cfr_failure_message(error_tail) -> str:
+    """PURE. How a failed CFR convert should be REPORTED.
+
+    to_cfr already tells our own kill apart from a content failure (a negative rc is always
+    a signal we sent — a stop/deploy, a Plex stream starting, the run thread claiming an item
+    the prefetcher was part-way through). That distinction was being thrown away, so routine
+    interruptions logged as red "CFR convert failed" — one long video collected six of them
+    in an evening and read like a broken file (user-caught 2026-09-04).
+
+    "interrupted:" is benign in run_stage. Deliberately NOT "paused:", which the run loop
+    treats as a segment-boundary yield and does livelock bookkeeping for."""
+    if str(error_tail) == "aborted":
+        return "interrupted: CFR convert stopped — the next attempt redoes it"
+    return f"CFR convert failed: {_err_tail(error_tail)}"
 
 
 def _download(p, abort, progress=None, low_prio=False):
@@ -462,7 +485,7 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
     res = topaz.to_cfr(p.source, p.source_cfr, abort=abort, on_progress=on_prog,
                        low_prio=low_prio, copy_only=fast)
     if not res.ok:
-        return False, f"CFR convert failed: {_err_tail(res.error_tail)}"
+        return False, cfr_failure_message(res.error_tail)
     if res.capped_secs:
         # Worth saying out loud: the source's container ran past its own picture, so the CFR
         # was bounded to the picture. Unbounded, Resolve takes the CONTAINER's length as the

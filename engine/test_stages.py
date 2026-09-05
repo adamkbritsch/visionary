@@ -2226,3 +2226,42 @@ class ImportedVideosUseTheirBatchSettings(unittest.TestCase):
         with mock.patch.object(youtube, "settings_scope_for_vid",
                                side_effect=OSError("book unreadable")):
             self.assertEqual(stages._settings_scope(p), "Chan")
+
+
+class AnAbortedCfrIsNotAFailure(unittest.TestCase):
+    """One long video logged six red "CFR convert failed" lines in an evening and read like a
+    broken file (user-caught 2026-09-04). Every one was OUR OWN kill — a stop/deploy, a Plex
+    stream starting, or the run thread claiming an item the prefetcher was part-way through.
+    to_cfr already distinguishes them (a negative rc is always our own signal); the stage was
+    throwing that away and reporting a failure."""
+
+    def test_an_abort_is_reported_as_interrupted(self):
+        msg = stages.cfr_failure_message("aborted")
+        self.assertTrue(msg.startswith("interrupted:"), msg)
+
+    def test_a_real_failure_still_says_failed(self):
+        msg = stages.cfr_failure_message("x264: invalid frame size")
+        self.assertIn("CFR convert failed", msg)
+        self.assertFalse(msg.startswith("interrupted:"))
+
+    def test_it_is_never_the_yield_prefix(self):
+        # "paused:" means a segment-boundary YIELD to the run loop, which does livelock
+        # bookkeeping on it — an abort must not be mistaken for one
+        for tail in ("aborted", "boom", None):
+            self.assertFalse(stages.cfr_failure_message(tail).startswith("paused:"))
+
+    def test_interrupted_logs_as_an_event_not_a_red_failure(self):
+        with mock.patch.object(stages, "_download",
+                               return_value=(False, "interrupted: CFR convert stopped")), \
+             mock.patch.object(stages.logbook, "failure") as fail, \
+             mock.patch.object(stages.logbook, "event") as event:
+            stages.run_stage("download", mock.MagicMock(ep="X"))
+        fail.assert_not_called()
+        event.assert_called_once()
+
+    def test_a_real_failure_still_logs_red(self):
+        with mock.patch.object(stages, "_download",
+                               return_value=(False, "CFR convert failed: boom")), \
+             mock.patch.object(stages.logbook, "failure") as fail:
+            stages.run_stage("download", mock.MagicMock(ep="X"))
+        fail.assert_called_once()

@@ -37,6 +37,10 @@ class UpNextCadence(unittest.TestCase):
             # LIVE pipeline happens to be part-way through
             s.enter_context(mock.patch.object(orchestrator.ORCH, "_yt_in_burst", 0))
             s.enter_context(mock.patch.object(orchestrator.ORCH, "_parked", set(parked)))
+            # up_next LEADS with the priority book, so an unpinned book means these cadence
+            # tests read whatever is genuinely queued on this machine — the same live-state
+            # leak the _yt_in_burst pin above exists for. Book behaviour has its own tests.
+            s.enter_context(mock.patch.object(youtube, "_priority", return_value=[]))
             return [it["kind"] for it in server.up_next(limit=limit, current=current)]
 
     def test_one_video_every_two_episodes(self):
@@ -93,3 +97,82 @@ class UpNextCadence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SentVideosLeadTheQueue(unittest.TestCase):
+    """Sent-to-Visionary videos were effectively invisible in the up-next list (user-caught
+    2026-09-04: of 8 sends exactly 1 appeared anywhere, one at position 62 of 80) while being
+    the very next thing the pipeline would run. The list was built only from the per-channel
+    staging cache, round-robined; the book that actually decides serving order was read only
+    to decorate rows that happened to already be there."""
+
+    def _rows(self, book, pending=(), current=None, items=None, done=()):
+        items = items if items is not None else [{"ep": "S01E01", "source_name": "a.mkv"}]
+        with contextlib.ExitStack() as s:
+            s.enter_context(mock.patch.object(series, "get_active_series", return_value=["A"]))
+            s.enter_context(mock.patch.object(series, "get_rotation", return_value=0))
+            s.enter_context(mock.patch.object(series, "cached_queue",
+                                              return_value={"remaining_items": items}))
+            s.enter_context(mock.patch.object(movies, "get_selected", return_value=[]))
+            s.enter_context(mock.patch.object(youtube, "all_pending",
+                                              return_value=list(pending)))
+            s.enter_context(mock.patch.object(youtube, "_priority", return_value=list(book)))
+            s.enter_context(mock.patch.object(youtube, "get_done", return_value=set(done)))
+            s.enter_context(mock.patch.object(settings, "get_settings",
+                                              return_value={"youtube_every_tv_episodes": 99}))
+            s.enter_context(mock.patch.object(orchestrator.ORCH, "_tv_since_yt", 0))
+            s.enter_context(mock.patch.object(orchestrator.ORCH, "_yt_in_burst", 0))
+            s.enter_context(mock.patch.object(orchestrator.ORCH, "_parked", set()))
+            return server.up_next(limit=10, current=current)
+
+    def _sent(self, vid, name, title="Sent One"):
+        return {"vid": vid, "title": title, "channel": "Chan", "sent_at": 1,
+                "path": "/Media/YouTube-raw/Chan/x/" + name}
+
+    def test_a_send_leads_the_list(self):
+        rows = self._rows([self._sent("aaaaaaaaaa1", "v1.mp4")])
+        self.assertEqual(rows[0]["kind"], "youtube")
+        self.assertEqual(rows[0]["name"], "v1.mp4")
+        self.assertTrue(rows[0]["priority"])
+
+    def test_book_order_is_preserved(self):
+        rows = self._rows([self._sent("aaaaaaaaaa1", "v1.mp4"),
+                           self._sent("aaaaaaaaaa2", "v2.mp4")])
+        self.assertEqual([r["name"] for r in rows[:2]], ["v1.mp4", "v2.mp4"])
+
+    def test_a_send_buried_in_its_channel_column_moves_up_and_is_not_duplicated(self):
+        # THE BUG: it was at position 62 of 80 while being next.
+        deep = [{"channel": "Chan", "source_name": "old%d.mp4" % i, "title": "old",
+                 "vid": "z" * 10 + str(i % 10)} for i in range(30)]
+        deep.append({"channel": "Chan", "source_name": "v1.mp4", "title": "Sent One",
+                     "vid": "aaaaaaaaaa1"})
+        rows = self._rows([self._sent("aaaaaaaaaa1", "v1.mp4")], pending=deep, items=[])
+        self.assertEqual(rows[0]["name"], "v1.mp4")
+        self.assertEqual(sum(1 for r in rows if r.get("name") == "v1.mp4"), 1)
+
+    def test_the_running_video_is_not_listed_as_next(self):
+        rows = self._rows([self._sent("aaaaaaaaaa1", "v1.mp4")],
+                          current={"kind": "youtube", "name": "v1.mp4"})
+        self.assertFalse([r for r in rows if r.get("name") == "v1.mp4"])
+
+    def test_an_unlocated_send_is_not_promised(self):
+        # no `path` yet = youtarr has not delivered it; it cannot run next
+        e = self._sent("aaaaaaaaaa1", "v1.mp4"); e["path"] = None
+        self.assertFalse([r for r in self._rows([e]) if r.get("kind") == "youtube"])
+
+    def test_a_finished_send_drops_out(self):
+        rows = self._rows([self._sent("aaaaaaaaaa1", "v1.mp4")], done={"aaaaaaaaaa1"})
+        self.assertFalse([r for r in rows if r.get("kind") == "youtube"])
+
+    def test_imports_do_not_jump(self):
+        # jump=False = a pasted-link import: it joins the cadence, it does not preempt
+        e = self._sent("aaaaaaaaaa1", "v1.mp4"); e["jump"] = False; e["batch"] = "imp1"
+        self.assertFalse([r for r in self._rows([e]) if r.get("kind") == "youtube"])
+
+    def test_an_empty_book_leaves_the_cadence_exactly_as_it_was(self):
+        items = [{"ep": "S01E0%d" % i, "source_name": "a%d.mkv" % i} for i in range(1, 4)]
+        with mock.patch.object(server, "_up_next_cadence") as cad:
+            cad.return_value = [{"kind": "episode", "ep": "S01E01"}]
+            with mock.patch.object(youtube, "_priority", return_value=[]):
+                rows = server.up_next(limit=10)
+        self.assertEqual(rows, [{"kind": "episode", "ep": "S01E01"}])
