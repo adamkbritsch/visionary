@@ -1119,22 +1119,33 @@ def up_next(limit=10, current=None, inflight=None):
     except Exception:
         return rows
     cur_name = (current or {}).get("name") or ""
-    lead, seen = [], set()
+    lead, names, keys = [], set(), set()
     for e in book:
+        if not _yt._jumps(e) or e.get("vid") in done:
+            continue                       # an import: a cadence-joiner, never a jump
         path = e.get("path")
-        if not path or not _yt._jumps(e) or e.get("vid") in done:
-            continue                       # unlocated, or an import (a cadence-joiner, not a jump)
-        name = os.path.basename(path)
-        if name == cur_name or name in seen:
+        # NOT-YET-DOWNLOADED SENDS STILL SHOW. youtarr needs a while to fetch a 4K video, and
+        # for that whole window the entry has no `path`. Hiding it meant pressing Send looked
+        # like nothing happened — and the press is exactly what the user is waiting to see
+        # acknowledged (user-caught 2026-09-04, minutes after the previous fix shipped). It is
+        # FLAGGED instead, so the row can say it is fetching rather than claim it runs next.
+        name = os.path.basename(path) if path else ""
+        key = name or (e.get("vid") or "")
+        if not key or (name and name == cur_name) or key in keys:
             continue                       # already running, or listed twice in the book
-        seen.add(name)
+        keys.add(key)
+        if name:
+            names.add(name)
         lead.append({"kind": "youtube", "channel": e.get("channel"), "name": name,
-                     "title": e.get("title") or _yt.video_title(name, e.get("channel")),
-                     "priority": True})
+                     # never a blank row: the sender's title, else the filename's, else the id
+                     "title": (e.get("title")
+                               or (_yt.video_title(name, e.get("channel")) if name else "")
+                               or e.get("vid") or ""),
+                     "priority": True, "awaiting_download": not path})
     if not lead:
         return rows
     return lead + [r for r in rows
-                   if not (r.get("kind") == "youtube" and r.get("name") in seen)]
+                   if not (r.get("kind") == "youtube" and r.get("name") in names)]
 
 
 def _up_next_cadence(limit=10, current=None, inflight=None):

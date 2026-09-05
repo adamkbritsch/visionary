@@ -3784,10 +3784,14 @@ private struct UpNextView: View {
                 // Already queued to jump: SAY so. The pipeline only yields at the next Topaz
                 // segment boundary (deliberate — the in-flight segment finishes first), which
                 // can be a couple of minutes, and an unacknowledged press reads as broken.
-                Text("running next").font(.system(size: 10)).foregroundStyle(Color.brand)
+                let fetching = it.awaiting_download == true
+                Text(fetching ? "fetching" : "running next").font(.system(size: 10))
+                    .foregroundStyle(fetching ? DS.steel : Color.brand)
                     .padding(.horizontal, 5).padding(.vertical, 1)
                     .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
-                    .help("Queued to jump the queue — starts when the current segment finishes")
+                    .help(fetching
+                          ? "Sent — youtarr is still downloading it. It jumps the queue as soon as it lands."
+                          : "Queued to jump the queue — starts when the current segment finishes")
             } else {
                 iconButton("arrow.up.to.line", enabled: true,
                            help: "Run this video now — the current segment finishes first, "

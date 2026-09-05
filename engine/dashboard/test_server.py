@@ -615,7 +615,10 @@ class UpNextMarksPriorityVideos(unittest.TestCase):
                  "title": "A", "vid": "aaaaaaaaaa1", "secs": 60},
                 {"channel": "Chan", "source_name": "b [aaaaaaaaaa2].mp4",
                  "title": "B", "vid": "aaaaaaaaaa2", "secs": 60}]
-        book = [{"vid": v} for v in prio_vids]
+        # a REAL send is located (youtarr delivered it), which is what makes it a lead row —
+        # an unlocated one is a separate, flagged "fetching" case with its own tests
+        paths = {v["vid"]: "/Media/YouTube-raw/Chan/x/" + v["source_name"] for v in vids}
+        book = [{"vid": v, "path": paths.get(v)} for v in prio_vids]
         with mock.patch.object(youtube, "all_pending", return_value=vids), \
              mock.patch.object(youtube, "_priority", return_value=book), \
              mock.patch.object(movies, "get_selected", return_value=[]), \
@@ -624,8 +627,12 @@ class UpNextMarksPriorityVideos(unittest.TestCase):
             return [(o.get("title"), o.get("priority"))
                     for o in server.up_next(limit=10) if o.get("kind") == "youtube"]
 
-    def test_flags_only_the_requested_video(self):
-        self.assertEqual(self._run(["aaaaaaaaaa2"]), [("A", False), ("B", True)])
+    def test_the_requested_video_leads_and_only_it_is_flagged(self):
+        # it is not merely decorated in place any more: the book is the serving order, so B
+        # leads and is removed from the cadence tail (it must appear exactly once)
+        # "b" not "B": a book entry carrying no title of its own derives one from the
+        # filename (which is youtarr's, i.e. the real title in practice)
+        self.assertEqual(self._run(["aaaaaaaaaa2"]), [("b", True), ("A", False)])
 
     def test_no_request_flags_nothing(self):
         self.assertEqual(self._run([]), [("A", False), ("B", False)])

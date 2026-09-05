@@ -155,9 +155,21 @@ class SentVideosLeadTheQueue(unittest.TestCase):
                           current={"kind": "youtube", "name": "v1.mp4"})
         self.assertFalse([r for r in rows if r.get("name") == "v1.mp4"])
 
-    def test_an_unlocated_send_is_not_promised(self):
-        # no `path` yet = youtarr has not delivered it; it cannot run next
+    def test_a_send_still_downloading_holds_its_place_and_says_so(self):
+        # no `path` yet = youtarr is still fetching. Hiding it made the send look inert —
+        # the press is what the user is waiting to see acknowledged.
         e = self._sent("aaaaaaaaaa1", "v1.mp4"); e["path"] = None
+        rows = self._rows([e])
+        self.assertEqual(rows[0]["kind"], "youtube")
+        self.assertTrue(rows[0]["priority"])
+        self.assertTrue(rows[0]["awaiting_download"])       # "fetching", not "running next"
+
+    def test_a_located_send_is_not_marked_as_fetching(self):
+        rows = self._rows([self._sent("aaaaaaaaaa1", "v1.mp4")])
+        self.assertFalse(rows[0]["awaiting_download"])
+
+    def test_an_entry_with_neither_path_nor_vid_is_skipped(self):
+        e = self._sent("aaaaaaaaaa1", "v1.mp4"); e["path"] = None; e["vid"] = None
         self.assertFalse([r for r in self._rows([e]) if r.get("kind") == "youtube"])
 
     def test_a_finished_send_drops_out(self):

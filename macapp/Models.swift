@@ -625,6 +625,10 @@ struct UpNextDTO: Codable, Identifiable {
     var name: String?          // movies + youtube (basename → remove/reorder key)
     var channel: String?       // youtube: which channel
     var priority: Bool?        // youtube: "run now" pressed — jumps the queue at the next boundary
+    // sent, but youtarr is still fetching it — it holds its place in the queue and says so
+    // rather than claiming it runs next (a 4K fetch is minutes, and hiding it read as "the
+    // send did nothing")
+    var awaiting_download: Bool?
     var id: String { [kind, series, channel, ep, title, source_name, name].compactMap { $0 }.joined(separator: "|") }
 }
 
