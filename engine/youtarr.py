@@ -11,12 +11,18 @@ youtube.list_channels falls back to the on-disk folders.
 from __future__ import annotations
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
 from transfer import _config, nas_hosts
 
 _TOKEN = {"token": None}          # cached session token (in-process)
+# youtarr's /auth/login is rate-limited to 5 attempts per 15-minute window per IP. After a
+# 429, no login is attempted until this lapses — retrying sooner only burns the window's
+# remaining attempts. 5 minutes recovers well inside one window without hammering it.
+LOGIN_BACKOFF_SECONDS = 300.0
+_LOGIN_BLOCKED_UNTIL = [0.0]      # epoch; list so tests and _login can reset it in place
 
 
 def _creds():
@@ -49,14 +55,40 @@ def _get(base, path, token, timeout=10):
 
 
 def _login(base):
-    """POST /auth/login → a session token (cached), or None. Password stays in config, never logged."""
+    """POST /auth/login → a session token (cached), or None. Password stays in config, never logged.
+
+    youtarr rate-limits THIS endpoint (brute-force protection) and answers 429. That used to
+    be swallowed like any other error, so every caller read "no data" with nothing to say
+    why — and, worse, each subsequent call with no cached token tried to log in AGAIN,
+    extending the lockout (live-caught 2026-09-05: a burst of probe processes, each with an
+    empty token cache, turned one 429 into a storm that made every channel look empty).
+    A 429 now arms a back-off: no login attempts until it lapses (Retry-After when the
+    server sends one, else LOGIN_BACKOFF_SECONDS)."""
     user, pw = _creds()
     if not (user and pw):
         return None
+    if time.time() < _LOGIN_BLOCKED_UNTIL[0]:
+        return None                              # still backing off — do not extend the lockout
     try:
         tok = (_post(base, "/auth/login", {"username": user, "password": pw}) or {}).get("token")
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            try:
+                wait = float(e.headers.get("Retry-After") or LOGIN_BACKOFF_SECONDS)
+            except (TypeError, ValueError):
+                wait = LOGIN_BACKOFF_SECONDS
+            _LOGIN_BLOCKED_UNTIL[0] = time.time() + max(1.0, wait)
+            try:                                 # say so ONCE per back-off, never silently
+                import logbook
+                logbook.event("youtarr: login rate-limited (429) — backing off %ds; "
+                              "channel listings read as empty until then" % int(wait))
+            except Exception:
+                pass
+        return None
     except Exception:
         return None
+    if tok:
+        _LOGIN_BLOCKED_UNTIL[0] = 0.0            # a real login clears any back-off
     _TOKEN["token"] = tok
     return tok
 
@@ -186,20 +218,60 @@ def channel_folder(channel_id):
     return None
 
 
-def channel_video_ids(channel_id, *, timeout=15):
-    """Every youtube video id youtarr knows for a channel (GET /getchannelvideos/:id), or [] on
-    failure. Used to strip a wiped channel from the download archive so it can re-download later."""
+# The channel tabs Visionary COUNTS as a channel's programme. `shorts` is deliberately
+# absent — see channel_video_ids.
+CHANNEL_TABS = ("videos", "streams")
+
+
+def channel_video_ids(channel_id, *, timeout=15, page_size=100, max_pages=400, tabs=None):
+    """EVERY youtube video id youtarr knows for a channel (GET /getchannelvideos/:id), or []
+    on failure.
+
+    PAGED, because the endpoint returns 50 at a time and reports the real size in
+    `totalCount`. Taking only the first page silently truncated the channel to its 50
+    newest videos, and this list is the CANDIDATE POOL that fetch-ahead asks youtarr to
+    download — so the older tail was never requested and those videos could never be
+    upscaled (user-caught 2026-09-05: Wizards with Guns looked "finished" at 50 of 56).
+    The same truncation left the forgotten tail behind on a channel wipe, so a re-added
+    channel would not re-download them either.
+
+    TABS. youtarr indexes a channel's YouTube tabs separately and this endpoint answers for
+    ONE tab per call (default `videos`). `videos` and `streams` are the channel's real
+    programme and are both counted; `shorts` are 60-second vertical clips and are NEVER
+    requested (user-dictated 2026-09-05: "don't count shorts").
+
+    Stops per tab on an empty/short page, on reaching that tab's totalCount, on a page that
+    yields nothing new (a server ignoring `page` would repeat page 1), or at max_pages."""
     if not channel_id:
         return []
-    r = _call("GET", f"/getchannelvideos/{channel_id}", timeout=timeout)
-    vids = r.get("videos") if isinstance(r, dict) else r
-    if not isinstance(vids, list):
-        return []
-    out = []
-    for v in vids:
-        yid = (v.get("youtube_id") or v.get("youtubeId") or v.get("id")) if isinstance(v, dict) else None
-        if yid:
-            out.append(str(yid))
+    out, seen = [], set()
+    for tab in (tabs or CHANNEL_TABS):
+        total, got, page = None, 0, 1
+        while page <= max_pages:
+            r = _call("GET", "/getchannelvideos/%s?tabType=%s&page=%d&pageSize=%d"
+                      % (channel_id, tab, page, page_size), timeout=timeout)
+            vids = r.get("videos") if isinstance(r, dict) else r
+            if isinstance(r, dict) and total is None:
+                tc = r.get("totalCount")
+                try:
+                    total = int(tc) if tc is not None else None
+                except (TypeError, ValueError):
+                    total = None
+            if not isinstance(vids, list) or not vids:
+                break
+            new = 0
+            for v in vids:
+                yid = (v.get("youtube_id") or v.get("youtubeId") or v.get("id")) if isinstance(v, dict) else v
+                if yid and str(yid) not in seen:
+                    seen.add(str(yid))
+                    out.append(str(yid))
+                    new += 1
+            got += len(vids)
+            if not new:
+                break
+            if len(vids) < page_size or (total is not None and got >= total):
+                break
+            page += 1
     return out
 
 
