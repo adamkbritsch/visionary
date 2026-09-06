@@ -735,7 +735,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 # SAY THE NUMBERS. "landing off target" with nothing to check it
                 # against is unfalsifiable from the log — the one thing you want
                 # when a file ships quiet is what it measured and where it went.
-                audio_note = _unboosted_note(mkv_measured, landed, audio_target_lufs)
+                audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)   # MP4 branch: measured_lufs
             audio_note += subs_note
         # ---- mux + verify + PEAK GATE, with a tightening ladder on a peak miss ------------------
         # VBV bufsize == maxrate legally allows a 1-second burst past cap × tolerance, and an
@@ -819,7 +819,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     # SAY THE NUMBERS. "landing off target" with nothing to check it
                     # against is unfalsifiable from the log — the one thing you want
                     # when a file ships quiet is what it measured and where it went.
-                    audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)
+                    audio_note = _unboosted_note(mkv_measured, landed, audio_target_lufs)   # MKV branch: mkv_measured
             else:
                 with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
                     mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output),
@@ -1021,8 +1021,13 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 on_step("preparing audio", None)
             atmos_lead = atmos_audio_index(cfr_source, ffprobe)      # see the cap path
             n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
+            # measured ONCE and kept: the landing test and the off-target note both need it.
+            # It used to be inline in boost_gain_db and the note named a variable that only
+            # the cap path binds — a NameError the first time a boost here landed off-target
+            # (Pyright-caught 2026-09-05; never fired live only because none had yet).
+            measured_lufs = None if atmos_lead is not None else measure_lufs(cfr_source, ffmpeg)
             gain = (0.0 if atmos_lead is not None
-                    else boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs))
+                    else boost_gain_db(measured_lufs, audio_target_lufs))
             if atmos_lead is not None:
                 audio_note = " · audio untouched (Atmos, now the main track)"
             tracks = output + ".tracks.mp4"
@@ -1048,7 +1053,10 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                     break
                 landed = measure_lufs(tracks, ffmpeg)
                 want = float(audio_target_lufs)
-                if landed is not None and abs(landed - want) <= 1.5:
+                # the same landing rule as the cap path (user-dictated: "normalize audio should
+                # normalize the audio"): BETTER than before passes — a limiter shortfall on a
+                # wide mix is not a reason to throw the whole boost away
+                if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
                 # SAY THE NUMBERS. "landing off target" with nothing to check it
@@ -1212,8 +1220,13 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                 on_step("preparing audio", None)
             atmos_lead = atmos_audio_index(cfr_source, ffprobe)      # see the cap path
             n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
+            # measured ONCE and kept: the landing test and the off-target note both need it.
+            # It used to be inline in boost_gain_db and the note named a variable that only
+            # the cap path binds — a NameError the first time a boost here landed off-target
+            # (Pyright-caught 2026-09-05; never fired live only because none had yet).
+            measured_lufs = None if atmos_lead is not None else measure_lufs(cfr_source, ffmpeg)
             gain = (0.0 if atmos_lead is not None
-                    else boost_gain_db(measure_lufs(cfr_source, ffmpeg), audio_target_lufs))
+                    else boost_gain_db(measured_lufs, audio_target_lufs))
             if atmos_lead is not None:
                 audio_note = " · audio untouched (Atmos, now the main track)"
             tracks = output + ".tracks.mp4"
@@ -1237,7 +1250,10 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                     break
                 landed = measure_lufs(tracks, ffmpeg)
                 want = float(audio_target_lufs)
-                if landed is not None and abs(landed - want) <= 1.5:
+                # the same landing rule as the cap path (user-dictated: "normalize audio should
+                # normalize the audio"): BETTER than before passes — a limiter shortfall on a
+                # wide mix is not a reason to throw the whole boost away
+                if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
                     audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
                     break
                 # SAY THE NUMBERS. "landing off target" with nothing to check it

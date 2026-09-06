@@ -1042,3 +1042,33 @@ class TheGapProbeMeasuresInterleavingNotGopLength(unittest.TestCase):
         _, seen = self._gap({})
         secs = int(seen["window"].split("+")[1])
         self.assertGreaterEqual(secs, 11)      # keyint 250 at 23.976 fps = 10.43 s
+
+
+class NoFreeMeasurementNames(unittest.TestCase):
+    """Static: the audio-landing note was refactored onto one helper and called with the
+    measurement variable — but the four remux paths name theirs differently, and two do not
+    store it at all. Pyright flagged `measured_lufs`/`mkv_measured` as undefined or unbound
+    in three functions (2026-09-05): a NameError the first time a boost lands off-target in
+    the inject/ship paths every YouTube video takes. Never fired live, only by luck. This
+    pins the CLASS: any load of these names inside a function must have a binding there."""
+
+    NAMES = {"measured_lufs", "mkv_measured"}
+
+    def test_every_load_has_a_binding_in_the_same_function(self):
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(remux))
+        problems = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            bound, loaded = set(), []
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Name) and node.id in self.NAMES:
+                    if isinstance(node.ctx, ast.Store):
+                        bound.add(node.id)
+                    else:
+                        loaded.append(node)
+                elif isinstance(node, ast.arg) and node.arg in self.NAMES:
+                    bound.add(node.arg)
+            for node in loaded:
+                if node.id not in bound:
+                    problems.append("%s: line %d loads %s with no binding" % (fn.name, node.lineno, node.id))
+        self.assertEqual(problems, [])
