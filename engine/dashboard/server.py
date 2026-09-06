@@ -1141,7 +1141,7 @@ def up_next(limit=10, current=None, inflight=None):
                      "title": (e.get("title")
                                or (_yt.video_title(name, e.get("channel")) if name else "")
                                or e.get("vid") or ""),
-                     "priority": True, "awaiting_download": not path})
+                     "priority": True, "jumps": True, "awaiting_download": not path})
     if not lead:
         return rows
     return lead + [r for r in rows
@@ -1223,14 +1223,25 @@ def _up_next_cadence(limit=10, current=None, inflight=None):
     # queued to jump. Without that the request looked inert: the pipeline only yields at the
     # next Topaz segment boundary (deliberately — see the run-now docs), which can be a
     # couple of minutes, and nothing in the UI acknowledged the press.
+    # WHICH rows wear the "running next" mark (user-dictated 2026-09-06): only a video the
+    # user activated themselves (a send / run-now — a JUMP entry) or an INDIVIDUALLY
+    # imported one. Not a playlist import: the book holds every video of every imported
+    # playlist, so keying on "is in the book" put the pill on hundreds of cadence-riding
+    # rows and made the mark meaningless. `jumps` says which of the two it is, so the app
+    # can describe a single import honestly (it rides the cadence, it does not preempt).
     try:
         import youtube as _yt
-        _prio_vids = {e.get("vid") for e in _yt._priority() if e.get("vid")}
+        _jump_vids = {e.get("vid") for e in _yt._priority() if e.get("vid") and _yt._jumps(e)}
+        _single_vids = {v for r in _yt._imports() if r.get("kind") == "video"
+                        for v in (r.get("vids") or [])}
     except Exception:
-        _prio_vids = set()
-    yt_item = lambda v: {"kind": "youtube", "channel": v.get("channel"),
-                         "name": v.get("source_name"), "title": v.get("title"),
-                         "priority": bool(v.get("vid") and v.get("vid") in _prio_vids)}
+        _jump_vids, _single_vids = set(), set()
+    def yt_item(v):
+        vid = v.get("vid")
+        return {"kind": "youtube", "channel": v.get("channel"),
+                "name": v.get("source_name"), "title": v.get("title"),
+                "priority": bool(vid and (vid in _jump_vids or vid in _single_vids)),
+                "jumps": bool(vid and vid in _jump_vids)}
     out, mi, yi, ep_count = [], 0, 0, tv_since
     # `limit` counts TV EPISODES (user-dictated): the queue always shows ten episodes of
     # actual show, with movies and YouTube videos riding along BETWEEN them rather than

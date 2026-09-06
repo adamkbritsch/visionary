@@ -41,6 +41,7 @@ class UpNextCadence(unittest.TestCase):
             # tests read whatever is genuinely queued on this machine — the same live-state
             # leak the _yt_in_burst pin above exists for. Book behaviour has its own tests.
             s.enter_context(mock.patch.object(youtube, "_priority", return_value=[]))
+            s.enter_context(mock.patch.object(youtube, "_imports", return_value=[]))
             return [it["kind"] for it in server.up_next(limit=limit, current=current)]
 
     def test_one_video_every_two_episodes(self):
@@ -117,6 +118,7 @@ class SentVideosLeadTheQueue(unittest.TestCase):
             s.enter_context(mock.patch.object(youtube, "all_pending",
                                               return_value=list(pending)))
             s.enter_context(mock.patch.object(youtube, "_priority", return_value=list(book)))
+            s.enter_context(mock.patch.object(youtube, "_imports", return_value=[]))
             s.enter_context(mock.patch.object(youtube, "get_done", return_value=set(done)))
             s.enter_context(mock.patch.object(settings, "get_settings",
                                               return_value={"youtube_every_tv_episodes": 99}))

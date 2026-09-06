@@ -629,6 +629,10 @@ struct UpNextDTO: Codable, Identifiable {
     // rather than claiming it runs next (a 4K fetch is minutes, and hiding it read as "the
     // send did nothing")
     var awaiting_download: Bool?
+    // priority = wears the "running next" mark: a video the user activated (jumps=true —
+    // a send / run-now, preempts at the next safe boundary) or an individually imported one
+    // (jumps=false — asked for by hand, but rides the ordinary cadence)
+    var jumps: Bool?
     var id: String { [kind, series, channel, ep, title, source_name, name].compactMap { $0 }.joined(separator: "|") }
 }
 

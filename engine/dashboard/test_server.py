@@ -58,6 +58,7 @@ class UpNext(unittest.TestCase):
         # ...and up_next LEADS with the priority book now, which is live state too: with real
         # sends queued these read the machine's actual book instead of the cadence under test.
         with mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(youtube, "_imports", return_value=[]), \
              mock.patch.object(youtube, "all_pending", return_value=[]), \
              mock.patch.object(movies, "get_selected", return_value=movies_list), \
              mock.patch.object(series, "get_active_series", return_value=["show"]), \
@@ -70,6 +71,7 @@ class UpNext(unittest.TestCase):
         import movies, series, youtube
         from unittest import mock
         with mock.patch.object(youtube, "_priority", return_value=[]), \
+             mock.patch.object(youtube, "_imports", return_value=[]), \
              mock.patch.object(youtube, "all_pending", return_value=[]), \
              mock.patch.object(movies, "get_selected", return_value=[]), \
              mock.patch.object(series, "get_active_series", return_value=active), \
@@ -621,6 +623,7 @@ class UpNextMarksPriorityVideos(unittest.TestCase):
         book = [{"vid": v, "path": paths.get(v)} for v in prio_vids]
         with mock.patch.object(youtube, "all_pending", return_value=vids), \
              mock.patch.object(youtube, "_priority", return_value=book), \
+             mock.patch.object(youtube, "_imports", return_value=[]), \
              mock.patch.object(movies, "get_selected", return_value=[]), \
              mock.patch.object(series, "get_active_series", return_value=[]), \
              mock.patch.object(series, "get_rotation", return_value=0):
@@ -925,3 +928,46 @@ class ScratchReportsBothFreeNumbers(unittest.TestCase):
             out = server.collect_scratch()
         self.assertIsNone(out["free_gb"])
         self.assertIsNone(out["disk_free_gb"])
+
+
+class RunningNextMarksOnlyWhatTheUserActivated(unittest.TestCase):
+    """The "running next" mark keyed on "is this video anywhere in the priority book" — and
+    the book holds every video of every imported PLAYLIST, so hundreds of cadence-riding
+    rows wore a pill that means "jumps the queue" (user-caught 2026-09-06). Only a video
+    the user activated themselves (a jump entry) or an individually imported one is marked;
+    `jumps` tells the two apart so the app can describe a single import honestly."""
+
+    def _rows(self, book, imports):
+        from unittest import mock
+        import movies, series, youtube
+        vids = [{"channel": "Chan", "source_name": "a [aaaaaaaaaa1].mp4", "title": "A", "vid": "aaaaaaaaaa1", "secs": 60},
+                {"channel": "Chan", "source_name": "b [aaaaaaaaaa2].mp4", "title": "B", "vid": "aaaaaaaaaa2", "secs": 60},
+                {"channel": "Chan", "source_name": "c [aaaaaaaaaa3].mp4", "title": "C", "vid": "aaaaaaaaaa3", "secs": 60}]
+        with mock.patch.object(youtube, "all_pending", return_value=vids), \
+             mock.patch.object(youtube, "_priority", return_value=book), \
+             mock.patch.object(youtube, "_imports", return_value=imports), \
+             mock.patch.object(youtube, "get_done", return_value=set()), \
+             mock.patch.object(movies, "get_selected", return_value=[]), \
+             mock.patch.object(series, "get_active_series", return_value=[]), \
+             mock.patch.object(series, "get_rotation", return_value=0):
+            return {o["title"]: (o.get("priority"), o.get("jumps"))
+                    for o in server.up_next(limit=10) if o.get("kind") == "youtube"}
+
+    def test_a_playlist_import_is_not_marked(self):
+        book = [{"vid": "aaaaaaaaaa1", "jump": False, "batch": "imp1", "path": "/x/a [aaaaaaaaaa1].mp4"}]
+        imports = [{"id": "imp1", "kind": "playlist", "vids": ["aaaaaaaaaa1"]}]
+        rows = self._rows(book, imports)
+        self.assertEqual(rows["A"], (False, False))
+
+    def test_a_single_import_is_marked_but_does_not_jump(self):
+        book = [{"vid": "aaaaaaaaaa2", "jump": False, "batch": "imp2", "path": "/x/b [aaaaaaaaaa2].mp4"}]
+        imports = [{"id": "imp2", "kind": "video", "vids": ["aaaaaaaaaa2"]}]
+        rows = self._rows(book, imports)
+        self.assertEqual(rows["B"], (True, False))
+
+    def test_a_send_is_marked_and_jumps(self):
+        book = [{"vid": "aaaaaaaaaa3", "title": "C", "sent_at": 1, "channel": "Chan",
+                 "path": "/Media/YouTube-raw/Chan/x/c [aaaaaaaaaa3].mp4"}]
+        rows = self._rows(book, [])
+        self.assertEqual(rows["C"], (True, True))
+        self.assertEqual(rows["A"], (False, False))          # everyone else untouched
