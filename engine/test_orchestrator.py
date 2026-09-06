@@ -3384,7 +3384,8 @@ class YoutubePreemption(unittest.TestCase):
             return False
         with mock.patch.object(youtube, "has_priority_ready", side_effect=fake):
             self.assertFalse(o._yt_priority_waiting())
-        self.assertEqual(seen["skip"], {"clip [aaaaaaaaaa1]"})   # its own stem is skipped
+        self.assertIn("clip [aaaaaaaaaa1]", seen["skip"])        # its own stem is skipped
+        # (the skip is selection's whole set + this stem now — see _selection_skip)
 
     def test_waiting_probe_fires_for_a_different_video(self):
         import youtube
@@ -4131,3 +4132,54 @@ class ASendNeverYieldsToAnotherSend(unittest.TestCase):
             o, sp = self._spy_download_predicate(p)
             with mock.patch.object(o, "_yt_priority_waiting", return_value=True):
                 self.assertTrue(sp())
+
+
+class TheBoundaryPollAgreesWithSelection(unittest.TestCase):
+    """Live 2026-09-05, 30 s after a deploy: S06E16's topaz yielded three times in two
+    seconds to "a ready send" and the livelock guard silenced it. The send WAS located and
+    not done — but selection could not serve it, so every yield was for nothing. The
+    boundary poll excluded only the current item; the selector excludes parked, refused,
+    finisher-owned and doorstep-deferred items. They must use the SAME skip set, or with
+    the download stage yielding too, every in-flight item burns a CFR on the phantom."""
+
+    STEM = "Chan - Sent [aaaaaaaaaa1]"
+
+    def _orch(self):
+        o = orch.Orchestrator(); o._enabled = True
+        return o
+
+    def _ready(self, o):
+        with mock.patch.object(orch.youtube, "has_priority_ready",
+                               side_effect=lambda skip=(): self.STEM not in set(skip)):
+            return o._yt_priority_waiting()
+
+    def test_a_servable_send_still_makes_the_poll_fire(self):
+        self.assertTrue(self._ready(self._orch()))
+
+    def test_a_finisher_owned_send_does_not(self):
+        o = self._orch()
+        with o._finisher_lock:
+            o._in_finisher.add(self.STEM)
+        self.assertFalse(self._ready(o))
+
+    def test_a_parked_send_does_not(self):
+        o = self._orch(); o._parked.add(self.STEM)
+        self.assertFalse(self._ready(o))
+
+    def test_the_current_item_still_does_not(self):
+        o = self._orch(); o.state["current"] = {"name": self.STEM + ".mp4"}
+        self.assertFalse(self._ready(o))
+
+    def test_selection_and_the_poll_share_one_skip_set(self):
+        o = self._orch()
+        o._parked.add("X"); 
+        with o._finisher_lock:
+            o._in_finisher.add("Y")
+        s = o._selection_skip()
+        self.assertTrue({"X", "Y"} <= s)
+
+    def test_a_doorstep_deferred_send_does_not(self):
+        # THE live case: the fast item parked at the resolve doorstep; gate release, not the
+        # priority poll, is what lets it in
+        o = self._orch(); o._gate_deferred.add(self.STEM)
+        self.assertFalse(self._ready(o))

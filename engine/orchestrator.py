@@ -2550,6 +2550,24 @@ class Orchestrator:
                 return p
         return None
 
+    def _selection_skip(self) -> set:
+        """Everything selection must NOT pick right now — and therefore everything the
+        segment-boundary poll must not yield FOR. One set, two consumers, by design:
+        live 2026-09-05 a sent video deferred at the resolve doorstep was excluded here but
+        not by _yt_priority_waiting, so the in-flight topaz yielded to it three times in two
+        seconds (nothing could be served) until the livelock guard silenced it. With the
+        download stage yielding too, that phantom would have cost a CFR per item."""
+        return (self._parked | set(self._refused)            # + PERMANENT refusals (already-DV, durable)
+                | self._gate_deferred                        # + fast items still waiting at the doorstep
+                | self._resolve_deferred                     # + items QUIET MODE is holding before Resolve
+                | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
+                | self._in_finisher_keys()                   # + items the FINISHER already owns (still
+                                                             #   un-mastered on the NAS — must not re-pick)
+                | self._finisher_persisted_keys())           # + DURABLE finisher items momentarily absent
+                                                             #   from _in_finisher (disable→enable discard
+                                                             #   race): the reconcile owns their resume, so
+                                                             #   the run thread must not also grab them
+
     def _next_episode(self):
         """(EpisodePaths|None, reason). reason ∈ {ok, no-series, complete, unreachable}.
         Mode-aware: TV walks the selected series' episodes, Movie walks the whole Movies
@@ -2577,16 +2595,7 @@ class Orchestrator:
             # intermediate is safe on disk and resumes right after their Resolve.
             self._gate_deferred.clear()
             gate_released = True
-        skip = (self._parked | set(self._refused)            # + PERMANENT refusals (already-DV, durable)
-                | self._gate_deferred                        # + fast items still waiting at the doorstep
-                | self._resolve_deferred                     # + items QUIET MODE is holding before Resolve
-                | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
-                | self._in_finisher_keys()                   # + items the FINISHER already owns (still
-                                                             #   un-mastered on the NAS — must not re-pick)
-                | self._finisher_persisted_keys())           # + DURABLE finisher items momentarily absent
-                                                             #   from _in_finisher (disable→enable discard
-                                                             #   race): the reconcile owns their resume, so
-                                                             #   the run thread must not also grab them
+        skip = self._selection_skip()      # shared with the boundary poll — see _selection_skip
         # FINISH a part-processed episode before any movie/YouTube priority interrupt. If the
         # active series' next episode already has its topaz on disk (segments or a DV render —
         # only resolve+remux left), resume it: a fresh movie must NOT preempt it and strand its
@@ -3316,12 +3325,16 @@ class Orchestrator:
         should yield at its next SAFE boundary and let the run loop re-select it.
 
         Cheap by construction (book-only, no staging scan) because this is polled between
-        Topaz segments. Never fires for the item already running: the current YouTube video
-        IS the priority pick while it processes, and yielding to itself would loop."""
+        Topaz segments and, since 2026-09-05, during the download stage too. Never fires for
+        the item already running (yielding to itself would loop), and never for a send that
+        SELECTION itself would skip — parked, finisher-owned, or deferred at the resolve
+        doorstep — because a yield for an unservable video is a yield for nothing
+        (live-caught 2026-09-05: three in two seconds, then the livelock guard). When a
+        deferred send becomes servable, _gate_release_pending is the reason that fires."""
         try:
             import youtube
             cur = self.state.get("current") or {}
-            skip = set()
+            skip = set(self._selection_skip())
             name = cur.get("name") or ""
             if name:
                 skip.add(os.path.splitext(name)[0])
