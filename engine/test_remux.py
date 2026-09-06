@@ -999,3 +999,46 @@ class AacAtCannotBeTrustedWithExoticLayouts(unittest.TestCase):
         self.assertEqual(r.count("build_audio_boost_filter(gain_db, src="), 3)
         self.assertEqual(h.count("build_audio_boost_filter(gain, src=work)"), 1)
         self.assertEqual(h.count("boost_keeping_original_args(gain, keep, src=work)"), 1)
+
+
+class TheGapProbeMeasuresInterleavingNotGopLength(unittest.TestCase):
+    """A video seek lands on the preceding KEYFRAME and ffprobe reports from there; an audio
+    seek is exact. Taking the first printed packet compared a keyframe-aligned video position
+    with a time-exact audio one, so the "gap" was the previous GOP in bytes: x265's default
+    keyint (250 = 10.4 s at 23.976) on a ~8 Mbps talking-heads video read as 10.4 MB, failed
+    "badly interleaved" eight times, and held the resolve doorstep shut for 15 hours
+    (live-caught 2026-09-05). The probe now takes the first packet AT OR AFTER t, and reads
+    a window long enough to reach it."""
+
+    def _gap(self, streams):
+        """streams: {(sel, t): [(pts, pos), ...]} as ffprobe would print them after the seek."""
+        seen = {}
+        def run(cmd, **kw):
+            sel = cmd[cmd.index("-select_streams") + 1]
+            iv = cmd[cmd.index("-read_intervals") + 1]
+            t = int(iv.split("%")[0]); seen["window"] = iv
+            rows = streams.get((sel, t), [])
+            return mock.Mock(stdout="".join("%.3f,%d\n" % (p, q) for p, q in rows))
+        with mock.patch.object(remux.subprocess, "run", side_effect=run):
+            return remux.interleave_gap_mb("/x.mp4", at=(60,)), seen
+
+    def test_a_keyframe_before_t_is_not_the_measurement(self):
+        # keyframe 8 s early at 33.1 MB, then the packets AT 60 s at 43.4 MB; audio at 60 s
+        # sits 43.48 MB — the file is tightly interleaved (0.08 MB), the GOP is just long
+        g, _ = self._gap({("v:0", 60): [(52.135, 33_121_655), (52.052, 33_170_992), (60.010, 43_400_000)],
+                          ("a:0", 60): [(59.977, 43_486_632), (60.000, 43_487_004)]})
+        self.assertLess(g, 0.5, g)
+
+    def test_a_genuinely_drifting_file_is_still_caught(self):
+        g, _ = self._gap({("v:0", 60): [(52.135, 33_000_000), (60.010, 43_000_000)],
+                          ("a:0", 60): [(60.000, 158_600_000)]})
+        self.assertAlmostEqual(g, 115.6, places=1)
+
+    def test_no_packet_at_or_after_t_reads_as_unmeasurable(self):
+        g, _ = self._gap({("v:0", 60): [(52.135, 33_000_000)], ("a:0", 60): [(60.0, 1)]})
+        self.assertEqual(g, -1.0)
+
+    def test_the_read_window_reaches_past_a_whole_gop(self):
+        _, seen = self._gap({})
+        secs = int(seen["window"].split("+")[1])
+        self.assertGreaterEqual(secs, 11)      # keyint 250 at 23.976 fps = 10.43 s

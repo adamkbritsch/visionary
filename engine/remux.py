@@ -299,18 +299,32 @@ def interleave_gap_mb(path: str, ffprobe=FFPROBE, at=(60, 300, 1200, 3600)) -> f
     def _pos(sel, t):
         try:
             out = subprocess.run([ffprobe, "-v", "error", "-select_streams", sel,
-                                  "-read_intervals", "%d%%+1" % t,
+                                  # read PAST the seek keyframe up to t: the window must
+                                  # cover a whole GOP (x265 keyint 250 = 10.4 s at 23.976),
+                                  # or the packet at t is never printed and the probe reads
+                                  # as "unmeasurable" — %+1 only ever showed the keyframe
+                                  "-read_intervals", "%d%%+15" % t,
                                   "-show_entries", "packet=pts_time,pos",
                                   "-of", "csv=p=0", path],
                                  capture_output=True, text=True, timeout=120).stdout
         except Exception:
             return None
+        # THE FIRST PACKET AT OR AFTER t — not the first packet ffprobe prints. A video seek
+        # lands on the preceding KEYFRAME and ffprobe reports from there, while an audio seek
+        # is exact, so taking the first line compared a keyframe-aligned video position with
+        # a time-exact audio one: the "gap" was the previous GOP's length in bytes. x265's
+        # default keyint is 250 frames = 10.4 s at 23.976, and a talking-heads YouTube video
+        # at ~8 Mbps measured exactly 10.4 MB, failed "badly interleaved" eight times, and
+        # held the resolve doorstep shut for 15 hours (live-caught 2026-09-05). What a
+        # player must have read by time t is the packet it decodes AT t, for both streams.
         for ln in out.splitlines():
             part = ln.split(",")
             try:
-                return int(part[1])
+                pts, pos = float(part[0]), int(part[1])
             except (ValueError, IndexError):
                 continue
+            if pts + 1e-6 >= t:
+                return pos
         return None
 
     worst = -1.0
