@@ -1278,6 +1278,22 @@ def has_priority_ready(skip=()) -> bool:
     return False
 
 
+def is_priority_video(source_name) -> bool:
+    """Is THIS item itself a send-to-Visionary (jump) video? Book-only, cheap.
+
+    The download stage yields to a ready send — but a send must never yield to ANOTHER
+    send: with several queued, #1's download would yield to #2, whose download would yield
+    back to #1, ping-ponging aborted CFRs until the livelock guard blocked them both.
+    Imports (jump=False) and unknown videos are not sends."""
+    vid = video_id(os.path.basename(str(source_name or "")))
+    if not vid:
+        return False
+    for e in _priority():
+        if e.get("vid") == vid:
+            return _jumps(e)
+    return False
+
+
 def _drop_priority(vid) -> None:
     with _PRIORITY_LOCK:
         book = _priority()
@@ -1307,6 +1323,18 @@ def _locate_scan() -> None:
     now = time.monotonic()
     if missing and now - _priority_scan_at >= _PRIORITY_SCAN_GAP:
         _priority_scan_at = now
+        # tier 1.5: the QUEUED channels' folders re-listed LIVE. Tier 1 reads the channel
+        # cache, and that cache is only re-listed at selection time — so a send delivered
+        # to a queued channel mid-item was invisible until the next item boundary, and the
+        # staging-wide walk below deliberately skips queued folders. Same throttle.
+        for e in get_queue():
+            folder = e.get("folder_name")
+            if not folder or not missing:
+                continue
+            for v in refresh_videos(folder):
+                if v.get("vid") in missing:
+                    found[v["vid"]] = {"channel": folder, "path": v["path"]}
+                    missing.discard(v["vid"])
         try:                                                # tier 2: staging-wide (throttled)
             ftp = ftp_connect(timeout=30)
         except ftplib.all_errors:
@@ -1332,6 +1360,27 @@ def _locate_scan() -> None:
                 if hit and not e.get("path"):
                     e.update(hit)
             _save_priority(book)
+
+
+def locate_pending_priority() -> bool:
+    """Locate any send-to-Visionary entry that youtarr has delivered since the last look.
+    Cheap when there is nothing to do (one book read); otherwise runs _locate_scan. Returns
+    True when at least one JUMP entry became located — i.e. a "run now" video is ready.
+
+    Called from the orchestrator's background locator every ~20 s WHILE AN ITEM RUNS.
+    Until 2026-09-05 locating only ever happened at selection time, so a send delivered
+    mid-encode stayed unlocated for the whole item, has_priority_ready() stayed False, and
+    the segment-boundary yield never once fired in the log (user-caught)."""
+    with _PRIORITY_LOCK:
+        book = _priority()
+        pending = [e for e in book if _jumps(e) and not e.get("path")]
+    if not pending:
+        return False
+    before = {e.get("vid") for e in pending}
+    _locate_scan()
+    with _PRIORITY_LOCK:
+        now_located = {e.get("vid") for e in _priority() if e.get("path")}
+    return bool(before & now_located)
 
 
 def locate_priority(skip=()) -> dict | None:

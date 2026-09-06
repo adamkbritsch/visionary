@@ -575,7 +575,7 @@ class MovieScheduling(unittest.TestCase):
              mock.patch.object(o, "_claim_prefetched"), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
              mock.patch.object(o, "_quiet_mode", return_value=False), \
-             mock.patch.object(o, "_download_once", side_effect=lambda _p, on_progress=None: ran.append("download") or (True, "ok")), \
+             mock.patch.object(o, "_download_once", side_effect=lambda _p, on_progress=None, **_k: ran.append("download") or (True, "ok")), \
              mock.patch.object(o, "_hand_to_finisher", side_effect=lambda _p: ran.append("handoff")), \
              mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
             o._process(p)
@@ -1489,7 +1489,7 @@ class FinisherOverlap(unittest.TestCase):
              mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
              mock.patch.object(o, "_claim_prefetched"), \
              mock.patch.object(o, "_reclaim_for_pipeline"), \
-             mock.patch.object(o, "_download_once", side_effect=lambda _p, on_progress=None: ran.append("download") or (True, "ok")), \
+             mock.patch.object(o, "_download_once", side_effect=lambda _p, on_progress=None, **_k: ran.append("download") or (True, "ok")), \
              mock.patch.object(o, "_save_cadence"), \
              mock.patch.object(orch.series, "get_active_series", return_value=[]), \
              mock.patch("stages.run_stage", side_effect=lambda st, *_a, **_k: ran.append(st) or (True, "ok")):
@@ -3426,7 +3426,7 @@ class YoutubePreemption(unittest.TestCase):
              mock.patch.object(topaz, "upscale_resumable", return_value=paused):
             o._process(p)
         self.assertEqual(held.get("code"), "yt-priority")
-        self.assertIn("YouTube video you moved up next", held.get("msg") or "")
+        self.assertIn("YouTube video you sent", held.get("msg") or "")
 
 
 class RemoteDeactivateKeepsItReachable(unittest.TestCase):
@@ -4011,3 +4011,123 @@ class AnOutageNeverDestroysFinishedWork(unittest.TestCase):
         with mock.patch.object(orch, "stage_done", side_effect=OSError("probe died")):
             o._sweep_parked_files(p, "S01E01")
         self.assertFalse(_os.path.exists(p.final))
+
+
+class SendsPreemptAtTheNextSafeBoundary(unittest.TestCase):
+    """The run-now yield had fired ZERO times in the whole log. Two reasons, both fixed:
+    locating only happened at selection, so a send delivered mid-item was invisible to the
+    boundary poll; and the download stage never yielded at all, so a YouTube item (which
+    never runs Topaz) had no boundary. User-dictated 2026-09-05: after the current segment,
+    not the current episode."""
+
+    def _paths(self):
+        return episode_paths("The Office", "S02E10", SRC)
+
+    def test_a_yielded_download_is_a_hold_not_a_failure(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._paths()
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=True), \
+             mock.patch("stages.run_stage",
+                        return_value=(False, "paused: a video you sent is ready — this download resumes after it")):
+            o._process(p)
+        self.assertEqual(o._fail_counts, {})
+        self.assertEqual(o._parked, set())
+        self.assertIn("download paused at a safe boundary", o.state["message"])
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "yt-priority")
+
+    def test_download_yields_to_a_sent_video_only(self):
+        # topaz's predicate honours dual-remux / gate / cadence too; download's must not —
+        # those exist to share the GPU, and yielding a NAS pull to them would just thrash
+        o = orch.Orchestrator(); o._enabled = True
+        p = self._paths()
+        seen = {}
+        def spy(st, _p, *, abort=None, progress=None, should_pause=None, **_k):
+            seen[st] = should_pause
+            return True, "ok"
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch("stages.run_stage", side_effect=spy):
+            o._process(p)
+        sp = seen["download"]
+        with mock.patch.object(o, "_yt_priority_waiting", return_value=True):
+            self.assertTrue(sp())
+        with mock.patch.object(o, "_yt_priority_waiting", return_value=False), \
+             mock.patch.object(o, "_dual_remux_live", return_value=True), \
+             mock.patch.object(o, "_yt_cadence_due", return_value=True), \
+             mock.patch.object(o, "_gate_release_pending", return_value=True):
+            self.assertFalse(sp())                 # none of topaz's other reasons move it
+
+    def test_the_locator_runs_while_armed_and_logs_when_a_send_lands(self):
+        o = orch.Orchestrator(); o._enabled = True
+        o._sleep = lambda s: setattr(o, "_enabled", False)      # exactly one iteration
+        with mock.patch.object(orch.youtube, "locate_pending_priority", return_value=True), \
+             mock.patch.object(orch.logbook, "event") as ev:
+            o._priority_locator()
+        ev.assert_called_once()
+        self.assertIn("next", ev.call_args[0][0])
+
+    def test_the_locator_is_quiet_when_nothing_landed(self):
+        o = orch.Orchestrator(); o._enabled = True
+        o._sleep = lambda s: setattr(o, "_enabled", False)
+        with mock.patch.object(orch.youtube, "locate_pending_priority", return_value=False), \
+             mock.patch.object(orch.logbook, "event") as ev:
+            o._priority_locator()
+        ev.assert_not_called()
+
+    def test_the_locator_is_one_of_the_run_threads(self):
+        import inspect
+        src = inspect.getsource(orch.Orchestrator.enable)
+        self.assertIn('("priority_locator", self._priority_locator)', src)
+
+
+class ASendNeverYieldsToAnotherSend(unittest.TestCase):
+    """Seven sends queued: #1's download must NOT yield to #2 (whose download would yield
+    straight back to #1) — that ping-pong aborts CFRs until the livelock guard blocks both.
+    The download predicate is off for an item that is itself a send."""
+
+    def _spy_download_predicate(self, p):
+        o = orch.Orchestrator(); o._enabled = True
+        seen = {}
+        def spy(st, _p, *, abort=None, progress=None, should_pause=None, **_k):
+            seen[st] = should_pause
+            return True, "ok"
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_hand_to_finisher"), \
+             mock.patch("stages.run_stage", side_effect=spy):
+            o._process(p)
+        return o, seen["download"]
+
+    def test_a_sent_videos_own_download_does_not_yield(self):
+        p = youtube_paths("Chan", "/s/Chan/x/S [aaaaaaaaaa1].mp4", "S",
+                               scratch_dir=__import__("tempfile").mkdtemp())
+        with mock.patch.object(orch.youtube, "is_priority_video", return_value=True):
+            o, sp = self._spy_download_predicate(p)
+            with mock.patch.object(o, "_yt_priority_waiting", return_value=True):
+                self.assertFalse(sp())
+
+    def test_an_ordinary_video_still_yields_to_a_send(self):
+        p = youtube_paths("Chan", "/s/Chan/x/O [bbbbbbbbbb1].mp4", "O",
+                               scratch_dir=__import__("tempfile").mkdtemp())
+        with mock.patch.object(orch.youtube, "is_priority_video", return_value=False):
+            o, sp = self._spy_download_predicate(p)
+            with mock.patch.object(o, "_yt_priority_waiting", return_value=True):
+                self.assertTrue(sp())
+
+    def test_a_tv_episode_yields_to_a_send(self):
+        p = episode_paths("The Office", "S02E10", SRC)
+        with mock.patch.object(orch.youtube, "is_priority_video",
+                               side_effect=AssertionError("not consulted for TV")):
+            o, sp = self._spy_download_predicate(p)
+            with mock.patch.object(o, "_yt_priority_waiting", return_value=True):
+                self.assertTrue(sp())

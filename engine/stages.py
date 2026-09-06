@@ -285,7 +285,9 @@ def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pau
         if stage in ("topaz", "remux"):
             ok, msg = fn(p, abort, progress, should_pause)
         elif stage == "download":
-            ok, msg = fn(p, abort, progress, low_prio)
+            # download yields too — to a sent video only (see _download); the orchestrator
+            # hands it a narrower predicate than topaz gets
+            ok, msg = fn(p, abort, progress, low_prio, should_pause)
         else:
             ok, msg = fn(p, abort, progress)
     except Exception as e:                       # any stage bug is logged, never silent
@@ -322,8 +324,52 @@ def cfr_failure_message(error_tail) -> str:
     return f"CFR convert failed: {_err_tail(error_tail)}"
 
 
-def _download(p, abort, progress=None, low_prio=False):
-    """NAS source -> scratch (FTP), THEN a constant-frame-rate pass.
+class _PauseAbort:
+    """Abort stand-in for the download stage: `is_set()` is the real abort OR a throttled
+    should_pause(). Both the FTP pull and to_cfr only ever poll `.is_set()`, so this slots
+    in without touching them. Remembers WHICH one fired, so the stage can report a benign
+    "paused:" (re-selected later, resumed) instead of an abort."""
+    POLL_SECONDS = 3.0
+
+    def __init__(self, abort, should_pause):
+        self._abort, self._sp = abort, should_pause
+        self._next, self.paused = 0.0, False
+
+    def is_set(self) -> bool:
+        if self._abort is not None and self._abort.is_set():
+            return True
+        if self.paused:
+            return True
+        now = time.monotonic()
+        if now >= self._next:
+            self._next = now + self.POLL_SECONDS
+            try:
+                if self._sp():
+                    self.paused = True
+                    return True
+            except Exception:
+                pass
+        return False
+
+
+def _download(p, abort, progress=None, low_prio=False, should_pause=None):
+    """The download stage: NAS pull + CFR (see _download_body), which YIELDS to a
+    send-to-Visionary video that is ready to run (user-dictated 2026-09-05: a send runs
+    after the current segment, not the current episode). Neither the pull nor the CFR is
+    segmented, so "the current segment" here is "now": the partial source is dropped (the
+    body already does that on any stop) and the CFR is redone on the next attempt — the
+    same cost as any interruption, spent deliberately. Reported as a benign "paused:" so
+    the run loop holds and re-selects rather than counting a failure."""
+    pa = _PauseAbort(abort, should_pause) if should_pause is not None else None
+    ok, msg = _download_body(p, pa if pa is not None else abort, progress, low_prio)
+    if not ok and pa is not None and pa.paused:
+        return False, "paused: a video you sent is ready — this download resumes after it"
+    return ok, msg
+
+
+def _download_body(p, abort, progress=None, low_prio=False):
+    """NAS source -> scratch (FTP), THEN a constant-frame-rate pass. (Wrapped by _download,
+    which adds the yield-to-a-sent-video behaviour; this body is unchanged.)
 
     Reuse an on-disk source ONLY if it's verified complete (size == the NAS file). A
     partial left by a stopped/interrupted download is deleted and re-pulled — never

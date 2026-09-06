@@ -1698,7 +1698,8 @@ class Orchestrator:
             for name, target in (("run", self._run), ("finisher", self._finisher),
                                  ("finisher2", self._finisher2),   # 2nd remux lane (backlog-drain only)
                                  ("power_monitor", self._power_monitor), ("dimmer", self._dimmer),
-                                 ("prefetch", self._prefetch), ("plex_monitor", self._plex_monitor)):
+                                 ("prefetch", self._prefetch), ("plex_monitor", self._plex_monitor),
+                                 ("priority_locator", self._priority_locator)):
                 self._ensure(name, target)
 
     def disable(self, reason="disabled by user", keep_awake_secs=0):
@@ -2292,7 +2293,8 @@ class Orchestrator:
         with self._dl_guard:
             return self._dl_locks.setdefault(p.source_basename, threading.Lock())
 
-    def _download_once(self, p, *, on_progress=None, low_prio=False, extra_abort=None):
+    def _download_once(self, p, *, on_progress=None, low_prio=False, extra_abort=None,
+                       should_pause=None):
         """Run the download+CFR stage for `p` under the per-item lock so the background prefetcher and
         the foreground pipeline never download the same item at once (a size-verify race that could
         corrupt the source). Idempotent — re-checks stage_done after acquiring, so the loser is a fast
@@ -2304,7 +2306,10 @@ class Orchestrator:
         with self._item_lock(p):
             if stage_done("download", p):
                 return True, "source + CFR already staged"
-            return run_stage("download", p, abort=abort, progress=on_progress, low_prio=low_prio)
+            # should_pause: the FOREGROUND download yields to a sent video (see _process);
+            # the prefetcher passes none — it is already low priority and has its own abort
+            return run_stage("download", p, abort=abort, progress=on_progress, low_prio=low_prio,
+                             should_pause=should_pause)
 
     def _claim_prefetched(self, p):
         """Move this item's prefetched source + CFR from the prefetch subfolder into the MAIN scratch, so
@@ -2500,6 +2505,24 @@ class Orchestrator:
             except Exception:
                 pass
             self._sleep(15 if did else 60)                        # tight while working, relaxed when full/idle
+
+    def _priority_locator(self):
+        """Background: keep send-to-Visionary entries LOCATED while an item is running, so
+        the in-flight stage's boundary poll (has_priority_ready) can actually see them.
+
+        Locating used to happen only inside selection. A video sent — and delivered by
+        youtarr — mid-encode therefore stayed unlocated for the whole item, and the "yield
+        at the next segment boundary" path never fired once in the log. The user's rule
+        (2026-09-05): a send runs after the current SEGMENT, not the current episode."""
+        while self._enabled:
+            try:
+                if youtube.locate_pending_priority():
+                    logbook.event("a video you sent is on staging — it runs at the next "
+                                  "safe boundary (after the current segment or download; "
+                                  "a running Resolve finishes first)")
+            except Exception:
+                pass
+            self._sleep(20)
 
     def _tv_skip(self, ref, skip):
         """The bare episode keys `series.episode_queue(ref)` matches — only THIS show's,
@@ -2868,20 +2891,32 @@ class Orchestrator:
                 self._extend_active.set()
                 self._suspend_remuxes(reason="AI outpainting has the machine")
                 self._prefetch_yield.set()      # drop any in-flight background pull/CFR
+            # topaz yields at its next segment boundary to 2 live remuxes, to a gate-released
+            # fast item, to a "run this video now" request and to a due cadence video. The
+            # DOWNLOAD stage yields to the run-now request ONLY (user-dictated 2026-09-05: a
+            # send runs after the current segment, not the current episode) — never to the
+            # remux/cadence reasons, which exist to share the GPU, not the NAS pull.
+            sp_full = lambda: (self._dual_remux_live()
+                               or ((self._skip_key(p) not in self._yield_block)
+                                   and (self._gate_release_pending()
+                                        or self._yt_priority_waiting()
+                                        or self._yt_cadence_due())))
+            # ...and a send never yields to ANOTHER send: with several queued, #1's download
+            # would yield to #2 and #2's straight back to #1 — aborted CFRs ping-ponging
+            # until the livelock guard blocked them both. Decided once per stage (one book
+            # read), not per poll.
+            cur_is_send = bool(getattr(p, "youtube", False)
+                               and youtube.is_priority_video(p.source_basename))
+            sp_download = lambda: ((not cur_is_send)
+                                   and (self._skip_key(p) not in self._yield_block)
+                                   and self._yt_priority_waiting())
             try:
                 if st == "download":          # per-source lock: the prefetcher may already be pulling
-                    ok, msg = self._download_once(p, on_progress=self._set_progress)   # this exact source
+                    ok, msg = self._download_once(p, on_progress=self._set_progress,   # this exact source
+                                                  should_pause=sp_download)
                 else:
                     ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
-                                        # topaz yields to 2 live remuxes AND to a gate-released
-                                        # fast item whose Resolve is now clear to run alone
-                                        # topaz yields to 2 live remuxes, to a gate-released
-                                        # fast item, and to a "run this video now" request
-                                        should_pause=lambda: (self._dual_remux_live()
-                                                              or ((self._skip_key(p) not in self._yield_block)
-                                                                  and (self._gate_release_pending()
-                                                                       or self._yt_priority_waiting()
-                                                                       or self._yt_cadence_due()))))
+                                        should_pause=sp_full)
             finally:
                 if st == "resolve":
                     self._resolve_active.clear()
@@ -2927,8 +2962,8 @@ class Orchestrator:
                     self.state["current"] = None
                     if self._yt_priority_waiting():
                         self._hold("yt-priority",
-                            f"{ep_disp}: paused at a segment boundary — running the "
-                            f"YouTube video you moved up next (this resumes after)")
+                            f"{ep_disp}: {st} paused at a safe boundary — running the "
+                            f"YouTube video you sent (this resumes after)")
                     elif self._gate_release_pending():
                         self._hold("resolve-gate",
                             f"{ep_disp}: topaz paused at a segment boundary — a waiting "

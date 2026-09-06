@@ -2265,3 +2265,71 @@ class AnAbortedCfrIsNotAFailure(unittest.TestCase):
              mock.patch.object(stages.logbook, "failure") as fail:
             stages.run_stage("download", mock.MagicMock(ep="X"))
         fail.assert_called_once()
+
+
+class DownloadYieldsToASentVideo(unittest.TestCase):
+    """A send-to-Visionary video runs after the current SEGMENT, not the current episode
+    (user-dictated 2026-09-05). Topaz already yielded between segments; a YouTube item runs
+    download -> CFR -> resolve and never touches Topaz, so sends waited out whole items.
+    The download stage now yields too: neither the pull nor the CFR is segmented, so it
+    stops now, drops the partial, reports a benign "paused:" and is resumed later."""
+
+    def test_pause_abort_fires_on_the_predicate_and_remembers_it(self):
+        pa = stages._PauseAbort(None, lambda: True)
+        self.assertTrue(pa.is_set())
+        self.assertTrue(pa.paused)
+
+    def test_a_real_abort_wins_and_is_not_a_pause(self):
+        import threading
+        ev = threading.Event(); ev.set()
+        pa = stages._PauseAbort(ev, lambda: False)
+        self.assertTrue(pa.is_set())
+        self.assertFalse(pa.paused)
+
+    def test_the_predicate_is_throttled_not_polled_every_call(self):
+        calls = []
+        pa = stages._PauseAbort(None, lambda: calls.append(1) or False)
+        for _ in range(50):
+            pa.is_set()
+        self.assertEqual(len(calls), 1)            # one look per POLL_SECONDS
+
+    def test_a_predicate_that_throws_never_aborts_the_download(self):
+        pa = stages._PauseAbort(None, lambda: 1 / 0)
+        self.assertFalse(pa.is_set())
+        self.assertFalse(pa.paused)
+
+    def test_a_yielded_download_reports_paused_not_a_failure(self):
+        def body(p, abort, progress, low_prio):
+            abort.is_set()                          # the pull polls -> predicate fires
+            return False, "CFR convert failed: aborted"
+        with mock.patch.object(stages, "_download_body", side_effect=body):
+            ok, msg = stages._download(object(), None, should_pause=lambda: True)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("paused:"), msg)
+
+    def test_a_plain_abort_keeps_its_own_message(self):
+        with mock.patch.object(stages, "_download_body",
+                               return_value=(False, "interrupted: CFR convert stopped")):
+            ok, msg = stages._download(object(), None, should_pause=lambda: False)
+        self.assertEqual(msg, "interrupted: CFR convert stopped")
+
+    def test_success_passes_straight_through(self):
+        with mock.patch.object(stages, "_download_body", return_value=(True, "ok")):
+            self.assertEqual(stages._download(object(), None, should_pause=lambda: True), (True, "ok"))
+
+    def test_no_predicate_means_the_body_sees_the_raw_abort(self):
+        import threading
+        ev = threading.Event(); seen = {}
+        with mock.patch.object(stages, "_download_body",
+                               side_effect=lambda p, a, pr, lp: seen.update(abort=a) or (True, "ok")):
+            stages._download(object(), ev)
+        self.assertIs(seen["abort"], ev)
+
+    def test_run_stage_forwards_should_pause_to_download(self):
+        seen = {}
+        def spy(p, abort, progress=None, low_prio=False, should_pause=None):
+            seen["sp"] = should_pause; return True, "ok"
+        sp = lambda: True
+        with mock.patch.object(stages, "_download", side_effect=spy):
+            stages.run_stage("download", mock.MagicMock(ep="X"), should_pause=sp)
+        self.assertIs(seen["sp"], sp)

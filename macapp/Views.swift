@@ -3796,7 +3796,8 @@ private struct UpNextView: View {
                     .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
                     .help(fetching
                           ? "Sent — youtarr is still downloading it. It jumps the queue as soon as it lands."
-                          : "Queued to jump the queue — starts when the current segment finishes")
+                          : "Queued to jump the queue — starts at the next safe boundary: after the "
+                            + "current Topaz segment or download. A running Resolve always finishes first.")
             } else {
                 iconButton("arrow.up.to.line", enabled: true,
                            help: "Run this video now — the current segment finishes first, "

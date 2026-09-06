@@ -1520,3 +1520,88 @@ class TheFtpSessionNegotiatesUtf8(unittest.TestCase):
         got, ftp = self._connect(mock.Mock(side_effect=_f.error_perm("500 unknown")))
         self.assertIs(got, ftp)                       # best-effort, never fatal
         ftp.set_pasv.assert_called_once_with(True)
+
+
+class SendsGetLocatedWhileAnItemRuns(unittest.TestCase):
+    """Locating used to happen only at selection, and the locate scan's staging-wide walk
+    skipped QUEUED channels' folders on the assumption that the channel cache covered them
+    — but that cache is itself only re-listed at selection. A send delivered to a queued
+    channel mid-item was therefore invisible until the next item boundary, and the
+    segment-boundary yield never once fired (user-caught 2026-09-05)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+        youtube._priority_scan_at = 0.0
+        self.addCleanup(setattr, youtube, "_priority_scan_at", 0.0)
+
+    def _send(self, vid="aaaaaaaaaa1"):
+        with youtube._PRIORITY_LOCK:
+            youtube._save_priority([{"vid": vid, "title": "Sent", "sent_at": 1}])
+
+    def test_nothing_pending_means_no_scan_at_all(self):
+        with mock.patch.object(youtube, "_locate_scan", side_effect=AssertionError("no scan")):
+            self.assertFalse(youtube.locate_pending_priority())
+
+    def test_an_unlocated_import_does_not_trigger_the_locator(self):
+        with youtube._PRIORITY_LOCK:
+            youtube._save_priority([{"vid": "aaaaaaaaaa1", "jump": False, "batch": "imp1"}])
+        with mock.patch.object(youtube, "_locate_scan", side_effect=AssertionError("no scan")):
+            self.assertFalse(youtube.locate_pending_priority())
+
+    def test_a_send_in_a_queued_channels_folder_is_found_by_relisting(self):
+        # THE BUG: cache empty (only re-listed at selection), staging walk skips queued
+        # folders -> never located. Tier 1.5 re-lists the queued folder live.
+        self._send()
+        youtube.add_channel("UC" + "x" * 22, "Almost Friday TV")
+        with youtube._QUEUE_LOCK if hasattr(youtube, "_QUEUE_LOCK") else mock.MagicMock():
+            q = youtube.get_queue(); q[0]["folder_name"] = "Almost Friday TV"; youtube._save_queue(q)
+        hit = [{"vid": "aaaaaaaaaa1", "name": "v [aaaaaaaaaa1].mp4",
+                "path": "/Media/YouTube-raw/Almost Friday TV/x/v [aaaaaaaaaa1].mp4", "mtime": 1}]
+        with mock.patch.object(youtube, "cached_videos", return_value=[]), \
+             mock.patch.object(youtube, "refresh_videos", return_value=hit), \
+             mock.patch.object(youtube, "ftp_connect", side_effect=OSError("no walk needed")):
+            self.assertTrue(youtube.locate_pending_priority())
+        e = youtube._priority()[0]
+        self.assertEqual(e["channel"], "Almost Friday TV")
+        self.assertTrue(e["path"].endswith("[aaaaaaaaaa1].mp4"))
+        self.assertTrue(youtube.has_priority_ready())          # the boundary poll now sees it
+
+    def test_a_second_look_inside_the_throttle_does_not_relist(self):
+        self._send()
+        youtube.add_channel("UC" + "x" * 22, "Chan")
+        q = youtube.get_queue(); q[0]["folder_name"] = "Chan"; youtube._save_queue(q)
+        with mock.patch.object(youtube, "cached_videos", return_value=[]), \
+             mock.patch.object(youtube, "refresh_videos", return_value=[]) as rv, \
+             mock.patch.object(youtube, "ftp_connect", side_effect=OSError("x")):
+            youtube.locate_pending_priority()
+            youtube.locate_pending_priority()
+        self.assertEqual(rv.call_count, 1)                     # 45 s gap honoured
+
+
+class ASendIsRecognisedAsASend(unittest.TestCase):
+    """is_priority_video: book-only, so the download stage can refuse to yield to another
+    send (a send yielding to a send ping-pongs aborted CFRs between them)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for name, fn in (("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DONE_FILE", "done.json"), ("QUEUE_FILE", "q.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start(); self.addCleanup(p.stop)
+
+    def test_a_jump_entry_is_a_send(self):
+        youtube._save_priority([{"vid": "aaaaaaaaaa1", "title": "S", "sent_at": 1}])
+        self.assertTrue(youtube.is_priority_video("Chan - S [aaaaaaaaaa1].mp4"))
+
+    def test_an_import_is_not(self):
+        youtube._save_priority([{"vid": "aaaaaaaaaa1", "jump": False, "batch": "imp1"}])
+        self.assertFalse(youtube.is_priority_video("Chan - S [aaaaaaaaaa1].mp4"))
+
+    def test_unknown_or_unparseable_names_are_not(self):
+        self.assertFalse(youtube.is_priority_video("Chan - S [bbbbbbbbbb1].mp4"))
+        self.assertFalse(youtube.is_priority_video("no id here.mp4"))
+        self.assertFalse(youtube.is_priority_video(None))
