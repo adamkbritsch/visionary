@@ -2800,7 +2800,17 @@ class Orchestrator:
                 # honours the skip set, so an unbounded rule would defer every pending video
                 # in turn before the next episode was ever selected.
                 defer_here = fast_resolve or (topaz_is_noop(p) and not self._yt_parked())
-            if st == "resolve" and defer_here and self._resolve_should_hold(fast_resolve):
+            # A SENT VIDEO IS NEVER HELD AT THE DOORSTEP (user-dictated 2026-09-05: it runs
+            # after the current segment). The doorstep is 1-at-a-time REMUX pacing for the
+            # ordinary queue; a deferred send could only be released when that pacing
+            # cleared, and a poison finisher item (a remux failing every attempt, never
+            # parking across re-arms) held the door shut for six hours while the send sat
+            # "deferred" and the TV topaz — correctly — refused to yield to an unservable
+            # video. Its Resolve simply starts: _resolve_active suspends the in-flight remux
+            # at its next x265 segment and resumes it after, as for any Resolve.
+            is_send = bool(getattr(p, "youtube", False)
+                           and youtube.is_priority_video(p.source_basename))
+            if st == "resolve" and defer_here and not is_send and self._resolve_should_hold(fast_resolve):
                 # A FAST-PATH item (its topaz was a no-op — nothing invested) must not
                 # idle the whole run thread behind the previous remux (user-dictated
                 # 2026-08-06): DEFER it and let the NEXT episode's topaz run meanwhile.
@@ -2814,7 +2824,7 @@ class Orchestrator:
                     f"{ep_disp}: waiting for the remux to finish — the next episode "
                     f"upscales meanwhile; Resolve preempts it when the remux ends")
                 return
-            while st == "resolve" and self._resolve_should_hold(fast_resolve):
+            while st == "resolve" and not is_send and self._resolve_should_hold(fast_resolve):
                 # RESOLVE GATE (user-dictated): hold this item at the Resolve doorstep until the
                 # previous item's remux fully completes. Side benefit: topaz is idle while we
                 # hold, so that remux runs at full tilt and clears fastest. (An EPISODE holds

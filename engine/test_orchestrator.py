@@ -4183,3 +4183,51 @@ class TheBoundaryPollAgreesWithSelection(unittest.TestCase):
         # priority poll, is what lets it in
         o = self._orch(); o._gate_deferred.add(self.STEM)
         self.assertFalse(self._ready(o))
+
+
+class ASentVideoIsNeverHeldAtTheResolveDoorstep(unittest.TestCase):
+    """Live 2026-09-05: the send was selected first, then DEFERRED at the resolve doorstep
+    by ordinary remux pacing (a remux live, a poison item queued behind it that fails every
+    remux and never parks). Deferred fast items are only released when the pacing clears,
+    so the send sat six hours while the TV topaz — correctly — refused to yield to an
+    unservable video. A send is not subject to remux pacing: its Resolve starts, the
+    in-flight remux is suspended at its next segment and resumed after."""
+
+    def _run(self, p, *, is_send):
+        o = orch.Orchestrator(); o._enabled = True
+        seen = []
+        def spy(st, _p, *, abort=None, progress=None, should_pause=None, **_k):
+            seen.append(st); return True, "ok"
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st == "download"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(orch, "topaz_is_noop", return_value=True), \
+             mock.patch.object(orch.youtube, "is_priority_video", return_value=is_send), \
+             mock.patch.object(o, "_resolve_should_hold", return_value=True), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_suspend_remuxes") as susp, \
+             mock.patch.object(o, "_resume_remuxes"), \
+             mock.patch.object(o, "_hand_to_finisher"), \
+             mock.patch("stages.run_stage", side_effect=spy):
+            o._process(p)
+        return o, seen, susp
+
+    def _yt(self):
+        import tempfile
+        return youtube_paths("Chan", "/s/Chan/x/Sent [aaaaaaaaaa1].mp4", "Sent",
+                             scratch_dir=tempfile.mkdtemp())
+
+    def test_a_send_walks_straight_into_resolve(self):
+        o, seen, susp = self._run(self._yt(), is_send=True)
+        self.assertIn("resolve", seen)
+        self.assertEqual(o._gate_deferred, set())
+        self.assertNotEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
+        susp.assert_called()                       # Resolve gets the machine, as always
+
+    def test_an_ordinary_video_is_still_deferred_by_pacing(self):
+        p = self._yt()
+        o, seen, _ = self._run(p, is_send=False)
+        self.assertNotIn("resolve", seen)
+        self.assertIn(o._skip_key(p), o._gate_deferred)
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
