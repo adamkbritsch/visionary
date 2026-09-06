@@ -2803,6 +2803,17 @@ class SendToVisionaryJumpsTheQueue(unittest.TestCase):
         nd.assert_called_once()
 
 
+def _repeat_last(values):
+    """A side_effect that yields `values` in order, then keeps returning the last one — the
+    doorstep now asks _resolve_should_hold once more than these fixtures were written for."""
+    seq = list(values)
+    def fn(*_a, **_k):
+        if len(seq) > 1:
+            return seq.pop(0)
+        return seq[0]
+    return fn
+
+
 class YouTubeDefersInsteadOfStallingTopaz(unittest.TestCase):
     """A YouTube video skips Topaz entirely (Resolve scales it), so it has nothing invested
     at the Resolve doorstep and must DEFER there like a fast-path item instead of pinning the
@@ -2835,7 +2846,7 @@ class YouTubeDefersInsteadOfStallingTopaz(unittest.TestCase):
             es.enter_context(mock.patch.object(o, "_suspend_remuxes"))
             es.enter_context(mock.patch.object(o, "_resume_remuxes"))
             if isinstance(holds, list):
-                es.enter_context(mock.patch.object(o, "_resolve_should_hold", side_effect=holds))
+                es.enter_context(mock.patch.object(o, "_resolve_should_hold", side_effect=_repeat_last(holds)))
             else:
                 es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=holds))
             es.enter_context(mock.patch.object(o, "_hand_to_finisher"))
@@ -4231,3 +4242,53 @@ class ASentVideoIsNeverHeldAtTheResolveDoorstep(unittest.TestCase):
         self.assertNotIn("resolve", seen)
         self.assertIn(o._skip_key(p), o._gate_deferred)
         self.assertEqual((o.state.get("hold") or {}).get("code"), "resolve-gate")
+
+
+class TheStarvationGuardNeverSpinsASend(unittest.TestCase):
+    """The doorstep's starvation guard steps an item back to selection so a fast item
+    deferred earlier gets first pick. It assumed that item was RELEASABLE — true for an
+    episode leaving the pacing hold, false for a send that bypassed it while the gate was
+    still closed. Live 2026-09-06: the send stepped back for a deferred video that could not
+    move, was re-picked as the priority, stepped back again — hundreds of log lines, nothing
+    moving. A send never steps back; nothing steps back unless the deferred item can enter."""
+
+    def _run(self, p, *, is_send, gate_open, deferred="Chan - Old [zzzzzzzzzz1]"):
+        o = orch.Orchestrator(); o._enabled = True
+        o._gate_deferred.add(deferred)
+        seen = []
+        def spy(st, _p, *, abort=None, progress=None, should_pause=None, **_k):
+            seen.append(st); return True, "ok"
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(orch, "topaz_is_noop", return_value=is_send), \
+             mock.patch.object(orch.youtube, "is_priority_video", return_value=is_send), \
+             mock.patch.object(o, "_resolve_should_hold", return_value=not gate_open), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_suspend_remuxes"), mock.patch.object(o, "_resume_remuxes"), \
+             mock.patch.object(o, "_hand_to_finisher"), \
+             mock.patch("stages.run_stage", side_effect=spy):
+            o._process(p)
+        return o, seen
+
+    def _yt(self):
+        import tempfile
+        return youtube_paths("Chan", "/s/Chan/x/Sent [aaaaaaaaaa1].mp4", "Sent", scratch_dir=tempfile.mkdtemp())
+
+    def test_a_send_resolves_even_with_an_item_deferred_ahead_and_the_gate_closed(self):
+        o, seen = self._run(self._yt(), is_send=True, gate_open=False)
+        self.assertIn("resolve", seen)
+        self.assertNotIn("yielding Resolve", o.state.get("message") or "")
+        self.assertEqual(o._gate_deferred, {"Chan - Old [zzzzzzzzzz1]"})   # untouched, released later
+
+    def test_a_send_resolves_even_when_the_gate_is_open(self):
+        o, seen = self._run(self._yt(), is_send=True, gate_open=True)
+        self.assertIn("resolve", seen)
+
+    def test_an_episode_still_steps_back_when_the_deferred_item_can_enter(self):
+        # the Borat guard, preserved: gate open -> the released fast item goes first
+        p = episode_paths("The Office", "S02E10", SRC)
+        o, seen = self._run(p, is_send=False, gate_open=True)
+        self.assertNotIn("resolve", seen)
+        self.assertIn("yielding Resolve to the item deferred ahead", o.state.get("message") or "")

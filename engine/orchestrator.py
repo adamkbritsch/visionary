@@ -2838,7 +2838,16 @@ class Orchestrator:
                     f"{ep_disp}: holding before Resolve — finishing "
                     f"{fin.get('ep') or 'the previous item'}'s remux first")
                 time.sleep(10)
-            if st == "resolve" and self._gate_deferred:
+            # ...but ONLY when that deferred item can actually enter now, and never for a
+            # SENT video. Live 2026-09-06: a send bypassed the pacing hold (as designed),
+            # found an ordinary video deferred here earlier, and stepped back for it — while
+            # the gate was still closed, so the deferred item stayed deferred, the send was
+            # re-picked as the priority, and stepped back again: hundreds of identical log
+            # lines and nothing moving. Stepping back is only worth anything if selection can
+            # then release the deferred item (_gate_release_pending), and a send outranks it
+            # regardless (user-dictated: it runs after the current segment).
+            if (st == "resolve" and self._gate_deferred and not is_send
+                    and self._gate_release_pending()):
                 # STARVATION GUARD (live-hit: Borat, 2026-08-10). A fast-path item was
                 # deferred at this doorstep EARLIER with the promise of first pick — but
                 # that release only happens at SELECTION, and this episode camping in the
