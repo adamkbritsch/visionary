@@ -4292,3 +4292,33 @@ class TheStarvationGuardNeverSpinsASend(unittest.TestCase):
         o, seen = self._run(p, is_send=False, gate_open=True)
         self.assertNotIn("resolve", seen)
         self.assertIn("yielding Resolve to the item deferred ahead", o.state.get("message") or "")
+
+
+class TheDoorstepSeesBothLanes(unittest.TestCase):
+    """resolve_must_wait only ever looked at lane 1 for the plain (non-fast) rule. A remux
+    that lane 2 picked up while lane 1 was busy became invisible the moment lane 1 went
+    idle: the next episode walked into Resolve on top of it, paused it ("Resolve has the
+    machine"), its Resolve then failed and the fluke ladder sent it back in — over and over
+    (user-caught 2026-09-07: S01E02 vs S06E17's remux). A remux is a remux on either lane."""
+
+    def test_a_lane_2_remux_alone_holds_the_next_episode(self):
+        self.assertTrue(orch.resolve_must_wait(None, 0, {"stage": "remux", "ep": "S06E17"}))
+
+    def test_a_lane_1_remux_alone_still_holds(self):
+        self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0, None))
+
+    def test_no_remux_anywhere_and_nothing_queued_does_not_hold(self):
+        self.assertFalse(orch.resolve_must_wait({"stage": "upload"}, 0, {"stage": "cleanup"}))
+        self.assertFalse(orch.resolve_must_wait(None, 0, None))
+
+    def test_the_fast_exception_applies_to_a_lone_fast_remux_on_either_lane(self):
+        fast = {"stage": "remux", "fast": True}
+        self.assertFalse(orch.resolve_must_wait(fast, 0, None))
+        self.assertFalse(orch.resolve_must_wait(None, 0, fast))
+        self.assertTrue(orch.resolve_must_wait(fast, 1, None))          # ...unless something is queued
+        self.assertTrue(orch.resolve_must_wait(fast, 0, {"stage": "remux"}))   # ...or a 2nd remux is live
+
+    def test_sharing_counts_live_remuxes_across_both_lanes(self):
+        r = {"stage": "remux"}
+        self.assertFalse(orch.resolve_must_wait(None, 0, r, incoming_fast=True, share=1))
+        self.assertTrue(orch.resolve_must_wait(r, 0, r, incoming_fast=True, share=1))

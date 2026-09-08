@@ -601,18 +601,23 @@ def resolve_must_wait(finishing, queued: int, finishing2=None,
     (resumed losslessly after — Resolve must finish ASAP, user-dictated). Simultaneous
     remuxes stay capped at the 2 lanes: the exception applies only while the 2nd lane is
     idle and nothing is queued behind the finisher, so the cadence is A-remux → B-resolve
-    (A holds) → A+B dual remux → the THIRD item waits here for a free lane."""
-    f = finishing or {}
+    (A holds) → A+B dual remux → the THIRD item waits here for a free lane.
+
+    EITHER LANE counts as "in flight" (live-caught 2026-09-07): the plain rule only ever
+    looked at lane 1, so a remux that lane 2 had picked up while lane 1 was busy became
+    invisible the moment lane 1 went idle — the next episode walked into Resolve on top of
+    it, paused it ("Resolve has the machine"), and the pacing this rule exists for was
+    gone. A remux is a remux whichever lane runs it."""
+    lanes = [l for l in (finishing, finishing2) if (l or {}).get("stage") == "remux"]
     if incoming_fast and share > 0:
         # The INCOMING item's Resolve shares the machine (user-dictated 2026-08-06): a
         # fast-path item may START its Resolve while up to `share` lanes are mid-remux —
         # the sharing rules (_remux_must_wait lane cap, no SIGSTOP) take it from there.
         # It holds only when live remuxes exceed the share.
-        live = sum(1 for l in (finishing, finishing2) if (l or {}).get("stage") == "remux")
-        return live > share
-    if f.get("stage") == "remux" and f.get("fast") and finishing2 is None and queued == 0:
-        return False
-    return f.get("stage") == "remux" or queued > 0
+        return len(lanes) > share
+    if len(lanes) == 1 and lanes[0].get("fast") and queued == 0:
+        return False                      # the fast-path exception: one fast remux, nothing behind it
+    return bool(lanes) or queued > 0
 
 
 def grace_label(seconds: int) -> str:

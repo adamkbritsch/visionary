@@ -191,7 +191,7 @@ def aac_at_target_layout(src, ffprobe=FFPROBE):
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a:0",
                               "-show_entries", "stream=channels,channel_layout",
                               "-of", "csv=p=0", str(src)],
-                             capture_output=True, text=True, timeout=60).stdout.strip()
+                             capture_output=True, text=True, errors="replace", timeout=60).stdout.strip()
         parts = (out.splitlines() or [""])[0].split(",")
         channels = int(parts[0] or 0)
         layout = parts[1].strip() if len(parts) > 1 else ""
@@ -213,7 +213,7 @@ def build_audio_boost_filter(gain_db: float, src=None) -> str:
 def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
     try:
         r = subprocess.run(build_loudness_probe_command(ffmpeg, src),
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
         return parse_integrated_lufs(r.stderr)
     except Exception:
         return None
@@ -275,7 +275,7 @@ def has_lossless_audio(path: str, ffprobe=FFPROBE) -> bool:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
                               "-show_entries", "stream=codec_name,profile",
                               "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=60).stdout.strip()
+                             capture_output=True, text=True, errors="replace", timeout=60).stdout.strip()
     except Exception:
         return True
     if not out:
@@ -306,7 +306,7 @@ def interleave_gap_mb(path: str, ffprobe=FFPROBE, at=(60, 300, 1200, 3600)) -> f
                                   "-read_intervals", "%d%%+15" % t,
                                   "-show_entries", "packet=pts_time,pos",
                                   "-of", "csv=p=0", path],
-                                 capture_output=True, text=True, timeout=120).stdout
+                                 capture_output=True, text=True, errors="replace", timeout=120).stdout
         except Exception:
             return None
         # THE FIRST PACKET AT OR AFTER t — not the first packet ffprobe prints. A video seek
@@ -363,7 +363,7 @@ def atmos_audio_index(path: str, ffprobe=FFPROBE):
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
                               "-show_entries", "stream=profile", "-of", "json", path],
-                             capture_output=True, text=True, timeout=60).stdout
+                             capture_output=True, text=True, errors="replace", timeout=60).stdout
         streams = json.loads(out).get("streams") or []
     except Exception:
         return None
@@ -401,7 +401,7 @@ def audio_track_count(path: str, ffprobe=FFPROBE) -> int:
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
                               "-show_entries", "stream=index", "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=60).stdout
+                             capture_output=True, text=True, errors="replace", timeout=60).stdout
     except Exception:
         return 0
     return len([ln for ln in out.splitlines() if ln.strip()])
@@ -595,7 +595,7 @@ class RemuxResult:
 
 def _probe(path: str, ffprobe: str) -> str:
     r = subprocess.run([ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", path],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, errors="replace")
     return r.stdout if r.returncode == 0 else "{}"
 
 
@@ -711,7 +711,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
                                                           gain_db=attempt_gain,
                                                           atmos_lead=atmos_lead, n_audio=n_audio),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
                 if ex.returncode != 0:
                     # LAST-RESORT RETRY, no subs: a still-broken subtitle track (even past
                     # -fix_sub_duration) must not park the episode — audio is essential,
@@ -721,7 +721,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                                               include_subs=False,
                                                               atmos_lead=atmos_lead,
                                                               n_audio=n_audio),
-                                        capture_output=True, text=True, timeout=timeout)
+                                        capture_output=True, text=True, errors="replace", timeout=timeout)
                     if ex.returncode != 0:
                         return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
                     subs_note = " · subs dropped (unconvertible track)"
@@ -773,7 +773,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 dv_mp4 = output + ".dv.mp4"
                 with mp4box_safe_input(hevc) as _hevc_in:
                     vx = subprocess.run(build_capped_video_mux_command(mp4box, _hevc_in, info["fps"], dv_mp4),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
                 mkv_gain, mkv_measured, keep = 0.0, None, 0
@@ -797,7 +797,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                               gain_db=attempt,
                                               keep_original_audio=(keep if attempt > 0 else 0),
                                               atmos_lead=mkv_atmos, n_audio=mkv_n),
-                        capture_output=True, text=True, timeout=timeout)
+                        capture_output=True, text=True, errors="replace", timeout=timeout)
                     if mx.returncode != 0:
                         # A failed BOOST must not fail the master. aac_at can refuse an exotic
                         # layout (a 7.1 TrueHD bed), and before the boost reached lossless at
@@ -823,7 +823,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             else:
                 with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
                     mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
                 if mx.returncode != 0:
                     return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
             res = _verify(output, ffprobe)
@@ -971,7 +971,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             return RemuxResult(False, output, reason="aborted")
         with _StepWatch(on_step, "copying the original video", src_es, _fsize(orig_source)):
             ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, orig_source, src_es),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
         if ex.returncode != 0 or not (os.path.exists(src_es) and os.path.getsize(src_es) > 0):
             return RemuxResult(False, output, reason="source ES extract failed: " + _tail(ex.stderr))
         if abort is not None and abort.is_set():
@@ -982,7 +982,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 with _StepWatch(on_step, "converting DV to profile 8.1", inj_es, _fsize(src_es)):
                     cv = subprocess.run(dvcap.build_dovi_convert_command(dvcap.DOVI_TOOL,
                                                                          src_es, inj_es),
-                                        capture_output=True, text=True, timeout=timeout)
+                                        capture_output=True, text=True, errors="replace", timeout=timeout)
                 if cv.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
                     return RemuxResult(False, output,
                                        reason="DV convert failed: " + _tail(cv.stderr or cv.stdout))
@@ -991,7 +991,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
         else:
             with _StepWatch(on_step, "injecting DV metadata", inj_es, _fsize(src_es)):
                 ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
             if ij.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
                 return RemuxResult(False, output,
                                    reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
@@ -1006,12 +1006,12 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(inj_es)), \
                  mp4box_safe_input(inj_es) as _es_in:
                 vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
             if vx.returncode != 0:
                 return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
             with _StepWatch(on_step, "muxing the master", output, _fsize(dv_mp4)):
                 mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
         else:
@@ -1036,7 +1036,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
                                                           gain_db=attempt_gain,
                                                           atmos_lead=atmos_lead, n_audio=n_audio),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
                 if ex.returncode != 0:
                     # LAST-RESORT RETRY, no subs (same rule as the cap path): a broken
                     # subtitle track must not park a fast-path item over nice-to-haves.
@@ -1045,7 +1045,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                                                               include_subs=False,
                                                               atmos_lead=atmos_lead,
                                                               n_audio=n_audio),
-                                        capture_output=True, text=True, timeout=timeout)
+                                        capture_output=True, text=True, errors="replace", timeout=timeout)
                     if ex.returncode != 0:
                         return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
                     subs_note = " · subs dropped (unconvertible track)"
@@ -1067,7 +1067,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             with _StepWatch(on_step, "muxing the master", output, _fsize(inj_es)), \
                  mp4box_safe_input(inj_es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
                 mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
         if on_step:
@@ -1197,7 +1197,7 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             return RemuxResult(False, output, reason="aborted")
         with _StepWatch(on_step, "copying the render's video", es, _fsize(dv_video)):
             ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, dv_video, es),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
         if ex.returncode != 0 or not (os.path.exists(es) and os.path.getsize(es) > 0):
             return RemuxResult(False, output, reason="render ES extract failed: " + _tail(ex.stderr))
         audio_note = ""
@@ -1206,12 +1206,12 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(es)), \
                  mp4box_safe_input(es) as _es_in:
                 vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
             if vx.returncode != 0:
                 return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
             with _StepWatch(on_step, "muxing the master", output, _fsize(dv_mp4)):
                 mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
         else:
@@ -1235,14 +1235,14 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                 ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
                                                           gain_db=attempt_gain,
                                                           atmos_lead=atmos_lead, n_audio=n_audio),
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, errors="replace", timeout=timeout)
                 if ex.returncode != 0:
                     ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
                                                               tracks, gain_db=attempt_gain,
                                                               include_subs=False,
                                                               atmos_lead=atmos_lead,
                                                               n_audio=n_audio),
-                                        capture_output=True, text=True, timeout=timeout)
+                                        capture_output=True, text=True, errors="replace", timeout=timeout)
                     if ex.returncode != 0:
                         return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
                     subs_note = " · subs dropped (unconvertible track)"
@@ -1264,7 +1264,7 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             with _StepWatch(on_step, "muxing the master", output, _fsize(es)), \
                  mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
                 mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
         if on_step:
