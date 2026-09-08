@@ -516,3 +516,115 @@ class LogIsolation(unittest.TestCase):
         logbook.failure("test-only line that must never reach the user's log")
         after = os.path.getsize(real) if os.path.exists(real) else 0
         self.assertEqual(before, after)
+
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "test_fixtures")
+
+
+@unittest.skipIf(dv_shim.cv2 is None, "cv2 not installed")
+class ReadoutStrip(unittest.TestCase):
+    """The Min/Max/Avg strip of the Dolby Vision palette, read RELATIVE to the Analyze
+    'All' button on real captures from 2026-09-07 (Lost S01E02): one taken 150 s after a
+    click that never took (0.000 / 0.000 / 0.000) and one after the analysis had run
+    (0.000 / 0.515 / 0.021). The strip is what tells 'the click missed' from 'the analysis
+    ran but its dialog was never in frame' — two cases a dialog-less poll cannot separate."""
+
+    def _boxes(self, name):
+        return dv_shim.readout_boxes(os.path.join(FIXTURES, name))
+
+    def test_a_blank_strip_is_not_populated(self):
+        boxes = self._boxes("dv_readouts_blank.png")
+        self.assertIsNotNone(boxes)
+        self.assertEqual(len(boxes), 3)
+        self.assertFalse(dv_shim.readouts_populated(boxes))
+
+    def test_a_finished_analysis_reads_populated(self):
+        self.assertTrue(dv_shim.readouts_populated(self._boxes("dv_readouts_done.png")))
+
+    def test_same_text_matches_and_different_text_does_not(self):
+        blank, done = self._boxes("dv_readouts_blank.png"), self._boxes("dv_readouts_done.png")
+        self.assertTrue(dv_shim.same_glyphs(blank[0], done[0]))    # Min: 0.000 both times
+        self.assertFalse(dv_shim.same_glyphs(blank[1], done[1]))   # Max: 0.000 vs 0.515
+
+    def test_no_button_means_no_strip_not_a_blank_one(self):
+        # the modal template on its own: nothing to hang the strip off
+        self.assertIsNone(dv_shim.readout_boxes(dv_shim._t("analyze_modal.png")))
+        self.assertIsNone(dv_shim.readout_boxes("/nonexistent/capture.png"))
+
+
+class AnalyzeReclick(unittest.TestCase):
+    """2026-09-07: the Analyze All click only raised Resolve's window — no dialog, blank
+    readouts, and 150 s later the attempt failed, so the orchestrator rebuilt the whole
+    timeline for another go (~10 min a round, three rounds that night). The watcher now
+    clicks again itself, and only while it can SEE that nothing started."""
+
+    def _run(self, frames, strip, ticks=None, **kw):
+        """`frames`: what each screenshot shows, 'modal' | 'resolve'. `strip`: what the
+        readout strip reads on each of them, 'blank' | 'populated' | None (not visible).
+        `ticks`: the monotonic clock, one entry per poll after the start."""
+        seq, strip = list(frames), list(strip)
+        calls = {"shots": 0, "clicks": [], "activate": 0}
+
+        def fake_screenshot(*a, **k):
+            calls["shots"] += 1
+            return seq[min(calls["shots"] - 1, len(seq) - 1)]
+
+        def fake_found(shot, template, **k):
+            if os.path.basename(template) == "analyze_modal.png":
+                return shot == "modal"
+            return shot in ("modal", "resolve")
+
+        def fake_boxes(shot, **k):
+            return strip[min(calls["shots"] - 1, len(strip) - 1)]
+
+        ticks = ticks or ([0] + [10 * i for i in range(1, 400)])
+        with mock.patch.object(dv_shim, "screenshot", fake_screenshot), \
+             mock.patch.object(dv_shim, "found", fake_found), \
+             mock.patch.object(dv_shim, "readout_boxes", fake_boxes), \
+             mock.patch.object(dv_shim, "readouts_populated", lambda b: b == "populated"), \
+             mock.patch.object(dv_shim, "find_button", lambda shot, t, **k: (10.0, 20.0)), \
+             mock.patch.object(dv_shim, "click", lambda x, y: calls["clicks"].append((x, y))), \
+             mock.patch.object(dv_shim, "activate",
+                               lambda: calls.__setitem__("activate", calls["activate"] + 1)), \
+             mock.patch.object(dv_shim, "screen_locked", return_value=False), \
+             mock.patch.object(dv_shim.time, "sleep", lambda *_a: None), \
+             mock.patch.object(dv_shim.time, "monotonic", mock.Mock(side_effect=ticks)):
+            res = dv_shim.wait_for_analysis(poll=0, **kw)
+        return res, calls
+
+    def test_a_missed_click_is_retried_and_the_dialog_then_counts(self):
+        # 60 s of Resolve sitting there with a blank strip, then the dialog runs and closes
+        res, calls = self._run(["resolve"] * 6 + ["modal", "modal", "resolve", "resolve"],
+                               ["blank"], reclick_after=40, appear_timeout=150)
+        self.assertTrue(res)
+        self.assertEqual(len(calls["clicks"]), 1, "exactly one retry before the dialog showed")
+        self.assertGreaterEqual(calls["activate"], 1, "Resolve is raised before the retry")
+
+    def test_populated_readouts_are_neither_reclicked_nor_accepted_unwitnessed(self):
+        # the analysis evidently ran — a second click could start it over; and with no
+        # dialog ever seen the result is still not trusted
+        res, calls = self._run(["resolve"], ["populated"], reclick_after=40, appear_timeout=100)
+        self.assertFalse(res)
+        self.assertEqual(calls["clicks"], [])
+        self.assertLessEqual(calls["shots"], 12, "it gave up at the appear timeout, not later")
+
+    def test_no_visible_button_means_no_click(self):
+        res, calls = self._run(["resolve"], [None], reclick_after=40, appear_timeout=100)
+        self.assertFalse(res)
+        self.assertEqual(calls["clicks"], [])
+
+    def test_retries_are_capped_and_each_restarts_the_appear_budget(self):
+        res, calls = self._run(["resolve"], ["blank"], reclick_after=40, appear_timeout=100,
+                               max_reclicks=2)
+        self.assertFalse(res)
+        self.assertEqual(len(calls["clicks"]), 2)
+        # clicks at 40 s and 80 s; the budget runs from the LAST click, so it gives up after
+        # 180 s rather than the plain 100 s
+        self.assertGreater(calls["shots"], 16)
+        self.assertLess(calls["shots"], 22)
+
+    def test_a_seen_dialog_disables_retries(self):
+        res, calls = self._run(["modal"] * 30 + ["resolve", "resolve"], ["blank"],
+                               reclick_after=40)
+        self.assertTrue(res)
+        self.assertEqual(calls["clicks"], [])

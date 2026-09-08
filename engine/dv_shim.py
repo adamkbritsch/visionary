@@ -544,6 +544,70 @@ def verify_target_display() -> bool:
     return found(screenshot(), _t("target_1000nit.png"))
 
 
+# --- the Min/Max/Avg readout strip ------------------------------------------
+# Geometry in TEMPLATE units: analyze_all.png is 60 px tall at capture scale and every
+# offset below scales with whatever height it matches at. Measured on real captures
+# (engine/test_fixtures/dv_readouts_*.png, 2026-09-07) — RELATIVE to the button, never
+# fixed coordinates, so the strip follows the palette wherever the window lands.
+READOUT_LABEL_DX = (-46, 159, 374)   # Min / Max / Avg label starts, from the All button centre
+READOUT_DIGITS = (42, 130)           # the value field's digit run, from each label start
+READOUT_DY, READOUT_H = 225, 32      # strip top below the button centre; field height
+GLYPH_SAME = 0.9                     # normalised correlation at/above which two fields show the same text
+
+
+def readout_boxes(shot_path: str, *, threshold: float = 0.8):
+    """The palette's three value fields (Min, Max, Avg) as grayscale crops, or None when
+    the capture does not show the Analyze 'All' button they hang off — Resolve out of
+    frame, or the progress dialog covering the palette. A None is 'no eyes on the strip',
+    never 'blank'."""
+    if cv2 is None:
+        return None
+    shot = cv2.imread(shot_path)
+    tmpl = cv2.imread(_t("analyze_all.png"))
+    if shot is None or tmpl is None:
+        return None
+    th, tw = tmpl.shape[:2]
+    if shot.shape[0] < th or shot.shape[1] < tw:
+        return None
+    res = cv2.matchTemplate(shot, tmpl, cv2.TM_CCOEFF_NORMED)
+    _minv, maxv, _minl, (x, y) = cv2.minMaxLoc(res)
+    if maxv < threshold:
+        return None
+    cx, cy = x + tw / 2, y + th / 2
+    s = th / 60.0
+    gray = cv2.cvtColor(shot, cv2.COLOR_BGR2GRAY)
+    top = int(cy + READOUT_DY * s)
+    bottom = top + int(READOUT_H * s)
+    out = []
+    for dx in READOUT_LABEL_DX:
+        x0 = int(cx + (dx + READOUT_DIGITS[0]) * s)
+        x1 = int(cx + (dx + READOUT_DIGITS[1]) * s)
+        if top < 0 or x0 < 0 or bottom > gray.shape[0] or x1 > gray.shape[1]:
+            return None
+        out.append(gray[top:bottom, x0:x1].copy())
+    return out
+
+
+def same_glyphs(a, b, *, threshold: float = GLYPH_SAME) -> bool:
+    """True when two value fields show the same text. Normalised correlation of one
+    field's core against the other, so a few pixels of layout drift never read as
+    different digits: identical text scores 1.000 on the real captures, 0.000 against
+    0.515 scores 0.63."""
+    core = a[3:-3, 6:-6]
+    if core.size == 0 or core.shape[0] > b.shape[0] or core.shape[1] > b.shape[1]:
+        return False
+    return float(cv2.matchTemplate(b, core, cv2.TM_CCOEFF_NORMED).max()) >= threshold
+
+
+def readouts_populated(boxes) -> bool:
+    """The strip reads 0.000 / 0.000 / 0.000 until Resolve writes results into it, and
+    then Max sits above Min for any real picture. So 'populated' is Max or Avg no longer
+    matching Min — a text comparison, not a stability one (stability is exactly what
+    false-fired the old region-hash watcher while the analysis was still running)."""
+    mn, mx, av = boxes
+    return not (same_glyphs(mn, mx) and same_glyphs(mn, av))
+
+
 def click_analyze_all():
     btn = find_button(screenshot(), _t("analyze_all.png"))
     if not btn:
@@ -564,7 +628,8 @@ def resolve_on_screen(shot_path: str) -> bool:
 
 
 def wait_for_analysis(*, abort=None, poll: float = 10.0,
-                      appear_timeout: float = 150.0, max_seconds: float = 3600.0) -> bool:
+                      appear_timeout: float = 150.0, max_seconds: float = 3600.0,
+                      reclick_after: float = 40.0, max_reclicks: int = 2) -> bool:
     """Block until Analyze All Shots truly finishes. Tracks the analyze MODAL: wait
     for it to APPEAR (analysis started) then DISAPPEAR (done). The old region-hash
     approach false-fired — the Min/Max/Avg strip reads 0.000 the whole analysis and
@@ -583,12 +648,26 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
     switching Spaces would read as "the modal went away, we're done" and render an
     unanalysed master. Such a poll advances nothing. And if Resolve stays unfindable even
     after activating, the loop reverts to raising it every poll (exactly the old behaviour),
-    so the worst case here is what the code did before, not a hang."""
+    so the worst case here is what the code did before, not a hang.
+
+    THE CLICK CAN MISS. Live-caught 2026-09-07 (Lost S01E02, minutes after a power-adapter
+    attach re-shuffled the displays): Analyze All was clicked, no dialog ever appeared, and
+    150 s later the readout strip still read 0.000 — the click had only raised the window.
+    The attempt failed and the orchestrator rebuilt the whole timeline to try again, ~10 min
+    a round. So while no dialog has been seen, the strip is BLANK and the button is plainly
+    visible, the button is clicked again (activating Resolve first) `reclick_after` seconds
+    after the last click, up to `max_reclicks` times, and the appear budget restarts from
+    that click. Blank readouts are the guard: once they hold values the analysis evidently
+    ran and a second click could start it over, so no re-click happens and the poll falls
+    through to the appear timeout as before — an analysis whose dialog was never witnessed
+    is still not accepted, it is only diagnosed."""
     start = time.monotonic()          # monotonic PAUSES through a real sleep — a slept
                                       # machine must not wake to a falsely-expired budget
+    click_at = start                  # the Analyze All click this watcher follows
     saw_modal = False
     gone = 0
     blind = 0
+    reclicks = 0
     force_activate = False
     capture_dead_at = None
     while True:
@@ -600,6 +679,7 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
         # killed a movie's whole DV pass over a transient the analysis itself survived).
         if screen_locked():
             start += poll             # locked (lid reopened onto login): wait it out
+            click_at += poll
             time.sleep(poll)
             continue
         try:
@@ -616,6 +696,7 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
                 print("dv_ui: displays never settled after 15 min — giving up", flush=True)
                 return False
             start += poll
+            click_at += poll
             time.sleep(poll)
             continue
         present = found(shot, _t("analyze_modal.png"))
@@ -628,11 +709,13 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
                 shot = screenshot()
             except RuntimeError:
                 start += poll         # transition mid-poll — same hold as above
+                click_at += poll
                 time.sleep(poll)
                 continue
             present = found(shot, _t("analyze_modal.png"))
             onscreen = present or resolve_on_screen(shot)
-        elapsed = time.monotonic() - start
+        now = time.monotonic()
+        elapsed = now - start
         if present:
             saw_modal, gone, blind = True, 0, 0
         elif onscreen:
@@ -641,8 +724,30 @@ def wait_for_analysis(*, abort=None, poll: float = 10.0,
                 gone += 1
                 if gone >= 2:                 # modal closed (2 polls) → analysis complete
                     return True
-            elif elapsed > appear_timeout:    # modal never showed — click missed / no grants
-                return False
+            else:
+                since_click = now - click_at
+                if since_click > appear_timeout:
+                    # modal never showed — click missed / no grants. Say which of the two
+                    # cases a blind poll cannot tell apart this was, for the diag reader.
+                    boxes = readout_boxes(shot)
+                    state = ("unseen" if boxes is None else
+                             "populated" if readouts_populated(boxes) else "blank")
+                    print(f"dv_ui: no progress dialog within {since_click:.0f} s of the "
+                          f"click (readouts {state}) — not accepting an unwitnessed analysis",
+                          flush=True)
+                    return False
+                if since_click >= reclick_after and reclicks < max_reclicks:
+                    boxes = readout_boxes(shot)
+                    if boxes is not None and not readouts_populated(boxes):
+                        btn = find_button(shot, _t("analyze_all.png"))
+                        if btn:
+                            reclicks += 1
+                            print(f"dv_ui: no analysis {since_click:.0f} s after the click "
+                                  f"(no dialog, readouts blank) — clicking Analyze All again "
+                                  f"({reclicks}/{max_reclicks})", flush=True)
+                            activate()
+                            click(*btn)
+                            click_at = now
         else:
             # Could not get eyes on Resolve even after raising it. Advance NOTHING.
             blind += 1
