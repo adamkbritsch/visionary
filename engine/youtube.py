@@ -957,17 +957,38 @@ def pending_batches(batch_secs, skip=()) -> list:
 
 # ---- delete a downloaded video (+ don't let youtarr re-fetch it) ----------
 
-def delete_video(channel_id, video_basename) -> bool:
+def delete_video(channel_id, video_basename, folder=None) -> bool:
     """Remove a downloaded video's folder (FTP) AND ignore it in youtarr so it isn't re-downloaded;
-    also mark it done so it's never re-queued. DESTRUCTIVE. Returns True on any success."""
+    also mark it done so it's never re-queued. DESTRUCTIVE. Returns True on any success.
+
+    Works WITHOUT a subscribed channel. A third of the up-next list can be imports and
+    sends whose uploader is not one of the queued channels (a playlist compiled from
+    First We Feast, optimum, thelonelyisland, ...): those rows carry a folder but no
+    channelId, and this needed one — so "Skip & delete" on them did nothing at all
+    (user-caught 2026-09-13). The priority book already holds such a video's exact path,
+    so it is deleted from there. A queued channel's video is looked up in its folder, listed
+    LIVE when the cache is cold: a freshly relaunched app has an empty cache, and a miss
+    there marked the video done while leaving the file on the NAS."""
     import youtarr
     import transfer
     vid = video_id(video_basename)
-    entry = next((e for e in get_queue() if e.get("channelId") == channel_id), None)
-    folder = (entry or {}).get("folder_name") or youtarr.channel_folder(channel_id)
-    v = next((x for x in cached_videos(folder) if x["vid"] == vid), None) if folder else None
-    deleted = transfer.delete_tree(v["dir"]) if v else False
-    youtarr.ignore_video(channel_id, vid)
+    entry = next((e for e in get_queue()
+                  if channel_id and e.get("channelId") == channel_id), None)
+    book = next((e for e in _priority() if e.get("vid") == vid and e.get("path")), None) if vid else None
+    folder = ((entry or {}).get("folder_name") or folder or (book or {}).get("channel")
+              or (youtarr.channel_folder(channel_id) if channel_id else None))
+    vdir = None
+    if book:
+        vdir = os.path.dirname(book["path"])
+    elif folder and vid:
+        vids = _VIDEO_CACHE.get(folder)
+        if vids is None:
+            vids = refresh_videos(folder)          # cold cache: list live, never "not found"
+        v = next((x for x in vids if x.get("vid") == vid), None)
+        vdir = v["dir"] if v else None
+    deleted = transfer.delete_tree(vdir) if vdir else False
+    if channel_id:
+        youtarr.ignore_video(channel_id, vid)
     mark_done(vid)
     if folder:
         refresh_videos(folder)

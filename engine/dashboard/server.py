@@ -508,13 +508,16 @@ def api_youtube_queue(body):
         # currently-processing header. Resolves the channelId from the folder when the
         # caller only knows the folder (up-next rows carry folder, not id).
         name = (body.get("name") or "").strip()
-        if not cid:
-            folder = (body.get("channel") or "").strip()
+        folder = (body.get("channel") or "").strip() or None
+        if not cid and folder:
             cid = next((e.get("channelId") for e in youtube.get_queue()
                         if e.get("folder_name") == folder), None)
-        if cid and name:
+        # `cid` stays None for an import or a send whose uploader is not a queued channel
+        # (a third of the list can be those) — requiring it made "Skip & delete" a silent
+        # no-op on every such row (user-caught 2026-09-13). The folder is enough.
+        if name:
             was_current = orchestrator.ORCH.skip_current(name)   # abort in-flight work on it
-            youtube.delete_video(cid, name)                      # staging + youtarr ignore + done
+            youtube.delete_video(cid, name, folder=folder)       # staging + youtarr ignore + done
             def _discard_later():
                 import time as _t
                 _t.sleep(8 if was_current else 0)   # let the aborted stage die + the loop move on

@@ -971,3 +971,39 @@ class RunningNextMarksOnlyWhatTheUserActivated(unittest.TestCase):
         rows = self._rows(book, [])
         self.assertEqual(rows["C"], (True, True))
         self.assertEqual(rows["A"], (False, False))          # everyone else untouched
+
+
+class DeleteFromTheQueue(unittest.TestCase):
+    """The "Skip & delete" row action. An import or a send from an uploader that is not a
+    queued channel has a folder but no channelId; the handler used to require both and
+    silently did nothing for such rows (user-caught 2026-09-13)."""
+
+    NAME = "optimum - My endgame racing simulator [p_gFpVf8C0w].mp4"
+
+    def _delete(self, body):
+        import youtube, orchestrator
+        calls = {}
+        with mock.patch.object(youtube, "get_queue", return_value=[
+                    {"channelId": "C1", "folder_name": "Chan"}]), \
+             mock.patch.object(youtube, "delete_video",
+                               side_effect=lambda *a, **k: calls.update(args=a, kw=k) or True), \
+             mock.patch.object(youtube, "queue_view", return_value={}), \
+             mock.patch.object(server, "up_next", return_value=[]), \
+             mock.patch.object(orchestrator.ORCH, "skip_current", return_value=False), \
+             mock.patch.object(orchestrator.ORCH, "snapshot", return_value={}), \
+             mock.patch.object(orchestrator.ORCH, "finisher_views", return_value=[]), \
+             mock.patch.object(orchestrator, "discard_workfiles"):
+            server.api_youtube_queue(dict(body, action="delete"))
+        return calls
+
+    def test_a_row_from_an_unqueued_uploader_is_still_deleted(self):
+        calls = self._delete({"channel": "optimum", "name": self.NAME})
+        self.assertEqual(calls.get("args"), (None, self.NAME))
+        self.assertEqual(calls.get("kw"), {"folder": "optimum"})
+
+    def test_a_queued_channels_row_resolves_its_channel_id(self):
+        calls = self._delete({"channel": "Chan", "name": self.NAME})
+        self.assertEqual(calls.get("args"), ("C1", self.NAME))
+
+    def test_no_name_deletes_nothing(self):
+        self.assertEqual(self._delete({"channel": "optimum", "name": ""}), {})

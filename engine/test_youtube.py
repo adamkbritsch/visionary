@@ -1605,3 +1605,64 @@ class ASendIsRecognisedAsASend(unittest.TestCase):
         self.assertFalse(youtube.is_priority_video("Chan - S [bbbbbbbbbb1].mp4"))
         self.assertFalse(youtube.is_priority_video("no id here.mp4"))
         self.assertFalse(youtube.is_priority_video(None))
+
+
+class DeleteVideo(unittest.TestCase):
+    """"Skip & delete" on an imported or sent video did nothing: its up-next row carries the
+    uploader's folder but no channelId (the uploader is not a queued channel), and
+    delete_video needed one to find the file (user-caught 2026-09-13)."""
+
+    VID = "p_gFpVf8C0w"
+    NAME = "optimum - My endgame racing simulator [p_gFpVf8C0w].mp4"
+    DIR = "/Media/YouTube-raw/optimum/optimum - My endgame racing simulator - p_gFpVf8C0w"
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        for name, fn in (("QUEUE_FILE", "q.json"), ("PRIORITY_FILE", "p.json"),
+                         ("DONE_FILE", "d.json"), ("IMPORTS_FILE", "i.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start()
+            self.addCleanup(p.stop)
+        self.deleted, self.ignored = [], []
+        for target, fn in (("transfer.delete_tree", lambda x: self.deleted.append(x) or True),
+                           ("youtarr.ignore_video", lambda c, v, **k: self.ignored.append((c, v)) or True),
+                           ("youtarr.channel_folder", lambda c, **k: None)):
+            p = mock.patch(target, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        # the trailing cache refresh must never touch the NAS in a test
+        p = mock.patch.object(youtube, "refresh_videos", return_value=[])
+        self.refresh = p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.dict(youtube._VIDEO_CACHE, {}, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_an_imported_video_with_no_channel_is_deleted_from_its_book_path(self):
+        youtube._save_priority([{"vid": self.VID, "channel": "optimum", "jump": False,
+                                 "path": self.DIR + "/" + self.NAME}])
+        self.assertTrue(youtube.delete_video(None, self.NAME, folder="optimum"))
+        self.assertEqual(self.deleted, [self.DIR])
+        self.assertEqual(self.ignored, [], "no subscribed channel — nothing to ignore in youtarr")
+        self.assertIn(self.VID, youtube.get_done())
+        self.assertFalse([e for e in youtube._priority() if e.get("vid") == self.VID],
+                         "a deleted import leaves the book")
+
+    def test_a_queued_channels_video_is_listed_live_when_the_cache_is_cold(self):
+        youtube.add_channel("C1", "Chan")
+        q = youtube.get_queue()
+        q[0]["folder_name"] = "Chan"
+        youtube._save_queue(q)
+        listed = [{"vid": self.VID, "name": self.NAME, "dir": "/Media/YouTube-raw/Chan/x",
+                   "path": "/Media/YouTube-raw/Chan/x/" + self.NAME, "mtime": 1}]
+        self.refresh.side_effect = lambda folder: listed if folder == "Chan" else []
+        self.refresh.return_value = None
+        self.assertTrue(youtube.delete_video("C1", self.NAME))
+        self.assertEqual(self.deleted, ["/Media/YouTube-raw/Chan/x"])
+        self.assertEqual(self.ignored, [("C1", self.VID)])
+
+    def test_a_video_nobody_can_find_is_still_retired(self):
+        self.assertFalse(youtube.delete_video(None, self.NAME, folder="optimum"))
+        self.assertEqual(self.deleted, [])
+        self.assertIn(self.VID, youtube.get_done(), "never re-queued even when the file is gone")
