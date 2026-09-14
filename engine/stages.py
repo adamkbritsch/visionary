@@ -1128,6 +1128,12 @@ def _resolve(p, abort, progress=None):
     # scale up 2x and freeze into the master. Off unless the user has actually saved a grade.
     cleanup = "1" if (yt and _st.get_settings().get("youtube_cleanup_grade", True)
                       and os.path.exists(resolve_pipeline_cleanup_drx())) else "-"
+    # The SHIELD peak cap, for a YouTube render only: resolve_pipeline measures the
+    # render's 1-s peak while the timeline is still up and re-exports lower while it is
+    # over — the gamble's second throw, minutes instead of the hour-class capped re-encode
+    # (user-dictated 2026-09-14). "-" for everything else: TV/movie renders always take
+    # the x265 capped pass, so their render bitrate is not a gamble.
+    cap_arg = str(int(_st.get_settings().get("max_peak_mbps", 50))) if yt else "-"
     single = fast or yt or p.combine
     ss = "-"
     h = 0
@@ -1158,7 +1164,9 @@ def _resolve(p, abort, progress=None):
                # 8th: apply the YouTube cleanup grade ("1"/"-"). APPENDED, never inserted —
                # an older resolve_pipeline.py just ignores a trailing arg.
                # Both files deploy together, so argv lockstep is fine.
-               (host.get("key") if host else "-"), ss, cleanup]
+               (host.get("key") if host else "-"), ss, cleanup,
+               # 9th: the peak cap for the render gate ("-" = none). Appended, as above.
+               cap_arg]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
@@ -1244,7 +1252,16 @@ def _resolve(p, abort, progress=None):
             return False, out, f"resolve produced a {how} render — not accepting it"
         if not ok:
             logbook.failure(f"resolve {p.ep}: rc={proc.returncode} :: {tail}")
-        return ok, out, ("rendered DV 8.1" if ok else f"resolve failed (rc={proc.returncode}): {tail}")
+        # The gamble's outcome is worth a line of its own: which target the render ended
+        # up at, or that it stayed over the cap and the remux will re-encode it.
+        note = ""
+        for ln in out.splitlines():
+            if ln.startswith(("RENDER_REEXPORT", "RENDER_OVER_CAP")):
+                logbook.event(f"resolve {p.ep}: {ln.strip()[:200]}")
+                if ln.startswith("RENDER_REEXPORT"):
+                    note = " (re-exported under the cap)"
+        return ok, out, (("rendered DV 8.1" + note) if ok
+                         else f"resolve failed (rc={proc.returncode}): {tail}")
 
     try:
         from orchestrator import combine_winner_path

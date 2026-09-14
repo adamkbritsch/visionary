@@ -523,6 +523,78 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
     return 0
 
 
+# ---- THE YOUTUBE GAMBLE, WITH A SECOND THROW -------------------------------------------
+# A YouTube render targets a cap-safe bitrate so the remux can SHIP it stream-copied
+# (stages.YOUTUBE_RENDER_KBPS). Resolve's VideoToolbox export has no peak control, so the
+# 1-second peak is a gamble on the burst ratio, and a lost gamble used to cost the whole
+# hour-class x265 re-encode the fast path exists to avoid. User-dictated 2026-09-14:
+# "instead of remuxing them the slow way, re-export them at a lower bitrate you
+# mathematically calculate would work." So the peak is measured HERE, while the timeline
+# and its DV analysis are still up, and an over-cap render is simply rendered again at a
+# target scaled by the burst ratio it just measured — minutes, no analysis, no x265.
+REEXPORT_MARGIN = 0.9            # aim the re-export's peak at cap x this, not at the gate
+REEXPORT_FLOOR_KBPS = 8000       # under this the picture loses more than the hour saves:
+                                 # the remux's capped re-encode (it caps only the PEAKS) takes it
+MAX_REEXPORTS = 2                # a third miss means the ratio is not stable — stop guessing
+
+
+def reexport_kbps(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
+                  floor=REEXPORT_FLOOR_KBPS):
+    """PURE. The target that lands the peak under the cap, from what this render taught
+    us: at target T the peak was P, so the burst ratio is P/T, and the target that puts
+    the peak at cap x margin is T x cap x margin / P. None when nothing needs lowering or
+    when the fitting target would fall under the floor."""
+    try:
+        kbps, peak, cap = float(kbps), float(peak_mbps), float(cap_mbps)
+    except (TypeError, ValueError):
+        return None
+    if kbps <= 0 or peak <= 0 or cap <= 0:
+        return None
+    want = int(kbps * (cap * margin) / peak)
+    if want >= kbps:                     # not over — nothing to lower
+        return None
+    return want if want >= floor else None
+
+
+def render_under_cap(out, mode, bitrate, cap_mbps=0, *, max_reexports=MAX_REEXPORTS):
+    """render(), then gate the render's 1-s peak against `cap_mbps` and re-export at a
+    lower target while it is over (reexport_kbps). cap_mbps 0 = the plain render. Prints
+    markers stages._resolve reads: RENDER_PEAK, RENDER_REEXPORT, RENDER_OVER_CAP."""
+    import dvcap
+    kbps = int(bitrate)
+    rc = 0
+    for attempt in range(max_reexports + 1):
+        rc = render(out, mode, kbps)
+        if rc != 0 or not cap_mbps or not os.path.exists(out):
+            return rc
+        try:
+            peak = dvcap.video_peak_1s_mbps(out, FFPROBE)
+        except Exception as e:
+            peak = 0.0
+            print(f"RENDER_PEAK unmeasured ({e.__class__.__name__}) — the remux gates it", flush=True)
+        if peak <= 0:
+            return rc                    # unverified here; the remux's gate still stands
+        if dvcap.peak_ok(peak, cap_mbps):
+            print(f"RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — under the {cap_mbps} Mbps cap",
+                  flush=True)
+            return rc
+        nxt = reexport_kbps(kbps, peak, cap_mbps)
+        if nxt is None or attempt >= max_reexports:
+            why = ("no re-exports left" if nxt is not None
+                   else f"a fitting target would be under {REEXPORT_FLOOR_KBPS} kb/s")
+            print(f"RENDER_OVER_CAP {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — {why}; "
+                  "the remux's capped re-encode takes it", flush=True)
+            return rc
+        print(f"RENDER_REEXPORT {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — "
+              f"re-exporting at {nxt} kb/s", flush=True)
+        try:
+            os.remove(out)               # Resolve must write THIS name again, not a "(1)" copy
+        except OSError:
+            pass
+        kbps = nxt
+    return rc
+
+
 def _probe_frames(path):
     """The file's true frame count. nb_frames when the container publishes one (our mp4 CFRs
     always do), else duration x rate. None when neither is readable — the caller then skips
@@ -767,22 +839,25 @@ def setup_single(video, mode=MODE_DV2000, superscale=0, cleanup=False):
     return 0
 
 
-def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0, cleanup=False):
+def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0, cleanup=False,
+           cap_mbps=0):
     """The whole FAST-PATH resolve stage in one process: single-file setup -> DV Analyze All
-    (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way."""
+    (UI shim) -> render. Mirrors episode(); run as a killable subprocess the same way.
+    `cap_mbps` > 0 (a YouTube item) gates the render's peak and re-exports lower while it
+    is over — see render_under_cap."""
     rc = setup_single(video, mode, superscale, cleanup=cleanup)
     if rc != 0:
         return rc
     if not is_dv_mode(mode):
         print("SDR output — skipping DV analyze (headless render)", flush=True)
-        return render(out, mode, bitrate)
+        return render_under_cap(out, mode, bitrate, cap_mbps)
     m = _resume_get(video, mode)
     if m and m.get("analyzed") and m.get("ident") == _src_ident(video):
         # The kill happened AFTER Analyze All completed (during render): the trims are in
         # the persistent project — only the render needs redoing. The marker can only say
         # analyzed on the RESUME path (a fresh setup resets it first).
         print("RESUME: DV analysis already complete — skipping Analyze All Shots", flush=True)
-        return render(out, mode, bitrate)
+        return render_under_cap(out, mode, bitrate, cap_mbps)
     import dv_shim
     try:
         if not dv_shim.run_dv_ui(expect_nit=target_nits(mode),
@@ -798,7 +873,7 @@ def single(video, out, mode=MODE_DV2000, bitrate=60000, superscale=0, cleanup=Fa
         print(f"DV_UI_EXC: {e.__class__.__name__}: {e}", flush=True)
         return 2
     _mark_analyzed(video, mode)         # step COMPLETE → a kill during render resumes past it
-    return render(out, mode, bitrate)
+    return render_under_cap(out, mode, bitrate, cap_mbps)
 
 
 def episode(segdir, out, mode=MODE_DV1000, bitrate=60000):
@@ -882,10 +957,14 @@ if __name__ == "__main__":
         # 7th (index 6) = apply the YouTube cleanup grade; "-"/absent = no. APPENDED, never
         # inserted: an older stages.py simply omits it and gets the old behaviour.
         _cl = a[6] if len(a) > 6 else "-"
+        # 8th (index 7) = the SHIELD peak cap in Mbps for a YouTube render; "-"/absent =
+        # no gate (the plain render). Appended like the others.
+        _cap = a[7] if len(a) > 7 else "-"
         sys.exit(single(a[0], a[1], a[2] if len(a) > 2 else MODE_DV2000,
                         int(a[3]) if len(a) > 3 else 60000,
                         superscale=int(_ss) if _ss.isdigit() else 0,
-                        cleanup=(_cl == "1")))
+                        cleanup=(_cl == "1"),
+                        cap_mbps=int(_cap) if _cap.isdigit() else 0))
     else:
         print("usage: resolve_pipeline.py setup <src> [mode] | render <out> [mode] [kbps] "
               "| episode <prores> <out> [mode] [kbps] | single <video> <out> [mode] [kbps]")

@@ -634,7 +634,7 @@ class MezzanineFallback(unittest.TestCase):
         mezz = stages.mezzanine_path(p.source)
         self.assertIn(mezz, calls[1])                          # retry ingests the mezzanine
         self.assertNotIn(p.source, calls[1])
-        self.assertEqual(calls[1][-1], calls[0][-1])           # export bitrate from the ORIGINAL
+        self.assertEqual(calls[1][6], calls[0][6])             # export bitrate from the ORIGINAL
         self.assertFalse(os.path.exists(mezz))                 # big temp deleted after success
 
     def test_retry_failure_stops_after_second_run(self):
@@ -2171,23 +2171,27 @@ class TheCleanupFlagReachesResolve(unittest.TestCase):
              mock.patch.object(S.subprocess, "Popen", side_effect=boom):
             S.run_stage("resolve", p)
         return seen["cmd"]
+    CLEANUP = 9      # its fixed place: py, script, phase, in, out, mode, kbps, host, ss, CLEANUP, cap
+
     def test_a_youtube_item_with_a_saved_grade_asks_for_it(self):
-        self.assertEqual(self._argv(youtube=True)[-1], "1")
+        self.assertEqual(self._argv(youtube=True)[self.CLEANUP], "1")
 
     def test_no_saved_grade_means_no(self):
-        self.assertEqual(self._argv(youtube=True, drx=False)[-1], "-")
+        self.assertEqual(self._argv(youtube=True, drx=False)[self.CLEANUP], "-")
 
     def test_the_setting_can_turn_it_off(self):
-        self.assertEqual(self._argv(youtube=True, setting=False)[-1], "-")
+        self.assertEqual(self._argv(youtube=True, setting=False)[self.CLEANUP], "-")
 
     def test_an_episode_never_asks_for_it(self):
-        self.assertEqual(self._argv(youtube=False)[-1], "-")
+        self.assertEqual(self._argv(youtube=False)[self.CLEANUP], "-")
 
-    def test_it_is_the_LAST_arg_so_older_builds_ignore_it(self):
+    def test_every_arg_keeps_its_place_so_older_builds_ignore_the_tail(self):
         cmd = self._argv(youtube=True)
-        # py, script, phase, in, out, mode, kbps, host, ss, cleanup
-        self.assertEqual(len(cmd), 10)
+        # py, script, phase, in, out, mode, kbps, host, ss, cleanup, cap — appended, never
+        # inserted (the peak cap joined the tail 2026-09-14)
+        self.assertEqual(len(cmd), 11)
         self.assertEqual(cmd[8], "2")          # superscale kept ITS place (1080p -> 2x)
+        self.assertEqual(cmd[10], str(int(cmd[10])))   # the cap is a number for a YouTube item
 
 
 class ImportedVideosUseTheirBatchSettings(unittest.TestCase):
@@ -2333,3 +2337,104 @@ class DownloadYieldsToASentVideo(unittest.TestCase):
         with mock.patch.object(stages, "_download", side_effect=spy):
             stages.run_stage("download", mock.MagicMock(ep="X"), should_pause=sp)
         self.assertIs(seen["sp"], sp)
+
+
+class YouTubeReexport(unittest.TestCase):
+    """The YouTube gamble's second throw (user-dictated 2026-09-14): a render whose 1-s
+    peak is over the SHIELD cap is re-exported at a target scaled by the burst ratio it
+    just measured, inside the same Resolve session — minutes — instead of losing the
+    whole hour-class x265 capped re-encode at remux."""
+
+    def test_the_math_scales_the_target_by_the_measured_burst_ratio(self):
+        import resolve_pipeline as RP
+        # 20 Mb/s peaked at 59.9 (live 2026-08-18) under a 50 cap: aim the peak at 45
+        self.assertEqual(RP.reexport_kbps(20000, 59.9, 50), int(20000 * 45 / 59.9))
+        self.assertIsNone(RP.reexport_kbps(20000, 40.0, 50), "not over — nothing to lower")
+        self.assertIsNone(RP.reexport_kbps(20000, 300.0, 50), "under the floor — the remux caps it")
+        self.assertIsNone(RP.reexport_kbps(0, 60, 50))
+        self.assertIsNone(RP.reexport_kbps("x", 60, 50))
+
+    def _loop(self, peaks, cap=50, bitrate=20000):
+        import resolve_pipeline as RP, dvcap
+        renders, peaks = [], list(peaks)
+        with mock.patch.object(RP, "render", side_effect=lambda out, mode, kbps: renders.append(kbps) or 0), \
+             mock.patch.object(dvcap, "video_peak_1s_mbps", side_effect=lambda *a, **k: peaks.pop(0)), \
+             mock.patch.object(RP.os.path, "exists", return_value=True), \
+             mock.patch.object(RP.os, "remove"), \
+             mock.patch("builtins.print") as pr:
+            rc = RP.render_under_cap("/out.mov", "dv1000", bitrate, cap)
+        lines = [str(c.args[0]) for c in pr.call_args_list if c.args]
+        return rc, renders, lines
+
+    def test_an_over_cap_render_is_re_exported_lower_and_then_accepted(self):
+        rc, renders, lines = self._loop([59.9, 44.0])
+        self.assertEqual(rc, 0)
+        self.assertEqual(renders, [20000, int(20000 * 45 / 59.9)])
+        self.assertTrue(any(l.startswith("RENDER_REEXPORT") for l in lines))
+        self.assertTrue(any(l.startswith("RENDER_PEAK") for l in lines))
+
+    def test_the_second_throw_uses_the_ratio_it_just_measured(self):
+        rc, renders, _ = self._loop([59.9, 58.0, 44.0])     # the ratio grew at the lower target
+        self.assertEqual(len(renders), 3)
+        self.assertEqual(renders[2], int(renders[1] * 45 / 58.0))
+
+    def test_it_stops_guessing_after_two_re_exports(self):
+        rc, renders, lines = self._loop([60, 60, 60, 60])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(renders), 3)
+        self.assertTrue(any(l.startswith("RENDER_OVER_CAP") for l in lines), "the remux is told to cap it")
+
+    def test_under_the_floor_it_leaves_the_render_to_the_remux(self):
+        rc, renders, lines = self._loop([300.0])
+        self.assertEqual(renders, [20000])
+        self.assertTrue(any(l.startswith("RENDER_OVER_CAP") for l in lines))
+
+    def test_a_render_that_lands_under_the_cap_is_rendered_once(self):
+        rc, renders, lines = self._loop([40.0])
+        self.assertEqual(renders, [20000])
+        self.assertFalse(any("RENDER_REEXPORT" in l for l in lines))
+
+    def test_no_cap_means_the_plain_render(self):
+        import resolve_pipeline as RP, dvcap
+        with mock.patch.object(RP, "render", return_value=0), \
+             mock.patch.object(dvcap, "video_peak_1s_mbps",
+                               side_effect=AssertionError("must not measure")):
+            self.assertEqual(RP.render_under_cap("/out.mov", "dv1000", 20000, 0), 0)
+
+    def test_the_resolve_stage_hands_the_cap_to_youtube_renders_only(self):
+        import plan, preflight, settings
+        from orchestrator import youtube_paths
+        seen = {}
+        def boom(cmd, **kw):
+            seen["cmd"] = cmd
+            raise RuntimeError("stop here")
+        common = dict(resolve="run", topaz="upscale", is_hdr=False, input={"height": 1080})
+        st = dict(settings.DEFAULT_SETTINGS, max_peak_mbps=50)
+        with mock.patch.object(plan, "plan_for", return_value=common), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings", return_value=st), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+            stages.run_stage("resolve", youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T",
+                                                      scratch_dir=tempfile.mkdtemp()))
+            yt_cmd = seen["cmd"]
+            stages.run_stage("resolve", _paths(tempfile.mkdtemp()))
+            tv_cmd = seen["cmd"]
+        self.assertEqual(yt_cmd[-1], "50", "a YouTube render is gated at max_peak_mbps")
+        self.assertEqual(tv_cmd[-1], "-", "a TV render is never a gamble — the x265 pass caps it")
+
+    def test_a_re_export_is_named_in_the_stage_result(self):
+        # the subprocess printed the gamble's second throw; the stage says so in its result
+        # and files a log line, so the outcome is visible without the raw stdout
+        events = []
+        p = _paths(tempfile.mkdtemp())
+        harness = MezzanineFallback("test_import_failure_builds_mezz_and_retries_once")
+        with mock.patch.object(stages.logbook, "event", side_effect=lambda m: events.append(m)):
+            ok, msg, calls, _ = harness._run_resolve(
+                p, [_FakeResolveProc(["RENDER_REEXPORT 59.9 Mbps at 20000 kb/s > 50 cap — "
+                                      "re-exporting at 15025 kb/s\n", "render ok\n"], 0)],
+                dv_ok_sequence=(True,))
+        self.assertTrue(ok)
+        self.assertIn("re-exported under the cap", msg)
+        self.assertTrue(any("RENDER_REEXPORT" in e for e in events))
