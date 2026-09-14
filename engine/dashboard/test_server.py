@@ -1007,3 +1007,22 @@ class DeleteFromTheQueue(unittest.TestCase):
 
     def test_no_name_deletes_nothing(self):
         self.assertEqual(self._delete({"channel": "optimum", "name": ""}), {})
+
+
+class AddWarmsTheChannel(unittest.TestCase):
+    """Adding a channel asks youtarr for its first couple of videos right away (after the
+    subscription sync that makes youtarr know the channel) — not at the next armed tick."""
+
+    def test_adding_a_channel_asks_for_its_first_videos_right_away(self):
+        import youtube, orchestrator
+        order = []
+        with mock.patch.object(youtube, "add_channel", side_effect=lambda *a, **k: order.append("add")), \
+             mock.patch.object(youtube, "configure_youtarr", side_effect=lambda: order.append("configure")), \
+             mock.patch.object(youtube, "warm_up",
+                               side_effect=lambda force=False: order.append("warm:%s" % force) or {}), \
+             mock.patch.object(youtube, "queue_view", return_value={}), \
+             mock.patch.object(server, "up_next", return_value=[]), \
+             mock.patch.object(orchestrator.ORCH, "snapshot", return_value={}), \
+             mock.patch.object(orchestrator.ORCH, "finisher_views", return_value=[]):
+            server.api_youtube_queue({"action": "add", "channelId": "UC" + "a" * 22, "title": "New"})
+        self.assertEqual(order, ["add", "configure", "warm:True"])

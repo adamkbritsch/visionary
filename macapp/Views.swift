@@ -3544,6 +3544,14 @@ private struct ChannelRow: View {
                     // but the list shouldn't imply you follow it (user-dictated).
                     Pill(systemImage: "link", text: "added by link", tint: DS.steelDim)
                 }
+                if let owed = ch.warmup, owed > 0 {
+                    // A NEW channel: its first videos are fetched ahead of youtarr's schedule
+                    // and take the next YouTube slots (TV is never interrupted); after that
+                    // it takes ordinary turns like every other channel, and the pill goes.
+                    Pill(systemImage: "bolt", text: "first videos", tint: DS.steelDim)
+                        .help("New channel — fetching its first \(owed) video\(owed == 1 ? "" : "s") now; "
+                              + "they run at the next YouTube slots, then it joins the normal rotation")
+                }
                 Group {
                     Picker("", selection: Binding(get: { ch.scope ?? "popular" },
                                                   set: { s in Task { await store.setChannelScope(ch.channelId ?? "", s) } })) {

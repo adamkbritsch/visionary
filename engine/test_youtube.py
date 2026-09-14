@@ -1666,3 +1666,295 @@ class DeleteVideo(unittest.TestCase):
         self.assertFalse(youtube.delete_video(None, self.NAME, folder="optimum"))
         self.assertEqual(self.deleted, [])
         self.assertIn(self.VID, youtube.get_done(), "never re-queued even when the file is gone")
+
+
+class Warmup(unittest.TestCase):
+    """User-dictated 2026-09-08: "when a channel is added, it should try really hard to get
+    the first couple videos from that channel, then it tones down and does it normal."
+    Before: nothing asked youtarr for a new channel until the armed 300 s tick, its folder
+    stayed unknown until the next queue edit, and the rotation reached it last."""
+
+    CID = "UC" + "a" * 22
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        for name, fn in (("QUEUE_FILE", "q.json"), ("DONE_FILE", "d.json"), ("ROTATION_FILE", "r.json"),
+                         ("PRIORITY_FILE", "p.json"), ("IMPORTS_FILE", "i.json"),
+                         ("DURATIONS_FILE", "dur.json"), ("PUBLISHED_FILE", "pub.json"),
+                         ("RESUME_FIRST_FILE", "rf.json")):
+            p = mock.patch.object(youtube, name, os.path.join(d, fn))
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_DURATIONS", "_PUBLISHED"):
+            p = mock.patch.object(youtube, name, {})
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_META", "_VIDEO_CACHE", "_WARMUP_CANDS"):
+            p = mock.patch.dict(getattr(youtube, name), {}, clear=True)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_warmup_tick_at", "_warmup_backoff_until"):
+            p = mock.patch.object(youtube, name, 0.0)
+            p.start()
+            self.addCleanup(p.stop)
+        self.asked = []
+        for target, fn in (("youtarr.download_videos", lambda ids, **k: self.asked.append(list(ids)) or True),
+                           ("youtarr.channel_folder", lambda c, **k: "Chan"),
+                           ("youtarr.channel_video_ids", lambda c, **k: []),
+                           ("ytdata.popular_videos", lambda *a, **k: None),
+                           ("ytdata.playlist_video_ids", lambda *a, **k: []),
+                           ("ytdata.video_meta", lambda ids, **k: {})):
+            p = mock.patch(target, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        # the live folder re-list must never touch the NAS: it "lists" the seeded cache
+        p = mock.patch.object(youtube, "refresh_videos",
+                              side_effect=lambda f: youtube._VIDEO_CACHE.get(f) or [])
+        p.start()
+        self.addCleanup(p.stop)
+        # ...and a cache MISS must not spawn the background FTP warmer either
+        p = mock.patch.object(youtube, "cached_videos",
+                              side_effect=lambda f: youtube._VIDEO_CACHE.get(f) or [])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _add(self, folder="Chan", scope="all", **extra):
+        youtube.add_channel(self.CID, "New", scope)
+        q = youtube.get_queue()
+        e = next(i for i in q if i["channelId"] == self.CID)
+        e["folder_name"] = folder
+        e.update(extra)
+        youtube._save_queue(q)
+        return e
+
+    def _on_disk(self, folder, *vids):
+        youtube._VIDEO_CACHE[folder] = [
+            {"vid": v, "name": f"{folder} - {v} [{v}].mp4", "dir": f"/d/{folder}/{v}",
+             "path": f"/d/{folder}/{v}/{v}.mp4", "mtime": i} for i, v in enumerate(vids)]
+
+    @staticmethod
+    def _disk_order(e, skip=()):
+        # channel_pending stand-in: the seeded disk order, so orderings are deterministic
+        return [{"vid": v["vid"], "source_name": v["name"], "channel": e["folder_name"],
+                 "video_path": v["path"], "nas_dir": v["dir"], "title": v["vid"]}
+                for v in youtube._VIDEO_CACHE.get(e["folder_name"]) or []]
+
+    def _stream(self):
+        with mock.patch.object(youtube, "channel_pending", side_effect=self._disk_order):
+            return [v["vid"] for v in youtube.all_pending()]
+
+    # -- what a new channel is owed --------------------------------------------------
+    def test_a_new_channel_is_owed_two_videos_and_readding_does_not_restart_it(self):
+        e = self._add()
+        self.assertEqual(youtube._warmup_left(e), youtube.WARMUP_VIDEOS)
+        youtube.note_served("Chan")                    # one paid off
+        youtube.add_channel(self.CID, "New")           # pressing add again is inert
+        self.assertEqual(youtube._warmup_left(youtube.get_queue()[0]), 1)
+
+    def test_channels_queued_before_the_feature_are_ordinary(self):
+        self.assertEqual(youtube._warmup_left({"channelId": "C"}), 0)
+
+    def test_an_expired_warmup_is_inert(self):
+        e = {"warmup": 2, "warmup_at": time.time() - youtube.WARMUP_TTL_SECONDS - 1}
+        self.assertEqual(youtube._warmup_left(e), 0)
+
+    # -- asking youtarr --------------------------------------------------------------
+    def test_on_add_youtarr_is_asked_for_exactly_the_first_two(self):
+        self._add()
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1", "v2", "v3"]):
+            out = youtube.warm_up(force=True)
+        self.assertEqual(self.asked, [["v1", "v2"]])
+        self.assertEqual(out, {"Chan": ["v1", "v2"]})
+        book = youtube.get_queue()[0]["warmup_asked"]
+        self.assertEqual(sorted(book), ["v1", "v2"])
+        self.assertEqual(book["v1"][1], 1)              # one ask so far
+
+    def test_the_folder_is_learned_from_youtarr_when_unknown(self):
+        self._add(folder="")
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1"]):
+            youtube.warm_up(force=True)
+        self.assertEqual(youtube.get_queue()[0]["folder_name"], "Chan")
+
+    def test_reasks_follow_the_ladder_and_then_give_the_id_up(self):
+        now = int(time.time())
+        self._add(warmup_asked={"v1": [now - 100, 1]})
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1"]):
+            youtube.warm_up(force=True)
+            self.assertEqual(self.asked, [], "asked 100 s ago — too soon to ask again")
+            q = youtube.get_queue(); q[0]["warmup_asked"] = {"v1": [now - 1000, 1]}; youtube._save_queue(q)
+            youtube.warm_up(force=True)
+            self.assertEqual(self.asked, [["v1"]], "15 min later it is asked again")
+            self.assertEqual(youtube.get_queue()[0]["warmup_asked"]["v1"][1], 2)
+            q = youtube.get_queue(); q[0]["warmup_asked"] = {"v1": [now - 99999, 4]}; youtube._save_queue(q)
+            youtube.warm_up(force=True)
+            self.assertEqual(self.asked, [["v1"]], "past the ladder: left to the ordinary fetch-ahead")
+
+    def test_a_landed_video_ends_the_asking(self):
+        self._add(warmup_asked={"v1": [1, 1], "v2": [1, 1]})
+        self._on_disk("Chan", "v1", "v2")
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v3"]):
+            youtube.warm_up(force=True)
+        self.assertEqual(self.asked, [], "both first videos are on staging — nothing more to ask")
+
+    def test_unreachable_youtarr_backs_off_instead_of_hammering(self):
+        self._add()
+        with mock.patch("youtarr.download_videos", return_value=None), \
+             mock.patch.object(youtube, "warmup_candidates", return_value=["v1", "v2"]) as cands:
+            youtube.warm_up(force=True)
+            self.assertEqual(youtube.get_queue()[0]["warmup_asked"], {}, "a failed ask is not recorded")
+            youtube.warm_up(force=True)
+            self.assertEqual(cands.call_count, 1, "inside the back-off nothing is asked")
+
+    def test_the_tick_is_throttled_unless_forced(self):
+        self._add()
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1"]):
+            youtube.warm_up()
+            youtube.warm_up()
+        self.assertEqual(self.asked, [["v1"]])
+
+    def test_a_paused_channel_is_not_warmed(self):
+        self._add(paused=True)
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1"]):
+            self.assertEqual(youtube.warm_up(force=True), {})
+
+    def test_nothing_warming_costs_nothing(self):
+        youtube.add_channel("C0", "Old")
+        q = youtube.get_queue(); q[0].pop("warmup"); youtube._save_queue(q)
+        with mock.patch.object(youtube, "refresh_videos", side_effect=AssertionError("must not list")):
+            self.assertEqual(youtube.warm_up(force=True), {})
+
+    # -- which videos are "the first couple" -----------------------------------------
+    def test_popular_candidates_are_the_most_viewed_first_minus_done_and_on_disk(self):
+        e = self._add(scope="popular")
+        youtube._META[self.CID] = {"popular": {"p1", "p2", "p3"}, "top": ["p1", "p2", "p3"]}
+        youtube.mark_done("p1")
+        self._on_disk("Chan", "p2")
+        self.assertEqual(youtube.warmup_candidates(e), ["p3"])
+
+    def test_all_scope_uses_youtarrs_index_newest_first(self):
+        e = self._add(scope="all")
+        youtube._PUBLISHED.update({"a": 10, "b": 30, "c": 20})
+        with mock.patch("youtarr.channel_video_ids", return_value=["a", "b", "c"]):
+            self.assertEqual(youtube.warmup_candidates(e), ["b", "c", "a"])
+
+    def test_with_no_index_the_uploads_playlist_is_used_without_shorts(self):
+        e = self._add(scope="all")
+        with mock.patch("ytdata.playlist_video_ids", return_value=["u1", "u2", "u3"]), \
+             mock.patch("ytdata.video_meta", return_value={"u1": {"secs": 30, "pub": 5},
+                                                          "u2": {"secs": 600, "pub": 4},
+                                                          "u3": {"secs": 900, "pub": 3}}):
+            self.assertEqual(youtube.warmup_candidates(e), ["u2", "u3"])
+
+    # -- running them early, then normally -------------------------------------------
+    def test_the_first_videos_lead_then_the_rotation_runs_as_before(self):
+        youtube.add_channel("CB", "B")
+        youtube.add_channel(self.CID, "New")
+        q = youtube.get_queue()
+        q[0].update(folder_name="B"); q[0].pop("warmup")           # an ordinary channel
+        q[1].update(folder_name="Chan", warmup_asked={"a2": [1, 1]})
+        youtube._save_queue(q)
+        self._on_disk("B", "b1", "b2")
+        self._on_disk("Chan", "a1", "a2", "a3")
+        youtube.advance_rotation("Chan")                # the plain rotation would start at B
+        # the asked one first, then the channel's next; then B, A, B exactly as before
+        self.assertEqual(self._stream(), ["a2", "a1", "b1", "a3", "b2"])
+
+    def test_channels_without_a_warmup_are_ordered_exactly_as_before(self):
+        youtube.add_channel("CA", "A")
+        youtube.add_channel("CB", "B")
+        q = youtube.get_queue()
+        for e, f in zip(q, ("A", "B")):
+            e.update(folder_name=f); e.pop("warmup")
+        youtube._save_queue(q)
+        self._on_disk("A", "a1", "a2")
+        self._on_disk("B", "b1", "b2")
+        self.assertEqual(self._stream(), ["a1", "b1", "a2", "b2"])
+
+    def test_serving_pays_the_warmup_off_and_drops_it_at_zero(self):
+        self._add()
+        self.assertEqual(youtube.note_served("Chan"), 1)
+        self.assertEqual(youtube.note_served("Chan"), 0)
+        e = youtube.get_queue()[0]
+        self.assertNotIn("warmup", e)
+        self.assertNotIn("warmup_asked", e)
+        self.assertIsNone(youtube.note_served("Chan"), "an ordinary channel: nothing to pay")
+
+    def test_a_warmup_pick_stays_pending_after_the_popular_set_refreshes(self):
+        e = self._add(scope="popular", warmup_asked={"y": [1, 1]})
+        youtube._META[self.CID] = {"popular": {"z"}, "top": ["z"]}
+        self._on_disk("Chan", "y")
+        self.assertEqual([v["vid"] for v in youtube.channel_pending(e)], ["y"])
+
+    def test_queue_view_reports_what_is_still_owed(self):
+        self._add()
+        with mock.patch.object(youtube, "_connected", return_value=True):
+            item = youtube.queue_view()["items"][0]
+        self.assertEqual(item["warmup"], youtube.WARMUP_VIDEOS)
+
+    # -- review-caught hardening (2026-09-13) ------------------------------------------
+    def test_fetch_ahead_does_not_resend_what_the_warmup_just_asked(self):
+        now = int(time.time())
+        e = self._add(scope="all", warmup_asked={"v1": [now - 100, 1]})
+        with mock.patch("youtarr.channel_video_ids", return_value=["v1", "v2"]):
+            self.assertEqual(youtube.wanted_ids(e, 5), ["v2"], "v1 is inside its ladder step")
+            e["warmup_asked"] = {"v1": [now - 99999, 4]}
+            self.assertEqual(youtube.wanted_ids(e, 5), ["v1", "v2"], "given up on: fetch-ahead may")
+
+    def test_candidate_lookups_are_throttled_per_channel(self):
+        self._add()
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1", "v2", "v3"]) as cands:
+            youtube.warm_up(force=True)
+            youtube.warm_up(force=True)
+        self.assertEqual(self.asked, [["v1", "v2"]], "the second tick has nothing new to ask")
+        self.assertEqual(cands.call_count, 1, "candidates were looked up once, not per tick")
+
+    def test_a_landed_candidate_is_never_re_asked_from_the_cache(self):
+        now = int(time.time())
+        self._add(warmup_asked={"v1": [now - 5000, 1]})      # its ladder step has passed
+        youtube._WARMUP_CANDS[self.CID] = (now, ["v1", "v2"])
+        self._on_disk("Chan", "v1")
+        youtube.warm_up(force=True)
+        self.assertEqual(self.asked, [["v2"]], "v1 landed; only the still-missing one is asked")
+
+    def test_one_tick_runs_at_a_time(self):
+        self._add()
+        with mock.patch.object(youtube, "warmup_candidates", return_value=["v1"]):
+            youtube._WARMUP_RUN.acquire()
+            try:
+                self.assertEqual(youtube.warm_up(force=True), {})
+            finally:
+                youtube._WARMUP_RUN.release()
+        self.assertEqual(self.asked, [])
+
+    def test_a_channel_removed_mid_tick_is_not_asked_for(self):
+        self._add()
+        with mock.patch.object(youtube, "warmup_candidates",
+                               side_effect=lambda e: (youtube.remove_channel(self.CID), ["v1"])[1]):
+            youtube.warm_up(force=True)
+        self.assertEqual(self.asked, [])
+
+    def test_configure_youtarr_keeps_what_the_warmup_wrote_meanwhile(self):
+        self._add(folder="")
+
+        def folder_after_a_warmup_write(cid, **k):
+            # the warm-up records an ask while configure_youtarr is busy on the network
+            youtube._update_entry(self.CID, lambda x: x.__setitem__("warmup_asked", {"v1": [1, 1]}))
+            return "Chan"
+        with mock.patch("youtarr.sync_subscriptions", return_value=True), \
+             mock.patch("youtarr.channel_folder", side_effect=folder_after_a_warmup_write), \
+             mock.patch.object(youtube, "refresh_meta"), mock.patch.object(youtube, "prune_old"):
+            youtube.configure_youtarr()
+        e = youtube.get_queue()[0]
+        self.assertEqual(e["folder_name"], "Chan")
+        self.assertEqual(e["warmup_asked"], {"v1": [1, 1]}, "a stale whole-file save dropped this")
+
+    def test_queue_edits_go_through_the_same_lock_as_the_warmup(self):
+        self._add()
+        youtube.set_paused(self.CID, True)
+        youtube._update_entry(self.CID, lambda x: x.__setitem__("warmup_asked", {"v1": [1, 1]}))
+        youtube.set_max_age(self.CID, 7)
+        e = youtube.get_queue()[0]
+        self.assertTrue(e["paused"])
+        self.assertEqual(e["max_age_days"], 7)
+        self.assertEqual(e["warmup_asked"], {"v1": [1, 1]})

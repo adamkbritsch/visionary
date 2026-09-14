@@ -2279,6 +2279,7 @@ class Orchestrator:
             if not self._yt_meta_done:                     # run start: fresh popular sets, once
                 youtube.refresh_all_meta()
                 self._yt_meta_done = True
+                youtube.warm_up(force=True)                # a NEW channel's first videos, now
                 self._yt_refresh_at = now + YT_REFRESH_SECONDS
             elif now >= self._yt_refresh_at:               # then a cheap live re-scan for new downloads
                 youtube.refresh_downloads()
@@ -2286,6 +2287,7 @@ class Orchestrator:
                 # own schedule let the upscale queue run dry with the pipeline idle; this
                 # asks for whatever each channel is short of (rate-limited inside).
                 youtube.fetch_ahead()
+                youtube.warm_up()                          # (throttled inside; cheap when idle)
                 self._yt_refresh_at = now + YT_REFRESH_SECONDS
         except Exception:
             pass
@@ -2525,6 +2527,13 @@ class Orchestrator:
                     logbook.event("a video you sent is on staging — it runs at the next "
                                   "safe boundary (after the current segment or download; "
                                   "a running Resolve finishes first)")
+            except Exception:
+                pass
+            try:
+                # A NEW channel's warm-up rides this thread too: its folder is re-listed
+                # about once a minute (throttled inside) so a first video that lands
+                # mid-item is pending at once, not at the next selection tick.
+                youtube.warm_up()
             except Exception:
                 pass
             self._sleep(20)
@@ -3439,7 +3448,18 @@ class Orchestrator:
                     # next_due() takes its HEAD — without this pointer the head was always the
                     # first channel and every other channel starved (live-caught 2026-08-21).
                     try:
-                        youtube.advance_rotation(p.series)
+                        # A warming channel's first video ran OUTSIDE the round-robin
+                        # (all_pending pulls it out of the rotation), so it must NOT move
+                        # the pointer: that restarted the ordinary stream at the front of
+                        # the queue and cost the channels due next their turn (review-
+                        # caught 2026-09-13). Pay it off instead; at zero the channel is
+                        # ordinary from here on. Only an ordinary serve advances.
+                        left = youtube.note_served(p.series, p.source_basename)
+                        if left is None:
+                            youtube.advance_rotation(p.series)
+                        elif left == 0:
+                            logbook.event(f"{p.series}: its first videos are through — it now "
+                                          "takes ordinary turns in the YouTube rotation")
                     except Exception:
                         pass
                     # One video of the burst done. Only when the burst is COMPLETE does the

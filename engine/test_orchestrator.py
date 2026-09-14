@@ -4322,3 +4322,38 @@ class TheDoorstepSeesBothLanes(unittest.TestCase):
         r = {"stage": "remux"}
         self.assertFalse(orch.resolve_must_wait(None, 0, r, incoming_fast=True, share=1))
         self.assertTrue(orch.resolve_must_wait(r, 0, r, incoming_fast=True, share=1))
+
+
+class WarmupPaysOffAtHandoff(unittest.TestCase):
+    """A NEW channel is owed its first couple of videos (youtube.warm_up). Each one is paid
+    off at hand-off — once per item (a finisher retry re-hands the same item off and must
+    not pay twice) — and, because it ran OUTSIDE the round-robin, it must not move the
+    rotation pointer: that restarted the ordinary stream at the front of the queue and
+    cost the channels due next their turn (review-caught 2026-09-13)."""
+
+    def _handoff(self, paid_value, times=1):
+        import os as _o, tempfile as _tf
+        import youtube
+        o = orch.Orchestrator(); o._enabled = True
+        p = orch.youtube_paths("Chan", "/Media/YouTube-raw/Chan/v/Chan - A [aaaaaaaaaa1].mp4", "A")
+        paid, rotated = [], []
+        with mock.patch.object(orch, "CADENCE_FILE", _o.path.join(_tf.mkdtemp(), "c.json")), \
+             mock.patch.object(youtube, "advance_rotation", side_effect=lambda ch: rotated.append(ch)), \
+             mock.patch.object(youtube, "note_served",
+                               side_effect=lambda f, n=None: paid.append(f) or paid_value):
+            for _ in range(times):
+                o._advance_cadence_at_handoff(p)
+        return paid, rotated
+
+    def test_a_warmup_video_pays_once_and_leaves_the_rotation_pointer_alone(self):
+        paid, rotated = self._handoff(1, times=2)          # finisher retry re-hands it off
+        self.assertEqual(paid, ["Chan"])
+        self.assertEqual(rotated, [], "a lead video ran outside the rotation — no pointer move")
+
+    def test_the_last_warmup_video_still_leaves_the_pointer_alone(self):
+        paid, rotated = self._handoff(0)
+        self.assertEqual(rotated, [])
+
+    def test_an_ordinary_video_advances_the_rotation(self):
+        paid, rotated = self._handoff(None)
+        self.assertEqual(rotated, ["Chan"])

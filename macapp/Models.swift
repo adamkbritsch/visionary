@@ -306,6 +306,7 @@ struct YouTubeChannelDTO: Codable, Identifiable {   // a queued channel (standin
     var downloaded: Int?      // videos youtarr has on disk
     var via_link: Bool?       // added by PASTING A LINK and not one of your real subscriptions —
                               // behaves identically, but badged so the list doesn't imply you follow it
+    var warmup: Int?          // a NEW channel: first videos still owed by its warm-up (0/absent = ordinary)
     var id: String { channelId ?? title ?? "" }
 }
 

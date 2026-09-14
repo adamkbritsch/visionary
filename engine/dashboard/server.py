@@ -524,8 +524,11 @@ def api_youtube_queue(body):
                 orchestrator.discard_workfiles(name)             # then drop its scratch leftovers
             threading.Thread(target=_discard_later, daemon=True).start()
     if reconfigure:
-        try: youtube.configure_youtarr()        # sync youtarr's subs + refresh scope/duration meta
-        except Exception: pass
+        try:
+            youtube.configure_youtarr()         # sync youtarr's subs + refresh scope/duration meta
+            youtube.warm_up(force=True)         # a NEW channel: ask youtarr for its first videos now
+        except Exception:
+            pass
     out = {"youtube": youtube.queue_view(), "up_next": up_next(current=orchestrator.ORCH.snapshot().get("current"), inflight=orchestrator.ORCH.finisher_views())}
     if imported is not None:
         out["import"] = imported

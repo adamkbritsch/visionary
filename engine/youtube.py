@@ -387,35 +387,53 @@ def _save_queue(items) -> None:
         json.dump(items, f)
 
 
+_QUEUE_LOCK = threading.Lock()
+
+
+def _mutate_queue(fn) -> list:
+    """EVERY queue write goes through here, under one lock. The handler thread, the run
+    thread, the priority locator and the wipe thread all write this file, and an unlocked
+    read-modify-write from one of them silently dropped what another had just written
+    (review-caught 2026-09-13: the warm-up's book and its pay-off). `fn(items)` mutates in
+    place or returns a replacement list; the result is saved and returned."""
+    with _QUEUE_LOCK:
+        items = get_queue()
+        out = fn(items)
+        if isinstance(out, list):
+            items = out
+        _save_queue(items)
+        return items
+
+
 def add_channel(channel_id, title, scope="popular", *, via_link=False) -> list:
     """Queue a subscribed channel (no dups, no limit). Defaults scope 'popular' + the YouTube preset.
 
     via_link marks a channel added by PASTING A LINK that is not one of your YouTube
     subscriptions — it behaves identically, but the app badges it so the list doesn't
     silently imply you follow it (user-dictated)."""
-    items = get_queue()
-    if channel_id and not any(i.get("channelId") == channel_id for i in items):
+    def _add(items):
+        if not channel_id or any(i.get("channelId") == channel_id for i in items):
+            return
         items.append({"channelId": channel_id, "title": title or channel_id, "folder_name": "",
                       "scope": scope if scope in ("popular", "all") else "popular",
                       "capped": False, "paused": False, "max_age_days": 0,
-                      "via_link": bool(via_link)})
-        _save_queue(items)
-    return items
+                      "via_link": bool(via_link),
+                      # a NEW channel is owed its first videos, fast (see warm_up)
+                      "warmup": WARMUP_VIDEOS, "warmup_at": int(time.time()),
+                      "warmup_asked": {}})
+    return _mutate_queue(_add)
 
 
 def remove_channel(channel_id) -> list:
-    items = [i for i in get_queue() if i.get("channelId") != channel_id]
-    _save_queue(items)
-    return items
+    return _mutate_queue(lambda items: [i for i in items if i.get("channelId") != channel_id])
 
 
 def set_scope(channel_id, scope) -> list:
-    items = get_queue()
-    for e in items:
-        if e.get("channelId") == channel_id:
-            e["scope"] = scope if scope in ("popular", "all") else "popular"
-    _save_queue(items)
-    return items
+    def _set(items):
+        for e in items:
+            if e.get("channelId") == channel_id:
+                e["scope"] = scope if scope in ("popular", "all") else "popular"
+    return _mutate_queue(_set)
 
 
 def set_capped(channel_id, on) -> list:
@@ -423,24 +441,22 @@ def set_capped(channel_id, on) -> list:
     existing queue file round-trips, but nothing reads it when choosing videos.
     Historical: on → only upscale videos ≤ max_youtube_minutes; off (default)
     → upscale any length. Purely upscale-side (doesn't change what youtarr downloads)."""
-    items = get_queue()
-    for e in items:
-        if e.get("channelId") == channel_id:
-            e["capped"] = bool(on)
-    _save_queue(items)
-    return items
+    def _set(items):
+        for e in items:
+            if e.get("channelId") == channel_id:
+                e["capped"] = bool(on)
+    return _mutate_queue(_set)
 
 
 def set_paused(channel_id, on) -> list:
     """Per-channel PAUSE toggle: on → stop ALL work on the channel (youtarr stops downloading it +
     Visionary stops upscaling it) WITHOUT deleting anything it already has; off → resume. The channel
     stays in the queue. (Caller re-runs configure_youtarr so youtarr's subscriptions follow suit.)"""
-    items = get_queue()
-    for e in items:
-        if e.get("channelId") == channel_id:
-            e["paused"] = bool(on)
-    _save_queue(items)
-    return items
+    def _set(items):
+        for e in items:
+            if e.get("channelId") == channel_id:
+                e["paused"] = bool(on)
+    return _mutate_queue(_set)
 
 
 def set_max_age(channel_id, days) -> list:
@@ -451,17 +467,15 @@ def set_max_age(channel_id, days) -> list:
         d = max(0, int(days))
     except (ValueError, TypeError):
         d = 0
-    items = get_queue()
-    for e in items:
-        if e.get("channelId") == channel_id:
-            e["max_age_days"] = d
-    _save_queue(items)
-    return items
+    def _set(items):
+        for e in items:
+            if e.get("channelId") == channel_id:
+                e["max_age_days"] = d
+    return _mutate_queue(_set)
 
 
 def clear_queue() -> list:
-    _save_queue([])
-    return []
+    return _mutate_queue(lambda items: [])
 
 
 # ---- picker (the user's real YouTube subscriptions) -----------------------
@@ -490,15 +504,15 @@ def configure_youtarr():
                 "url": f"https://www.youtube.com/channel/{e['channelId']}"}
                for e in active]
     ok = youtarr.sync_subscriptions(desired)
-    changed = False
     for e in q:
         if not e.get("folder_name") and not e.get("paused"):
             fn = youtarr.channel_folder(e["channelId"])
             if fn:
+                # Per entry, under the lock. This runs seconds after `q` was read (network
+                # calls above), and saving that stale copy whole dropped whatever the
+                # warm-up had written meanwhile (review-caught 2026-09-13).
+                _update_entry(e["channelId"], lambda x, f=fn: x.__setitem__("folder_name", f))
                 e["folder_name"] = fn
-                changed = True
-    if changed:
-        _save_queue(q)
     for e in active:
         refresh_meta(e)
         prune_old(e)                        # download-then-delete: drop videos past the channel's max age
@@ -550,9 +564,12 @@ def wanted_ids(entry, target) -> list:
         cands = list(popular)
     cands.sort(key=lambda v: -(pubs.get(v) or 0))
     out = []
+    asked = entry.get("warmup_asked") or {}
     for vid in cands:
         if vid in have or vid in done:
             continue
+        if _asked_recently(asked.get(vid), now):
+            continue          # the warm-up asked for it and is still inside its ladder step
         if scope == "popular" and popular and vid not in popular:
             continue
         pub = pubs.get(vid)
@@ -595,6 +612,254 @@ def fetch_ahead(force=False) -> dict:
         except Exception:
             continue
     return asked
+
+
+# ---- NEW-CHANNEL WARM-UP: the first couple of videos, fast ---------------------------
+# A channel added today did nothing visible for a long time: nothing asked youtarr for a
+# just-subscribed channel until the armed 300 s tick (and youtarr's own cron takes hours),
+# its folder_name stayed "" until the NEXT queue edit (only configure_youtarr fills it),
+# and once something landed the rotation reached the new channel only after every other
+# channel had had a turn. User-dictated 2026-09-08: "when a channel is added, it should
+# try really hard to get the first couple videos from that channel, then it tones down
+# and does it normal."
+#
+# So a NEW entry is owed WARMUP_VIDEOS videos. While it is: the warm-up asks youtarr for
+# exactly those (most-viewed for scope=popular, newest non-short for scope=all) the moment
+# the channel is added and re-asks on a ladder; it learns the folder youtarr filed the
+# channel under; it re-lists that folder every minute so an arrival is pending within a
+# minute rather than five; and all_pending() leads with them, so they take the next
+# YouTube cadence slots — INSIDE the ordinary gate, never preempting TV (preemption is
+# only ever for a video the user sent or activated). Each served video pays one off; at
+# zero (or after WARMUP_TTL_SECONDS) the keys are dropped and the channel is an ordinary
+# rotation member. That is the "tones down".
+WARMUP_VIDEOS = 2
+WARMUP_TICK_SECONDS = 60.0            # how often a warming channel's folder is re-listed
+WARMUP_RESEND_LADDER = (900.0, 3600.0, 10800.0)   # re-ask an id that has not landed after
+                                      # 15 min, 1 h, 3 h — then that id is given up on
+WARMUP_TTL_SECONDS = 3 * 86400        # a warm-up that never completes expires
+WARMUP_CANDIDATES = 12                # ids considered (and meta-fetched) per pick
+WARMUP_SHORT_SECS = 60                # the uploads-playlist fallback is the one source that
+                                      # can carry shorts, which are never counted
+WARMUP_BACKOFF_SECONDS = 300.0        # youtarr answered nothing: no asks for this long
+WARMUP_CANDIDATE_GAP = 900.0          # a channel's candidates are looked up at most this often
+                                      # (the lookup pages youtarr's index or spends API quota)
+_WARMUP_RUN = threading.Lock()        # one tick at a time — four threads call warm_up
+_WARMUP_CANDS = {}                    # channelId -> (looked up at, [candidate ids])
+_warmup_tick_at = 0.0
+_warmup_backoff_until = 0.0
+
+
+def _asked_recently(rec, now) -> bool:
+    """True while an id the warm-up asked for is still inside its ladder step, so neither the
+    warm-up nor the ordinary fetch-ahead re-sends it (a second /triggerspecificdownloads for
+    an id mid-download queues a duplicate job). False once never asked, or given up on."""
+    try:
+        last, n = float((rec or [0, 0])[0] or 0), int((rec or [0, 0])[1] or 0)
+    except (TypeError, ValueError, IndexError):
+        return False
+    if n <= 0 or n > len(WARMUP_RESEND_LADDER):
+        return False
+    return now - last < WARMUP_RESEND_LADDER[n - 1]
+
+
+def _warmup_left(entry) -> int:
+    """Videos this channel is still owed by its warm-up: 0 for an entry without one (every
+    channel queued before the feature), a paid-off one, or one past its TTL — so an
+    expired warm-up is inert without a write."""
+    try:
+        left = int(entry.get("warmup") or 0)
+        if left <= 0:
+            return 0
+        if time.time() - float(entry.get("warmup_at") or 0) > WARMUP_TTL_SECONDS:
+            return 0
+        return left
+    except (TypeError, ValueError):
+        return 0
+
+
+def _update_entry(channel_id, fn):
+    """Read-modify-write ONE queue entry under the queue lock (the warm-up runs on the
+    locator thread, the run thread and the handler thread; a whole-file rewrite from two
+    of them at once would lose one's change). None when the channel is gone."""
+    with _QUEUE_LOCK:
+        items = get_queue()
+        e = next((i for i in items if i.get("channelId") == channel_id), None)
+        if e is None:
+            return None
+        fn(e)
+        _save_queue(items)
+        return e
+
+
+def warmup_candidates(entry) -> list:
+    """The ids a warming channel's first videos are picked from, best-first, minus what is
+    done, already on staging, or older than the channel's max age (prune_old would delete
+    it the moment it landed). scope=popular: most-viewed first — refresh_meta keeps that
+    order as _META[cid]['top']. scope=all: newest first from youtarr's index (shorts are
+    never in it), else the channel's uploads playlist with clips <= WARMUP_SHORT_SECS
+    dropped. Never raises."""
+    cid = entry.get("channelId")
+    if not cid:
+        return []
+    folder = entry.get("folder_name")
+    have = {v.get("vid") for v in cached_videos(folder)} if folder else set()
+    done = get_done()
+    order = []
+    if entry.get("scope", "popular") == "popular":
+        order = list((_META.get(cid) or {}).get("top") or [])
+        if not order:
+            try:
+                import ytdata
+                pv = ytdata.popular_videos(cid, max_secs=10 ** 9, n=50) or []
+                order = [v["id"] for v in pv]
+                if pv:
+                    remember_durations({v["id"]: v["secs"] for v in pv})
+                    _META[cid] = {"popular": set(order), "top": list(order)}
+            except Exception:
+                order = []
+    if not order:
+        try:
+            import youtarr
+            pubs = _published()
+            idx = [v if isinstance(v, str) else (v or {}).get("youtube_id") or (v or {}).get("id")
+                   for v in youtarr.channel_video_ids(cid)]
+            idx = [v for v in idx if v]
+            idx.sort(key=lambda v: -(pubs.get(v) or 0))
+            order = idx
+        except Exception:
+            order = []
+    if not order:
+        try:
+            import ytdata
+            ids = list(ytdata.playlist_video_ids("UU" + cid[2:]) or [])[:WARMUP_CANDIDATES]
+            meta = (ytdata.video_meta(ids) or {}) if ids else {}
+            remember_durations({k: m.get("secs") for k, m in meta.items()})
+            remember_published({k: m.get("pub") for k, m in meta.items()})
+            order = [v for v in ids
+                     if ((meta.get(v) or {}).get("secs") or 0) > WARMUP_SHORT_SECS]
+        except Exception:
+            order = []
+    pubs, max_age, now = _published(), _max_age_secs(entry), time.time()
+    out = []
+    for v in order:
+        if not v or v in have or v in done or v in out:
+            continue
+        pub = pubs.get(v)
+        if max_age and pub and (now - pub) > max_age:
+            continue
+        out.append(v)
+        if len(out) >= WARMUP_CANDIDATES:
+            break
+    return out
+
+
+def warm_up(force=False) -> dict:
+    """One warm-up tick for every channel still owed its first videos: learn the folder
+    youtarr filed it under, re-list that folder so an arrival is pending at once, and ask
+    youtarr for what is still missing (ladder-throttled per id). {folder or channelId:
+    [ids asked]}. Cheap when nothing is warming (one queue read); otherwise throttled to
+    WARMUP_TICK_SECONDS — `force` (the add handler, the first armed tick) skips that.
+    ONE TICK AT A TIME: four threads call this (handler, run, locator, the send kick) and
+    two in flight together asked youtarr for the same ids twice. Best-effort — never
+    raises, never logs in on its own (the server's youtarr token)."""
+    global _warmup_tick_at, _warmup_backoff_until
+    if not _WARMUP_RUN.acquire(blocking=False):
+        return {}
+    try:
+        try:
+            warming = [e for e in get_queue() if _warmup_left(e) > 0 and not e.get("paused")]
+        except Exception:
+            return {}
+        if not warming:
+            return {}
+        now = time.time()
+        if not force and now - _warmup_tick_at < WARMUP_TICK_SECONDS:
+            return {}
+        _warmup_tick_at = now
+        import youtarr
+        asked = {}
+        for e in warming:
+            cid = e.get("channelId")
+            try:
+                folder = e.get("folder_name")
+                if not folder:
+                    folder = youtarr.channel_folder(cid)
+                    if folder:
+                        _update_entry(cid, lambda x, f=folder: x.__setitem__("folder_name", f))
+                        e["folder_name"] = folder
+                if folder:
+                    refresh_videos(folder)                # live: an arrival is pending NOW
+                done = get_done()
+                have = ({v.get("vid") for v in cached_videos(folder)} - done) if folder else set()
+                book = dict(e.get("warmup_asked") or {})
+                # Ids asked and still inside their ladder step are ON THE WAY: they count
+                # toward what is owed, so a tick a minute later asks for nothing more (a
+                # third download for "a couple" of videos); the ladder re-asks the SAME ids
+                # and only a given-up id makes room for the next candidate.
+                in_flight = {v for v, rec in book.items()
+                             if v not in have and v not in done and _asked_recently(rec, now)}
+                need = _warmup_left(e) - len(have) - len(in_flight)
+                if need <= 0 or now < _warmup_backoff_until:
+                    continue
+                cached = _WARMUP_CANDS.get(cid)
+                if cached and now - cached[0] < WARMUP_CANDIDATE_GAP:
+                    cands = cached[1]
+                else:
+                    cands = warmup_candidates(e)
+                    _WARMUP_CANDS[cid] = (now, cands)
+                due = []
+                for v in cands:
+                    if v in have or v in done:
+                        continue                  # landed since the lookup: never re-asked
+                    rec = book.get(v) or [0, 0]
+                    if int(rec[1] or 0) <= len(WARMUP_RESEND_LADDER) and not _asked_recently(rec, now):
+                        due.append(v)             # an id past the ladder is left to the ordinary
+                    if len(due) >= need:          # fetch-ahead; the pool supplies the next one
+                        break
+                if not due:
+                    continue
+                if not any(i.get("channelId") == cid for i in get_queue()):
+                    continue                      # removed mid-tick: its folder is being wiped
+                if youtarr.download_videos(due):
+                    stamp = {v: [int(now), int((book.get(v) or [0, 0])[1] or 0) + 1] for v in due}
+
+                    def _record(x, s=stamp):
+                        b = dict(x.get("warmup_asked") or {})
+                        b.update(s)
+                        x["warmup_asked"] = b
+                    _update_entry(cid, _record)
+                    asked[folder or cid] = due
+                else:
+                    _warmup_backoff_until = now + WARMUP_BACKOFF_SECONDS
+            except Exception:
+                continue
+        return asked
+    finally:
+        _WARMUP_RUN.release()
+
+def note_served(folder, source_name=None):
+    """A video from this channel handed off: one warm-up video paid off. Returns the videos
+    still owed (0 = the keys were just dropped and the channel is ordinary from here), or
+    None for a channel that is not warming. Called at hand-off on the run thread, which
+    already guards against re-hand-offs of the same item; never raises."""
+    try:
+        if not folder:
+            return None
+        e = next((i for i in get_queue() if i.get("folder_name") == folder), None)
+        if e is None or _warmup_left(e) <= 0:
+            return None
+        left = _warmup_left(e) - 1
+
+        def _pay(x):
+            if left <= 0:
+                for k in ("warmup", "warmup_at", "warmup_asked"):
+                    x.pop(k, None)
+            else:
+                x["warmup"] = left
+        _update_entry(e.get("channelId"), _pay)
+        return left
+    except Exception:
+        return None
 
 
 # ---- youtarr's own settings: the contract Visionary silently depends on ---------------
@@ -809,7 +1074,9 @@ def refresh_meta(entry) -> None:
             meta = ytdata.video_meta(missing) or {}
             remember_durations({k: m.get("secs") for k, m in meta.items()})
             remember_published({k: m.get("pub") for k, m in meta.items()})
-    _META[cid] = {"popular": popular}
+    # 'top' keeps the by-views ORDER the set throws away — the warm-up's "first videos"
+    # for a popular-scope channel are the most-viewed, not an arbitrary pair of the set.
+    _META[cid] = {"popular": popular, "top": [v["id"] for v in (pv or [])]}
 
 
 # ---- what to upscale (cap + scope filter) ---------------------------------
@@ -832,6 +1099,9 @@ def channel_pending(entry, skip=()) -> list:
     max_age = _max_age_secs(entry)                       # None → no age limit
     scope = entry.get("scope", "popular")
     popular = (_META.get(entry.get("channelId")) or {}).get("popular") or set()
+    asked = entry.get("warmup_asked") or {}    # the warm-up chose these for this channel —
+                                               # a popular set refreshed later must not hide
+                                               # a first video that already landed
     durs, pubs, done, now = _durations(), _published(), get_done(), time.time()
     out = []
     for v in cached_videos(folder):
@@ -841,7 +1111,7 @@ def channel_pending(entry, skip=()) -> list:
         pub = pubs.get(vid)
         if max_age and pub and (now - pub) > max_age:  # older than this channel's max age (prune deletes it)
             continue
-        if scope == "popular" and popular and vid not in popular:
+        if scope == "popular" and popular and vid not in popular and vid not in asked:
             continue
         out.append({"channel": folder, "source_name": v["name"], "nas_dir": v["dir"],
                     "video_path": v["path"], "title": video_title(v["name"], folder), "vid": vid,
@@ -910,9 +1180,22 @@ def all_pending(skip=()) -> list:
     channels' videos interleave evenly. Each is annotated with its duration ('secs'). This is the
     stream that gets grouped into ~length-cap batches."""
     durs = _durations()
-    cols, keys = [], []
+    cols, keys, lead = [], [], []
     for e in get_queue():
-        cols.append([{**v, "secs": durs.get(v["vid"]) or 0} for v in channel_pending(e, skip)])
+        col = [{**v, "secs": durs.get(v["vid"]) or 0} for v in channel_pending(e, skip)]
+        owed = _warmup_left(e)
+        if owed > 0 and col:
+            # A NEW channel's first videos LEAD the stream (see warm_up): the ones the
+            # warm-up asked for first, then whatever else landed first (youtarr's own cron
+            # may beat it — that IS a first video of the channel). Pulled out of the
+            # column, so the rotation below runs over exactly what it always did.
+            asked = e.get("warmup_asked") or {}
+            first = [v for v in col if v["vid"] in asked]
+            first += [v for v in col if v not in first]
+            first = first[:owed]
+            lead.append(first)
+            col = [v for v in col if v not in first]
+        cols.append(col)
         keys.append(e.get("folder_name"))
     for col in _import_pending(skip):      # each IMPORT batch is one more column, so playlist
         cols.append([{**v, "secs": durs.get(v["vid"]) or 0} for v in col])   # order holds WITHIN
@@ -928,13 +1211,18 @@ def all_pending(skip=()) -> list:
     if len(cols) > 1 and last in keys:
         s = (keys.index(last) + 1) % len(cols)
         cols = cols[s:] + cols[:s]
-    out, i = [], 0
-    while any(i < len(col) for col in cols):          # take index i from every channel, then i+1, …
-        for col in cols:
-            if i < len(col):
-                out.append(col[i])
-        i += 1
-    return out
+    def interleave(columns):
+        out, i = [], 0
+        while any(i < len(col) for col in columns):   # take index i from every channel, then i+1, …
+            for col in columns:
+                if i < len(col):
+                    out.append(col[i])
+            i += 1
+        return out
+    # Warming channels lead (their own little round-robin when several were added
+    # together), then the ordinary rotation exactly as before. Both next_due() and the
+    # app's up-next read this one list, so the engine and the preview agree.
+    return interleave(lead) + interleave(cols)
 
 
 def pending_batches(batch_secs, skip=()) -> list:
@@ -1066,6 +1354,7 @@ def queue_view() -> dict:
                       # youtarr's downloads are SDR, so auto always means the 1000-nit ceiling
                       "output_mode_effective": settings.effective_output_mode(folder or "", False),
                       "via_link": bool(e.get("via_link")),
+                      "warmup": _warmup_left(e),      # first videos still owed (0 = ordinary)
                       "pending": len(channel_pending(e)), "downloaded": len(cached_videos(folder))})
     return {"items": items, "count": len(items), "connected": _connected(),
             # Capability gate for the companion app's Send-to-Visionary buttons: one button
@@ -1217,6 +1506,18 @@ def send_collection(url, title=None) -> dict:
         is_sub = any(c.get("channelId") == ch["channelId"] for c in subs)
         add_channel(ch["channelId"], (title or "").strip() or ch["title"],
                     via_link=not is_sub)
+
+        # The app's add handler syncs youtarr and warms the channel; this path never
+        # reconfigured youtarr at all, so a sent channel was not even subscribed until
+        # the next queue edit. Off the request thread: configure_youtarr walks every
+        # channel's metadata and the sender's button is waiting on the answer.
+        def _kick():
+            try:
+                configure_youtarr()
+                warm_up(force=True)
+            except Exception:
+                pass
+        threading.Thread(target=_kick, daemon=True, name="yt-warmup-kick").start()
         return {"status": "queued", "channelId": ch["channelId"], "title": ch["title"]}
 
     return {"status": "bad-url"}
