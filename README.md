@@ -484,6 +484,23 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 Optional, and entirely driven through [youtarr](https://github.com/DialmasterOrg/Youtarr) on
 the NAS. Without youtarr the YouTube tab simply stays off.
 
+A YouTube video is by far the quickest thing Visionary processes. It skips Topaz, and its
+Resolve render usually ships without a re-encode, so it takes minutes where an episode
+takes hours:
+
+| | typical length | typical time to finish | per minute of content |
+|---|---|---|---|
+| YouTube video | 8 min | **13 min** | 1.4 min |
+| TV episode | 32 min | **3 h 25 min** | 6.7 min |
+| Movie, 1080p upscaled to 4K | 1 h 50 min | **8 h 10 min** | 5.0 min |
+
+<sub>Medians from Visionary's own log for everything finished between 15 July and 16 September
+2026: 351 videos, 309 episodes and 8 movies. Time runs from an item's first GPU stage to its
+master landing on the NAS, minus any time the pipeline was stopped. These are real-world
+figures, so they include waiting on other items — an episode's remux pauses whenever a video
+takes Resolve — which is why they run longer than the dedicated-machine figures quoted above.
+4K fast-path movies are too few so far to quote.</sub>
+
 - **youtarr only has to EXIST.** Run the container; Visionary does the rest — it discovers
   the URL on your NAS, and once you've entered its login (youtarr requires auth, so that one
   credential is unavoidable) it configures youtarr itself. Several of youtarr's own settings
