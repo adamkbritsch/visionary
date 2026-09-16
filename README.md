@@ -304,6 +304,10 @@ flowchart TD
 | 1080p and below | upscale to 4K | adds (HDR+)DV, 1000 nits | capped x265 | yes |
 | already Dolby Vision | — | — | — | filtered out of the queue up front; a slip-through is refused at the Topaz stage — never mastered or uploaded |
 
+**YouTube videos take their own route**, whatever their resolution: Topaz is skipped and
+Resolve does the scaling (SuperScale doubles a 1080p source), so a video spends minutes in
+the pipeline rather than hours. See [YouTube](#youtube) below.
+
 The nit ceiling is **1000 by default on every path** — the 2000-nit target exists but is
 manual-only, set per show, movie or channel (as is the true-SDR output).
 
@@ -458,6 +462,27 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   pulling ahead can't stutter playback.
 
 - **TV + Movies** are the core; **YouTube mode** is optional (requires youtarr on the NAS).
+  Everything YouTube is described [below](#youtube).
+
+| Round-robin queue | Guardrails |
+|:---:|:---:|
+| <img src="docs/assets/queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine items lined up" width="420"> | <img src="docs/assets/scratch.png" alt="Scratch and power: the 140 W gate, free space, live per-episode scratch usage" width="420"> |
+| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. A show's featurettes always run after its episodes, and a per-show <b>Upscale featurettes</b> toggle skips them entirely. While the pipeline is armed the per-item settings condense to <b>one line</b> — they can't change mid-run — but you can still queue more work, and drag a movie to whichever slot you want it to run in.</sub> | <sub>The <b>140 W power gate</b> and free-space headroom, plus live per-episode scratch usage broken out by artefact (Topaz segments, DV render, CFR source, source).</sub> |
+
+| Movies | YouTube |
+|:---:|:---:|
+| <img src="docs/assets/movies.png" alt="Movies tab: a queued movie showing its resolved output mode, audio and source-fate settings" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
+| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned otherwise (2000-nit is manual-only), and an HDR10 source keeps its original bits (unless its peaks breach the DV playback ceiling). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence you set (here <b>1 per 3 TV episodes</b>), with per-channel scope and age filters. Channels can be paused individually.</sub> |
+
+<p align="center">
+  <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">
+</p>
+<p align="center"><sub><b>Settings.</b> Screen Control can be paused for a fixed span or until a wall-clock time (4 hours max — past that the scratch disk fills and the run stalls). <b>Run Resolve on another screen</b> lists every display that can host it, ranked, with the smoke-tested match score for each.</sub></p>
+
+## YouTube
+
+Optional, and entirely driven through [youtarr](https://github.com/DialmasterOrg/Youtarr) on
+the NAS. Without youtarr the YouTube tab simply stays off.
 
 - **youtarr only has to EXIST.** Run the container; Visionary does the rest — it discovers
   the URL on your NAS, and once you've entered its login (youtarr requires auth, so that one
@@ -473,38 +498,60 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   first if missing, and a path matching nothing recognisable is reported instead of
   overwritten with an invented one.
 
+- **The fast route.** A video skips Topaz; Resolve scales it (SuperScale doubles a 1080p
+  source, and an optional saved cleanup grade is applied) and renders the Dolby Vision
+  master at a bitrate chosen so its **one-second peaks land under the playback cap** —
+  20 Mbps, or 14 for a native 4K source, whose detail bursts harder. The remux can then
+  ship that render **stream-copied** in minutes instead of spending an hour on the capped
+  x265 pass. Resolve's export has no peak control, so this is a measured gamble: the peak
+  is checked right after the render, while the Dolby Vision analysis is still loaded, and a
+  render that busts the cap is **re-exported at a lower target calculated from the burst it
+  just showed** (up to twice, never below 8 Mbps). Only a video that still misses takes the
+  capped x265 pass. During a run of videos **Resolve stays open** between them, since each
+  spends only a few minutes in it, and closes when the run ends.
+
+- **Channels.** Subscribe from your own YouTube subscriptions, or paste a channel link.
+  Each channel has a **scope** (most popular or all), a **max age**, its own output mode,
+  loudness setting and pause. Visionary reads a channel's whole back catalogue — videos and
+  live streams, **never Shorts** — not just the 50 newest youtarr indexes on its own, and
+  videos round-robin across channels. A **newly added channel gets its first two videos
+  fast**: they are requested from youtarr the moment you add it and take the next YouTube
+  slots (never interrupting TV), and after that it takes ordinary turns. Removing a channel
+  deletes its downloads **and its finished 4K masters** from the NAS, and forgets youtarr's
+  download record so re-adding it downloads fresh.
+
 - **Fetch-ahead** keeps the NAS stocked: Visionary used to only *subscribe* youtarr and then
   wait for its own schedule, so the upscale queue could run dry with the pipeline idle. It
   now asks youtarr for whatever each channel is short of — newest first, respecting the
   channel's scope and max-age — to keep `youtube_fetch_ahead` (default 12) undownloaded
   videos staged per channel. Set it to 0 for the old wait-and-see behaviour.
 
+- **Links and Send to Visionary.** Paste a video, playlist or channel link into the YouTube
+  tab; a confirm step shows real titles and counts first, and a `watch?v=…&list=…` link asks
+  which one you meant. A companion app can do the same through `POST /api/send-to-visionary`,
+  which advertises what it accepts in `/api/state`. A **sent video jumps the queue**; imported
+  playlists and videos join the normal cadence, keep playlist order, and each import has
+  its own output mode, loudness setting and pause, like a channel. Every video is filed under **its own uploader**, never
+  under the person who compiled the playlist, so a playlist author's name only appears if
+  it is part of the playlist's title.
+
 - **Run a video now**: any pending YouTube video can jump the whole queue from its up-next
   row (the ↥ button) — cadence-exempt and ahead of due movies. The item processing
   **finishes its current segment first**, exactly like a deploy does, then yields and
   resumes afterwards — so no encoding work is thrown away. It is never cut off mid-Resolve
-  (screen automation, not resumable) and a download is left to finish rather than
-  discarding gigabytes. Because that wait can be a couple of minutes, the row says
-  **running next** the moment you press it, and the pipeline card names what it is waiting
-  for. Consecutive videos collapse into **one expandable slot** in the queue, so a burst of
-  them doesn't bury the shows and movies behind it. The queue always holds **ten TV
-  episodes** — movies and videos ride along between them without consuming that count, and
-  only the episodes are numbered.
+  (screen automation, not resumable). A download in progress does stop for it, and is
+  pulled again afterwards. The row says **running next** the moment you press it, and
+  only rows you activated this way, or imported as single videos, ever carry that label;
+  the pipeline card names what it is waiting for. Consecutive videos collapse into **one
+  expandable slot** in the queue, so a burst of them doesn't bury the shows and movies
+  behind it. The queue always holds **ten TV episodes** — movies and videos ride along
+  between them without consuming that count, and only the episodes are numbered.
 
-| Round-robin queue | Guardrails |
-|:---:|:---:|
-| <img src="docs/assets/queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine items lined up" width="420"> | <img src="docs/assets/scratch.png" alt="Scratch and power: the 140 W gate, free space, live per-episode scratch usage" width="420"> |
-| <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. While the pipeline is armed the per-item settings condense to <b>one line</b> — they can't change mid-run — but you can still queue more work, and drag a movie to whichever slot you want it to run in.</sub> | <sub>The <b>140 W power gate</b> and free-space headroom, plus live per-episode scratch usage broken out by artefact (Topaz segments, DV render, CFR source, source).</sub> |
-
-| Movies | YouTube |
-|:---:|:---:|
-| <img src="docs/assets/movies.png" alt="Movies tab: a queued movie showing its resolved output mode, audio and source-fate settings" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
-| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned otherwise (2000-nit is manual-only), and an HDR10 source keeps its original bits (unless its peaks breach the DV playback ceiling). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence (<b>1 per 3 TV episodes</b>), with per-channel length and age filters. Channels can be paused individually.</sub> |
-
-<p align="center">
-  <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">
-</p>
-<p align="center"><sub><b>Settings.</b> Screen Control can be paused for a fixed span or until a wall-clock time (4 hours max — past that the scratch disk fills and the run stalls). <b>Run Resolve on another screen</b> lists every display that can host it, ranked, with the smoke-tested match score for each.</sub></p>
+- **Cleaning up.** **Skip & delete** on any video row — subscribed, imported or sent —
+  removes the download from the NAS and makes sure it is never downloaded or queued again. Dropping a
+  playlist or removing a channel also clears its videos' working files from the local
+  scratch disk; a background pass catches anything left behind, and only ever removes a
+  file it has proven belongs to a YouTube video nothing still needs.
 
 ## Configuration
 

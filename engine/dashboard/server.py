@@ -522,7 +522,9 @@ def api_youtube_queue(body):
             out["current_stage"] = stage
             out["starts"] = {"topaz": "at the current segment boundary (about a minute)",
                              "resolve": "after the current Dolby Vision pass finishes",
-                             "download": "after the current download finishes",
+                             # the download stage yields to a ready send: the pull
+                             # stops and is redone afterwards (stages._download)
+                             "download": "right away — the current download stops and restarts after",
                              }.get(stage, "next")
         return out
     elif action == "delete":
