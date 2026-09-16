@@ -626,6 +626,7 @@ def _sweep_orphaned_youtube_workfiles(explicit, dry_run):
     # --- 1. proof it is YouTube ---------------------------------------------------------
     known = (explicit | youtube.get_done() | set(youtube._durations())
              | set(youtube._published()))
+    listings = {}                                # uploader -> ids on staging, listed ONCE per sweep
     removed, freed = {}, 0
     for tag, files in found.items():
         if tag in keep:
@@ -635,7 +636,8 @@ def _sweep_orphaned_youtube_workfiles(explicit, dry_run):
                  and transfer.display_name(_yt_workfile_uploader(n)) not in queued_uploaders]
         if not files:
             continue
-        if tag not in known and not _on_youtube_staging(tag, {_yt_workfile_uploader(n) for _d, n in files}):
+        if tag not in known and not _on_youtube_staging(
+                tag, {_yt_workfile_uploader(n) for _d, n in files}, listings):
             continue
         for d, n in files:
             path = os.path.join(d, n)
@@ -659,21 +661,26 @@ def _sweep_orphaned_youtube_workfiles(explicit, dry_run):
     return out
 
 
-def _on_youtube_staging(tag, uploaders) -> bool:
-    """Is `tag` a video youtarr has on staging under one of these uploader folders? A listing
-    that FAILS (NAS down, folder absent) proves nothing and is not remembered; a successful
-    listing without the tag is remembered, so a release tag is not re-listed every sweep."""
+def _on_youtube_staging(tag, uploaders, listings=None) -> bool:
+    """Is `tag` a video youtarr has on staging under one of these uploader folders? Each folder
+    is listed at most ONCE per sweep (`listings`): a dropped 27-video playlist used to list
+    its whole staging folder 27 times over FTP. A listing that FAILS (NAS down, folder absent)
+    proves nothing and is not remembered across sweeps; a successful listing without the
+    tag is, so a release tag is not re-listed every sweep."""
     import youtube
+    listings = {} if listings is None else listings
     for up in sorted(u for u in uploaders if u):
         if (up, tag) in _SWEEP_NOT_YT:
             continue
-        try:
-            listed = youtube.list_video_files(up)
-        except Exception:
-            listed = []
-        if any(v.get("vid") == tag for v in listed):
+        if up not in listings:
+            try:
+                listings[up] = {v.get("vid") for v in (youtube.list_video_files(up) or [])}
+            except Exception:
+                listings[up] = set()
+        ids = listings[up]
+        if tag in ids:
             return True
-        if listed:
+        if ids:
             _SWEEP_NOT_YT.add((up, tag))
     return False
 

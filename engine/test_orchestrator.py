@@ -4553,3 +4553,20 @@ class SweepOrphanedYouTubeWorkfiles(unittest.TestCase):
     def test_the_master_tag_is_recognised(self):
         self.assertEqual(orch._yt_workfile_vid(self.HOT_NAME + orch.DV_TAG + ".mp4"), self.HOT)
         self.assertEqual(orch._yt_workfile_vid("First We Feast - x [tFRjzukT7Es] extra.mp4"), "")
+
+
+class SweepListsEachFolderOnce(SweepOrphanedYouTubeWorkfiles):
+    """A dropped playlist's videos share one uploader folder; proving them used to list that
+    whole staging folder over FTP once per video."""
+
+    def test_one_listing_proves_every_video_of_the_folder(self):
+        import youtube
+        tags = ["tFRjzukT7Es", "7LxMd8yV1cE", "SFdR240qaXA"]
+        files = [self._touch(f"First We Feast - Video {i} [{t}]_cfr.mp4") for i, t in enumerate(tags)]
+        calls = []
+        listing = [{"vid": t} for t in tags]
+        with mock.patch.object(youtube, "list_video_files",
+                               side_effect=lambda f: calls.append(f) or listing):
+            orch.sweep_orphaned_youtube_workfiles()
+        self.assertEqual(calls, ["First We Feast"])
+        self.assertFalse(any(os.path.exists(f) for f in files))
