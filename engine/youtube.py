@@ -1328,7 +1328,8 @@ def wipe_channel(channel_id, folder) -> dict:
         except Exception:
             pass
         return {"folder": folder, "staging_deleted": bool(staged), "masters_deleted": bool(masters),
-                "archive_forgotten": forgotten, "ids": len(ids)}
+                "archive_forgotten": forgotten, "ids": len(ids),
+                "vids": sorted(ids)}         # the proof the local sweep needs once staging is gone
     finally:
         with _WIPE_LOCK:
             _WIPING.discard(channel_id)
@@ -1936,6 +1937,19 @@ def _drop_batch(batch_id) -> int:
         if gone:
             _save_priority(kept)
     return gone
+
+
+def import_batch_media(batch_id):
+    """(source basenames of the batch's LOCATED videos, every video id the batch holds) —
+    what its local working files are named after and the proof they are YouTube videos.
+    Read BEFORE drop_import, which forgets both."""
+    book = [e for e in _priority() if e.get("batch") == batch_id]
+    names = [os.path.basename(e["path"]) for e in book if e.get("path")]
+    vids = {e.get("vid") for e in book if e.get("vid")}
+    for r in _imports():
+        if r.get("id") == batch_id:
+            vids |= set(r.get("vids") or [])
+    return names, vids
 
 
 def drop_import(batch_id) -> dict:

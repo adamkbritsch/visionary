@@ -438,7 +438,13 @@ def api_youtube_queue(body):
         # wipe_channel does the youtarr sync itself. FTP deletes can be slow; don't block the handler.
         folder = next((e.get("folder_name") for e in youtube.get_queue() if e.get("channelId") == cid), None)
         youtube.remove_channel(cid)
-        threading.Thread(target=youtube.wipe_channel, args=(cid, folder), daemon=True).start()
+
+        def _wipe_then_sweep():
+            res = youtube.wipe_channel(cid, folder) or {}
+            # ...and its prefetched sources/CFRs on the LAPTOP, which the wipe (NAS-side)
+            # never touched (user-caught 2026-09-14 on a dropped playlist; same hole here).
+            orchestrator.sweep_orphaned_youtube_workfiles(vids=res.get("vids"))
+        threading.Thread(target=_wipe_then_sweep, daemon=True).start()
     elif action == "scope" and cid:
         youtube.set_scope(cid, (body.get("scope") or "popular").strip()); reconfigure = True
     elif action == "cap" and cid:                # per-channel length-limit toggle
@@ -475,7 +481,23 @@ def api_youtube_queue(body):
         if imported.get("status") == "channel-queued":
             reconfigure = True                  # a newly queued channel needs youtarr synced
     elif action == "drop_import":
-        imported = youtube.drop_import((body.get("batch") or body.get("id") or "").strip())
+        batch = (body.get("batch") or body.get("id") or "").strip()
+        names, vids = youtube.import_batch_media(batch)    # BEFORE the drop forgets them
+        imported = youtube.drop_import(batch)
+        # A dropped playlist's prefetched sources and CFRs stayed on the laptop — 116 GB of
+        # Hot Ones (user-caught 2026-09-14). Abort one that is mid-flight, then sweep every
+        # working file of a video that is no longer queued off the scratch.
+        was_current = any([orchestrator.ORCH.skip_current(n) for n in names])
+
+        def _sweep_later():
+            import time as _t
+            _t.sleep(8 if was_current else 0)   # let the aborted stage die first
+            orchestrator.sweep_orphaned_youtube_workfiles(vids=vids)
+        threading.Thread(target=_sweep_later, daemon=True).start()
+    elif action == "sweep":
+        # On demand: reclaim the scratch space of every YouTube video no longer queued.
+        # dry_run reports what would go without deleting anything.
+        return orchestrator.sweep_orphaned_youtube_workfiles(dry_run=bool(body.get("dry_run")))
     elif action == "pause_import":
         # Pause/resume ONE import batch — the same lever a channel's pause is. Its videos
         # stay in the book; they just stop being served until resumed.

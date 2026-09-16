@@ -519,6 +519,164 @@ def discard_workfiles(source_basename: str) -> None:
     shutil.rmtree(os.path.join(main, stem + "_prob4_upscaled.segments"), ignore_errors=True)
 
 
+# A YouTube working file is named after youtarr's source stem, `<uploader> - <title> [<id>]`,
+# plus a working suffix (`_cfr`, `_prob4_upscaled.segments`, `_mezz`), the master tag, or just
+# the extension. The id is taken from right there.
+_YT_WORKFILE_ID = re.compile(r"\[([0-9A-Za-z_-]{11})\](?:_|\.|%s|%s|$)"
+                             % (re.escape(DV_TAG), re.escape(SDR_TAG)))
+
+
+def _yt_workfile_vid(name: str) -> str:
+    """The id-shaped tag of a local working file, or ''. SHAPE ONLY — a movie release tag like
+    `[WEBRip-x264]` has the same shape, so this never decides on its own that a file is a
+    YouTube video (see sweep_orphaned_youtube_workfiles)."""
+    m = _YT_WORKFILE_ID.search(name or "")
+    return m.group(1) if m else ""
+
+
+def _yt_workfile_uploader(name: str) -> str:
+    """The `<uploader>` youtarr put before the first ' - ', which is also its staging folder."""
+    head = (name or "").split(" - ", 1)
+    return head[0] if len(head) == 2 else ""
+
+
+def _tree_bytes(path: str) -> int:
+    if not os.path.isdir(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+_SWEEP_LOCK = threading.Lock()
+_SWEEP_NOT_YT = set()          # (uploader, tag) pairs a staging listing proved are NOT YouTube
+
+
+def sweep_orphaned_youtube_workfiles(vids=None, *, dry_run=False) -> dict:
+    """Delete the LOCAL working files (source, CFR, segments, mezzanine, master) of YouTube
+    videos that are no longer queued anywhere. Dropping an import batch only edited the
+    books: every prefetched source and CFR of a dropped Hot Ones playlist stayed on the
+    laptop — 116 GB (user-caught 2026-09-14).
+
+    A file is removed only when BOTH hold:
+    1. It is PROVEN to be a YouTube video. The id-shaped tag in its name is not enough on
+       its own: a movie release tag such as `[WEBRip-x264]` has the same shape. Proof is
+       the tag being one of `vids` (the videos of a batch or channel just dropped), a
+       video the YouTube books know (done, durations, publish dates), or a video youtarr
+       has on staging in the folder named by the file's `<uploader> - ` prefix.
+    2. Nothing still needs it: not the item running now, not finisher-owned, parked or
+       deferred, not in the priority book (sends and imports), and not from a channel
+       still in the queue — paused ones included — by name prefix or its cached listing.
+       A dropped playlist from an uploader that is ALSO a queued channel is therefore
+       kept: its videos may still be served by that channel's rotation.
+
+    Never deletes a finished master the pipeline still owns (finisher-owned), and never
+    runs two at once. `dry_run` reports without deleting. Returns {"removed": {tag:
+    [names]}, "bytes": freed} (+ "skipped" when another sweep was running)."""
+    if not _SWEEP_LOCK.acquire(blocking=False):
+        return {"removed": {}, "bytes": 0, "skipped": "a sweep is already running"}
+    try:
+        return _sweep_orphaned_youtube_workfiles(set(vids or ()), dry_run)
+    finally:
+        _SWEEP_LOCK.release()
+
+
+def _sweep_orphaned_youtube_workfiles(explicit, dry_run):
+    import youtube
+    dirs = [scratch.default_scratch(), scratch.prefetch_dir()]
+    found = {}                                   # tag -> [(dir, name)]
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            tag = _yt_workfile_vid(n)
+            if tag:
+                found.setdefault(tag, []).append((d, n))
+    if not found:
+        return {"removed": {}, "bytes": 0}
+    # --- 2. what is still needed ----------------------------------------------------
+    keep = set()
+    cur = ORCH.state.get("current") or {}
+    for n in (cur.get("name"), cur.get("source_name")):
+        keep.add(_yt_workfile_vid(os.path.basename(n or "")))
+    for c in ORCH.finisher_views():
+        keep.add(_yt_workfile_vid(c.get("name") or ""))
+    for k in ORCH._selection_skip() | set(ORCH._fail_counts):
+        keep.add(_yt_workfile_vid(str(k)))
+    keep |= {e.get("vid") for e in youtube._priority()}
+    queued_uploaders = set()
+    for e in youtube.get_queue():
+        folder = e.get("folder_name") or ""
+        if not folder:
+            continue
+        queued_uploaders |= {folder, transfer.display_name(folder), transfer.to_wire(folder)}
+        keep |= {v.get("vid") for v in (youtube._VIDEO_CACHE.get(folder) or [])}
+    keep.discard("")
+    keep.discard(None)
+    # --- 1. proof it is YouTube ---------------------------------------------------------
+    known = (explicit | youtube.get_done() | set(youtube._durations())
+             | set(youtube._published()))
+    removed, freed = {}, 0
+    for tag, files in found.items():
+        if tag in keep:
+            continue
+        files = [(d, n) for d, n in files
+                 if _yt_workfile_uploader(n) not in queued_uploaders
+                 and transfer.display_name(_yt_workfile_uploader(n)) not in queued_uploaders]
+        if not files:
+            continue
+        if tag not in known and not _on_youtube_staging(tag, {_yt_workfile_uploader(n) for _d, n in files}):
+            continue
+        for d, n in files:
+            path = os.path.join(d, n)
+            size = _tree_bytes(path)
+            if not dry_run:
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except OSError:
+                    continue
+            removed.setdefault(tag, []).append(n)
+            freed += size
+    if removed and not dry_run:
+        logbook.event(f"swept {sum(len(x) for x in removed.values())} local working file(s) — "
+                      f"{freed / 1e9:.1f} GB — of {len(removed)} YouTube video(s) no longer queued")
+    out = {"removed": removed, "bytes": freed}
+    if dry_run:
+        out["dry_run"] = True
+    return out
+
+
+def _on_youtube_staging(tag, uploaders) -> bool:
+    """Is `tag` a video youtarr has on staging under one of these uploader folders? A listing
+    that FAILS (NAS down, folder absent) proves nothing and is not remembered; a successful
+    listing without the tag is remembered, so a release tag is not re-listed every sweep."""
+    import youtube
+    for up in sorted(u for u in uploaders if u):
+        if (up, tag) in _SWEEP_NOT_YT:
+            continue
+        try:
+            listed = youtube.list_video_files(up)
+        except Exception:
+            listed = []
+        if any(v.get("vid") == tag for v in listed):
+            return True
+        if listed:
+            _SWEEP_NOT_YT.add((up, tag))
+    return False
+
 def apply_container(p: EpisodePaths) -> EpisodePaths:
     """Lock the working container to what the LOCAL source needs — MKV for lossless audio (TrueHD/
     DTS-HD MA/PCM/FLAC) or bitmap subtitles (PGS/VOBSUB), else MP4 — by probing p.source, and
@@ -2300,6 +2458,11 @@ class Orchestrator:
                 # asks for whatever each channel is short of (rate-limited inside).
                 youtube.fetch_ahead()
                 youtube.warm_up()                          # (throttled inside; cheap when idle)
+                # Leftovers of videos no longer queued — e.g. the one that was running when
+                # its playlist was dropped. Background: proving a file is a YouTube video can
+                # take a staging listing, and this is the run thread.
+                threading.Thread(target=sweep_orphaned_youtube_workfiles, daemon=True,
+                                 name="yt-sweep").start()
                 self._yt_refresh_at = now + YT_REFRESH_SECONDS
         except Exception:
             pass

@@ -1026,3 +1026,36 @@ class AddWarmsTheChannel(unittest.TestCase):
              mock.patch.object(orchestrator.ORCH, "finisher_views", return_value=[]):
             server.api_youtube_queue({"action": "add", "channelId": "UC" + "a" * 22, "title": "New"})
         self.assertEqual(order, ["add", "configure", "warm:True"])
+
+
+class DroppingAPlaylistSweepsItsFiles(unittest.TestCase):
+    """A dropped playlist left its prefetched sources and CFRs on the laptop (user-caught
+    2026-09-14). The drop aborts a video of the batch that is running and sweeps with the
+    batch's ids as proof they are YouTube videos."""
+
+    def test_the_drop_sweeps_with_the_batch_ids(self):
+        import youtube, orchestrator
+        swept, skipped = {}, []
+        with mock.patch.object(youtube, "import_batch_media",
+                               return_value=(["a [aaaaaaaaaa1].mp4"], {"aaaaaaaaaa1", "aaaaaaaaaa2"})), \
+             mock.patch.object(youtube, "drop_import", return_value={"status": "ok", "removed": 2}), \
+             mock.patch.object(orchestrator.ORCH, "skip_current",
+                               side_effect=lambda n: skipped.append(n) or False), \
+             mock.patch.object(orchestrator, "sweep_orphaned_youtube_workfiles",
+                               side_effect=lambda vids=None, **k: swept.update(vids=set(vids)) or {}), \
+             mock.patch.object(server.threading, "Thread",
+                               side_effect=lambda target=None, **k: mock.Mock(start=target)), \
+             mock.patch.object(youtube, "queue_view", return_value={}), \
+             mock.patch.object(server, "up_next", return_value=[]), \
+             mock.patch.object(orchestrator.ORCH, "snapshot", return_value={}), \
+             mock.patch.object(orchestrator.ORCH, "finisher_views", return_value=[]):
+            server.api_youtube_queue({"action": "drop_import", "batch": "imp1"})
+        self.assertEqual(skipped, ["a [aaaaaaaaaa1].mp4"])
+        self.assertEqual(swept.get("vids"), {"aaaaaaaaaa1", "aaaaaaaaaa2"})
+
+    def test_the_sweep_action_can_dry_run(self):
+        import orchestrator
+        with mock.patch.object(orchestrator, "sweep_orphaned_youtube_workfiles",
+                               side_effect=lambda vids=None, dry_run=False: {"dry_run": dry_run}):
+            self.assertEqual(server.api_youtube_queue({"action": "sweep", "dry_run": True}),
+                             {"dry_run": True})

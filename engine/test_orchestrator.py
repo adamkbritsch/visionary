@@ -4396,3 +4396,160 @@ class ResolveClosesWhenTheYouTubeRunEnds(unittest.TestCase):
         import stages
         with mock.patch.object(stages, "close_kept_resolve", side_effect=RuntimeError("boom")):
             self.assertFalse(orch.Orchestrator()._close_kept_resolve("test"))
+
+
+class SweepOrphanedYouTubeWorkfiles(unittest.TestCase):
+    """Dropping a playlist left every prefetched source and CFR of its videos on the laptop
+    (116 GB of Hot Ones, user-caught 2026-09-14). The sweep removes the local working files
+    of YouTube videos nothing still needs, and must never take anything else: a movie
+    release tag like [WEBRip-x264] has exactly the shape of a YouTube id."""
+
+    HOT = "tFRjzukT7Es"
+    HOT_NAME = "First We Feast - Chris D'Elia Eats Spicy Wings [tFRjzukT7Es]"
+
+    def setUp(self):
+        import youtube
+        self.dir = tempfile.mkdtemp()
+        self.pre = os.path.join(self.dir, "prefetch")
+        os.makedirs(self.pre)
+        patches = [
+            mock.patch.object(orch.scratch, "default_scratch", return_value=self.dir),
+            mock.patch.object(orch.scratch, "prefetch_dir", return_value=self.pre),
+            mock.patch.object(youtube, "get_queue", return_value=[]),
+            mock.patch.object(youtube, "_priority", return_value=[]),
+            mock.patch.object(youtube, "get_done", return_value=set()),
+            mock.patch.object(youtube, "_durations", return_value={}),
+            mock.patch.object(youtube, "_published", return_value={}),
+            mock.patch.object(youtube, "list_video_files",
+                              side_effect=AssertionError("no staging listing expected")),
+            mock.patch.dict(youtube._VIDEO_CACHE, {}, clear=True),
+            mock.patch.object(orch.ORCH, "finisher_views", return_value=[]),
+            mock.patch.object(orch.ORCH, "_selection_skip", return_value=set()),
+            mock.patch.object(orch.ORCH, "_fail_counts", {}),
+            mock.patch.dict(orch.ORCH.state, {"current": None}),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        orch._SWEEP_NOT_YT.clear()
+        self.addCleanup(orch._SWEEP_NOT_YT.clear)
+
+    def _touch(self, name, where=None, size=10):
+        path = os.path.join(where or self.dir, name)
+        if name.endswith(".segments"):
+            os.makedirs(path)
+            with open(os.path.join(path, "chunk.mov"), "wb") as f:
+                f.write(b"x" * size)
+        else:
+            with open(path, "wb") as f:
+                f.write(b"x" * size)
+        return path
+
+    def _hot_files(self):
+        return [self._touch(self.HOT_NAME + ".mp4"), self._touch(self.HOT_NAME + "_cfr.mp4", self.pre),
+                self._touch(self.HOT_NAME + "_prob4_upscaled.segments")]
+
+    def test_a_dropped_playlists_files_go(self):
+        files = self._hot_files()
+        out = orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        self.assertFalse(any(os.path.exists(f) for f in files))
+        self.assertEqual(len(out["removed"][self.HOT]), 3)
+        self.assertEqual(out["bytes"], 30)
+
+    def test_a_movie_release_tag_is_never_taken_for_a_youtube_id(self):
+        import youtube
+        movie = self._touch("Some Movie (2021) [WEBRip-x264]_cfr.mkv")
+        tv = self._touch("Show (2004) - S01E01 - Pilot [WEBRip-x264].mkv")
+        with mock.patch.object(youtube, "list_video_files", return_value=[]):
+            orch.sweep_orphaned_youtube_workfiles()
+        self.assertTrue(os.path.exists(movie))
+        self.assertTrue(os.path.exists(tv))
+
+    def test_proof_can_come_from_youtube_staging(self):
+        import youtube
+        files = self._hot_files()
+        listing = [{"vid": self.HOT, "name": self.HOT_NAME + ".mp4"}]
+        with mock.patch.object(youtube, "list_video_files",
+                               side_effect=lambda f: listing if f == "First We Feast" else []):
+            orch.sweep_orphaned_youtube_workfiles()
+        self.assertFalse(any(os.path.exists(f) for f in files))
+
+    def test_a_failed_listing_proves_nothing_and_is_not_remembered(self):
+        import youtube
+        files = self._hot_files()
+        with mock.patch.object(youtube, "list_video_files", return_value=[]):
+            orch.sweep_orphaned_youtube_workfiles()
+        self.assertTrue(all(os.path.exists(f) for f in files), "NAS down must not read as proof")
+        self.assertEqual(orch._SWEEP_NOT_YT, set())
+
+    def test_the_running_video_is_kept(self):
+        files = self._hot_files()
+        with mock.patch.dict(orch.ORCH.state, {"current": {"name": self.HOT_NAME + ".mp4"}}):
+            orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        self.assertTrue(all(os.path.exists(f) for f in files))
+
+    def test_finisher_owned_video_is_kept(self):
+        files = self._hot_files()
+        with mock.patch.object(orch.ORCH, "finisher_views",
+                               return_value=[{"kind": "youtube", "name": self.HOT_NAME + ".mp4"}]):
+            orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        self.assertTrue(all(os.path.exists(f) for f in files))
+
+    def test_parked_or_deferred_video_is_kept(self):
+        files = self._hot_files()
+        with mock.patch.object(orch.ORCH, "_selection_skip", return_value={self.HOT_NAME}):
+            orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        self.assertTrue(all(os.path.exists(f) for f in files))
+
+    def test_a_video_still_in_the_priority_book_is_kept(self):
+        import youtube
+        files = self._hot_files()
+        with mock.patch.object(youtube, "_priority", return_value=[{"vid": self.HOT}]):
+            orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        self.assertTrue(all(os.path.exists(f) for f in files))
+
+    def test_a_queued_channels_videos_are_kept_even_when_paused(self):
+        import youtube
+        files = self._hot_files()
+        with mock.patch.object(youtube, "get_queue",
+                               return_value=[{"channelId": "C", "folder_name": "First We Feast",
+                                              "paused": True}]):
+            orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        self.assertTrue(all(os.path.exists(f) for f in files))
+
+    def test_a_queued_channel_is_matched_across_the_wire_encoding(self):
+        import youtube, transfer
+        folder = "Kurzgesagt – In a Nutshell"
+        wire = transfer.to_wire(folder)
+        f = self._touch(wire + " - Some Video [NYNBAxDfgrY]_cfr.mp4")
+        with mock.patch.object(youtube, "get_queue",
+                               return_value=[{"channelId": "C", "folder_name": folder}]):
+            orch.sweep_orphaned_youtube_workfiles(vids={"NYNBAxDfgrY"})
+        self.assertTrue(os.path.exists(f))
+
+    def test_the_youtube_books_count_as_proof(self):
+        import youtube
+        files = self._hot_files()
+        with mock.patch.object(youtube, "_durations", return_value={self.HOT: 600}):
+            orch.sweep_orphaned_youtube_workfiles()
+        self.assertFalse(any(os.path.exists(f) for f in files))
+
+    def test_a_dry_run_deletes_nothing(self):
+        files = self._hot_files()
+        out = orch.sweep_orphaned_youtube_workfiles(vids={self.HOT}, dry_run=True)
+        self.assertTrue(all(os.path.exists(f) for f in files))
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["bytes"], 30)
+
+    def test_two_sweeps_never_run_at_once(self):
+        self._hot_files()
+        orch._SWEEP_LOCK.acquire()
+        try:
+            out = orch.sweep_orphaned_youtube_workfiles(vids={self.HOT})
+        finally:
+            orch._SWEEP_LOCK.release()
+        self.assertIn("skipped", out)
+
+    def test_the_master_tag_is_recognised(self):
+        self.assertEqual(orch._yt_workfile_vid(self.HOT_NAME + orch.DV_TAG + ".mp4"), self.HOT)
+        self.assertEqual(orch._yt_workfile_vid("First We Feast - x [tFRjzukT7Es] extra.mp4"), "")
