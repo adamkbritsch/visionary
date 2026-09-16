@@ -1728,7 +1728,17 @@ class Orchestrator:
             topaz.terminate_all()              # kill any in-flight encode at once (don't orphan it)
         except Exception:
             pass
+        self._close_kept_resolve("the pipeline stopped")
         logbook.event(f"stopped — {reason}")
+
+    def _close_kept_resolve(self, why: str) -> bool:
+        """Close the Resolve a YouTube run left open (stages.close_kept_resolve). A no-op
+        when none was kept; never raises into the run loop."""
+        try:
+            import stages
+            return stages.close_kept_resolve(why)
+        except Exception:
+            return False
 
     def snapshot(self) -> dict:
         d = dict(self.state)
@@ -1918,6 +1928,7 @@ class Orchestrator:
                 self._power_paused = (pstatus == "pause")        # let the prefetcher back off too
                 if pstatus == "pause":
                     self._stop_caffeinate()                      # don't hold the display/system awake
+                    self._close_kept_resolve("the run paused for power")
                     # keep_stage: the item is FROZEN mid-stage, not abandoned. Without it the
                     # pipeline card forgot which item was waiting and lost its percentage.
                     self._hold("power", pmsg, keep_stage=True)   # all night while waiting on power
@@ -1943,6 +1954,7 @@ class Orchestrator:
                 ep, why = self._next_episode()
                 if ep is None:
                     self.state["current"] = None                 # nothing processing → header falls back to up-next
+                    self._close_kept_resolve("nothing left to run")
                     if why == "unreachable":     # NAS listing came back empty — a blip, not 'done'
                         # Say WHICH it is. An empty listing has two very different causes and
                         # the old blanket "NAS unreachable" sent the user hunting a network
@@ -2774,6 +2786,10 @@ class Orchestrator:
         self._current_paths = p                      # abandon_series needs the real paths (state's
                                                      # item_view carries DISPLAY names, not wire ones)
         self.state.update(episode=ep_disp, current=p.item_view(), message=f"working {p.series} {ep_disp}")
+        if not p.youtube:
+            # A YouTube run leaves Resolve open between videos; a TV episode or a movie is
+            # the end of that run, and its download/Topaz wants the memory and GPU back.
+            self._close_kept_resolve("the YouTube videos are done")
         self._claim_prefetched(p)      # pull any prefetched source+CFR from the buffer into main scratch
         p = apply_container(p)         # resume: if the source is already on disk, lock its container
         # Every item — TV, movie, or YouTube — runs its GPU stages START-TO-FINISH in one go

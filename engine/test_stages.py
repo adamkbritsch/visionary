@@ -2438,3 +2438,94 @@ class YouTubeReexport(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("re-exported under the cap", msg)
         self.assertTrue(any("RENDER_REEXPORT" in e for e in events))
+
+
+class YouTubeKeepsResolveOpen(unittest.TestCase):
+    """User-caught 2026-09-16: every YouTube video relaunched Resolve although each spends
+    about three minutes in it. A successful YouTube pass now leaves Resolve running; the
+    run's end closes it, and anything suspect still kills it at once."""
+
+    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False, input={"height": 1080})
+
+    def setUp(self):
+        self.kills = []
+        stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0)
+        p = mock.patch.object(stages, "_kill_resolve",
+                              side_effect=lambda: (self.kills.append(1),
+                                                   stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0)))
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(stages._RESOLVE_KEPT.update, open=False, mode=None, passes=0)
+
+    def _pass(self, *, youtube=True, rc=0, dv=True, mode="auto", abort=None):
+        import plan, preflight, settings, orchestrator
+        from orchestrator import youtube_paths
+        tmp = tempfile.mkdtemp()
+        p = (youtube_paths("Chan", os.path.join(tmp, "v [aaaaaaaaaaa].mp4"), "V", scratch_dir=tmp)
+             if youtube else _paths(tmp))
+        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
+             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+             mock.patch.object(settings, "get_settings", return_value=dict(settings.DEFAULT_SETTINGS)), \
+             mock.patch.object(settings, "get_show_output_mode", return_value=mode), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+             mock.patch.object(stages, "_resolve_budget", return_value=stages.RESOLVE_TIMEOUT), \
+             mock.patch.object(stages.threading, "Thread", _InlineThread), \
+             mock.patch.object(stages.time, "sleep"), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", return_value=dv), \
+             mock.patch.object(orchestrator, "render_is_complete", return_value=True), \
+             mock.patch.object(stages.subprocess, "Popen",
+                               side_effect=lambda cmd, **kw: _FakeResolveProc(["render ok\n"], rc)):
+            return stages.run_stage("resolve", p, abort=abort)
+
+    def test_a_successful_video_leaves_resolve_open(self):
+        ok, _msg = self._pass()
+        self.assertTrue(ok)
+        self.assertEqual(self.kills, [], "Resolve was killed after a good video")
+        self.assertTrue(stages.resolve_kept_open())
+
+    def test_the_next_video_reuses_it(self):
+        self._pass()
+        self._pass()
+        self.assertEqual(self.kills, [])
+        self.assertEqual(stages._RESOLVE_KEPT["passes"], 2)
+
+    def test_a_failed_video_still_kills_it(self):
+        self._pass()
+        ok, _msg = self._pass(dv=False)
+        self.assertFalse(ok)
+        self.assertEqual(self.kills, [1], "a suspect Resolve must not survive into the next video")
+        self.assertFalse(stages.resolve_kept_open())
+
+    def test_an_aborted_pass_kills_it(self):
+        ab = mock.Mock()
+        ab.is_set.return_value = False
+        self._pass()
+        ab.is_set.return_value = True
+        self._pass(abort=ab)
+        self.assertTrue(self.kills)
+
+    def test_a_tv_episode_never_keeps_it(self):
+        ok, _msg = self._pass(youtube=False)
+        self.assertTrue(ok)
+        self.assertEqual(self.kills, [1])
+        self.assertFalse(stages.resolve_kept_open())
+
+    def test_a_different_output_project_starts_fresh(self):
+        self._pass(mode="dv1000")
+        self._pass(mode="sdr")
+        self.assertEqual(self.kills, [1], "closed before switching projects, then kept again")
+        self.assertEqual(stages._RESOLVE_KEPT["mode"], "sdr")
+
+    def test_a_long_run_gets_a_fresh_resolve_now_and_then(self):
+        for _ in range(stages.RESOLVE_REUSE_MAX):
+            self._pass()
+        self.assertEqual(len(self.kills), 1)
+        self.assertFalse(stages.resolve_kept_open())
+
+    def test_closing_is_a_no_op_unless_the_pipeline_kept_it(self):
+        self.assertFalse(stages.close_kept_resolve("test"))
+        self.assertEqual(self.kills, [], "never touch a Resolve the pipeline did not leave open")
+        self._pass()
+        self.assertTrue(stages.close_kept_resolve("test"))
+        self.assertEqual(self.kills, [1])

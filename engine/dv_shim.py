@@ -338,8 +338,9 @@ def place_on_host(host, *, settle: float = 3.0, attempts: int = 3) -> bool:
     * Window INDEX is never valid twice (it moved three times in one session), and
       `count of windows` legitimately reads 0 while Resolve is full-screen on another
       Space — that means "look again", not "Resolve is gone".
-    * Placement does not survive a quit; stages pkills Resolve every stage, so this runs
-      per episode. The upside is that nothing can strand Resolve on an unwatched screen.
+    * Placement does not survive a quit; stages pkills Resolve after every TV/movie
+      stage, so this runs per episode. A YouTube run keeps Resolve open between videos —
+      then the already-full-screen-on-the-host check below returns at once.
     """
     if not host:
         return True

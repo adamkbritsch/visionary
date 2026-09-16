@@ -913,15 +913,85 @@ def _err_tail(text, n=200):
     return (" ".join(picked.split()) or "(no error output)")[-n:]
 
 
+# UNDER TESTS these two never touch the real machine. Closing a kept Resolve is now reachable
+# from ordinary orchestrator paths (a TV item starting, disable(), an idle loop), so a test
+# that leaked kept-open state could otherwise pkill the LIVE Resolve mid-analysis or pull
+# Visionary to the front while the suite runs. Same detection as scratch/logbook.
+_UNDER_TEST = "unittest" in sys.modules
+
+
+def _kill_resolve():
+    """Force-quit Resolve (a graceful quit hangs on its 'cancel renders?' prompt) and forget
+    any kept-open state."""
+    if not _UNDER_TEST:
+        subprocess.run(["pkill", "-9", "-f", "DaVinci Resolve.app"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with _RESOLVE_KEPT_LOCK:
+        _RESOLVE_KEPT.update(open=False, mode=None, passes=0)
+
+
+def _refocus_app():
+    if not _UNDER_TEST:
+        subprocess.run(["open", "-a", "Visionary"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _quit_resolve_focus_app():
-    """After the resolve stage: force-quit Resolve (graceful quit hangs on its
-    'cancel renders?' prompt) to free its RAM/GPU and guarantee a FRESH, responsive
-    Resolve next episode (stale Resolve is what caused the original hang), then bring
-    the dashboard app back to the front."""
-    subprocess.run(["pkill", "-9", "-f", "DaVinci Resolve.app"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["open", "-a", "Visionary"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """After the resolve stage: force-quit Resolve to free its RAM/GPU and guarantee a
+    FRESH, responsive Resolve next episode (stale Resolve is what caused the original
+    hang), then bring the dashboard app back to the front."""
+    _kill_resolve()
+    _refocus_app()
+
+
+# ---- A YOUTUBE RUN KEEPS RESOLVE OPEN ------------------------------------------------
+# Every resolve stage used to end by killing Resolve. For a TV episode that is right: an
+# hour of Topaz follows and wants the GPU and memory back, and the next episode's Resolve
+# is hours away. For a burst of YouTube videos it was pure overhead — each video spends
+# about three minutes in Resolve and paid a cold launch on top of that, then the next
+# video launched it again (user-caught 2026-09-16: "make it so resolve doesn't close at
+# the end of every video export, just at the end of the youtube queue").
+#
+# So a SUCCESSFUL YouTube pass leaves Resolve running, and the orchestrator closes it when
+# the YouTube run ends: the run thread starts an item that is not a video, finds nothing
+# to run, pauses for power, or stops (close_kept_resolve). Anything that went wrong still
+# kills it — a failed, aborted or timed-out pass must never leave a suspect Resolve for
+# the next video — and so does a change of output project (switching projects inside a
+# live session can raise a save prompt the automation cannot see) and a long run
+# (RESOLVE_REUSE_MAX passes: a fresh Resolve now and then costs one launch, a slowly
+# degrading one costs a hang).
+RESOLVE_REUSE_MAX = 20
+_RESOLVE_KEPT = {"open": False, "mode": None, "passes": 0}
+_RESOLVE_KEPT_LOCK = threading.Lock()
+
+
+def _keep_resolve_open(mode) -> bool:
+    """Leave Resolve running after a successful YouTube pass. False when the reuse budget is
+    spent — the caller then kills it as it always did."""
+    with _RESOLVE_KEPT_LOCK:
+        n = int(_RESOLVE_KEPT.get("passes") or 0) + 1
+        if n >= RESOLVE_REUSE_MAX:
+            return False
+        _RESOLVE_KEPT.update(open=True, mode=mode, passes=n)
+    _refocus_app()
+    return True
+
+
+def resolve_kept_open() -> bool:
+    with _RESOLVE_KEPT_LOCK:
+        return bool(_RESOLVE_KEPT.get("open"))
+
+
+def close_kept_resolve(why: str) -> bool:
+    """Close a Resolve a YouTube run left open. No-op (False) when none was kept — this never
+    touches a Resolve the pipeline did not leave running. No refocus: Visionary was already
+    brought back to the front when the last pass ended."""
+    with _RESOLVE_KEPT_LOCK:
+        if not _RESOLVE_KEPT.get("open"):
+            return False
+    _kill_resolve()
+    logbook.event(f"closed DaVinci Resolve — {why}")
+    return True
 
 
 # ---- FAST-PATH RESOLVE-COMPAT MEZZANINE -----------------------------------------------
@@ -1070,7 +1140,8 @@ def _resolve(p, abort, progress=None):
     The OUTPUT MODE picks the Resolve project. Automatically that is ALWAYS the
     1000-nit Dolby Vision project (user-dictated 2026-08-09); the 2000-nit DV project
     and the non-DV SDR project are reachable ONLY through explicit per-item overrides.
-    When the stage finishes (any outcome) Resolve is quit and the app refocused.
+    When the stage finishes Resolve is quit and the app refocused — except after a
+    successful YouTube pass, which leaves it running for the next video (_keep_resolve_open).
     FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
     nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""
     import plan
@@ -1263,7 +1334,7 @@ def _resolve(p, abort, progress=None):
         return ok, out, (("rendered DV 8.1" + note) if ok
                          else f"resolve failed (rc={proc.returncode}): {tail}")
 
-    try:
+    def _passes():
         from orchestrator import combine_winner_path
         video_in = resolve_input(p)
         if p.combine and not video_in:
@@ -1293,8 +1364,21 @@ def _resolve(p, abort, progress=None):
             try: os.remove(mezz)        # re-encoding 10 minutes; cleanup sweeps a stray
             except OSError: pass
         return ok, (reason + " (via compat mezzanine)" if ok else reason)
+
+    with _RESOLVE_KEPT_LOCK:
+        other_project = _RESOLVE_KEPT.get("open") and _RESOLVE_KEPT.get("mode") != mode
+    if other_project:
+        close_kept_resolve(f"this video renders to the {mode} project, not the open one")
+    ok = False
+    try:
+        ok, reason = _passes()
+        return ok, reason
     finally:
-        _quit_resolve_focus_app()
+        # A successful YouTube pass leaves Resolve running for the next video (see
+        # _keep_resolve_open); everything else ends the way it always did.
+        aborted = abort is not None and abort.is_set()
+        if not (ok and yt and not aborted and _keep_resolve_open(mode)):
+            _quit_resolve_focus_app()
 
 
 def _combine_result(res, real_rpu_donor):

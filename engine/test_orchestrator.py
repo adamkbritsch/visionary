@@ -4357,3 +4357,42 @@ class WarmupPaysOffAtHandoff(unittest.TestCase):
     def test_an_ordinary_video_advances_the_rotation(self):
         paid, rotated = self._handoff(None)
         self.assertEqual(rotated, ["Chan"])
+
+
+class ResolveClosesWhenTheYouTubeRunEnds(unittest.TestCase):
+    """A YouTube run leaves Resolve open between videos (stages._keep_resolve_open). The run
+    thread closes it when the run ends: an item that is not a video, nothing to run, a
+    power pause, or a stop."""
+
+    def setUp(self):
+        import stages
+        self.closed = []
+        p = mock.patch.object(stages, "close_kept_resolve",
+                              side_effect=lambda why: self.closed.append(why) or True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _process(self, p):
+        o = orch.Orchestrator(); o._enabled = False           # returns before any stage runs
+        with mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x):
+            o._process(p)
+
+    def test_a_tv_episode_closes_it(self):
+        self._process(episode_paths("A", "S01E01", SRC))
+        self.assertEqual(len(self.closed), 1)
+
+    def test_the_next_video_does_not(self):
+        self._process(youtube_paths("Chan", "/Media/YouTube-raw/Chan/v/Chan - A [aaaaaaaaaa1].mp4", "A"))
+        self.assertEqual(self.closed, [])
+
+    def test_stopping_closes_it(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(o, "_stop_caffeinate"):
+            o.disable("test")
+        self.assertEqual(len(self.closed), 1)
+
+    def test_a_closing_error_never_reaches_the_run_loop(self):
+        import stages
+        with mock.patch.object(stages, "close_kept_resolve", side_effect=RuntimeError("boom")):
+            self.assertFalse(orch.Orchestrator()._close_kept_resolve("test"))
