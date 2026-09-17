@@ -806,6 +806,24 @@ def _extend(p, abort, progress=None):
                   f"{total} frames -> 16:9 wide source")
 
 
+def _discard_wrong_clock_input(p, src_in, why):
+    """Topaz refused its input because the file declares a frame rate its frames do not run
+    at (topaz.declared_rate_mismatch). The usual origin is a CFR that an older build
+    stream-copied from such a source. It can never pass, and nothing planned on its clock is
+    sound, so drop the input and the segdir. The next pass finds the file missing and rebuilds
+    it: the download stage re-encodes the CFR at the frames' own rate, and the extend stage
+    re-makes a border-extended copy from that. Counting one failure for it is fine; looping on
+    it cost The Adventures of Sharkboy and Lavagirl five 44-minute retries (2026-09-06)."""
+    import shutil
+    try:
+        if src_in and os.path.exists(src_in):
+            os.remove(src_in)
+    except OSError:
+        pass
+    shutil.rmtree(p.segdir, ignore_errors=True)
+    return f"{why} — discarded it and its segments; the next pass rebuilds it on that clock"
+
+
 def _topaz(p, abort, progress=None, should_pause=None):
     """source -> ProRes 4444 XQ. Uses the SHOW's chosen preset + the input plan
     (upscale 1080p 2×, clean already-4K 1×; range PRESERVED, never SDR<->HDR).
@@ -892,6 +910,8 @@ def _topaz(p, abort, progress=None, should_pause=None):
                                   on_plan=on_plan, should_pause=should_pause)
     if not res.ok and str(res.error_tail).startswith("paused:"):
         return False, res.error_tail            # NOT a failure — held cleanly at a segment boundary
+    if not res.ok and str(res.error_tail).startswith(topaz.RATE_MISMATCH):
+        return False, _discard_wrong_clock_input(p, src_in, res.error_tail)
     return res.ok, (f"[{key} · {pl.get('res') or '?'} {pl['topaz']} {pl['scale']}× → 4K] "
                     f"{res.frames} frames → segments"
                     if res.ok else _err_tail(res.error_tail))

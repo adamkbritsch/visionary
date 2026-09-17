@@ -505,3 +505,231 @@ class TheCapIsReportedNotLogged(unittest.TestCase):
                                          error_tail="").capped_secs, 0.0)
         self.assertEqual(topaz.CfrResult(ok=True, frames=1, rate="24/1", error_tail="",
                                          capped_secs=8298.667).capped_secs, 8298.667)
+
+
+class DeclaredRateMismatch(unittest.TestCase):
+    """The Adventures of Sharkboy and Lavagirl (EDGE2020) declares 500/21 fps, a DefaultDuration
+    rounded to 42 ms, over 133,624 frames that run at 24000/1001. The CFR pass stream-copied the
+    lie, Topaz seeked on the wrong clock, and the last segment came out 11,899 of 12,826 frames
+    on every 44-minute retry (live 2026-09-06). The frames' own count over their own span wins."""
+
+    def _check(self, declared, frames, span):
+        with mock.patch.object(topaz, "_fps_fraction", return_value=declared), \
+             mock.patch.object(topaz, "_frame_count", return_value=frames), \
+             mock.patch.object(topaz, "_video_span", return_value=span):
+            return topaz.declared_rate_mismatch("/src.mkv")
+
+    def test_the_sharkboy_header_is_caught(self):
+        self.assertEqual(self._check("500/21", 133624, 5573.234), ("500/21", "24000/1001"))
+
+    def test_an_honest_ntsc_file_passes(self):
+        self.assertIsNone(self._check("24000/1001", 133624, 5573.234))
+
+    def test_an_odd_spelling_of_the_same_rate_passes(self):
+        self.assertIsNone(self._check("2997/125", 133624, 5573.234))
+
+    def test_whole_rate_frames_declared_as_ntsc_are_caught(self):
+        # an hour of 24 fps frames declared 24000/1001 mispredicts 86 frames
+        self.assertEqual(self._check("24000/1001", 86400, 3600.0), ("24000/1001", "24/1"))
+
+    def test_a_difference_too_small_to_cost_two_frames_passes(self):
+        # 24/1 declared over a minute of 24000/1001 frames mispredicts 1.4 frames
+        self.assertIsNone(self._check("24/1", 1439, 60.018))
+
+    def test_a_clip_under_the_minimum_span_gets_no_verdict(self):
+        self.assertIsNone(self._check("500/21", 120, 5.005))
+
+    def test_a_cadence_matching_no_standard_rate_gets_no_verdict(self):
+        self.assertIsNone(self._check("24000/1001", 129000, 5573.234))   # 23.15 fps
+
+    def test_a_count_the_caller_holds_is_not_taken_again(self):
+        with mock.patch.object(topaz, "_fps_fraction", return_value="500/21"), \
+             mock.patch.object(topaz, "_frame_count", side_effect=AssertionError("rescanned")), \
+             mock.patch.object(topaz, "_video_span", return_value=5573.234):
+            self.assertEqual(topaz.declared_rate_mismatch("/src.mkv", frames=133624),
+                             ("500/21", "24000/1001"))
+
+    def test_unreadable_evidence_gets_no_verdict(self):
+        self.assertIsNone(self._check("500/21", -1, 5573.234))
+        self.assertIsNone(self._check("500/21", 133624, None))
+        self.assertIsNone(self._check(None, 133624, 5573.234))
+
+
+class VideoSpan(unittest.TestCase):
+    """The span the frames' own timestamps cover, read without the declared rate."""
+
+    def _span(self, stream, box=None, tail=""):
+        def fake(argv, **kw):
+            if "stream=duration,start_time:stream_tags" in argv:
+                return mock.Mock(stdout=json.dumps({"streams": [stream]}))
+            if "format=duration" in argv:
+                return mock.Mock(stdout=f"{box}\n" if box else "")
+            if "packet=pts_time,duration_time" in argv:
+                return mock.Mock(stdout=tail)
+            self.fail(f"unexpected probe: {argv}")
+        with mock.patch.object(topaz.subprocess, "run", side_effect=fake):
+            return topaz._video_span("/x")
+
+    def test_mp4_track_duration(self):
+        self.assertAlmostEqual(self._span({"duration": "185.560375"}), 185.560375)
+
+    def test_matroska_duration_tag(self):
+        self.assertAlmostEqual(self._span({"duration": "N/A",
+                                           "tags": {"DURATION": "01:32:53.234000000"}}), 5573.234)
+
+    def test_language_suffixed_duration_tag(self):
+        self.assertAlmostEqual(self._span({"tags": {"DURATION-eng": "00:00:20.020000000"}}), 20.02)
+
+    def test_last_packets_without_tags_minus_the_start(self):
+        tail = "5573.109000,0.041000\n5573.151000,0.042000\n5573.192000,0.042000\n"
+        self.assertAlmostEqual(self._span({"start_time": "0.042000"}, box=5573.3, tail=tail),
+                               5573.192)
+
+    def test_nothing_readable(self):
+        self.assertIsNone(self._span({}))
+
+
+class NoWrongDeclaredRateReachesTheCfr(unittest.TestCase):
+    """A copy used to carry the container's wrong rate straight to Topaz and Resolve."""
+
+    def test_a_lying_header_is_not_already_cfr(self):
+        js = ('{"streams":[{"avg_frame_rate":"500/21","r_frame_rate":"500/21",'
+              '"pix_fmt":"yuv420p10le","time_base":"1/1000"}]}')
+        for lie, expected in ((("500/21", "24000/1001"), False), (None, True)):
+            with mock.patch.object(topaz.subprocess, "run", return_value=mock.Mock(stdout=js)), \
+                 mock.patch.object(topaz, "declared_rate_mismatch", return_value=lie):
+                self.assertEqual(topaz._is_already_cfr("x.mkv"), expected)
+
+    def test_a_caller_that_just_checked_skips_the_second_scan(self):
+        js = ('{"streams":[{"avg_frame_rate":"25/1","r_frame_rate":"25/1",'
+              '"pix_fmt":"yuv420p","time_base":"1/1000"}]}')
+        with mock.patch.object(topaz.subprocess, "run", return_value=mock.Mock(stdout=js)), \
+             mock.patch.object(topaz, "declared_rate_mismatch",
+                               side_effect=AssertionError("checked twice")):
+            self.assertTrue(topaz._is_already_cfr("x.mkv", check_rate=False))
+
+    def _to_cfr(self, *, lie, copy_only=False, already=False):
+        with mock.patch.object(topaz, "declared_rate_mismatch", return_value=lie), \
+             mock.patch.object(topaz, "_fps_fraction", return_value="500/21"), \
+             mock.patch.object(topaz, "_is_already_cfr", return_value=already), \
+             mock.patch.object(topaz, "cfr_duration_cap", return_value=None) as cap, \
+             mock.patch.object(topaz, "_cfr_pix_fmt", return_value="yuv420p10le"), \
+             mock.patch.object(topaz, "_cfr_height", return_value=1080), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "_run_ffmpeg", return_value=(0, 100, False, "")) as rf:
+            r = topaz.to_cfr("/in.mkv", "/out.mkv", copy_only=copy_only)
+        return rf.call_args.args[0], r, cap
+
+    def test_a_lying_source_reencodes_at_the_frames_own_rate(self):
+        cmd, r, cap = self._to_cfr(lie=("500/21", "24000/1001"), already=True)
+        self.assertIn("libx264", cmd)
+        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
+        self.assertEqual(r.rate, "24000/1001")
+        self.assertEqual(cap.call_args.kwargs["rate"], "24000/1001")
+
+    def test_a_fast_path_copy_declares_the_frames_own_rate(self):
+        cmd, r, _ = self._to_cfr(lie=("500/21", "24000/1001"), copy_only=True)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+        self.assertNotIn("libx264", cmd)
+        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
+        self.assertLess(cmd.index("-r"), cmd.index("/out.mkv"))
+
+    def test_an_honest_copy_declares_nothing_new(self):
+        cmd, r, _ = self._to_cfr(lie=None, already=True)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+        self.assertNotIn("-r", cmd)
+        self.assertEqual(r.rate, "500/21")
+
+
+class ResumableRefusesAWrongClock(unittest.TestCase):
+    """Nine hours of upscaling, then five identical 44-minute failures whose log line was only
+    ffmpeg's closing stats. The wrong clock is now refused up front, and a short segment says so."""
+
+    def test_a_wrong_clock_input_is_refused_before_any_work(self):
+        import tempfile
+        with mock.patch.object(topaz, "media_timing", return_value=(500 / 21, 5573.2)), \
+             mock.patch.object(topaz, "_frame_count", return_value=133624), \
+             mock.patch.object(topaz, "declared_rate_mismatch",
+                               return_value=("500/21", "24000/1001")) as check, \
+             mock.patch.object(topaz, "_cached_scene_frames",
+                               side_effect=AssertionError("must not plan")), \
+             mock.patch.object(topaz, "_run_ffmpeg", side_effect=AssertionError("must not encode")):
+            res = topaz.upscale_resumable("/cfr.mkv", segdir=tempfile.mkdtemp())
+        check.assert_called_once_with("/cfr.mkv", frames=133624)    # its own exact count, reused
+        self.assertFalse(res.ok)
+        self.assertTrue(res.error_tail.startswith(topaz.RATE_MISMATCH))
+        self.assertIn("500/21", res.error_tail)
+        self.assertIn("24000/1001", res.error_tail)
+
+    def _one_segment(self, rc, got, tail):
+        import tempfile
+        with mock.patch.object(topaz, "media_timing", return_value=(24.0, 100.0)), \
+             mock.patch.object(topaz, "_frame_count", side_effect=[2400, got]), \
+             mock.patch.object(topaz, "declared_rate_mismatch", return_value=None), \
+             mock.patch.object(topaz, "_cached_scene_frames", return_value=[1200]), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "_run_ffmpeg", return_value=(rc, 1150, False, tail)):
+            return topaz.upscale_resumable("/cfr.mp4", segdir=tempfile.mkdtemp(),
+                                           target_seconds=10)
+
+    def test_a_short_segment_names_its_counts_not_the_closing_stats(self):
+        stats = ("muxing overhead: 0.000499%\nframe=11899 fps=4.7 q=-0.0 Lsize=27610339KiB "
+                 "time=00:08:19.71 bitrate=452624.9kbits/s dup=0 drop=82 speed=0.196x")
+        res = self._one_segment(0, 1150, stats)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_tail, "segment 1 of 2 came out 1150 frames, expected 1200")
+
+    def test_a_crash_still_reports_ffmpegs_own_error(self):
+        res = self._one_segment(1, -1, "Conversion failed!")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_tail, "Conversion failed!")
+
+
+import os as _os
+import shutil as _shutil
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+
+@unittest.skipUnless(_os.path.exists(topaz.FFMPEG_HB) and _os.path.exists(topaz.FFPROBE_HB)
+                     and _shutil.which("mkvpropedit"), "needs ffmpeg, ffprobe and mkvtoolnix")
+class WrongDeclaredRateOnRealMedia(unittest.TestCase):
+    """End to end on real files, because the bug lives in what muxers write and ffprobe reads:
+    a Matroska clip whose DefaultDuration says 42 ms over 24000/1001 timestamps, exactly the
+    shape of the Sharkboy release (and Due Date, South Park and Curb Your Enthusiasm S11)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = _tempfile.mkdtemp()
+        cls.honest = _os.path.join(cls.dir, "honest.mkv")
+        _subprocess.run([topaz.FFMPEG_HB, "-v", "error", "-y", "-f", "lavfi", "-i",
+                         "testsrc2=size=64x36:rate=24000/1001:duration=20", "-c:v", "libx264",
+                         "-preset", "ultrafast", "-pix_fmt", "yuv420p", cls.honest], check=True)
+        cls.lying = _os.path.join(cls.dir, "lying.mkv")
+        _shutil.copy(cls.honest, cls.lying)
+        _subprocess.run(["mkvpropedit", "-q", cls.lying, "--edit", "track:v1",
+                         "--set", "default-duration=42000000"], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_the_check_sees_the_lie_and_only_the_lie(self):
+        self.assertEqual(topaz._fps_fraction(self.lying), "500/21")
+        self.assertEqual(topaz.declared_rate_mismatch(self.lying), ("500/21", "24000/1001"))
+        self.assertIsNone(topaz.declared_rate_mismatch(self.honest))
+        self.assertFalse(topaz._is_already_cfr(self.lying))
+
+    def test_every_cfr_declares_the_frames_rate_and_keeps_every_frame(self):
+        want = topaz._frame_count(self.lying)
+        self.assertGreater(want, 0)
+        for copy_only in (False, True):
+            for ext in (".mkv", ".mp4"):
+                with self.subTest(copy_only=copy_only, container=ext):
+                    dst = _os.path.join(self.dir, f"cfr_{int(copy_only)}{ext}")
+                    r = topaz.to_cfr(self.lying, dst, copy_only=copy_only)
+                    self.assertTrue(r.ok, r.error_tail)
+                    self.assertEqual(topaz._fps_fraction(dst), "24000/1001")
+                    self.assertEqual(topaz._frame_count(dst), want)
+                    self.assertIsNone(topaz.declared_rate_mismatch(dst))

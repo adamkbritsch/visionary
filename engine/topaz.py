@@ -278,9 +278,11 @@ CFR_TAIL_SLOP_SECS = 2.0
 CFR_TAIL_KEEP_SECS = 1.0
 
 
-def video_duration(path, ffprobe=FFPROBE_HB):
+def video_duration(path, ffprobe=FFPROBE_HB, *, rate=None):
     """Length of the VIDEO stream in seconds — frames / rate where both are known (exact),
-    else the stream's own duration tag. None when neither is readable."""
+    else the stream's own duration tag. None when neither is readable. `rate` overrides the
+    declared one when a caller has proven it wrong (declared_rate_mismatch): frames over a
+    declared rate that is too HIGH comes out short of the real picture."""
     from fractions import Fraction
     try:
         out = subprocess.run(
@@ -291,7 +293,7 @@ def video_duration(path, ffprobe=FFPROBE_HB):
     except Exception:
         return None
     try:
-        n, r = int(st.get("nb_frames") or 0), Fraction(st.get("r_frame_rate") or "0/0")
+        n, r = int(st.get("nb_frames") or 0), Fraction(rate or st.get("r_frame_rate") or "0/0")
         if n > 0 and r > 0:
             return n / float(r)
     except Exception:
@@ -348,11 +350,12 @@ def _container_duration(path, ffprobe=FFPROBE_HB):
         return None
 
 
-def cfr_duration_cap(source, ffprobe=FFPROBE_HB):
+def cfr_duration_cap(source, ffprobe=FFPROBE_HB, *, rate=None):
     """The `-t` to give the CFR pass so its container cannot outrun its picture, or None
     when the source is already honest (the overwhelmingly common case). Only ever LONGER
-    than the video, so it can never truncate one."""
-    vid = video_duration(source, ffprobe)
+    than the video, so it can never truncate one — given the rate the frames really run at,
+    which is why to_cfr passes the one it encodes at."""
+    vid = video_duration(source, ffprobe, rate=rate)
     box = _container_duration(source, ffprobe)
     if not vid or not box or box <= vid + CFR_TAIL_SLOP_SECS:
         return None
@@ -455,7 +458,107 @@ def _period_exact_in_timebase(r_frame_rate: str, time_base: str) -> bool:
     return (fps_den * tb_den) % (fps_num * tb_num) == 0
 
 
-def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
+# ---- the frames' own rate vs the rate the container declares ------------------------------
+# A container's DECLARED frame rate can be wrong while agreeing with itself. Matroska hands
+# ffprobe both r_frame_rate and avg_frame_rate from the track's DefaultDuration, and some
+# release muxers store that rounded to whole milliseconds. The Adventures of Sharkboy and
+# Lavagirl (EDGE2020) declares 42 ms = 500/21 fps, yet its 133,624 frames carry 24000/1001
+# timestamps (deltas alternate 42/41 ms). avg == r, 10-bit 4:2:0, and 42 ms sits exactly on
+# the 1 ms timebase, so the CFR pass stream-COPIED it. Its PGS subtitles made that CFR a
+# Matroska file, which re-declares the same 42 ms (an MP4 copy re-derives the rate from the
+# timestamps and would have been right), and the lie reached Topaz intact. There every
+# segment seeked on the wrong clock while the MOV muxer's CFR output dropped 1 frame in 144
+# to hold 500/21. The middle segments still reached their -frames:v count, so nothing noticed
+# until the LAST segment, which reads to EOF: 11,899 of 12,826 frames after nine hours of
+# upscaling, failing identically on every ~44-minute retry (live 2026-09-06). The frames are
+# the truth: an exact frame count over the span their own timestamps cover.
+STANDARD_FRAME_RATES = ("24000/1001", "24/1", "25/1", "30000/1001", "30/1", "48000/1001",
+                        "48/1", "50/1", "60000/1001", "60/1", "100/1", "120000/1001", "120/1",
+                        "12000/1001", "12/1", "15000/1001", "15/1")
+RATE_SNAP_TOLERANCE = 2e-4    # how close a measured cadence must sit to a standard rate. NTSC
+                              # and whole rates are 1e-3 apart, so a snap never confuses them
+RATE_MIN_SPAN_SECS = 10.0     # shorter, a millisecond of timestamp rounding outweighs the check
+RATE_LIE_FRAMES = 2           # the declared rate must mispredict the frame count by this much
+RATE_MISMATCH = "frame-rate mismatch:"   # upscale_resumable's refusal; stages._topaz rebuilds on it
+
+
+def _hms_seconds(s):
+    """'01:32:53.234000000' (a Matroska DURATION statistics tag) → 5573.234; None if unparseable."""
+    try:
+        h, m, sec = str(s).strip().split(":")
+        total = int(h) * 3600 + int(m) * 60 + float(sec)
+    except (ValueError, TypeError):
+        return None
+    return total if total > 0 else None
+
+
+def _video_span(path, ffprobe=FFPROBE_HB):
+    """Seconds of picture the video stream's OWN timestamps cover, first frame on screen to
+    last frame off. Never derived from the declared rate, because that is what it is checked
+    against. MP4/MOV publish it as the track duration, and mkvmerge/ffmpeg Matroska as a
+    DURATION statistics tag. Anything else is read off the last packets with one seek.
+    None when unknown."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=duration,start_time:stream_tags",
+                              "-of", "json", path],
+                             capture_output=True, text=True, timeout=60).stdout
+        st = (json.loads(out).get("streams") or [{}])[0]
+    except Exception:
+        return None
+    try:
+        d = float(st.get("duration"))
+        if d > 0:
+            return d
+    except (TypeError, ValueError):
+        pass
+    for key, val in (st.get("tags") or {}).items():
+        if key.upper() == "DURATION" or key.upper().startswith("DURATION-"):
+            secs = _hms_seconds(val)
+            if secs:
+                return secs
+    end = _last_video_pts(path, ffprobe)
+    try:
+        start = max(0.0, float(st.get("start_time")))
+    except (TypeError, ValueError):
+        start = 0.0
+    return (end - start) if end and end > start else None
+
+
+def declared_rate_mismatch(path, ffprobe=FFPROBE_HB, *, frames=None):
+    """`(declared, actual)` frame-rate strings when `path`'s frames prove its declared rate
+    wrong, else None. Wrong means two things at once: the frames run at a DIFFERENT standard
+    rate, and the declared rate mispredicts the frame count by RATE_LIE_FRAMES or more. So
+    timestamp rounding, a short clip, or an odd spelling of the same rate ('2997/125') never
+    qualifies. CONSERVATIVE the other way from _is_already_cfr: any doubt (unreadable count or
+    span, a cadence matching no standard rate) → None, which keeps the behaviour this check
+    predates. `frames` passes in an EXACT count the caller already holds: on a Matroska file
+    without a count tag, counting means a packet scan of the whole file."""
+    from fractions import Fraction
+    declared_s = _fps_fraction(path, ffprobe)
+    try:
+        declared = Fraction(declared_s or "")
+    except (ValueError, ZeroDivisionError):
+        return None
+    if declared <= 0:
+        return None
+    if not frames or frames <= 0:
+        frames = _frame_count(path, ffprobe, decode=False)
+    span = _video_span(path, ffprobe)
+    if frames <= 0 or not span or span < RATE_MIN_SPAN_SECS:
+        return None
+    raw = frames / span
+    actual = min((Fraction(r) for r in STANDARD_FRAME_RATES), key=lambda r: abs(raw / r - 1))
+    if abs(raw / actual - 1) > RATE_SNAP_TOLERANCE:
+        return None                                   # no standard rate fits → no verdict
+    if abs(declared / actual - 1) <= RATE_SNAP_TOLERANCE:
+        return None                                   # the same rate, however it is spelled
+    if abs(float(declared) * span - frames) < RATE_LIE_FRAMES:
+        return None                                   # too short for the difference to cost a frame
+    return (declared_s, f"{actual.numerator}/{actual.denominator}")
+
+
+def _is_already_cfr(path, ffprobe=FFPROBE_HB, *, check_rate=True) -> bool:
     """The source is ALREADY constant frame rate at a 4:2:0 pixel format AND its container
     timebase can represent that rate EXACTLY → the CFR step can stream-COPY the video instead
     of a full re-encode (identical pixels, ~seconds not minutes).
@@ -465,6 +568,10 @@ def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
     an MKV is nominally CFR (avg==r) but its 1 ms timebase can't hold an NTSC frame period, so a
     stream-copy inherits jitter the upscaler turns into a growing audio/video drift — such a
     source must re-encode to get uniform PTS (the path MP4 sources already take).
+    Last, the declared rate must be the one the frames actually run at (declared_rate_mismatch):
+    avg and r both come from the same Matroska header, so they agree even when it is wrong, and
+    a copy would hand that wrong clock to Topaz. `check_rate=False` is for a caller that has
+    just run that check itself (to_cfr), so a tagless file is not packet-scanned twice.
     CONSERVATIVE: any doubt (unreadable, VFR, wide chroma, lossy timebase) → False → safe re-encode."""
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
@@ -477,14 +584,17 @@ def _is_already_cfr(path, ffprobe=FFPROBE_HB) -> bool:
     if not avg or not r or avg in ("0/0", "N/A") or r in ("0/0", "N/A"):
         return False
     return (avg == r and pix in ("yuv420p", "yuv420p10le")
-            and _period_exact_in_timebase(r, s.get("time_base")))
+            and _period_exact_in_timebase(r, s.get("time_base"))
+            and (not check_rate or declared_rate_mismatch(path, ffprobe) is None))
 
 
-def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False, duration_cap=None):
+def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False, duration_cap=None, rate=None):
     """Fast path for an already-CFR 4:2:0 source (see _is_already_cfr): stream-COPY the video
     (+audio) into the CFR file — no re-encode. Subtitles stay out (PGS can't ride the CFR and
     aren't needed; the remux re-attaches them from the original). `-progress` still lets
-    _run_ffmpeg surface progress + a frame count."""
+    _run_ffmpeg surface progress + a frame count. `rate` corrects a DECLARED rate the frames do
+    not run at (declared_rate_mismatch): on a stream copy `-r` rewrites only what the container
+    declares (Matroska's DefaultDuration), never a packet or a timestamp."""
     prio = ["/usr/sbin/taskpolicy", "-c", "background"] if low_prio else []
     return [
         *prio,
@@ -492,6 +602,7 @@ def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False, duration_cap=Non
         "-i", src,
         "-map", "0:v:0", "-map", "0:a?",
         "-c", "copy",
+        *(["-r", rate] if rate else []),
         *(["-t", f"{duration_cap:.3f}"] if duration_cap else []),
         dst,
     ]
@@ -534,13 +645,19 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     TOPAZ's frame counts stable — but the fast paths skip Topaz, ship the ORIGINAL video (or
     Resolve's render of it), and read only this file's AUDIO (a bit-copy of the original's
     either way) plus decoded frames for scene-cut planning. Hours of libx264 on a 4K movie
-    whose video bytes nothing reads (live-caught 2026-08-06, a 60 GB REMUX)."""
-    rate = _fps_fraction(source)
-    cap = cfr_duration_cap(source)     # see CFR_TAIL_SLOP_SECS — a container longer than its
-                                       # own picture becomes Resolve's timeline length
-    if copy_only or _is_already_cfr(source):
+    whose video bytes nothing reads (live-caught 2026-08-06, a 60 GB REMUX).
+
+    A container that DECLARES a rate its frames do not run at (declared_rate_mismatch) never
+    passes that rate on. A re-encode is timed at the frames' own rate, since `-r 500/21` over
+    24000/1001 frames drops 1 in 144 to hold the wrong clock. A copy keeps its packets and
+    declares the right rate over them, because Resolve imports this file for every item."""
+    lie = declared_rate_mismatch(source)
+    rate = lie[1] if lie else _fps_fraction(source)
+    cap = cfr_duration_cap(source, rate=rate)   # see CFR_TAIL_SLOP_SECS — a container longer
+                                                # than its own picture becomes Resolve's timeline
+    if copy_only or (not lie and _is_already_cfr(source, check_rate=False)):
         cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio,
-                                     duration_cap=cap)
+                                     duration_cap=cap, rate=(rate if lie else None))
     else:
         cmd = build_cfr_command(FFMPEG_HB, source, dst, rate=rate,
                                 pix=_cfr_pix_fmt(source), color=source_color(source),
@@ -732,7 +849,7 @@ def _cached_scene_frames(source, segdir, fps) -> list:
     return [int(round(t * fps)) for t in times]
 
 
-def _frame_count(path, ffprobe=FFPROBE_HB) -> int:
+def _frame_count(path, ffprobe=FFPROBE_HB, *, decode=True) -> int:
     """Frames in a file — fast header/tag reads first; a full-decode count only as a LAST
     resort. `nb_frames` is present in MP4 but N/A in MKV, where the EXACT count instead lives
     in a NUMBER_OF_FRAMES stream tag (written by any muxer/copy) — read that before decoding.
@@ -749,7 +866,8 @@ def _frame_count(path, ffprobe=FFPROBE_HB) -> int:
     for args, tmo in ((["-show_entries", "stream=nb_frames"], 120),
                       (["-show_entries", "stream_tags=NUMBER_OF_FRAMES"], 120),
                       (["-count_packets", "-show_entries", "stream=nb_read_packets"], 300),
-                      (["-count_frames", "-show_entries", "stream=nb_read_frames"], 600)):
+                      *([(["-count_frames", "-show_entries", "stream=nb_read_frames"], 600)]
+                        if decode else [])):   # decode=False: a CHECK must never cost a full decode
         try:
             out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
                                   *args, "-of", "csv=p=0", path],
@@ -816,11 +934,20 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
     item and resumes here once the pause condition clears)."""
     os.makedirs(segdir, exist_ok=True)
     fps, _dur = media_timing(source)
-    total = _frame_count(source)          # EXACT frame count (nb_frames). A duration×fps
+    total = exact = _frame_count(source)  # EXACT frame count (nb_frames). A duration×fps
     if total <= 0:                        # estimate makes the LAST chunk's -frames:v overshoot
         total = total_frames(source)      # EOF → fewer frames than asked → validation fails.
     if not (fps and total):
         return UpscaleResult(False, -1, 0, segdir, "could not read source fps/frame-count")
+    # Every seek below is frame / fps, and the .mov output holds the declared rate. If the
+    # frames run at another rate, each middle segment silently drops frames to hold it and the
+    # LAST one comes up short on every attempt (see declared_rate_mismatch). Refuse here, before
+    # hours of GPU, so the caller can rebuild the input on the right clock.
+    lie = declared_rate_mismatch(source, frames=exact)   # never the estimate: it assumes the rate
+    if lie:
+        return UpscaleResult(False, -1, 0, segdir,
+                             f"{RATE_MISMATCH} the input declares {lie[0]} fps but its frames "
+                             f"run at {lie[1]}")
     segs = plan_segments(total, fps, _cached_scene_frames(source, segdir, fps), target_seconds)
     if on_plan:
         try:
@@ -873,8 +1000,13 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
         if not good:
             try: os.remove(sf)
             except OSError: pass
-            return UpscaleResult(False, rc, done + frames, segdir,
-                                 (tail or "")[-200:] or f"segment {i}: got {c} frames, wanted {n}")
+            # ffmpeg's tail explains a CRASH. After a clean exit it holds only the closing stats
+            # ("muxing overhead … frame=11899 … drop=82"), and logging that hid a wrong frame
+            # count through five 44-minute failures of the same segment.
+            got = f"{c} frames" if c >= 0 else "an unreadable file"
+            why = (f"segment {i + 1} of {nseg} came out {got}, expected {n}" if rc == 0
+                   else (tail or "")[-200:] or f"segment {i + 1} of {nseg}: ffmpeg exited {rc}")
+            return UpscaleResult(False, rc, done + frames, segdir, why)
         entries.append({"file": os.path.basename(sf), "start": a, "frames": c})
         done += c
     # All chunks present — record the order + ACTUAL frame counts for Resolve (no concat).

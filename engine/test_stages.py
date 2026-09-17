@@ -286,6 +286,53 @@ class NormalizeAudioGate(unittest.TestCase):
                 self.assertEqual(stages._read_topaz_bounds(p.source_basename), ends)   # exact cuts, ×1
 
 
+class WrongClockInputIsRebuilt(unittest.TestCase):
+    """Topaz refuses an input whose declared frame rate its frames do not run at (the
+    Sharkboy release, 2026-09-06). The stage then drops that input and every segment
+    planned on its clock, so the next pass rebuilds the CFR on the right one. Any other
+    failure leaves the files alone."""
+
+    def _run(self, error_tail):
+        import types, plan, settings, topaz
+        p = _paths(tempfile.mkdtemp())
+        for f in (p.source, p.source_cfr):
+            with open(f, "w") as fh:
+                fh.write("x")
+        os.makedirs(p.segdir, exist_ok=True)
+        with open(os.path.join(p.segdir, "seg_0000.mov"), "w") as fh:
+            fh.write("x")
+        pl = {"topaz": "upscale", "scale": 2, "res": "1080p", "fit_height": None,
+              "input": {"is_4k": False}}
+        d = tempfile.mkdtemp()
+        refused = types.SimpleNamespace(ok=False, error_tail=error_tail, frames=0)
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
+             mock.patch.object(plan, "plan_for", return_value=pl), \
+             mock.patch.object(settings, "show_topaz_params", return_value={}), \
+             mock.patch.object(settings, "show_preset_key", return_value="digital"), \
+             mock.patch.object(topaz, "total_frames", return_value=400), \
+             mock.patch.object(topaz, "upscale_resumable", return_value=refused):
+            ok, msg = stages.run_stage("topaz", p)
+        return p, ok, msg
+
+    def test_a_wrong_clock_input_is_discarded_for_a_rebuild(self):
+        import topaz
+        p, ok, msg = self._run(f"{topaz.RATE_MISMATCH} the input declares 500/21 fps "
+                               f"but its frames run at 24000/1001")
+        self.assertFalse(ok)
+        self.assertIn("500/21", msg)
+        self.assertIn("rebuilds", msg)
+        self.assertFalse(os.path.exists(p.source_cfr))
+        self.assertFalse(os.path.exists(p.segdir))
+        self.assertTrue(os.path.exists(p.source))           # the download itself is kept
+
+    def test_any_other_failure_keeps_the_input(self):
+        p, ok, msg = self._run("segment 41 of 41 came out 11899 frames, expected 12826")
+        self.assertFalse(ok)
+        self.assertIn("11899", msg)
+        self.assertTrue(os.path.exists(p.source_cfr))
+        self.assertTrue(os.path.exists(os.path.join(p.segdir, "seg_0000.mov")))
+
+
 if __name__ == "__main__":
     unittest.main()
 
