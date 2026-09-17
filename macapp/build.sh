@@ -13,7 +13,7 @@ BIN="$TMP/Visionary"
 BUNDLE_ID="${BUNDLE_ID:-com.visionary.upscaler}"
 # --release [version]: also produce a version-stamped distributable zip in dist/.
 RELEASE=0
-VERSION="${VISIONARY_VERSION:-0.4}"
+VERSION="${VISIONARY_VERSION:-0.5}"
 if [ "${1:-}" = "--release" ]; then
   RELEASE=1
   [ -n "${2:-}" ] && VERSION="$2"
