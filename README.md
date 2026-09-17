@@ -4,6 +4,11 @@
 
 **An overnight appliance that upscales your Plex library to 4K Dolby Vision — unattended.**
 
+**See it on real footage:** [download the sample stills](https://github.com/adamkbritsch/visionary/releases/download/samples-lost-s01e01/visionary-lost-s01e01-samples.zip)
+— six moments from the pilot of *Lost*, upscaled from 1080p to 4K Dolby Vision and set against the
+original as side-by-sides, zoomed crops and isolated frames. One 106 MB zip of the whole folder; the
+HDR images are AVIF and need an HDR screen to show their highlights. Or [browse them](docs/samples/lost-s01e01).
+
 Point Visionary at your TV shows, movies and YouTube channels, arm it, and walk away. It
 takes each one through Topaz Video AI, grades a **real Dolby Vision 8.1 master in DaVinci
 Resolve** — an actual per-shot DV grade, not an HDR tone-map — encodes a peak-capped x265,
