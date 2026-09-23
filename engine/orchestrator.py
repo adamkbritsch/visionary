@@ -41,6 +41,7 @@ import settings
 import eta as eta_math
 import eta_model
 import transfer
+import yield_lease
 import youtube
 
 FFPROBE = "/opt/homebrew/bin/ffprobe"
@@ -1106,6 +1107,12 @@ class Orchestrator:
         self._finish_q = queue.Queue()         # EpisodePaths handed off after their resolve completes
         self._finish_abort = threading.Event() # aborts the finisher's CURRENT stage (disable / power pause)
         self._resolve_active = threading.Event()   # run thread's Resolve is live → remux lanes HOLD/yield
+        # A sibling app (Discretion, the content filter) can ask for the machine with a TTL'd lease.
+        # Same intent as _resolve_active/_extend_active, from outside: stages yield at their next
+        # segment boundary and resume by themselves when the lease lapses. NOT persisted — a restart
+        # clears every lease, which fails OPEN, because a restart must never be how a wedge is
+        # inherited.
+        self._yield_lease = yield_lease.YieldLease()
         self._extend_active = threading.Event()    # AI outpainting is live → the machine is EXCLUSIVELY
                                                    # its own: remuxes SIGSTOPped, the finisher held at
                                                    # every stage, the prefetcher stood down
@@ -3124,7 +3131,12 @@ class Orchestrator:
             # DOWNLOAD stage yields to the run-now request ONLY (user-dictated 2026-09-05: a
             # send runs after the current segment, not the current episode) — never to the
             # remux/cadence reasons, which exist to share the GPU, not the NAS pull.
-            sp_full = lambda: (self._dual_remux_live()
+            # `_yield_lease.blocks(st)` is first because it is the cheapest and the most absolute:
+            # a sibling app holding the machine outranks every internal sharing reason. It returns
+            # False for resolve/extend/upload whatever the lease says — those stages are
+            # uninterruptible in Visionary's own deploy discipline and a lease respects the same line.
+            sp_full = lambda: (self._yield_lease.blocks(st)
+                               or self._dual_remux_live()
                                or ((self._skip_key(p) not in self._yield_block)
                                    and (self._gate_release_pending()
                                         or self._yt_priority_waiting()
@@ -3476,7 +3488,12 @@ class Orchestrator:
         would satisfy it forever and freeze the finisher permanently with nothing left to
         convert. Tying it to "Resolve actually ran in the last few minutes" covers the gaps
         BETWEEN back-to-back conversions — which is all it was ever for — and self-releases
-        the moment conversions stop happening."""
+        the moment conversions stop happening.
+
+        A sibling's yield lease is checked FIRST: a remux is an x265 encode with the whole machine's
+        worth of appetite, which is exactly what an app asking for the machine needs to stand down."""
+        if self._yield_lease.blocks("remux"):
+            return True
         if self._extend_active.is_set():
             return True                     # AI outpainting takes the machine outright — no share
         if self._resolve_active.is_set():

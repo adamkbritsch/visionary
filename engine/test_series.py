@@ -147,8 +147,15 @@ class ActiveSeries(unittest.TestCase):
         self.d = tempfile.mkdtemp()
         self.p = mock.patch.object(series, "SELECTION_FILE", os.path.join(self.d, "selection.json"))
         self.p.start()
+        # PIN THE CAP. `series.max_active()` reads the LIVE `max_active_shows` tunable out of
+        # ~/.topaz-pipeline/settings.json, so these tests were silently measuring the developer's own
+        # setting: with it at 1, "caps at three" failed with ['A'] != ['A','B','C'] and the suite had
+        # six red tests that said nothing about the code (found 2026-09-23).
+        self.cap = mock.patch.object(series, "max_active", lambda: 3)
+        self.cap.start()
 
     def tearDown(self):
+        self.cap.stop()
         self.p.stop()
 
     def test_default_empty_then_set_is_single_primary(self):
@@ -282,9 +289,13 @@ class NextUpSlot(unittest.TestCase):
         self.d = tempfile.mkdtemp()
         self.p = mock.patch.object(series, "SELECTION_FILE", os.path.join(self.d, "selection.json"))
         self.p.start()
+        # Same pin as ActiveSeries: the cap comes from a live tunable, not from the code.
+        self.cap = mock.patch.object(series, "max_active", lambda: 3)
+        self.cap.start()
         series.set_selection("A")
 
     def tearDown(self):
+        self.cap.stop()
         self.p.stop()
 
     def _queues(self, mapping):

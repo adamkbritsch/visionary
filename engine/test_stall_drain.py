@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import orchestrator as orch
+import yield_lease
 
 
 class DrainFloorInvariant(unittest.TestCase):
@@ -265,6 +266,53 @@ class DrainConvertsEverythingFirst(unittest.TestCase):
             self.assertTrue(o._resolve_should_hold())
 
 
+class SiblingYieldLease(unittest.TestCase):
+    """A sibling app (Discretion) can ask for the machine with a TTL'd lease. Same intent as the
+    Resolve and outpainting exclusivity, from outside."""
+
+    def _orch(self):
+        import threading
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._resolve_active = threading.Event()
+        o._extend_active = threading.Event()
+        o._yield_lease = yield_lease.YieldLease()
+        o._resolve_fast = False
+        o._drain_backlog = lambda: 0
+        o._last_resolve_at = 0.0
+        return o
+
+    def test_a_remux_stands_down_for_a_lease(self):
+        o = self._orch()
+        self.assertFalse(o._remux_must_wait(), "no lease, nothing to wait for")
+        o._yield_lease.take("discretion", 600, "Pass 2 on Arrival")
+        self.assertTrue(o._remux_must_wait())
+
+    def test_it_resumes_by_itself_when_the_lease_lapses(self):
+        """The safety property: a crashed sibling cannot wedge an overnight queue."""
+        clock = [1000.0]
+        o = self._orch()
+        o._yield_lease = yield_lease.YieldLease(now=lambda: clock[0])
+        o._yield_lease.take("discretion", 60)
+        self.assertTrue(o._remux_must_wait())
+        clock[0] += 61
+        self.assertFalse(o._remux_must_wait())
+
+    def test_releasing_frees_the_lane_immediately(self):
+        o = self._orch()
+        o._yield_lease.take("discretion", 3600)
+        o._yield_lease.release("discretion")
+        self.assertFalse(o._remux_must_wait())
+
+    def test_resolve_and_upload_never_stand_down_for_a_lease(self):
+        """Resolve holds the screen and cannot be paced; a half-written upload is worse than a slow
+        one. Both are already uninterruptible in the deploy discipline, and a lease respects the
+        same line."""
+        o = self._orch()
+        o._yield_lease.take("discretion", 3600)
+        for stage in ("resolve", "upload", "extend"):
+            self.assertFalse(o._yield_lease.blocks(stage), stage)
+
+
 class NoRemuxingDuringResolve(unittest.TestCase):
     """User-dictated: nothing remuxes while Resolve is working. Gating on `_resolve_active`
     alone was not enough — it goes false in the gap between two back-to-back conversions, so
@@ -275,7 +323,8 @@ class NoRemuxingDuringResolve(unittest.TestCase):
         import threading, time
         o = orch.Orchestrator.__new__(orch.Orchestrator)
         o._resolve_active = threading.Event()
-        o._extend_active = threading.Event()  # idle here — pinned in ExtendExclusivity
+        o._extend_active = threading.Event()
+        o._yield_lease = yield_lease.YieldLease()  # idle here — pinned in ExtendExclusivity
         o._resolve_fast = False               # the whole-machine case these tests pin
         if resolve_active:
             o._resolve_active.set()
@@ -465,7 +514,8 @@ class RemuxRunsDuringAnUpload(unittest.TestCase):
                    "finishing2": None}
         o._finish_q = mock.Mock(qsize=lambda: queued)
         o._resolve_active = threading.Event()
-        o._extend_active = threading.Event()   # idle here — pinned in ExtendExclusivity
+        o._extend_active = threading.Event()
+        o._yield_lease = yield_lease.YieldLease()   # idle here — pinned in ExtendExclusivity
         o._resolve_fast = False
         o._drain_backlog = lambda: backlog
         o._last_resolve_at = 0.0

@@ -34,7 +34,8 @@ import scratch          # noqa: E402
 import series           # noqa: E402
 import settings         # noqa: E402
 import transfer         # noqa: E402
-import orchestrator     # noqa: E402
+import orchestrator
+import yield_lease     # noqa: E402
 
 # The app launches us with a minimal PATH (no /opt/homebrew/bin) — augment it so the
 # selftest and every spawned subprocess (notably the resolve stage's cliclick) can
@@ -81,6 +82,9 @@ def build_state(*, power, scratch, adapter_watts, in_win,
     return {
         "automation_enabled": automation_enabled,
         "status": "disabled" if not automation_enabled else "armed",
+        # Who, if anyone, has asked for the machine from outside. Reported so an idle-looking
+        # pipeline has a visible reason rather than looking stuck.
+        "yield_lease": orchestrator.ORCH._yield_lease.state(),
         "power": {
             "external_connected": power.external_connected,
             "charging": power.is_charging,
@@ -556,6 +560,33 @@ def api_youtube_queue(body):
     out = {"youtube": youtube.queue_view(), "up_next": up_next(current=orchestrator.ORCH.snapshot().get("current"), inflight=orchestrator.ORCH.finisher_views())}
     if imported is not None:
         out["import"] = imported
+    return out
+
+
+def api_yield(body):
+    """POST /api/yield — a sibling app asks for the machine, with a TTL.
+
+    Discretion (the content filter) needs the whole machine for a scan or a masked render, the same
+    way Resolve and outpainting stages do. It asks here rather than by pausing automation, because
+    pausing is a state a human has to undo and this is a state that undoes itself.
+
+    The TTL is the safety property: a crashed or force-quit sibling can never wedge the overnight
+    queue, and the worst case is that Visionary idles for the remainder of one lease. See
+    engine/yield_lease.py for why it is not persisted."""
+    lease = orchestrator.ORCH._yield_lease
+    holder = (body.get("holder") or "").strip()
+    if body.get("release"):
+        ok, detail = lease.release(holder or None)
+    else:
+        ok, detail = lease.take(holder, body.get("seconds", yield_lease.DEFAULT_SECONDS),
+                                body.get("reason") or "")
+    out = {"ok": bool(ok), "detail": detail, "lease": lease.state()}
+    # The protected stages are reported so a caller knows a granted lease is not yet in force when
+    # one of them is running, rather than discovering it by watching the CPU.
+    cur = (orchestrator.ORCH.snapshot().get("current") or {})
+    out["current_stage"] = cur.get("stage")
+    out["effective_now"] = bool(ok and not body.get("release")
+                                and cur.get("stage") not in yield_lease.PROTECTED_STAGES)
     return out
 
 
@@ -1581,6 +1612,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_select(name, action, index))
         elif path == "/api/mode":
             self._json(api_mode((body.get("mode") or "tv").strip()))
+        elif path == "/api/yield":
+            self._json(api_yield(body or {}))
         elif path == "/api/movie-queue":
             self._json(api_movie_queue(body or {}))
         elif path == "/api/companion":
