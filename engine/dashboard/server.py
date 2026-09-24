@@ -576,7 +576,10 @@ def api_yield(body):
     lease = orchestrator.ORCH._yield_lease
     holder = (body.get("holder") or "").strip()
     if body.get("release"):
-        ok, detail = lease.release(holder or None)
+        # `id` is optional and SCOPES the release to the lease that was granted: a release that
+        # arrives late, from a pass whose lease already lapsed or from before a restart, must not
+        # free whatever holds the machine now. A caller that sends no id keeps the old behaviour.
+        ok, detail = lease.release(holder or None, lease_id=(body.get("id") or None))
     else:
         ok, detail = lease.take(holder, body.get("seconds", yield_lease.DEFAULT_SECONDS),
                                 body.get("reason") or "")

@@ -1059,3 +1059,66 @@ class DroppingAPlaylistSweepsItsFiles(unittest.TestCase):
                                side_effect=lambda vids=None, dry_run=False: {"dry_run": dry_run}):
             self.assertEqual(server.api_youtube_queue({"action": "sweep", "dry_run": True}),
                              {"dry_run": True})
+
+
+class YieldEndpoint(unittest.TestCase):
+    """POST /api/yield. Discretion depends on this response shape, so the id is ADDED beside the
+    existing fields, never in place of one. The id is what lets a holder notice its lease is gone:
+    this process is the only place a lease lives, so a deploy, a quit or a relaunch drops it."""
+
+    def _lease(self, stage="topaz"):
+        import orchestrator as _orch
+        import yield_lease
+        return (mock.patch.object(_orch.ORCH, "_yield_lease", yield_lease.YieldLease()),
+                mock.patch.object(_orch.ORCH, "snapshot",
+                                  return_value={"current": {"stage": stage}}))
+
+    def test_a_granted_lease_comes_back_with_an_id(self):
+        pl, ps = self._lease()
+        with pl, ps:
+            out = server.api_yield({"holder": "discretion", "seconds": 600, "reason": "Pass 2"})
+            self.assertTrue(out["ok"])
+            self.assertTrue(out["lease"]["id"])
+            self.assertTrue(out["effective_now"])
+            # the same id is what /api/state reports, so a holder can check it any time
+            self.assertEqual(server.build_state(
+                power=PowerReading(True, False, 100, 0), scratch=SCRATCH, adapter_watts=140,
+                in_win=True, automation_enabled=True)["yield_lease"]["id"], out["lease"]["id"])
+
+    def test_renewing_keeps_the_id_and_a_retake_after_release_changes_it(self):
+        pl, ps = self._lease()
+        with pl, ps:
+            first = server.api_yield({"holder": "discretion", "seconds": 600})["lease"]["id"]
+            self.assertEqual(server.api_yield({"holder": "discretion", "seconds": 600})["lease"]["id"],
+                             first)
+            server.api_yield({"holder": "discretion", "release": True})
+            self.assertNotEqual(server.api_yield({"holder": "discretion", "seconds": 600})["lease"]["id"],
+                                first)
+
+    def test_a_release_carrying_a_stale_id_is_refused(self):
+        pl, ps = self._lease()
+        with pl, ps:
+            stale = server.api_yield({"holder": "discretion", "seconds": 600})["lease"]["id"]
+            server.api_yield({"holder": "discretion", "release": True})
+            live = server.api_yield({"holder": "discretion", "seconds": 600})["lease"]["id"]
+            out = server.api_yield({"holder": "discretion", "release": True, "id": stale})
+            self.assertFalse(out["ok"])
+            self.assertEqual(out["lease"]["id"], live)      # the live lease still holds the machine
+            self.assertTrue(out["lease"]["held"])
+
+    def test_an_id_less_release_still_works(self):
+        pl, ps = self._lease()
+        with pl, ps:
+            server.api_yield({"holder": "discretion", "seconds": 600})
+            out = server.api_yield({"holder": "discretion", "release": True})
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["lease"]["held"])
+            self.assertIsNone(out["lease"]["id"])
+
+    def test_a_lease_granted_during_a_protected_stage_says_it_is_not_in_force_yet(self):
+        pl, ps = self._lease(stage="resolve")
+        with pl, ps:
+            out = server.api_yield({"holder": "discretion", "seconds": 600})
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["effective_now"])
+            self.assertEqual(out["current_stage"], "resolve")

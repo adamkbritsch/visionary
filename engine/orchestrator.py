@@ -1111,8 +1111,11 @@ class Orchestrator:
         # Same intent as _resolve_active/_extend_active, from outside: stages yield at their next
         # segment boundary and resume by themselves when the lease lapses. NOT persisted — a restart
         # clears every lease, which fails OPEN, because a restart must never be how a wedge is
-        # inherited.
-        self._yield_lease = yield_lease.YieldLease()
+        # inherited. Every transition is LOGGED: a lease that vanishes is otherwise unattributable
+        # after the fact (2026-09-23, twice: a sibling read back not-held within a minute of a
+        # successful take and nothing on either side had recorded a restart, a release or an expiry).
+        self._yield_lease = yield_lease.YieldLease(
+            on_change=lambda msg: logbook.event("yield lease: " + msg))
         self._extend_active = threading.Event()    # AI outpainting is live → the machine is EXCLUSIVELY
                                                    # its own: remuxes SIGSTOPped, the finisher held at
                                                    # every stage, the prefetcher stood down

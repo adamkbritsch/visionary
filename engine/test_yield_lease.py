@@ -147,5 +147,125 @@ class StateTests(unittest.TestCase):
         self.assertFalse(yield_lease.YieldLease().state()["held"])
 
 
+class LeaseIdentityTests(unittest.TestCase):
+    """A holder cannot tell "my lease lapsed" from "I never had one" unless the lease has a name.
+
+    The lease lives only in the server process, and the process is replaced by every deploy, quit
+    or relaunch: twice on 2026-09-23 a sibling read back not-held within a minute of a successful
+    take, and nothing on either side recorded which of those it was. An id makes the loss visible
+    to the holder, whatever caused it: a restart, an expiry, a release, or a takeover."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.lease = yield_lease.YieldLease(now=self.clock)
+
+    def test_a_held_lease_has_an_id(self):
+        self.lease.take("discretion", 600)
+        self.assertTrue(self.lease.state()["id"])
+
+    def test_extending_keeps_the_same_id(self):
+        self.lease.take("discretion", 600)
+        first = self.lease.state()["id"]
+        self.clock.t += 60
+        self.lease.take("discretion", 600)
+        self.assertEqual(self.lease.state()["id"], first)   # one lease, renewed — not a new one
+
+    def test_a_retake_after_a_lapse_gets_a_different_id(self):
+        self.lease.take("discretion", 60)
+        first = self.lease.state()["id"]
+        self.clock.t += 61
+        self.lease.take("discretion", 60)
+        self.assertNotEqual(self.lease.state()["id"], first)
+
+    def test_a_free_lease_has_no_id(self):
+        self.assertIsNone(self.lease.state()["id"])
+        self.lease.take("discretion", 60)
+        self.clock.t += 61
+        self.assertIsNone(self.lease.state()["id"])         # lapsed → the holder's id is stale
+
+    def test_a_fresh_process_cannot_reissue_an_id(self):
+        """A restart is exactly the case the id exists for, so two lives must not collide."""
+        a = yield_lease.YieldLease(now=Clock())
+        b = yield_lease.YieldLease(now=Clock())
+        a.take("discretion", 600)
+        b.take("discretion", 600)
+        self.assertNotEqual(a.state()["id"], b.state()["id"])
+
+    def test_a_stale_id_cannot_release_a_newer_lease(self):
+        """A late release from a pass that predates a restart must not free the lease that replaced it."""
+        self.lease.take("discretion", 60)
+        stale = self.lease.state()["id"]
+        self.clock.t += 61
+        self.lease.take("discretion", 600)                  # a new lease, same holder
+        ok, detail = self.lease.release("discretion", lease_id=stale)
+        self.assertFalse(ok)
+        self.assertIn("another lease", detail)
+        self.assertTrue(self.lease.active())
+
+    def test_the_matching_id_releases(self):
+        self.lease.take("discretion", 600)
+        ok, _d = self.lease.release("discretion", lease_id=self.lease.state()["id"])
+        self.assertTrue(ok)
+        self.assertFalse(self.lease.active())
+
+    def test_a_release_without_an_id_still_works(self):
+        """Discretion's current client sends no id, and an operator escape sends no holder either."""
+        self.lease.take("discretion", 600)
+        self.assertTrue(self.lease.release("discretion")[0])
+        self.lease.take("discretion", 600)
+        self.assertTrue(self.lease.release()[0])
+
+
+class TransitionLogTests(unittest.TestCase):
+    """Every lease transition is reported, because the two sightings on 2026-09-23 could not be
+    attributed afterwards: Visionary recorded nothing and the sibling's own events are in memory."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.seen = []
+        self.lease = yield_lease.YieldLease(now=self.clock, on_change=self.seen.append)
+
+    def test_a_take_an_extension_and_a_release_are_each_reported(self):
+        self.lease.take("discretion", 600, "Pass 2 on Arrival")
+        self.lease.take("discretion", 600)
+        self.lease.release("discretion")
+        self.assertEqual(len(self.seen), 3)
+        self.assertIn("discretion", self.seen[0])
+        self.assertIn("Pass 2 on Arrival", self.seen[0])
+        self.assertIn("extended", self.seen[1])
+        self.assertIn("released", self.seen[2])
+
+    def test_an_expiry_is_reported_once_however_often_it_is_read(self):
+        self.lease.take("discretion", 60)
+        self.clock.t += 61
+        for _ in range(5):
+            self.lease.active()
+            self.lease.state()
+            self.lease.blocks("topaz")
+        self.assertEqual(len([m for m in self.seen if "expired" in m]), 1)
+
+    def test_whichever_read_notices_the_expiry_first_reports_it(self):
+        for read in (lambda l: l.active(), lambda l: l.state(), lambda l: l.blocks("remux")):
+            seen = []
+            lease = yield_lease.YieldLease(now=Clock(), on_change=seen.append)
+            lease.take("discretion", 60)
+            lease._now = Clock(1061.0)
+            read(lease)
+            self.assertEqual(len([m for m in seen if "expired" in m]), 1, read)
+
+    def test_a_refusal_is_reported_so_a_fight_over_the_machine_is_visible(self):
+        self.lease.take("discretion", 600)
+        self.lease.take("someone-else", 600)
+        self.assertTrue(any("refused" in m for m in self.seen))
+
+    def test_a_reporting_callback_that_raises_never_breaks_the_lease(self):
+        def boom(_m):
+            raise RuntimeError("the log is not the point")
+        lease = yield_lease.YieldLease(now=Clock(), on_change=boom)
+        self.assertTrue(lease.take("discretion", 600)[0])
+        self.assertTrue(lease.active())
+        self.assertTrue(lease.release("discretion")[0])
+
+
 if __name__ == "__main__":
     unittest.main()

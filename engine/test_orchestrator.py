@@ -619,6 +619,22 @@ class MovieScheduling(unittest.TestCase):
             self.assertEqual(b._tv_since_yt, 2)
 
 
+class LeaseTransitionsReachTheLog(unittest.TestCase):
+    """A lease that vanishes must leave a record. On 2026-09-23 a sibling twice read back not-held
+    within a minute of a successful take, and nothing on either side had logged a take, a release,
+    an expiry or the two server restarts that evening — so it could not be attributed afterwards."""
+
+    def test_the_orchestrators_lease_reports_into_the_log(self):
+        import logbook
+        self.assertIsNotNone(orch.ORCH._yield_lease._on_change,
+                             "the singleton's lease must report transitions, not just hold them")
+        with mock.patch.object(logbook, "event") as ev:
+            orch.ORCH._yield_lease._report("discretion took the machine for 600s")
+        ev.assert_called_once()
+        self.assertIn("yield lease:", ev.call_args.args[0])
+        self.assertIn("discretion", ev.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main()
 
