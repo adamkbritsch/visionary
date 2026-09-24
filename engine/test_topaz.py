@@ -507,6 +507,135 @@ class TheCapIsReportedNotLogged(unittest.TestCase):
                                          capped_secs=8298.667).capped_secs, 8298.667)
 
 
+class ResolveHostableRate(unittest.TestCase):
+    """Resolve can only put a timeline on the rates it knows. A CFR at any other rate is dead on
+    arrival: `proj.SetSetting("timelineFrameRate", "23")` is ignored, the timeline stays 23.976,
+    and resolve_pipeline's conform guard refuses to render it — five times a day, for as long as
+    the video sits in the queue (live: Rhett & Link's "Christmas Face", a genuine 23.000 fps
+    upload, from 2026-09-14 to 2026-09-24). Frames are DUPLICATED up to the next rate Resolve
+    knows, never dropped down to it: duplication keeps every frame of the source and its running
+    time, and a drop would throw picture away to save a file we re-encode anyway."""
+
+    def test_a_rate_resolve_knows_is_left_exactly_as_it_is(self):
+        for rate in ("24000/1001", "24/1", "25/1", "30000/1001", "30/1", "60/1", "120000/1001"):
+            self.assertEqual(topaz.resolve_hostable_rate(rate), rate)
+
+    def test_the_christmas_face_rate_goes_up_to_the_next_one_resolve_knows(self):
+        self.assertEqual(topaz.resolve_hostable_rate("23/1"), "24000/1001")
+
+    def test_it_never_rounds_down_and_throws_frames_away(self):
+        self.assertEqual(topaz.resolve_hostable_rate("55/1"), "60000/1001")   # up to 59.94, not 50
+        self.assertEqual(topaz.resolve_hostable_rate("10/1"), "16/1")
+        self.assertEqual(topaz.resolve_hostable_rate("26/1"), "30000/1001")
+
+    def test_another_spelling_of_a_rate_resolve_knows_is_not_re_encoded_over(self):
+        self.assertEqual(topaz.resolve_hostable_rate("2997/125"), "2997/125")   # 23.976 to 6 places
+
+    def test_an_absurd_rate_clamps_to_the_highest_resolve_knows(self):
+        self.assertEqual(topaz.resolve_hostable_rate("240/1"), "120/1")
+
+    def test_an_unreadable_rate_is_left_alone(self):
+        self.assertIsNone(topaz.resolve_hostable_rate(None))
+        self.assertEqual(topaz.resolve_hostable_rate("0/0"), "0/0")
+
+
+class TimestampHoles(unittest.TestCase):
+    """A CFR that SKIPS frame slots advertises more running time than it has pictures, so every
+    reader that measures by duration (Resolve, sizing its timeline) disagrees with every reader
+    that counts frames (our own gates), and the item can never pass. Live 2026-09-24: the
+    hardware encoder dropped 4 frames 39 minutes into a 2-hour interview and left the gap in the
+    timestamps; Resolve built a 171,235-frame timeline for 171,230 frames and refused it on
+    every attempt. The same stretch re-encoded clean, so the drop was a hiccup, not the file."""
+
+    def _holes(self, pts_ticks, rate="24000/1001", time_base="1/24000"):
+        js = json.dumps({"streams": [{"time_base": time_base, "r_frame_rate": rate}]})
+        packets = "\n".join(str(p) for p in pts_ticks)
+        def fake(argv, **kw):
+            if "packet=pts" in argv:
+                return mock.Mock(stdout=packets + "\n")
+            return mock.Mock(stdout=js)
+        with mock.patch.object(topaz.subprocess, "run", side_effect=fake):
+            return topaz.timestamp_holes("/cfr.mp4")
+
+    def test_a_continuous_file_has_none(self):
+        self.assertEqual(self._holes([0, 1001, 2002, 3003, 4004]), 0)
+
+    def test_a_skipped_slot_is_counted(self):
+        self.assertEqual(self._holes([0, 1001, 3003, 4004]), 1)            # 2002 missing
+
+    def test_the_afroman_shape_counts_every_missing_slot(self):
+        # one gap of a frame and one of three, exactly what the live file had
+        self.assertEqual(self._holes([0, 1001, 3003, 7007, 8008]), 4)
+
+    def test_an_unreadable_file_says_it_cannot_tell(self):
+        with mock.patch.object(topaz.subprocess, "run", side_effect=OSError("no ffprobe")):
+            self.assertEqual(topaz.timestamp_holes("/cfr.mp4"), -1)
+
+    def test_a_file_with_one_frame_cannot_have_a_hole(self):
+        self.assertEqual(self._holes([0]), 0)
+
+
+class TheCfrMustBeSomethingResolveCanHost(unittest.TestCase):
+    """to_cfr's output is what Resolve imports, so both rules live here."""
+
+    def _run(self, *, already_cfr, rate, holes, copy_only=False):
+        captured = {}
+        def fake_run(cmd, env, *, abort=None, on_progress=None):
+            captured["cmd"] = cmd
+            return (0, 100, False, "")
+        removed = []
+        with mock.patch.object(topaz, "declared_rate_mismatch", return_value=None), \
+             mock.patch.object(topaz, "_fps_fraction", return_value=rate), \
+             mock.patch.object(topaz, "_is_already_cfr", return_value=already_cfr), \
+             mock.patch.object(topaz, "cfr_duration_cap", return_value=None), \
+             mock.patch.object(topaz, "_cfr_pix_fmt", return_value="yuv420p"), \
+             mock.patch.object(topaz, "_cfr_height", return_value=1080), \
+             mock.patch.object(topaz, "source_color", return_value=None), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "_frame_count", return_value=100), \
+             mock.patch.object(topaz, "timestamp_holes", return_value=holes), \
+             mock.patch.object(topaz.os.path, "exists", return_value=True), \
+             mock.patch.object(topaz.os, "remove", side_effect=removed.append), \
+             mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run):
+            res = topaz.to_cfr("/in.mp4", "/out.mp4", copy_only=copy_only)
+        return captured.get("cmd", []), res, removed
+
+    def test_a_rate_resolve_cannot_host_is_re_encoded_at_one_it_can(self):
+        cmd, res, _ = self._run(already_cfr=True, rate="23/1", holes=0)
+        self.assertIn("libx264", cmd)                       # a COPY could not change the rate
+        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
+        self.assertEqual(res.rate, "24000/1001")
+
+    def test_even_a_fast_path_copy_gives_way_to_a_hostable_rate(self):
+        cmd, _res, _ = self._run(already_cfr=False, rate="23/1", holes=0, copy_only=True)
+        self.assertIn("libx264", cmd)
+        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
+
+    def test_a_hostable_rate_still_copies(self):
+        cmd, res, _ = self._run(already_cfr=True, rate="24000/1001", holes=0)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+        self.assertEqual(res.rate, "24000/1001")
+
+    def test_a_holed_cfr_is_thrown_away_so_the_next_attempt_redoes_it(self):
+        _cmd, res, removed = self._run(already_cfr=False, rate="24000/1001", holes=4)
+        self.assertFalse(res.ok)
+        self.assertIn("4", res.error_tail)
+        self.assertIn("short", res.error_tail)
+        self.assertEqual(removed, ["/out.mp4"])             # never left to be reused as ready
+
+    def test_a_copy_is_not_judged_on_holes(self):
+        """Deliberate boundary: a copy's gaps come from the source, so copying again would only
+        reproduce them. Filling a gap is what the re-encode's `-fps_mode cfr` does."""
+        _cmd, res, removed = self._run(already_cfr=True, rate="24000/1001", holes=4)
+        self.assertTrue(res.ok)
+        self.assertEqual(removed, [])
+
+    def test_an_unreadable_hole_count_is_not_treated_as_a_fault(self):
+        _cmd, res, removed = self._run(already_cfr=False, rate="24000/1001", holes=-1)
+        self.assertTrue(res.ok)
+        self.assertEqual(removed, [])
+
+
 class DeclaredRateMismatch(unittest.TestCase):
     """The Adventures of Sharkboy and Lavagirl (EDGE2020) declares 500/21 fps, a DefaultDuration
     rounded to 42 ms, over 133,624 frames that run at 24000/1001. The CFR pass stream-copied the
@@ -608,9 +737,9 @@ class NoWrongDeclaredRateReachesTheCfr(unittest.TestCase):
                                side_effect=AssertionError("checked twice")):
             self.assertTrue(topaz._is_already_cfr("x.mkv", check_rate=False))
 
-    def _to_cfr(self, *, lie, copy_only=False, already=False):
+    def _to_cfr(self, *, lie, copy_only=False, already=False, declared="500/21"):
         with mock.patch.object(topaz, "declared_rate_mismatch", return_value=lie), \
-             mock.patch.object(topaz, "_fps_fraction", return_value="500/21"), \
+             mock.patch.object(topaz, "_fps_fraction", return_value=declared), \
              mock.patch.object(topaz, "_is_already_cfr", return_value=already), \
              mock.patch.object(topaz, "cfr_duration_cap", return_value=None) as cap, \
              mock.patch.object(topaz, "_cfr_pix_fmt", return_value="yuv420p10le"), \
@@ -636,10 +765,18 @@ class NoWrongDeclaredRateReachesTheCfr(unittest.TestCase):
         self.assertLess(cmd.index("-r"), cmd.index("/out.mkv"))
 
     def test_an_honest_copy_declares_nothing_new(self):
-        cmd, r, _ = self._to_cfr(lie=None, already=True)
+        # a rate Resolve can host, so nothing has to be re-timed and the copy stands
+        cmd, r, _ = self._to_cfr(lie=None, already=True, declared="24000/1001")
         self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
         self.assertNotIn("-r", cmd)
-        self.assertEqual(r.rate, "500/21")
+        self.assertEqual(r.rate, "24000/1001")
+
+    def test_an_honest_but_unhostable_rate_is_re_timed_rather_than_copied(self):
+        """500/21 is what the Sharkboy release DECLARED, and Resolve cannot host it either. A
+        source whose frames genuinely run at it has to be re-timed, copy or no copy."""
+        cmd, r, _ = self._to_cfr(lie=None, already=True, declared="500/21")
+        self.assertIn("libx264", cmd)
+        self.assertEqual(r.rate, "24000/1001")
 
 
 class ResumableRefusesAWrongClock(unittest.TestCase):

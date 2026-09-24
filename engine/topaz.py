@@ -558,6 +558,82 @@ def declared_rate_mismatch(path, ffprobe=FFPROBE_HB, *, frames=None):
     return (declared_s, f"{actual.numerator}/{actual.denominator}")
 
 
+# ---- what DaVinci Resolve can actually host ------------------------------------------------
+# Resolve puts a timeline on a fixed set of rates. Ask for one it does not know and the setting
+# is IGNORED — `proj.SetSetting("timelineFrameRate", "23")` leaves the project at 23.976 — so
+# resolve_pipeline's conform guard refuses to render, correctly, because a conform would drop or
+# duplicate frames behind our back. The CFR is the file Resolve imports, so the constraint
+# belongs here: a source at a rate Resolve cannot host is RE-TIMED on the way in. Live: Rhett &
+# Link's "Christmas Face" is a genuine 23.000 fps upload, and from 2026-09-14 to 2026-09-24 it
+# failed Resolve five times a day, every day, with nothing to show for it.
+RESOLVE_TIMELINE_RATES = ("16/1", "18/1", "24000/1001", "24/1", "25/1", "30000/1001", "30/1",
+                          "48000/1001", "48/1", "50/1", "60000/1001", "60/1", "72/1",
+                          "96000/1001", "96/1", "100/1", "120000/1001", "120/1")
+HOSTABLE_RATE_TOLERANCE = 1e-4   # 2997/125 IS Resolve's 23.976 — do not re-encode over a rounding
+
+
+def resolve_hostable_rate(rate):
+    """The rate to encode at so Resolve can host the result: `rate` itself when Resolve knows it,
+    otherwise the next one UP.
+
+    Up, never down: duplicating frames to reach a hostable rate keeps every picture in the source
+    and its running time, while rounding down would throw pictures away to shrink a file that is a
+    temporary intermediate anyway. Beyond the top of the list it clamps. An unreadable rate is
+    returned untouched — the caller's existing behaviour, which is to let ffmpeg decide."""
+    from fractions import Fraction
+    if not rate:
+        return rate
+    try:
+        want = Fraction(rate)
+    except (ValueError, ZeroDivisionError):
+        return rate
+    if want <= 0:
+        return rate
+    known = sorted(Fraction(r) for r in RESOLVE_TIMELINE_RATES)
+    for r in known:
+        if abs(float(want) / float(r) - 1) <= HOSTABLE_RATE_TOLERANCE:
+            return rate                      # already one of Resolve's, however it is spelled
+    for r in known:
+        if r > want:
+            return "%d/%d" % (r.numerator, r.denominator)
+    top = known[-1]
+    return "%d/%d" % (top.numerator, top.denominator)
+
+
+def timestamp_holes(path, ffprobe=FFPROBE_HB) -> int:
+    """How many frame slots `path`'s own video timestamps SKIP — the number of frames it is short
+    of the running time it advertises. 0 for a sound CFR, -1 when it cannot be read.
+
+    A constant-rate file is supposed to have one picture per slot. When it does not, every reader
+    that measures by DURATION (Resolve, sizing a timeline) disagrees with every reader that counts
+    FRAMES (our own gates), and the item can never satisfy both. Live 2026-09-24: hevc_videotoolbox
+    dropped 4 frames 39 minutes into a 2-hour interview and left the gap in the timestamps, so
+    Resolve built a 171,235-frame timeline for a 171,230-frame file and refused it on every
+    attempt, for two days. The same stretch re-encoded clean — a hiccup under load, not the file.
+    Reads the packet INDEX only, no decode: measured at ~0.2 s/GB on that 71 GB CFR."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=time_base,r_frame_rate", "-of", "json", path],
+                             capture_output=True, text=True, timeout=60).stdout
+        st = (json.loads(out).get("streams") or [{}])[0]
+        fps, tb = _frac(st.get("r_frame_rate")), _frac(st.get("time_base"))
+        if not fps or not tb:
+            return -1
+        period = (fps[1] * tb[1]) / float(fps[0] * tb[0])     # one frame, in timebase ticks
+        if period <= 0:
+            return -1
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "packet=pts", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=1800).stdout
+    except Exception:
+        return -1
+    pts = sorted(int(v) for v in out.replace(",", " ").split() if v.lstrip("-").isdigit())
+    if len(pts) < 2:
+        return 0                                  # nothing to be discontinuous with
+    slots = int(round((pts[-1] - pts[0]) / period)) + 1
+    return max(0, slots - len(pts))
+
+
 def _is_already_cfr(path, ffprobe=FFPROBE_HB, *, check_rate=True) -> bool:
     """The source is ALREADY constant frame rate at a 4:2:0 pixel format AND its container
     timebase can represent that rate EXACTLY → the CFR step can stream-COPY the video instead
@@ -652,10 +728,15 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     24000/1001 frames drops 1 in 144 to hold the wrong clock. A copy keeps its packets and
     declares the right rate over them, because Resolve imports this file for every item."""
     lie = declared_rate_mismatch(source)
-    rate = lie[1] if lie else _fps_fraction(source)
-    cap = cfr_duration_cap(source, rate=rate)   # see CFR_TAIL_SLOP_SECS — a container longer
-                                                # than its own picture becomes Resolve's timeline
-    if copy_only or (not lie and _is_already_cfr(source, check_rate=False)):
+    true_rate = lie[1] if lie else _fps_fraction(source)
+    # Resolve can only host the rates it knows (resolve_hostable_rate), and re-timing is not
+    # something a stream copy can do — so a source at any other rate is re-encoded, fast path or not.
+    rate = resolve_hostable_rate(true_rate)
+    retime = bool(rate and true_rate and rate != true_rate)
+    cap = cfr_duration_cap(source, rate=true_rate)   # see CFR_TAIL_SLOP_SECS — a container longer
+                                                     # than its own picture becomes Resolve's timeline
+    copied = (copy_only or (not lie and _is_already_cfr(source, check_rate=False))) and not retime
+    if copied:
         cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio,
                                      duration_cap=cap, rate=(rate if lie else None))
     else:
@@ -670,6 +751,17 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     # isn't logged as "CFR convert failed" (with x264's close-stats masking the real cause).
     aborted = aborted or (rc is not None and rc < 0)
     ok = (rc == 0 and not aborted and is_cfr_ready(dst))
+    # A re-encode that SKIPPED slots is not a constant-rate file, whatever its frame count says
+    # (timestamp_holes): Resolve sizes a timeline by duration and refuses it against our own
+    # frame count, for as long as the item is in the queue. The drop is a hiccup under load, so
+    # throwing the file away is enough — the next attempt redoes it. Only the RE-ENCODE is judged
+    # this way: a copy's gaps come from the source, copying again would reproduce them, and it is
+    # `-fps_mode cfr` that fills a gap in the first place.
+    holes = timestamp_holes(dst) if (ok and not copied) else 0
+    if holes > 0:
+        ok = False
+        tail = ("the CFR came out %d frame(s) short of the running time it advertises — "
+                "the encoder dropped them" % holes)
     if not ok and os.path.exists(dst):
         try: os.remove(dst)
         except OSError: pass
