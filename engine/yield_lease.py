@@ -116,16 +116,21 @@ class YieldLease(object):
                 extending = self._holder == holder
                 self._holder = holder
                 self._reason = str(reason or "")
-                self._expires = now + seconds
+                # A renewal only ever moves the expiry LATER. One holder can be several tasks —
+                # Discretion runs them all as `discretion` — and a short take from one of them
+                # must not cut another's hold short: live 2026-09-24, a 900 s "Pass 1 on a.mkv"
+                # trimmed a 3600 s detection lease two minutes after it was granted.
+                asked = now + seconds
+                self._expires = max(self._expires, asked) if extending else asked
                 if not extending:
                     # A NEW lease, so a new id: the holder of the old one must not think it still
                     # has this one. An extension deliberately keeps its id — it is one lease.
                     self._id = uuid.uuid4().hex
                     self._taken_at = now
-                detail = ("extended to %d second(s)" if extending else "held for %d second(s)") \
-                    % int(seconds)
-                note = ("%s %s%s" % (holder, "extended its lease to %ds" % int(seconds) if extending
-                                     else "took the machine for %ds" % int(seconds),
+                left = int(self._expires - now)
+                detail = ("extended to %d second(s)" if extending else "held for %d second(s)") % left
+                note = ("%s %s%s" % (holder, "extended its lease to %ds" % left if extending
+                                     else "took the machine for %ds" % left,
                                      (" (%s)" % self._reason) if self._reason else ""))
                 ok = True
         self._report(lapsed)

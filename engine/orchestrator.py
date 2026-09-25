@@ -55,6 +55,9 @@ RUN_STAGES = ["download", "extend", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
 PLEX_COLLECTION_SYNC_DELAY = 90   # let Plex's scan create the item before tagging it
 YIELD_LIVELOCK_LIMIT = 3      # yields in a row with nothing else running -> the reason can't be met
+LEASE_POLL_SECONDS = 10       # while a sibling holds the machine, how often the run thread re-checks.
+                              # It used to re-select the held item ~45x a MINUTE, starting a stage that
+                              # yielded at its first boundary every time (2026-09-24: 662 of them)
 FINISHER_LANES = 2           # DEFAULT max concurrent remuxes ('finisher_lanes' setting — read via
                              # _finisher_lanes()). The 2nd lane runs whenever >=2 topaz-done items need
                              # finishing at once (an item queued behind a busy lane 1 — a re-picked movie
@@ -3074,6 +3077,16 @@ class Orchestrator:
                 return
             if st == "resolve" and self._quiet_mode():     # flipped OFF in the instant the gate cleared —
                 self._defer_resolve(p, ep_disp); return    # never launch Resolve with Screen Control off
+            # A SIBLING HOLDS THE MACHINE: do not start a stage at all. Checking only inside the
+            # stage means it starts, yields at its first boundary, is re-selected and starts again
+            # (see _lease_hold). Nothing has begun at this point — no flags set, no elapsed clock
+            # started, nothing to unwind — so a plain hold-and-poll is the whole of it.
+            held = self._lease_hold(st)
+            if held:
+                self.state["current"] = None
+                self._hold("yield-lease", f"{ep_disp}: {st} waits — {held}")
+                self._sleep(LEASE_POLL_SECONDS)
+                return
             self.state.update(stage=st, message=f"{ep_disp}: {st}", progress=None, hold=None)
             self._reclaim_for_pipeline()   # pipeline > queue: purge the prefetch buffer if raw free is
                                            # low, so this stage's write can't be starved/truncated
@@ -3191,6 +3204,17 @@ class Orchestrator:
                 # return without a fail count — the run loop's dual gate holds this item until a
                 # lane frees, then it's re-selected and topaz resumes from its completed segments.
                 if str(msg).startswith("paused:"):
+                    # A LEASE is an EXTERNAL reason with a clock of its own: it clears whether or
+                    # not this item ever runs, so the livelock guard below must not count it —
+                    # there is nothing for this item to win by "keeping the machine", and the
+                    # lease is not one of the reasons that guard can suppress anyway.
+                    held = self._lease_hold(st)
+                    if held:
+                        self.state["current"] = None
+                        self._hold("yield-lease",
+                                   f"{ep_disp}: {st} paused at a segment boundary — {held}")
+                        self._sleep(LEASE_POLL_SECONDS)
+                        return
                     # LIVELOCK GUARD. A yield is only worth anything if something else then
                     # runs. If this same item keeps being re-selected and re-yielding with no
                     # stage completing in between, the reason cannot be satisfied — stop
@@ -3466,6 +3490,20 @@ class Orchestrator:
             return max(0, min(2, int(settings.get_settings().get("resolve_share_remuxes", 0))))
         except Exception:
             return 0
+
+    def _lease_hold(self, st):
+        """Why this stage must not START while a sibling app holds the machine, or None.
+
+        The in-stage yield (`sp_full`) is what stops work ALREADY running, at its next safe
+        boundary. This is the other half: a stage that starts anyway pauses at its first boundary
+        and is re-selected at once, which on 2026-09-24 spun 662 times in 14 minutes and wrote
+        1,324 log lines with no work done in between. Returns None for resolve/extend/upload —
+        a lease respects the same uninterruptible line the deploy discipline does."""
+        if not self._yield_lease.blocks(st):
+            return None
+        s = self._yield_lease.state()
+        return "%s has the machine for another %ds" % (s.get("holder") or "a sibling app",
+                                                       int(s.get("seconds_left") or 0))
 
     def _remux_must_wait(self, lane: int = 1) -> bool:
         """Should a remux lane stand down? True while Resolve is actually running, AND for

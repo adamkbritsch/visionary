@@ -313,6 +313,53 @@ class SiblingYieldLease(unittest.TestCase):
             self.assertFalse(o._yield_lease.blocks(stage), stage)
 
 
+class ALeaseStopsWorkStarting(unittest.TestCase):
+    """A lease has to be checked BEFORE a stage starts, not only inside it. The in-stage yield
+    stops an encode already running at its next safe boundary — but a stage that STARTS and then
+    yields is re-selected immediately, and on 2026-09-24 one lease produced 662 re-selections and
+    1,324 log lines in 14 minutes with no work done in between."""
+
+    def _orch(self):
+        import threading
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._yield_lease = yield_lease.YieldLease()
+        return o
+
+    def test_no_lease_holds_nothing(self):
+        self.assertIsNone(self._orch()._lease_hold("topaz"))
+
+    def test_a_live_lease_names_the_holder_and_the_wait(self):
+        o = self._orch()
+        clock = [1000.0]
+        o._yield_lease = yield_lease.YieldLease(now=lambda: clock[0])
+        o._yield_lease.take("discretion", 600, "Pass 2 on Arrival")
+        clock[0] += 60
+        held = o._lease_hold("topaz")
+        self.assertIn("discretion", held)
+        self.assertIn("540", held)
+
+    def test_the_uninterruptible_stages_are_never_held(self):
+        o = self._orch()
+        o._yield_lease.take("discretion", 600)
+        for stage in ("resolve", "upload", "extend"):
+            self.assertIsNone(o._lease_hold(stage), stage)
+
+    def test_the_run_loop_asks_before_it_starts_the_stage(self):
+        import inspect
+        src = inspect.getsource(orch.Orchestrator._process)
+        self.assertIn("_lease_hold", src)
+        self.assertLess(src.index("_lease_hold"), src.index("run_stage(st, p"),
+                        "checked after the stage starts = the stage starts and then yields")
+
+    def test_a_lease_yield_does_not_feed_the_livelock_guard(self):
+        """The guard exists for reasons this item could satisfy by taking the machine. A lease is
+        not one: it is external and it clears on its own, so 'keeping the machine' is nonsense."""
+        import inspect
+        src = inspect.getsource(orch.Orchestrator._process)
+        paused = src[src.index('startswith("paused:")'):]
+        self.assertLess(paused.index("_lease_hold"), paused.index("_yield_streak"))
+
+
 class NoRemuxingDuringResolve(unittest.TestCase):
     """User-dictated: nothing remuxes while Resolve is working. Gating on `_resolve_active`
     alone was not enough — it goes false in the gap between two back-to-back conversions, so

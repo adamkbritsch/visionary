@@ -267,5 +267,42 @@ class TransitionLogTests(unittest.TestCase):
         self.assertTrue(lease.release("discretion")[0])
 
 
+class ARenewalNeverShortens(unittest.TestCase):
+    """One holder, two tasks. Discretion runs everything as `discretion`, so a short take from a
+    second task lands on the FIRST task's lease: live 2026-09-24, a 900 s "Pass 1 on a.mkv" cut a
+    3600 s detection lease down to 900 s two minutes after it was granted. A renewal may only ever
+    move the expiry later — the TTL is a ceiling on how long a crashed holder can wedge the queue,
+    and nobody asking for the machine should be able to shorten somebody else's hold on it."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.lease = yield_lease.YieldLease(now=self.clock)
+
+    def test_a_shorter_renewal_leaves_the_longer_expiry_alone(self):
+        self.lease.take("discretion", 3600, "Pass 1 detection")
+        self.clock.t += 120
+        ok, _d = self.lease.take("discretion", 900, "Pass 1 on a.mkv")
+        self.assertTrue(ok)
+        self.assertEqual(self.lease.state()["seconds_left"], 3480)   # 3600 - 120, not 900
+
+    def test_a_longer_renewal_still_extends(self):
+        self.lease.take("discretion", 900)
+        self.clock.t += 60
+        self.lease.take("discretion", 3600)
+        self.assertEqual(self.lease.state()["seconds_left"], 3600)
+
+    def test_the_detail_reports_what_the_holder_actually_has(self):
+        self.lease.take("discretion", 3600)
+        self.clock.t += 120
+        _ok, detail = self.lease.take("discretion", 900)
+        self.assertIn("3480", detail)          # not "900" — that would be a lie
+
+    def test_a_renewal_after_a_lapse_is_a_new_lease_at_its_own_length(self):
+        self.lease.take("discretion", 3600)
+        self.clock.t += 3601
+        self.lease.take("discretion", 900)
+        self.assertEqual(self.lease.state()["seconds_left"], 900)
+
+
 if __name__ == "__main__":
     unittest.main()

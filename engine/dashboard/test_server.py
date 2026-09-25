@@ -1115,6 +1115,28 @@ class YieldEndpoint(unittest.TestCase):
             self.assertFalse(out["lease"]["held"])
             self.assertIsNone(out["lease"]["id"])
 
+    def test_the_reply_says_whether_this_call_created_the_lease(self):
+        """`created` answers "is it mine to release?". The sibling runs every task as one holder,
+        so a task that merely RENEWED another task's lease must not free it on the way out."""
+        pl, ps = self._lease()
+        with pl, ps:
+            first = server.api_yield({"holder": "discretion", "seconds": 3600, "reason": "detection"})
+            self.assertTrue(first["created"])
+            renew = server.api_yield({"holder": "discretion", "seconds": 900, "reason": "Pass 1 on a.mkv"})
+            self.assertFalse(renew["created"])
+            self.assertEqual(renew["lease"]["id"], first["lease"]["id"])
+            # ...and the short renewal must not have cut the long lease down
+            self.assertGreater(renew["lease"]["seconds_left"], 3000)
+            self.assertFalse(server.api_yield({"holder": "discretion", "release": True})["created"])
+
+    def test_a_refused_take_created_nothing(self):
+        pl, ps = self._lease()
+        with pl, ps:
+            server.api_yield({"holder": "discretion", "seconds": 600})
+            out = server.api_yield({"holder": "someone-else", "seconds": 600})
+            self.assertFalse(out["ok"])
+            self.assertFalse(out["created"])
+
     def test_a_lease_granted_during_a_protected_stage_says_it_is_not_in_force_yet(self):
         pl, ps = self._lease(stage="resolve")
         with pl, ps:

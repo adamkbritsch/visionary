@@ -575,6 +575,7 @@ def api_yield(body):
     engine/yield_lease.py for why it is not persisted."""
     lease = orchestrator.ORCH._yield_lease
     holder = (body.get("holder") or "").strip()
+    before = lease.state()["id"]      # a NEW lease gets a new id; a renewal keeps the old one
     if body.get("release"):
         # `id` is optional and SCOPES the release to the lease that was granted: a release that
         # arrives late, from a pass whose lease already lapsed or from before a restart, must not
@@ -583,7 +584,13 @@ def api_yield(body):
     else:
         ok, detail = lease.take(holder, body.get("seconds", yield_lease.DEFAULT_SECONDS),
                                 body.get("reason") or "")
-    out = {"ok": bool(ok), "detail": detail, "lease": lease.state()}
+    now = lease.state()
+    # `created` answers "is this lease MINE to release?". One holder can be several tasks — the
+    # sibling runs them all under one name — and a task that only RENEWED somebody else's lease
+    # must not free it on the way out. Live 2026-09-24: a short task's `finally` released the
+    # hour-long lease a detection pass was relying on, two minutes into it.
+    out = {"ok": bool(ok), "detail": detail, "lease": now,
+           "created": bool(ok and not body.get("release") and now["id"] != before)}
     # The protected stages are reported so a caller knows a granted lease is not yet in force when
     # one of them is running, rather than discovering it by watching the CPU.
     cur = (orchestrator.ORCH.snapshot().get("current") or {})
