@@ -2392,14 +2392,64 @@ class YouTubeReexport(unittest.TestCase):
     just measured, inside the same Resolve session — minutes — instead of losing the
     whole hour-class x265 capped re-encode at remux."""
 
+    def _gate(self, cap=50):
+        import resolve_pipeline as RP, dvcap
+        return cap * dvcap.PEAK_TOLERANCE * RP.REEXPORT_MARGIN     # 51.75 for a 50 cap
+
     def test_the_math_scales_the_target_by_the_measured_burst_ratio(self):
         import resolve_pipeline as RP
-        # 20 Mb/s peaked at 59.9 (live 2026-08-18) under a 50 cap: aim the peak at 45
-        self.assertEqual(RP.reexport_kbps(20000, 59.9, 50), int(20000 * 45 / 59.9))
+        # 20 Mb/s peaked at 59.9 (live 2026-08-18) under a 50 cap
+        self.assertEqual(RP.reexport_kbps(20000, 59.9, 50), int(20000 * self._gate() / 59.9))
         self.assertIsNone(RP.reexport_kbps(20000, 40.0, 50), "not over — nothing to lower")
         self.assertIsNone(RP.reexport_kbps(20000, 300.0, 50), "under the floor — the remux caps it")
         self.assertIsNone(RP.reexport_kbps(0, 60, 50))
         self.assertIsNone(RP.reexport_kbps("x", 60, 50))
+
+    def test_it_aims_at_the_gate_that_decides_not_at_the_bare_cap(self):
+        """dvcap.peak_ok accepts peak <= cap * PEAK_TOLERANCE, so aiming at the cap alone threw
+        away 15% of the budget before the safety margin even applied — and that is what pushed
+        marginal videos under the floor. Live 2026-09-26: a 14000 kb/s render peaked at 79.7
+        against a 50 cap, the old aim computed 7905 (under the 8000 floor), the gamble declined
+        and the item spent 4 h 36 m in the capped re-encode."""
+        import resolve_pipeline as RP
+        want = RP.reexport_kbps(14000, 79.7, 50)
+        self.assertIsNotNone(want, "this is the video that took the four-hour path")
+        self.assertGreaterEqual(want, RP.REEXPORT_FLOOR_KBPS)
+        self.assertEqual(want, int(14000 * self._gate() / 79.7))
+        self.assertLess(want, 14000)                       # still a REDUCTION
+
+    def test_two_measured_points_are_fitted_rather_than_assumed_proportional(self):
+        """The peak does not scale with the target: live 2026-09-25, 14000 kb/s peaked at 75.4
+        and its 8358 kb/s re-export still peaked at 61.7 — the burst ratio GREW as the target
+        fell. Assuming proportionality makes the second throw undershoot the reduction it needs,
+        so once two points exist the line through them is used instead."""
+        import resolve_pipeline as RP
+        proportional = int(17000 * self._gate() / 55.0)
+        fitted = RP.reexport_kbps(17000, 55.0, 50, prev=(20000, 60.0))
+        self.assertIsNotNone(fitted)
+        self.assertLess(fitted, proportional, "a fit through both points asks for a real cut")
+        # the line: peak = a + b*target through (20000, 60) and (17000, 55)
+        b = (60.0 - 55.0) / (20000 - 17000)
+        self.assertEqual(fitted, int((self._gate() - (55.0 - b * 17000)) / b))
+
+    def test_a_fit_that_lands_under_the_floor_still_declines(self):
+        """The Xiaomi review, live: (14000, 75.4) then (8358, 61.7) fits to ~4300 kb/s, far under
+        the floor. The capped re-encode really is the right call for that one."""
+        import resolve_pipeline as RP
+        self.assertIsNone(RP.reexport_kbps(8358, 61.7, 50, prev=(14000, 75.4)))
+
+    def test_a_line_that_never_reaches_the_gate_declines_instead_of_guessing(self):
+        """Some content's peak barely answers to bitrate at all. If the fitted line's floor is
+        already over the gate, no target gets there and a third render would be wasted."""
+        import resolve_pipeline as RP
+        self.assertIsNone(RP.reexport_kbps(15000, 68.0, 50, prev=(20000, 70.0)))
+
+    def test_a_useless_fit_falls_back_to_the_ratio(self):
+        import resolve_pipeline as RP
+        same = RP.reexport_kbps(20000, 60.0, 50, prev=(20000, 59.0))   # same target, no slope
+        self.assertEqual(same, int(20000 * self._gate() / 60.0))
+        backwards = RP.reexport_kbps(17000, 62.0, 50, prev=(20000, 60.0))  # peak ROSE as target fell
+        self.assertEqual(backwards, int(17000 * self._gate() / 62.0))
 
     def _loop(self, peaks, cap=50, bitrate=20000):
         import resolve_pipeline as RP, dvcap
@@ -2416,14 +2466,17 @@ class YouTubeReexport(unittest.TestCase):
     def test_an_over_cap_render_is_re_exported_lower_and_then_accepted(self):
         rc, renders, lines = self._loop([59.9, 44.0])
         self.assertEqual(rc, 0)
-        self.assertEqual(renders, [20000, int(20000 * 45 / 59.9)])
+        self.assertEqual(renders, [20000, int(20000 * self._gate() / 59.9)])
         self.assertTrue(any(l.startswith("RENDER_REEXPORT") for l in lines))
         self.assertTrue(any(l.startswith("RENDER_PEAK") for l in lines))
 
-    def test_the_second_throw_uses_the_ratio_it_just_measured(self):
-        rc, renders, _ = self._loop([59.9, 58.0, 44.0])     # the ratio grew at the lower target
+    def test_the_second_throw_fits_the_line_through_both_measurements(self):
+        rc, renders, _ = self._loop([59.9, 58.0, 44.0])     # the peak barely moved — a steep line
         self.assertEqual(len(renders), 3)
-        self.assertEqual(renders[2], int(renders[1] * 45 / 58.0))
+        b = (59.9 - 58.0) / (renders[0] - renders[1])
+        self.assertEqual(renders[2], int((self._gate() - (58.0 - b * renders[1])) / b))
+        self.assertLess(renders[2], int(renders[1] * self._gate() / 58.0),
+                        "the fit asks for more than the ratio would have")
 
     def test_it_stops_guessing_after_two_re_exports(self):
         rc, renders, lines = self._loop([60, 60, 60, 60])

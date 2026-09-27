@@ -539,18 +539,49 @@ MAX_REEXPORTS = 2                # a third miss means the ratio is not stable �
 
 
 def reexport_kbps(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
-                  floor=REEXPORT_FLOOR_KBPS):
-    """PURE. The target that lands the peak under the cap, from what this render taught
-    us: at target T the peak was P, so the burst ratio is P/T, and the target that puts
-    the peak at cap x margin is T x cap x margin / P. None when nothing needs lowering or
-    when the fitting target would fall under the floor."""
+                  floor=REEXPORT_FLOOR_KBPS, tolerance=None, prev=None):
+    """PURE. The target to re-export at so the peak clears the gate, from what the renders
+    just taught us. None when nothing needs lowering, when no target can get there, or when
+    the one that would fall under the floor.
+
+    AIM AT THE GATE THAT DECIDES. The render is accepted by dvcap.peak_ok, which passes a peak
+    up to cap * PEAK_TOLERANCE — the same bar every TV master clears. Aiming at the bare cap
+    threw away that 15% before the safety margin even applied, so a marginal video computed a
+    target under the floor and lost the whole fast path: live 2026-09-26, 14000 kb/s peaked at
+    79.7 against a 50 cap, the old aim asked for 7905 (under the 8000 floor), the gamble
+    declined, and the item spent 4 h 36 m in the capped re-encode. Aiming at the gate asks for
+    9090 and re-exports in minutes.
+
+    ONE MEASUREMENT: assume the peak scales with the target (peak/target is the burst ratio).
+    TWO: fit the line through them instead, because the peak does NOT scale — live 2026-09-25,
+    14000 kb/s peaked at 75.4 and its 8358 kb/s re-export still peaked at 61.7, a burst ratio
+    that GREW as the target fell. Hard frames cost what they cost, so the honest model is
+    peak = base + slope * target: the line says how much peak the bitrate can actually buy
+    back, and a line that never reaches the gate says so instead of guessing again."""
+    import dvcap
+    if tolerance is None:
+        tolerance = dvcap.PEAK_TOLERANCE
     try:
         kbps, peak, cap = float(kbps), float(peak_mbps), float(cap_mbps)
     except (TypeError, ValueError):
         return None
     if kbps <= 0 or peak <= 0 or cap <= 0:
         return None
-    want = int(kbps * (cap * margin) / peak)
+    gate = cap * float(tolerance) * margin
+    want = None
+    if prev:
+        try:
+            t0, p0 = float(prev[0]), float(prev[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            t0 = p0 = 0.0
+        slope = ((peak - p0) / (kbps - t0)) if (t0 > 0 and p0 > 0 and kbps != t0) else 0.0
+        if slope > 0:
+            base = peak - slope * kbps          # what the content costs at any bitrate
+            if base >= gate:
+                return None                     # no target reaches the gate — stop guessing
+            want = int((gate - base) / slope)
+    if want is None:
+        want = int(kbps * gate / peak)
     if want >= kbps:                     # not over — nothing to lower
         return None
     return want if want >= floor else None
@@ -562,7 +593,8 @@ def render_under_cap(out, mode, bitrate, cap_mbps=0, *, max_reexports=MAX_REEXPO
     markers stages._resolve reads: RENDER_PEAK, RENDER_REEXPORT, RENDER_OVER_CAP."""
     import dvcap
     kbps = int(bitrate)
-    rc = 0
+    prev = None                          # (target, peak) of the render before this one: two
+    rc = 0                               # points let reexport_kbps fit rather than assume
     for attempt in range(max_reexports + 1):
         rc = render(out, mode, kbps)
         if rc != 0 or not cap_mbps or not os.path.exists(out):
@@ -578,19 +610,21 @@ def render_under_cap(out, mode, bitrate, cap_mbps=0, *, max_reexports=MAX_REEXPO
             print(f"RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — under the {cap_mbps} Mbps cap",
                   flush=True)
             return rc
-        nxt = reexport_kbps(kbps, peak, cap_mbps)
+        nxt = reexport_kbps(kbps, peak, cap_mbps, prev=prev)
         if nxt is None or attempt >= max_reexports:
             why = ("no re-exports left" if nxt is not None
-                   else f"a fitting target would be under {REEXPORT_FLOOR_KBPS} kb/s")
+                   else f"no target over {REEXPORT_FLOOR_KBPS} kb/s gets this under the gate")
             print(f"RENDER_OVER_CAP {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — {why}; "
                   "the remux's capped re-encode takes it", flush=True)
             return rc
         print(f"RENDER_REEXPORT {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — "
-              f"re-exporting at {nxt} kb/s", flush=True)
+              f"re-exporting at {nxt} kb/s"
+              f"{' (fitted from two renders)' if prev else ''}", flush=True)
         try:
             os.remove(out)               # Resolve must write THIS name again, not a "(1)" copy
         except OSError:
             pass
+        prev = (kbps, peak)
         kbps = nxt
     return rc
 
