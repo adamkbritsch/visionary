@@ -2454,6 +2454,43 @@ class YouTubeReexport(unittest.TestCase):
         for marker in ("RENDER_PEAK", "RENDER_REEXPORT", "RENDER_OVER_CAP"):
             self.assertIn(marker, line)
 
+    def _real_loop(self, peaks, cap=50, bitrate=20000):
+        """The loop against REAL files: `render` writes the target it was given into the output,
+        so the surviving file says which render the remux would get."""
+        import resolve_pipeline as RP, dvcap, tempfile, os
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "render.mov")
+        peaks = list(peaks)
+        def fake_render(path, mode, kbps):
+            with open(path, "w") as f:
+                f.write(str(kbps))
+            return 0
+        with mock.patch.object(RP, "render", side_effect=fake_render), \
+             mock.patch.object(dvcap, "video_peak_1s_mbps", side_effect=lambda *a, **k: peaks.pop(0)), \
+             mock.patch("builtins.print"):
+            RP.render_under_cap(out, "dv1000", bitrate, cap)
+        survivor = open(out).read() if os.path.exists(out) else None
+        strays = [f for f in os.listdir(d) if f != "render.mov"]
+        return survivor, strays
+
+    def test_a_lost_gamble_leaves_the_FIRST_render_for_the_fallback(self):
+        """The x265 fallback re-encodes whatever survived. Encoding it from a half-bitrate
+        re-export is pure loss: measured, that path delivers 19.2 Mbps from a full render
+        against the 8.5-11 Mbps a re-export ships."""
+        survivor, strays = self._real_loop([75.4, 61.7, 61.0])    # never gets under the gate
+        self.assertEqual(survivor, "20000", "the fallback must get the best render, not the last")
+        self.assertEqual(strays, [], "and nothing is left beside it")
+
+    def test_a_won_gamble_ships_the_re_export_and_keeps_no_stray(self):
+        survivor, strays = self._real_loop([59.9, 44.0])
+        self.assertNotEqual(survivor, "20000")                    # the re-export is what ships
+        self.assertEqual(strays, [])
+
+    def test_a_first_render_under_the_cap_is_untouched(self):
+        survivor, strays = self._real_loop([40.0])
+        self.assertEqual(survivor, "20000")
+        self.assertEqual(strays, [])
+
     def test_each_no_says_which_no_it_is(self):
         """All three declines in the log read "under the floor" and none read "out of attempts",
         which is what pointed at the arithmetic instead of the retry budget. A census that cannot

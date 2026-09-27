@@ -601,50 +601,88 @@ def reexport_kbps(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
 
 def render_under_cap(out, mode, bitrate, cap_mbps=0, *, max_reexports=MAX_REEXPORTS):
     """render(), then gate the render's 1-s peak against `cap_mbps` and re-export at a
-    lower target while it is over (reexport_kbps). cap_mbps 0 = the plain render. Prints
-    markers stages._resolve reads: RENDER_PEAK, RENDER_REEXPORT, RENDER_OVER_CAP."""
+    lower target while it is over (reexport_plan). cap_mbps 0 = the plain render. Prints
+    markers stages._resolve reads: RENDER_PEAK, RENDER_REEXPORT, RENDER_OVER_CAP.
+
+    A LOST GAMBLE COSTS RENDER TIME, NEVER PICTURE. Each re-export overwrites the render, so
+    the first one was the best one we will ever have — and when the gamble is declined the
+    remux's capped x265 re-encodes whatever survived. Encoding it from a half-bitrate re-export
+    instead of the original is pure loss: on the one item where that mattered, the x265 path
+    delivered 19.2 Mbps from a full render against the 8.5-11 Mbps a re-export ships. So the
+    first render is set aside and put back if the gamble does not come off."""
     import dvcap
     kbps = int(bitrate)
     prev = None                          # (target, peak) of the render before this one: two
-    rc = 0                               # points let reexport_kbps fit rather than assume
-    for attempt in range(max_reexports + 1):
-        rc = render(out, mode, kbps)
-        if rc != 0 or not cap_mbps or not os.path.exists(out):
-            return rc
-        try:
-            peak = dvcap.video_peak_1s_mbps(out, FFPROBE)
-        except Exception as e:
-            peak = 0.0
-            print(f"RENDER_PEAK unmeasured ({e.__class__.__name__}) — the remux gates it", flush=True)
-        if peak <= 0:
-            return rc                    # unverified here; the remux's gate still stands
-        if dvcap.peak_ok(peak, cap_mbps):
-            print(f"RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — under the {cap_mbps} Mbps cap",
-                  flush=True)
-            return rc
-        nxt, why_not = reexport_plan(kbps, peak, cap_mbps, prev=prev)
-        if nxt is None or attempt >= max_reexports:
-            # Each no says which one it is. A census that cannot tell "the target fell under the
-            # floor" from "the fit says no target reaches the gate" cannot tell an arithmetic
-            # problem from a content one — telling them apart is what found the aim-point bug.
-            why = ("no re-exports left" if nxt is not None else
-                   {"under-floor": f"a fitting target would be under {REEXPORT_FLOOR_KBPS} kb/s",
-                    "content-floor": "the two renders fit a line that never reaches the gate",
-                    "not-over": "nothing to lower",
-                    "unreadable": "the numbers did not read"}.get(why_not, why_not))
-            print(f"RENDER_OVER_CAP {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — {why}; "
-                  "the remux's capped re-encode takes it", flush=True)
-            return rc
-        print(f"RENDER_REEXPORT {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — "
-              f"re-exporting at {nxt} kb/s"
-              f"{' (fitted from two renders)' if prev else ''}", flush=True)
-        try:
-            os.remove(out)               # Resolve must write THIS name again, not a "(1)" copy
-        except OSError:
-            pass
-        prev = (kbps, peak)
-        kbps = nxt
-    return rc
+    best = out + ".best"                 # points let reexport_plan fit rather than assume
+    rc = 0
+
+    def keep_best():
+        """Put the first render back — it is the best source the fallback can have."""
+        if os.path.exists(best):
+            try:
+                os.replace(best, out)
+            except OSError:
+                pass
+
+    def drop_best():
+        if os.path.exists(best):
+            try:
+                os.remove(best)
+            except OSError:
+                pass
+
+    try:
+        for attempt in range(max_reexports + 1):
+            rc = render(out, mode, kbps)
+            if rc != 0 or not cap_mbps or not os.path.exists(out):
+                keep_best()              # a failed re-render must not leave only the reject
+                return rc
+            try:
+                peak = dvcap.video_peak_1s_mbps(out, FFPROBE)
+            except Exception as e:
+                peak = 0.0
+                print(f"RENDER_PEAK unmeasured ({e.__class__.__name__}) — the remux gates it",
+                      flush=True)
+            if peak <= 0:
+                keep_best()              # unverified here; the remux gates the better file
+                return rc
+            if dvcap.peak_ok(peak, cap_mbps):
+                print(f"RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — under the {cap_mbps} Mbps cap",
+                      flush=True)
+                drop_best()              # this one ships; the earlier render is dead weight
+                return rc
+            nxt, why_not = reexport_plan(kbps, peak, cap_mbps, prev=prev)
+            if nxt is None or attempt >= max_reexports:
+                # Each no says which one it is. A census that cannot tell "the target fell under
+                # the floor" from "the fit says no target reaches the gate" cannot tell an
+                # arithmetic problem from a content one — telling them apart found the aim bug.
+                why = ("no re-exports left" if nxt is not None else
+                       {"under-floor": f"a fitting target would be under {REEXPORT_FLOOR_KBPS} kb/s",
+                        "content-floor": "the two renders fit a line that never reaches the gate",
+                        "not-over": "nothing to lower",
+                        "unreadable": "the numbers did not read"}.get(why_not, why_not))
+                kept = os.path.exists(best)
+                keep_best()
+                print(f"RENDER_OVER_CAP {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — {why}; "
+                      f"the remux's capped re-encode takes it"
+                      f"{' (from the first render, not the re-export)' if kept else ''}",
+                      flush=True)
+                return rc
+            print(f"RENDER_REEXPORT {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — "
+                  f"re-exporting at {nxt} kb/s"
+                  f"{' (fitted from two renders)' if prev else ''}", flush=True)
+            try:
+                if os.path.exists(best):
+                    os.remove(out)       # a later re-export is never the best one
+                else:
+                    os.replace(out, best)  # keep the first; Resolve must write THIS name again,
+            except OSError:                # not a "(1)" copy, so `out` has to be free either way
+                pass
+            prev = (kbps, peak)
+            kbps = nxt
+        return rc
+    finally:
+        drop_best()                      # never leave a stray beside the render
 
 
 def _probe_frames(path):
