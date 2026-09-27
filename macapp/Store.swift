@@ -223,9 +223,14 @@ final class AppStore: ObservableObject {
     /// BOTH whole-number knobs of the YouTube cadence in one write, so the dial can't
     /// land on a torn pair (e.g. burst applied without every, briefly serving a burst
     /// every N episodes when the user asked for N-per-episode).
+    // ZERO IS A SETTING — "no YouTube videos", the dial's middle stop. This clamped the burst up
+    // to 1, so the stepper could not go below "1 video per TV episode": it wrote 1, the state came
+    // back unchanged and the control snapped straight back (user-caught 2026-09-27). The bounds
+    // live in CadenceDial with the rest of the dial's arithmetic, which is tested.
     func setYoutubeCadence(every: Int, burst: Int) async {
-        await saveSettings(["youtube_every_tv_episodes": max(1, min(50, every)),
-                            "youtube_videos_per_burst": max(1, min(10, burst))])
+        let k = CadenceDial.clampForSave(every: every, burst: burst)
+        await saveSettings(["youtube_every_tv_episodes": k.every,
+                            "youtube_videos_per_burst": k.burst])
     }
     // Put a show in round-robin slot `index` (replace that slot, or append for the empty slot).
     // Each show's own picker uses this — changing one slot leaves the others alone.

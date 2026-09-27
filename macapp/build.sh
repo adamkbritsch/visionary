@@ -21,6 +21,7 @@ fi
 
 # 1. COMPILE FIRST — to a temp path, so a build error never wrecks the working app.
 swiftc \
+  "$ROOT/macapp/Cadence.swift" \
   "$ROOT/macapp/Models.swift" \
   "$ROOT/macapp/Store.swift" \
   "$ROOT/macapp/Views.swift" \

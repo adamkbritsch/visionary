@@ -3431,26 +3431,10 @@ private struct CadenceControl: View {
     let burst: Int
     let onChange: (Int, Int) -> Void          // (every, burst)
 
-    private static let minPos = -49           // DOWN: 1 video per 50 episodes
-    private static let maxPos = 10            // UP:   10 videos per episode
-
-    private var position: Int {
-        if burst == 0 { return 0 }             // the zero stop
-        if every <= 1 { return max(1, burst) } // 1..10 videos per episode
-        return -(every - 1)                    // 1 video every 2..50 episodes
-    }
-
-    private static func knobs(_ pos: Int) -> (Int, Int) {
-        if pos == 0 { return (1, 0) }                 // burst 0: the cadence serves nothing
-        return pos >= 1 ? (1, pos) : (-pos + 1, 1)
-    }
-
-    private var summary: String {
-        if burst == 0 { return "no YouTube videos" }
-        if burst > 1 { return "\(burst) videos per TV episode" }
-        return every == 1 ? "1 video per TV episode"
-                          : "1 video every \(every) TV episodes"
-    }
+    // The arithmetic lives in CadenceDial (macapp/Cadence.swift) so it can be compiled and RUN
+    // by engine/test_cadence_dial.py. It shipped untested twice; it does not live here again.
+    private var position: Int { CadenceDial.position(every: every, burst: burst) }
+    private var summary: String { CadenceDial.summary(every: every, burst: burst) }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -3462,8 +3446,9 @@ private struct CadenceControl: View {
             }
             Spacer()
             Stepper(value: Binding(get: { position },
-                                   set: { p in let k = Self.knobs(p); onChange(k.0, k.1) }),
-                    in: Self.minPos...Self.maxPos) { EmptyView() }
+                                   set: { p in let k = CadenceDial.knobs(p)
+                                                onChange(k.every, k.burst) }),
+                    in: CadenceDial.minPos...CadenceDial.maxPos) { EmptyView() }
                 .labelsHidden().fixedSize()
         }
         .padding(10).panel(DS.radiusControl, inset: true)
