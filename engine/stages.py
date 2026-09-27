@@ -1695,6 +1695,8 @@ def _cleanup(p, abort, progress=None):
             shutil.rmtree(mezzanine_path(p.source) + ".segments", ignore_errors=True)
         if os.path.exists(p.final + ".ship.hevc"):      # ship-render temp: the render's ES
             os.remove(p.final + ".ship.hevc")
+        if os.path.exists(p.dv_render + ".best"):       # the re-export gamble's kept first render
+            os.remove(p.dv_render + ".best")            # (its own finally clears it; a kill does not)
         # A hard kill during the mux can strand remux.mp4box_safe_input's hardlink — and a
         # leftover link keeps the multi-GB transient it points at ALIVE (second reference
         # to the same inode), so sweep any that share this item's directory.

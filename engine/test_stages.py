@@ -2473,6 +2473,13 @@ class YouTubeReexport(unittest.TestCase):
         strays = [f for f in os.listdir(d) if f != "render.mov"]
         return survivor, strays
 
+    def test_cleanup_sweeps_a_gamble_stray_a_kill_left_behind(self):
+        """render_under_cap clears its own kept render in a finally — but a hard kill (a deploy
+        mid-gamble) skips that, and the stray is a multi-GB 4K render."""
+        import inspect, stages
+        self.assertIn('.best', inspect.getsource(stages._cleanup),
+                      "a killed gamble would leak its kept render onto the scratch disk")
+
     def test_a_lost_gamble_leaves_the_FIRST_render_for_the_fallback(self):
         """The x265 fallback re-encodes whatever survived. Encoding it from a half-bitrate
         re-export is pure loss: measured, that path delivers 19.2 Mbps from a full render
