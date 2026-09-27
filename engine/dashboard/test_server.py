@@ -672,6 +672,13 @@ class UpNextKeepsTenEpisodes(unittest.TestCase):
     def _eps(out):
         return sum(1 for o in out if o.get("kind") == "episode")
 
+    def test_a_cadence_of_zero_puts_no_videos_in_the_queue(self):
+        """The dial's middle stop. With the cadence off, the queue is TV and movies — showing
+        videos as "next" when none will be served is the queue lying about the plan."""
+        out = self._run(n_eps=6, n_videos=8, burst=0)
+        self.assertEqual(sum(1 for o in out if o.get("kind") == "youtube"), 0)
+        self.assertEqual(self._eps(out), 6)
+
     def test_ten_episodes_even_with_a_video_between_each(self):
         out = self._run(30, 30)
         self.assertEqual(self._eps(out), 10)

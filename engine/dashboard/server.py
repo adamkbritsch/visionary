@@ -1262,8 +1262,12 @@ def _up_next_cadence(limit=10, current=None, inflight=None):
     mvs = [m for m in mvs if m.get("name") not in mv_excl]      # in-flight movies are not "next"
     _st = settings.get_settings()
     every = max(1, int(_st.get("youtube_every_tv_episodes", 2)))
-    burst = max(1, int(_st.get("youtube_videos_per_burst", 1) or 1))   # videos per firing
-    yt_videos = list(youtube.all_pending(skip=parked))         # flat, newest-first — 1 served per `every` eps
+    try:                                                       # 0 = the cadence serves none, so
+        burst = max(0, int(_st.get("youtube_videos_per_burst", 1)))    # nothing YouTube is "next"
+    except (TypeError, ValueError):
+        burst = 1
+    yt_videos = (list(youtube.all_pending(skip=parked))        # flat, newest-first — 1 per `every` eps
+                 if burst else [])
     yt_videos = [v for v in yt_videos if v.get("source_name") not in yt_excl]   # in-flight videos not "next"
     # WHERE THE CURRENT BURST STANDS. `_yt_in_burst` counts videos that have HANDED OFF; a
     # video on the run thread right now has not, and is excluded from yt_videos anyway, so it

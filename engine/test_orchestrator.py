@@ -434,7 +434,8 @@ class YouTubeCadence(unittest.TestCase):
     `youtube_every_tv_episodes` TV episodes (not a round-robin peer, not a batch)."""
     VP = "/Media/YouTube-raw/Chan/Chan - T - abc/Chan - T [abc12345678].mp4"
 
-    def _decide(self, tv_since, *, yt=True, ep=True, active=("A",), every=2, parked=False):
+    def _decide(self, tv_since, *, yt=True, ep=True, active=("A",), every=2, parked=False,
+                burst=None):
         o = orch.Orchestrator(); o._tv_since_yt = tv_since
         if parked:                                    # a video already waiting at the Resolve doorstep
             o._gate_deferred.add("parked-stem"); o._gate_deferred_yt.add("parked-stem")
@@ -443,8 +444,10 @@ class YouTubeCadence(unittest.TestCase):
         v = {"channel": "Chan", "video_path": self.VP, "title": "T"} if yt else None
         with contextlib.ExitStack() as s:
             s.enter_context(mock.patch.object(orch.movies, "next_due", return_value=None))
-            s.enter_context(mock.patch.object(orch.settings, "get_settings",
-                                              return_value={"youtube_every_tv_episodes": every}))
+            live = {"youtube_every_tv_episodes": every}
+            if burst is not None:
+                live["youtube_videos_per_burst"] = burst
+            s.enter_context(mock.patch.object(orch.settings, "get_settings", return_value=live))
             s.enter_context(mock.patch.object(orch.series, "get_active_series", return_value=list(active)))
             s.enter_context(mock.patch.object(orch.series, "series_root", return_value="/Media/TV"))
             s.enter_context(mock.patch.object(orch.series, "episode_queue", return_value=q))
@@ -461,6 +464,34 @@ class YouTubeCadence(unittest.TestCase):
     def test_youtube_fires_once_cadence_reached(self):
         p, why = self._decide(tv_since=2, every=2)         # 2 eps done → 1 YouTube video
         self.assertEqual(why, "ok"); self.assertTrue(p.youtube)
+
+    def test_a_burst_of_zero_serves_no_videos_at_all(self):
+        """The cadence dial's middle stop: no YouTube videos. The counter can run as high as it
+        likes and a video can be due — nothing is served, so TV and movies have the queue."""
+        for tv_since in (2, 5, 50):
+            p, why = self._decide(tv_since=tv_since, every=2, burst=0)
+            self.assertEqual(why, "ok")
+            self.assertFalse(p.youtube, f"a video was served at {tv_since} episodes with burst 0")
+            self.assertEqual(p.ep, "S01E01")
+
+    def test_zero_is_the_only_value_that_turns_the_cadence_off(self):
+        o = orch.Orchestrator()
+        for burst, expect in ((0, 0), (1, 1), (10, 10), ("x", 1), (-3, 0)):
+            with mock.patch.object(orch.settings, "get_settings",
+                                   return_value={"youtube_videos_per_burst": burst}):
+                self.assertEqual(o._yt_burst(), expect, burst)
+        with mock.patch.object(orch.settings, "get_settings", return_value={}):
+            self.assertEqual(o._yt_burst(), 1)                    # default unchanged
+
+    def test_nothing_is_owed_while_the_cadence_is_off(self):
+        o = orch.Orchestrator()
+        o._tv_since_yt = 99
+        with mock.patch.object(orch.settings, "get_settings",
+                               return_value={"youtube_every_tv_episodes": 2,
+                                             "youtube_videos_per_burst": 0}), \
+             mock.patch.object(orch.youtube, "next_due",
+                               side_effect=AssertionError("must not even look")):
+            self.assertFalse(o._yt_cadence_owed())
 
     def test_parked_video_stops_the_gate_offering_another(self):
         # A video deferred at the doorstep means the NEXT EPISODE's topaz is what should run

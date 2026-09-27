@@ -2846,8 +2846,8 @@ class Orchestrator:
         # (`_tv_since_yt`), exactly ONE YouTube video runs, then the counter resets. So the stream is
         # e.g. ep, ep, 1 video, ep, ep, 1 video, … (newest video first — `next_due` order). The gate is
         # checked BEFORE the TV rotation so the video fires the moment the count is reached.
-        yt = youtube.next_due(skip=skip)
-        every = self._yt_every_tv()
+        yt = youtube.next_due(skip=skip) if self._yt_burst() else None   # burst 0: the cadence
+        every = self._yt_every_tv()                                      # serves nothing at all
         # The gate stays OPEN until the whole burst is served: `_yt_in_burst` counts how many
         # of this burst's videos have completed, and only the LAST one resets _tv_since_yt
         # (see _advance_cadence_at_handoff). burst=1 is the long-standing behavior exactly.
@@ -2888,9 +2888,16 @@ class Orchestrator:
         return None, "no-series"
 
     def _yt_burst(self) -> int:
-        """How many YouTube videos run back-to-back once the cadence gate fires (>=1)."""
+        """How many YouTube videos run back-to-back once the cadence gate fires.
+
+        ZERO is a real setting and the only way to mean it: the cadence serves no videos at all,
+        so TV and movies have the queue to themselves. It is the middle stop of the app's one
+        cadence dial, between "2 videos per TV episode" and "1 video every 2 TV episodes"
+        (user-dictated 2026-09-27). A "run this now" send is deliberately unaffected — it is
+        cadence-exempt by design, and switching the rotation off is not the same as refusing a
+        video the user just asked for."""
         try:
-            return max(1, int(settings.get_settings().get("youtube_videos_per_burst", 1)))
+            return max(0, int(settings.get_settings().get("youtube_videos_per_burst", 1)))
         except (TypeError, ValueError):
             return 1
 
@@ -3562,6 +3569,8 @@ class Orchestrator:
         video resolves the moment the remux clears.
         """
         try:
+            if not self._yt_burst():       # the dial's middle stop: no YouTube videos
+                return False
             if self._tv_since_yt < self._yt_every_tv():
                 return False
             import youtube

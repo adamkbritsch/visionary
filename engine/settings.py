@@ -125,6 +125,10 @@ DEFAULT_SETTINGS = {
                                 # as WHOLE NUMBERS instead of a fraction (user-dictated 2026-08-17):
                                 # K videos per episode is (every=1, burst=K); 1 video per N episodes
                                 # is (every=N, burst=1). Both default to the long-standing 1-per-2.
+                                # ZERO means the cadence serves NO videos — the dial's middle stop
+                                # (user-dictated 2026-09-27). A "run this now" send still runs: it is
+                                # cadence-exempt by design, and turning the rotation off is not the
+                                # same as refusing a video the user just asked for.
     "youtube_every_tv_episodes": 2,  # YouTube CADENCE: serve exactly 1 YouTube video after every N TV
                                 # episodes (was: a ~max_youtube_minutes batch every turn). Throttles the
                                 # slow 4K-SDR YouTube upscales so they don't crowd out TV. If TV runs out,
@@ -192,7 +196,7 @@ LIMITS = {
     "resolve_share_remuxes": (0, 2),
     "max_youtube_minutes": (1, 600),
     "youtube_every_tv_episodes": (1, 50),
-    "youtube_videos_per_burst": (1, 10),
+    "youtube_videos_per_burst": (0, 10),   # 0 IS a setting: the cadence serves no videos at all
     "youtube_fetch_ahead": (0, 100),
     "max_active_shows": (1, MAX_ACTIVE_CEILING),
     "finisher_lanes": (1, 2),

@@ -339,6 +339,17 @@ class Tunables(unittest.TestCase):
     def tearDown(self):
         self.p.stop()
 
+    def test_a_cadence_burst_of_zero_survives_the_clamp(self):
+        """0 is the dial's middle stop — "no YouTube videos" — so the clamp table has to let it
+        through. It used to floor at 1, which is why the dial had no way to say none."""
+        self.assertEqual(settings.clamp_setting("youtube_videos_per_burst", 0), 0)
+        self.assertEqual(settings.set_settings({"youtube_videos_per_burst": 0})
+                         ["youtube_videos_per_burst"], 0)
+        self.assertEqual(settings.clamp_setting("youtube_videos_per_burst", -2), 0)   # still floored
+        self.assertEqual(settings.clamp_setting("youtube_videos_per_burst", 99), 10)
+        # the OTHER knob keeps its floor of 1: zero episodes between videos is not a cadence
+        self.assertEqual(settings.clamp_setting("youtube_every_tv_episodes", 0), 1)
+
     def test_dead_battery_drain_key_is_gone(self):
         # It had ZERO engine consumers (the adapter-wattage gate replaced it); a setting that
         # does nothing is worse than no setting.

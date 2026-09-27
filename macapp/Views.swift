@@ -1637,8 +1637,9 @@ struct SeriesCard: View {
         // start-to-finish when their slot comes up; YouTube is cadence-gated, not a queue-jumper
         let n = store.state?.settings?.youtube_every_tv_episodes ?? 2
         let k = store.state?.settings?.youtube_videos_per_burst ?? 1
-        let cadence = k > 1 ? "\(k) videos per episode"
-                            : (n == 1 ? "1 video per episode" : "1 video per \(n) episodes")
+        let cadence = k == 0 ? "no YouTube videos"
+                     : (k > 1 ? "\(k) videos per episode"
+                              : (n == 1 ? "1 video per episode" : "1 video per \(n) episodes"))
         Card(title: title, systemImage: icon,
              hint: "TV in order · movies run whole when due · " + cadence) {
             ModeNavBar()                              // the TV / YouTube / Movies view toggle
@@ -3411,12 +3412,18 @@ private struct YouTubeMode: View {
 // Global YouTube cadence: how many TV episodes play per 1 YouTube video. YouTube 4K-SDR upscales are
 // far slower than a 1080p episode, so this throttles them so they don't crowd out TV.
 // ONE dial spanning BOTH directions of the cadence as whole numbers (user-dictated
-// 2026-08-17): "3 videos per episode" ... "1 per episode" ... "1 video every 10 episodes".
+// 2026-08-17): "3 videos per episode" ... "no YouTube videos" ... "1 video every 10 episodes".
 // A single Int position maps onto the engine's two whole-number knobs — no fractions.
 // UP IS MORE YOUTUBE (user-dictated 2026-08-20): the stepper's increment has to move toward
 // more videos, so the position axis runs the same way the dial reads.
-//   position > 0  ->  every = 1,           burst = position + 1  (K videos per episode)
-//   position <= 0 ->  every = -position + 1, burst = 1           (1 video per N episodes)
+// THE MIDDLE STOP IS ZERO (user-dictated 2026-09-27): it sits between "2 videos per TV
+// episode" and "1 video every 2 TV episodes", where "1 video per TV episode" used to be, and
+// means the cadence serves no videos at all. A "run this now" send is unaffected — it is
+// cadence-exempt by design. Note the axis is deliberately NOT monotonic because of it: one
+// step down from "2 videos per episode" is none, and the step after that is 1 every 2.
+//   position > 0  ->  every = 1,            burst = position + 1  (K videos per episode, K>=2)
+//   position == 0 ->  burst = 0                                   (no YouTube videos)
+//   position < 0  ->  every = -position + 1, burst = 1            (1 video every N episodes, N>=2)
 private struct CadenceControl: View {
     let every: Int
     let burst: Int
@@ -3425,13 +3432,23 @@ private struct CadenceControl: View {
     private static let minPos = -49           // DOWN: 1 video per 50 episodes
     private static let maxPos = 9             // UP:   10 videos per episode
 
-    private var position: Int { burst > 1 ? (burst - 1) : -(every - 1) }
+    private var position: Int {
+        if burst == 0 { return 0 }
+        if burst > 1 { return burst - 1 }
+        // A setting saved before the zero stop existed can still say 1-per-1, which no longer
+        // has a position of its own. Anchor the stepper at the centre so the first step lands on
+        // a real neighbour either way — up is 2 per episode, down is 1 every 2 — and the summary
+        // below keeps telling the truth until the dial is actually moved.
+        return every > 1 ? -(every - 1) : 0
+    }
 
     private static func knobs(_ pos: Int) -> (Int, Int) {
-        pos > 0 ? (1, pos + 1) : (-pos + 1, 1)
+        if pos == 0 { return (1, 0) }                 // burst 0: the cadence serves nothing
+        return pos > 0 ? (1, pos + 1) : (-pos + 1, 1)
     }
 
     private var summary: String {
+        if burst == 0 { return "no YouTube videos" }
         if burst > 1 { return "\(burst) videos per TV episode" }
         return every == 1 ? "1 video per TV episode"
                           : "1 video every \(every) TV episodes"
