@@ -532,41 +532,32 @@ def render(out, mode=MODE_DV1000, bitrate=60000):
 # mathematically calculate would work." So the peak is measured HERE, while the timeline
 # and its DV analysis are still up, and an over-cap render is simply rendered again at a
 # target scaled by the burst ratio it just measured — minutes, no analysis, no x265.
-REEXPORT_MARGIN = 0.9            # aim the re-export's peak at cap x this, not at the gate
+REEXPORT_MARGIN = 0.9            # the SAFETY FACTOR on the gate (cap * dvcap.PEAK_TOLERANCE),
+                                 # not on the bare cap: the burst ratio shifts a little between
+                                 # renders, so aim just inside the bar rather than at it. Reading
+                                 # this as 0.9 * cap is what mis-diagnosed the floor for two weeks
 REEXPORT_FLOOR_KBPS = 8000       # under this the picture loses more than the hour saves:
                                  # the remux's capped re-encode (it caps only the PEAKS) takes it
 MAX_REEXPORTS = 2                # a third miss means the ratio is not stable — stop guessing
 
 
-def reexport_kbps(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
+def reexport_plan(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
                   floor=REEXPORT_FLOOR_KBPS, tolerance=None, prev=None):
-    """PURE. The target to re-export at so the peak clears the gate, from what the renders
-    just taught us. None when nothing needs lowering, when no target can get there, or when
-    the one that would fall under the floor.
+    """PURE. `(target, why_not)` — the target to re-export at, or None and WHICH no it is.
 
-    AIM AT THE GATE THAT DECIDES. The render is accepted by dvcap.peak_ok, which passes a peak
-    up to cap * PEAK_TOLERANCE — the same bar every TV master clears. Aiming at the bare cap
-    threw away that 15% before the safety margin even applied, so a marginal video computed a
-    target under the floor and lost the whole fast path: live 2026-09-26, 14000 kb/s peaked at
-    79.7 against a 50 cap, the old aim asked for 7905 (under the 8000 floor), the gamble
-    declined, and the item spent 4 h 36 m in the capped re-encode. Aiming at the gate asks for
-    9090 and re-exports in minutes.
-
-    ONE MEASUREMENT: assume the peak scales with the target (peak/target is the burst ratio).
-    TWO: fit the line through them instead, because the peak does NOT scale — live 2026-09-25,
-    14000 kb/s peaked at 75.4 and its 8358 kb/s re-export still peaked at 61.7, a burst ratio
-    that GREW as the target fell. Hard frames cost what they cost, so the honest model is
-    peak = base + slope * target: the line says how much peak the bitrate can actually buy
-    back, and a line that never reaches the gate says so instead of guessing again."""
+    The three noes are different problems and a census that cannot tell them apart cannot tell a
+    floor problem from a content one. That distinction is exactly what found the aim-point bug:
+    all three declines in the log said "under the floor", none said "out of attempts", which is
+    what pointed at the arithmetic rather than at the retry budget."""
     import dvcap
     if tolerance is None:
         tolerance = dvcap.PEAK_TOLERANCE
     try:
         kbps, peak, cap = float(kbps), float(peak_mbps), float(cap_mbps)
     except (TypeError, ValueError):
-        return None
+        return None, "unreadable"
     if kbps <= 0 or peak <= 0 or cap <= 0:
-        return None
+        return None, "unreadable"
     gate = cap * float(tolerance) * margin
     want = None
     if prev:
@@ -577,14 +568,35 @@ def reexport_kbps(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
         slope = ((peak - p0) / (kbps - t0)) if (t0 > 0 and p0 > 0 and kbps != t0) else 0.0
         if slope > 0:
             base = peak - slope * kbps          # what the content costs at any bitrate
+            # Judged against the AIM, not the bare gate, on purpose: a target that only clears
+            # 57.5 with no cushion left is a coin flip, and losing it costs a whole 4K export.
             if base >= gate:
-                return None                     # no target reaches the gate — stop guessing
+                return None, "content-floor"    # no target reaches the aim — stop guessing
             want = int((gate - base) / slope)
     if want is None:
         want = int(kbps * gate / peak)
-    if want >= kbps:                     # not over — nothing to lower
-        return None
-    return want if want >= floor else None
+    if want >= kbps:
+        return None, "not-over"                 # nothing to lower
+    return (want, "") if want >= floor else (None, "under-floor")
+
+
+def reexport_kbps(kbps, peak_mbps, cap_mbps, *, margin=REEXPORT_MARGIN,
+                  floor=REEXPORT_FLOOR_KBPS, tolerance=None, prev=None):
+    """PURE. The target to re-export at so the peak clears the gate, or None. The target half
+    of reexport_plan, which is where the reasoning (and the reason for a None) lives.
+
+    AIM AT THE GATE THAT DECIDES. The render is accepted by dvcap.peak_ok, which passes a peak
+    up to cap * PEAK_TOLERANCE — 57.5 Mbps at the 50 cap, the same bar every TV master clears,
+    and the same function the remux re-applies to the shipped bits. Aiming at the bare cap threw
+    away that 15% before the safety margin even applied, so a high-burst video computed a target
+    under the floor and lost the whole fast path: live 2026-09-26, 14000 kb/s peaked at 79.7, the
+    old aim asked for 7905 (declined, then 4 h 36 m of x265), the gate-based aim asks for 9090.
+
+    ONE MEASUREMENT: assume the peak scales with the target. TWO: fit the line through them,
+    because it does not — live 2026-09-25, 14000 kb/s peaked at 75.4 and its 8358 kb/s re-export
+    still peaked at 61.7, a burst ratio that GREW as the target fell."""
+    return reexport_plan(kbps, peak_mbps, cap_mbps, margin=margin, floor=floor,
+                         tolerance=tolerance, prev=prev)[0]
 
 
 def render_under_cap(out, mode, bitrate, cap_mbps=0, *, max_reexports=MAX_REEXPORTS):
@@ -610,10 +622,16 @@ def render_under_cap(out, mode, bitrate, cap_mbps=0, *, max_reexports=MAX_REEXPO
             print(f"RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — under the {cap_mbps} Mbps cap",
                   flush=True)
             return rc
-        nxt = reexport_kbps(kbps, peak, cap_mbps, prev=prev)
+        nxt, why_not = reexport_plan(kbps, peak, cap_mbps, prev=prev)
         if nxt is None or attempt >= max_reexports:
-            why = ("no re-exports left" if nxt is not None
-                   else f"no target over {REEXPORT_FLOOR_KBPS} kb/s gets this under the gate")
+            # Each no says which one it is. A census that cannot tell "the target fell under the
+            # floor" from "the fit says no target reaches the gate" cannot tell an arithmetic
+            # problem from a content one — telling them apart is what found the aim-point bug.
+            why = ("no re-exports left" if nxt is not None else
+                   {"under-floor": f"a fitting target would be under {REEXPORT_FLOOR_KBPS} kb/s",
+                    "content-floor": "the two renders fit a line that never reaches the gate",
+                    "not-over": "nothing to lower",
+                    "unreadable": "the numbers did not read"}.get(why_not, why_not))
             print(f"RENDER_OVER_CAP {peak:.1f} Mbps at {kbps} kb/s > {cap_mbps} cap — {why}; "
                   "the remux's capped re-encode takes it", flush=True)
             return rc

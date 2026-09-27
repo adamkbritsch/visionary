@@ -1347,7 +1347,11 @@ def _resolve(p, abort, progress=None):
         # up at, or that it stayed over the cap and the remux will re-encode it.
         note = ""
         for ln in out.splitlines():
-            if ln.startswith(("RENDER_REEXPORT", "RENDER_OVER_CAP")):
+            # RENDER_PEAK rides along: it carries the peak a render LANDED at against the target
+            # it asked for, and without it there is no instrument on the one number this gamble
+            # turns — every review of it so far has had to infer the distribution from how often
+            # the slow path fired, weeks after the fact.
+            if ln.startswith(("RENDER_PEAK", "RENDER_REEXPORT", "RENDER_OVER_CAP")):
                 logbook.event(f"resolve {p.ep}: {ln.strip()[:200]}")
                 if ln.startswith("RENDER_REEXPORT"):
                     note = " (re-exported under the cap)"

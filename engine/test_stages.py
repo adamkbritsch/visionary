@@ -2444,6 +2444,35 @@ class YouTubeReexport(unittest.TestCase):
         import resolve_pipeline as RP
         self.assertIsNone(RP.reexport_kbps(15000, 68.0, 50, prev=(20000, 70.0)))
 
+    def test_the_stage_forwards_every_render_marker_to_the_log(self):
+        """RENDER_PEAK carries the peak a render LANDED at against the target it asked for, and
+        it was the one marker the stage dropped. Three audits of this mechanism had to infer the
+        distribution from how often the slow path fired, because the log held 0 of them."""
+        import inspect, stages
+        src = inspect.getsource(stages._resolve)
+        line = next(l for l in src.splitlines() if "RENDER_OVER_CAP" in l and "startswith" in l)
+        for marker in ("RENDER_PEAK", "RENDER_REEXPORT", "RENDER_OVER_CAP"):
+            self.assertIn(marker, line)
+
+    def test_each_no_says_which_no_it_is(self):
+        """All three declines in the log read "under the floor" and none read "out of attempts",
+        which is what pointed at the arithmetic instead of the retry budget. A census that cannot
+        tell an arithmetic problem from a content one cannot find the next bug either."""
+        import resolve_pipeline as RP
+        self.assertEqual(RP.reexport_plan(14000, 300.0, 50)[1], "under-floor")
+        self.assertEqual(RP.reexport_plan(15000, 68.0, 50, prev=(20000, 70.0))[1], "content-floor")
+        self.assertEqual(RP.reexport_plan(20000, 40.0, 50)[1], "not-over")
+        self.assertEqual(RP.reexport_plan("x", 60, 50)[1], "unreadable")
+        self.assertEqual(RP.reexport_plan(14000, 79.7, 50)[1], "", "a target is not a no")
+
+    def test_the_two_declines_read_differently_in_the_log(self):
+        _rc, _r, lines = self._loop([300.0])                      # target under the floor
+        floor_line = next(l for l in lines if l.startswith("RENDER_OVER_CAP"))
+        self.assertIn("under 8000 kb/s", floor_line)
+        _rc, _r, lines = self._loop([70.0, 68.0])                 # a line that never gets there
+        fit_line = next(l for l in lines if l.startswith("RENDER_OVER_CAP"))
+        self.assertIn("never reaches the gate", fit_line)
+
     def test_a_useless_fit_falls_back_to_the_ratio(self):
         import resolve_pipeline as RP
         same = RP.reexport_kbps(20000, 60.0, 50, prev=(20000, 59.0))   # same target, no slope
