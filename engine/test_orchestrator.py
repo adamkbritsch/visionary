@@ -465,6 +465,14 @@ class YouTubeCadence(unittest.TestCase):
         p, why = self._decide(tv_since=2, every=2)         # 2 eps done → 1 YouTube video
         self.assertEqual(why, "ok"); self.assertTrue(p.youtube)
 
+    def test_one_video_per_episode_is_still_a_cadence(self):
+        """(every=1, burst=1) — the ordinary alternating cadence, and its own stop on the dial
+        just above the zero. It is not the same setting as "none" and must never be folded into
+        it (user-dictated 2026-09-27)."""
+        p, why = self._decide(tv_since=1, every=1, burst=1)
+        self.assertEqual(why, "ok")
+        self.assertTrue(p.youtube, "one episode has run, so one video is due")
+
     def test_a_burst_of_zero_serves_no_videos_at_all(self):
         """The cadence dial's middle stop: no YouTube videos. The counter can run as high as it
         likes and a video can be due — nothing is served, so TV and movies have the queue."""
