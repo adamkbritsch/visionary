@@ -320,6 +320,25 @@ class ProfileSevenRows(unittest.TestCase):
                 movies._refilter_lib()                              # the sweep's re-filter too
                 self.assertEqual([m["name"] for m in movies.peek_library()], [p7])
 
+    def test_a_dual_track_release_whose_name_and_manifest_miss_dv_is_still_a_p7_row(self):
+        """Spectre / Requiem for a Dream: 'REMUX HDR10 HEVC', DV only in the 1080p EL track."""
+        import companion, dvbook, plex
+        dual = "Spectre (2015) [2160p UHD BluRay REMUX HDR10 HEVC 10bit AC3 5.1]-NAHOM.mkv"
+        d = tempfile.mkdtemp()
+        with mock.patch.object(dvbook, "PROFILES_FILE", os.path.join(d, "p.json")), \
+             mock.patch.object(dvbook, "QUEUE_FILE", os.path.join(d, "q.json")):
+            dvbook.record_profile(dual, 48, 7, el="dual", src="rpu")
+            with mock.patch.object(movies, "list_movie_entries",
+                                   return_value=[{"name": dual, "dir": "/m", "bytes": 48}]), \
+                 mock.patch.object(movies, "load_movies_dv_manifest", return_value={dual: 0}), \
+                 mock.patch.object(plex, "movie_watched_map", return_value={}), \
+                 mock.patch.object(companion, "sweep_counterparts"), \
+                 mock.patch.object(companion, "counterparts", return_value={}), \
+                 mock.patch.dict(movies._CACHE, {}, clear=True):
+                (row,) = movies.refresh_library()
+        self.assertEqual((row["dv_profile"], row["dv_el"], row["has_dv"]), (7, "dual", True))
+        self.assertEqual(row["route"], movies.P7_ROUTE)
+
     def test_plain_rows_carry_no_profile(self):
         import companion, plex
         with mock.patch.object(movies, "list_movie_entries",

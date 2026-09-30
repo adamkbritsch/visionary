@@ -224,13 +224,17 @@ def _dv_row_visible(m, cmap) -> bool:
 P7_ROUTE = "DV 7 \u2192 8.1 \u00b7 no re-encode"
 
 
-def _p7_entry(m):
+def _p7_entry(m, p7map):
     """The profile book's entry when this row is a KNOWN Dolby Vision profile 7 movie, else None.
-    The listing carries FTP wire names; the book keys on real names (dvbook's docstring)."""
-    import dvbook
+    The listing carries FTP wire names; the book keys on real names (dvbook's docstring). A size
+    that differs from the classified one is a different file, so it no longer counts."""
     from transfer import display_name
-    e = dvbook.profile_of(display_name(m["name"]), m.get("bytes") or None)
-    return e if e and e.get("profile") == 7 else None
+    e = p7map.get(display_name(m["name"]))
+    if not e:
+        return None
+    if m.get("bytes") and e.get("size") not in (None, int(m["bytes"])):
+        return None
+    return e
 
 
 def _refilter_lib() -> None:
@@ -265,14 +269,21 @@ def refresh_library() -> list:
                                   if not (m["has_dv"] and has_atmos_name(m["name"]))],
                                  on_update=_refilter_lib)
     cmap = companion.counterparts()
+    import dvbook
+    p7map = dvbook.p7_names()
     lib = []
     for m in movies:
         # A KNOWN profile 7 movie is always listed, Atmos or not (user-dictated 2026-09-29): it is
         # not a combine candidate but a conversion — the Movies pane's "DV 7" filter queues it to
         # become profile 8.1 with no re-encode (dvlane.py). Every other DV row keeps the
-        # combine-only curation above.
-        p7 = _p7_entry(m) if m["has_dv"] else None
-        if m["has_dv"] and not p7 and not _dv_row_visible(m, cmap):
+        # combine-only curation above. Looked up for EVERY row, not only DV-badged ones: a
+        # dual-track release keeps its Dolby Vision in the 1080p EL track, so neither its name
+        # ("REMUX HDR10 HEVC") nor the manifest's first-stream probe says DV (Spectre, Requiem
+        # for a Dream — live-caught 2026-09-30). The book's RPU reading makes the row DV.
+        p7 = _p7_entry(m, p7map)
+        if p7:
+            m["has_dv"] = True
+        elif m["has_dv"] and not _dv_row_visible(m, cmap):
             continue
         lib.append({"name": m["name"], "dir": m["dir"], "title": m["title"],
                     "watched": m["watched"], "tags": m["tags"],
