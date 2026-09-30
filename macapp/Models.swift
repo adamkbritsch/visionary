@@ -276,8 +276,18 @@ struct DVQueueEntryDTO: Codable, Identifiable {
     var id: String { name ?? row ?? "" }
 }
 
+struct DVLinkDTO: Codable {             // the Mac's link to the NAS for the lane's transfers
+    var iface: String?       // "en12"
+    var wired: Bool?         // an Ethernet link was found and the transfers are bound to it
+    var kind: String?        // "Ethernet" / "Wi-Fi" / ...
+    var name: String?        // the network service's name ("Living Room 5G LAN")
+    var speed: String?       // "2.5 GbE"
+    var ip: String?
+}
+
 struct DVConvertDTO: Codable {
     var running: Bool?
+    var link: DVLinkDTO?     // nil until the lane has opened a connection
     var note: String?        // why the lane is idle: waiting for disk / for the NAS
     var fetch: DVLaneStepDTO?
     var ship: DVLaneStepDTO?

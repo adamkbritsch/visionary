@@ -12,9 +12,13 @@ its own two threads instead of taking the run thread's turn:
           refused if the original changed since it was read) -> Plex rescans the folder and
           re-analyzes the item
 
-so the next movie downloads while the last one uploads. No backup is kept (user-dictated
-2026-09-27); the original is only replaced after the new file has been verified twice, on the Mac
-and again where it sits on the NAS.
+ONE TRANSFER AT A TIME (user-dictated 2026-09-30: "it should only upload/download one thing at a
+time"): every download and upload passes through one first-come-first-served gate, so the NAS link
+and the NAS's disks and sshd serve a single stream. Only the local conversion overlaps a transfer —
+and first-come order is what makes that overlap happen: the fetch thread queues the next download
+while an upload is still running, so it goes next, and the movie just downloaded converts while the
+one before it uploads. No backup is kept (user-dictated 2026-09-27); the original is only replaced
+after the new file has been verified twice, on the Mac and again where it sits on the NAS.
 
 THE NAS COMES FIRST while anyone is watching Plex (user rule 2026-09-27: "every single precaution
 should be taken on the nas so that the cpu doesn't spike"). Every transfer is throttled to
@@ -33,6 +37,8 @@ conversion restarts, and a swap that happened just before a crash is recognized 
 """
 from __future__ import annotations
 
+import collections
+import contextlib
 import hashlib
 import os
 import shutil
@@ -53,7 +59,9 @@ THROTTLE_BPS = 25_000_000       # per transfer while anyone has a Plex session o
 SIZE_FACTOR = 2.8               # peak local footprint: the source + its bare video + the new file
 IDLE_POLL_SECS = 30
 PLEX_CACHE_SECS = 5             # both threads and every leg ask; Plex is asked at most this often
-SHIP_BACKLOG = 1                # converted files allowed to wait for the ship thread
+SHIP_BACKLOG = 2                # converted files allowed to wait for the ship thread: with one
+                                # transfer at a time the next download goes while the last movie
+                                # waits its turn to upload, so one must be allowed to wait
 
 
 def work_dir(host: str) -> str:
@@ -109,6 +117,49 @@ class _Cancelled(Exception):
     pass
 
 
+class _NoRoom(Exception):
+    """The disk budget no longer fits once the transfer's turn came — back to waiting for disk."""
+
+
+KEEP_ON_FAILURE = ("converted", "upload", "swap")   # a verified new file exists: worth a retry
+
+
+class TransferGate:
+    """At most one NAS transfer at a time, granted in the order it was asked for.
+
+    First-come order, not a plain Lock: with a Lock whichever thread the OS wakes wins, so an upload
+    could keep finishing and re-grabbing ahead of a download that has been waiting, or the other
+    way round. In order, neither side can be starved. A waiter that is stopped or cancelled leaves
+    the line without ever holding the gate."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._line = collections.deque()
+        self._busy = False
+        self.holder = None                 # what is transferring now, for the waiter's note
+
+    def acquire(self, what: str, check=None, poll: float = 1.0):
+        me = object()
+        with self._cv:
+            self._line.append(me)
+            try:
+                while self._busy or self._line[0] is not me:
+                    if check:
+                        check()            # raises to give up the place in line
+                    self._cv.wait(poll)
+            except BaseException:
+                self._line.remove(me)
+                self._cv.notify_all()
+                raise
+            self._line.popleft()
+            self._busy, self.holder = True, what
+
+    def release(self):
+        with self._cv:
+            self._busy, self.holder = False, None
+            self._cv.notify_all()
+
+
 class Lane:
     def __init__(self):
         self._lock = threading.RLock()
@@ -121,6 +172,7 @@ class Lane:
         self._plex_lock = threading.Lock()
         self._status = {"fetch": None, "ship": None}
         self._note = None
+        self._gate = TransferGate()
 
     # ---- lifecycle -----------------------------------------------------------------------
 
@@ -162,7 +214,9 @@ class Lane:
         q = dvbook.queue()
         def pub(st):
             return {k: v for k, v in st.items() if not k.startswith("_")} if st else None
+        import nas_link
         return {"running": self.running(), "note": self._note,
+                "link": nas_link.last(),          # the link the last connection chose (no probing)
                 "fetch": pub(self._status.get("fetch")), "ship": pub(self._status.get("ship")),
                 "summary": dvbook.summary(),
                 "queue": [{k: e.get(k) for k in ("name", "title", "bytes", "state", "phase", "el",
@@ -196,11 +250,21 @@ class Lane:
         return True
 
     def retry(self, name: str) -> bool:
+        """Put a failed movie back. It resumes where it failed when that is safe — a staged copy on
+        the NAS (swap) or a verified new file still on the Mac (converted/upload) — and starts over
+        otherwise. Annihilation failed on one SSH blip with 43 GB converted and ready (2026-09-30);
+        starting it over would have moved 90 GB again for nothing."""
         e = dvbook.entry(name)
         if not e or e.get("state") != dvbook.FAILED:
             return False
         self._failed_now.discard(name)
-        dvbook.update(name, state=dvbook.PENDING, phase=None, error=None)
+        out = os.path.join(work_dir(e["host"]), "p81.mkv")
+        have_out = os.path.exists(out) and os.path.getsize(out) == int(e.get("size_out") or -1)
+        if e.get("phase") == "swap" or (e.get("phase") in KEEP_ON_FAILURE and have_out):
+            dvbook.update(name, state=dvbook.ACTIVE, error=None)
+        else:
+            shutil.rmtree(work_dir(e["host"]), ignore_errors=True)
+            dvbook.update(name, state=dvbook.PENDING, phase=None, error=None)
         return True
 
     # ---- helpers -------------------------------------------------------------------------
@@ -247,14 +311,42 @@ class Lane:
         st = {"name": e["name"], "title": e.get("title") or e["name"], "phase": phase,
               "done": done, "total": total, "note": note,
               "throttled": bool(self._plex[1] is None or (self._plex[1] or {}).get("count"))}
-        if cur.get("name") == e["name"] and cur.get("phase") == phase and done is not None:
+        # The rate is measured from the first PROGRESS of this step. A status without progress (a
+        # waiting note) must not start the clock at 0 bytes, or a resumed transfer would open with
+        # its already-moved bytes counted as speed.
+        if (cur.get("name") == e["name"] and cur.get("phase") == phase and done is not None
+                and cur.get("_b0") is not None):
             t0, b0 = cur.get("_t0"), cur.get("_b0")
             st["_t0"], st["_b0"] = t0, b0
             if t0 and time.time() - t0 > 3:
                 st["rate"] = int((done - b0) / (time.time() - t0))
         else:
-            st["_t0"], st["_b0"] = time.time(), done or 0
+            st["_t0"], st["_b0"] = time.time(), done
         self._status[lane] = st
+
+    @contextlib.contextmanager
+    def _transfer(self, lane, e, phase, ev):
+        """Hold the one-transfer gate for a download or an upload. While waiting, the step says
+        what it is waiting behind, and a stop or a cancel gives up its place in line."""
+        title = e.get("title") or e["name"]
+        verb = "download" if phase == "download" else "upload"
+
+        def check():
+            self._check(e["name"], ev)
+            ahead = self._gate.holder
+            self._set(lane, e, phase, note=(f"waiting for the {ahead} to finish — one transfer at "
+                                            f"a time" if ahead else "waiting for its turn to transfer"))
+
+        self._gate.acquire(f"{verb} of {title}", check)
+        try:
+            # A stop or cancel can land while the waiter sleeps and the holder lets go in the same
+            # moment — the wait then ends without another check (review 2026-09-30). Re-check
+            # holding the gate, and clear the "waiting" note: from here this step IS the transfer.
+            self._check(e["name"], ev)
+            self._set(lane, e, phase)
+            yield
+        finally:
+            self._gate.release()
 
     def _offline(self, ex) -> bool:
         """A step that failed because the NAS dropped off the network (asleep, the Mac away from
@@ -269,8 +361,15 @@ class Lane:
         return True
 
     def _fail(self, e, why):
+        """Mark a movie failed. A verified new file (converted, uploading, staged) is KEPT so a
+        retry resumes from it instead of moving the movie twice more; anything earlier (a part
+        download, a half conversion) is deleted — it is not worth the disk while the movie waits
+        for someone to look at the reason."""
         self._failed_now.add(e["name"])
+        cur = dvbook.entry(e["name"]) or e
         dvbook.update(e["name"], state=dvbook.FAILED, error=str(why)[:400], failed=int(time.time()))
+        if cur.get("phase") not in KEEP_ON_FAILURE:
+            shutil.rmtree(work_dir(e["host"]), ignore_errors=True)
         logbook.failure(f"DV 7->8.1 {e.get('title') or e['name']}: {why}")
 
     def _clean(self, e):
@@ -282,9 +381,11 @@ class Lane:
                 pass
 
     def _sweep_orphans(self):
-        """Working folders of movies no longer queued (removed while the app was down)."""
-        keep = {os.path.basename(work_dir(e["host"])) for e in dvbook.queue()
-                if e.get("state") in (dvbook.PENDING, dvbook.ACTIVE) and e.get("host")}
+        """Working folders of movies no longer queued (removed while the app was down). A FAILED
+        movie's verified new file is not an orphan: a retry resumes from it."""
+        keep = {os.path.basename(work_dir(e["host"])) for e in dvbook.queue() if e.get("host") and (
+                    e.get("state") in (dvbook.PENDING, dvbook.ACTIVE)
+                    or (e.get("state") == dvbook.FAILED and e.get("phase") in KEEP_ON_FAILURE))}
         try:
             names = os.listdir(WORK_ROOT)
         except OSError:
@@ -330,12 +431,13 @@ class Lane:
             ev = self._event(e["name"])
             try:
                 self._fetch(e, ev)
-            except _Cancelled:
-                pass
+            except (_Cancelled, _NoRoom):
+                pass                     # _pick_fetch now says what it is waiting for
             except (nas_ssh.Stopped, dvp7.Aborted):
                 if self._abort.is_set():
                     return
             except Exception as ex:  # noqa: BLE001
+                self._status["fetch"] = None    # the panel shows the lane's note, not a dead step
                 if not self._offline(ex):
                     self._fail(e, ex)
             finally:
@@ -364,15 +466,20 @@ class Lane:
         dvbook.update(name, state=dvbook.ACTIVE, phase="download", expect_mtime=st[1], size_in=size,
                       started=e.get("started") or int(time.time()), error=None)
         self._check(name, ev)
-        logbook.event(f"DV 7->8.1 {e.get('title')}: downloading {size / 1e9:.1f} GB")
-        nas_ssh.download(host, src, size, abort=ev, limit=self._limit,
-                         on_progress=lambda b, t: self._set("fetch", e, "download", b, t))
+        with self._transfer("fetch", e, "download", ev):
+            # The budget was judged when the movie was picked; the turn to transfer can come a whole
+            # upload later, and the pipeline's own upscale writes to the same disk meanwhile.
+            if not fits(size, local_bytes(host), shutil.disk_usage(WORK_ROOT).free, _floor_bytes()):
+                raise _NoRoom(name)
+            logbook.event(f"DV 7->8.1 {e.get('title')}: downloading {size / 1e9:.1f} GB")
+            nas_ssh.download(host, src, size, abort=ev, limit=self._limit,
+                             on_progress=lambda b, t: self._set("fetch", e, "download", b, t))
+        self._set("fetch", e, "convert", 0, 100)      # the download row must not look live now
         self._check(name, ev)
         dvbook.update(name, phase="convert")
         # A fresh conversion makes any staged copy from an earlier attempt stale: mkvmerge writes a
         # new segment UID every time, so resuming an upload onto it would splice two files.
         nas_ssh.discard_stage(host)
-        self._set("fetch", e, "convert", 0, 100)
         try:
             res = dvp7.convert(src, out, os.path.join(d, "work"), abort=ev,
                                progress=lambda pct: self._set("fetch", e, "convert", pct, 100))
@@ -419,6 +526,7 @@ class Lane:
                 if self._abort.is_set():
                     return
             except Exception as ex:  # noqa: BLE001
+                self._status["ship"] = None    # the panel shows the lane's note, not a dead step
                 if not self._offline(ex):
                     self._fail(e, ex)
             finally:
@@ -443,9 +551,11 @@ class Lane:
                 return
             dvbook.update(name, phase="upload")
             self._check(name, ev)
-            logbook.event(f"DV 7->8.1 {e.get('title')}: uploading {size_out / 1e9:.1f} GB")
-            nas_ssh.upload(out, stage, abort=ev, limit=self._limit,
-                           on_progress=lambda b, t: self._set("ship", e, "upload", b, t))
+            with self._transfer("ship", e, "upload", ev):
+                logbook.event(f"DV 7->8.1 {e.get('title')}: uploading {size_out / 1e9:.1f} GB")
+                nas_ssh.upload(out, stage, abort=ev, limit=self._limit,
+                               on_progress=lambda b, t: self._set("ship", e, "upload", b, t))
+            self._set("ship", e, "swap", note="checking the uploaded copy on the NAS")
             prof = nas_ssh.remote_dv_profile(stage)
             if prof != 8:
                 nas_ssh.discard_stage(host)

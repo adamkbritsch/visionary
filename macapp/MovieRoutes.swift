@@ -145,6 +145,17 @@ enum DVConvert {
         }
     }
 
+    /// "Transfers over Ethernet · Living Room 5G LAN · 2.5 GbE", or the Wi-Fi fallback said
+    /// plainly. Empty until the lane has connected once.
+    static func linkLine(_ l: DVLinkDTO?) -> String {
+        guard let l, let iface = l.iface else { return "" }
+        if l.wired == true {
+            let parts = ["Transfers over Ethernet", l.name ?? iface, l.speed ?? ""].filter { !$0.isEmpty }
+            return parts.joined(separator: " · ")
+        }
+        return "Transfers over \(l.kind ?? iface) — no Ethernet link to the NAS"
+    }
+
     /// The header line: "12 of 210 converted · 96.4 GB saved · 3 failed"
     static func summaryLine(_ d: DVConvertDTO?) -> String {
         let by = d?.summary?.by_state ?? [:]

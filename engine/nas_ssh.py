@@ -21,7 +21,9 @@ the SSH user cannot chown to, so the rename runs as root in a one-second contain
 (the SSH user is in the docker group), with the numeric owner and mode read beforehand: alpine's
 busybox chown/chmod have no --reference. Nothing heavy runs on the NAS itself — reads and writes.
 
-PURE (unit-tested): ftp_to_host, host_to_plex, share_root, stage_path_for, swap_argv_inner.
+PURE (unit-tested): ftp_to_host, host_to_plex, share_root, stage_path_for, swap_argv_inner,
+ssh_argv_for. The link to the NAS is chosen in nas_link.py: the wired one, never Wi-Fi when a
+cable is there (user-dictated 2026-09-30).
 """
 from __future__ import annotations
 
@@ -114,21 +116,57 @@ def target():
     return f"{user}@{host}" if user else host
 
 
+def link():
+    """The link the transfers use to reach the NAS (nas_link.detect: the wired one when there is
+    one). Local commands only, cached."""
+    import nas_link
+    return nas_link.detect(target().rsplit("@", 1)[-1])
+
+
+def ssh_argv_for(tgt: str, ln) -> list:
+    """PURE: the ssh command line for `tgt` over link `ln`. IPv4 always — the NAS's mDNS name also
+    resolves to IPv6 link-local addresses, and ssh preferred one scoped to Wi-Fi (2026-09-30). On a
+    wired link: the NAS's IPv4 address, `-B <interface>` so the kernel cannot route it elsewhere,
+    and a connection-sharing socket named for that interface, so a master opened over Wi-Fi is never
+    reused once the Ethernet is up."""
+    user, _, host = tgt.rpartition("@")
+    iface = (ln or {}).get("iface") if (ln or {}).get("wired") else None
+    if (ln or {}).get("ip"):
+        host = ln["ip"]
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+            "-o", "AddressFamily=inet",
+            "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
+            "-o", f"ControlPath=/tmp/visionary-ssh-%r@%h:%p{'-' + iface if iface else ''}"]
+    if iface:
+        argv += ["-B", iface]
+    return argv + ["-c", "aes128-gcm@openssh.com", f"{user}@{host}" if user else host]
+
+
 def ssh_argv():
     if "unittest" in sys.modules:       # same rule as scratch and dvbook: a test never reaches out
         raise RuntimeError("a test tried to reach the NAS over SSH — mock it")
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
-            "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-            "-o", "ControlPath=/tmp/visionary-ssh-%r@%h:%p",
-            "-c", "aes128-gcm@openssh.com", target()]
+    return ssh_argv_for(target(), link())
 
 
-def remote(cmd: str, timeout=600) -> str:
-    r = subprocess.run(ssh_argv() + [cmd], capture_output=True, text=True, timeout=timeout)
-    if r.returncode != 0:
-        raise RuntimeError(f"NAS command failed ({r.returncode}): {cmd[:120]} :: {r.stderr.strip()[-300:]}")
-    return r.stdout
+SSH_FAILED = 255                        # ssh's own exit code: the connection, not the command
+RETRY_WAITS = (5, 20)                   # seconds before each retry of a connection failure
+
+
+def remote(cmd: str, timeout=600, retries=len(RETRY_WAITS)) -> str:
+    """Run one command on the NAS. A CONNECTION failure (exit 255 — a timed-out banner exchange,
+    a dropped link) is retried a couple of times before it counts: one such blip failed a movie
+    whose converted file was sitting ready to upload (Annihilation, 2026-09-30). Every command here
+    is safe to repeat except the swap's rename, which passes retries=0 and relies on the lane
+    recognizing a finished rename instead."""
+    for attempt in range(retries + 1):
+        r = subprocess.run(ssh_argv() + [cmd], capture_output=True, text=True, timeout=timeout)
+        if r.returncode == 0:
+            return r.stdout
+        if r.returncode != SSH_FAILED or attempt >= retries:
+            break
+        time.sleep(RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)])
+    raise RuntimeError(f"NAS command failed ({r.returncode}): {cmd[:120]} :: {r.stderr.strip()[-300:]}")
 
 
 def reachable(timeout=20) -> bool:
@@ -312,7 +350,7 @@ def swap(stage: str, host_path: str, *, expect_size: int, expect_mtime: int, new
     share = share_root(host_path)
     inner = swap_argv_inner(stage, host_path, st[2], st[3], st[4])
     remote(f"docker run --rm -v {shlex.quote(share)}:{shlex.quote(share)} {SWAP_IMAGE} "
-           f"sh -c {shlex.quote(inner)}", timeout=300)
+           f"sh -c {shlex.quote(inner)}", timeout=300, retries=0)
     after = stat(host_path)
     if not after or after[0] != new_size:
         raise RuntimeError("after the swap the NAS file has the wrong size")

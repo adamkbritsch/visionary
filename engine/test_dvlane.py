@@ -46,7 +46,7 @@ class Pure(unittest.TestCase):
         self.assertFalse(dvlane.swapped_already(None, False, 100, 90))   # gone: not ours
 
 
-class Steps(unittest.TestCase):
+class _Lane(unittest.TestCase):
     def setUp(self):
         d = tempfile.mkdtemp()
         self.patches = [mock.patch.object(dvbook, "PROFILES_FILE", os.path.join(d, "p.json")),
@@ -78,6 +78,16 @@ class Steps(unittest.TestCase):
             fh.write(b"n" * 90)
         return {"el": "FEL", "dual_track": False, "frames": 10, "size_out": 90}
 
+    def _converted(self):
+        d = dvlane.work_dir(HOST)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "p81.mkv"), "wb") as fh:
+            fh.write(b"n" * 90)
+        dvbook.update(NAME, state=dvbook.ACTIVE, phase="converted", size_in=100, size_out=90,
+                      expect_mtime=7)
+
+
+class Steps(_Lane):
     def test_fetch_converts_and_hands_off_without_keeping_the_source(self):
         with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
              mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
@@ -115,14 +125,6 @@ class Steps(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "profile 5"):
                 self.lane._fetch(self.e(), self.ev)
         self.assertFalse(dvbook.is_p7(NAME))          # never offered again
-
-    def _converted(self):
-        d = dvlane.work_dir(HOST)
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "p81.mkv"), "wb") as fh:
-            fh.write(b"n" * 90)
-        dvbook.update(NAME, state=dvbook.ACTIVE, phase="converted", size_in=100, size_out=90,
-                      expect_mtime=7)
 
     def test_ship_uploads_checks_and_swaps_then_records_profile_8(self):
         self._converted()
@@ -222,6 +224,205 @@ class Steps(unittest.TestCase):
             st = self.lane.status()
         self.assertEqual(st["queue"][0]["name"], NAME)
         self.assertEqual(st["summary"]["total"], 1)
+
+
+class Failures(_Lane):
+    """Annihilation (2026-09-30): one SSH blip failed it with 43 GB converted and ready."""
+
+    def test_a_failure_after_converting_keeps_the_file_and_retry_resumes_the_upload(self):
+        self._converted()
+        dvbook.update(NAME, phase="upload")
+        self.lane._fail(self.e(), "NAS command failed (255)")
+        out = os.path.join(dvlane.work_dir(HOST), "p81.mkv")
+        self.assertTrue(os.path.exists(out))
+        self.lane._sweep_orphans()                        # a relaunch must not delete it either
+        self.assertTrue(os.path.exists(out))
+        self.assertTrue(self.lane.retry(NAME))
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"], e.get("error")), (dvbook.ACTIVE, "upload", None))
+        self.assertEqual(self.lane._pick_ship()["name"], NAME)
+
+    def test_a_failure_before_converting_frees_the_disk_and_retry_starts_over(self):
+        d = dvlane.work_dir(HOST)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "source.mkv"), "wb") as fh:
+            fh.write(b"s" * 50)
+        dvbook.update(NAME, state=dvbook.ACTIVE, phase="download")
+        self.lane._fail(self.e(), "not on the NAS any more")
+        self.assertFalse(os.path.exists(d))
+        self.assertTrue(self.lane.retry(NAME))
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"]), (dvbook.PENDING, None))
+
+    def test_a_retry_whose_converted_file_is_gone_starts_over(self):
+        dvbook.update(NAME, state=dvbook.FAILED, phase="upload", size_out=90)
+        self.assertTrue(self.lane.retry(NAME))
+        self.assertIsNone(self.e()["phase"])
+
+    def test_a_staged_movie_resumes_at_the_swap_even_without_the_local_file(self):
+        dvbook.update(NAME, state=dvbook.FAILED, phase="swap", size_out=90)
+        self.assertTrue(self.lane.retry(NAME))
+        self.assertEqual((self.e()["state"], self.e()["phase"]), (dvbook.ACTIVE, "swap"))
+
+
+class OneTransferAtATime(unittest.TestCase):
+    """User-dictated 2026-09-30: "it should only upload/download one thing at a time"."""
+
+    def test_the_gate_serves_in_the_order_asked(self):
+        gate, order, started = dvlane.TransferGate(), [], []
+        gate.acquire("first")
+        def want(tag):
+            started.append(tag)
+            gate.acquire(tag, poll=0.01)
+            order.append(tag)
+            gate.release()
+        threads = []
+        for tag in ("second", "third", "fourth"):
+            t = threading.Thread(target=want, args=(tag,))
+            t.start()
+            threads.append(t)
+            while tag not in started:
+                pass
+            import time as _t
+            _t.sleep(0.05)                     # each is in line before the next asks
+        self.assertEqual(gate.holder, "first")
+        gate.release()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(order, ["second", "third", "fourth"])
+        self.assertIsNone(gate.holder)
+
+    def test_a_stopped_waiter_leaves_the_line_without_holding_up_the_next(self):
+        gate = dvlane.TransferGate()
+        gate.acquire("upload of A")
+        stop = threading.Event()
+        def check():
+            if stop.is_set():
+                raise nas_ssh.Stopped("stopped")
+        errs = []
+        def waiter():
+            try:
+                gate.acquire("download of B", check, poll=0.01)
+            except nas_ssh.Stopped as ex:
+                errs.append(ex)
+        t = threading.Thread(target=waiter)
+        t.start()
+        stop.set()
+        t.join(5)
+        self.assertEqual(len(errs), 1)
+        gate.release()
+        gate.acquire("download of C", poll=0.01)      # the line is not stuck behind B
+        self.assertEqual(gate.holder, "download of C")
+
+
+class LaneNeverOverlapsTransfers(_Lane):
+    def test_a_download_and_an_upload_queued_together_run_one_after_the_other(self):
+        """Movie A converted and uploading, movie B downloading — never both at once."""
+        import time as _t
+        other = "/volume1/Media/Movies/Other (1990) [2160p DV].mkv"
+        dvbook.seed([{"nas_path": other, "size_bytes": 100, "enhancement_layer": "MEL"}])
+        dvbook.add([{"name": os.path.basename(other), "title": "Other", "bytes": 100}])
+        self._converted()                                     # NAME is ready to upload
+        live, peak, log = [0], [0], []
+        guard = threading.Lock()
+        def busy(tag):
+            with guard:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                log.append(("start", tag))
+            _t.sleep(0.3)
+            with guard:
+                live[0] -= 1
+                log.append(("end", tag))
+        def fake_download(host, local, size, **kw):
+            busy("download")
+            with open(local, "wb") as fh:
+                fh.write(b"s" * size)
+        idle = {"count": 0, "files": set()}
+        with mock.patch.object(nas_ssh, "stat", side_effect=lambda p: None if p.endswith(".part")
+                               else (100, 7, 911, 10, "644")), \
+             mock.patch.object(nas_ssh, "download", side_effect=fake_download), \
+             mock.patch.object(nas_ssh, "upload", side_effect=lambda *a, **k: busy("upload")), \
+             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ssh, "discard_stage"), \
+             mock.patch.object(nas_ssh, "swap"), \
+             mock.patch.object(dvp7, "convert", side_effect=self._fake_convert), \
+             mock.patch.object(dvlane.plex, "session_detail", return_value=idle), \
+             mock.patch.object(dvlane.plex, "refresh_folder", return_value=True), \
+             mock.patch.object(dvlane.plex, "analyze", return_value=True):
+            b = dvbook.entry(os.path.basename(other))
+            t1 = threading.Thread(target=self.lane._ship, args=(self.e(), threading.Event()))
+            t2 = threading.Thread(target=self.lane._fetch, args=(b, threading.Event()))
+            t1.start(); t2.start()
+            t1.join(10); t2.join(10)
+        self.assertEqual(peak[0], 1, log)
+        self.assertEqual(sorted(x[1] for x in log if x[0] == "start"), ["download", "upload"])
+        self.assertEqual(self.e()["state"], dvbook.DONE)
+        self.assertEqual(dvbook.entry(os.path.basename(other))["phase"], "converted")
+
+    def test_the_waiting_step_says_what_it_waits_behind(self):
+        self.lane._gate.acquire("upload of Casino Royale (2006)")
+        stop = threading.Event()
+        seen = []
+        def watch():
+            while not stop.is_set():
+                st = self.lane._status.get("fetch")
+                if st and st.get("note"):
+                    seen.append(st["note"])
+                    stop.set()
+        w = threading.Thread(target=watch)
+        w.start()
+        with self.assertRaises(nas_ssh.Stopped):
+            with self.lane._transfer("fetch", self.e(), "download", stop):
+                pass
+        w.join(5)
+        self.lane._gate.release()
+        self.assertIn("waiting for the upload of Casino Royale (2006) to finish", seen[0])
+
+    def test_the_waiting_note_is_cleared_the_moment_the_turn_comes(self):
+        with self.lane._transfer("fetch", self.e(), "download", threading.Event()):
+            st = self.lane._status["fetch"]
+            self.assertIsNone(st["note"])
+            self.assertEqual(st["phase"], "download")
+
+    def test_a_stop_that_lands_as_the_turn_comes_starts_no_transfer(self):
+        stop = threading.Event()
+        stop.set()                       # already stopped when the gate is granted
+        ran = []
+        with self.assertRaises(nas_ssh.Stopped):
+            with self.lane._transfer("fetch", self.e(), "download", stop):
+                ran.append(1)
+        self.assertEqual(ran, [])
+        self.assertIsNone(self.lane._gate.holder)       # and the gate is free again
+
+    def test_no_room_by_the_time_the_turn_comes_means_no_download(self):
+        with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
+             mock.patch.object(dvlane, "fits", return_value=False), \
+             mock.patch.object(nas_ssh, "download", side_effect=AssertionError("no room")):
+            with self.assertRaises(dvlane._NoRoom):
+                self.lane._fetch(self.e(), self.ev)
+        self.assertIsNone(self.lane._gate.holder)
+
+    def test_after_the_upload_the_row_no_longer_reads_as_a_transfer(self):
+        self._converted()
+        seen = []
+        def prof(stage):
+            seen.append(dict(self.lane._status["ship"]))
+            return 8
+        with mock.patch.object(nas_ssh, "upload"), \
+             mock.patch.object(nas_ssh, "remote_dv_profile", side_effect=prof), \
+             mock.patch.object(nas_ssh, "swap"), \
+             mock.patch.object(dvlane.plex, "session_detail", return_value=None), \
+             mock.patch.object(self.lane, "_wait", side_effect=lambda s: True):
+            with self.assertRaises(nas_ssh.Stopped):
+                self.lane._ship(self.e(), threading.Event())
+        self.assertNotEqual(seen[0]["phase"], "upload")
+        self.assertIsNone(seen[0].get("rate"))
+
+    def test_a_waiting_note_does_not_poison_the_rate(self):
+        self.lane._set("fetch", self.e(), "download", note="waiting")
+        self.lane._set("fetch", self.e(), "download", 30_000_000_000, 40_000_000_000)
+        self.assertEqual(self.lane._status["fetch"]["_b0"], 30_000_000_000)
 
 
 if __name__ == "__main__":

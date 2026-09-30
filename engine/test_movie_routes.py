@@ -98,6 +98,16 @@ let vis = DVConvert.visible(many, pendingShown: 5).map { $0.name! }
 check(vis.first == "P7a.mkv" && vis.contains("Gone.mkv") && !vis.contains("P7b.mkv")
       && vis.count == 2 + 5, "visible -> \(vis)")
 
+// the link the transfers use
+var wired = DVLinkDTO(); wired.iface = "en12"; wired.wired = true; wired.kind = "Ethernet"
+wired.name = "Living Room 5G LAN"; wired.speed = "2.5 GbE"
+check(DVConvert.linkLine(wired) == "Transfers over Ethernet · Living Room 5G LAN · 2.5 GbE",
+      "wired -> \(DVConvert.linkLine(wired))")
+var air = DVLinkDTO(); air.iface = "en0"; air.wired = false; air.kind = "Wi-Fi"
+check(DVConvert.linkLine(air) == "Transfers over Wi-Fi — no Ethernet link to the NAS",
+      "wifi -> \(DVConvert.linkLine(air))")
+check(DVConvert.linkLine(nil) == "", "no link yet -> nothing shown")
+
 if failures.isEmpty { print("OK") } else { for f in failures { print("FAIL: \(f)") } }
 '''
 

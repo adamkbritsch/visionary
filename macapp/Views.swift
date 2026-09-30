@@ -2764,7 +2764,11 @@ private struct DVConvertPanel: View {
                 Spacer()
                 Text(DVConvert.summaryLine(dv)).font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            if let note = dv?.note, !note.isEmpty, dv?.fetch == nil {
+            let link = DVConvert.linkLine(dv?.link)
+            if !link.isEmpty {
+                Text(link).font(.system(size: 11)).foregroundStyle(DS.steelDim)
+            }
+            if let note = dv?.note, !note.isEmpty, dv?.fetch == nil || note.hasPrefix("waiting for the NAS") {
                 Text(note.prefix(1).uppercased() + note.dropFirst())
                     .font(.system(size: 11)).foregroundStyle(DS.steelDim)
             }

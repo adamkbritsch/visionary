@@ -97,6 +97,68 @@ class Leg(unittest.TestCase):
         self.assertTrue(naps and all(0 < n <= nas_ssh.LIMIT_POLL_SECS for n in naps))
 
 
+class ConnectionBlips(unittest.TestCase):
+    def _r(self, rc, out="", err=""):
+        return mock.Mock(returncode=rc, stdout=out, stderr=err)
+
+    def test_a_connection_failure_is_retried_then_succeeds(self):
+        runs = [self._r(255, err="Connection timed out during banner exchange"), self._r(0, "ok")]
+        with mock.patch.object(nas_ssh, "ssh_argv", return_value=["ssh"]), \
+             mock.patch.object(nas_ssh.subprocess, "run", side_effect=runs) as run, \
+             mock.patch.object(nas_ssh.time, "sleep") as nap:
+            self.assertEqual(nas_ssh.remote("stat x"), "ok")
+        self.assertEqual(run.call_count, 2)
+        nap.assert_called_once_with(nas_ssh.RETRY_WAITS[0])
+
+    def test_a_command_failure_is_not_retried(self):
+        with mock.patch.object(nas_ssh, "ssh_argv", return_value=["ssh"]), \
+             mock.patch.object(nas_ssh.subprocess, "run", return_value=self._r(1, err="no")) as run, \
+             mock.patch.object(nas_ssh.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, r"failed \(1\)"):
+                nas_ssh.remote("false")
+        self.assertEqual(run.call_count, 1)
+
+    def test_it_gives_up_after_the_retries(self):
+        with mock.patch.object(nas_ssh, "ssh_argv", return_value=["ssh"]), \
+             mock.patch.object(nas_ssh.subprocess, "run", return_value=self._r(255)) as run, \
+             mock.patch.object(nas_ssh.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, r"failed \(255\)"):
+                nas_ssh.remote("stat x")
+        self.assertEqual(run.call_count, len(nas_ssh.RETRY_WAITS) + 1)
+
+    def test_the_rename_is_never_repeated(self):
+        with mock.patch.object(nas_ssh, "stat", side_effect=[(100, 5, 911, 10, "644")]), \
+             mock.patch.object(nas_ssh, "ssh_argv", return_value=["ssh"]), \
+             mock.patch.object(nas_ssh.subprocess, "run", return_value=self._r(255)) as run, \
+             mock.patch.object(nas_ssh.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                nas_ssh.swap("/volume1/Media/_claude-tmp/k.part", "/volume1/Media/Movies/a.mkv",
+                             expect_size=100, expect_mtime=5, new_size=90)
+        self.assertEqual(run.call_count, 1)
+
+
+class SshCommandLine(unittest.TestCase):
+    WIRED = {"iface": "en12", "wired": True, "kind": "Ethernet", "ip": "192.168.1.195"}
+
+    def test_a_wired_link_is_pinned_by_interface_and_address(self):
+        a = nas_ssh.ssh_argv_for("adamkbritsch@adamsnas.local", self.WIRED)
+        self.assertEqual(a[a.index("-B") + 1], "en12")
+        self.assertEqual(a[-1], "adamkbritsch@192.168.1.195")
+        self.assertIn("AddressFamily=inet", a)
+        self.assertTrue(any(x.startswith("ControlPath=") and x.endswith("-en12") for x in a))
+
+    def test_without_a_wired_link_it_still_refuses_ipv6_but_binds_nothing(self):
+        a = nas_ssh.ssh_argv_for("adamkbritsch@adamsnas.local",
+                                 {"iface": "en0", "wired": False, "kind": "Wi-Fi", "ip": None})
+        self.assertNotIn("-B", a)
+        self.assertIn("AddressFamily=inet", a)
+        self.assertEqual(a[-1], "adamkbritsch@adamsnas.local")
+        self.assertTrue(any(x == "ControlPath=/tmp/visionary-ssh-%r@%h:%p" for x in a))
+
+    def test_no_detection_at_all(self):
+        self.assertEqual(nas_ssh.ssh_argv_for("nas", None)[-1], "nas")
+
+
 class NeverFromATest(unittest.TestCase):
     def test_a_test_cannot_open_an_ssh_connection(self):
         with self.assertRaisesRegex(RuntimeError, "mock it"):
