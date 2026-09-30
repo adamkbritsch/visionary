@@ -369,6 +369,9 @@ class Lane:
                          on_progress=lambda b, t: self._set("fetch", e, "download", b, t))
         self._check(name, ev)
         dvbook.update(name, phase="convert")
+        # A fresh conversion makes any staged copy from an earlier attempt stale: mkvmerge writes a
+        # new segment UID every time, so resuming an upload onto it would splice two files.
+        nas_ssh.discard_stage(host)
         self._set("fetch", e, "convert", 0, 100)
         try:
             res = dvp7.convert(src, out, os.path.join(d, "work"), abort=ev,
@@ -382,9 +385,11 @@ class Lane:
         except dvp7.NotP7 as why:
             dvbook.record_profile(name, size, None, src="rpu", host=host)
             raise RuntimeError(str(why))
-        os.remove(src)                     # the NAS original is still intact; the local copy is spent
+        # Record first, THEN drop the source: a crash between the two must not send a converted
+        # movie back to be downloaded again.
         dvbook.update(name, phase="converted", size_out=res["size_out"], frames=res["frames"],
                       el=res.get("el") or e.get("el"), dual_track=res.get("dual_track"))
+        os.remove(src)                     # the NAS original is still intact; the local copy is spent
         logbook.event(f"DV 7->8.1 {e.get('title')}: converted and verified "
                       f"({size / 1e9:.1f} -> {res['size_out'] / 1e9:.1f} GB)")
 

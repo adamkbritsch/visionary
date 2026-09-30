@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 
 CHUNK = 8 * 1024 * 1024
@@ -114,6 +115,8 @@ def target():
 
 
 def ssh_argv():
+    if "unittest" in sys.modules:       # same rule as scratch and dvbook: a test never reaches out
+        raise RuntimeError("a test tried to reach the NAS over SSH — mock it")
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
             "-o", "ControlMaster=auto", "-o", "ControlPersist=120",

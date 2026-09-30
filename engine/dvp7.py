@@ -32,6 +32,7 @@ FFPROBE = "/opt/homebrew/bin/ffprobe"
 DOVI = "/opt/homebrew/bin/dovi_tool"
 MKVMERGE = "/opt/homebrew/bin/mkvmerge"
 DURATION_SLACK_NS = 100e6       # the new file's duration may differ by at most 100 ms
+NICE = 10                       # below the pipeline's own x265 remux, which shares these cores
 
 
 class AlreadyP8(Exception):
@@ -56,6 +57,10 @@ def _run(cmd, *, abort=None, timeout=None, shell=False):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          shell=shell, executable=("/bin/bash" if shell else None),
                          start_new_session=True)
+    try:        # the whole new process group — a pipeline's later children inherit it
+        os.setpriority(os.PRIO_PGRP, p.pid, NICE)
+    except OSError:
+        pass
     t0 = time.time()
     while True:
         try:

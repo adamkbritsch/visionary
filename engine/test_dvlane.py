@@ -81,8 +81,10 @@ class Steps(unittest.TestCase):
     def test_fetch_converts_and_hands_off_without_keeping_the_source(self):
         with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
              mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ssh, "discard_stage") as disc, \
              mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
             self.lane._fetch(self.e(), self.ev)
+        disc.assert_called_once_with(HOST)            # no stale staged copy survives a re-convert
         e = self.e()
         self.assertEqual((e["state"], e["phase"], e["size_out"], e["expect_mtime"]),
                          (dvbook.ACTIVE, "converted", 90, 7))
@@ -108,6 +110,7 @@ class Steps(unittest.TestCase):
     def test_a_file_that_is_not_p7_after_all_fails_with_the_reason(self):
         with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
              mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ssh, "discard_stage"), \
              mock.patch.object(dvp7, "convert", side_effect=dvp7.NotP7("reads profile 5")):
             with self.assertRaisesRegex(RuntimeError, "profile 5"):
                 self.lane._fetch(self.e(), self.ev)

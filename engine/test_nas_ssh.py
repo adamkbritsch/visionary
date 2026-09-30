@@ -97,5 +97,11 @@ class Leg(unittest.TestCase):
         self.assertTrue(naps and all(0 < n <= nas_ssh.LIMIT_POLL_SECS for n in naps))
 
 
+class NeverFromATest(unittest.TestCase):
+    def test_a_test_cannot_open_an_ssh_connection(self):
+        with self.assertRaisesRegex(RuntimeError, "mock it"):
+            nas_ssh.ssh_argv()
+
+
 if __name__ == "__main__":
     unittest.main()
