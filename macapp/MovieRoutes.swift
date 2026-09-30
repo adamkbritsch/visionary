@@ -4,45 +4,47 @@ import Foundation
 // this file with Models.swift and RUN them (the Cadence.swift pattern: the dial shipped broken
 // twice when it could only be read, never executed).
 
-/// WHAT THE PIPELINE WILL DO WITH A MOVIE, as far as the row can know before it is probed.
+/// WHAT THE SOURCE FILE IS, as far as its release name says before it is probed.
 ///
-/// These read the SAME filename-parsed tags the row already shows in its own `pipelineHint`
-/// ("4K · HDR · HEVC — fast path ~2.5× runtime"), so a chip predicts a path, it does not
-/// promise one: the real routing is decided by plan.choose_plan AFTER the source is probed.
-/// Judged on `tags` rather than `route`, because route_hint only has two values and cannot
-/// separate the passthrough (no re-encode at all) from the 4K SDR conversion.
+/// The chips are named for the INPUT — 4K HDR10, 4K SDR, 1080p & below, DV 7 — not for the route
+/// the pipeline will take (user-dictated 2026-09-30; they used to read Passthrough / Convert /
+/// Upscale). What the pipeline will DO with each kind is still said, in the chip's tooltip.
+/// They read the SAME filename-parsed tags the row already shows in its own `pipelineHint`
+/// ("4K · HDR · HEVC — fast path ~2.5× runtime"), so a chip describes the name, not a probe:
+/// the real routing is decided by plan.choose_plan AFTER the source is probed.
 ///
-/// A row that is ALREADY Dolby Vision takes none of the three upscale paths — the pipeline refuses
-/// a DV source — so it is never counted under them. (Before the DV 7 filter every such row fell
-/// under Convert: the name tag "DV" replaces "HDR", so a 4K DV remux read as 4K SDR.)
+/// A row that is ALREADY Dolby Vision is in none of the first three — the pipeline refuses a DV
+/// source — so it is never counted under them. (Before the DV 7 filter every such row fell under
+/// 4K SDR: the name tag "DV" replaces "HDR", so a 4K DV remux read as 4K SDR.)
 enum MovieFilter: String, CaseIterable {
-    case all, passthrough, convert, upscale, dvP7, unwatched
+    case all, uhdHDR10, uhdSDR, hdAndBelow, dvP7, unwatched
 
     var label: String {
         switch self {
-        case .all:         return "All"
-        case .passthrough: return "Passthrough"
-        case .convert:     return "Convert"
-        case .upscale:     return "Upscale"
-        case .dvP7:        return "DV 7"
-        case .unwatched:   return "Unwatched"
+        case .all:        return "All"
+        case .uhdHDR10:   return "4K HDR10"
+        case .uhdSDR:     return "4K SDR"
+        case .hdAndBelow: return "1080p & below"
+        case .dvP7:       return "DV 7"
+        case .unwatched:  return "Unwatched"
         }
     }
 
-    /// What the chip means, for the tooltip — the counts alone don't say why you'd pick one.
+    /// What the chip holds and what happens to it, for the tooltip.
     var hint: String {
         switch self {
-        case .all:         return "Every movie the library can offer"
-        case .passthrough: return "4K HDR — the original stream is kept and only the Dolby "
-                                + "Vision layer is added, so these are the quick ones"
-        case .convert:     return "4K without HDR — Resolve converts it, so the video is "
-                                + "re-encoded under the peak cap"
-        case .upscale:     return "1080p and below — a full Topaz upscale, roughly 5× runtime"
-        case .dvP7:        return "Dolby Vision profile 7 — becomes profile 8.1 in place, under "
-                                + "the same name. The HDR10 video is copied bit for bit and only "
-                                + "the Dolby Vision metadata is rewritten: no Topaz, no Resolve, "
-                                + "no re-encode"
-        case .unwatched:   return "Not yet watched, according to Plex"
+        case .all:        return "Every movie the library can offer"
+        case .uhdHDR10:   return "4K HDR10 (or HDR10+) sources — the original stream is kept and "
+                               + "only the Dolby Vision layer is added, so these are the quick ones"
+        case .uhdSDR:     return "4K SDR sources — Resolve converts them to HDR, so the video is "
+                               + "re-encoded under the peak cap"
+        case .hdAndBelow: return "1080p, 720p and SD sources — a full Topaz upscale to 4K, roughly "
+                               + "5× runtime"
+        case .dvP7:       return "Dolby Vision profile 7 sources — become profile 8.1 in place, "
+                               + "under the same name. The HDR10 video is copied bit for bit and "
+                               + "only the Dolby Vision metadata is rewritten: no Topaz, no "
+                               + "Resolve, no re-encode"
+        case .unwatched:  return "Not yet watched, according to Plex"
         }
     }
 
@@ -50,12 +52,12 @@ enum MovieFilter: String, CaseIterable {
         let t = Set(m.tags ?? [])
         let dv = m.has_dv == true
         switch self {
-        case .all:         return true
-        case .passthrough: return !dv && t.contains("4K") && t.contains("HDR")
-        case .convert:     return !dv && t.contains("4K") && !t.contains("HDR")
-        case .upscale:     return !dv && !t.contains("4K")
-        case .dvP7:        return m.dv_profile == 7
-        case .unwatched:   return m.watched != true
+        case .all:        return true
+        case .uhdHDR10:   return !dv && t.contains("4K") && t.contains("HDR")
+        case .uhdSDR:     return !dv && t.contains("4K") && !t.contains("HDR")
+        case .hdAndBelow: return !dv && !t.contains("4K")
+        case .dvP7:       return m.dv_profile == 7
+        case .unwatched:  return m.watched != true
         }
     }
 }

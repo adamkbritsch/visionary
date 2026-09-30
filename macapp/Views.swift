@@ -2560,6 +2560,10 @@ private struct MovieFilterBar: View {
                 Text("\(n)").font(.system(size: 11, weight: .medium))
                     .foregroundStyle(on ? DS.steel : DS.steelDim.opacity(0.7))
             }
+            // Named for the source now ("1080p & below"), so the labels are longer than the old
+            // route names: a label keeps its own width and never truncates; spare room is shared.
+            .fixedSize()
+            .padding(.horizontal, 6)
             .foregroundStyle(on ? DS.steelBright : DS.steelDim)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 5)

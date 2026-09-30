@@ -42,9 +42,13 @@ check(names(.dvP7) == ["P7a.mkv", "P7b.mkv", "P7c.mkv"], "dvP7 -> \(names(.dvP7)
 check(MovieFilter.dvP7.label == "DV 7", "chip label")
 // ...and no DV row inflates an upscale chip any more (the "DV" tag replaces "HDR", so every 4K
 // DV row used to count as a 4K SDR Convert).
-check(names(.convert) == ["Plain4KSDR.mkv"], "convert -> \(names(.convert))")
-check(names(.passthrough) == ["Plain4KHDR.mkv"], "passthrough -> \(names(.passthrough))")
-check(names(.upscale) == ["Plain1080.mkv"], "upscale -> \(names(.upscale))")
+check(names(.uhdSDR) == ["Plain4KSDR.mkv"], "4K SDR -> \(names(.uhdSDR))")
+check(names(.uhdHDR10) == ["Plain4KHDR.mkv"], "4K HDR10 -> \(names(.uhdHDR10))")
+check(names(.hdAndBelow) == ["Plain1080.mkv"], "1080p & below -> \(names(.hdAndBelow))")
+// the chips are named for what the SOURCE is (user-dictated 2026-09-30), in this order
+check(MovieFilter.allCases.map { $0.label }
+      == ["All", "4K HDR10", "4K SDR", "1080p & below", "DV 7", "Unwatched"],
+      "labels -> \(MovieFilter.allCases.map { $0.label })")
 check(names(.all).count == lib.count, "all")
 check(names(.unwatched).count == lib.count - 1, "unwatched")
 
