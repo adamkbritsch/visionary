@@ -1,0 +1,21 @@
+<svg viewBox="0 0 684.42 384.05" xmlns="http://www.w3.org/2000/svg">
+  <!-- The Visionary mark (docs/assets/visionary-logo.svg), in the app's steel badge gradient:
+       one gradient across the whole mark (userSpaceOnUse), so the V and its serifs shade with the
+       frame instead of each restarting it. -->
+  <defs>
+    <linearGradient id="g" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="384.05">
+      <stop offset="0" stop-color="#EDEEF0"/>
+      <stop offset="1" stop-color="#6B87AE"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#g)">
+    <path d="M0,0v384.05h684.42V0H0ZM637.16,353.95H47.26V30.1h589.9v323.85Z"/>
+    <path d="M146.47,27.52h111.12l81.42,206.73L420.43,27.52h109.07l-145.43,329h-92.17L146.47,27.52Z"/>
+    <path d="M404.74,313.18c0-4.05.67-7.96,1.89-11.66h-30.32v54.99h72.76v-2.94c-24.48,0-44.33-18.09-44.33-40.4Z"/>
+    <path d="M269.51,313.18c0-4.05-.67-7.96-1.89-11.66h30.32v54.99h-72.76v-2.94c24.48,0,44.33-18.09,44.33-40.4Z"/>
+    <path d="M414.22,41.06c0,1.19-.2,2.34-.56,3.42h8.91v-16.15h-21.37v.86c7.19,0,13.02,5.31,13.02,11.87Z"/>
+    <path d="M263.67,41.06c0,1.19.2,2.34.56,3.42h-8.91v-16.15h21.37v.86c-7.19,0-13.02,5.31-13.02,11.87Z"/>
+    <path d="M537.77,29.18v-7.16h-21.21v15.05h8.63c1.94-4.61,6.83-7.89,12.58-7.89Z"/>
+    <path d="M138.23,29.17v-7.16h21.21v15.05h-8.63c-1.94-4.61-6.83-7.89-12.58-7.89Z"/>
+  </g>
+</svg>

@@ -1,25 +1,25 @@
 <p align="center">
-  <img src="docs/assets/visionary-lockup-v5.png" alt="Visionary" width="340">
+  <img src="docs/assets/visionary-lockup-v6.png" alt="Visionary" width="420">
 </p>
 
-**An overnight appliance that upscales your Plex library to 4K Dolby Vision — unattended.**
+**An overnight appliance that upscales your Plex library to 4K Dolby Vision™ — unattended.**
 
 Point Visionary at your TV shows, movies and YouTube channels, arm it, and walk away. It
-takes each one through Topaz Video AI, grades a **real Dolby Vision 8.1 master in DaVinci
+takes each one through Topaz Video AI, grades a **real Dolby Vision™ 8.1 master in DaVinci
 Resolve** — an actual per-shot DV grade, not an HDR tone-map — encodes a peak-capped x265,
 and files it back into your library in place of the 1080p original (or beside it, your
 call). Then it starts the next one. It stays out of your way while you're watching Plex,
 refuses to run on a machine that can't sustain the power draw, and picks up mid-episode
 after a restart without redoing finished work.
 
-The Dolby Vision step is the one that normally can't be automated at all. Resolve's
+The Dolby Vision™ step is the one that normally can't be automated at all. Resolve's
 *Analyze All Shots* cannot be driven by script, so Visionary clicks it — by matching a
 picture of the button against the live screen. That is why it pins exact Resolve and Topaz
 builds and asks for a Retina display, and it is what separates the output from the usual
 "HDR-ish" upscale.
 
 **See it on real footage:** [download the sample stills](https://github.com/adamkbritsch/visionary/releases/download/samples-lost-s01e01/visionary-lost-s01e01-samples.zip)
-— six moments from the pilot of *Lost*, upscaled from 1080p to 4K Dolby Vision and set against the
+— six moments from the pilot of *Lost*, upscaled from 1080p to 4K Dolby Vision™ and set against the
 original as side-by-sides, zoomed crops and isolated frames. One 106 MB zip of the whole folder; the
 HDR images are AVIF and need an HDR screen to show their highlights. Or [browse them](docs/samples/lost-s01e01).
 
@@ -28,9 +28,9 @@ Optionally, AI border extension fills 4:3 shows out to 16:9 before upscaling.
 Arm it in the evening; wake up to finished episodes.
 
 <p align="center">
-  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one upscaling in Topaz while the previous one's Dolby Vision remux runs beside it" width="820">
+  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one upscaling in Topaz while the previous one's Dolby Vision™ remux runs beside it" width="820">
 </p>
-<p align="center"><sub><b>Two episodes in flight at once</b> — S05E02 upscaling in Topaz while S05E01's Dolby Vision remux runs beside it, each with its own segmented, resumable progress and its own estimate.</sub></p>
+<p align="center"><sub><b>Two episodes in flight at once</b> — S05E02 upscaling in Topaz while S05E01's Dolby Vision™ remux runs beside it, each with its own segmented, resumable progress and its own estimate.</sub></p>
 
 > [!IMPORTANT]
 > **Visionary drives the DaVinci Resolve interface by looking at the screen, and runs the
@@ -47,7 +47,7 @@ Arm it in the evening; wake up to finished episodes.
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
 > | AI border extension | **optional.** Requires the **[Comfy Desktop](https://www.comfy.org/) app** (run once so it builds its ComfyUI + venv — a hand-cloned ComfyUI is not detected), its **ComfyUI-VideoHelperSuite** node from Manager, and ~11.4 GB of WAN 2.1 models Visionary downloads for you from Settings → Setup. Without all of it, everything else works unchanged — the feature simply never appears. See [step 11](#11-ai-border-extension--optional-only-for-43-shows). |
 >
-> **Why the display rule?** Dolby Vision's "Analyze All Shots" button can't be clicked by
+> **Why the display rule?** Dolby Vision™'s "Analyze All Shots" button can't be clicked by
 > script, so Visionary finds it by matching a picture of the button against the screen.
 > Every Retina screen draws that button at the same size, so it works on any of them —
 > the monitor's size and shape barely matter (anything at least 1280×720 points: every
@@ -185,9 +185,9 @@ Quit Resolve if it's open, then:
 /usr/bin/python3 setup/import_resolve.py
 ```
 
-This merges the **OvernightDV** render preset (it carries the Dolby Vision 8.1 profile —
+This merges the **OvernightDV** render preset (it carries the Dolby Vision™ 8.1 profile —
 the one setting with no scripting API) into your global preset list, launches Resolve,
-imports the three persistent projects (the DV1000/DV2000 Dolby Vision outputs + the
+imports the three persistent projects (the DV1000/DV2000 Dolby Vision™ outputs + the
 SDR output) from `bundle/resolve/`, and verifies them. Optional: import `bundle/topaz/*.json` in Topaz's GUI (File → Import
 preset) — reference only; the pipeline embeds its Topaz parameters.
 
@@ -210,7 +210,7 @@ python3 engine/preflight.py --network
 ```
 
 FTP must connect; Plex, if you configured it, must answer (it's optional). Optional NAS extras: [nas/dv_probe.py](nas/README.md)
-(precise Dolby Vision detection for pre-existing DV content) and
+(precise Dolby Vision™ detection for pre-existing DV content) and
 [youtarr](https://github.com/DialmasterOrg/Youtarr) (enables the YouTube mode — without it
 that mode simply stays off).
 
@@ -222,7 +222,7 @@ python3 engine/preflight.py --network --post-setup
 
 All green → open Visionary, pick a show, press **Activate**, and watch one episode flow
 through download → topaz → resolve → remux → upload. The first resolve stage takes the
-screen for ~10-15 minutes — that's the Dolby Vision analysis (there's a Screen Control
+screen for ~10-15 minutes — that's the Dolby Vision™ analysis (there's a Screen Control
 button to defer it while you're using the Mac).
 
 ### 11. AI border extension — OPTIONAL, only for 4:3 shows
@@ -263,7 +263,7 @@ NAS (FTP) ──download──▶ local scratch
                         Topaz Video AI (bundled ffmpeg, prob-4) — 1080p → 4K ProRes chunks
                           ▼
                         DaVinci Resolve Studio (scripted + screen automation)
-                          │  scene cuts → Dolby Vision "Analyze All Shots" → DV 8.1 render
+                          │  scene cuts → Dolby Vision™ "Analyze All Shots" → DV 8.1 render
                           ▼
                         remux — x265 re-encode under a hard peak-bitrate cap (native DV RPU),
                           │  original audio folded back + smart loudness boost, hvc1 mp4
@@ -282,7 +282,7 @@ for the *suggestion* shown in the app before a file has been downloaded.
 
 ```mermaid
 flowchart TD
-    S["source on the NAS"] --> DV{"already<br/>Dolby Vision?"}
+    S["source on the NAS"] --> DV{"already<br/>Dolby Vision™?"}
     DV -->|yes| SKIP["skip<br/>not processed"]
     DV -->|no| FOURK{"4K?"}
     FOURK -->|no| UPS["upscale"]
@@ -307,7 +307,7 @@ flowchart TD
 | 4K SDR ≥ 12 Mbps | skipped | adds HDR + DV, 1000 nits | capped x265 | yes |
 | 4K, VFR or under threshold | 1× clean pass | adds (HDR+)DV | capped x265 | yes |
 | 1080p and below | upscale to 4K | adds (HDR+)DV, 1000 nits | capped x265 | yes |
-| already Dolby Vision | — | — | — | filtered out of the queue up front; a slip-through is refused at the Topaz stage — never mastered or uploaded |
+| already Dolby Vision™ | — | — | — | filtered out of the queue up front; a slip-through is refused at the Topaz stage — never mastered or uploaded |
 
 **YouTube videos take their own route**, whatever their resolution: Topaz is skipped and
 Resolve does the scaling (SuperScale doubles a 1080p source), so a video spends minutes in
@@ -319,7 +319,7 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 <p align="center">
   <img src="docs/assets/before-after-4k.png" alt="Before/after: a 1080p source frame vs Visionary's 4K upscale, cropped equally" width="880">
 </p>
-<p align="center"><sub><b>1080p source vs Visionary's 4K master</b> — same frame, cropped equally (colour-matched to isolate the resolution gain; the master is also Dolby Vision).</sub></p>
+<p align="center"><sub><b>1080p source vs Visionary's 4K master</b> — same frame, cropped equally (colour-matched to isolate the resolution gain; the master is also Dolby Vision™).</sub></p>
 
 - **Smart upscaling profiles**: it detects how a title was actually made — **film, digital,
   or animation (2D vs CGI)** — by consulting TMDb (animation + technique) and ShotOnWhat
@@ -327,18 +327,18 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   with per-resolution variants for 480p/720p/1080p sources. No confident match → it asks
   once, and every choice is overridable per show.
 
-- **Dolby Vision mastering at 1000 nits**: every item is automatically mastered to
-  **Dolby Vision at 1000 nits** through a hand-configured Resolve project, whatever the
+- **Dolby Vision™ mastering at 1000 nits**: every item is automatically mastered to
+  **Dolby Vision™ at 1000 nits** through a hand-configured Resolve project, whatever the
   intake range. A second **2000-nit** project ships too, but it is **manual-only** — a
   per-show/movie/channel override, never chosen automatically. Both export HDR10 +
-  Dolby Vision Profile 8.1.
+  Dolby Vision™ Profile 8.1.
 
 - **4K fast paths**: a 4K CFR source skips Topaz entirely — its picture is already the
   deliverable. Two tiers, decided by what the stream can technically carry:
 
-  **HDR10 keeps its original bits — up to the Dolby Vision playback ceiling.** A 4K PQ /
+  **HDR10 keeps its original bits — up to the Dolby Vision™ playback ceiling.** A 4K PQ /
   HEVC / 10-bit source keeps its **original video bits**, and Resolve runs purely as a
-  Dolby Vision analyser: its render is discarded and only the RPU is injected onto the
+  Dolby Vision™ analyser: its render is discarded and only the RPU is injected onto the
   original with `dovi_tool`, at any 4K geometry (2.39:1 scope and DCI 4K included). The
   coded pictures come out bit-identical; only the container and NAL scaffolding are
   rebuilt. One gate applies: players that choke on high-bitrate single-layer DV (the
@@ -357,14 +357,14 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   numbers. Either way a movie lands in **~2.5× its runtime** instead of ~5×.
 
   An HDR source that *cannot* carry an RPU — HLG, AV1, H.264 or 8-bit — has to be converted
-  to gain Dolby Vision at all, since DV 8.1 requires an HEVC PQ 10-bit base layer. That is
+  to gain Dolby Vision™ at all, since DV 8.1 requires an HEVC PQ 10-bit base layer. That is
   the one case where HDR material is re-encoded, and the plan says which property forced it
   rather than doing it silently.
 
 - **Companion combine** (needs [Shuttle](https://github.com/adamkbritsch/shuttle)'s relay):
   when a second copy of a movie sits on your seedbox, Visionary pairs the two and builds
   ONE best-of MKV — the genuinely better HDR10 video (an **IMAX edition wins outright**:
-  more picture beats every other signal), a **real (studio) Dolby Vision RPU**
+  more picture beats every other signal), a **real (studio) Dolby Vision™ RPU**
   from whichever copy carries one (grafted across releases with `dovi_tool`; Profile 7
   Blu-ray metadata is converted to 8.1, and real DV always beats a Resolve analysis), and
   the best lossless audio (**TrueHD Atmos** ranks first — the donor's compat AC-3 rides
@@ -377,13 +377,13 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   seeding), and the combined master obeys the same playback peak budget as every other
   output, taking the capped re-encode (real RPU preserved) when the winner's peaks bust it.
 
-- **Dolby Vision profile 7 → 8.1, in place** (needs SSH to the NAS and
-  `brew install mkvtoolnix`): Blu-ray remuxes carry Dolby Vision as **profile 7**, which most
+- **Dolby Vision™ profile 7 → 8.1, in place** (needs SSH to the NAS and
+  `brew install mkvtoolnix`): Blu-ray remuxes carry Dolby Vision™ as **profile 7**, which most
   streaming players (Google TV, Apple TV, the SHIELD in some modes) will only play as HDR10.
   The Movies pane's **DV 7** filter lists every movie known to be profile 7 — read from the
   RPU itself, since a release name says "DV" for 7 and 8.1 alike — and queues one, or all of
   them, to be converted. **Nothing is re-encoded**: the file has already proven it carries
-  Dolby Vision, so the HDR10 video is copied bit for bit, `dovi_tool` rewrites each RPU to
+  Dolby Vision™, so the HDR10 video is copied bit for bit, `dovi_tool` rewrites each RPU to
   8.1 (dropping the enhancement layer, MEL, FEL or a separate 1080p EL track), and
   `mkvmerge` puts every other track, chapter and attachment back unchanged. The new file is
   verified twice (DV 8.1 side data and RPU, frame count, duration, tracks, start timestamps —
@@ -448,7 +448,7 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**. Those are
   the ~30-minute extended-cut episodes in the test library; that's about **4.9 minutes of
   wall-clock per minute of content**, so a standard **20-minute 1080p episode** comes out a
-  finished 4K Dolby Vision master in **roughly 1h35m** (measured median across 65 finished
+  finished 4K Dolby Vision™ master in **roughly 1h35m** (measured median across 65 finished
   episodes). And if two finished upscales are ever waiting at once, **both remux in
   parallel** on a second lane (Topaz pauses until a lane frees, so the two x265 encodes
   get the machine). High-bitrate fast-path items don't serialize either: while one is
@@ -466,7 +466,7 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K
-  Dolby Vision master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p source**
+  Dolby Vision™ master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p source**
   (measured across 48 upscaled episodes). A per-show/movie **"Replaces source"** setting
   decides the source's fate: replace (default — deleted only after the master
   size-verifies on the NAS) or keep it beside the master, where Plex serves both as one
@@ -526,7 +526,7 @@ takes Resolve — which is why they run longer than the dedicated-machine figure
 
 <sub>Peak space is estimated from measured rates and scales with runtime. An episode or movie
 peaks at the end of its Resolve render, while Topaz's ProRes intermediate (about 4.4 GB per
-minute of content) and the Dolby Vision render (about 0.45 GB per minute) exist together; the
+minute of content) and the Dolby Vision™ render (about 0.45 GB per minute) exist together; the
 intermediate is deleted right after, so the remux needs only tens of GB. A YouTube video writes
 no ProRes. It peaks at the final mux, when the source, its frame-rate copy, the render, a
 stream copy of it and the master all exist at once. The range depends on whether the frame-rate
@@ -548,12 +548,12 @@ same way: an 88-minute 4K interview needs about 80 GB. A 4K fast-path movie meas
   overwritten with an invented one.
 
 - **The fast route.** A video skips Topaz; Resolve scales it (SuperScale doubles a 1080p
-  source, and an optional saved cleanup grade is applied) and renders the Dolby Vision
+  source, and an optional saved cleanup grade is applied) and renders the Dolby Vision™
   master at a bitrate chosen so its **one-second peaks land under the playback cap** —
   20 Mbps, or 14 for a native 4K source, whose detail bursts harder. The remux can then
   ship that render **stream-copied** in minutes instead of spending an hour on the capped
   x265 pass. Resolve's export has no peak control, so this is a measured gamble: the peak
-  is checked right after the render, while the Dolby Vision analysis is still loaded, and a
+  is checked right after the render, while the Dolby Vision™ analysis is still loaded, and a
   render that busts the cap is **re-exported at a lower target calculated from the burst it
   just showed** (up to twice, never below 8 Mbps). Only a video that still misses takes the
   capped x265 pass. During a run of videos **Resolve stays open** between them, since each
@@ -629,7 +629,7 @@ override (env wins); keys marked — have no env override:
 > **Plex is optional — you don't need it to run this.** Leave the `plex_*` keys blank and
 > everything still works. Show and movie names come from your **NAS folder structure**, not
 > Plex, and Plex never decides *what* gets upscaled (that's always "a 1080p file with no 4K
-> Dolby Vision master yet"). The token only enables two best-effort extras:
+> Dolby Vision™ master yet"). The token only enables two best-effort extras:
 >
 > - **Playback failsafe** — while you're streaming from your Plex server, the background
 >   prefetch of upcoming downloads pauses so it can't stutter your playback.
@@ -718,7 +718,7 @@ everything, including Plex detection.
 
 ## Legal
 
-© 2026 Adam Britsch. Resolve, Topaz Video AI, Plex, and Dolby Vision are trademarks of
+© 2026 Adam Britsch. Resolve, Topaz Video AI, Plex, and Dolby Vision™ are trademarks of
 their respective owners; you must own licenses for the commercial apps.
 Use this only on content you legally own.
 

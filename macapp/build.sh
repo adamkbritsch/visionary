@@ -39,16 +39,20 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/engine"
 # Icon: prefer the compiled Icon Composer .icon (Assets.car -> the live glass icon the
 # system renders dynamically) when it's present; otherwise fall back to the flattened
 # AppIcon.icns. Emit the matching Info.plist keys for whichever we have.
-ICON_KEYS='  <key>CFBundleIconFile</key><string>UpscalerDV</string>'
+# Both are compiled from macapp/Visionary.icon by macapp/compile_icon.sh (needs Xcode; the outputs
+# are committed so a build never does). Retired art is removed first: this bundle is rebuilt in
+# place, so a file dropped from the repo would otherwise ship forever (the engine/ rsync below has
+# --delete for the same reason).
+rm -f "$APP/Contents/Resources/UpscalerDV.icns" "$APP/Contents/Resources/DolbyVision.svg"
+ICON_KEYS='  <key>CFBundleIconFile</key><string>Visionary</string>'
 if [ -f "$ROOT/macapp/Assets.car" ]; then
   cp "$ROOT/macapp/Assets.car" "$APP/Contents/Resources/Assets.car"
-  ICON_KEYS='  <key>CFBundleIconName</key><string>UpscalerDV</string>
-  <key>CFBundleIconFile</key><string>UpscalerDV</string>'
+  ICON_KEYS='  <key>CFBundleIconName</key><string>Visionary</string>
+  <key>CFBundleIconFile</key><string>Visionary</string>'
 fi
-[ -f "$ROOT/macapp/UpscalerDV.icns" ] && cp "$ROOT/macapp/UpscalerDV.icns" "$APP/Contents/Resources/UpscalerDV.icns"
-# Header mark: the recolored Dolby Vision logo (NSImage renders the SVG with its gradient
-# + transparent Ds at runtime).
-[ -f "$ROOT/macapp/DolbyVision.svg" ] && cp "$ROOT/macapp/DolbyVision.svg" "$APP/Contents/Resources/DolbyVision.svg"
+[ -f "$ROOT/macapp/Visionary.icns" ] && cp "$ROOT/macapp/Visionary.icns" "$APP/Contents/Resources/Visionary.icns"
+# Header mark: the Visionary logo in the steel badge gradient (NSImage renders the SVG at runtime).
+[ -f "$ROOT/macapp/VisionaryLogo.svg" ] && cp "$ROOT/macapp/VisionaryLogo.svg" "$APP/Contents/Resources/VisionaryLogo.svg"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

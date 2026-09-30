@@ -338,18 +338,19 @@ struct PulseDot: View {
 
 func minutes(_ secs: Double?) -> Int? { secs.map { Int(($0 / 60).rounded()) } }
 
-// The recolored Dolby Vision logo (steel-blue gradient field, double-D knocked out so the
-// header shows through). NSImage renders the bundled SVG natively, keeping it crisp + the
-// holes transparent; falls back to an SF Symbol if the asset is missing.
-struct DolbyMark: View {
+// The Visionary mark — the V in its screen frame (user-supplied 2026-09-30, replacing the
+// recolored Dolby Vision double-D), in the steel badge gradient so it reads on the dark header.
+// NSImage renders the bundled SVG natively, keeping it crisp and the frame's inside transparent;
+// falls back to an SF Symbol if the asset is missing.
+struct VisionaryMark: View {
     var body: some View {
-        if let url = Bundle.main.url(forResource: "DolbyVision", withExtension: "svg"),
+        if let url = Bundle.main.url(forResource: "VisionaryLogo", withExtension: "svg"),
            let img = NSImage(contentsOf: url) {
             Image(nsImage: img)
                 .resizable().aspectRatio(contentMode: .fit)
                 .frame(height: 24)
                 .shadow(color: .black.opacity(0.4), radius: 3, y: 1)   // the icon's neutral shadow
-                .accessibilityLabel("Dolby Vision")
+                .accessibilityLabel("Visionary")
         } else {
             Image(systemName: "sparkles.tv").font(.system(size: 24, weight: .medium)).foregroundStyle(.tint)
         }
@@ -364,7 +365,7 @@ struct HeaderBar: View {
     var body: some View {
         let on = store.activated          // appliance: the persisted arm state, not the transient run
         HStack(spacing: 14) {
-            DolbyMark()
+            VisionaryMark()
             VStack(alignment: .leading, spacing: 1) {
                 Text("Visionary").font(.system(size: 16, weight: .bold))
                     .foregroundStyle(DS.silverBright).headerSurface()   // cutout of the shared header surface
