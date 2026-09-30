@@ -6,7 +6,7 @@ import Foundation
 
 /// WHAT THE SOURCE FILE IS, as far as its release name says before it is probed.
 ///
-/// The chips are named for the INPUT — 4K HDR10, 4K SDR, 1080p & below, DV 7 — not for the route
+/// The chips are named for the INPUT — 1080p & below, 4K SDR, 4K HDR10, DV 7, DV 8.1 — not the route
 /// the pipeline will take (user-dictated 2026-09-30; they used to read Passthrough / Convert /
 /// Upscale). What the pipeline will DO with each kind is still said, in the chip's tooltip.
 /// They read the SAME filename-parsed tags the row already shows in its own `pipelineHint`
@@ -17,15 +17,18 @@ import Foundation
 /// source — so it is never counted under them. (Before the DV 7 filter every such row fell under
 /// 4K SDR: the name tag "DV" replaces "HDR", so a 4K DV remux read as 4K SDR.)
 enum MovieFilter: String, CaseIterable {
-    case all, uhdHDR10, uhdSDR, hdAndBelow, dvP7, unwatched
+    // Declaration order IS the chip order, left to right: up the ladder of what the source is,
+    // then the watch-state chip (user-dictated 2026-09-30). All stays first — it is the reset.
+    case all, hdAndBelow, uhdSDR, uhdHDR10, dvP7, dv81, unwatched
 
     var label: String {
         switch self {
         case .all:        return "All"
-        case .uhdHDR10:   return "4K HDR10"
-        case .uhdSDR:     return "4K SDR"
         case .hdAndBelow: return "1080p & below"
+        case .uhdSDR:     return "4K SDR"
+        case .uhdHDR10:   return "4K HDR10"
         case .dvP7:       return "DV 7"
+        case .dv81:       return "DV 8.1"
         case .unwatched:  return "Unwatched"
         }
     }
@@ -44,6 +47,10 @@ enum MovieFilter: String, CaseIterable {
                                + "under the same name. The HDR10 video is copied bit for bit and "
                                + "only the Dolby Vision metadata is rewritten: no Topaz, no "
                                + "Resolve, no re-encode"
+        case .dv81:       return "Dolby Vision 8.1 sources a best-of combine can still improve: "
+                               + "Shuttle has found a copy on the seedbox and the NAS copy is not "
+                               + "Dolby Atmos yet. Tap one to pair it. Listed only once there is "
+                               + "such a pair"
         case .unwatched:  return "Not yet watched, according to Plex"
         }
     }
@@ -57,6 +64,11 @@ enum MovieFilter: String, CaseIterable {
         case .uhdSDR:     return !dv && t.contains("4K") && !t.contains("HDR")
         case .hdAndBelow: return !dv && !t.contains("4K")
         case .dvP7:       return m.dv_profile == 7
+        // Only a PROVEN profile 8: every DV row that is not profile 7 is listed only because the
+        // combine curation let it through (engine/movies.py _dv_row_visible), and a web release is
+        // often profile 5, which is not 8.1 (review 2026-09-30). A listed row whose profile is not
+        // known yet gets a one-time header probe (companion sweep) and joins on the next refresh.
+        case .dv81:       return dv && m.dv_profile == 8
         case .unwatched:  return m.watched != true
         }
     }
@@ -147,16 +159,27 @@ enum DVConvert {
         }
     }
 
-    /// "Transfers over Ethernet · Living Room 5G LAN · 2.5 GbE", or the Wi-Fi fallback said
-    /// plainly. Empty until the lane has connected once.
+    /// "Transfers over Ethernet · Living Room 5G LAN · 2.5 GbE", the Wi-Fi case said plainly, or
+    /// the Ethernet-only wait. Empty until the lane has connected once.
     static func linkLine(_ l: DVLinkDTO?) -> String {
-        guard let l, let iface = l.iface else { return "" }
+        guard let l else { return "" }
+        if let age = l.age, age > 120 { return "" }     // a stopped lane's leftover, not "now"
+        if l.unavailable == true { return "Waiting for an Ethernet link to the NAS — Ethernet only" }
+        guard let iface = l.iface else { return "" }
+        let name = l.name ?? iface
         if l.wired == true {
-            let parts = ["Transfers over Ethernet", l.name ?? iface, l.speed ?? ""].filter { !$0.isEmpty }
-            return parts.joined(separator: " · ")
+            return ["Transfers over Ethernet", name, l.speed ?? ""].filter { !$0.isEmpty }
+                .joined(separator: " · ")
+        }
+        if l.bound == true && l.priority == "wifi" {
+            return "Transfers over Wi-Fi · Wi-Fi first"
         }
         return "Transfers over \(l.kind ?? iface) — no Ethernet link to the NAS"
     }
+
+    /// The NAS network setting's three choices, in the order the control shows them.
+    static let networkChoices: [(key: String, label: String)] =
+        [("ethernet", "Ethernet first"), ("wifi", "Wi-Fi first"), ("ethernet_only", "Ethernet only")]
 
     /// The header line: "12 of 210 converted · 96.4 GB saved · 3 failed"
     static func summaryLine(_ d: DVConvertDTO?) -> String {

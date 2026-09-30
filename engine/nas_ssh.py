@@ -5,8 +5,8 @@ profile 7 -> 8.1 lane, whose files are 20-130 GB, whose transfers must STOP whil
 streaming from Plex (the NAS is CPU-saturated during a stream, and the user's rule is that Plex
 gets the box), and whose result must land under the EXACT original filename. FTP here cannot
 resume (no REST) and cannot rename atomically over an existing file. SSH can do both, and it is
-the transport the user proved this job on: `ssh ... "tail -c +N PATH"` down and `cat >> PATH` up
-at 100-175 MB/s, with UGOS's SFTP root and its rsync both unusable.
+the transport the user proved this job on: `ssh ... "tail -c +N PATH"` down and, up, a write at an
+explicit offset (upload_leg_cmd; it was `cat >> PATH`) at 100-225 MB/s, with UGOS's SFTP root and its rsync both unusable.
 
 So a transfer here is a sequence of resumable legs, paced by `limit()`: the caller's current cap
 in bytes per second (None = full speed). The lane caps it while anyone is watching Plex — the
@@ -45,6 +45,23 @@ LIMIT_POLL_SECS = 2.0                   # how often a leg re-reads its cap and t
 
 class Stopped(Exception):
     """The run was stopped."""
+
+
+class NoLink(Exception):
+    """Settings say Ethernet only and no wired link reaches the NAS: wait, never fall back."""
+
+
+class _Relink(Exception):
+    """The chosen link changed under a running leg (the setting, or a cable): end the leg; the
+    next one resumes from the bytes already moved, on the new link."""
+
+
+def link_key(ln) -> tuple:
+    """What a running leg is tied to: the interface it is bound to and whether any may be used. The
+    setting's name is left out on purpose — Ethernet first -> Ethernet only on the same cable is
+    the same route, and a relink there would only cost a restart (review 2026-09-30)."""
+    ln = ln or {}
+    return (ln.get("iface") if ln.get("bound") else None, bool(ln.get("unavailable")))
 
 
 # ---- paths ---------------------------------------------------------------------------------
@@ -120,17 +137,20 @@ def link():
     """The link the transfers use to reach the NAS (nas_link.detect: the wired one when there is
     one). Local commands only, cached."""
     import nas_link
-    return nas_link.detect(target().rsplit("@", 1)[-1])
+    return nas_link.remember(nas_link.detect(target().rsplit("@", 1)[-1]))
 
 
 def ssh_argv_for(tgt: str, ln) -> list:
     """PURE: the ssh command line for `tgt` over link `ln`. IPv4 always — the NAS's mDNS name also
     resolves to IPv6 link-local addresses, and ssh preferred one scoped to Wi-Fi (2026-09-30). On a
-    wired link: the NAS's IPv4 address, `-B <interface>` so the kernel cannot route it elsewhere,
-    and a connection-sharing socket named for that interface, so a master opened over Wi-Fi is never
-    reused once the Ethernet is up."""
+    chosen (bound) link: the NAS's IPv4 address, `-B <interface>` so the kernel cannot route it
+    elsewhere, and a connection-sharing socket named for that interface, so a master opened on one
+    link is never reused once the setting or the cable picks another. Raises NoLink when the
+    setting is Ethernet only and there is no cable."""
     user, _, host = tgt.rpartition("@")
-    iface = (ln or {}).get("iface") if (ln or {}).get("wired") else None
+    if (ln or {}).get("unavailable"):
+        raise NoLink("no Ethernet link to the NAS (Settings: NAS network — Ethernet only)")
+    iface = (ln or {}).get("iface") if (ln or {}).get("bound") else None
     if (ln or {}).get("ip"):
         host = ln["ip"]
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -173,7 +193,7 @@ def reachable(timeout=20) -> bool:
     try:
         return subprocess.run(ssh_argv() + ["true"], capture_output=True,
                               timeout=timeout).returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, NoLink):
         return False
 
 
@@ -206,8 +226,9 @@ def local_hash(path: str, tail: bool) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
-def _leg(src, sink, *, moved0, total, abort, limit, on_progress):
-    """Pump one leg, paced to `limit()` bytes/s. Returns bytes moved; raises Stopped on abort."""
+def _leg(src, sink, *, moved0, total, abort, limit, on_progress, relink=None):
+    """Pump one leg, paced to `limit()` bytes/s. Returns bytes moved; raises Stopped on abort and
+    _Relink when `relink()` says the chosen link is no longer the one this leg runs on."""
     moved, polled, cap = 0, 0.0, None
     win_t, win_b = time.monotonic(), 0             # pacing window, reset whenever the cap changes
     while True:
@@ -216,6 +237,8 @@ def _leg(src, sink, *, moved0, total, abort, limit, on_progress):
             polled = now
             if abort is not None and abort.is_set():
                 raise Stopped("stopped")
+            if relink is not None and relink():
+                raise _Relink("the chosen link changed")
             new_cap = limit() if limit else None
             if new_cap != cap:
                 cap, win_t, win_b = new_cap, now, 0
@@ -247,26 +270,32 @@ def _kill(proc):
 def download(host_path, local, size, *, abort=None, limit=None, on_progress=None):
     """Resumable pull of a NAS file to `local`, verified by size and head/tail SHA-1. A dropped
     leg resumes from the bytes already on disk. Returns the verified local path."""
-    for _attempt in range(12):
+    failures = 0
+    while failures < 12:
         have = os.path.getsize(local) if os.path.exists(local) else 0
         if have > size:
             os.remove(local)
             have = 0
         if have == size:
             break
+        leg = link_key(link())
         p = subprocess.Popen(ssh_argv() + [f"tail -c +{have + 1} {shlex.quote(host_path)}"],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             with open(local, "ab") as fh:
                 _leg(p.stdout, fh, moved0=have, total=size, abort=abort, limit=limit,
-                     on_progress=on_progress)
+                     on_progress=on_progress, relink=lambda: link_key(link()) != leg)
             if p.wait(timeout=60):
+                failures += 1
                 _pause(abort, 10)              # ssh itself failed (NAS asleep, network blip)
         except Stopped:
             _kill(p)
             raise
+        except _Relink:
+            _kill(p)                       # straight on: the next leg takes the new link
         except Exception:  # noqa: BLE001 — a dropped leg: the bytes stay, the next leg resumes
             _kill(p)
+            failures += 1
             _pause(abort, 10)
     if not os.path.exists(local) or os.path.getsize(local) != size:
         raise RuntimeError("download incomplete")
@@ -277,11 +306,22 @@ def download(host_path, local, size, *, abort=None, limit=None, on_progress=None
     return local
 
 
+def upload_leg_cmd(stage: str, have: int) -> str:
+    """PURE: the NAS side of one upload leg — write the stream at byte `have` of the staged file,
+    not at its end. A killed leg's last buffered bytes can still reach the NAS after the next leg
+    has read the file's size; appended (the old `cat >>`), they would land twice and splice the
+    file, and only the final hash check would notice. Written at their own offsets, late bytes can
+    only rewrite the identical bytes already there (review 2026-09-30). GNU dd 9.1 on the NAS."""
+    return (f"dd of={shlex.quote(stage)} bs=4M seek={int(have)} oflag=seek_bytes conv=notrunc "
+            f"iflag=fullblock status=none")
+
+
 def upload(local, stage, *, abort=None, limit=None, on_progress=None):
     """Resumable push of `local` to a NAS staging path, verified by size and head/tail SHA-1."""
     size = os.path.getsize(local)
     remote(f"mkdir -p {shlex.quote(os.path.dirname(stage))}")
-    for _attempt in range(12):
+    failures = 0
+    while failures < 12:
         st = stat(stage)
         have = st[0] if st else 0
         if have > size:
@@ -289,21 +329,26 @@ def upload(local, stage, *, abort=None, limit=None, on_progress=None):
             have = 0
         if have == size:
             break
-        p = subprocess.Popen(ssh_argv() + [f"cat >> {shlex.quote(stage)}"],
+        leg = link_key(link())
+        p = subprocess.Popen(ssh_argv() + [upload_leg_cmd(stage, have)],
                              stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             with open(local, "rb") as fh:
                 fh.seek(have)
                 _leg(fh, p.stdin, moved0=have, total=size, abort=abort, limit=limit,
-                     on_progress=on_progress)
+                     on_progress=on_progress, relink=lambda: link_key(link()) != leg)
             p.stdin.close()
             if p.wait(timeout=300):
+                failures += 1
                 _pause(abort, 10)
         except Stopped:
             _kill(p)
             raise
+        except _Relink:
+            _kill(p)
         except Exception:  # noqa: BLE001
             _kill(p)
+            failures += 1
             _pause(abort, 10)
     st = stat(stage)
     if not st or st[0] != size:

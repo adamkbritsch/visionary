@@ -278,7 +278,11 @@ struct DVQueueEntryDTO: Codable, Identifiable {
 
 struct DVLinkDTO: Codable {             // the Mac's link to the NAS for the lane's transfers
     var iface: String?       // "en12"
-    var wired: Bool?         // an Ethernet link was found and the transfers are bound to it
+    var bound: Bool?         // the transfers are pinned to `iface` (the setting's choice)
+    var wired: Bool?         // ...and it is an Ethernet link
+    var priority: String?    // the NAS network setting this was chosen under
+    var unavailable: Bool?   // Ethernet only, and no cable: the lane waits
+    var age: Int?            // seconds since the lane last looked — shown only while fresh
     var kind: String?        // "Ethernet" / "Wi-Fi" / ...
     var name: String?        // the network service's name ("Living Room 5G LAN")
     var speed: String?       // "2.5 GbE"
@@ -474,6 +478,8 @@ struct SettingsDTO: Codable {
     var youtube_every_tv_episodes: Int?   // serve 1 YouTube video per this many TV episodes
     var youtube_videos_per_burst: Int?    // ...or this many videos back-to-back per firing
     var min_adapter_watts: Int?           // power sufficiency = a brick of at least this wattage
+    var nas_network: String?              // which link big NAS transfers take: "ethernet" (first,
+                                          // the default) / "wifi" (first) / "ethernet_only"
     var passthrough_min_mbps: Int?        // 4K fast path: a 4K source at/above this skips Topaz (0 = off)
 
     // Scheduling / capacity — universal, and none of them change how a file is encoded.

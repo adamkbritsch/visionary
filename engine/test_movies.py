@@ -339,6 +339,31 @@ class ProfileSevenRows(unittest.TestCase):
         self.assertEqual((row["dv_profile"], row["dv_el"], row["has_dv"]), (7, "dual", True))
         self.assertEqual(row["route"], movies.P7_ROUTE)
 
+    def test_a_known_profile_8_row_is_dv_and_keeps_the_combine_curation(self):
+        """A converted dual-track release is 8.1 under its old "REMUX HDR10 HEVC" name: it must not
+        read as a plain HDR10 movie to upscale, and it lists (under DV 8.1) only when a combine can
+        still gain — a seedbox counterpart known and the NAS audio not already Atmos."""
+        import companion, dvbook, plex
+        conv = "Spectre (2015) [2160p UHD BluRay REMUX HDR10 HEVC 10bit AC3 5.1]-NAHOM.mkv"
+        d = tempfile.mkdtemp()
+        def lib_with(cmap):
+            with mock.patch.object(movies, "list_movie_entries",
+                                   return_value=[{"name": conv, "dir": "/m", "bytes": 44}]), \
+                 mock.patch.object(movies, "load_movies_dv_manifest", return_value={conv: 0}), \
+                 mock.patch.object(plex, "movie_watched_map", return_value={}), \
+                 mock.patch.object(companion, "sweep_counterparts") as sw, \
+                 mock.patch.object(companion, "counterparts", return_value=cmap), \
+                 mock.patch.dict(movies._CACHE, {}, clear=True):
+                return movies.refresh_library(), sw.call_args.args[0]
+        with mock.patch.object(dvbook, "PROFILES_FILE", os.path.join(d, "p.json")), \
+             mock.patch.object(dvbook, "QUEUE_FILE", os.path.join(d, "q.json")):
+            dvbook.record_profile(conv, 44, 8, src="rpu")
+            lib, swept = lib_with({})
+            self.assertEqual(lib, [])                                   # nothing to gain yet
+            self.assertTrue(swept[0]["has_dv"])      # the sweep Atmos-probes it as the DV it is
+            (row,), _ = lib_with({conv: {"counterpart": True, "atmos": False}})
+        self.assertEqual((row["dv_profile"], row["has_dv"], row["dv_el"]), (8, True, None))
+
     def test_plain_rows_carry_no_profile(self):
         import companion, plex
         with mock.patch.object(movies, "list_movie_entries",

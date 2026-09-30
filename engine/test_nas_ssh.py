@@ -138,7 +138,7 @@ class ConnectionBlips(unittest.TestCase):
 
 
 class SshCommandLine(unittest.TestCase):
-    WIRED = {"iface": "en12", "wired": True, "kind": "Ethernet", "ip": "192.168.1.195"}
+    WIRED = {"iface": "en12", "bound": True, "wired": True, "kind": "Ethernet", "ip": "192.168.1.195"}
 
     def test_a_wired_link_is_pinned_by_interface_and_address(self):
         a = nas_ssh.ssh_argv_for("adamkbritsch@adamsnas.local", self.WIRED)
@@ -149,14 +149,111 @@ class SshCommandLine(unittest.TestCase):
 
     def test_without_a_wired_link_it_still_refuses_ipv6_but_binds_nothing(self):
         a = nas_ssh.ssh_argv_for("adamkbritsch@adamsnas.local",
-                                 {"iface": "en0", "wired": False, "kind": "Wi-Fi", "ip": None})
+                                 {"iface": "utun6", "bound": False, "wired": False, "ip": None})
         self.assertNotIn("-B", a)
         self.assertIn("AddressFamily=inet", a)
         self.assertEqual(a[-1], "adamkbritsch@adamsnas.local")
         self.assertTrue(any(x == "ControlPath=/tmp/visionary-ssh-%r@%h:%p" for x in a))
 
+    def test_wifi_first_binds_the_wifi(self):
+        a = nas_ssh.ssh_argv_for("u@adamsnas.local", {"iface": "en0", "bound": True, "wired": False,
+                                                       "ip": "192.168.1.195"})
+        self.assertEqual(a[a.index("-B") + 1], "en0")
+
+    def test_ethernet_only_without_a_cable_refuses_to_connect(self):
+        with self.assertRaises(nas_ssh.NoLink):
+            nas_ssh.ssh_argv_for("u@nas", {"iface": None, "bound": False, "unavailable": True})
+
     def test_no_detection_at_all(self):
         self.assertEqual(nas_ssh.ssh_argv_for("nas", None)[-1], "nas")
+
+
+class Relink(unittest.TestCase):
+    def test_a_changed_link_ends_the_leg(self):
+        with self.assertRaises(nas_ssh._Relink):
+            nas_ssh._leg(io.BytesIO(b"x" * 10), io.BytesIO(), moved0=0, total=10, abort=None,
+                         limit=None, on_progress=None, relink=lambda: True)
+
+    def test_the_key_tracks_interface_availability_and_setting(self):
+        a = {"iface": "en12", "bound": True, "priority": "ethernet"}
+        self.assertNotEqual(nas_ssh.link_key(a), nas_ssh.link_key(dict(a, iface="en0")))
+        # same cable under another setting: the same route, no restart
+        self.assertEqual(nas_ssh.link_key(a), nas_ssh.link_key(dict(a, priority="ethernet_only")))
+        self.assertNotEqual(nas_ssh.link_key(a), nas_ssh.link_key({"unavailable": True}))
+        self.assertEqual(nas_ssh.link_key(a), nas_ssh.link_key(dict(a, speed="2.5 GbE")))
+
+    def test_download_resumes_on_the_new_link_without_pausing(self):
+        import os, tempfile
+        d = tempfile.mkdtemp()
+        local = os.path.join(d, "f")
+        links = iter([{"iface": "en0", "bound": True, "priority": "wifi"}] * 3
+                     + [{"iface": "en12", "bound": True, "priority": "ethernet"}] * 50)
+        procs = []
+        class P:
+            def __init__(self, data):
+                self.stdout = io.BytesIO(data)
+            def wait(self, timeout=None):
+                return 0
+            def kill(self):
+                pass
+        def popen(argv, **kw):
+            n = len(procs)
+            procs.append(argv)
+            return P(b"a" * 4 if n == 0 else b"b" * 6)
+        calls = {"relink": 0}
+        orig_leg = nas_ssh._leg
+        def leg(src, sink, **kw):
+            if len(procs) == 1:                  # the first leg sees the link change mid-way
+                sink.write(src.read(4))
+                raise nas_ssh._Relink("changed")
+            return orig_leg(src, sink, **kw)
+        with mock.patch.object(nas_ssh, "link", side_effect=lambda: next(links)), \
+             mock.patch.object(nas_ssh, "ssh_argv", return_value=["ssh"]), \
+             mock.patch.object(nas_ssh.subprocess, "Popen", side_effect=popen), \
+             mock.patch.object(nas_ssh, "_leg", side_effect=leg), \
+             mock.patch.object(nas_ssh, "_pause", side_effect=AssertionError("no pause on a relink")), \
+             mock.patch.object(nas_ssh, "local_hash", return_value="h"), \
+             mock.patch.object(nas_ssh, "remote_hash", return_value="h"):
+            nas_ssh.download("/volume1/Media/x.mkv", local, 10)
+        self.assertEqual(open(local, "rb").read(), b"aaaabbbbbb")
+        self.assertIn("tail -c +5 ", procs[1][-1])              # resumed from the 4 bytes
+
+
+class UploadAtOffset(unittest.TestCase):
+    def test_each_leg_writes_at_its_own_offset_never_appends(self):
+        c = nas_ssh.upload_leg_cmd("/volume1/Media/_claude-tmp/k.part", 123456789)
+        self.assertIn("seek=123456789", c)
+        self.assertIn("oflag=seek_bytes", c)
+        self.assertIn("conv=notrunc", c)
+        self.assertIn("iflag=fullblock", c)
+        self.assertNotIn(">>", c)
+
+    def test_relinks_do_not_use_up_the_attempts(self):
+        import os, tempfile
+        d = tempfile.mkdtemp()
+        local = os.path.join(d, "f")
+        n = {"legs": 0}
+        class P:
+            stdout = None
+            def wait(self, timeout=None): return 0
+            def kill(self): pass
+        def popen(argv, **kw):
+            return P()
+        def leg(src, sink, **kw):
+            n["legs"] += 1
+            if n["legs"] <= 20:                  # 20 relinks in a row — more than the 12 attempts
+                raise nas_ssh._Relink("flap")
+            sink.write(b"z" * 5)
+            return 5
+        with mock.patch.object(nas_ssh, "link", return_value={}), \
+             mock.patch.object(nas_ssh, "ssh_argv", return_value=["ssh"]), \
+             mock.patch.object(nas_ssh.subprocess, "Popen", side_effect=popen), \
+             mock.patch.object(nas_ssh, "_leg", side_effect=leg), \
+             mock.patch.object(nas_ssh, "_pause"), \
+             mock.patch.object(nas_ssh, "local_hash", return_value="h"), \
+             mock.patch.object(nas_ssh, "remote_hash", return_value="h"):
+            nas_ssh.download("/volume1/Media/x.mkv", local, 5)
+        self.assertEqual(os.path.getsize(local), 5)
 
 
 class NeverFromATest(unittest.TestCase):

@@ -639,14 +639,28 @@ def _note_dv_profile(m: dict, prof) -> None:
         import dvbook
         import nas_ssh
         from transfer import display_name
-        major = int(str(prof).split(".")[0]) if prof else None
-        if major not in (7, 8):
-            return
+        try:
+            major = int(str(prof).split(".")[0]) if prof else None
+        except ValueError:
+            major = None
+        # Anything but 5/7/8 is recorded as None: "probed, not a profile the Movies pane files" —
+        # so the row is KNOWN, and the one-time backfill below never probes it again. 5 is kept so
+        # the DV 8.1 chip can never claim a profile 5 web release.
         name = display_name(m["name"])
         host = nas_ssh.ftp_to_host(display_name((m.get("dir") or "").rstrip("/")) + "/" + name)
-        dvbook.record_profile(name, m.get("bytes") or None, major, src="probe", host=host)
+        dvbook.record_profile(name, m.get("bytes") or None, major if major in (5, 7, 8) else None,
+                              src="probe", host=host)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _profile_unknown(m: dict) -> bool:
+    try:
+        import dvbook
+        from transfer import display_name
+        return dvbook.profile_of(display_name(m["name"]), m.get("bytes") or None) is None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def sweep_counterparts(entries: list, on_update=None) -> None:
@@ -686,6 +700,16 @@ def sweep_counterparts(entries: list, on_update=None) -> None:
                         continue              # already Atmos — hidden; don't burn a search
                 elif m.get("has_dv") and e.get("nas_atmos"):
                     continue
+                elif (m.get("has_dv") and e.get("counterpart") and not e.get("profile_probed")
+                        and _profile_unknown(m)):
+                    # A LISTED DV row (counterpart known, not Atmos) whose header was probed before
+                    # profiles were recorded: read it once more so the DV 8.1 chip can file it
+                    # (review 2026-09-30). Marked either way, so it is never read twice.
+                    if _probe_nas_atmos(m) is not None:      # read: filed or known-none now
+                        mark(m["name"], None, profile_probed=True)
+                        if on_update:
+                            on_update()
+                        e = entry(m["name"])
                 if time.time() - (e.get("counterpart_at") or 0) < COUNTERPART_TTL:
                     continue
                 try:

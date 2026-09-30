@@ -35,6 +35,14 @@ let lib = [
     row("P7b.mkv", ["4K", "DV", "HEVC", "REMUX"], dv: true, p7: true, bytes: 70_000_000_000),
     row("P7c.mkv", ["4K", "DV", "HEVC", "REMUX"], dv: true, p7: true),
 ]
+var p8 = row("Converted.mkv", ["4K", "HDR", "HEVC", "REMUX"], dv: true); p8.dv_profile = 8
+var p5 = row("WebP5.mkv", ["4K", "DV", "HEVC"], dv: true); p5.dv_profile = 5
+let dv81 = (lib + [p8, p5]).filter(MovieFilter.dv81.matches).map { $0.name! }
+// DV 8.1: only a PROVEN profile 8 — never a profile 7 (those convert), a known profile 5, or a DV
+// row whose profile is not known yet
+check(dv81 == ["Converted.mkv"], "dv81 -> \(dv81)")
+// a converted file still named "HDR10" is DV now: not a 4K HDR10 upscale source
+check(!MovieFilter.uhdHDR10.matches(p8), "a DV 8.1 row is not a 4K HDR10 source")
 func names(_ f: MovieFilter) -> [String] { lib.filter(f.matches).map { $0.name! } }
 
 // THE DV 7 CHIP lists exactly the known profile 7 rows...
@@ -45,9 +53,10 @@ check(MovieFilter.dvP7.label == "DV 7", "chip label")
 check(names(.uhdSDR) == ["Plain4KSDR.mkv"], "4K SDR -> \(names(.uhdSDR))")
 check(names(.uhdHDR10) == ["Plain4KHDR.mkv"], "4K HDR10 -> \(names(.uhdHDR10))")
 check(names(.hdAndBelow) == ["Plain1080.mkv"], "1080p & below -> \(names(.hdAndBelow))")
-// the chips are named for what the SOURCE is (user-dictated 2026-09-30), in this order
+// the chips are named for what the SOURCE is, left to right from 1080p up to DV 8.1, then
+// Unwatched (user-dictated 2026-09-30)
 check(MovieFilter.allCases.map { $0.label }
-      == ["All", "4K HDR10", "4K SDR", "1080p & below", "DV 7", "Unwatched"],
+      == ["All", "1080p & below", "4K SDR", "4K HDR10", "DV 7", "DV 8.1", "Unwatched"],
       "labels -> \(MovieFilter.allCases.map { $0.label })")
 check(names(.all).count == lib.count, "all")
 check(names(.unwatched).count == lib.count - 1, "unwatched")
@@ -111,6 +120,21 @@ var air = DVLinkDTO(); air.iface = "en0"; air.wired = false; air.kind = "Wi-Fi"
 check(DVConvert.linkLine(air) == "Transfers over Wi-Fi — no Ethernet link to the NAS",
       "wifi -> \(DVConvert.linkLine(air))")
 check(DVConvert.linkLine(nil) == "", "no link yet -> nothing shown")
+var wf = DVLinkDTO(); wf.iface = "en0"; wf.bound = true; wf.wired = false; wf.kind = "Wi-Fi"
+wf.priority = "wifi"
+check(DVConvert.linkLine(wf) == "Transfers over Wi-Fi · Wi-Fi first", "wifi first -> \(DVConvert.linkLine(wf))")
+var none = DVLinkDTO(); none.unavailable = true; none.priority = "ethernet_only"
+check(DVConvert.linkLine(none).hasPrefix("Waiting for an Ethernet link"), "ethernet only, no cable")
+check(DVConvert.networkChoices.map { $0.key } == ["ethernet", "wifi", "ethernet_only"], "choices")
+var stale = wired; stale.age = 600
+check(DVConvert.linkLine(stale) == "", "a stopped lane's old link is not shown as now")
+var fresh = wired; fresh.age = 30
+check(DVConvert.linkLine(fresh).hasPrefix("Transfers over Ethernet"), "a fresh link is shown")
+// the setting decodes from the state poll
+struct S: Codable { var settings: SettingsDTO? }
+let sj = #"{"settings": {"nas_network": "ethernet_only"}}"#
+check((try? JSONDecoder().decode(S.self, from: sj.data(using: .utf8)!))?.settings?.nas_network
+      == "ethernet_only", "nas_network decodes")
 
 if failures.isEmpty { print("OK") } else { for f in failures { print("FAIL: \(f)") } }
 '''

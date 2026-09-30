@@ -215,8 +215,11 @@ class Lane:
         def pub(st):
             return {k: v for k, v in st.items() if not k.startswith("_")} if st else None
         import nas_link
+        link = nas_link.last()
+        if link:                                  # how old the answer is: the UI shows it only fresh
+            link = dict(link, age=int(time.time() - (link.get("at") or 0)))
         return {"running": self.running(), "note": self._note,
-                "link": nas_link.last(),          # the link the last connection chose (no probing)
+                "link": link,                     # the link the last connection chose (no probing)
                 "fetch": pub(self._status.get("fetch")), "ship": pub(self._status.get("ship")),
                 "summary": dvbook.summary(),
                 "queue": [{k: e.get(k) for k in ("name", "title", "bytes", "state", "phase", "el",
@@ -353,8 +356,19 @@ class Lane:
         home) is not the movie's fault: wait for the NAS instead of failing it."""
         if nas_ssh.reachable():
             return False
-        self._note = f"waiting for the NAS (SSH unreachable: {str(ex)[:120]})"
+        def why(ex):
+            return ("waiting for an Ethernet link to the NAS (Settings: NAS network is Ethernet only)"
+                    if isinstance(ex, nas_ssh.NoLink)
+                    else f"waiting for the NAS (SSH unreachable: {str(ex)[:120]})")
+        self._note = why(ex)
         while not self._abort.is_set() and not nas_ssh.reachable():
+            # The reason follows what is true NOW (a cable plugged back in while the NAS is still
+            # rebooting is no longer a cable problem — review 2026-09-30).
+            if (nas_ssh.link() or {}).get("unavailable"):
+                self._note = why(nas_ssh.NoLink(""))
+            else:
+                self._note = ("waiting for the NAS (it does not answer over SSH)"
+                              if isinstance(ex, nas_ssh.NoLink) else why(ex))
             if self._wait(IDLE_POLL_SECS):
                 break
         self._note = None
@@ -514,6 +528,10 @@ class Lane:
             e = self._pick_ship()
             if not e:
                 self._status["ship"] = None
+                try:
+                    nas_ssh.link()          # keep the panel's link current while idle (local only)
+                except Exception:  # noqa: BLE001
+                    pass
                 if self._wait(IDLE_POLL_SECS):
                     return
                 continue
@@ -569,6 +587,10 @@ class Lane:
             if d is not None and os.path.basename(host) not in d["files"]:
                 break
             self._set("ship", e, "swap", note="waiting: this movie is playing on Plex")
+            try:
+                nas_ssh.link()              # a long wait here must not leave the panel's link stale
+            except Exception:  # noqa: BLE001
+                pass
             if self._wait(IDLE_POLL_SECS):
                 raise nas_ssh.Stopped("stopped")
         self._set("ship", e, "swap")

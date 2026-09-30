@@ -2768,7 +2768,8 @@ private struct DVConvertPanel: View {
                 Spacer()
                 Text(DVConvert.summaryLine(dv)).font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            let link = DVConvert.linkLine(dv?.link)
+            let setting = store.state?.settings?.nas_network ?? "ethernet"
+            let link = dv?.link?.priority == setting ? DVConvert.linkLine(dv?.link) : ""
             if !link.isEmpty {
                 Text(link).font(.system(size: 11)).foregroundStyle(DS.steelDim)
             }
@@ -4121,6 +4122,47 @@ private struct OptionalSettingRow: View {
     }
 }
 
+/// Which of the Mac's links the big NAS transfers take — the upscale pipeline's downloads and
+/// uploads and the Dolby Vision 7 -> 8.1 lane (engine/nas_link.py; user-dictated 2026-09-30).
+private struct NasNetworkRow: View {
+    @EnvironmentObject var store: AppStore
+
+    private var value: String { store.state?.settings?.nas_network ?? "ethernet" }
+
+    private var blurb: String {
+        switch value {
+        case "wifi":          return "Transfers to the NAS use Wi-Fi when it reaches the NAS, else the Ethernet."
+        case "ethernet_only": return "Transfers to the NAS use the Ethernet. Without a cable the Dolby Vision lane waits; upscales still reach the NAS however they can."
+        default:              return "Transfers to the NAS use the Ethernet when a cable reaches it, else Wi-Fi."
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("NAS network").font(.system(size: 13, weight: .medium))
+                    Text(blurb).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 10)
+            }
+            Picker("", selection: Binding(get: { value },
+                                          set: { v in Task { await store.saveSettings(["nas_network": v]) } })) {
+                ForEach(DVConvert.networkChoices, id: \.key) { c in Text(c.label).tag(c.key) }
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            // What the lane is actually on — shown only once it was chosen under THIS setting, so a
+            // just-changed choice never sits next to the old link (it refreshes within ~30 s).
+            let link = store.state?.dv_convert?.link
+            let now = link?.priority == value ? DVConvert.linkLine(link) : ""
+            if !now.isEmpty {
+                Text("Now: " + now).font(.system(size: 11)).foregroundStyle(DS.steelDim)
+            }
+        }
+    }
+}
+
 private struct SettingsGroupLabel: View {
     let text: String
     var body: some View {
@@ -4163,6 +4205,7 @@ struct SettingsPopover: View {
                            blurb: "Idle this long → screen off. Tap the brightness key to bring it back.",
                            key: "dim_after_minutes", fallback: 15,
                            range: 0...240, step: 5, unit: "min", zeroLabel: "Off")
+                NasNetworkRow()
 
                 Divider()
 

@@ -16,6 +16,8 @@ hard-coded here.
 """
 from __future__ import annotations
 import ftplib
+import threading
+import functools
 import json
 import os
 
@@ -122,8 +124,56 @@ class _WireFTP(ftplib.FTP):
         super().putcmd(to_wire(line))
 
 
+_LINK = threading.local()        # per-thread: did this transfer's connection use the LAN route?
+
+
+def _link_retry(fn):
+    """A transfer whose connection took the pinned LAN route and then FAILED gets one more attempt
+    over the configured host order before the failure is reported. A direct LAN connection cannot
+    survive its link going away (a cable pulled mid-episode stalls it, then fails it), where the
+    Tailscale route it replaced moved to the other link and carried on — so a lost link must cost
+    one retry, not a count against the episode (review 2026-09-30). Aborts are never retried."""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        _LINK.bound, _LINK.plain = False, False
+        res = fn(*a, **kw)
+        if res[0] or not _LINK.bound or "aborted" in str(res[-1]):
+            return res
+        try:
+            import nas_link
+            nas_link.forget()
+        except Exception:  # noqa: BLE001
+            pass
+        _LINK.plain = True
+        try:
+            return fn(*a, **kw)
+        finally:
+            _LINK.bound, _LINK.plain = False, False
+    return wrapper
+
+
+def _route_order(hosts):
+    """[(host, local address to bind or None)] in the order to try. When the NAS network setting's
+    link (nas_link.py: Ethernet first by default) reaches the NAS DIRECTLY, its LAN address goes
+    FIRST, bound to that link — ahead of the Tailscale address the host list leads with, which is
+    right for a phone away from home and wrong for moving an episode across the living room
+    (user-dictated 2026-09-30: NAS transfers take the Ethernet). Anything else — away from home, a
+    host forced by env/config, a detection error — keeps the configured order exactly."""
+    plain = [(h, None) for h in hosts]
+    if getattr(_LINK, "plain", False):
+        return plain                                  # the retry after a failure on the LAN route
+    if os.environ.get("TOPAZ_NAS_FTP_HOST") or _config().get("ftp_host"):
+        return plain                                  # a forced host is the user's call
+    try:
+        import nas_link
+        route = nas_link.lan_route(hosts)
+    except Exception:  # noqa: BLE001 — never let link detection keep the pipeline off the NAS
+        return plain
+    return ([route] + plain) if route else plain
+
+
 def connect(timeout=15):
-    """Open an FTP connection, trying each host in order."""
+    """Open an FTP connection, trying each host in order (_route_order)."""
     s = ftp_settings()
     hosts = ftp_hosts()
     if not hosts:
@@ -131,7 +181,7 @@ def connect(timeout=15):
             "no NAS FTP host configured — set `ftp_host` (or `ftp_hosts`) in "
             "~/.topaz-pipeline/config.json, or export TOPAZ_NAS_FTP_HOST")
     last = None
-    for host in hosts:
+    for host, src in _route_order(hosts):
         try:
             ftp = _WireFTP()
             # latin-1 decodes ANY byte 0-255 without error and round-trips bytes
@@ -139,7 +189,10 @@ def connect(timeout=15):
             # an episode title) can't crash mlsd()/listings — and RETR/STOR/SIZE
             # still send the original bytes back. (Default utf-8 raises on 0xa1.)
             ftp.encoding = "latin-1"
-            ftp.connect(host, s["port"], timeout=timeout)
+            # A bound source address pins the control AND data connections (ftplib passes
+            # source_address to both) to the chosen link.
+            ftp.connect(host, s["port"], timeout=timeout,
+                        source_address=(src, 0) if src else None)
             ftp.login(s["user"], s["passwd"])
             # ASK FOR UTF-8 EXPLICITLY. ftplib only sends this itself when its encoding is
             # utf-8, and ours is deliberately latin-1 (above) — so we never asked, and
@@ -158,6 +211,7 @@ def connect(timeout=15):
             except ftplib.all_errors:
                 pass
             ftp.set_pasv(True)   # passive (smbftpd PassiveModePortRange 40000-50000)
+            _LINK.bound = bool(src)
             return ftp
         except ftplib.all_errors as e:
             last = e
@@ -347,6 +401,7 @@ def download_head(remote_path, local_file, max_bytes, *, timeout=None):
         except Exception: pass
 
 
+@_link_retry
 def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=None):
     """Pull a source from the NAS via FTP. Returns (ok, local_path, reason).
     on_progress(done_bytes, total_bytes) fires as blocks arrive, for a live % bar.
@@ -390,6 +445,7 @@ def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=No
         except ftplib.all_errors: pass
 
 
+@_link_retry
 def upload(local_file, remote_dir, *, timeout=None, on_progress=None):
     """Push the finished file to the NAS via FTP (spacey paths OK, no quoting).
     smbftpd writes it as uid 1000 / gid 10 (umask 007) — Plex-readable, no chown.
@@ -556,6 +612,7 @@ def _copy_sidecars(ftp, src_dir, dst_dir, scratch_dir) -> int:
     return copied
 
 
+@_link_retry
 def publish_master(local_master, master_remote, sidecar_src_dir, scratch_dir, *,
                    timeout=None, on_progress=None) -> tuple:
     """Publish a finished master into a NEW library path (folder-split YouTube): make the dest dir
@@ -570,14 +627,22 @@ def publish_master(local_master, master_remote, sidecar_src_dir, scratch_dir, *,
         return False, master_remote, f"FTP connect/login failed: {e}"
     try:
         _makedirs(ftp, dest_dir)
+        # What a cut attempt left at the target (the _link_retry after a lost link, or the
+        # orchestrator's own retry): a COMPLETE copy is already shipped — only the sidecars remain —
+        # and a PARTIAL is cleared first, or STOR onto it may be refused. The same rule as upload().
+        rs = remote_size(ftp, master_remote)
+        if rs is not None and rs != lsz:
+            try: ftp.delete(master_remote)
+            except ftplib.all_errors: pass
         done = 0
         def _sent(block):
             nonlocal done
             done += len(block)
             if on_progress and lsz:
                 on_progress(done, lsz)
-        with open(local_master, "rb") as f:
-            ftp.storbinary("STOR " + master_remote, f, callback=_sent)
+        if rs != lsz:
+            with open(local_master, "rb") as f:
+                ftp.storbinary("STOR " + master_remote, f, callback=_sent)
         rs = remote_size(ftp, master_remote)
         if rs is None:
             return False, master_remote, f"master upload unverifiable (SIZE failed) — rejecting {lsz} bytes"

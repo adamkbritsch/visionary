@@ -213,6 +213,18 @@ class TopazColorAndScale(unittest.TestCase):
         self.assertIn("smpte2084", cmd)
 
 
+class NasNetwork(unittest.TestCase):
+    def test_only_the_three_choices_survive(self):
+        import settings as st
+        self.assertEqual(st.DEFAULT_SETTINGS["nas_network"], "ethernet")
+        for v in ("ethernet", "wifi", "ethernet_only"):
+            self.assertEqual(st._valid_nas_network(v), v)
+        for junk in ("", None, "5g", 3):
+            self.assertEqual(st._valid_nas_network(junk), "ethernet")
+        self.assertIs(st.VALIDATORS["nas_network"], st._valid_nas_network)
+
+
+
 if __name__ == "__main__":
     unittest.main()
 

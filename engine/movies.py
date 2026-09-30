@@ -224,17 +224,32 @@ def _dv_row_visible(m, cmap) -> bool:
 P7_ROUTE = "DV 7 \u2192 8.1 \u00b7 no re-encode"
 
 
-def _p7_entry(m, p7map):
-    """The profile book's entry when this row is a KNOWN Dolby Vision profile 7 movie, else None.
-    The listing carries FTP wire names; the book keys on real names (dvbook's docstring). A size
-    that differs from the classified one is a different file, so it no longer counts."""
+def _profile_entry(m, book):
+    """The profile book's entry for this row's file, or None. The listing carries FTP wire names;
+    the book keys on real names (dvbook's docstring). A size that differs from the recorded one is a
+    different file, so it no longer counts."""
     from transfer import display_name
-    e = p7map.get(display_name(m["name"]))
+    e = book.get(display_name(m["name"]))
     if not e:
         return None
     if m.get("bytes") and e.get("size") not in (None, int(m["bytes"])):
         return None
     return e
+
+
+def _apply_profiles(movies, book) -> None:
+    """Stamp each row with its KNOWN Dolby Vision profile (7 or 8) from the book, and make such a
+    row DV whatever its name says. A dual-track release keeps its Dolby Vision in the 1080p EL track,
+    so neither its name ("REMUX HDR10 HEVC") nor the manifest's first-stream probe says DV (Spectre,
+    Requiem for a Dream — live-caught 2026-09-30) — and once converted it is profile 8.1 under that
+    same name, which must not read as a plain HDR10 movie to upscale."""
+    for m in movies:
+        e = _profile_entry(m, book)
+        prof = (e or {}).get("profile")
+        m["dv_profile"] = prof if prof in (5, 7, 8) else None
+        m["dv_el"] = e.get("el") if prof == 7 else None
+        if m["dv_profile"]:
+            m["has_dv"] = True
 
 
 def _refilter_lib() -> None:
@@ -257,6 +272,8 @@ def refresh_library() -> list:
     except Exception:
         wm = None
     movies = parse_movies(list_movie_entries(), load_movies_dv_manifest(), watched_map=wm)
+    import dvbook
+    _apply_profiles(movies, dvbook.profiles())   # before the sweep: it treats DV rows differently
     import companion
     # EVERY movie gets a counterpart search, not just the DV ones (user-dictated
     # 2026-08-19). The combine was reachable for any queued movie all along — but nothing
@@ -269,27 +286,20 @@ def refresh_library() -> list:
                                   if not (m["has_dv"] and has_atmos_name(m["name"]))],
                                  on_update=_refilter_lib)
     cmap = companion.counterparts()
-    import dvbook
-    p7map = dvbook.p7_names()
     lib = []
     for m in movies:
         # A KNOWN profile 7 movie is always listed, Atmos or not (user-dictated 2026-09-29): it is
         # not a combine candidate but a conversion — the Movies pane's "DV 7" filter queues it to
         # become profile 8.1 with no re-encode (dvlane.py). Every other DV row keeps the
-        # combine-only curation above. Looked up for EVERY row, not only DV-badged ones: a
-        # dual-track release keeps its Dolby Vision in the 1080p EL track, so neither its name
-        # ("REMUX HDR10 HEVC") nor the manifest's first-stream probe says DV (Spectre, Requiem
-        # for a Dream — live-caught 2026-09-30). The book's RPU reading makes the row DV.
-        p7 = _p7_entry(m, p7map)
-        if p7:
-            m["has_dv"] = True
-        elif m["has_dv"] and not _dv_row_visible(m, cmap):
+        # combine-only curation above; those are what the "DV 8.1" filter lists.
+        p7 = m.get("dv_profile") == 7
+        if not p7 and m["has_dv"] and not _dv_row_visible(m, cmap):
             continue
         lib.append({"name": m["name"], "dir": m["dir"], "title": m["title"],
                     "watched": m["watched"], "tags": m["tags"],
                     "route": P7_ROUTE if p7 else m["route"],
                     "has_dv": m["has_dv"], "bytes": m.get("bytes") or 0,
-                    "dv_profile": 7 if p7 else None, "dv_el": (p7 or {}).get("el"),
+                    "dv_profile": m.get("dv_profile"), "dv_el": m.get("dv_el"),
                     # a seedbox copy is KNOWN to exist -> the combine is worth offering on
                     # this row, whatever its resolution
                     "companion": bool((cmap.get(m["name"]) or {}).get("counterpart"))})

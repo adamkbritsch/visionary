@@ -108,31 +108,194 @@ class Pick(unittest.TestCase):
         self.assertIsNone(nas_link.pick_wired("adamsnas.local", self.i, self.p, self.o))
 
 
+class Choose(unittest.TestCase):
+    def setUp(self):
+        self.i = nas_link.parse_ifconfig(IFCONFIG)
+        self.p = nas_link.parse_hardware_ports(PORTS)
+        self.o = nas_link.parse_service_order(ORDER)
+
+    def test_priorities(self):
+        c = lambda pr, i=None: nas_link.choose("192.168.1.195", i or self.i, self.p, self.o, pr)
+        self.assertEqual(c("ethernet"), ("en12", False))
+        self.assertEqual(c("wifi"), ("en0", False))
+        self.assertEqual(c("ethernet_only"), ("en12", False))
+        no_eth = {k: v for k, v in self.i.items() if k != "en12"}
+        self.assertEqual(c("ethernet", no_eth), ("en0", False))
+        self.assertEqual(c("ethernet_only", no_eth), (None, True))
+        self.assertEqual(c("bogus"), ("en12", False))                 # junk reads as the default
+
+    def test_valid_priority(self):
+        self.assertEqual(nas_link.valid_priority("wifi"), "wifi")
+        self.assertEqual(nas_link.valid_priority(None), "ethernet")
+
+    def test_no_system_commands_from_a_test(self):
+        self.assertEqual(nas_link._run(["ifconfig"]), "")
+        self.assertIsNone(nas_link.nas_ipv4("adamsnas.local"))
+
+
+class Resolution(unittest.TestCase):
+    def setUp(self):
+        nas_link._negative.clear()
+        nas_link._known.clear()
+
+    def test_an_unknown_address_is_never_blamed_on_the_cable(self):
+        i = nas_link.parse_ifconfig(IFCONFIG)
+        p = nas_link.parse_hardware_ports(PORTS)
+        o = nas_link.parse_service_order(ORDER)
+        self.assertEqual(nas_link.choose(None, i, p, o, "ethernet"), (None, False))
+        # Ethernet only still pins to the cable — "never over the air" holds without an address
+        self.assertEqual(nas_link.choose(None, i, p, o, "ethernet_only"), ("en12", False))
+        no_eth = {k: v for k, v in i.items() if k != "en12"}
+        # the iPhone USB tether (en14) is active and not Wi-Fi — and still not the Ethernet
+        self.assertEqual(nas_link.choose(None, no_eth, p, o, "ethernet_only"), (None, True))
+
+    def test_a_phone_tether_is_never_the_ethernet(self):
+        p = nas_link.parse_hardware_ports(PORTS)
+        self.assertFalse(nas_link.is_ethernet_like("en14", p))
+        self.assertTrue(nas_link.is_ethernet_like("en12", p))
+        self.assertTrue(nas_link.is_ethernet_like("en9", p))       # "AX88179A": a USB LAN chip
+        self.assertFalse(nas_link.is_ethernet_like("en0", p))
+
+    def _live(self, fn, deadline=0.2):
+        return (mock.patch.object(nas_link, "_under_test", return_value=False),
+                mock.patch.object(nas_link.socket, "getaddrinfo", side_effect=fn),
+                mock.patch.object(nas_link, "RESOLVE_DEADLINE", deadline))
+
+    def test_a_slow_lookup_is_bounded_and_never_remembered_as_a_failure(self):
+        import time as _t
+        def slow(*a, **k):
+            _t.sleep(1.0)
+            return [(None, None, None, None, ("192.168.1.195", 22))]
+        a, b, c = self._live(slow)
+        with a, b, c:
+            t0 = _t.monotonic()
+            self.assertIsNone(nas_link.nas_ipv4("nas.local"))       # slow, nothing known yet
+            self.assertLess(_t.monotonic() - t0, 0.8)
+            _t.sleep(1.1)                                           # ...the answer lands
+            self.assertEqual(nas_link.nas_ipv4("nas.local"), "192.168.1.195")   # it stands in
+        self.assertNotIn("nas.local", nas_link._negative)
+
+    def test_after_a_real_failure_a_kept_answer_from_this_network_stands_in(self):
+        home = ("192.168.1.92", "192.168.1.117")
+        answers = iter([[(None, None, None, None, ("192.168.1.195", 22))], OSError("mdns hiccup")])
+        def look(*a, **k):
+            r = next(answers)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        a, b, c = self._live(look)
+        with a, b, c:
+            self.assertEqual(nas_link.nas_ipv4("nas.local", home), "192.168.1.195")
+            self.assertTrue(nas_link.last_was_fresh("nas.local"))
+            self.assertEqual(nas_link.nas_ipv4("nas.local", home), "192.168.1.195")   # kept
+            self.assertFalse(nas_link.last_was_fresh("nas.local"))
+            self.assertEqual(nas_link.nas_ipv4("nas.local", home), "192.168.1.195")   # still kept
+            # ...but never on another network (the café on the same 192.168.1.0/24)
+            self.assertIsNone(nas_link.nas_ipv4("nas.local", ("192.168.1.50",)))
+
+    def test_a_kept_answer_ages_by_the_wall_clock(self):
+        nas_link._known["nas.local"] = (nas_link.time.time() - nas_link.KNOWN_SECS - 1,
+                                        "192.168.1.195", None)
+        nas_link._negative["nas.local"] = nas_link.time.time() + 60
+        with mock.patch.object(nas_link, "_under_test", return_value=False):
+            self.assertIsNone(nas_link.nas_ipv4("nas.local"))
+
+    def test_a_failed_lookup_is_not_repeated(self):
+        calls = []
+        def fail(*a, **k):
+            calls.append(1)
+            raise OSError("no answer")
+        a, b, c = self._live(fail)
+        with a, b, c:
+            self.assertIsNone(nas_link.nas_ipv4("away.local"))
+            self.assertIsNone(nas_link.nas_ipv4("away.local"))
+        self.assertEqual(len(calls), 1)
+
+
+class LanRoute(unittest.TestCase):
+    def test_an_ip_literal_is_never_taken_as_the_home_lan(self):
+        with mock.patch.object(nas_link, "detect", side_effect=AssertionError("not asked")):
+            self.assertIsNone(nas_link.lan_route(["192.168.1.195", "100.101.182.68"]))
+
+    def test_the_first_host_the_link_reaches_directly(self):
+        links = {"adamsnas.local": {"bound": True, "ip": "192.168.1.195", "src": "192.168.1.92",
+                                    "fresh": True}}
+        with mock.patch.object(nas_link, "detect", side_effect=lambda h: links[h]):
+            self.assertEqual(nas_link.lan_route(["100.101.182.68", "adamsnas.local"]),
+                             ("192.168.1.195", "192.168.1.92"))
+
+    def test_a_kept_address_never_carries_the_ftp_login(self):
+        stale = {"bound": True, "ip": "192.168.1.195", "src": "192.168.1.117", "fresh": False}
+        with mock.patch.object(nas_link, "detect", return_value=stale):
+            self.assertIsNone(nas_link.lan_route(["adamsnas.local"]))
+
+    def test_nothing_direct_means_none(self):
+        with mock.patch.object(nas_link, "detect", return_value={"bound": False, "unavailable": True}):
+            self.assertIsNone(nas_link.lan_route(["a", "b"]))
+
+
 class Detect(unittest.TestCase):
     def _run(self, cmd):
         return {"ifconfig": IFCONFIG, "networksetup": PORTS if "-listallhardwareports" in cmd
                 else ORDER, "route": "   interface: en0\n"}[cmd[0]]
 
     def setUp(self):
-        nas_link._cache.update(at=0.0, key=None, link=None)
+        nas_link._cache.clear()
 
     def test_reports_the_wired_link(self):
         with mock.patch.object(nas_link, "_run", side_effect=self._run), \
              mock.patch.object(nas_link, "nas_ipv4", return_value="192.168.1.195"):
-            link = nas_link.detect("adamsnas.local")
-        self.assertEqual(link, {"iface": "en12", "wired": True, "kind": "Ethernet",
-                                "ip": "192.168.1.195", "name": "Living Room 5G LAN",
-                                "speed": "2.5 GbE"})
-        self.assertEqual(nas_link.last(), link)
+            link = nas_link.detect("adamsnas.local", "ethernet")
+        self.assertEqual(link, {"iface": "en12", "bound": True, "wired": True, "kind": "Ethernet",
+                                "ip": "192.168.1.195", "unresolved": False, "fresh": False,
+                                "src": "192.168.1.92",
+                                "priority": "ethernet", "unavailable": False,
+                                "name": "Living Room 5G LAN", "speed": "2.5 GbE"})
 
-    def test_undocked_falls_back_to_the_route_and_says_it_is_wifi(self):
-        no_eth = IFCONFIG.replace("status: active\nen14", "status: inactive\nen14")
+    def _detect(self, priority, text=IFCONFIG):
         def run(cmd):
-            return no_eth if cmd[0] == "ifconfig" else self._run(cmd)
+            return text if cmd[0] == "ifconfig" else self._run(cmd)
         with mock.patch.object(nas_link, "_run", side_effect=run), \
              mock.patch.object(nas_link, "nas_ipv4", return_value="192.168.1.195"):
-            link = nas_link.detect("adamsnas.local")
-        self.assertEqual((link["iface"], link["wired"], link["kind"]), ("en0", False, "Wi-Fi"))
+            return nas_link.detect("adamsnas.local", priority)
+
+    NO_ETH = IFCONFIG.replace("status: active\nen14", "status: inactive\nen14")
+
+    def test_undocked_ethernet_first_falls_back_to_wifi_and_says_so(self):
+        link = self._detect("ethernet", self.NO_ETH)
+        self.assertEqual((link["iface"], link["bound"], link["wired"], link["kind"]),
+                         ("en0", True, False, "Wi-Fi"))
+
+    def test_wifi_first_binds_the_wifi_even_with_a_cable(self):
+        link = self._detect("wifi")
+        self.assertEqual((link["iface"], link["bound"], link["src"]), ("en0", True, "192.168.1.117"))
+
+    def test_ethernet_only_without_a_cable_is_unavailable_not_wifi(self):
+        link = self._detect("ethernet_only", self.NO_ETH)
+        self.assertEqual((link["iface"], link["bound"], link["unavailable"]), (None, False, True))
+
+    def test_each_priority_is_cached_on_its_own(self):
+        self.assertEqual(self._detect("ethernet")["iface"], "en12")
+        self.assertEqual(self._detect("wifi")["iface"], "en0")
+        self.assertEqual(self._detect("ethernet")["iface"], "en12")
+
+    def test_unknown_address_under_ethernet_only_uses_the_port_that_last_reached_the_nas(self):
+        nas_link._last_wired.clear()
+        self._detect("ethernet_only")                          # address known: en12 remembered
+        nas_link._cache.clear()
+        def run(cmd):
+            return IFCONFIG if cmd[0] == "ifconfig" else self._run(cmd)
+        with mock.patch.object(nas_link, "_run", side_effect=run), \
+             mock.patch.object(nas_link, "nas_ipv4", return_value=None):
+            link = nas_link.detect("adamsnas.local", "ethernet_only")
+        self.assertEqual((link["iface"], link["bound"], link["unavailable"]), ("en12", True, False))
+
+    def test_the_lane_link_is_remembered_for_the_poll(self):
+        link = self._detect("ethernet")
+        nas_link.remember(link)
+        got = dict(nas_link.last())
+        self.assertLess(abs(got.pop("at") - __import__("time").time()), 5)   # stamped, so age is known
+        self.assertEqual(got, link)
 
 
 if __name__ == "__main__":

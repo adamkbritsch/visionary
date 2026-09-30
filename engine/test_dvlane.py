@@ -226,6 +226,27 @@ class Steps(_Lane):
         self.assertEqual(st["summary"]["total"], 1)
 
 
+class EthernetOnly(_Lane):
+    def test_the_note_follows_the_live_reason_and_the_movie_never_fails(self):
+        reach = iter([False, False, False, True])       # three looks unreachable, then back
+        links = iter([{"unavailable": True}, {"unavailable": False}])
+        notes = []
+        with mock.patch.object(nas_ssh, "reachable", side_effect=lambda: next(reach)), \
+             mock.patch.object(nas_ssh, "link", side_effect=lambda: next(links)), \
+             mock.patch.object(self.lane, "_wait",
+                               side_effect=lambda s: notes.append(self.lane._note) or False):
+            self.assertTrue(self.lane._offline(nas_ssh.NoLink("no cable")))
+        self.assertIn("waiting for an Ethernet link to the NAS", notes[0])     # no cable
+        self.assertEqual(notes[1], "waiting for the NAS (it does not answer over SSH)")  # cable back
+        self.assertEqual(self.e()["state"], dvbook.PENDING)          # not failed
+
+    def test_status_says_how_old_the_link_is(self):
+        import nas_link
+        nas_link.remember({"iface": "en12", "bound": True, "wired": True, "priority": "ethernet"})
+        with mock.patch.object(nas_link.time, "time", return_value=nas_link.last()["at"] + 300):
+            self.assertEqual(self.lane.status()["link"]["age"], 300)
+
+
 class Failures(_Lane):
     """Annihilation (2026-09-30): one SSH blip failed it with 43 GB converted and ready."""
 

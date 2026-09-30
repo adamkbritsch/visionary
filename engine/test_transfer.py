@@ -86,6 +86,129 @@ class Settings(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TOPAZ_NAS_FTP_HOST": "only"}):
             self.assertEqual(transfer.ftp_hosts(), ["only"])
 
+    def test_the_lan_link_goes_first_bound_and_the_list_stays_behind_it(self):
+        import nas_link
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(transfer, "_config", return_value={"ftp_hosts": ["100.1.2.3", "nas.local"]}), \
+             mock.patch.object(nas_link, "lan_route", return_value=("192.168.1.195", "192.168.1.92")):
+            self.assertEqual(transfer._route_order(transfer.ftp_hosts()),
+                             [("192.168.1.195", "192.168.1.92"), ("100.1.2.3", None), ("nas.local", None)])
+
+    def test_no_direct_link_or_a_detection_error_keeps_the_configured_order(self):
+        import nas_link
+        cfg = {"ftp_hosts": ["100.1.2.3", "nas.local"]}
+        for side in ({"return_value": None}, {"side_effect": RuntimeError("ifconfig broke")}):
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(transfer, "_config", return_value=cfg), \
+                 mock.patch.object(nas_link, "lan_route", **side):
+                self.assertEqual(transfer._route_order(transfer.ftp_hosts()),
+                                 [("100.1.2.3", None), ("nas.local", None)])
+
+    def test_a_forced_host_is_never_second_guessed(self):
+        import nas_link
+        with mock.patch.dict(os.environ, {"TOPAZ_NAS_FTP_HOST": "only"}), \
+             mock.patch.object(nas_link, "lan_route", side_effect=AssertionError("not asked")):
+            self.assertEqual(transfer._route_order(transfer.ftp_hosts()), [("only", None)])
+
+    def test_connect_binds_the_lan_attempt_and_falls_back_unbound(self):
+        import ftplib
+        calls = []
+        class Fake(transfer._WireFTP):
+            def connect(self, host, port, timeout=None, source_address=None):
+                calls.append((host, source_address))
+                if host == "192.168.1.195":
+                    raise OSError("cable pulled")
+            def login(self, *a): pass
+            def sendcmd(self, *a): pass
+            def set_pasv(self, *a): pass
+        with mock.patch.object(transfer, "_WireFTP", Fake), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["100.1.2.3", "nas.local"]), \
+             mock.patch.object(transfer, "_route_order",
+                               return_value=[("192.168.1.195", "192.168.1.92"), ("100.1.2.3", None),
+                                             ("nas.local", None)]):
+            transfer.connect(timeout=1)
+        self.assertEqual(calls, [("192.168.1.195", ("192.168.1.92", 0)), ("100.1.2.3", None)])
+
+    def test_a_failure_on_the_lan_route_is_retried_once_over_the_configured_order(self):
+        import nas_link
+        seen = []
+        @transfer._link_retry
+        def job():
+            plain = getattr(transfer._LINK, "plain", False)
+            seen.append(plain)
+            if not plain:
+                transfer._LINK.bound = True          # connect() took the LAN route...
+                return False, "x", "download failed: timed out"      # ...and the link died
+            return True, "x", "ok"
+        with mock.patch.object(nas_link, "forget") as forget:
+            self.assertEqual(job()[0], True)
+        self.assertEqual(seen, [False, True])
+        forget.assert_called_once()
+        self.assertFalse(transfer._LINK.plain)       # the thread is left as it was found
+
+    def test_no_retry_for_success_an_abort_or_a_connection_that_never_took_the_lan(self):
+        for bound, res in ((True, (True, "x", "ok")), (True, (False, "x", "aborted mid-download")),
+                           (False, (False, "x", "download failed: 550"))):
+            calls = []
+            @transfer._link_retry
+            def job():
+                calls.append(1)
+                transfer._LINK.bound = bound
+                return res
+            job()
+            self.assertEqual(len(calls), 1, (bound, res))
+
+    def test_the_retry_really_takes_the_configured_order(self):
+        import nas_link
+        cfg = {"ftp_hosts": ["100.1.2.3", "nas.local"]}
+        transfer._LINK.plain = True
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(transfer, "_config", return_value=cfg), \
+                 mock.patch.object(nas_link, "lan_route", return_value=("192.168.1.195", "192.168.1.92")):
+                # a LAN route IS available — the retry must still not take it
+                self.assertEqual(transfer._route_order(transfer.ftp_hosts()),
+                                 [("100.1.2.3", None), ("nas.local", None)])
+        finally:
+            transfer._LINK.plain = False
+
+    def _publish(self, remote_sizes):
+        import tempfile
+        d = tempfile.mkdtemp()
+        local = os.path.join(d, "m.mkv")
+        with open(local, "wb") as fh:
+            fh.write(b"x" * 10)
+        ftp = mock.Mock()
+        sizes = iter(remote_sizes)
+        with mock.patch.object(transfer, "connect", return_value=ftp), \
+             mock.patch.object(transfer, "_makedirs"), \
+             mock.patch.object(transfer, "_copy_sidecars", return_value=0), \
+             mock.patch.object(transfer, "remote_size", side_effect=lambda f, p: next(sizes)):
+            res = transfer.publish_master.__wrapped__(local, "/Media/YouTube/c/m.mkv", d, d)
+        return res, ftp
+
+    def test_publish_clears_a_partial_before_storing(self):
+        (ok, _r, _w), ftp = self._publish([4, 10])        # a cut attempt left 4 bytes
+        self.assertTrue(ok)
+        ftp.delete.assert_called_once_with("/Media/YouTube/c/m.mkv")
+        ftp.storbinary.assert_called_once()
+
+    def test_publish_skips_the_store_when_a_complete_copy_is_there(self):
+        (ok, _r, _w), ftp = self._publish([10, 10])
+        self.assertTrue(ok)
+        ftp.delete.assert_not_called()
+        ftp.storbinary.assert_not_called()
+
+    def test_publish_fresh(self):
+        (ok, _r, _w), ftp = self._publish([None, 10])
+        self.assertTrue(ok)
+        ftp.delete.assert_not_called()
+        ftp.storbinary.assert_called_once()
+
+    def test_download_upload_and_publish_all_carry_the_retry(self):
+        for fn in (transfer.download, transfer.upload, transfer.publish_master):
+            self.assertTrue(hasattr(fn, "__wrapped__"), fn.__name__)
+
     def test_owner_is_gid10(self):
         self.assertEqual(transfer.MEDIA_OWNER, "1000:10")   # FTP yields this automatically
 

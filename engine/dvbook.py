@@ -116,6 +116,12 @@ def seed(entries) -> int:
     return n
 
 
+def profiles() -> dict:
+    """{name: entry} for every movie whose profile is known — one read, for a library refresh."""
+    with _LOCK:
+        return dict(_load(PROFILES_FILE, {}))
+
+
 def p7_names() -> dict:
     """{name: entry} for every movie currently known to be profile 7."""
     with _LOCK:

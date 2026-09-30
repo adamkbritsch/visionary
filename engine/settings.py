@@ -69,6 +69,10 @@ DEFAULT_SETTINGS = {
     "quiet_mode": False,        # QUIET MODE: keep download+topaz running but DEFER each item before the
                                 # screen-invasive Resolve stage, so the laptop stays usable. Items pile up
                                 # (no drain to remux/upload/cleanup) → the run pauses on low disk until off.
+    "nas_network": "ethernet",  # WHICH LINK reaches the NAS for big transfers (nas_link.py; user-dictated
+                                # 2026-09-30): "ethernet" first (default), "wifi" first, or
+                                # "ethernet_only" (the DV lane waits for a cable; the pipeline's FTP
+                                # keeps its host order rather than stall)
     "min_adapter_watts": 140,   # power SUFFICIENCY = the brick: >= this wattage adapter → run;
                                 # anything less (hub/monitor PD, battery) → full passive pause
     "refocus_app_on_steps": True,   # The Resolve stage raises Visionary at two points: once the
@@ -357,8 +361,13 @@ def _valid_quiet_until(v):
     return 0 if n <= 0 else min(n, int(_t.time()) + MAX_QUIET_SECONDS)
 
 
+def _valid_nas_network(v):
+    return v if v in ("ethernet", "wifi", "ethernet_only") else "ethernet"
+
+
 VALIDATORS = {"resolve_host_displays": _valid_display_list,
-              "quiet_until": _valid_quiet_until}
+              "quiet_until": _valid_quiet_until,
+              "nas_network": _valid_nas_network}
 
 
 def set_settings(updates: dict) -> dict:

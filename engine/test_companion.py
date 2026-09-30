@@ -445,6 +445,69 @@ class CounterpartSweep(unittest.TestCase):
         self.assertEqual(companion.entry("f.mkv")["status"], "found")
 
 
+class ProfileBackfill(unittest.TestCase):
+    """A listed DV row probed before profiles were recorded gets ONE more header read, so the DV 8.1
+    chip can file it (review 2026-09-30) — and never a second."""
+    def setUp(self):
+        import dvbook
+        self.d = tempfile.mkdtemp()
+        self.ps = [mock.patch.object(companion, "BOOK_FILE", os.path.join(self.d, "companions.json")),
+                   mock.patch.object(dvbook, "PROFILES_FILE", os.path.join(self.d, "p.json")),
+                   mock.patch.object(dvbook, "QUEUE_FILE", os.path.join(self.d, "q.json"))]
+        for p in self.ps:
+            p.start()
+        companion.mark("old.mkv", None, nas_atmos=False, counterpart=True,
+                       counterpart_at=companion.time.time())
+
+    def tearDown(self):
+        for p in self.ps:
+            p.stop()
+
+    def _sweep(self, probe):
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        with mock.patch.object(companion, "configured", return_value=True), \
+             mock.patch.object(companion.threading, "Thread", T), \
+             mock.patch.object(companion.time, "sleep", lambda s: None), \
+             mock.patch.object(companion, "_probe_nas_atmos", side_effect=probe), \
+             mock.patch.object(companion, "search", side_effect=AssertionError("fresh: no search")):
+            companion.sweep_counterparts([{"name": "old.mkv", "title": "Old", "dir": "/Media/Movies",
+                                           "has_dv": True, "bytes": 10}])
+
+    def test_reads_the_header_once_and_records_the_profile(self):
+        import dvbook
+        calls = []
+        def probe(m):
+            calls.append(m["name"])
+            companion._note_dv_profile(m, "5.0")
+            return False
+        self._sweep(probe)
+        self._sweep(probe)                                  # a second sweep: not read again
+        self.assertEqual(calls, ["old.mkv"])
+        self.assertTrue(companion.entry("old.mkv")["profile_probed"])
+        self.assertEqual(dvbook.profile_of("old.mkv", 10)["profile"], 5)
+
+    def test_a_failed_read_is_not_marked_done(self):
+        self._sweep(lambda m: None)                         # the head read failed
+        self.assertNotIn("profile_probed", companion.entry("old.mkv"))
+        calls = []
+        self._sweep(lambda m: calls.append(1) or None)      # so the next sweep tries again
+        self.assertEqual(calls, [1])
+
+    def test_a_row_whose_profile_is_known_is_not_read(self):
+        import dvbook
+        dvbook.record_profile("old.mkv", 10, 8, src="probe")
+        self._sweep(lambda m: (_ for _ in ()).throw(AssertionError("already known")))
+
+    def test_an_unfiled_profile_is_recorded_as_known_none(self):
+        import dvbook
+        companion._note_dv_profile({"name": "x.mkv", "dir": "/Media/Movies", "bytes": 3}, None)
+        e = dvbook.profile_of("x.mkv", 3)
+        self.assertIsNotNone(e)
+        self.assertIsNone(e["profile"])
+
+
 class AtmosProbeInSweep(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
