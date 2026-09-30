@@ -1884,6 +1884,14 @@ class Orchestrator:
                                  ("prefetch", self._prefetch), ("plex_monitor", self._plex_monitor),
                                  ("priority_locator", self._priority_locator)):
                 self._ensure(name, target)
+        # The Dolby Vision profile 7 -> 8.1 lane runs BESIDE the pipeline for as long as the run is
+        # on: it needs no GPU and takes no turn from an episode, only transfers and a remux
+        # (dvlane.py). Outside the lock — starting it touches only its own threads.
+        try:
+            import dvlane
+            dvlane.LANE.start()
+        except Exception as e:  # noqa: BLE001 — the lane must never keep the pipeline from starting
+            logbook.exception("dv lane start", e)
 
     def disable(self, reason="disabled by user", keep_awake_secs=0):
         with self._lock:
@@ -1894,6 +1902,11 @@ class Orchestrator:
             self._extend_active.clear()
             self._resume_remuxes()             # ...nor frozen by one
             self.state.update(enabled=False, ended_reason=reason)
+        try:
+            import dvlane
+            dvlane.LANE.stop()                 # its transfers resume from their bytes next run
+        except Exception:  # noqa: BLE001
+            pass
         # Caffeinate is released OUTSIDE the lock: a remote Deactivate asks us to keep the
         # display alive a while longer so it can still be re-armed from away, and taking
         # that decision here (rather than unconditionally dropping it above) is what makes

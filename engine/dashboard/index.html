@@ -698,8 +698,19 @@ function tabHits(q){
     var lib = ((d.movies || {}).library) || (movieLib || []);
     var sel = ((d.movies || {}).selected || {}).items || [];
     var have = {}; sel.forEach(function(m){ have[m.name] = 1; });
+    /* A known Dolby Vision profile 7 movie is not blocked: it goes to the DV lane to become
+       8.1 in place (engine/dvlane.py) — unless it is already there (a failed one can go again). */
+    (((d.dv_convert || {}).queue) || []).forEach(function(e){
+      if (e.state !== "failed") have[e.row || e.name] = 1;
+    });
     lib.forEach(function(m){
       if (have[m.name] || !match(m.title || m.name)) return;
+      if (m.dv_profile === 7){
+        out.push({label: m.title || m.name, tag: "DV 7 \u2192 8.1 \u00b7 no re-encode",
+                  add: {ep: "/api/dv-queue", body: {action: "add", items: [
+                    {name: m.name, dir: m.dir, title: m.title, bytes: m.bytes || 0}]}}});
+        return;
+      }
       out.push({label: m.title || m.name, tag: (m.tags || []).join(" · "),
                 blocked: m.has_dv ? "already Dolby Vision — pair a companion instead" : "",
                 add: {ep: "/api/movie-queue",
@@ -743,6 +754,12 @@ function drawPicker(){
     rows = (((d.movies || {}).selected || {}).items || []).map(function(m){
       return {label: m.title || m.name,
               rm: {ep: "/api/movie-queue", body: {action: "remove", name: m.name}}};
+    });
+    (((d.dv_convert || {}).queue) || []).forEach(function(e){
+      if (e.state === "done") return;               /* finished: nothing left to take off */
+      rows.push({label: (e.title || e.name) + "  (DV 7 \u2192 8.1" +
+                        (e.state === "failed" ? ", failed" : "") + ")",
+                 rm: {ep: "/api/dv-queue", body: {action: "remove", name: e.name}}});
     });
   } else {
     rows = ((d.youtube || {}).items || []).map(function(c){

@@ -470,6 +470,20 @@ final class AppStore: ObservableObject {
     func removeMovie(_ name: String) async {
         await post("/api/movie-queue", ["action": "remove", "name": name]); await refresh()
     }
+    // DOLBY VISION PROFILE 7 -> 8.1 (engine/dvlane.py): queue one row or many ("Queue all"), take
+    // one off (its work in flight stops; the NAS original is untouched), or retry a failed one.
+    func dvQueueAdd(_ rows: [MovieItemDTO]) async {
+        let items: [[String: Any]] = rows.map { ["name": $0.name ?? "", "dir": $0.dir ?? "",
+                                                 "title": $0.title ?? "", "bytes": $0.bytes ?? 0] }
+        guard !items.isEmpty else { return }
+        await post("/api/dv-queue", ["action": "add", "items": items]); await refresh()
+    }
+    func dvQueueRemove(_ name: String) async {
+        await post("/api/dv-queue", ["action": "remove", "name": name]); await refresh()
+    }
+    func dvQueueRetry(_ name: String) async {
+        await post("/api/dv-queue", ["action": "retry", "name": name]); await refresh()
+    }
     // COMPANION COMBINE control. action: "search" | "pair" | "unpair" | "confirm" | "dismiss".
     // Status flows back through the state poll's movies.companions map (async workers).
     func companionAction(_ action: String, name: String, path: String? = nil,

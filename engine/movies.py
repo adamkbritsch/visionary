@@ -221,6 +221,18 @@ def _dv_row_visible(m, cmap) -> bool:
     return bool(e.get("counterpart")) and e.get("atmos") is False
 
 
+P7_ROUTE = "DV 7 \u2192 8.1 \u00b7 no re-encode"
+
+
+def _p7_entry(m):
+    """The profile book's entry when this row is a KNOWN Dolby Vision profile 7 movie, else None.
+    The listing carries FTP wire names; the book keys on real names (dvbook's docstring)."""
+    import dvbook
+    from transfer import display_name
+    e = dvbook.profile_of(display_name(m["name"]), m.get("bytes") or None)
+    return e if e and e.get("profile") == 7 else None
+
+
 def _refilter_lib() -> None:
     """Re-apply the DV-row filter to the CACHED pool — the background sweep calls this
     after every answer (atmos probe / counterpart search), so a just-proven-Atmos row
@@ -230,7 +242,8 @@ def _refilter_lib() -> None:
         return
     import companion
     cmap = companion.counterparts()
-    _CACHE["lib"] = [m for m in lib if not m.get("has_dv") or _dv_row_visible(m, cmap)]
+    _CACHE["lib"] = [m for m in lib if not m.get("has_dv") or m.get("dv_profile") == 7
+                     or _dv_row_visible(m, cmap)]
 
 
 def refresh_library() -> list:
@@ -247,19 +260,29 @@ def refresh_library() -> list:
     # 1080p movie could never learn it had a better counterpart sitting there. That is the
     # case with the most to gain from a combine, not the least.
     companion.sweep_counterparts([{"name": m["name"], "title": m["title"], "dir": m["dir"],
-                                   "has_dv": m["has_dv"]}
+                                   "has_dv": m["has_dv"], "bytes": m.get("bytes") or 0}
                                   for m in movies
                                   if not (m["has_dv"] and has_atmos_name(m["name"]))],
                                  on_update=_refilter_lib)
     cmap = companion.counterparts()
-    _CACHE["lib"] = [{"name": m["name"], "dir": m["dir"], "title": m["title"],
-                      "watched": m["watched"], "tags": m["tags"], "route": m["route"],
-                      "has_dv": m["has_dv"], "bytes": m.get("bytes") or 0,
-                      # a seedbox copy is KNOWN to exist -> the combine is worth offering on
-                      # this row, whatever its resolution
-                      "companion": bool((cmap.get(m["name"]) or {}).get("counterpart"))}
-                     for m in movies
-                     if not m["has_dv"] or _dv_row_visible(m, cmap)]
+    lib = []
+    for m in movies:
+        # A KNOWN profile 7 movie is always listed, Atmos or not (user-dictated 2026-09-29): it is
+        # not a combine candidate but a conversion — the Movies pane's "DV 7" filter queues it to
+        # become profile 8.1 with no re-encode (dvlane.py). Every other DV row keeps the
+        # combine-only curation above.
+        p7 = _p7_entry(m) if m["has_dv"] else None
+        if m["has_dv"] and not p7 and not _dv_row_visible(m, cmap):
+            continue
+        lib.append({"name": m["name"], "dir": m["dir"], "title": m["title"],
+                    "watched": m["watched"], "tags": m["tags"],
+                    "route": P7_ROUTE if p7 else m["route"],
+                    "has_dv": m["has_dv"], "bytes": m.get("bytes") or 0,
+                    "dv_profile": 7 if p7 else None, "dv_el": (p7 or {}).get("el"),
+                    # a seedbox copy is KNOWN to exist -> the combine is worth offering on
+                    # this row, whatever its resolution
+                    "companion": bool((cmap.get(m["name"]) or {}).get("counterpart"))})
+    _CACHE["lib"] = lib
     return _CACHE["lib"]
 
 

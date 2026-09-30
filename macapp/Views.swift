@@ -2517,50 +2517,7 @@ private struct OutputModeRow: View {
 // Movie mode: search the library and queue specific movies, each with its own preset chosen
 // in the add step. Movies can be added ANY time (even during a run) — they jump ahead of the
 // next TV episode, then the TV show continues.
-/// WHAT THE PIPELINE WILL DO WITH A MOVIE, as far as the row can know before it is probed.
-///
-/// These read the SAME filename-parsed tags the row already shows in its own `pipelineHint`
-/// ("4K · HDR · HEVC — fast path ~2.5× runtime"), so a chip predicts a path, it does not
-/// promise one: the real routing is decided by plan.choose_plan AFTER the source is probed.
-/// Judged on `tags` rather than `route`, because route_hint only has two values and cannot
-/// separate the passthrough (no re-encode at all) from the 4K SDR conversion.
-private enum MovieFilter: String, CaseIterable {
-    case all, passthrough, convert, upscale, unwatched
-
-    var label: String {
-        switch self {
-        case .all:         return "All"
-        case .passthrough: return "Passthrough"
-        case .convert:     return "Convert"
-        case .upscale:     return "Upscale"
-        case .unwatched:   return "Unwatched"
-        }
-    }
-
-    /// What the chip means, for the tooltip — the counts alone don't say why you'd pick one.
-    var hint: String {
-        switch self {
-        case .all:         return "Every movie the library can offer"
-        case .passthrough: return "4K HDR — the original stream is kept and only the Dolby "
-                                + "Vision layer is added, so these are the quick ones"
-        case .convert:     return "4K without HDR — Resolve converts it, so the video is "
-                                + "re-encoded under the peak cap"
-        case .upscale:     return "1080p and below — a full Topaz upscale, roughly 5× runtime"
-        case .unwatched:   return "Not yet watched, according to Plex"
-        }
-    }
-
-    func matches(_ m: MovieItemDTO) -> Bool {
-        let t = Set(m.tags ?? [])
-        switch self {
-        case .all:         return true
-        case .passthrough: return t.contains("4K") && t.contains("HDR")
-        case .convert:     return t.contains("4K") && !t.contains("HDR")
-        case .upscale:     return !t.contains("4K")
-        case .unwatched:   return m.watched != true
-        }
-    }
-}
+// MovieFilter lives in MovieRoutes.swift (compiled and run by engine/test_movie_routes.py).
 
 /// The filter line above the movie search. Same shape as ModeNavBar (which is hard-wired to
 /// store.mode, so this is a sibling rather than a reuse): a recessed track with one raised
@@ -2636,20 +2593,15 @@ private struct MovieMode: View {
         let items = store.state?.movies?.selected?.items ?? []
         let catalog = store.presetCatalog
         let pool = store.movieLibrary.filter(filter.matches)
+        let dv = store.state?.dv_convert
+        let dvQueue = dv?.queue ?? []
         VStack(alignment: .leading, spacing: 12) {
             MovieFilterBar(library: store.movieLibrary, filter: $filter)
             HStack(alignment: .top, spacing: 8) {
                 SearchablePicker(placeholder: "Search movies to add…",   // never locked — addable mid-run
                                  options: pool.map { m in
                                      PickOption(id: m.id, label: store.movieTitle(m.name, m.title ?? m.name),
-                                                detail: m.has_dv == true
-                                                    ? [m.pipelineHint, "already DV — companion on the seedbox"]
-                                                        .filter { !$0.isEmpty }.joined(separator: " — ")
-                                                    : [m.pipelineHint,
-                                                       // the combine is no longer DV-only: say so where a
-                                                       // counterpart is actually known to exist
-                                                       m.companion == true ? "seedbox companion available" : ""]
-                                                        .filter { !$0.isEmpty }.joined(separator: " — "))
+                                                detail: Self.detail(m, dvQueue: dvQueue, lane: dv))
                                  },
                                  disabled: !store.moviesReachable,
                                  // an explicit filter IS the query — show what it selected
@@ -2657,6 +2609,17 @@ private struct MovieMode: View {
                                  // 400 unfiltered rows is what that rule exists to prevent.
                                  showsAllWhenEmpty: filter != .all) { id in
                     if let m = store.movieLibrary.first(where: { $0.id == id }) {
+                        if m.dv_profile == 7 {
+                            // A profile 7 movie is not a combine: it is queued straight to the DV
+                            // lane to become 8.1 in place — no preset, nothing to choose. Tapping
+                            // one already in the lane does nothing, except a failed one, which is
+                            // queued again from the start.
+                            let e = DVConvert.entry(for: m, in: dvQueue)
+                            if e == nil || e?.state == "failed" {
+                                Task { await store.dvQueueAdd([m]) }
+                            }
+                            return
+                        }
                         if m.has_dv == true {
                             // DV-badged movies are COMBINE-ONLY (user-dictated): the tap
                             // starts the seedbox companion search instead of a plain add.
@@ -2689,6 +2652,31 @@ private struct MovieMode: View {
                 LibraryRefreshButton(help: "Rescan the Movies library") { await store.fetchMovies() }
             }
             if store.movieDetecting { DetectingRow() }
+            if filter == .dvP7 {
+                let more = DVConvert.addable(store.movieLibrary, queue: dvQueue)
+                if !more.isEmpty {
+                    Button {
+                        Task { await store.dvQueueAdd(more) }
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "plus.circle")
+                            Text("Queue all \(more.count) for Dolby Vision 8.1")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text(DVConvert.gb(more.reduce(0) { $0 + ($1.bytes ?? 0) }))
+                                .font(.system(size: 11)).foregroundStyle(DS.steelDim)
+                        }
+                        .foregroundStyle(DS.steelBright)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous)
+                            .fill(Color.white.opacity(0.07)))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Every profile 7 movie listed here goes to the Dolby Vision lane: copied "
+                          + "down, its metadata rewritten to 8.1 with no re-encode, and put back "
+                          + "under the same name. It runs beside the upscales, not in their queue.")
+                }
+            }
+            if !dvQueue.isEmpty { DVConvertPanel(dv: dv) }
             // COMPANION COMBINE flows in progress (search → candidates → verdict card →
             // confirm). Driven entirely by the state poll's companions map — no view-local
             // state, so a tab switch mid-pairing loses nothing. Confirmed pairings leave
@@ -2734,6 +2722,119 @@ private struct MovieMode: View {
             }
         }
         .onAppear { if store.movieLibrary.isEmpty { Task { await store.fetchMovies() } } }
+    }
+}
+
+extension MovieMode {
+    /// The picker's second line for a row: its route hint, then what applies to it — its place in
+    /// the Dolby Vision lane (profile 7), the combine (other DV), or a known seedbox companion.
+    static func detail(_ m: MovieItemDTO, dvQueue: [DVQueueEntryDTO], lane: DVConvertDTO?) -> String {
+        let extra: String
+        if m.dv_profile == 7 {
+            if let e = DVConvert.entry(for: m, in: dvQueue) {
+                extra = DVConvert.entryLabel(e, lane: lane)
+            } else {
+                extra = [m.dv_el, "tap to queue for 8.1"].compactMap { $0 }.joined(separator: " · ")
+            }
+        } else if m.has_dv == true {
+            extra = "already DV — companion on the seedbox"
+        } else {
+            // the combine is no longer DV-only: say so where a counterpart is known to exist
+            extra = m.companion == true ? "seedbox companion available" : ""
+        }
+        return [m.pipelineHint, extra].filter { !$0.isEmpty }.joined(separator: " — ")
+    }
+}
+
+/// The Dolby Vision profile 7 -> 8.1 lane: what its two threads are doing, what is next, and what
+/// failed. Finished conversions are totalled in the header rather than listed.
+private struct DVConvertPanel: View {
+    @EnvironmentObject var store: AppStore
+    let dv: DVConvertDTO?
+
+    var body: some View {
+        let queue = dv?.queue ?? []
+        let shown = DVConvert.visible(queue)
+        let pendingTotal = queue.filter { $0.state == "pending" || $0.state == nil }.count
+        let pendingShown = shown.filter { $0.state == "pending" || $0.state == nil }.count
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles.tv").foregroundStyle(DS.steel).font(.system(size: 12))
+                Text("Dolby Vision 7 → 8.1").font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Text(DVConvert.summaryLine(dv)).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            if let note = dv?.note, !note.isEmpty, dv?.fetch == nil {
+                Text(note.prefix(1).uppercased() + note.dropFirst())
+                    .font(.system(size: 11)).foregroundStyle(DS.steelDim)
+            }
+            if dv?.running != true && queue.contains(where: { $0.state == "pending" || $0.state == "active" }) {
+                Text("Starts when Visionary is running")
+                    .font(.system(size: 11)).foregroundStyle(DS.steelDim)
+            }
+            VStack(spacing: 0) {
+                ForEach(shown) { e in DVQueueRow(e: e, dv: dv) }
+                if pendingTotal > pendingShown {
+                    Text("\(pendingTotal - pendingShown) more queued")
+                        .font(.system(size: 11)).foregroundStyle(DS.steelDim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                }
+            }.panel(DS.radiusControl, inset: true)
+        }
+    }
+}
+
+private struct DVQueueRow: View {
+    @EnvironmentObject var store: AppStore
+    let e: DVQueueEntryDTO
+    let dv: DVConvertDTO?
+
+    private var step: DVLaneStepDTO? {
+        [dv?.fetch, dv?.ship].compactMap { $0 }.first { $0.name == e.name }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 9) {
+                Image(systemName: e.state == "failed" ? "exclamationmark.triangle" : "film")
+                    .foregroundStyle(.secondary).font(.system(size: 12))
+                Text(store.movieTitle(e.row ?? e.name, e.title ?? e.name)).font(.system(size: 13)).lineLimit(1)
+                Spacer()
+                if let el = e.el {
+                    Text(el).font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.steel)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous)
+                            .fill(Color.white.opacity(0.07)))
+                        .help(el == "FEL" ? "Full enhancement layer — dropped by the conversion (approved)"
+                              : el == "dual" ? "The enhancement layer is a separate 1080p track — dropped"
+                              : "Minimal enhancement layer — carries nothing the 8.1 file loses")
+                }
+                if e.state == "failed", let n = e.name {
+                    Button { Task { await store.dvQueueRetry(n) } } label: {
+                        Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain).help("Try this movie again from the start")
+                }
+                if e.state != "done", let n = e.name {
+                    Button { Task { await store.dvQueueRemove(n) } } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain)
+                    .help("Take it off the queue — the original on the NAS is not touched")
+                }
+            }
+            Text(DVConvert.entryLabel(e, lane: dv))
+                .font(.system(size: 11)).foregroundStyle(e.state == "failed" ? DS.steelBright : DS.steelDim)
+                .lineLimit(2)
+            if let f = DVConvert.fraction(step) {
+                GeometryReader { g in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.08))
+                        Capsule().fill(DS.steel).frame(width: max(2, g.size.width * f))
+                    }
+                }.frame(height: 3)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
     }
 }
 

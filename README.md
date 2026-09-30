@@ -377,6 +377,24 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   seeding), and the combined master obeys the same playback peak budget as every other
   output, taking the capped re-encode (real RPU preserved) when the winner's peaks bust it.
 
+- **Dolby Vision profile 7 → 8.1, in place** (needs SSH to the NAS and
+  `brew install mkvtoolnix`): Blu-ray remuxes carry Dolby Vision as **profile 7**, which most
+  streaming players (Google TV, Apple TV, the SHIELD in some modes) will only play as HDR10.
+  The Movies pane's **DV 7** filter lists every movie known to be profile 7 — read from the
+  RPU itself, since a release name says "DV" for 7 and 8.1 alike — and queues one, or all of
+  them, to be converted. **Nothing is re-encoded**: the file has already proven it carries
+  Dolby Vision, so the HDR10 video is copied bit for bit, `dovi_tool` rewrites each RPU to
+  8.1 (dropping the enhancement layer, MEL, FEL or a separate 1080p EL track), and
+  `mkvmerge` puts every other track, chapter and attachment back unchanged. The new file is
+  verified twice (DV 8.1 side data and RPU, frame count, duration, tracks, start timestamps —
+  on the Mac, then again by the NAS's own ffprobe where it is staged) and then **renamed
+  over the original under the exact same name**, owner and permissions, so Plex keeps the
+  item, its posters and watch state, and is told to re-analyze it. No backup is kept.
+  This runs beside the upscales, not in their queue: it needs no GPU, it only uses disk
+  above Visionary's own free-space floor, transfers resume after any interruption and are
+  **throttled whenever anyone has a Plex session open**, a file is never replaced while it
+  is being played, and Plex is only asked to rescan once nobody is streaming.
+
 - **AI border extension — 4:3 shows to 16:9** (optional, off by default): an old 4:3 show
   can have its **left and right borders generated** by a diffusion model
   ([WAN 2.1 VACE](https://github.com/Wan-Video/Wan2.1)) instead of living in pillarboxes,

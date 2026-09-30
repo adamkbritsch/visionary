@@ -326,6 +326,57 @@ def api_movie_queue(body):
     return {"selected": movies.selected_view()}
 
 
+def dv_convert_info():
+    """The Dolby Vision profile 7 -> 8.1 lane for the state poll: its queue, what each of its two
+    threads is doing, and the totals. Two small local files — no NAS I/O (poll-safe)."""
+    try:
+        import dvlane
+        st = dvlane.LANE.status()
+    except Exception as e:  # noqa: BLE001 — a broken book must not take the whole poll down
+        return {"error": str(e)[:200]}
+    for e in st.get("queue") or []:
+        e["row"] = transfer.to_wire(e["name"])     # the library row this entry came from
+    return st
+
+
+def api_dv_queue(body):
+    """Queue Dolby Vision profile 7 movies to become profile 8.1 (dvlane.py), take one off, or
+    retry a failed one. `add` takes one row or many (`items`, the Movies pane's "Add all"): each is
+    a library row {name, dir, title, bytes}. Only KNOWN profile 7 movies are accepted — the lane
+    replaces the NAS original in place, so it must never be handed anything else. This is the one
+    route by which an already-Dolby-Vision movie is queued; the movie queue still refuses them."""
+    import dvbook
+    import dvlane
+    import nas_ssh
+    action = (body.get("action") or "").strip()
+    if action == "add":
+        rows = body.get("items") or [body]
+        items = []
+        for r in rows:
+            wire = (r.get("name") or "").strip()
+            if not wire:
+                continue
+            name = transfer.display_name(wire)           # the book keys on REAL names
+            d = transfer.display_name((r.get("dir") or "").strip().rstrip("/"))
+            items.append({"name": name, "dir": r.get("dir") or "", "title": r.get("title") or name,
+                          "bytes": r.get("bytes") or None,
+                          "host": nas_ssh.ftp_to_host(f"{d}/{name}") if d else None})
+        added = dvbook.add(items)
+        return {"added": added, "refused": len(items) - added, "dv_convert": dv_convert_info()}
+    raw = (body.get("name") or "").strip()
+    if not raw:
+        return {"error": "name required"}
+    # the app may send the queue entry's real name or its library row's wire name
+    name = raw if dvbook.entry(raw) else transfer.display_name(raw)
+    if action == "remove":
+        ok = dvlane.LANE.remove(name)
+        return {"removed": ok, "dv_convert": dv_convert_info()}
+    if action == "retry":
+        ok = dvlane.LANE.retry(name)
+        return {"retried": ok, "dv_convert": dv_convert_info()}
+    return {"error": f"unknown action {action!r}"}
+
+
 def api_companion(body):
     """COMPANION COMBINE control (all localhost): pair a NAS movie with its seedbox copy.
     Actions: `search` (async relay search → candidates), `pair` (async dual head-probe →
@@ -1397,6 +1448,7 @@ def current_state():
     state["mode"] = series.get_mode()
     state["series"] = series_info()
     state["movies"] = movies_info()
+    state["dv_convert"] = dv_convert_info()
     state["youtube"] = youtube_info()
     state["up_next"] = up_next(current=orch.get("current"), inflight=orchestrator.ORCH.finisher_views())
     state["orchestrator"] = orch
@@ -1632,6 +1684,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_movie_queue(body or {}))
         elif path == "/api/companion":
             self._json(api_companion(body or {}))
+        elif path == "/api/dv-queue":
+            self._json(api_dv_queue(body or {}))
         elif path == "/api/queue-action":
             self._json(api_queue_action(body or {}))
         elif path == "/api/youtube-connect":

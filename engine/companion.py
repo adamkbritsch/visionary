@@ -624,9 +624,29 @@ def _probe_nas_atmos(m: dict) -> bool | None:
         p = probe_media(tmp, name=m["name"])
         if not p:
             return None
+        _note_dv_profile(m, p.get("dv_profile"))
         return any(t.get("atmos") for t in p.get("audio") or [])
     finally:
         _rm(tmp)
+
+
+def _note_dv_profile(m: dict, prof) -> None:
+    """The head the Atmos probe just read also says which Dolby Vision PROFILE the file is — keep
+    it, so a profile 7 movie shows up under the Movies pane's DV 7 filter (dvbook.py). A header
+    reading is the weaker source: the conversion re-reads the RPU itself before touching the file.
+    Never raises into the sweep."""
+    try:
+        import dvbook
+        import nas_ssh
+        from transfer import display_name
+        major = int(str(prof).split(".")[0]) if prof else None
+        if major not in (7, 8):
+            return
+        name = display_name(m["name"])
+        host = nas_ssh.ftp_to_host(display_name((m.get("dir") or "").rstrip("/")) + "/" + name)
+        dvbook.record_profile(name, m.get("bytes") or None, major, src="probe", host=host)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def sweep_counterparts(entries: list, on_update=None) -> None:

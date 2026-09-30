@@ -218,6 +218,9 @@ struct MovieItemDTO: Codable, Identifiable {
     var companion: Bool?   // a seedbox counterpart is KNOWN to exist, so the best-of combine is
                            // worth offering on this row whatever its resolution
     var combine: Bool?     // queued as a COMPANION COMBINE (best-of merge with a seedbox copy)
+    var dv_profile: Int?   // 7 = a KNOWN Dolby Vision profile 7 movie: the DV 7 filter queues it
+                           // to become 8.1 in place (engine/dvlane.py); nil = not known to be 7
+    var dv_el: String?     // its enhancement layer: "MEL" / "FEL" / "dual" (nil when unknown)
     var id: String { name ?? title ?? "" }
 
     /// "18.9 GB" — empty when the listing carried no size, so an unknown reads as absent
@@ -236,6 +239,51 @@ struct MovieItemDTO: Codable, Identifiable {
         let parts = [t, route ?? ""].filter { !$0.isEmpty }
         return parts.joined(separator: " — ")
     }
+}
+
+// THE DOLBY VISION PROFILE 7 -> 8.1 LANE (engine/dvlane.py via the state poll's `dv_convert`).
+// A queued P7 movie is copied down, its RPU rewritten (no re-encode), and swapped back over the
+// original under the same name — beside the TV pipeline, not in its queue.
+struct DVLaneStepDTO: Codable {          // what one of the lane's two threads is doing now
+    var name: String?
+    var title: String?
+    var phase: String?       // checking | download | convert | upload | swap
+    var done: Int?           // bytes moved (download/upload) or percent (convert)
+    var total: Int?
+    var note: String?        // e.g. "waiting: this movie is playing on Plex"
+    var throttled: Bool?     // someone has a Plex session open: transfers are capped
+    var rate: Int?           // bytes per second over this step so far
+}
+
+struct DVSummaryDTO: Codable {
+    var total: Int?
+    var by_state: [String: Int]?   // pending / active / done / failed -> count
+    var saved_bytes: Int?          // NAS space freed by finished conversions
+    var bytes_left: Int?           // size of what is still to convert
+}
+
+struct DVQueueEntryDTO: Codable, Identifiable {
+    var name: String?        // the REAL filename (the book's key)
+    var title: String?
+    var bytes: Int?
+    var state: String?       // pending | active | done | failed
+    var phase: String?       // download | convert | converted | upload | swap (active only)
+    var el: String?
+    var error: String?
+    var size_out: Int?
+    var plex_pending: Bool?  // replaced; Plex is told once nobody is streaming
+    var row: String?         // the library row's name (FTP wire form) this entry came from
+    var id: String { name ?? row ?? "" }
+}
+
+struct DVConvertDTO: Codable {
+    var running: Bool?
+    var note: String?        // why the lane is idle: waiting for disk / for the NAS
+    var fetch: DVLaneStepDTO?
+    var ship: DVLaneStepDTO?
+    var summary: DVSummaryDTO?
+    var queue: [DVQueueEntryDTO]?
+    var error: String?
 }
 
 struct MovieSelectedDTO: Codable {        // the curated queue
@@ -649,6 +697,7 @@ struct StateDTO: Codable {
     var up_next: [UpNextDTO]?          // next ~10 items to process (movies + youtube jump ahead of episodes)
     var series: SeriesStateDTO?
     var movies: MoviesStateDTO?
+    var dv_convert: DVConvertDTO?      // the DV profile 7 -> 8.1 lane (engine/dvlane.py)
     var youtube: YouTubeStateDTO?
     var orchestrator: OrchestratorDTO?
     var settings: SettingsDTO?

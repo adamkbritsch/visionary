@@ -37,3 +37,26 @@ class IsPlaying(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionsDetail(unittest.TestCase):
+    """The DV lane's view: it throttles for ANY session and never renames the file being played."""
+    TWO = (b'<MediaContainer size="2">'
+           b'<Video><Media><Part file="/media/vol3/Movies/Drive (2011).mkv"/></Media>'
+           b'<Player state="paused"/></Video>'
+           b'<Track><Media><Part file="/media/Music/a.flac"/></Media><Player state="playing"/></Track>'
+           b'</MediaContainer>')
+
+    def test_counts_paused_sessions_and_names_the_files(self):
+        self.assertEqual(plex.sessions_detail(self.TWO),
+                         {"count": 2, "files": {"Drive (2011).mkv", "a.flac"}})
+
+    def test_empty_and_garbage(self):
+        self.assertEqual(plex.sessions_detail(EMPTY), {"count": 0, "files": set()})
+        self.assertEqual(plex.sessions_detail(b"<<"), {"count": 0, "files": set()})
+
+    def test_unreachable_is_none_not_idle(self):
+        with mock.patch.object(plex, "plex_token", return_value="tok"), \
+             mock.patch.object(plex, "plex_base_urls", return_value=["http://x:32400"]), \
+             mock.patch.object(plex, "_get", side_effect=OSError("down")):
+            self.assertIsNone(plex.session_detail())

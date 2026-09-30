@@ -13,7 +13,7 @@ BIN="$TMP/Visionary"
 BUNDLE_ID="${BUNDLE_ID:-com.visionary.upscaler}"
 # --release [version]: also produce a version-stamped distributable zip in dist/.
 RELEASE=0
-VERSION="${VISIONARY_VERSION:-0.5}"
+VERSION="${VISIONARY_VERSION:-0.6}"
 if [ "${1:-}" = "--release" ]; then
   RELEASE=1
   [ -n "${2:-}" ] && VERSION="$2"
@@ -23,6 +23,7 @@ fi
 swiftc \
   "$ROOT/macapp/Cadence.swift" \
   "$ROOT/macapp/Models.swift" \
+  "$ROOT/macapp/MovieRoutes.swift" \
   "$ROOT/macapp/Store.swift" \
   "$ROOT/macapp/Views.swift" \
   "$ROOT/macapp/SetupViews.swift" \

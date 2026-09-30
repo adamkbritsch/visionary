@@ -230,6 +230,71 @@ class CompanionEndpoint(unittest.TestCase):
         add.assert_called_once()
 
 
+class DvQueue(unittest.TestCase):
+    """POST /api/dv-queue — the ONE route by which an already-Dolby-Vision movie is queued: known
+    profile 7 movies only, to become 8.1 in place (dvlane.py). The movie queue's DV refusal above
+    stays exactly as it was."""
+    def setUp(self):
+        import os, tempfile
+        import dvbook
+        d = tempfile.mkdtemp()
+        self.patches = [mock.patch.object(dvbook, "PROFILES_FILE", os.path.join(d, "p.json")),
+                        mock.patch.object(dvbook, "QUEUE_FILE", os.path.join(d, "q.json"))]
+        for p in self.patches:
+            p.start()
+        dvbook.record_profile("P7 (2001).mkv", 70, 7, el="MEL", src="rpu",
+                              host="/volume2/MediaVolume2/Movies/P7 (2001).mkv", rk="4", section="2")
+        dvbook.record_profile("Found (2002).mkv", 50, 7, src="probe")
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_add_many_takes_only_known_profile_7_rows(self):
+        import dvbook
+        out = server.api_dv_queue({"action": "add", "items": [
+            {"name": "P7 (2001).mkv", "dir": "/MediaVolume2/Movies", "title": "P7", "bytes": 70},
+            {"name": "Found (2002).mkv", "dir": "/MediaVolume3/Movies/Found (2002)",
+             "title": "Found", "bytes": 50},
+            {"name": "Plain (2003).mkv", "dir": "/Media/Movies", "title": "Plain", "bytes": 9},
+            {"name": "P7 (2001).mkv", "dir": "/MediaVolume2/Movies", "title": "P7", "bytes": 1}]})
+        self.assertEqual((out["added"], out["refused"]), (2, 2))
+        q = {e["name"]: e for e in dvbook.queue()}
+        self.assertEqual(q["P7 (2001).mkv"]["host"], "/volume2/MediaVolume2/Movies/P7 (2001).mkv")
+        # a movie only the header probe found: its NAS path comes from its library row
+        self.assertEqual(q["Found (2002).mkv"]["host"],
+                         "/volume3/MediaVolume3/Movies/Found (2002)/Found (2002).mkv")
+        self.assertEqual({e["row"] for e in out["dv_convert"]["queue"]},
+                         {"P7 (2001).mkv", "Found (2002).mkv"})
+
+    def test_a_single_row_add_and_remove(self):
+        import dvbook
+        server.api_dv_queue({"action": "add", "name": "P7 (2001).mkv", "dir": "/MediaVolume2/Movies",
+                             "title": "P7", "bytes": 70})
+        self.assertEqual(len(dvbook.queue()), 1)
+        out = server.api_dv_queue({"action": "remove", "name": "P7 (2001).mkv"})
+        self.assertTrue(out["removed"])
+        self.assertEqual(dvbook.queue(), [])
+
+    def test_the_state_poll_carries_the_lane(self):
+        with mock.patch("nas_ssh.remote", side_effect=AssertionError("poll-safe: no NAS I/O")):
+            st = server.dv_convert_info()
+        self.assertIn("summary", st)
+        self.assertIn("queue", st)
+
+    def test_the_movie_queue_still_refuses_a_p7_movie(self):
+        import movies
+        with mock.patch.object(movies, "peek_library",
+                               return_value=[{"name": "P7 (2001).mkv", "has_dv": True,
+                                              "dv_profile": 7}]), \
+             mock.patch.object(movies, "add_selected",
+                               side_effect=AssertionError("never into the GPU pipeline")), \
+             mock.patch.object(movies, "selected_view", return_value={"items": []}):
+            out = server.api_movie_queue({"action": "add", "name": "P7 (2001).mkv", "dir": "/m",
+                                          "title": "P7"})
+        self.assertIn("error", out)
+
+
 class SetupEndpoints(unittest.TestCase):
     """The in-app onboarding surface: full preflight with fix strings, redacted config,
     connectivity tests, guarded Resolve import, dv_probe upload."""

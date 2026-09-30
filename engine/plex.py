@@ -93,6 +93,61 @@ def is_playing(*, timeout=6):
     return None                            # no base reachable
 
 
+def sessions_detail(xml_bytes) -> dict:
+    """PURE (unit-tested): {"count": every session, paused ones included, "files": the basename of
+    every file being played}. The DV conversion lane needs both: it throttles while ANYONE has a
+    session open (a paused viewer resumes without warning), and it never renames a file out from
+    under the viewer who is playing it."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return {"count": 0, "files": set()}
+    count = sum(1 for _ in root.iter("Player"))
+    files = {os.path.basename(pt.get("file") or "") for pt in root.iter("Part") if pt.get("file")}
+    return {"count": count, "files": files}
+
+
+def session_detail(*, timeout=6):
+    """sessions_detail() of the live server, or None when Plex can't be reached or no token is set —
+    the caller decides; the DV lane treats unknown as someone watching."""
+    token = plex_token()
+    if not token:
+        return None
+    for base in plex_base_urls():
+        try:
+            return sessions_detail(_get(base, "/status/sessions", token, timeout=timeout))
+        except Exception:
+            continue
+    return None
+
+
+def _send(method, path, *, timeout=30) -> bool:
+    token = plex_token()
+    if not token:
+        return False
+    for base in plex_base_urls():
+        req = urllib.request.Request(base + path, method=method, headers={"X-Plex-Token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status in (200, 201, 204)
+        except Exception:
+            continue
+    return False
+
+
+def refresh_folder(section, folder, *, timeout=30) -> bool:
+    """Ask Plex to rescan ONE folder of a section (its container-side path, e.g. /media/vol3/Movies)
+    — a partial scan, not the library-wide one, so it is light enough to send after every swap."""
+    q = urllib.parse.urlencode({"path": folder})
+    return _send("GET", f"/library/sections/{section}/refresh?{q}", timeout=timeout)
+
+
+def analyze(rating_key, *, timeout=60) -> bool:
+    """Re-read one item's media info — a file replaced in place still shows its old streams (the
+    profile 7 video, the old size) until this runs."""
+    return _send("PUT", f"/library/metadata/{rating_key}/analyze", timeout=timeout)
+
+
 # ---- pure helpers (unit-tested) -------------------------------------------
 
 def _parse_leaves(xml_bytes, series) -> dict:

@@ -290,6 +290,49 @@ class DvRowVisibility(unittest.TestCase):
         self.assertTrue(all("has_dv" in e for e in sw.call_args.args[0]))
 
 
+class ProfileSevenRows(unittest.TestCase):
+    """A KNOWN profile 7 movie is listed whatever the combine curation says — Atmos in the name, no
+    seedbox copy — because it is queued for a conversion, not a combine (DV 7 filter, dvlane.py).
+    Every other DV row keeps the curation pinned above."""
+    def test_known_p7_rows_are_listed_with_their_route_and_others_stay_hidden(self):
+        import companion, dvbook, plex
+        p7 = "P7 (2004) [2160p REMUX HDR10 DV TrueHD Atmos].mkv"
+        other = "DvAtmos (2005) [2160p DV TrueHD Atmos].mkv"
+        stale = "Stale (2006) [2160p DV].mkv"
+        entries = [{"name": p7, "dir": "/m", "bytes": 70}, {"name": other, "dir": "/m", "bytes": 5},
+                   {"name": stale, "dir": "/m", "bytes": 99}]
+        d = tempfile.mkdtemp()
+        with mock.patch.object(dvbook, "PROFILES_FILE", os.path.join(d, "p.json")), \
+             mock.patch.object(dvbook, "QUEUE_FILE", os.path.join(d, "q.json")):
+            dvbook.record_profile(p7, 70, 7, el="FEL", src="rpu", host="/volume1/Media/m/" + p7)
+            dvbook.record_profile(stale, 60, 7, src="rpu")          # the file has changed since
+            with mock.patch.object(movies, "list_movie_entries", return_value=entries), \
+                 mock.patch.object(movies, "load_movies_dv_manifest", return_value={}), \
+                 mock.patch.object(plex, "movie_watched_map", return_value={}), \
+                 mock.patch.object(companion, "sweep_counterparts"), \
+                 mock.patch.object(companion, "counterparts", return_value={}), \
+                 mock.patch.dict(movies._CACHE, {}, clear=True):
+                lib = movies.refresh_library()
+                rows = {m["name"]: m for m in lib}
+                self.assertEqual(set(rows), {p7})
+                self.assertEqual((rows[p7]["dv_profile"], rows[p7]["dv_el"], rows[p7]["route"]),
+                                 (7, "FEL", movies.P7_ROUTE))
+                movies._refilter_lib()                              # the sweep's re-filter too
+                self.assertEqual([m["name"] for m in movies.peek_library()], [p7])
+
+    def test_plain_rows_carry_no_profile(self):
+        import companion, plex
+        with mock.patch.object(movies, "list_movie_entries",
+                               return_value=[{"name": "Plain (2001) [1080p].mkv", "dir": "/m"}]), \
+             mock.patch.object(movies, "load_movies_dv_manifest", return_value={}), \
+             mock.patch.object(plex, "movie_watched_map", return_value={}), \
+             mock.patch.object(companion, "sweep_counterparts"), \
+             mock.patch.object(companion, "counterparts", return_value={}), \
+             mock.patch.dict(movies._CACHE, {}, clear=True):
+            (row,) = movies.refresh_library()
+        self.assertIsNone(row["dv_profile"])
+
+
 class NameAdvertisedDv(unittest.TestCase):
     def test_dv_release_name_counts_before_the_manifest_catches_up(self):
         # the NAS dv-probe cron runs overnight — a fresh '...WEB-DL.DV...' file must not
