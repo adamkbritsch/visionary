@@ -34,6 +34,19 @@ class Pure(unittest.TestCase):
         self.assertTrue(dvlane.fits(70 * GB, 30 * GB, 580 * GB, 400 * GB))
         self.assertEqual(dvlane.disk_need(10, 100), 0)
 
+    def test_the_plex_throttle_setting_off_means_full_speed(self):
+        self.assertIsNone(dvlane.throttle_for({"count": 3, "files": set()}, enabled=False))
+        self.assertIsNone(dvlane.throttle_for(None, enabled=False))
+        lane = dvlane.Lane()
+        with mock.patch("settings.plex_throttle", return_value=False), \
+             mock.patch.object(dvlane.plex, "session_detail",
+                               side_effect=AssertionError("off: Plex is not even asked")):
+            self.assertIsNone(lane._limit())
+        lane = dvlane.Lane()
+        with mock.patch("settings.plex_throttle", return_value=True), \
+             mock.patch.object(dvlane.plex, "session_detail", return_value={"count": 1, "files": set()}):
+            self.assertEqual(lane._limit(), dvlane.THROTTLE_BPS)
+
     def test_any_session_or_an_unreachable_plex_throttles(self):
         self.assertEqual(dvlane.throttle_for({"count": 1, "files": set()}), dvlane.THROTTLE_BPS)
         self.assertEqual(dvlane.throttle_for(None), dvlane.THROTTLE_BPS)

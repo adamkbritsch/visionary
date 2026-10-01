@@ -391,7 +391,7 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   item, its posters and watch state, and is told to re-analyze it. No backup is kept.
   This runs beside the upscales, not in their queue: it needs no GPU, it only uses disk
   above Visionary's own free-space floor, transfers resume after any interruption and are
-  **throttled whenever anyone has a Plex session open**, a file is never replaced while it
+  **throttled whenever anyone has a Plex session open** (the **Plex throttle** switch in Settings; off runs at full speed), a file is never replaced while it
   is being played, and Plex is only asked to rescan once nobody is streaming.
 
 - **AI border extension — 4:3 shows to 16:9** (optional, off by default): an old 4:3 show

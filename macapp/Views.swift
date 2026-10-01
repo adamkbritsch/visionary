@@ -4140,6 +4140,28 @@ private struct OptionalSettingRow: View {
     }
 }
 
+/// The Plex throttle (user-dictated 2026-09-30): ease off the NAS while anyone has Plex open.
+private struct PlexThrottleRow: View {
+    @EnvironmentObject var store: AppStore
+    private var on: Bool { store.state?.settings?.plex_throttle ?? true }
+
+    var body: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Plex throttle").font(.system(size: 13, weight: .medium))
+                Text(on ? "While anyone is watching Plex, Dolby Vision transfers slow to 25 MB/s and downloading ahead pauses, so the stream never stutters."
+                        : "Off: transfers run at full speed even while someone is watching Plex. A file being played is still never replaced.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 10)
+            Toggle("", isOn: Binding(get: { on },
+                                     set: { v in Task { await store.saveSettings(["plex_throttle": v]) } }))
+                .labelsHidden().toggleStyle(.switch).controlSize(.small)
+        }
+    }
+}
+
 /// Which of the Mac's links the big NAS transfers take — the upscale pipeline's downloads and
 /// uploads and the Dolby Vision 7 -> 8.1 lane (engine/nas_link.py; user-dictated 2026-09-30).
 private struct NasNetworkRow: View {
@@ -4224,6 +4246,7 @@ struct SettingsPopover: View {
                            key: "dim_after_minutes", fallback: 15,
                            range: 0...240, step: 5, unit: "min", zeroLabel: "Off")
                 NasNetworkRow()
+                PlexThrottleRow()
 
                 Divider()
 

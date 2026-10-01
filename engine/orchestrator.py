@@ -2070,6 +2070,8 @@ class Orchestrator:
         """A FRESH Plex check at the exact moment before a prefetch pull would start — closes the gap
         where a stream began between 2s polls. True if the cached flag is set OR a live check confirms
         playing; a Plex blip (None) falls back to the cached flag (never blocks on a transient)."""
+        if not settings.plex_throttle():
+            return False                       # Plex throttle off: the prefetcher never stands down
         if self._plex_playing:
             return True
         try:
@@ -2103,9 +2105,12 @@ class Orchestrator:
                 p = False                               # sustained → assume nobody's streaming
             else:
                 self._plex_errs = 0
-            self._plex_playing = bool(p)
-            self.state["plex_playing"] = self._plex_playing
-            (self._plex_abort.set if p else self._plex_abort.clear)()
+            # The state reports what is TRUE (the web dashboard shows "Plex: streaming"); the
+            # prefetch gate only follows it while the Plex throttle is on (user toggle 2026-09-30).
+            gate = bool(p) and settings.plex_throttle()
+            self._plex_playing = gate
+            self.state["plex_playing"] = bool(p)
+            (self._plex_abort.set if gate else self._plex_abort.clear)()
             self._sleep(2)                              # fast poll: an in-flight pull aborts within ~2s
 
     def _run(self):

@@ -674,6 +674,44 @@ class LeaseTransitionsReachTheLog(unittest.TestCase):
         self.assertIn("discretion", ev.call_args.args[0])
 
 
+class PlexThrottleToggle(unittest.TestCase):
+    """The prefetcher stands down for a Plex stream only while the Plex throttle is on (2026-09-30)."""
+    def test_off_means_the_prefetcher_never_stands_down(self):
+        import plex
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.settings, "plex_throttle", return_value=False), \
+             mock.patch.object(plex, "is_playing", return_value=True):     # someone IS watching
+            self.assertFalse(o._plex_started_now())
+        self.assertFalse(o._plex_abort.is_set())          # ...and no in-flight pull is cut
+
+    def _monitor_once(self, throttle):
+        import plex
+        o = orch.Orchestrator()
+        o._enabled = True
+        def stop(_secs):
+            o._enabled = False                  # one pass of the 2 s loop
+        with mock.patch.object(orch.settings, "plex_throttle", return_value=throttle), \
+             mock.patch.object(plex, "is_playing", return_value=True), \
+             mock.patch.object(o, "_sleep", side_effect=stop):
+            o._plex_monitor()
+        return o
+
+    def test_the_monitor_reports_the_truth_but_gates_only_when_on(self):
+        on, off = self._monitor_once(True), self._monitor_once(False)
+        self.assertTrue(on.state["plex_playing"] and off.state["plex_playing"])   # the dashboard's truth
+        self.assertTrue(on._plex_playing and on._plex_abort.is_set())
+        self.assertFalse(off._plex_playing or off._plex_abort.is_set())
+
+    def test_on_a_live_stream_stops_the_pull(self):
+        import plex
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.settings, "plex_throttle", return_value=True), \
+             mock.patch.object(plex, "is_playing", return_value=True):
+            self.assertTrue(o._plex_started_now())
+        self.assertTrue(o._plex_abort.is_set())
+
+
+
 if __name__ == "__main__":
     unittest.main()
 

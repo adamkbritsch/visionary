@@ -234,6 +234,17 @@ class NasNetwork(unittest.TestCase):
         self.assertIs(st.VALIDATORS["nas_network"], st._valid_nas_network)
 
 
+class PlexThrottle(unittest.TestCase):
+    def test_on_by_default_and_only_an_explicit_off_turns_it_off(self):
+        import settings as st
+        self.assertIs(st.DEFAULT_SETTINGS["plex_throttle"], True)
+        for v in (True, 1, "yes", None, "garbage"):
+            self.assertIs(st._valid_plex_throttle(v), True, v)
+        for v in (False, 0, "0", "false", "off"):
+            self.assertIs(st._valid_plex_throttle(v), False, v)
+        self.assertIs(st.VALIDATORS["plex_throttle"], st._valid_plex_throttle)
+
+
 
 if __name__ == "__main__":
     unittest.main()

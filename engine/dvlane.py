@@ -90,9 +90,12 @@ def fits(size: int, have: int, free: int, floor: int) -> bool:
     return free - disk_need(size, have) >= floor
 
 
-def throttle_for(detail):
+def throttle_for(detail, enabled=True):
     """PURE: the transfer cap for a Plex session snapshot. None (Plex unreachable) counts as someone
-    watching — the safe answer when the NAS may be serving a stream."""
+    watching — the safe answer when the NAS may be serving a stream. `enabled` is the Plex-throttle
+    setting: off, transfers run at full speed whoever is watching."""
+    if not enabled:
+        return None
     if detail is None or detail.get("count", 0) > 0:
         return THROTTLE_BPS
     return None
@@ -173,6 +176,7 @@ class Lane:
         self._status = {"fetch": None, "ship": None}
         self._note = None
         self._gate = TransferGate()
+        self._throttle_cache = (0.0, True)
 
     # ---- lifecycle -----------------------------------------------------------------------
 
@@ -284,7 +288,22 @@ class Lane:
             self._plex = (time.monotonic(), d)
             return d
 
+    def _throttle_on(self) -> bool:
+        """The Plex-throttle setting, re-read at most every PLEX_CACHE_SECS — a leg asks on every
+        8 MiB chunk, far too often for a settings-file read each time."""
+        at, on = self._throttle_cache
+        if time.monotonic() - at >= PLEX_CACHE_SECS:
+            try:
+                import settings
+                on = settings.plex_throttle()
+            except Exception:  # noqa: BLE001 — unreadable: keep protecting the stream
+                on = True
+            self._throttle_cache = (time.monotonic(), on)
+        return on
+
     def _limit(self):
+        if not self._throttle_on():
+            return None                       # off: no need to even ask Plex who is watching
         return throttle_for(self._plex_detail())
 
     def _event(self, name) -> threading.Event:
@@ -313,7 +332,8 @@ class Lane:
         cur = self._status.get(lane) or {}
         st = {"name": e["name"], "title": e.get("title") or e["name"], "phase": phase,
               "done": done, "total": total, "note": note,
-              "throttled": bool(self._plex[1] is None or (self._plex[1] or {}).get("count"))}
+              "throttled": self._throttle_on() and bool(self._plex[1] is None
+                                                         or (self._plex[1] or {}).get("count"))}
         # The rate is measured from the first PROGRESS of this step. A status without progress (a
         # waiting note) must not start the clock at 0 bytes, or a resumed transfer would open with
         # its already-moved bytes counted as speed.

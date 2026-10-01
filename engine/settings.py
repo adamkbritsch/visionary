@@ -69,6 +69,11 @@ DEFAULT_SETTINGS = {
     "quiet_mode": False,        # QUIET MODE: keep download+topaz running but DEFER each item before the
                                 # screen-invasive Resolve stage, so the laptop stays usable. Items pile up
                                 # (no drain to remux/upload/cleanup) → the run pauses on low disk until off.
+    "plex_throttle": True,      # PLEX THROTTLE (user-dictated toggle 2026-09-30): while anyone has Plex
+                                # open, ease off the NAS — the DV 7 -> 8.1 lane's transfers drop to
+                                # 25 MB/s and the pipeline's download-ahead pauses. Off = full speed
+                                # always. Never a safety switch: a file being played is still never
+                                # replaced, and Plex is still only rescanned once nobody is streaming.
     "nas_network": "ethernet",  # WHICH LINK reaches the NAS for big transfers (nas_link.py; user-dictated
                                 # 2026-09-30): "ethernet" first (default), "wifi" first, or
                                 # "ethernet_only" (the DV lane waits for a cable; the pipeline's FTP
@@ -354,13 +359,28 @@ def _valid_quiet_until(v):
     return 0 if n <= 0 else min(n, int(_t.time()) + MAX_QUIET_SECONDS)
 
 
+def _valid_plex_throttle(v):
+    """A hand-edited "false"/0 turns it off; anything unreadable leaves the protection ON."""
+    if isinstance(v, bool):
+        return v
+    if v in (0, "0", "false", "False", "off"):
+        return False
+    return True
+
+
+def plex_throttle() -> bool:
+    """The live Plex-throttle switch (read at use time, so a change applies at once)."""
+    return _valid_plex_throttle(get_settings().get("plex_throttle", True))
+
+
 def _valid_nas_network(v):
     return v if v in ("ethernet", "wifi", "ethernet_only") else "ethernet"
 
 
 VALIDATORS = {"resolve_host_displays": _valid_display_list,
               "quiet_until": _valid_quiet_until,
-              "nas_network": _valid_nas_network}
+              "nas_network": _valid_nas_network,
+              "plex_throttle": _valid_plex_throttle}
 
 
 def set_settings(updates: dict) -> dict:

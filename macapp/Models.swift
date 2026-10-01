@@ -84,7 +84,8 @@ struct OrchestratorDTO: Codable {
     var finishing2: FinishingDTO?  // the 2nd remux lane (backlog drain only — usually nil)
     var revising: FinishingDTO?    // an audio revision from Finished — deliberately lane-SHAPED so
                                    // the existing lane view renders it with no new code
-    var plex_playing: Bool?        // a Plex client is streaming → the prefetcher is standing down
+    var plex_playing: Bool?        // a Plex client is streaming (the prefetcher stands down only
+                                   // while the Plex throttle setting is on)
 }
 
 struct FinishingDTO: Codable {
@@ -478,6 +479,7 @@ struct SettingsDTO: Codable {
     var youtube_every_tv_episodes: Int?   // serve 1 YouTube video per this many TV episodes
     var youtube_videos_per_burst: Int?    // ...or this many videos back-to-back per firing
     var min_adapter_watts: Int?           // power sufficiency = a brick of at least this wattage
+    var plex_throttle: Bool?              // ease off the NAS while anyone has Plex open (default on)
     var nas_network: String?              // which link big NAS transfers take: "ethernet" (first,
                                           // the default) / "wifi" (first) / "ethernet_only"
 
