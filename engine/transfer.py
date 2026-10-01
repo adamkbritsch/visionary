@@ -172,16 +172,27 @@ def _route_order(hosts):
     return ([route] + plain) if route else plain
 
 
-def connect(timeout=15):
-    """Open an FTP connection, trying each host in order (_route_order)."""
+class NoLanRoute(ftplib.error_temp):
+    """connect(lan_only=True) found no route bound to the chosen link."""
+
+
+def connect(timeout=15, lan_only=False):
+    """Open an FTP connection, trying each host in order (_route_order). `lan_only`: only the route
+    bound to the NAS network setting's link — the Dolby Vision lane's 'Ethernet only', which waits
+    for the cable rather than fall back to another route."""
     s = ftp_settings()
     hosts = ftp_hosts()
     if not hosts:
         raise ftplib.error_perm(
             "no NAS FTP host configured — set `ftp_host` (or `ftp_hosts`) in "
             "~/.topaz-pipeline/config.json, or export TOPAZ_NAS_FTP_HOST")
+    order = _route_order(hosts)
+    if lan_only:
+        order = [r for r in order if r[1]]
+        if not order:
+            raise NoLanRoute("no route to the NAS on the chosen link")
     last = None
-    for host, src in _route_order(hosts):
+    for host, src in order:
         try:
             ftp = _WireFTP()
             # latin-1 decodes ANY byte 0-255 without error and round-trips bytes

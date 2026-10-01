@@ -17,7 +17,10 @@ subnet. WHICH one is the "NAS network" setting (Settings, main section — user-
                  terabytes over the air. The upscale pipeline's FTP never waits on this — it keeps
                  its configured host order instead (a stalled transfer there fails episodes)
 The same choice puts the pipeline's FTP on the NAS's LAN address, bound to that link, ahead of the
-Tailscale address it otherwise tries first (transfer.connect).
+Tailscale address it otherwise tries first (transfer.connect). Since 2026-10-01 the lane moves its
+files over that same FTP too (nas_ftp.py — user: "it shouldn't be going over ssh at all"), so the
+binding above is the FTP connection's source address, and Ethernet only is
+transfer.connect(lan_only=True).
 
 PURE (unit-tested): parse_ifconfig, parse_hardware_ports, parse_service_order, pick_wired,
 pick_wifi, choose, link_speed, valid_priority. The rest runs `ifconfig` / `networksetup` locally —
@@ -376,8 +379,8 @@ def lan_route(hosts):
         if is_literal(h):
             continue
         ln = detect(h)
-        # only a FRESH answer: a kept address is fine for the lane's ssh (a stranger fails its host
-        # key check) but must never carry an FTP login (review 2026-09-30)
+        # only a FRESH answer: a kept address could be a stranger's on another network, and must
+        # never carry an FTP login (review 2026-09-30)
         if ln.get("bound") and ln.get("src") and ln.get("ip") and ln.get("fresh"):
             return ln["ip"], ln["src"]
     return None

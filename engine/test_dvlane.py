@@ -10,7 +10,7 @@ from unittest import mock
 import dvbook
 import dvlane
 import dvp7
-import nas_ssh
+import nas_ftp
 
 GB = 1024 ** 3
 HOST = "/volume1/Media/Movies/Temple (1984) [2160p DV].mkv"
@@ -66,7 +66,8 @@ class _Lane(unittest.TestCase):
                         mock.patch.object(dvbook, "QUEUE_FILE", os.path.join(d, "q.json")),
                         mock.patch.object(dvlane, "WORK_ROOT", os.path.join(d, "work")),
                         mock.patch.object(dvlane.logbook, "event"),
-                        mock.patch.object(dvlane.logbook, "failure")]
+                        mock.patch.object(dvlane.logbook, "failure"),
+                        mock.patch.object(nas_ftp, "discard_stage")]   # a test patches it to look
         for p in self.patches:
             p.start()
         dvbook.seed([{"nas_path": HOST, "size_bytes": 100, "enhancement_layer": "FEL",
@@ -102,9 +103,9 @@ class _Lane(unittest.TestCase):
 
 class Steps(_Lane):
     def test_fetch_converts_and_hands_off_without_keeping_the_source(self):
-        with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
-             mock.patch.object(nas_ssh, "discard_stage") as disc, \
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ftp, "discard_stage") as disc, \
              mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
             self.lane._fetch(self.e(), self.ev)
         disc.assert_called_once_with(HOST)            # no stale staged copy survives a re-convert
@@ -116,24 +117,24 @@ class Steps(_Lane):
         self.assertTrue(os.path.exists(os.path.join(d, "p81.mkv")))
 
     def test_a_file_that_changed_on_the_nas_is_not_touched(self):
-        with mock.patch.object(nas_ssh, "stat", return_value=(123, 7, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=7), \
-             mock.patch.object(nas_ssh, "download", side_effect=AssertionError("no download")):
+        with mock.patch.object(nas_ftp, "stat", return_value=(123, 7)), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=7), \
+             mock.patch.object(nas_ftp, "download", side_effect=AssertionError("no download")):
             with self.assertRaisesRegex(RuntimeError, "not the 100"):
                 self.lane._fetch(self.e(), self.ev)
 
     def test_an_already_converted_file_is_done_not_failed(self):
-        with mock.patch.object(nas_ssh, "stat", return_value=(90, 7, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=8), \
-             mock.patch.object(nas_ssh, "download", side_effect=AssertionError("no download")):
+        with mock.patch.object(nas_ftp, "stat", return_value=(90, 7)), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "download", side_effect=AssertionError("no download")):
             self.lane._fetch(self.e(), self.ev)
         self.assertEqual(self.e()["state"], dvbook.DONE)
         self.assertFalse(dvbook.is_p7(NAME))
 
     def test_a_file_that_is_not_p7_after_all_fails_with_the_reason(self):
-        with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
-             mock.patch.object(nas_ssh, "discard_stage"), \
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ftp, "discard_stage"), \
              mock.patch.object(dvp7, "convert", side_effect=dvp7.NotP7("reads profile 5")):
             with self.assertRaisesRegex(RuntimeError, "profile 5"):
                 self.lane._fetch(self.e(), self.ev)
@@ -142,9 +143,9 @@ class Steps(_Lane):
     def test_ship_uploads_checks_and_swaps_then_records_profile_8(self):
         self._converted()
         idle = {"count": 0, "files": set()}
-        with mock.patch.object(nas_ssh, "upload") as up, \
-             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=8), \
-             mock.patch.object(nas_ssh, "swap") as sw, \
+        with mock.patch.object(nas_ftp, "upload") as up, \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "swap") as sw, \
              mock.patch.object(dvlane.plex, "session_detail", return_value=idle), \
              mock.patch.object(dvlane.plex, "refresh_folder", return_value=True) as rf, \
              mock.patch.object(dvlane.plex, "analyze", return_value=True) as an:
@@ -162,35 +163,68 @@ class Steps(_Lane):
 
     def test_a_staged_file_the_nas_does_not_read_as_8_is_never_swapped(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "upload"), \
-             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=7), \
-             mock.patch.object(nas_ssh, "discard_stage") as disc, \
-             mock.patch.object(nas_ssh, "swap", side_effect=AssertionError("must not swap")):
+        with mock.patch.object(nas_ftp, "upload"), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=7), \
+             mock.patch.object(nas_ftp, "discard_stage") as disc, \
+             mock.patch.object(nas_ftp, "swap", side_effect=AssertionError("must not swap")):
             with self.assertRaisesRegex(RuntimeError, "profile 7"):
                 self.lane._ship(self.e(), self.ev)
-        disc.assert_called_once_with(HOST)
+        # once before this conversion's first upload (stale copies), once for the bad copy
+        self.assertEqual(disc.call_args_list, [mock.call(HOST), mock.call(HOST)])
+
+    def test_the_first_upload_of_a_conversion_clears_a_stale_stage_first(self):
+        # mkvmerge writes a new segment UID every time: resuming onto an older conversion's staged
+        # copy would splice two files (review 2026-10-01: the pre-convert discard is best effort)
+        self._converted()
+        order = []
+        with mock.patch.object(nas_ftp, "discard_stage", side_effect=lambda h: order.append("discard")), \
+             mock.patch.object(nas_ftp, "upload", side_effect=lambda *a, **k: order.append("upload")), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=7):
+            with self.assertRaises(RuntimeError):
+                self.lane._ship(self.e(), self.ev)
+        self.assertEqual(order[:2], ["discard", "upload"])
+
+    def test_a_resumed_upload_keeps_its_staged_bytes(self):
+        self._converted()
+        dvbook.update(NAME, phase="upload")
+        with mock.patch.object(nas_ftp, "discard_stage", side_effect=AssertionError("resume")), \
+             mock.patch.object(nas_ftp, "upload") as up, \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "swap"), \
+             mock.patch.object(self.lane, "_plex_detail", return_value={"count": 0, "files": set()}), \
+             mock.patch.object(self.lane, "_flush_plex"):
+            self.lane._ship(self.e(), self.ev)
+        up.assert_called_once()
+
+    def test_a_blip_clearing_the_stage_before_convert_keeps_the_download(self):
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ftp, "discard_stage", side_effect=OSError("blip")), \
+             mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
+            self.lane._fetch(self.e(), self.ev)
+        self.assertEqual(self.e()["phase"], "converted")
 
     def test_never_swaps_while_that_movie_is_playing(self):
         self._converted()
         dvbook.update(NAME, phase="swap")
         playing = {"count": 1, "files": {NAME}}
         stop = threading.Event()
-        with mock.patch.object(nas_ssh, "stat", side_effect=lambda p: (90, 1, 0, 0, "644")
-                               if p.endswith(".part") else (100, 7, 911, 10, "644")), \
+        with mock.patch.object(nas_ftp, "stat", side_effect=lambda p: (90, 1, 0, 0, "644")
+                               if p.endswith(".part") else (100, 7)), \
              mock.patch.object(dvlane.plex, "session_detail", return_value=playing), \
-             mock.patch.object(nas_ssh, "swap", side_effect=AssertionError("must not swap")), \
+             mock.patch.object(nas_ftp, "swap", side_effect=AssertionError("must not swap")), \
              mock.patch.object(self.lane, "_wait", side_effect=lambda s: True):
-            with self.assertRaises(nas_ssh.Stopped):
+            with self.assertRaises(nas_ftp.Stopped):
                 self.lane._ship(self.e(), stop)
         self.assertEqual(self.e()["phase"], "swap")
 
     def test_plex_is_only_told_once_nobody_is_streaming(self):
         self._converted()
         watching = {"count": 1, "files": {"Other.mkv"}}
-        with mock.patch.object(nas_ssh, "stat", return_value=None), \
-             mock.patch.object(nas_ssh, "upload"), \
-             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=8), \
-             mock.patch.object(nas_ssh, "swap"), \
+        with mock.patch.object(nas_ftp, "stat", return_value=None), \
+             mock.patch.object(nas_ftp, "upload"), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "swap"), \
              mock.patch.object(dvlane.plex, "session_detail", return_value=watching), \
              mock.patch.object(dvlane.plex, "refresh_folder",
                                side_effect=AssertionError("not while streaming")):
@@ -200,17 +234,17 @@ class Steps(_Lane):
     def test_a_crash_after_the_rename_resumes_as_done(self):
         self._converted()
         dvbook.update(NAME, phase="swap")
-        with mock.patch.object(nas_ssh, "stat", side_effect=lambda p: None if p.endswith(".part")
-                               else (90, 9, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "upload", side_effect=AssertionError("no re-upload")), \
-             mock.patch.object(nas_ssh, "swap", side_effect=AssertionError("no second swap")), \
+        with mock.patch.object(nas_ftp, "stat", side_effect=lambda p: None if p.endswith(".part")
+                               else (90, 9)), \
+             mock.patch.object(nas_ftp, "upload", side_effect=AssertionError("no re-upload")), \
+             mock.patch.object(nas_ftp, "swap", side_effect=AssertionError("no second swap")), \
              mock.patch.object(dvlane.plex, "session_detail", return_value=None):
             self.lane._ship(self.e(), self.ev)
         self.assertEqual(self.e()["state"], dvbook.DONE)
 
     def test_a_lost_local_file_goes_back_to_be_converted_again(self):
         dvbook.update(NAME, state=dvbook.ACTIVE, phase="converted", size_in=100, size_out=90)
-        with mock.patch.object(nas_ssh, "upload", side_effect=AssertionError("nothing to send")):
+        with mock.patch.object(nas_ftp, "upload", side_effect=AssertionError("nothing to send")):
             self.lane._ship(self.e(), self.ev)
         self.assertIsNone(self.e()["phase"])
 
@@ -223,15 +257,15 @@ class Steps(_Lane):
 
     def test_remove_cleans_up_and_leaves_the_original_alone(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage") as disc, \
-             mock.patch.object(nas_ssh, "swap", side_effect=AssertionError("never")):
+        with mock.patch.object(nas_ftp, "discard_stage") as disc, \
+             mock.patch.object(nas_ftp, "swap", side_effect=AssertionError("never")):
             self.assertTrue(self.lane.remove(NAME))
         disc.assert_not_called()                         # nothing was staged yet
         self.assertIsNone(dvbook.entry(NAME))
         self.assertFalse(os.path.exists(dvlane.work_dir(HOST)))
 
     def test_status_is_local_only(self):
-        with mock.patch.object(nas_ssh, "remote", side_effect=AssertionError("no NAS I/O")), \
+        with mock.patch.object(nas_ftp, "_connect", side_effect=AssertionError("no NAS I/O")), \
              mock.patch.object(dvlane.plex, "session_detail",
                                side_effect=AssertionError("no Plex I/O")):
             st = self.lane.status()
@@ -244,14 +278,25 @@ class EthernetOnly(_Lane):
         reach = iter([False, False, False, True])       # three looks unreachable, then back
         links = iter([{"unavailable": True}, {"unavailable": False}])
         notes = []
-        with mock.patch.object(nas_ssh, "reachable", side_effect=lambda: next(reach)), \
-             mock.patch.object(nas_ssh, "link", side_effect=lambda: next(links)), \
+        with mock.patch.object(nas_ftp, "reachable", side_effect=lambda: next(reach)), \
+             mock.patch.object(nas_ftp, "link", side_effect=lambda: next(links)), \
              mock.patch.object(self.lane, "_wait",
                                side_effect=lambda s: notes.append(self.lane._note) or False):
-            self.assertTrue(self.lane._offline(nas_ssh.NoLink("no cable")))
+            self.assertTrue(self.lane._offline(nas_ftp.NoLink("no cable")))
         self.assertIn("waiting for an Ethernet link to the NAS", notes[0])     # no cable
-        self.assertEqual(notes[1], "waiting for the NAS (it does not answer over SSH)")  # cable back
+        self.assertEqual(notes[1], "waiting for the NAS (it does not answer over FTP)")  # cable back
         self.assertEqual(self.e()["state"], dvbook.PENDING)          # not failed
+
+    def test_a_configuration_reason_is_shown_for_as_long_as_it_waits(self):
+        reach = iter([False, False, False, True])
+        notes = []
+        why = "Ethernet only needs the NAS's network name among the FTP hosts, not only addresses"
+        with mock.patch.object(nas_ftp, "reachable", side_effect=lambda: next(reach)), \
+             mock.patch.object(nas_ftp, "link", return_value={}), \
+             mock.patch.object(self.lane, "_wait",
+                               side_effect=lambda s: notes.append(self.lane._note) or False):
+            self.assertTrue(self.lane._offline(nas_ftp.NoLink(why, note=why)))
+        self.assertEqual(notes, ["waiting: " + why] * 2)
 
     def test_status_says_how_old_the_link_is(self):
         import nas_link
@@ -328,7 +373,7 @@ class FiveAttempts(_Lane):
 
     def test_the_fifth_failure_deletes_its_files_from_this_mac_and_the_nas_stage(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+        with mock.patch.object(nas_ftp, "discard_stage") as disc:
             self._fail_n(dvlane.SHIP_TRIES - 1)
             out = os.path.join(dvlane.work_dir(HOST), "p81.mkv")
             self.assertTrue(os.path.exists(out))          # four failures: still trying
@@ -344,7 +389,7 @@ class FiveAttempts(_Lane):
 
     def test_a_retry_after_giving_up_starts_over_with_fresh_attempts(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage"):
+        with mock.patch.object(nas_ftp, "discard_stage"):
             self._fail_n(dvlane.SHIP_TRIES)
         self.assertTrue(self.lane.retry(NAME))
         e = self.e()
@@ -352,9 +397,9 @@ class FiveAttempts(_Lane):
 
     def test_a_swap_that_keeps_failing_is_given_up_on_too(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage") as disc, \
-             mock.patch.object(nas_ssh, "stat", side_effect=lambda p: (100, 7, 911, 10, "644")
-                               if p == HOST else (90, 8, 911, 10, "644")):   # not swapped yet
+        with mock.patch.object(nas_ftp, "discard_stage") as disc, \
+             mock.patch.object(nas_ftp, "stat", side_effect=lambda p: (100, 7)
+                               if p == HOST else (90, 8)):   # not swapped yet
             self._fail_n(dvlane.SHIP_TRIES, phase="swap")
         self.assertEqual(self.e()["state"], dvbook.FAILED)
         disc.assert_called_once_with(HOST)
@@ -364,9 +409,9 @@ class FiveAttempts(_Lane):
         # fifth attempt that must not delete anything or mark the movie failed (review 2026-09-30).
         self._converted()
         dvbook.update(NAME, tries=dvlane.SHIP_TRIES - 1, phase="swap")
-        with mock.patch.object(nas_ssh, "stat", side_effect=lambda p: (90, 9, 911, 10, "644")
+        with mock.patch.object(nas_ftp, "stat", side_effect=lambda p: (90, 9)
                                if p == HOST else None), \
-             mock.patch.object(nas_ssh, "discard_stage") as disc, \
+             mock.patch.object(nas_ftp, "discard_stage") as disc, \
              mock.patch.object(self.lane, "_flush_plex"):
             self.lane._fail(self.e(), "NAS command failed (255)")
         e = self.e()
@@ -378,8 +423,8 @@ class FiveAttempts(_Lane):
         # and asks again, deleting nothing (review 2026-09-30).
         self._converted()
         dvbook.update(NAME, tries=dvlane.SHIP_TRIES - 1, phase="swap")
-        with mock.patch.object(nas_ssh, "stat", side_effect=RuntimeError("ssh")), \
-             mock.patch.object(nas_ssh, "discard_stage") as disc, \
+        with mock.patch.object(nas_ftp, "stat", side_effect=RuntimeError("ssh")), \
+             mock.patch.object(nas_ftp, "discard_stage") as disc, \
              mock.patch.object(dvlane.time, "time", return_value=1000.0):
             self.lane._fail(self.e(), "NAS command failed (255)")
         e = self.e()
@@ -390,33 +435,33 @@ class FiveAttempts(_Lane):
 
     def test_a_staged_copy_the_give_up_could_not_delete_is_deleted_later(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage", side_effect=RuntimeError("ssh")):
+        with mock.patch.object(nas_ftp, "discard_stage", side_effect=RuntimeError("ssh")):
             self._fail_n(dvlane.SHIP_TRIES)
         self.assertTrue(self.e()["stage_left"])
-        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+        with mock.patch.object(nas_ftp, "discard_stage") as disc:
             self.lane._resume_kept_failures()                # the lane's next start
         disc.assert_called_once_with(HOST)
         self.assertFalse(self.e().get("stage_left"))
 
     def test_remove_deletes_a_staged_copy_the_give_up_left(self):
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage", side_effect=RuntimeError("ssh")):
+        with mock.patch.object(nas_ftp, "discard_stage", side_effect=RuntimeError("ssh")):
             self._fail_n(dvlane.SHIP_TRIES)
-        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+        with mock.patch.object(nas_ftp, "discard_stage") as disc:
             self.assertTrue(self.lane.remove(NAME))
         disc.assert_called_once_with(HOST)
 
     def test_an_unanswered_swap_check_is_not_taken_as_landed(self):
         self._converted()
         dvbook.update(NAME, phase="swap")
-        with mock.patch.object(nas_ssh, "stat", side_effect=RuntimeError("ssh")):
+        with mock.patch.object(nas_ftp, "stat", side_effect=RuntimeError("ssh")):
             self.lane._fail(self.e(), "boom")
         self.assertEqual((self.e()["state"], self.e()["tries"]), (dvbook.ACTIVE, 1))
 
     def test_a_movie_queued_again_after_giving_up_runs_this_run(self):
         # Re-adding it from the picker must not leave it 'Queued' until the run restarts (review).
         self._converted()
-        with mock.patch.object(nas_ssh, "discard_stage"):
+        with mock.patch.object(nas_ftp, "discard_stage"):
             self._fail_n(dvlane.SHIP_TRIES)
         dvbook.add([{"name": NAME, "dir": "/Media/Movies", "title": "Temple", "bytes": 100}])
         with mock.patch.object(dvlane.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 15)):
@@ -426,7 +471,7 @@ class FiveAttempts(_Lane):
         self._converted()
         dvbook.update(NAME, phase="upload", tries=3)
         os.remove(os.path.join(dvlane.work_dir(HOST), "p81.mkv"))
-        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+        with mock.patch.object(nas_ftp, "discard_stage") as disc:
             self.lane._ship(self.e(), self.ev)
         e = self.e()
         self.assertEqual((e["phase"], e.get("tries"), e.get("retry_at")), (None, None, None))
@@ -443,7 +488,7 @@ class FiveAttempts(_Lane):
             self.lane._abort.set()
         with mock.patch.object(self.lane, "_ship", side_effect=ship), \
              mock.patch.object(self.lane, "_flush_plex"), \
-             mock.patch.object(nas_ssh, "link"):
+             mock.patch.object(nas_ftp, "link"):
             self.lane._ship_loop()
         self.assertEqual(seen, [None])
         e = self.e()
@@ -503,7 +548,7 @@ class FiveAttempts(_Lane):
 
     def test_a_kept_failure_whose_file_is_gone_starts_over_when_retried(self):
         dvbook.update(NAME, state=dvbook.FAILED, phase="upload", size_out=90)
-        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+        with mock.patch.object(nas_ftp, "discard_stage") as disc:
             self.lane._resume_kept_failures()
         e = self.e()
         self.assertEqual((e["state"], e["phase"]), (dvbook.FAILED, None))
@@ -552,12 +597,12 @@ class OneTransferAtATime(unittest.TestCase):
         stop = threading.Event()
         def check():
             if stop.is_set():
-                raise nas_ssh.Stopped("stopped")
+                raise nas_ftp.Stopped("stopped")
         errs = []
         def waiter():
             try:
                 gate.acquire("download of B", check, poll=0.01)
-            except nas_ssh.Stopped as ex:
+            except nas_ftp.Stopped as ex:
                 errs.append(ex)
         t = threading.Thread(target=waiter)
         t.start()
@@ -593,13 +638,13 @@ class LaneNeverOverlapsTransfers(_Lane):
             with open(local, "wb") as fh:
                 fh.write(b"s" * size)
         idle = {"count": 0, "files": set()}
-        with mock.patch.object(nas_ssh, "stat", side_effect=lambda p: None if p.endswith(".part")
-                               else (100, 7, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "download", side_effect=fake_download), \
-             mock.patch.object(nas_ssh, "upload", side_effect=lambda *a, **k: busy("upload")), \
-             mock.patch.object(nas_ssh, "remote_dv_profile", return_value=8), \
-             mock.patch.object(nas_ssh, "discard_stage"), \
-             mock.patch.object(nas_ssh, "swap"), \
+        with mock.patch.object(nas_ftp, "stat", side_effect=lambda p: None if p.endswith(".part")
+                               else (100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=fake_download), \
+             mock.patch.object(nas_ftp, "upload", side_effect=lambda *a, **k: busy("upload")), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "discard_stage"), \
+             mock.patch.object(nas_ftp, "swap"), \
              mock.patch.object(dvp7, "convert", side_effect=self._fake_convert), \
              mock.patch.object(dvlane.plex, "session_detail", return_value=idle), \
              mock.patch.object(dvlane.plex, "refresh_folder", return_value=True), \
@@ -626,7 +671,7 @@ class LaneNeverOverlapsTransfers(_Lane):
                     stop.set()
         w = threading.Thread(target=watch)
         w.start()
-        with self.assertRaises(nas_ssh.Stopped):
+        with self.assertRaises(nas_ftp.Stopped):
             with self.lane._transfer("fetch", self.e(), "download", stop):
                 pass
         w.join(5)
@@ -643,16 +688,16 @@ class LaneNeverOverlapsTransfers(_Lane):
         stop = threading.Event()
         stop.set()                       # already stopped when the gate is granted
         ran = []
-        with self.assertRaises(nas_ssh.Stopped):
+        with self.assertRaises(nas_ftp.Stopped):
             with self.lane._transfer("fetch", self.e(), "download", stop):
                 ran.append(1)
         self.assertEqual(ran, [])
         self.assertIsNone(self.lane._gate.holder)       # and the gate is free again
 
     def test_no_room_by_the_time_the_turn_comes_means_no_download(self):
-        with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
              mock.patch.object(dvlane, "fits", return_value=False), \
-             mock.patch.object(nas_ssh, "download", side_effect=AssertionError("no room")):
+             mock.patch.object(nas_ftp, "download", side_effect=AssertionError("no room")):
             with self.assertRaises(dvlane._NoRoom):
                 self.lane._fetch(self.e(), self.ev)
         self.assertIsNone(self.lane._gate.holder)
@@ -663,12 +708,12 @@ class LaneNeverOverlapsTransfers(_Lane):
         def prof(stage):
             seen.append(dict(self.lane._status["ship"]))
             return 8
-        with mock.patch.object(nas_ssh, "upload"), \
-             mock.patch.object(nas_ssh, "remote_dv_profile", side_effect=prof), \
-             mock.patch.object(nas_ssh, "swap"), \
+        with mock.patch.object(nas_ftp, "upload"), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", side_effect=prof), \
+             mock.patch.object(nas_ftp, "swap"), \
              mock.patch.object(dvlane.plex, "session_detail", return_value=None), \
              mock.patch.object(self.lane, "_wait", side_effect=lambda s: True):
-            with self.assertRaises(nas_ssh.Stopped):
+            with self.assertRaises(nas_ftp.Stopped):
                 self.lane._ship(self.e(), threading.Event())
         self.assertNotEqual(seen[0]["phase"], "upload")
         self.assertIsNone(seen[0].get("rate"))
@@ -740,9 +785,9 @@ class CachedDownloadsGiveWay(_Lane):
         # Room is judged again when the transfer's turn comes; the cache must give way there as well,
         # not send the movie back to wait for disk.
         self.disk["cache"] = 500
-        with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
-             mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
-             mock.patch.object(nas_ssh, "discard_stage"), \
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ftp, "discard_stage"), \
              mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
             self.lane._fetch(self.e(), self.ev)
         self.assertEqual(self.asks, [180])

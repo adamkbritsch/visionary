@@ -277,7 +277,7 @@ class DvQueue(unittest.TestCase):
         self.assertEqual(dvbook.queue(), [])
 
     def test_the_state_poll_carries_the_lane(self):
-        with mock.patch("nas_ssh.remote", side_effect=AssertionError("poll-safe: no NAS I/O")):
+        with mock.patch("nas_ftp._connect", side_effect=AssertionError("poll-safe: no NAS I/O")):
             st = server.dv_convert_info()
         self.assertIn("summary", st)
         self.assertIn("queue", st)

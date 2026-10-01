@@ -290,6 +290,7 @@ struct DVLinkDTO: Codable {             // the Mac's link to the NAS for the lan
     var name: String?        // the network service's name ("Living Room 5G LAN")
     var speed: String?       // "2.5 GbE"
     var ip: String?
+    var via: String?         // how the last connection reached the NAS: "lan" | "tailscale"
 }
 
 struct DVConvertDTO: Codable {

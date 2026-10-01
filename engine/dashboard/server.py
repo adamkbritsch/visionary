@@ -347,7 +347,7 @@ def api_dv_queue(body):
     route by which an already-Dolby-Vision movie is queued; the movie queue still refuses them."""
     import dvbook
     import dvlane
-    import nas_ssh
+    import nas_ftp
     action = (body.get("action") or "").strip()
     if action == "add":
         rows = body.get("items") or [body]
@@ -360,7 +360,7 @@ def api_dv_queue(body):
             d = transfer.display_name((r.get("dir") or "").strip().rstrip("/"))
             items.append({"name": name, "dir": r.get("dir") or "", "title": r.get("title") or name,
                           "bytes": r.get("bytes") or None,
-                          "host": nas_ssh.ftp_to_host(f"{d}/{name}") if d else None})
+                          "host": nas_ftp.ftp_to_host(f"{d}/{name}") if d else None})
         added = dvbook.add(items)
         return {"added": added, "refused": len(items) - added, "dv_convert": dv_convert_info()}
     raw = (body.get("name") or "").strip()

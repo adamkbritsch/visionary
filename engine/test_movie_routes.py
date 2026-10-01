@@ -141,6 +141,13 @@ var wired = DVLinkDTO(); wired.iface = "en12"; wired.wired = true; wired.kind = 
 wired.name = "Living Room 5G LAN"; wired.speed = "2.5 GbE"
 check(DVConvert.linkLine(wired) == "Transfers over Ethernet · Living Room 5G LAN · 2.5 GbE",
       "wired -> \(DVConvert.linkLine(wired))")
+var away = DVLinkDTO(); away.via = "tailscale"; away.bound = false
+check(DVConvert.linkLine(away) == "Transfers over Tailscale — not over the NAS's local network",
+      "tailscale -> \(DVConvert.linkLine(away))")
+var fellBack = wired; fellBack.via = "tailscale"; fellBack.bound = true      // home, but the LAN failed
+check(DVConvert.linkLine(fellBack).hasPrefix("Transfers over Tailscale"), "fell back -> \(DVConvert.linkLine(fellBack))")
+var homeLan = wired; homeLan.via = "lan"; homeLan.bound = true
+check(DVConvert.linkLine(homeLan).hasPrefix("Transfers over Ethernet"), "lan via")
 var air = DVLinkDTO(); air.iface = "en0"; air.wired = false; air.kind = "Wi-Fi"
 check(DVConvert.linkLine(air) == "Transfers over Wi-Fi — no Ethernet link to the NAS",
       "wifi -> \(DVConvert.linkLine(air))")

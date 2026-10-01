@@ -181,6 +181,9 @@ enum DVConvert {
         guard let l else { return "" }
         if let age = l.age, age > 120 { return "" }     // a stopped lane's leftover, not "now"
         if l.unavailable == true { return "Waiting for an Ethernet link to the NAS — Ethernet only" }
+        if l.via == "tailscale" {                            // away from home, or the LAN failed
+            return "Transfers over Tailscale — not over the NAS's local network"
+        }
         guard let iface = l.iface else { return "" }
         let name = l.name ?? iface
         if l.wired == true {

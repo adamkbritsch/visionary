@@ -637,7 +637,7 @@ def _note_dv_profile(m: dict, prof) -> None:
     Never raises into the sweep."""
     try:
         import dvbook
-        import nas_ssh
+        import nas_ftp
         from transfer import display_name
         try:
             major = int(str(prof).split(".")[0]) if prof else None
@@ -647,7 +647,7 @@ def _note_dv_profile(m: dict, prof) -> None:
         # so the row is KNOWN, and the one-time backfill below never probes it again. 5 is kept so
         # the DV 8.1 chip can never claim a profile 5 web release.
         name = display_name(m["name"])
-        host = nas_ssh.ftp_to_host(display_name((m.get("dir") or "").rstrip("/")) + "/" + name)
+        host = nas_ftp.ftp_to_host(display_name((m.get("dir") or "").rstrip("/")) + "/" + name)
         dvbook.record_profile(name, m.get("bytes") or None, major if major in (5, 7, 8) else None,
                               src="probe", host=host)
     except Exception:  # noqa: BLE001

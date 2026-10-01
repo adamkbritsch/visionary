@@ -6,15 +6,19 @@ should have to re-encode their hdr video"). dvp7.py copies the HDR10 video bit f
 only the RPU. That makes this a transfer job, not a GPU job, so it runs BESIDE the TV pipeline in
 its own two threads instead of taking the run thread's turn:
 
-  fetch:  pull the original over SSH (resumable) -> dvp7.convert (inspect, build, verify)
-  ship:   push the new file to a staging folder on the SAME NAS volume -> the NAS's own ffprobe
-          must read profile 8 there -> one rename over the original (same name, owner and mode;
-          refused if the original changed since it was read) -> Plex rescans the folder and
-          re-analyzes the item
+  fetch:  pull the original over FTP (resumable) -> dvp7.convert (inspect, build, verify)
+  ship:   push the new file to a staging folder on the SAME NAS volume -> ffprobe must read
+          profile 8 in the head read back from there -> one rename over the original (same name
+          and mode; refused if the original changed since it was read) -> Plex rescans the folder
+          and re-analyzes the item
+
+The NAS is reached over FTP, the same way as the rest of Visionary (user, 2026-10-01: "it
+shouldn't be going over ssh at all, it should use ftp"): the LAN route at home, Tailscale away from
+it. nas_ftp.py has the resumable transfers and the swap.
 
 ONE TRANSFER AT A TIME (user-dictated 2026-09-30: "it should only upload/download one thing at a
 time"): every download and upload passes through one first-come-first-served gate, so the NAS link
-and the NAS's disks and sshd serve a single stream. Only the local conversion overlaps a transfer —
+and the NAS's disks and FTP server serve a single stream. Only the local conversion overlaps a transfer —
 and first-come order is what makes that overlap happen: the fetch thread queues the next download
 while an upload is still running, so it goes next, and the movie just downloaded converts while the
 one before it uploads. No backup is kept (user-dictated 2026-09-27); the original is only replaced
@@ -50,7 +54,7 @@ import time
 import dvbook
 import dvp7
 import logbook
-import nas_ssh
+import nas_ftp
 import plex
 
 WORK_ROOT = (os.path.join(tempfile.gettempdir(), "visionary-test-dvlane")
@@ -270,7 +274,7 @@ class Lane:
     def retry(self, name: str) -> bool:
         """Put a failed movie back. It resumes where it failed when that is safe — a staged copy on
         the NAS (swap) or a verified new file still on the Mac (converted/upload) — and starts over
-        otherwise. Annihilation failed on one SSH blip with 43 GB converted and ready (2026-09-30);
+        otherwise. Annihilation failed on one network blip with 43 GB converted and ready (2026-09-30);
         starting it over would have moved 90 GB again for nothing."""
         e = dvbook.entry(name)
         if e and e.get("state") == dvbook.ACTIVE and e.get("retry_at"):
@@ -335,7 +339,7 @@ class Lane:
         if name in self._cancelled:
             raise _Cancelled(name)
         if self._abort.is_set() or ev.is_set():
-            raise nas_ssh.Stopped("stopped")
+            raise nas_ftp.Stopped("stopped")
 
     def _wait(self, secs) -> bool:
         """Sleep, waking early on stop. True if stopping."""
@@ -387,21 +391,24 @@ class Lane:
     def _offline(self, ex) -> bool:
         """A step that failed because the NAS dropped off the network (asleep, the Mac away from
         home) is not the movie's fault: wait for the NAS instead of failing it."""
-        if nas_ssh.reachable():
+        if nas_ftp.reachable():
             return False
         def why(ex):
-            return ("waiting for an Ethernet link to the NAS (Settings: NAS network is Ethernet only)"
-                    if isinstance(ex, nas_ssh.NoLink)
-                    else f"waiting for the NAS (SSH unreachable: {str(ex)[:120]})")
+            if isinstance(ex, nas_ftp.NoLink):
+                return (f"waiting: {ex.note}" if getattr(ex, "note", None) else
+                        "waiting for an Ethernet link to the NAS (Settings: NAS network is Ethernet only)")
+            return f"waiting for the NAS (it does not answer over FTP: {str(ex)[:120]})"
         self._note = why(ex)
-        while not self._abort.is_set() and not nas_ssh.reachable():
+        while not self._abort.is_set() and not nas_ftp.reachable():
             # The reason follows what is true NOW (a cable plugged back in while the NAS is still
             # rebooting is no longer a cable problem — review 2026-09-30).
-            if (nas_ssh.link() or {}).get("unavailable"):
-                self._note = why(nas_ssh.NoLink(""))
+            if (nas_ftp.link() or {}).get("unavailable"):
+                self._note = why(nas_ftp.NoLink(""))
+            elif getattr(ex, "note", None):
+                self._note = why(ex)           # a configuration Ethernet only cannot pin: still so
             else:
-                self._note = ("waiting for the NAS (it does not answer over SSH)"
-                              if isinstance(ex, nas_ssh.NoLink) else why(ex))
+                self._note = ("waiting for the NAS (it does not answer over FTP)"
+                              if isinstance(ex, nas_ftp.NoLink) else why(ex))
             if self._wait(IDLE_POLL_SECS):
                 break
         self._note = None
@@ -456,7 +463,7 @@ class Lane:
     def _swap_landed(self, e):
         """After a failed swap: did the rename happen anyway? None when the NAS cannot say."""
         try:
-            st, staged = nas_ssh.stat(e["host"]), nas_ssh.stat(nas_ssh.stage_path_for(e["host"]))
+            st, staged = nas_ftp.stat(e["host"]), nas_ftp.stat(nas_ftp.stage_path_for(e["host"]))
         except Exception:  # noqa: BLE001 — unknown: the next attempt asks again
             return None
         return swapped_already(st[0] if st else None, bool(staged),
@@ -487,7 +494,7 @@ class Lane:
         shutil.rmtree(work_dir(e["host"]), ignore_errors=True)
         if e.get("phase") in ("upload", "swap") or e.get("stage_left"):
             try:
-                nas_ssh.discard_stage(e["host"])
+                nas_ftp.discard_stage(e["host"])
             except Exception:  # noqa: BLE001 — remembered as stage_left and tried again later
                 return False
         return True
@@ -625,7 +632,7 @@ class Lane:
                 self._fetch(e, ev)
             except (_Cancelled, _NoRoom):
                 pass                     # _pick_fetch now says what it is waiting for
-            except (nas_ssh.Stopped, dvp7.Aborted):
+            except (nas_ftp.Stopped, dvp7.Aborted):
                 if self._abort.is_set():
                     return
             except Exception as ex:  # noqa: BLE001
@@ -644,11 +651,11 @@ class Lane:
         src, out = os.path.join(d, "source.mkv"), os.path.join(d, "p81.mkv")
         os.makedirs(d, exist_ok=True)
         self._set("fetch", e, "checking")
-        st = nas_ssh.stat(host)
+        st = nas_ftp.stat(host)
         if not st:
             raise RuntimeError(f"not on the NAS any more: {host}")
         if st[0] != size:
-            if nas_ssh.remote_dv_profile(host) == 8:
+            if nas_ftp.remote_dv_profile(host) == 8:
                 dvbook.record_profile(name, st[0], 8, src="probe", host=host)
                 dvbook.update(name, state=dvbook.DONE, phase=None, note="already profile 8",
                               finished=int(time.time()))
@@ -666,14 +673,19 @@ class Lane:
             if not self._room(e):
                 raise _NoRoom(name)
             logbook.event(f"DV 7->8.1 {e.get('title')}: downloading {size / 1e9:.1f} GB")
-            nas_ssh.download(host, src, size, abort=ev, limit=self._limit,
+            nas_ftp.download(host, src, size, abort=ev, limit=self._limit,
                              on_progress=lambda b, t: self._set("fetch", e, "download", b, t))
         self._set("fetch", e, "convert", 0, 100)      # the download row must not look live now
         self._check(name, ev)
         dvbook.update(name, phase="convert")
         # A fresh conversion makes any staged copy from an earlier attempt stale: mkvmerge writes a
-        # new segment UID every time, so resuming an upload onto it would splice two files.
-        nas_ssh.discard_stage(host)
+        # new segment UID every time, so resuming an upload onto it would splice two files. Best
+        # effort here — a blip must not throw away a verified download (review 2026-10-01); the
+        # ship step clears it again before this conversion's first upload.
+        try:
+            nas_ftp.discard_stage(host)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             res = dvp7.convert(src, out, os.path.join(d, "work"), abort=ev,
                                progress=lambda pct: self._set("fetch", e, "convert", pct, 100))
@@ -711,7 +723,7 @@ class Lane:
             if not e:
                 self._status["ship"] = None
                 try:
-                    nas_ssh.link()          # keep the panel's link current while idle (local only)
+                    nas_ftp.link()          # keep the panel's link current while idle (local only)
                 except Exception:  # noqa: BLE001
                     pass
                 if self._wait(IDLE_POLL_SECS):
@@ -724,7 +736,7 @@ class Lane:
                 self._ship(e, ev)
             except _Cancelled:
                 pass
-            except (nas_ssh.Stopped, dvp7.Aborted):
+            except (nas_ftp.Stopped, dvp7.Aborted):
                 if self._abort.is_set():
                     return
             except Exception as ex:  # noqa: BLE001
@@ -738,11 +750,11 @@ class Lane:
     def _ship(self, e, ev):
         name, host = e["name"], e["host"]
         out = os.path.join(work_dir(host), "p81.mkv")
-        stage = nas_ssh.stage_path_for(host)
+        stage = nas_ftp.stage_path_for(host)
         size_in, size_out = int(e.get("size_in") or e.get("bytes") or 0), int(e.get("size_out") or 0)
         phase = e.get("phase")
         if phase == "swap":
-            st, staged = nas_ssh.stat(host), nas_ssh.stat(stage)
+            st, staged = nas_ftp.stat(host), nas_ftp.stat(stage)
             if swapped_already(st[0] if st else None, bool(staged), size_in, size_out):
                 return self._finish(e)
             if not staged or staged[0] != size_out:
@@ -752,21 +764,24 @@ class Lane:
                 # The new file is gone: convert it again. The next file is a new file — it gets
                 # its own attempts — and a staged copy of the old one is of no use to it.
                 try:
-                    nas_ssh.discard_stage(host)
+                    nas_ftp.discard_stage(host)
                 except Exception:  # noqa: BLE001 — the conversion discards it again before uploading
                     pass
                 dvbook.update(name, phase=None, tries=None, retry_at=None)
                 return
+            if phase == "converted":
+                nas_ftp.discard_stage(host)              # this conversion's first upload: any
+                                                         # staged copy is from an older one
             dvbook.update(name, phase="upload")
             self._check(name, ev)
             with self._transfer("ship", e, "upload", ev):
                 logbook.event(f"DV 7->8.1 {e.get('title')}: uploading {size_out / 1e9:.1f} GB")
-                nas_ssh.upload(out, stage, abort=ev, limit=self._limit,
+                nas_ftp.upload(out, stage, abort=ev, limit=self._limit,
                                on_progress=lambda b, t: self._set("ship", e, "upload", b, t))
             self._set("ship", e, "swap", note="checking the uploaded copy on the NAS")
-            prof = nas_ssh.remote_dv_profile(stage)
+            prof = nas_ftp.remote_dv_profile(stage)
             if prof != 8:
-                nas_ssh.discard_stage(host)
+                nas_ftp.discard_stage(host)
                 raise RuntimeError(f"the NAS reads DV profile {prof} in the staged file, not 8")
             dvbook.update(name, phase="swap")
         # The swap: never while someone is playing THIS file (their player holds the old one open,
@@ -778,16 +793,16 @@ class Lane:
                 break
             self._set("ship", e, "swap", note="waiting: this movie is playing on Plex")
             try:
-                nas_ssh.link()              # a long wait here must not leave the panel's link stale
+                nas_ftp.link()              # a long wait here must not leave the panel's link stale
             except Exception:  # noqa: BLE001
                 pass
             if self._wait(IDLE_POLL_SECS):
-                raise nas_ssh.Stopped("stopped")
+                raise nas_ftp.Stopped("stopped")
         self._set("ship", e, "swap")
         with self._lock:
             if name in self._cancelled:
                 raise _Cancelled(name)
-            nas_ssh.swap(stage, host, expect_size=size_in, expect_mtime=int(e["expect_mtime"]),
+            nas_ftp.swap(stage, host, expect_size=size_in, expect_mtime=int(e["expect_mtime"]),
                          new_size=size_out)
         self._finish(e)
 
@@ -812,7 +827,7 @@ class Lane:
         if d is None or d["count"] > 0:
             return
         for e in pend:
-            folder = nas_ssh.host_to_plex(os.path.dirname(e["host"]))
+            folder = nas_ftp.host_to_plex(os.path.dirname(e["host"]))
             ok = True
             if e.get("section") and folder:
                 ok = plex.refresh_folder(e["section"], folder) and ok
