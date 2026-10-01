@@ -30,7 +30,7 @@ Arm it in the evening; wake up to finished episodes.
 <p align="center">
   <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one upscaling in Topaz while the previous one's Dolby Vision™ remux runs beside it" width="820">
 </p>
-<p align="center"><sub><b>Two episodes in flight at once</b> — S05E02 upscaling in Topaz while S05E01's Dolby Vision™ remux runs beside it, each with its own segmented, resumable progress and its own estimate.</sub></p>
+<p align="center"><sub><b>Two episodes in flight at once</b> — S03E10 upscaling in Topaz while S03E09's Dolby Vision™ remux runs beside it, each with its own segmented, resumable progress and its own estimate.</sub></p>
 
 > [!IMPORTANT]
 > **Visionary drives the DaVinci Resolve interface by looking at the screen, and runs the
@@ -460,9 +460,9 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   uploads, cleanup and the prefetcher, so nothing whatsoever overlaps it.
 
 <p align="center">
-  <img src="docs/assets/dual-remux.png" alt="The pipeline card with two remux lanes running at once, and the header showing both percentages" width="900">
+  <img src="docs/assets/dual-remux.png" alt="The pipeline card with two remux lanes running at once" width="900">
 </p>
-<p align="center"><sub><b>Both remux lanes live</b> — each names its own episode and carries its own progress, segment counter and ETA; the header readout shows both at once. Lane 2 shows no elapsed clock because the engine keeps that bookkeeping on lane 1 only.</sub></p>
+<p align="center"><sub><b>Both remux lanes live</b> (an earlier build's pipeline card) — each names its own episode and carries its own progress, segment counter and ETA. Lane 2 shows no elapsed clock because the engine keeps that bookkeeping on lane 1 only.</sub></p>
 
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Resolve render
   under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K
@@ -489,13 +489,13 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 | Round-robin queue | Guardrails |
 |:---:|:---:|
-| <img src="docs/assets/queue.png" alt="Series queue: round-robin shows, unwatched-first, the next nine items lined up" width="420"> | <img src="docs/assets/scratch.png" alt="Scratch and power: the 140 W gate, free space, live per-episode scratch usage" width="420"> |
+| <img src="docs/assets/queue.png" alt="Series queue: the current show and its settings, then the next items in the one global order, episodes with YouTube videos slotted in at the cadence" width="420"> | <img src="docs/assets/scratch.png" alt="Scratch and power: the 140 W gate, free space, live per-episode scratch usage" width="420"> |
 | <sub>Pick shows, keep <b>unwatched first</b>, round-robin several series; movies and YouTube slot in on their own cadence. A show's featurettes always run after its episodes, and a per-show <b>Upscale featurettes</b> toggle skips them entirely. While the pipeline is armed the per-item settings condense to <b>one line</b> — they can't change mid-run — but you can still queue more work, and drag a movie to whichever slot you want it to run in.</sub> | <sub>The <b>140 W power gate</b> and free-space headroom, plus live per-episode scratch usage broken out by artefact (Topaz segments, DV render, CFR source, source).</sub> |
 
 | Movies | YouTube |
 |:---:|:---:|
-| <img src="docs/assets/movies.png" alt="Movies tab: a queued movie showing its resolved output mode, audio and source-fate settings" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
-| <sub>Movies run whole when they come due. Each one shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned otherwise (2000-nit is manual-only), and an HDR10 source keeps its original bits (unless its peaks breach the DV playback ceiling). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence you set (here <b>1 per 3 TV episodes</b>), with per-channel scope and age filters. Channels can be paused individually.</sub> |
+| <img src="docs/assets/movies.png" alt="Movies tab: filters named for the source, and the Dolby Vision™ 7 → 8.1 lane converting profile 7 movies in place" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
+| <sub>Movies run whole when they come due. The filters say what each source is — <b>1080p & below</b>, <b>4K SDR</b>, <b>4K HDR10</b>, <b>DV 7</b>, <b>DV 8.1</b> — and a profile 7 movie goes to the <b>Dolby Vision™ 7 → 8.1</b> lane: converted in place with no re-encode, over the Ethernet, one transfer at a time (here 22 of 210 done). A queued movie shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned otherwise (2000-nit is manual-only). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence you set (here <b>4 per TV episode</b>), with per-channel scope and age filters. Channels can be paused individually.</sub> |
 
 <p align="center">
   <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">

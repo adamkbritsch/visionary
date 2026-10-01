@@ -3791,29 +3791,30 @@ private struct UpNextView: View {
     var showSeries: Bool = false        // round-robin: tag each episode with which show it's from
     @EnvironmentObject var store: AppStore
     @State private var expanded = false
+    @Environment(\.snapshotExpanded) private var forceOpen      // Snapshots.swift: render it open
     @State private var confirmingVideoDelete: UpNextDTO? = nil   // a video awaiting skip/delete confirm
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Button { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } } label: {
                 HStack(spacing: 8) {
                     Text("Next up").foregroundStyle(.secondary)
-                    if !expanded, let first = items.first { row(first) }
+                    if !(expanded || forceOpen), let first = items.first { row(first) }
                     Spacer()
                     // Count SLOTS, not entries — a run of videos draws as one row, so
                     // "+N" has to match what expanding actually reveals.
                     let slots = Self.grouped(items).count
                     if slots > 1 {
-                        if !expanded {
+                        if !(expanded || forceOpen) {
                             Text("+\(slots - 1)").font(.system(size: 11)).foregroundStyle(.tertiary)
                         }
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        Image(systemName: (expanded || forceOpen) ? "chevron.up" : "chevron.down")
                             .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
                     }
                 }
                 .font(.system(size: 13)).contentShape(Rectangle())
             }
             .buttonStyle(.plain).disabled(Self.grouped(items).count <= 1)
-            if expanded {
+            if expanded || forceOpen {
                 // Full list in processing order. Movies (only) get controls: ↑/↓ move them
                 // anywhere — including between episodes — and × removes them. CONSECUTIVE
                 // YOUTUBE VIDEOS COLLAPSE into ONE slot (they arrive in bursts and used to
@@ -4567,7 +4568,7 @@ private struct ScrollYKey: PreferenceKey {
 /// scrolling back up lets it settle (subtle parallax — the room feels physical).
 /// GPU: the glow layers are flattened once into a Metal texture (`drawingGroup`) and the
 /// scroll motion is a pure `.offset` transform — composited on the GPU, never re-rendered.
-private struct TheatreStage: View {
+struct TheatreStage: View {      // internal: Snapshots.swift paints cards on it
     var scrollY: CGFloat            // ScrollView content minY (0 at top, negative scrolled down)
     var body: some View {
         // scroll DOWN (minY negative) → the light LIFTS toward you and BRIGHTENS a touch

@@ -24,6 +24,7 @@ swiftc \
   "$ROOT/macapp/Cadence.swift" \
   "$ROOT/macapp/Models.swift" \
   "$ROOT/macapp/MovieRoutes.swift" \
+  "$ROOT/macapp/Snapshots.swift" \
   "$ROOT/macapp/Store.swift" \
   "$ROOT/macapp/Views.swift" \
   "$ROOT/macapp/SetupViews.swift" \

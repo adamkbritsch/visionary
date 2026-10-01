@@ -585,6 +585,18 @@ final class DockProgressView: NSView {
 }
 
 MainActor.assumeIsolated {
+    // `--snapshots DIR`: render the README card screenshots from the running app's live state and
+    // exit (Snapshots.swift) — no server, no window, no Dock icon; the app in use is untouched.
+    if let i = CommandLine.arguments.firstIndex(of: "--snapshots") {
+        let dir = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "."
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        Task { @MainActor in
+            await Snapshots.run(dir)
+            exit(0)
+        }
+        app.run()
+    }
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate                 // NSApplication.delegate is weak; the local
