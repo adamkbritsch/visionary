@@ -146,6 +146,12 @@ else
   say "user had the pipeline STOPPED — deploying without re-arming"
 fi
 pkill -f tvai_up 2>/dev/null; pkill -f "dashboard/server.py" 2>/dev/null; pkill -f "$BIN" 2>/dev/null
+# Refresh LaunchServices BEFORE the relaunch. The bundle is rebuilt in place, and the app takes its
+# icon (NSApp.applicationIconImage, which its progress Dock tile draws) from that cache at launch —
+# so a new icon deployed without this kept showing the old one until the next relaunch
+# (user-caught 2026-09-30). Cheap, and a no-op when nothing changed.
+LSR=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+touch "$APP"; [ -x "$LSR" ] && "$LSR" -f "$APP" 2>/dev/null
 sleep 3; open "$APP"; sleep 8
 vp=$(pgrep -f "$BIN" | wc -l | tr -d ' '); sp=$(pgrep -f "dashboard/server.py" | wc -l | tr -d ' ')
 say "relaunched: Visionary=$vp server=$sp"
