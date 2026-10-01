@@ -366,10 +366,12 @@ struct HeaderBar: View {
         let on = store.activated          // appliance: the persisted arm state, not the transient run
         HStack(spacing: 14) {
             VisionaryMark()
-            // Just the mark and the name — the "4K Dolby Vision Upscaler" subtitle is gone
-            // (user-dictated 2026-09-30).
-            Text("Visionary").font(.system(size: 16, weight: .bold))
-                .foregroundStyle(DS.silverBright).headerSurface()   // cutout of the shared header surface
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Visionary").font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(DS.silverBright).headerSurface()   // cutout of the shared header surface
+                Text("4K Dolby Vision Upscaler")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
             Spacer()
             PowerPill()
             Button(action: {
