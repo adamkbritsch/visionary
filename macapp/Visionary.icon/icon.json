@@ -1,8 +1,8 @@
 {
   "fill" : {
     "linear-gradient" : [
-      "display-p3:0.14417,0.14246,0.14185,1.00000",
-      "display-p3:0.11688,0.08557,0.06116,1.00000"
+      "display-p3:0.19343,0.19981,0.20799,1.00000",
+      "display-p3:0.16891,0.13621,0.11024,1.00000"
     ],
     "orientation" : {
       "start" : {
@@ -19,27 +19,26 @@
     {
       "layers" : [
         {
-          "blend-mode" : "lighten",
           "fill" : {
             "linear-gradient" : [
-              "display-p3:0.89790,0.90198,0.90559,1.00000",
-              "display-p3:0.25099,0.29429,0.34534,1.00000"
+              "display-p3:0.89941,0.90332,0.90967,1.00000",
+              "display-p3:0.20142,0.21460,0.23413,1.00000"
             ],
             "orientation" : {
               "start" : {
-                "x" : 0.5,
+                "x" : 0.49999999999999983,
                 "y" : 0
               },
               "stop" : {
-                "x" : 0.5,
-                "y" : 0.7
+                "x" : 0.49999999999999983,
+                "y" : 1
               }
             }
           },
-          "image-name" : "Visionary-Logo.svg",
-          "name" : "Visionary-Logo",
+          "image-name" : "Visionary-icon.svg",
+          "name" : "Visionary-icon",
           "position" : {
-            "scale" : 1.19,
+            "scale" : 1.3,
             "translation-in-points" : [
               0,
               0
