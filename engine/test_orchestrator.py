@@ -778,6 +778,105 @@ class PlexFailsafe(unittest.TestCase):
         self.assertFalse(captured["abort"].is_set())      # the live download is NOT gated by Plex
 
 
+class DVQueueOverCache(unittest.TestCase):
+    """The DV 7 queue outranks cached downloads (user, 2026-09-30): the DV lane may clear the
+    prefetch buffer, least imminent item first, and the prefetcher leaves the lane its room."""
+
+    def _buffer(self, o):
+        pf = tempfile.mkdtemp()
+        def put(name, n):
+            with open(os.path.join(pf, name), "wb") as fh:
+                fh.write(b"x" * n)
+        items = {k: episode_paths("A", f"S01E0{i}", f"{k}.mkv") for i, k in enumerate("ABCDE", 1)}
+        for k, p in items.items():
+            stem = os.path.splitext(p.source_basename)[0]
+            put(p.source_basename, 100)
+            put(stem + "_cfr.mp4", 100)
+        put("orphan.mkv", 10)
+        o.state["current"] = {"name": items["D"].source_basename}     # being claimed right now
+        o._item_lock(items["E"]).acquire()                            # its download is in flight
+        cands = [items[k] for k in "ABEC"]                            # priority order: A runs next
+        return pf, items, cands
+
+    def test_eviction_goes_least_imminent_first_and_stops_when_enough(self):
+        o = orch.Orchestrator()
+        pf, items, cands = self._buffer(o)
+        with mock.patch.object(orch.scratch, "prefetch_dir", return_value=pf), \
+             mock.patch.object(o, "_prefetch_candidates", return_value=cands):
+            self.assertEqual(o._evict_prefetch(0, dry_run=True), 610)   # orphan + A, B, C
+            freed = o._evict_prefetch(150)
+        self.assertEqual(freed, 210)                                     # the orphan, then all of C
+        left = set(os.listdir(pf))
+        self.assertNotIn("orphan.mkv", left)
+        for k in "ABDE":                                                 # D claimed, E in flight
+            self.assertIn(items[k].source_basename, left)
+        self.assertNotIn(items["C"].source_basename, left)
+
+    def test_the_item_starting_now_is_never_taken_for_an_orphan(self):
+        # _process sets _current_paths, then the skip key that drops the item from the candidates,
+        # then state['current']. Caught between the last two, the item is in no candidate list and
+        # not yet 'current' — it must still be kept (review 2026-09-30).
+        o = orch.Orchestrator()
+        pf, items, cands = self._buffer(o)
+        o.state["current"] = None
+        o._current_paths = items["A"]
+        with mock.patch.object(orch.scratch, "prefetch_dir", return_value=pf), \
+             mock.patch.object(o, "_prefetch_candidates", return_value=[items[k] for k in "BEC"]):
+            o._evict_prefetch(10 ** 9)                                   # clear everything it may
+        left = set(os.listdir(pf))
+        self.assertIn(items["A"].source_basename, left)
+        self.assertNotIn(items["B"].source_basename, left)
+
+    def test_an_empty_or_missing_buffer_frees_nothing(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.scratch, "prefetch_dir", return_value="/no/such/prefetch"):
+            self.assertEqual(o._evict_prefetch(100), 0)
+
+    def _round(self, reserve_gb):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("A", "S01E01", SRC)
+        with mock.patch.object(orch, "_prefetch_cap_gb", return_value=100), \
+             mock.patch.object(o, "_prefetch_candidates", return_value=[p]), \
+             mock.patch.object(o, "_purge_prefetch_orphans"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda q: q), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch.scratch, "physical_free_gb",
+                               return_value=orch._prefetch_gate_gb() + 10), \
+             mock.patch.object(orch.scratch, "folder_used_gb", return_value=0), \
+             mock.patch.object(o, "_plex_started_now", return_value=False), \
+             mock.patch.object(orch, "_dv_reserve_gb", return_value=reserve_gb), \
+             mock.patch.object(o, "_download_once") as dl, \
+             mock.patch.object(o, "_sleep", side_effect=lambda _s: setattr(o, "_enabled", False)):
+            o._prefetch()
+        return dl
+
+    def test_the_prefetcher_leaves_the_dv_lane_its_room(self):
+        self._round(20).assert_not_called()           # 10 GB over its gate, but the DV lane needs 20
+        self._round(0).assert_called_once()           # nothing reserved: prefetching as before
+
+    def test_the_reserve_rounds_up_to_whole_gb(self):
+        import dvlane
+        with mock.patch.object(dvlane.LANE, "reserve_bytes", return_value=1):
+            self.assertEqual(orch._dv_reserve_gb(), 1)
+        with mock.patch.object(dvlane.LANE, "reserve_bytes", return_value=0):
+            self.assertEqual(orch._dv_reserve_gb(), 0)
+        with mock.patch.object(dvlane.LANE, "reserve_bytes", side_effect=OSError):
+            self.assertEqual(orch._dv_reserve_gb(), 0)
+
+    def test_enable_lends_the_lane_the_buffer(self):
+        import dvlane
+        o = orch.Orchestrator()
+        old = dvlane.LANE._cache
+        try:
+            with mock.patch.object(o, "_start_caffeinate"), \
+                 mock.patch.object(o, "_finisher_reconcile"), \
+                 mock.patch.object(o, "_ensure"):
+                o.enable()
+            self.assertEqual(dvlane.LANE._cache[1], o._evict_prefetch)
+        finally:
+            dvlane.LANE._cache = old
+
+
 class PipelineOverQueue(unittest.TestCase):
     """Pipeline > queue: when the active item's write needs disk, the prefetch buffer is sacrificed."""
 

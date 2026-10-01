@@ -390,7 +390,10 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   over the original under the exact same name**, owner and permissions, so Plex keeps the
   item, its posters and watch state, and is told to re-analyze it. No backup is kept.
   This runs beside the upscales, not in their queue: it needs no GPU, it only uses disk
-  above Visionary's own free-space floor, transfers resume after any interruption and are
+  above Visionary's own free-space floor — and it **outranks the upscales' cached
+  downloads**: when a movie needs room, the sources downloaded ahead for later items are
+  cleared (the furthest-off first; each downloads again in its turn), and the download-ahead
+  never takes the room a movie in progress still needs. Transfers resume after any interruption and are
   **throttled whenever anyone has a Plex session open** (the **Plex throttle** switch in Settings; off runs at full speed), a file is never replaced while it
   is being played, and Plex is only asked to rescan once nobody is streaming.
 

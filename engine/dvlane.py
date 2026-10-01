@@ -68,16 +68,21 @@ def work_dir(host: str) -> str:
     return os.path.join(WORK_ROOT, hashlib.sha1(host.encode()).hexdigest()[:12])
 
 
-def local_bytes(host: str) -> int:
-    """What this movie already has on the Mac's disk (its part-downloaded source, a new file)."""
+def tree_bytes(path: str) -> int:
+    """Total size of the files under `path` (0 when it does not exist)."""
     total = 0
-    for root, _dirs, files in os.walk(work_dir(host)):
+    for root, _dirs, files in os.walk(path):
         for f in files:
             try:
                 total += os.path.getsize(os.path.join(root, f))
             except OSError:
                 pass
     return total
+
+
+def local_bytes(host: str) -> int:
+    """What this movie already has on the Mac's disk (its part-downloaded source, a new file)."""
+    return tree_bytes(work_dir(host))
 
 
 def disk_need(size: int, have: int) -> int:
@@ -177,6 +182,8 @@ class Lane:
         self._note = None
         self._gate = TransferGate()
         self._throttle_cache = (0.0, True)
+        self._cache = None                # (scratch folder fn, evict fn) — see use_cache
+        self._active = None               # the movie the fetch thread is working on
 
     # ---- lifecycle -----------------------------------------------------------------------
 
@@ -428,11 +435,82 @@ class Lane:
             if n not in keep:
                 shutil.rmtree(os.path.join(WORK_ROOT, n), ignore_errors=True)
 
+    # ---- the pipeline's cached downloads ----------------------------------------------------
+    # THE DV 7 QUEUE OUTRANKS CACHED DOWNLOADS (user, 2026-09-30). The upscale pipeline downloads
+    # ahead into its prefetch buffer — upcoming items' sources and CFRs, every one of which simply
+    # downloads again when its turn comes. So the lane counts that buffer as room it may clear
+    # (_room), and the prefetcher leaves alone the room the movie in progress will still write
+    # (reserve_bytes). Nothing is held for a movie still WAITING for disk: the buffer it would keep
+    # empty is clearable the moment that movie fits anyway, so holding it would only switch the
+    # download-ahead off for as long as the wait lasts (review 2026-09-30). The pipeline's own
+    # working files still outrank both.
+
+    def use_cache(self, scratch, evict):
+        """The orchestrator lends the lane its cached downloads. `scratch()` is the pipeline's scratch
+        folder (the buffer lives inside it); `evict(nbytes, dry_run=False)` clears at least that much
+        of the buffer, least imminent first, and returns the bytes freed — or, as a dry run, the bytes
+        it could free right now."""
+        self._cache = (scratch, evict)
+
+    def _same_disk(self) -> bool:
+        try:
+            return os.stat(self._cache[0]()).st_dev == os.stat(WORK_ROOT).st_dev
+        except Exception:  # noqa: BLE001 — unreadable: clearing it cannot be shown to help
+            return False
+
+    def _cache_bytes(self) -> int:
+        """Bytes of cached downloads the lane may clear — only those on its own disk help it."""
+        if not self._cache or not self._same_disk():
+            return 0
+        try:
+            return int(self._cache[1](0, dry_run=True) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _room(self, e, memo=None) -> bool:
+        """Does movie `e` fit above the floor — clearing cached downloads if that is what it takes?
+        Never clears anything for a movie the cache could not make fit. `memo` carries the cache's
+        size across one pick, so a long queue measures it once, not once per movie."""
+        memo = {} if memo is None else memo
+        size, have = int(e.get("bytes") or 0), local_bytes(e["host"])
+        free, floor = shutil.disk_usage(WORK_ROOT).free, _floor_bytes()
+        if fits(size, have, free, floor):
+            return True
+        if "cache" not in memo:
+            memo["cache"] = self._cache_bytes()
+        if not memo["cache"] or not fits(size, have, free + memo["cache"], floor):
+            return False
+        # The movie claims its room BEFORE anything is cleared: from here the prefetcher sees the
+        # reserve and cannot start a download into the space being made (review 2026-09-30).
+        prev, self._active = self._active, e
+        memo.pop("cache")                        # whatever is left must be measured again
+        try:
+            freed = int(self._cache[1](disk_need(size, have) - (free - floor)) or 0)
+        except Exception as ex:  # noqa: BLE001 — the lane waits for disk instead
+            logbook.exception("dv lane: clearing cached downloads", ex)
+            freed = 0
+        if freed:
+            logbook.event(f"DV 7->8.1 {e.get('title') or e['name']}: cleared {freed / 1e9:.1f} GB of "
+                          f"cached downloads to make room (they download again in their turn)")
+        ok = fits(size, have, shutil.disk_usage(WORK_ROOT).free, floor)
+        if not ok:
+            self._active = prev
+        return ok
+
+    def reserve_bytes(self) -> int:
+        """The room the prefetcher must leave this lane: what the movie in progress will still
+        write. 0 while the lane is off or between movies."""
+        if not self.running():
+            return 0
+        e = self._active
+        return disk_need(e.get("bytes") or 0, local_bytes(e["host"])) if e is not None else 0
+
     # ---- fetch: download + convert -------------------------------------------------------
 
     def _pick_fetch(self):
-        """The first not-yet-converted movie whose footprint fits above the pipeline's disk floor.
-        A movie already part-downloaded is preferred — its bytes are sunk."""
+        """The first not-yet-converted movie whose footprint fits above the pipeline's disk floor,
+        counting the pipeline's cached downloads as room it may clear. A movie already
+        part-downloaded is preferred — its bytes are sunk."""
         todo = dvbook.open_entries(phases=(None, "download", "convert"),
                                    skip=self._failed_now | self._cancelled)
         if not todo:
@@ -443,15 +521,18 @@ class Lane:
             self._note = "a converted movie is waiting to upload"
             return None
         os.makedirs(WORK_ROOT, exist_ok=True)
-        free, floor = shutil.disk_usage(WORK_ROOT).free, _floor_bytes()
         todo.sort(key=lambda e: 0 if e.get("phase") else 1)       # stable: queue order otherwise
+        memo = {}
         for e in todo:
-            if fits(e.get("bytes") or 0, local_bytes(e["host"]), free, floor):
+            if self._room(e, memo):
                 self._note = None
                 return e
+        free, floor = shutil.disk_usage(WORK_ROOT).free, _floor_bytes()
+        cache = memo["cache"] if "cache" in memo else self._cache_bytes()
         need = disk_need(todo[0].get("bytes") or 0, local_bytes(todo[0]["host"]))
+        more = f" + {cache / 1e9:.0f} GB of cached downloads it can clear" if cache else ""
         self._note = (f"waiting for disk: {todo[0].get('title')} needs {need / 1e9:.0f} GB above "
-                      f"Visionary's {floor / 1024 ** 3:.0f} GB floor ({free / 1e9:.0f} GB free)")
+                      f"Visionary's {floor / 1024 ** 3:.0f} GB floor ({free / 1e9:.0f} GB free{more})")
         return None
 
     def _fetch_loop(self):
@@ -463,6 +544,7 @@ class Lane:
                     return
                 continue
             ev = self._event(e["name"])
+            self._active = e
             try:
                 self._fetch(e, ev)
             except (_Cancelled, _NoRoom):
@@ -472,9 +554,11 @@ class Lane:
                     return
             except Exception as ex:  # noqa: BLE001
                 self._status["fetch"] = None    # the panel shows the lane's note, not a dead step
-                if not self._offline(ex):
+                self._active = None             # waiting out a NAS outage writes nothing: the
+                if not self._offline(ex):       # prefetcher must not be held off for its length
                     self._fail(e, ex)
             finally:
+                self._active = None
                 self._release(e["name"])
                 self._status["fetch"] = None
 
@@ -503,7 +587,7 @@ class Lane:
         with self._transfer("fetch", e, "download", ev):
             # The budget was judged when the movie was picked; the turn to transfer can come a whole
             # upload later, and the pipeline's own upscale writes to the same disk meanwhile.
-            if not fits(size, local_bytes(host), shutil.disk_usage(WORK_ROOT).free, _floor_bytes()):
+            if not self._room(e):
                 raise _NoRoom(name)
             logbook.event(f"DV 7->8.1 {e.get('title')}: downloading {size / 1e9:.1f} GB")
             nas_ssh.download(host, src, size, abort=ev, limit=self._limit,

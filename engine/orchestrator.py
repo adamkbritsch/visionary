@@ -231,6 +231,17 @@ def _prefetch_gate_gb() -> int:
     return _min_free_gb() + PREFETCH_GATE_MARGIN_GB
 
 
+def _dv_reserve_gb() -> int:
+    """GB the DV 7 queue is using or waiting for (dvlane.Lane.reserve_bytes), rounded up. The
+    prefetcher leaves it free on top of its own gate: the DV 7 queue outranks cached downloads
+    (user, 2026-09-30)."""
+    try:
+        import dvlane
+        return -(-int(dvlane.LANE.reserve_bytes()) // 1024 ** 3)
+    except Exception:  # noqa: BLE001 — never let the lane's bookkeeping stop the pipeline
+        return 0
+
+
 def _prefetch_cap_gb() -> int:
     """Prefetch buffer ceiling; 0 = prefetching disabled entirely."""
     return settings.tunable("prefetch_cap_gb")
@@ -1889,6 +1900,7 @@ class Orchestrator:
         # (dvlane.py). Outside the lock — starting it touches only its own threads.
         try:
             import dvlane
+            dvlane.LANE.use_cache(scratch.default_scratch, self._evict_prefetch)
             dvlane.LANE.start()
         except Exception as e:  # noqa: BLE001 — the lane must never keep the pipeline from starting
             logbook.exception("dv lane start", e)
@@ -2658,6 +2670,70 @@ class Orchestrator:
                 pass
         return n
 
+    def _evict_prefetch(self, nbytes: int, dry_run: bool = False) -> int:
+        """THE DV 7 QUEUE > CACHED DOWNLOADS (user, 2026-09-30): clear at least `nbytes` of the
+        prefetch buffer for the DV lane (dvlane.Lane._room). Least imminent first — files no pending
+        item owns, then pending items from the furthest out to the next one up — so the item about
+        to run keeps its head start longest. Whole items only (a source without its CFR is no head
+        start). Never touches the item being claimed right now, nor one whose download is in flight
+        (its per-item lock is held). `dry_run` only counts what could go. Returns bytes freed."""
+        pf = scratch.prefetch_dir()
+        try:
+            names = set(os.listdir(pf))
+        except OSError:
+            return 0
+        cands = self._prefetch_candidates()
+        # The item starting now, read AFTER the candidates: _process sets _current_paths before the
+        # skip key that drops it from them, so an item missing from the candidates for that reason
+        # is always caught here (review 2026-09-30).
+        cur = self.state.get("current") or {}
+        cur_paths = self._current_paths
+        for nm in (cur.get("name") or cur.get("source_name"),
+                   cur_paths.source_basename if cur_paths is not None else None):
+            if nm:
+                names -= _buffer_names(nm)
+        with self._dl_guard:
+            busy = [k for k, lk in self._dl_locks.items() if lk.locked()]
+        for k in busy:
+            names -= _buffer_names(k)
+        groups, owned = [], set()
+        for p in cands:
+            mine = (_buffer_names(p.source_basename) & names) - owned
+            if mine:
+                owned |= mine
+                groups.append((p, mine))
+        order = [(None, {n}) for n in sorted(names - owned)] + groups[::-1]
+
+        def size(n):
+            try:
+                return os.path.getsize(os.path.join(pf, n))
+            except OSError:
+                return 0
+        if dry_run:
+            return sum(size(n) for _p, group in order for n in group)
+        freed = 0
+        for p, group in order:
+            if freed >= nbytes:
+                break
+            lock = self._item_lock(p) if p is not None else None
+            if lock is not None and not lock.acquire(blocking=False):
+                continue                                  # its download started meanwhile
+            try:
+                for n in group:
+                    b = size(n)
+                    try:
+                        os.remove(os.path.join(pf, n))
+                        freed += b
+                    except OSError:
+                        pass
+            finally:
+                if lock is not None:
+                    lock.release()
+        if freed:
+            print(f"[disk] DV 7 queue > cached downloads: cleared {freed / 1e9:.1f} GB of the "
+                  f"prefetch buffer", flush=True)
+        return freed
+
     def _reclaim_for_pipeline(self, need_gb: int | None = None):
         """PIPELINE > QUEUE: the active item's working files take priority over the prefetch buffer.
         If RAW physical free has fallen below `need_gb` (default: the live disk floor — NOT a default
@@ -2712,6 +2788,8 @@ class Orchestrator:
                     free = scratch.physical_free_gb()             # gate on RAW free — the buffer is what we
                     if free is None or free < _prefetch_gate_gb():  # fill, so it can't count as 'available'
                         break                                     # to itself (else it overcommits disk)
+                    if free - _dv_reserve_gb() < _prefetch_gate_gb():
+                        break                                     # the DV 7 queue's room comes first
                     if scratch.folder_used_gb(scratch.prefetch_dir()) >= cap:
                         break                                     # HARD CAP: queued content ≤ cap GB
 
@@ -2990,9 +3068,13 @@ class Orchestrator:
         # channel+title, not the next TV episode inferred from the up-next preview).
         # State/messages use the DISPLAY form of the id (a YouTube stem carries wire encoding).
         ep_disp = transfer.display_name(p.ep)
-        self._current_skip_key = self._skip_key(p)   # the prefetcher excludes this item (we download it now)
         self._current_paths = p                      # abandon_series needs the real paths (state's
-                                                     # item_view carries DISPLAY names, not wire ones)
+                                                     # item_view carries DISPLAY names, not wire ones).
+                                                     # Set BEFORE the skip key: _evict_prefetch reads
+                                                     # the candidates (which drop the skip key's item)
+                                                     # and then this, so it can never see the item as
+                                                     # gone from both and clear it mid-claim
+        self._current_skip_key = self._skip_key(p)   # the prefetcher excludes this item (we download it now)
         self.state.update(episode=ep_disp, current=p.item_view(), message=f"working {p.series} {ep_disp}")
         if not p.youtube:
             # A YouTube run leaves Resolve open between videos; a TV episode or a movie is

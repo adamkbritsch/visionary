@@ -459,5 +459,156 @@ class LaneNeverOverlapsTransfers(_Lane):
         self.assertEqual(self.lane._status["fetch"]["_b0"], 30_000_000_000)
 
 
+
+
+class CachedDownloadsGiveWay(_Lane):
+    """The DV 7 queue outranks the pipeline's cached downloads (user, 2026-09-30): a movie that fits
+    once the prefetch buffer is cleared clears it, and the prefetcher leaves the lane its room."""
+
+    def setUp(self):
+        super().setUp()
+        self.disk = {"free": 400 * GB + 100, "cache": 0}   # the movie needs 280: 180 short
+        self.scratch = tempfile.mkdtemp()
+        self.asks = []
+
+        def evict(nbytes, dry_run=False):
+            if dry_run:
+                return self.disk["cache"]
+            self.asks.append(nbytes)
+            freed = min(self.disk["cache"], nbytes)
+            self.disk["cache"] -= freed
+            self.disk["free"] += freed
+            return freed
+        self.lane.use_cache(lambda: self.scratch, evict)
+        for p in (mock.patch.object(dvlane.shutil, "disk_usage",
+                                    side_effect=lambda _p: mock.Mock(free=self.disk["free"])),
+                  mock.patch.object(dvlane, "_floor_bytes", return_value=400 * GB)):
+            p.start()
+            self.patches.append(p)
+
+    def test_a_movie_that_fits_once_the_cache_is_cleared_clears_just_enough(self):
+        self.disk["cache"] = 500
+        e = self.lane._pick_fetch()
+        self.assertEqual(e["name"], NAME)
+        self.assertEqual(self.asks, [180])                # its shortfall, not the whole buffer
+        self.assertIsNone(self.lane._note)
+        self.assertIn("cleared", dvlane.logbook.event.call_args.args[0])
+
+    def test_room_already_there_clears_nothing(self):
+        self.disk.update(free=400 * GB + 1000, cache=500)
+        self.assertEqual(self.lane._pick_fetch()["name"], NAME)
+        self.assertEqual(self.asks, [])
+
+    def test_a_cache_too_small_to_help_is_left_alone(self):
+        self.disk["cache"] = 50                           # 100 free + 50 < 280
+        self.assertIsNone(self.lane._pick_fetch())
+        self.assertEqual(self.asks, [])                   # nothing thrown away for nothing
+        self.assertIn("cached downloads it can clear", self.lane._note)
+
+    def test_a_cache_on_another_disk_does_not_count(self):
+        self.disk["cache"] = 500
+        os.makedirs(dvlane.WORK_ROOT, exist_ok=True)
+        real = os.stat
+        def stat(p, *a, **k):
+            st = real(p, *a, **k)
+            return mock.Mock(st_dev=st.st_dev + (1 if p == self.scratch else 0))
+        with mock.patch.object(dvlane.os, "stat", side_effect=stat):
+            self.assertEqual(self.lane._cache_bytes(), 0)
+        self.assertEqual(self.lane._cache_bytes(), 500)
+
+    def test_the_turn_to_transfer_clears_cached_downloads_too(self):
+        # Room is judged again when the transfer's turn comes; the cache must give way there as well,
+        # not send the movie back to wait for disk.
+        self.disk["cache"] = 500
+        with mock.patch.object(nas_ssh, "stat", return_value=(100, 7, 911, 10, "644")), \
+             mock.patch.object(nas_ssh, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ssh, "discard_stage"), \
+             mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
+            self.lane._fetch(self.e(), self.ev)
+        self.assertEqual(self.asks, [180])
+        self.assertEqual(self.e()["phase"], "converted")
+
+    def test_the_prefetcher_is_asked_for_nothing_while_the_lane_is_off(self):
+        self.lane._active = self.e()
+        self.assertEqual(self.lane.reserve_bytes(), 0)
+
+    def test_the_movie_being_fetched_keeps_what_it_will_still_write(self):
+        self.lane._active = self.e()
+        d = dvlane.work_dir(HOST)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "source.mkv"), "wb") as fh:
+            fh.write(b"s" * 30)
+        with mock.patch.object(self.lane, "running", return_value=True):
+            self.assertEqual(self.lane.reserve_bytes(), 250)    # 280 - the 30 already written
+
+    def test_a_movie_waiting_for_disk_holds_nothing(self):
+        # The buffer it would keep empty is clearable the moment it fits anyway: holding it would
+        # only switch the download-ahead off for as long as the wait lasts (review 2026-09-30).
+        self.assertIsNone(self.lane._pick_fetch())
+        with mock.patch.object(self.lane, "running", return_value=True):
+            self.assertEqual(self.lane.reserve_bytes(), 0)
+
+    def test_the_room_is_claimed_before_anything_is_cleared(self):
+        # From the moment the clearing starts, the prefetcher must see the reserve, or it can start
+        # a download into the very space being made (review 2026-09-30).
+        self.disk["cache"] = 500
+        seen = []
+        evict = self.lane._cache[1]
+        def watch(nbytes, dry_run=False):
+            if not dry_run:
+                seen.append(self.lane.reserve_bytes())
+            return evict(nbytes, dry_run=dry_run)
+        self.lane._cache = (self.lane._cache[0], watch)
+        with mock.patch.object(self.lane, "running", return_value=True):
+            self.assertEqual(self.lane._pick_fetch()["name"], NAME)
+        self.assertEqual(seen, [280])
+
+    def test_a_clearing_that_falls_short_hands_the_claim_back(self):
+        self.disk["cache"] = 500
+        self.lane._cache = (self.lane._cache[0], lambda n, dry_run=False: 500 if dry_run else 0)
+        self.assertIsNone(self.lane._pick_fetch())
+        self.assertIsNone(self.lane._active)
+
+    def test_the_cache_is_measured_once_per_pick(self):
+        # 183 open movies used to mean 183 scans of the pipeline's queue every 30 s (review).
+        for i in range(3):
+            host = f"/volume1/Media/Movies/Other {i} (2001).mkv"
+            dvbook.seed([{"nas_path": host, "size_bytes": 100, "enhancement_layer": "MEL"}])
+            dvbook.add([{"name": os.path.basename(host), "dir": "/Media/Movies", "bytes": 100}])
+        self.disk["cache"] = 50
+        calls = []
+        evict = self.lane._cache[1]
+        def count(nbytes, dry_run=False):
+            calls.append(dry_run)
+            return evict(nbytes, dry_run=dry_run)
+        self.lane._cache = (self.lane._cache[0], count)
+        self.assertIsNone(self.lane._pick_fetch())
+        self.assertEqual(calls, [True])
+
+    def test_waiting_out_a_nas_outage_holds_nothing(self):
+        # An outage can last hours; the movie writes nothing meanwhile (review 2026-09-30).
+        self.disk["free"] = 400 * GB + 1000
+        seen = []
+        def offline(_ex):
+            seen.append(self.lane._active)
+            self.lane._abort.set()
+            return True
+        with mock.patch.object(self.lane, "_fetch", side_effect=RuntimeError("ssh: no route")), \
+             mock.patch.object(self.lane, "_offline", side_effect=offline):
+            self.lane._fetch_loop()
+        self.assertEqual(seen, [None])
+
+    def test_the_fetch_loop_marks_the_movie_it_works_on(self):
+        self.disk["free"] = 400 * GB + 1000
+        seen = []
+        def fetch(e, ev):
+            seen.append(self.lane._active)
+            self.lane._abort.set()
+        with mock.patch.object(self.lane, "_fetch", side_effect=fetch):
+            self.lane._fetch_loop()
+        self.assertEqual(seen[0]["name"], NAME)           # held while it is being fetched...
+        self.assertIsNone(self.lane._active)              # ...and let go after
+
+
 if __name__ == "__main__":
     unittest.main()
