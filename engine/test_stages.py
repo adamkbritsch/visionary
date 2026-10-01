@@ -896,7 +896,7 @@ class ScopeHdr10IsNeverReEncoded(unittest.TestCase):
 
     def _real_plan(self, **over):
         import plan
-        return plan.choose_plan({**self.SCOPE_HDR10, **over}, passthrough_min_kbps=12000)
+        return plan.choose_plan({**self.SCOPE_HDR10, **over})
 
     def test_the_real_plan_says_rpu_only(self):
         self.assertEqual(self._real_plan()["topaz"], "rpu-only")
@@ -1080,14 +1080,15 @@ class FastPathSkipsTheCfrReencode(unittest.TestCase):
     """The download stage's CFR pass runs copy-only for fast-path plans — hours of libx264
     on a 4K movie whose video bytes nothing reads (live-caught: a 60 GB HDR10 REMUX)."""
 
-    def _cfr_kwargs(self, plan_topaz):
+    def _cfr_kwargs(self, plan_topaz, source_cfr=None):
         import plan, topaz
         p = _paths(tempfile.mkdtemp())
         with open(p.source, "w") as fh:
             fh.write("x")
         with mock.patch.object(stages.transfer, "download"), \
              mock.patch.object(stages, "_source_complete", return_value=True), \
-             mock.patch.object(plan, "plan_for", return_value={"topaz": plan_topaz}), \
+             mock.patch.object(plan, "plan_for", return_value=dict(
+                 {"topaz": plan_topaz}, **({} if source_cfr is None else {"source_cfr": source_cfr}))), \
              mock.patch.object(plan, "probe_input", return_value={"is_dv": False}), \
              mock.patch("topaz.is_cfr_ready", return_value=False), \
              mock.patch("topaz.to_cfr", return_value=topaz.CfrResult(
@@ -1104,6 +1105,12 @@ class FastPathSkipsTheCfrReencode(unittest.TestCase):
 
     def test_upscale_still_true_cfr(self):
         self.assertFalse(self._cfr_kwargs("upscale")["copy_only"])
+
+    def test_a_variable_frame_rate_4k_source_is_really_re_timed(self):
+        """No 4K source goes through Topaz (2026-09-30), a VFR one included — so the CFR pass
+        must re-encode it to one rate: Resolve imports this file and its timeline runs at one rate."""
+        self.assertFalse(self._cfr_kwargs("resolve-only", source_cfr=False)["copy_only"])
+        self.assertTrue(self._cfr_kwargs("resolve-only", source_cfr=True)["copy_only"])
 
 
 class YouTubeSkipsTopaz(unittest.TestCase):

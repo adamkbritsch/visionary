@@ -434,10 +434,12 @@ class ContainerMustNotOutrunThePicture(unittest.TestCase):
     minutes could not align to the RPU, and the movie parked at the remux after five
     identical failures (live-caught 2026-08-21). The CFR now caps its own length."""
 
-    def _cap(self, video, box, frames=None, rate="24/1"):
+    def _cap(self, video, box, frames=None, rate="24/1", avg=None):
         st = {"duration": str(video) if video is not None else "N/A", "r_frame_rate": rate}
         if frames is not None:
             st["nb_frames"] = str(frames)
+        if avg is not None:
+            st["avg_frame_rate"] = avg
 
         def run(cmd, **kw):
             out = (json.dumps({"streams": [st]}) if "-of" in cmd and "json" in cmd
@@ -453,6 +455,20 @@ class ContainerMustNotOutrunThePicture(unittest.TestCase):
         cap = self._cap(8297.667, 8591.648)
         self.assertIsNotNone(cap)
         self.assertAlmostEqual(cap, 8298.667, places=2)
+
+    def test_a_variable_rate_mp4_is_never_cut_short(self):
+        """Review 2026-09-30: r_frame_rate is a VFR stream's fastest cadence, so nb_frames / r
+        under-measured its picture and the re-timed CFR was cut there — a 60 s VFR MP4 (r 30,
+        avg 27, 1620 frames) came out 55 s. VFR 4K now ships straight from that CFR."""
+        self.assertIsNone(self._cap(60.0, 60.0, frames=1620, rate="30/1", avg="27/1"))
+        # ...and a VFR container that really does run past its picture is still capped, at
+        # the stream's own duration rather than the short frames/rate estimate
+        cap = self._cap(60.0, 120.0, frames=1620, rate="30/1", avg="27/1")
+        self.assertGreater(cap, 60.0)
+
+    def test_a_constant_rate_stream_still_uses_its_exact_frame_count(self):
+        cap = self._cap(8400.0, 8591.648, frames=199144, rate="24/1", avg="24/1")
+        self.assertAlmostEqual(cap, 199144 / 24 + 1.0, places=2)
 
     def test_the_cap_is_always_longer_than_the_picture(self):
         # -t must never shave a real trailing frame off the end of the movie
@@ -749,6 +765,15 @@ class NoWrongDeclaredRateReachesTheCfr(unittest.TestCase):
              mock.patch.object(topaz, "_run_ffmpeg", return_value=(0, 100, False, "")) as rf:
             r = topaz.to_cfr("/in.mkv", "/out.mkv", copy_only=copy_only)
         return rf.call_args.args[0], r, cap
+
+    def test_only_a_proven_rate_reaches_the_length_cap(self):
+        """2026-09-30: the stream's plain r_frame_rate was passed too, so a VARIABLE-rate source's
+        length came out frames / r — short — and the re-timed CFR was cut there (a real 60 s VFR
+        MP4 came out 55 s). Only a container that lies about its rate gets its true rate passed."""
+        _cmd, _r, cap = self._to_cfr(lie=None, declared="30/1")
+        self.assertIsNone(cap.call_args.kwargs["rate"])
+        _cmd, _r, cap = self._to_cfr(lie=("500/21", "24000/1001"), already=True)
+        self.assertEqual(cap.call_args.kwargs["rate"], "24000/1001")
 
     def test_a_lying_source_reencodes_at_the_frames_own_rate(self):
         cmd, r, cap = self._to_cfr(lie=("500/21", "24000/1001"), already=True)

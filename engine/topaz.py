@@ -279,22 +279,32 @@ CFR_TAIL_KEEP_SECS = 1.0
 
 
 def video_duration(path, ffprobe=FFPROBE_HB, *, rate=None):
-    """Length of the VIDEO stream in seconds — frames / rate where both are known (exact),
-    else the stream's own duration tag. None when neither is readable. `rate` overrides the
-    declared one when a caller has proven it wrong (declared_rate_mismatch): frames over a
-    declared rate that is too HIGH comes out short of the real picture."""
+    """Length of the VIDEO stream in seconds — frames / rate where that is exact, else the
+    stream's own duration tag. None when neither is readable. `rate` overrides the declared one
+    when a caller has proven it wrong (declared_rate_mismatch): frames over a declared rate that
+    is too HIGH comes out short of the real picture.
+
+    frames / rate is exact only at a CONSTANT rate. A variable-rate stream's r_frame_rate is its
+    fastest cadence, above its average, so nb_frames / r_frame_rate came out SHORT — and
+    cfr_duration_cap then cut the re-timed CFR there: a 60 s VFR MP4 (r 30, avg 27) became 55 s,
+    and a 2 h movie would lose ~7 s that every later check, measuring the same short file, passes
+    (review 2026-09-30, when VFR 4K started shipping straight from its CFR). For VFR the stream's
+    own duration (or its last frame's timestamp) is the truth."""
     from fractions import Fraction
     try:
         out = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
-             "stream=nb_frames,duration,r_frame_rate", "-of", "json", path],
+             "stream=nb_frames,duration,r_frame_rate,avg_frame_rate", "-of", "json", path],
             capture_output=True, text=True, timeout=60).stdout
         st = (json.loads(out).get("streams") or [{}])[0]
     except Exception:
         return None
     try:
         n, r = int(st.get("nb_frames") or 0), Fraction(rate or st.get("r_frame_rate") or "0/0")
-        if n > 0 and r > 0:
+        avg = st.get("avg_frame_rate") or ""
+        constant = rate is not None or not avg or avg.startswith("0") \
+            or Fraction(avg) == Fraction(st.get("r_frame_rate") or "0/1")
+        if n > 0 and r > 0 and constant:
             return n / float(r)
     except Exception:
         pass
@@ -733,7 +743,11 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     # something a stream copy can do — so a source at any other rate is re-encoded, fast path or not.
     rate = resolve_hostable_rate(true_rate)
     retime = bool(rate and true_rate and rate != true_rate)
-    cap = cfr_duration_cap(source, rate=true_rate)   # see CFR_TAIL_SLOP_SECS — a container longer
+    # Only a PROVEN rate (a container that lies about its own) overrides the stream's: passing
+    # the plain r_frame_rate of a VARIABLE-rate source made video_duration take frames / r — short
+    # of the real picture — and the cap then cut the re-timed CFR there (2026-09-30, a real 60 s
+    # VFR MP4 came out 55 s).
+    cap = cfr_duration_cap(source, rate=(true_rate if lie else None))   # see CFR_TAIL_SLOP_SECS — a container longer
                                                      # than its own picture becomes Resolve's timeline
     copied = (copy_only or (not lie and _is_already_cfr(source, check_rate=False))) and not retime
     if copied:

@@ -377,6 +377,17 @@ class ProfileSevenRows(unittest.TestCase):
         self.assertIsNone(row["dv_profile"])
 
 
+class QueuedRowTags(unittest.TestCase):
+    def test_a_queued_movie_carries_its_release_tags(self):
+        """The queued row shows "4K · no Topaz" instead of an inert preset pill (2026-09-30)."""
+        with mock.patch.object(movies, "get_selected", return_value=[
+                {"name": "Big (2020) [2160p WEB-DL HEVC].mkv", "dir": "/m", "title": "Big (2020)"},
+                {"name": "Small (2001) [1080p BluRay x264].mkv", "dir": "/m", "title": "Small (2001)"}]):
+            items = movies.selected_view()["items"]
+        self.assertIn("4K", items[0]["tags"])
+        self.assertNotIn("4K", items[1]["tags"])
+
+
 class NameAdvertisedDv(unittest.TestCase):
     def test_dv_release_name_counts_before_the_manifest_catches_up(self):
         # the NAS dv-probe cron runs overnight — a fresh '...WEB-DL.DV...' file must not

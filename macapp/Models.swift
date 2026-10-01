@@ -480,7 +480,6 @@ struct SettingsDTO: Codable {
     var min_adapter_watts: Int?           // power sufficiency = a brick of at least this wattage
     var nas_network: String?              // which link big NAS transfers take: "ethernet" (first,
                                           // the default) / "wifi" (first) / "ethernet_only"
-    var passthrough_min_mbps: Int?        // 4K fast path: a 4K source at/above this skips Topaz (0 = off)
 
     // Scheduling / capacity — universal, and none of them change how a file is encoded.
     var max_active_shows: Int?            // how many shows share the round-robin
@@ -511,7 +510,6 @@ extension SettingsDTO {
         case "youtube_every_tv_episodes": return youtube_every_tv_episodes
         case "youtube_videos_per_burst": return youtube_videos_per_burst
         case "min_adapter_watts":         return min_adapter_watts
-        case "passthrough_min_mbps":      return passthrough_min_mbps
         case "max_active_shows":          return max_active_shows
         case "finisher_lanes":            return finisher_lanes
         case "min_free_gb":               return min_free_gb

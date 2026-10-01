@@ -521,7 +521,13 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
     # (a bit-copy of the original's either way) and decodable frames for scene-cut planning.
     # Stream-copy instead: minutes and disk-bound rather than hours of libx264 on a 4K
     # movie whose video bytes nothing downstream reads (live-caught: a 60 GB REMUX).
-    fast = plan.plan_for(p.source).get("topaz") in ("rpu-only", "resolve-only")
+    pl = plan.plan_for(p.source)
+    fast = pl.get("topaz") in ("rpu-only", "resolve-only")
+    # ...except a VARIABLE frame rate source, which takes the fast path too (no 4K source goes
+    # through Topaz, user-dictated 2026-09-30) and so must really be RE-TIMED here: Resolve
+    # imports this file (resolve_input) and its timeline runs at one rate. For 4K that is the
+    # hardware HEVC re-encode at CFR_HW_KBPS — the same one the old Topaz clean pass started from.
+    copy_only = fast and pl.get("source_cfr", True)
     on_prog = None
     if progress:
         total = topaz.total_frames(p.source) or 0
@@ -529,7 +535,7 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
             pct = 20 + round(frames / total * 79) if total else None
             progress({"stage": "download", "ep": p.ep, "pct": min(99, pct) if pct else None})
     res = topaz.to_cfr(p.source, p.source_cfr, abort=abort, on_progress=on_prog,
-                       low_prio=low_prio, copy_only=fast)
+                       low_prio=low_prio, copy_only=copy_only)
     if not res.ok:
         return False, cfr_failure_message(res.error_tail)
     if res.capped_secs:

@@ -441,7 +441,9 @@ def selected_view(skip=()) -> dict:
               # Prefers the real probe once the file has been through the pipeline; falls
               # back to the filename before that.
               "output_mode_effective": settings.effective_output_mode(
-                  i.get("title") or "", settings.source_is_hdr(i.get("name") or ""))}
+                  i.get("title") or "", settings.source_is_hdr(i.get("name") or "")),
+              # the queued row says "4K · no Topaz" instead of offering an inert preset
+              "tags": release_tags(i.get("name") or "")}
              for i in get_selected()]
     nextable = [i for i in items if i.get("name") not in skip]
     nx = nextable[0] if nextable else None

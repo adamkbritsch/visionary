@@ -106,12 +106,6 @@ DEFAULT_SETTINGS = {
                                 # the pathological seconds. NO uncapped fallback — cap fails => stage fails.
                                 # LIMIT capped at 62 so cap + gate tolerance + TrueHD headroom stays
                                 # under the SHIELD's ~80 Mbps whole-stream DV ceiling (dvcap constants).
-    "passthrough_min_mbps": 12, # HIGH-BITRATE 4K FAST PATH: a 3840x2160 HEVC 10-bit CFR source whose
-                                # VIDEO bitrate is at/above this skips Topaz entirely. HDR10 (PQ) intake
-                                # keeps its ORIGINAL stream and gets Resolve's Dolby Vision RPU injected
-                                # (no re-encode); SDR intake ships Resolve's HDR+DV conversion through
-                                # the normal capped remux. Sized so WWDITS-tier 4K web-DLs (~15 Mbps)
-                                # qualify while starved 4K still gets the full Topaz cleanup. 0 = off.
     "resolve_share_remuxes": 0, # When Resolve runs it is the ONLY thing running (user-dictated
                                 # 2026-08-06, reversing the same-day sharing experiment): 0 = never
                                 # share, every Resolve takes the whole machine (SIGSTOP). Raising it
@@ -196,7 +190,6 @@ LIMITS = {
                                 # EVERY output is budgeted as if it carries TrueHD (user-dictated)
     "audio_target_lufs": (-24, -10),
     "min_adapter_watts": (1, 500),
-    "passthrough_min_mbps": (5, 200),
     "resolve_share_remuxes": (0, 2),
     "max_youtube_minutes": (1, 600),
     "youtube_every_tv_episodes": (1, 50),
@@ -211,7 +204,7 @@ LIMITS = {
     "seg_eta_after_minutes": (1, 120),
                                          # in under a minute); high = effectively never
 }
-ZERO_IS_OFF = {"audio_target_lufs", "passthrough_min_mbps", "prefetch_cap_gb"}
+ZERO_IS_OFF = {"audio_target_lufs", "prefetch_cap_gb"}
 
 # --- the Topaz preset catalog: ALL SDR ProRes; content-type × resolution ----
 # Each parent preset (content type) carries a tuned param set for EACH source resolution.

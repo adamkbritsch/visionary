@@ -155,13 +155,21 @@ class Plan(unittest.TestCase):
         pl = self._plan()
         self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("upscale", 2, "add_hdr_dv"))
 
-    def test_4k_sdr_cleans_and_adds_hdr(self):
-        pl = self._plan(is_4k=True)
-        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("clean", 1, "add_hdr_dv"))
+    def test_4k_sdr_skips_topaz_and_adds_hdr(self):
+        pl = self._plan(is_4k=True, is_cfr=True)
+        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("resolve-only", 1, "add_hdr_dv"))
 
-    def test_4k_hdr_cleans_keeps_hdr_adds_dv_only(self):
+    def test_4k_hdr_skips_topaz_keeps_hdr_adds_dv_only(self):
+        pl = self._plan(is_4k=True, is_hdr=True, is_cfr=True)
+        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("resolve-only", 1, "add_dv"))
+
+    def test_4k_vfr_is_only_re_timed_never_sent_to_topaz(self):
+        pl = self._plan(is_4k=True)                          # is_cfr absent = not proven CFR
+        self.assertEqual((pl["topaz"], pl["source_cfr"], pl["resolve"]),
+                         ("resolve-only", False, "add_hdr_dv"))
         pl = self._plan(is_4k=True, is_hdr=True)
-        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("clean", 1, "add_dv"))
+        self.assertEqual((pl["topaz"], pl["source_cfr"], pl["resolve"]),
+                         ("resolve-only", False, "add_dv"))
 
     def test_1080p_hdr_upscales_keeps_hdr(self):
         pl = self._plan(is_hdr=True)
@@ -184,10 +192,12 @@ class Plan(unittest.TestCase):
         pl = self._plan(height=1080)
         self.assertEqual((pl["scale"], pl["res"], pl["fit_height"]), (2, "1080p", None))  # 1080×2 = 2160
 
-    def test_4k_clean_uses_1080p_variant_and_no_fit(self):
-        pl = self._plan(is_4k=True)
-        self.assertEqual((pl["topaz"], pl["scale"], pl["res"], pl["fit_height"]),
-                         ("clean", 1, "1080p", None))
+    def test_4k_never_gets_a_topaz_pass(self):
+        # No 4K "clean" route any more (2026-09-30) — the cleanup counts as upscaling.
+        for cfr in (True, False):
+            pl = self._plan(is_4k=True, is_cfr=cfr)
+            self.assertEqual((pl["topaz"], pl["scale"], pl["res"], pl["fit_height"]),
+                             ("resolve-only", 1, None, None), cfr)
 
     def test_odd_height_fits_to_exact_4k(self):
         pl = self._plan(height=1088)                        # 1088×2 = 2176 ≠ 2160 → fit
@@ -230,19 +240,21 @@ if __name__ == "__main__":
 
 
 class FastPathGate(unittest.TestCase):
-    """4K FAST PATH. A 4K HDR10 (PQ/HEVC/Main10) CFR source is NEVER re-encoded — it takes
-    rpu-only at ANY bitrate and ANY 4K geometry. Everything else 4K needs the bitrate
-    threshold and ships Resolve's conversion (resolve-only). Disqualifiers fall through."""
+    """NO 4K SOURCE GOES THROUGH TOPAZ (user-dictated 2026-09-30: no 12 Mbps minimum, and no
+    cleanup pass for a variable frame rate either — "that counts as upscaling even though it's
+    the same size"). A 4K HDR10 (PQ/HEVC/Main10) CFR source is NEVER re-encoded — rpu-only at any
+    bitrate and 4K geometry. Every other 4K source takes resolve-only; a VFR one is re-timed."""
 
     GOOD = dict(is_4k=True, is_hdr=False, is_dv=False, codec="hevc", pix_fmt="yuv420p10le",
                 width=3840, height=2160, is_cfr=True, video_kbps=15000, transfer=None)
 
-    def _plan(self, thresh=12000, **kw):
-        return plan.choose_plan({**self.GOOD, **kw}, passthrough_min_kbps=thresh)
+    def _plan(self, **kw):
+        return plan.choose_plan({**self.GOOD, **kw})
 
     def test_hdr10_takes_rpu_only(self):
         pl = self._plan(transfer="smpte2084", is_hdr=True)
-        self.assertEqual((pl["topaz"], pl["resolve"], pl["is_hdr"]), ("rpu-only", "add_dv", True))
+        self.assertEqual((pl["topaz"], pl["resolve"], pl["is_hdr"], pl["source_cfr"]),
+                         ("rpu-only", "add_dv", True, True))
 
     def test_sdr_takes_resolve_only(self):
         pl = self._plan()                                    # WWDITS profile: SDR 4K ~15 Mbps
@@ -252,47 +264,53 @@ class FastPathGate(unittest.TestCase):
         pl = self._plan(transfer="arib-std-b67", is_hdr=True)  # HLG base can't carry an 8.1 RPU
         self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
 
-    def test_threshold_boundary_is_inclusive(self):
-        self.assertEqual(self._plan(video_kbps=12000)["topaz"], "resolve-only")   # == passes
-        self.assertEqual(self._plan(video_kbps=11999)["topaz"], "clean")          # below → full path
-
-    def test_hdr10_is_EXEMPT_from_the_bitrate_threshold(self):
-        # User-dictated: a 4K HDR10 source is never re-encoded, whatever its bitrate. The
-        # threshold still governs the OTHER fast tier (above).
-        for kbps in (11999, 6000, 1):
+    def test_no_bitrate_sends_a_4k_source_through_topaz(self):
+        # The old 12 Mbps minimum is gone: a starved, an unknown and a huge bitrate all skip it.
+        for kbps in (120000, 12000, 11999, 6000, 1, 0):
+            self.assertEqual(self._plan(video_kbps=kbps)["topaz"], "resolve-only", kbps)
             pl = self._plan(transfer="smpte2084", is_hdr=True, video_kbps=kbps)
             self.assertEqual(pl["topaz"], "rpu-only", kbps)
 
+    def test_no_4k_input_of_any_kind_reaches_topaz(self):
+        import itertools
+        for hdr, transfer, codec, pix, cfr, kbps in itertools.product(
+                (False, True), (None, "smpte2084", "arib-std-b67"), ("hevc", "h264", "av1", "vp9"),
+                ("yuv420p10le", "yuv420p"), (True, False), (0, 4000, 40000)):
+            pl = self._plan(is_hdr=hdr, transfer=transfer, codec=codec, pix_fmt=pix,
+                            is_cfr=cfr, video_kbps=kbps)
+            self.assertIn(pl["topaz"], ("rpu-only", "resolve-only"),
+                          (hdr, transfer, codec, pix, cfr, kbps))
+            self.assertEqual(pl["source_cfr"], cfr)          # VFR: the CFR pass must re-time it
+
+    def test_a_variable_frame_rate_source_is_re_timed_not_sent_to_topaz(self):
+        pl = self._plan(is_cfr=False)
+        self.assertEqual((pl["topaz"], pl["source_cfr"]), ("resolve-only", False))
+        self.assertIn("re-timed to a constant frame rate", pl["reason"])
+        # an HDR10 VFR source cannot keep its stream (the RPU needs one frame rate) — and says so
+        pl = self._plan(is_cfr=False, transfer="smpte2084", is_hdr=True)
+        self.assertEqual((pl["topaz"], pl["source_cfr"]), ("resolve-only", False))
+        self.assertIn("re-encoded because its frame rate varies", pl["reason"])
+
     def test_hdr10_takes_rpu_only_at_ANY_4k_geometry(self):
-        # THE bug this class used to assert the wrong way round. The tier required
-        # width==3840 AND height==2160 exactly, so a 2.39:1 film (3840x1600) — i.e. most
-        # blockbusters — and DCI 4K both fell through to resolve-only and were re-encoded.
-        # Geometry has no bearing on whether an RPU can ride on a stream.
-        for geom in (dict(width=3840, height=1600),      # 2.39:1 scope
-                     dict(width=3840, height=1608),
-                     dict(width=4096, height=2160),      # DCI 4K
-                     dict(width=3840, height=2160)):
+        # The tier used to require width==3840 AND height==2160 exactly, so a 2.39:1 film
+        # (3840x1600) and DCI 4K were re-encoded. Geometry has no bearing on an RPU.
+        for geom in (dict(width=3840, height=1600), dict(width=3840, height=1608),
+                     dict(width=4096, height=2160), dict(width=3840, height=2160)):
             pl = self._plan(transfer="smpte2084", is_hdr=True, **geom)
             self.assertEqual(pl["topaz"], "rpu-only", geom)
 
     def test_nothing_is_categorically_excluded(self):
-        # Eligibility is PURELY measured — codec/bit-depth only pick the tier (user-dictated:
-        # no carve-outs; e.g. YouTube must not be discounted). These are all SDR, so they need
-        # the threshold and take resolve-only.
         for kw in (dict(codec="av1"), dict(codec="h264"), dict(pix_fmt="yuv420p"),
                    dict(width=4096), dict(height=2072, width=3840)):
             self.assertEqual(self._plan(**kw)["topaz"], "resolve-only", kw)
-        # a PQ source that misses an inject prerequisite still fast-paths via resolve-only
         pl = self._plan(transfer="smpte2084", is_hdr=True, codec="av1")
         self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
 
     def test_a_re_encode_of_HDR_always_says_why(self):
-        # These three are Dolby Vision 8.1 base-layer requirements, not caution: an RPU cannot
-        # ride on HLG, AV1 or 8-bit, so such a source must be CONVERTED to gain DV at all.
-        # That is the one legitimate HDR re-encode and it must never be silent.
         for kw, needle in ((dict(transfer="arib-std-b67"), "not PQ"),
                            (dict(transfer="smpte2084", codec="av1"), "not HEVC"),
-                           (dict(transfer="smpte2084", pix_fmt="yuv420p"), "not 10-bit")):
+                           (dict(transfer="smpte2084", pix_fmt="yuv420p"), "not 10-bit"),
+                           (dict(transfer="smpte2084", is_cfr=False), "frame rate varies")):
             pl = self._plan(is_hdr=True, **kw)
             self.assertEqual(pl["topaz"], "resolve-only", kw)
             self.assertIn("re-encoded because", pl["reason"], kw)
@@ -302,21 +320,8 @@ class FastPathGate(unittest.TestCase):
         pl = self._plan(codec="vp9", pix_fmt="yuv420p", video_kbps=20000)   # typical 4K VP9
         self.assertEqual(pl["topaz"], "resolve-only")
 
-    def test_only_measured_disqualifiers_fall_through(self):
-        self.assertEqual(self._plan(is_cfr=False)["topaz"], "clean")   # VFR: timing untrustworthy
-        self.assertEqual(self._plan(video_kbps=0)["topaz"], "clean")   # unknown/zero bitrate
-
     def test_already_dv_still_wins(self):
         self.assertEqual(self._plan(is_dv=True)["topaz"], "skip")
-
-    def test_threshold_zero_disables_the_gate(self):
-        self.assertEqual(self._plan(thresh=0)["topaz"], "clean")
-
-    def test_threshold_zero_does_NOT_force_hdr10_to_re_encode(self):
-        # Turning the knob off must not start re-encoding HDR10 — that setting is about the
-        # SDR/other fast tier, and "never re-encode HDR10" is not a tunable.
-        self.assertEqual(self._plan(thresh=0, transfer="smpte2084", is_hdr=True)["topaz"],
-                         "rpu-only")
 
     def test_a_1080p_hdr_source_is_still_upscaled(self):
         # The no-re-encode rule is about sources that do not need upscaling. Upscaling is the
@@ -325,15 +330,11 @@ class FastPathGate(unittest.TestCase):
                         transfer="smpte2084", is_hdr=True)
         self.assertEqual(pl["topaz"], "upscale")
 
-    def test_settings_clamp_for_the_knob(self):
+    def test_the_threshold_setting_is_gone(self):
         import settings as s
-        import tempfile, os as _os
-        from unittest import mock
-        with mock.patch.object(s, "SETTINGS_FILE", _os.path.join(tempfile.mkdtemp(), "s.json")):
-            self.assertEqual(s.set_settings({"passthrough_min_mbps": 3})["passthrough_min_mbps"], 5)
-            self.assertEqual(s.set_settings({"passthrough_min_mbps": 999})["passthrough_min_mbps"], 200)
-            self.assertEqual(s.set_settings({"passthrough_min_mbps": 0})["passthrough_min_mbps"], 0)
-            self.assertEqual(s.set_settings({"passthrough_min_mbps": 12})["passthrough_min_mbps"], 12)
+        self.assertNotIn("passthrough_min_mbps", s.DEFAULT_SETTINGS)
+        self.assertNotIn("passthrough_min_mbps", s.LIMITS)
+        self.assertFalse(hasattr(plan, "passthrough_min_kbps"))
 
 
 class Tunables(unittest.TestCase):

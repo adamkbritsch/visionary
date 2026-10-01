@@ -373,6 +373,12 @@ def extend_gate(p) -> dict:
     if info.get("is_hdr"):
         return {"needed": False, "reason": "HDR source — the outpaint model is SDR-only",
                 "geom": None}
+    if info.get("is_4k"):
+        # The extended picture is only ever read by the Topaz pass, and no 4K source goes
+        # through Topaz (user-dictated 2026-09-30) — outpainting it would be hours of work that
+        # nothing ships. Same rule as the plan: the 4K picture is left as it is.
+        return {"needed": False, "reason": "4K source — it skips Topaz, so the 4:3 picture "
+                                           "ships as it is", "geom": None}
     n, d = parse_sar(info.get("sar"))
     g = plan_geometry(info["width"], info["height"], n, d)
     if "error" in g:

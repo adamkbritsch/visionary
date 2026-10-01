@@ -103,20 +103,27 @@ def _no_rpu_reason(info) -> str | None:
     return None
 
 
-def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
+def choose_plan(info: dict) -> dict:
     """Map input characteristics to the path (PURE — unit-tested). Topaz preserves range;
     Resolve adds HDR only for SDR sources. Every sub-4K source upscales to 4K. Returns
-    {topaz, scale, res, fit_height, resolve, is_hdr, reason}: `scale` = the tvai AI factor,
-    `res` = the preset/resolution bucket (which variant's params to use), `fit_height` = the
-    final lanczos-fit height (2160) or None when the AI scale already lands on 2160.
+    {topaz, scale, res, fit_height, resolve, is_hdr, reason, source_cfr}: `scale` = the tvai AI
+    factor, `res` = the preset/resolution bucket (which variant's params to use), `fit_height` =
+    the final lanczos-fit height (2160) or None when the AI scale already lands on 2160.
 
-    HIGH-BITRATE 4K FAST PATH (`passthrough_min_kbps` > 0, user-dictated): ANY 4K CFR source
-    at/above the threshold skips Topaz — its picture is already the deliverable, whatever the
-    codec or provenance (no categorical exclusions). The tier split is technical, not
-    eligibility: an HDR10/PQ HEVC Main10 exact-3840×2160 source → topaz "rpu-only" (keep the
-    ORIGINAL stream, Resolve runs only for the DV analysis and its RPU is injected — no
-    re-encode); everything else → topaz "resolve-only" (Resolve's HDR+DV conversion ships
-    through the normal capped remux — an RPU alone can't sit on a non-PQ/non-HEVC base).
+    NO 4K SOURCE GOES THROUGH TOPAZ (user-dictated 2026-09-30: "get rid of the 12 mbps minimum
+    for things to be able to go through topaz first, so 4k things all don't go through topaz",
+    and of a variable-frame-rate source, "I don't want it to do the cleanup, that counts as
+    upscaling even though it's the same size"). There used to be a bitrate threshold
+    (passthrough_min_mbps, 12 Mbps) and a Topaz "clean" 1x pass for 4K under it or at a variable
+    frame rate. Neither exists now. The tier is technical:
+      rpu-only      an HDR10/PQ HEVC Main10 4K source at a CONSTANT frame rate: the ORIGINAL
+                    stream is kept and Resolve's Dolby Vision RPU is injected — no re-encode, at
+                    any bitrate or 4K geometry (user-dictated: 4K HDR10 is never re-encoded)
+      resolve-only  every other 4K source: Resolve's HDR+DV conversion ships through the normal
+                    capped remux. A VARIABLE frame rate source is only RE-TIMED first — the CFR
+                    pass re-encodes it to a constant rate (source_cfr=False) instead of
+                    stream-copying, since Resolve's timeline and the remux run at one rate. The
+                    re-time is ffmpeg's, never Topaz's.
     `"skip"` stays reserved for already-DV (an abort, not a fast path)."""
     is_hdr = bool(info.get("is_hdr"))
     resolve = "add_dv" if is_hdr else "add_hdr_dv"
@@ -125,44 +132,32 @@ def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
         return {"topaz": "skip", "scale": 1, "res": None, "fit_height": None,
                 "resolve": "skip", "is_hdr": is_hdr, "reason": "already Dolby Vision — nothing to do"}
     kbps = int(info.get("video_kbps") or 0)
-    # ELIGIBILITY is purely measured — 4K + CFR + bitrate. NOTHING is categorically excluded
-    # (user-dictated: no carve-outs by provenance — a 4K YouTube VP9 at threshold bitrate
-    # qualifies the same as a web-DL). The stricter stream properties below only decide WHICH
-    # tier, never whether the fast path applies.
-    # A 4K HDR10 source is NEVER re-encoded (user-dictated), so its tier is decided BEFORE
-    # the bitrate threshold and without any geometry requirement. Only the three properties
-    # that Dolby Vision 8.1 physically requires of a base layer are tested.
-    #
-    # The old gate also demanded width==3840 AND height==2160 EXACTLY. A 2.39:1 film is
-    # 3840x1600, so every scope-ratio blockbuster failed it — and DCI 4K (4096 wide) with it
-    # — and fell through to `resolve-only`, which re-encodes the HDR10 through the capped
-    # x265 path. That was the whole bug: the passthrough was working, almost nothing reached
-    # it. Geometry has no bearing on whether an RPU can ride on a stream.
-    if (info.get("is_4k") and info.get("is_cfr")
+    cfr = bool(info.get("is_cfr"))
+    # Only the three properties Dolby Vision 8.1 physically requires of a base layer are tested,
+    # plus a constant frame rate for the RPU to land on frame by frame. Geometry has no bearing
+    # (the old exact-3840x2160 gate re-encoded every 2.39:1 blockbuster and DCI 4K).
+    if (info.get("is_4k") and cfr
             and info.get("transfer") == "smpte2084"           # PQ — DV 8.1 needs an HDR10 base
             and info.get("codec") == "hevc"                   # ...an HEVC one
             and info.get("pix_fmt") == "yuv420p10le"):        # ...Main10
         return {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
-                "resolve": "add_dv", "is_hdr": True,
+                "resolve": "add_dv", "is_hdr": True, "source_cfr": True,
                 "reason": "4K HDR10 HEVC Main10 (%dx%d @ ~%d Mbps) — original stream kept "
                           "untouched, Resolve adds the DV layer only"
                           % (info.get("width") or 0, info.get("height") or 0, kbps // 1000)}
-    if (passthrough_min_kbps and info.get("is_4k") and info.get("is_cfr")
-            and kbps >= passthrough_min_kbps):
-        # 4K, but it cannot carry an RPU on its own stream, so it must be converted. Name the
-        # reason — a re-encode of HDR material should never be silent.
-        why = _no_rpu_reason(info)
-        return {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
-                "resolve": resolve, "is_hdr": is_hdr,
-                "reason": "4K %s (%s) @ ~%d Mbps ≥ threshold — no upscale needed, Resolve %s%s"
-                          % (rng, info.get("codec") or "?", kbps // 1000,
-                             "adds DV" if is_hdr else "adds HDR + DV",
-                             ("; re-encoded because " + why) if (is_hdr and why) else "")}
     if info.get("is_4k"):
-        return {"topaz": "clean", "scale": 1, "res": "1080p", "fit_height": None,
-                "resolve": resolve, "is_hdr": is_hdr,
-                "reason": "4K %s → Topaz clean 1× (keeps %s) → Resolve %s"
-                          % (rng, rng, "adds DV" if is_hdr else "adds HDR + DV")}
+        # 4K, but it cannot keep its own stream, so it is converted. Name the reason — a
+        # re-encode of HDR material should never be silent.
+        why = _no_rpu_reason(info) if is_hdr else None
+        if is_hdr and not why and not cfr:
+            why = "its frame rate varies"
+        return {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
+                "resolve": resolve, "is_hdr": is_hdr, "source_cfr": cfr,
+                "reason": "4K %s (%s) @ ~%d Mbps — no upscale, %sResolve %s%s"
+                          % (rng, info.get("codec") or "?", kbps // 1000,
+                             "" if cfr else "re-timed to a constant frame rate, ",
+                             "adds DV" if is_hdr else "adds HDR + DV",
+                             ("; re-encoded because " + why) if why else "")}
     height = int(info.get("height") or 0)
     res = resolution_bucket(height)
     scale = _AI_SCALE[res]
@@ -172,15 +167,6 @@ def choose_plan(info: dict, *, passthrough_min_kbps: int = 0) -> dict:
                  "adds DV" if is_hdr else "adds HDR + DV"))
     return {"topaz": "upscale", "scale": scale, "res": res, "fit_height": fit_height,
             "resolve": resolve, "is_hdr": is_hdr, "reason": reason}
-
-
-def passthrough_min_kbps() -> int:
-    """The live fast-path threshold (Kb/s) from settings; 0 = feature off or unreadable."""
-    try:
-        import settings
-        return max(0, int(settings.get_settings().get("passthrough_min_mbps", 0))) * 1000
-    except Exception:
-        return 0
 
 
 # What ffprobe ACTUALLY found, remembered per source basename so the app can stop guessing.
@@ -232,7 +218,7 @@ def probed_is_hdr(name):
 
 def plan_for(path: str) -> dict:
     info = probe_input(path)
-    p = choose_plan(info, passthrough_min_kbps=passthrough_min_kbps())
+    p = choose_plan(info)
     p["input"] = info
     _remember_probe(path, info)
     return p

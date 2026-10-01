@@ -819,7 +819,7 @@ let PIPELINE: [StageInfo] = [
     .init(key: "download", name: "Download", symbol: "arrow.down.circle",
           desc: "Pull the 1080p source from the NAS to local scratch.", how: "FTP RETR · size-verified"),
     .init(key: "topaz", name: "Topaz", symbol: "cpu",
-          desc: "Upscale 1080p → 4K (or clean an already-4K source). ProRes HQ 10-bit, range preserved — never SDR↔HDR.", how: "per-show preset"),
+          desc: "Upscale sub-4K sources to 4K. ProRes HQ 10-bit, range preserved — never SDR↔HDR. 4K sources skip it.", how: "per-show preset"),
     .init(key: "resolve", name: "Resolve", symbol: "wand.and.stars",
           desc: "Scene-cut, Dolby Vision analyze, render mute master — HDR inherited from the project.", how: "H.265 Main10 · DV 8.1"),
     .init(key: "remux", name: "Remux", symbol: "square.stack.3d.up",
@@ -2633,6 +2633,12 @@ private struct MovieMode: View {
                             return
                         }
                         let queued = items.contains { $0.name == m.name }
+                        if (m.tags ?? []).contains("4K") {
+                            // A 4K movie never goes through Topaz (user-dictated 2026-09-30), so a
+                            // Topaz preset would be an inert choice: add it straight, ask nothing.
+                            if !queued { Task { await store.addMovieWithPreset(m, preset: "") } }
+                            return
+                        }
                         Task {
                             let prof = await store.profileFor(m.title ?? "")
                             if queued {                                  // re-pick a queued movie → edit its preset
@@ -2719,6 +2725,7 @@ private struct MovieMode: View {
                 VStack(spacing: 0) {
                     ForEach(items) { m in
                         MovieRow(m: m, catalog: catalog) {
+                            guard !(m.tags ?? []).contains("4K") else { return }   // no preset to change
                             store.moviePick = m.preset ?? catalog.first?.key ?? ""
                             store.pendingMovie = m                                     // tap → change its preset
                         }
@@ -2883,10 +2890,19 @@ private struct MovieRow: View {
                         .help("Best-of merge with its seedbox companion — the better video base, "
                               + "real DV if either copy has it, and the best audio of the two")
                 } else {
-                    Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
-                        .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
-                        .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
+                    if (m.tags ?? []).contains("4K") {
+                        // no Topaz pass, so no preset — the pill says what happens instead
+                        Text("4K · no Topaz")
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
+                            .padding(.horizontal, 7).padding(.vertical, 2)
+                            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
+                            .help("Already 4K: it skips Topaz and goes straight to Resolve for Dolby Vision")
+                    } else {
+                        Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
+                            .padding(.horizontal, 7).padding(.vertical, 2)
+                            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
+                    }
                     Button {
                         Task { await store.companionAction("search", name: m.name ?? "",
                                                            dir: m.dir, title: m.title) }
@@ -4263,11 +4279,9 @@ struct SettingsPopover: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
 
-                        SettingsGroupLabel(text: "What qualifies").padding(.top, 4)
-                        OptionalSettingRow(title: "4K fast path",
-                                           blurb: "A 4K source at or above this bitrate skips Topaz — it's already sharp enough to go straight to Dolby Vision.",
-                                           key: "passthrough_min_mbps", fallback: 12,
-                                           range: 5...200, unit: "Mbps")
+                        // Every 4K source skips Topaz now — there is no bitrate to qualify by
+                        // (user-dictated 2026-09-30), so the old "4K fast path" Mbps row is gone.
+                        SettingsGroupLabel(text: "4K fast path").padding(.top, 4)
                         SettingRow(title: "Remuxes beside a fast-path Resolve",
                                    blurb: "Never (the default) gives every Resolve the whole machine. Raising it lets a fast-path title's Resolve share with this many running remuxes.",
                                    key: "resolve_share_remuxes", fallback: 0,

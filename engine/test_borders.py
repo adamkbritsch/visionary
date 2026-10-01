@@ -575,6 +575,14 @@ class ExtendGate(unittest.TestCase):
         self.assertFalse(g["needed"])
         self.assertIn("SDR-only", g["reason"])
 
+    def test_a_4k_source_is_never_outpainted(self):
+        """No 4K source goes through Topaz (2026-09-30), and only Topaz reads the extended
+        file — so outpainting a 4:3 4K episode would be hours of work that nothing ships."""
+        g = self._gate(self._p(), probe={"width": 2880, "height": 2160, "sar": "",
+                                         "is_hdr": False, "is_4k": True})
+        self.assertFalse(g["needed"])
+        self.assertIn("4K source", g["reason"])
+
     def test_wide_episode_in_an_enabled_show_skips(self):
         g = self._gate(self._p(), probe={"width": 1920, "height": 1080, "sar": "",
                                          "is_hdr": False})
