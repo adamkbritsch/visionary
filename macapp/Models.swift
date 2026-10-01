@@ -273,6 +273,8 @@ struct DVQueueEntryDTO: Codable, Identifiable {
     var error: String?
     var size_out: Int?
     var plex_pending: Bool?  // replaced; Plex is told once nobody is streaming
+    var tries: Int?          // failed attempts so far (a movie with a verified new file gets 5)
+    var retry_at: Double?    // epoch seconds: waiting out its pause before the next attempt
     var row: String?         // the library row's name (FTP wire form) this entry came from
     var id: String { name ?? row ?? "" }
 }
@@ -294,6 +296,7 @@ struct DVConvertDTO: Codable {
     var running: Bool?
     var link: DVLinkDTO?     // nil until the lane has opened a connection
     var note: String?        // why the lane is idle: waiting for disk / for the NAS
+    var ship_tries: Int?     // attempts a movie gets before its files are deleted from this Mac
     var fetch: DVLaneStepDTO?
     var ship: DVLaneStepDTO?
     var summary: DVSummaryDTO?

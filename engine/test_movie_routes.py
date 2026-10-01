@@ -102,6 +102,31 @@ check(DVConvert.entryLabel(q[2], lane: dv) == "Failed: not on the NAS any more",
 let sum = DVConvert.summaryLine(dv)
 check(sum == "1 of 3 converted · 8.0 GB saved · 1 failed", "summary -> \(sum)")
 check(DVConvert.fraction(dv.fetch) == 0.5, "fraction")
+
+// a movie whose upload failed waits out a pause, then tries again: 5 attempts, then its files go
+// (user, 2026-09-30)
+var again = DVQueueEntryDTO(); again.name = "Again.mkv"; again.state = "active"; again.phase = "upload"
+again.tries = 2; again.retry_at = 1_000_240; again.error = "NAS command failed (255)"
+let t0 = Date(timeIntervalSince1970: 1_000_000)
+let wait = DVConvert.entryLabel(again, lane: dv, now: t0)
+check(wait == "Attempt 2 of 5 failed · trying again in 4 min — NAS command failed (255)",
+      "retry wait -> \(wait)")
+check(DVConvert.entryLabel(again, lane: dv, now: Date(timeIntervalSince1970: 1_000_230))
+      .contains("trying again in under a minute"), "retry soon")
+check(DVConvert.entryLabel(again, lane: dv, now: Date(timeIntervalSince1970: 1_000_300))
+      .contains("trying again now"), "retry due")
+check(DVConvert.waitingToRetry(again) && !DVConvert.waitingToRetry(q[0]), "waitingToRetry")
+var onTry = again; onTry.name = "Again.mkv"; onTry.retry_at = nil     // the attempt is running
+var shipping = dv
+var up = DVLaneStepDTO(); up.name = "Again.mkv"; up.phase = "upload"; shipping.ship = up
+check(DVConvert.entryLabel(onTry, lane: shipping).hasSuffix(" · attempt 3 of 5"),
+      "attempt -> \(DVConvert.entryLabel(onTry, lane: shipping))")
+var fetching = onTry; fetching.name = "P7a.mkv"                       // a download is no attempt
+check(!DVConvert.entryLabel(fetching, lane: dv).contains("attempt"),
+      "fetch step -> \(DVConvert.entryLabel(fetching, lane: dv))")
+var withRetry = dv; withRetry.queue = q + [again]
+check(DVConvert.summaryLine(withRetry) == "1 of 3 converted · 8.0 GB saved · 1 retrying · 1 failed",
+      "summary with a retry -> \(DVConvert.summaryLine(withRetry))")
 check(DVConvert.gb(13_580_000_000_000) == "13.58 TB", "TB -> \(DVConvert.gb(13_580_000_000_000))")
 
 // the panel lists work in flight and failures, and only the next few queued

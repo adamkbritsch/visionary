@@ -263,7 +263,7 @@ class EthernetOnly(_Lane):
 class Failures(_Lane):
     """Annihilation (2026-09-30): one SSH blip failed it with 43 GB converted and ready."""
 
-    def test_a_failure_after_converting_keeps_the_file_and_retry_resumes_the_upload(self):
+    def test_a_failure_after_converting_keeps_the_file_and_tries_the_upload_again(self):
         self._converted()
         dvbook.update(NAME, phase="upload")
         self.lane._fail(self.e(), "NAS command failed (255)")
@@ -271,9 +271,10 @@ class Failures(_Lane):
         self.assertTrue(os.path.exists(out))
         self.lane._sweep_orphans()                        # a relaunch must not delete it either
         self.assertTrue(os.path.exists(out))
-        self.assertTrue(self.lane.retry(NAME))
         e = self.e()
-        self.assertEqual((e["state"], e["phase"], e.get("error")), (dvbook.ACTIVE, "upload", None))
+        self.assertEqual((e["state"], e["phase"], e["tries"]), (dvbook.ACTIVE, "upload", 1))
+        self.assertIsNone(self.lane._pick_ship())         # it waits out its pause first...
+        self.assertTrue(self.lane.retry(NAME))            # ...unless asked to try now
         self.assertEqual(self.lane._pick_ship()["name"], NAME)
 
     def test_a_failure_before_converting_frees_the_disk_and_retry_starts_over(self):
@@ -297,6 +298,225 @@ class Failures(_Lane):
         dvbook.update(NAME, state=dvbook.FAILED, phase="swap", size_out=90)
         self.assertTrue(self.lane.retry(NAME))
         self.assertEqual((self.e()["state"], self.e()["phase"]), (dvbook.ACTIVE, "swap"))
+
+
+class FiveAttempts(_Lane):
+    """User, 2026-09-30: "if something's downloaded and it fails, either delete it from this device
+    or retry upload, try 5 times before deletion"."""
+
+    def _fail_n(self, n, phase="upload"):
+        for _ in range(n):
+            dvbook.update(NAME, phase=phase)
+            self.lane._fail(self.e(), "NAS command failed (255)")
+
+    def test_the_pauses_between_attempts_grow(self):
+        self._converted()
+        waits = []
+        with mock.patch.object(dvlane.time, "time", return_value=1000.0):
+            for _ in range(dvlane.SHIP_TRIES - 1):
+                dvbook.update(NAME, phase="upload")
+                self.lane._fail(self.e(), "boom")
+                waits.append(self.e()["retry_at"] - 1000)
+        self.assertEqual(waits, list(dvlane.SHIP_RETRY_WAITS))
+
+    def test_a_movie_is_picked_again_once_its_pause_is_over(self):
+        self._converted()
+        self._fail_n(1)
+        self.assertIsNone(self.lane._pick_ship())
+        with mock.patch.object(dvlane.time, "time", return_value=self.e()["retry_at"] + 1):
+            self.assertEqual(self.lane._pick_ship()["name"], NAME)
+
+    def test_the_fifth_failure_deletes_its_files_from_this_mac_and_the_nas_stage(self):
+        self._converted()
+        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+            self._fail_n(dvlane.SHIP_TRIES - 1)
+            out = os.path.join(dvlane.work_dir(HOST), "p81.mkv")
+            self.assertTrue(os.path.exists(out))          # four failures: still trying
+            self.assertEqual(self.e()["state"], dvbook.ACTIVE)
+            disc.assert_not_called()
+            self._fail_n(1)
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"], e["tries"]), (dvbook.FAILED, None, 5))
+        self.assertIn("gave up after 5 attempts", e["error"])
+        self.assertFalse(os.path.exists(dvlane.work_dir(HOST)))
+        disc.assert_called_once_with(HOST)                # its staged copy on the NAS goes too
+        self.assertIsNone(self.lane._pick_ship())
+
+    def test_a_retry_after_giving_up_starts_over_with_fresh_attempts(self):
+        self._converted()
+        with mock.patch.object(nas_ssh, "discard_stage"):
+            self._fail_n(dvlane.SHIP_TRIES)
+        self.assertTrue(self.lane.retry(NAME))
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"], e["tries"]), (dvbook.PENDING, None, 0))
+
+    def test_a_swap_that_keeps_failing_is_given_up_on_too(self):
+        self._converted()
+        with mock.patch.object(nas_ssh, "discard_stage") as disc, \
+             mock.patch.object(nas_ssh, "stat", side_effect=lambda p: (100, 7, 911, 10, "644")
+                               if p == HOST else (90, 8, 911, 10, "644")):   # not swapped yet
+            self._fail_n(dvlane.SHIP_TRIES, phase="swap")
+        self.assertEqual(self.e()["state"], dvbook.FAILED)
+        disc.assert_called_once_with(HOST)
+
+    def test_a_swap_whose_rename_landed_is_finished_not_failed(self):
+        # The rename ran, then the session dropped (it is never retried on the NAS side): on the
+        # fifth attempt that must not delete anything or mark the movie failed (review 2026-09-30).
+        self._converted()
+        dvbook.update(NAME, tries=dvlane.SHIP_TRIES - 1, phase="swap")
+        with mock.patch.object(nas_ssh, "stat", side_effect=lambda p: (90, 9, 911, 10, "644")
+                               if p == HOST else None), \
+             mock.patch.object(nas_ssh, "discard_stage") as disc, \
+             mock.patch.object(self.lane, "_flush_plex"):
+            self.lane._fail(self.e(), "NAS command failed (255)")
+        e = self.e()
+        self.assertEqual((e["state"], e.get("plex_pending"), e.get("tries")), (dvbook.DONE, True, None))
+        disc.assert_not_called()
+
+    def test_the_last_attempt_never_gives_up_on_a_swap_the_nas_cannot_check(self):
+        # Its rename may have landed: deleting it and calling it failed could be wrong. It waits
+        # and asks again, deleting nothing (review 2026-09-30).
+        self._converted()
+        dvbook.update(NAME, tries=dvlane.SHIP_TRIES - 1, phase="swap")
+        with mock.patch.object(nas_ssh, "stat", side_effect=RuntimeError("ssh")), \
+             mock.patch.object(nas_ssh, "discard_stage") as disc, \
+             mock.patch.object(dvlane.time, "time", return_value=1000.0):
+            self.lane._fail(self.e(), "NAS command failed (255)")
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"], e["tries"]), (dvbook.ACTIVE, "swap", 4))
+        self.assertEqual(e["retry_at"], 1000 + dvlane.SHIP_RETRY_WAITS[-1])
+        self.assertTrue(os.path.exists(os.path.join(dvlane.work_dir(HOST), "p81.mkv")))
+        disc.assert_not_called()
+
+    def test_a_staged_copy_the_give_up_could_not_delete_is_deleted_later(self):
+        self._converted()
+        with mock.patch.object(nas_ssh, "discard_stage", side_effect=RuntimeError("ssh")):
+            self._fail_n(dvlane.SHIP_TRIES)
+        self.assertTrue(self.e()["stage_left"])
+        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+            self.lane._resume_kept_failures()                # the lane's next start
+        disc.assert_called_once_with(HOST)
+        self.assertFalse(self.e().get("stage_left"))
+
+    def test_remove_deletes_a_staged_copy_the_give_up_left(self):
+        self._converted()
+        with mock.patch.object(nas_ssh, "discard_stage", side_effect=RuntimeError("ssh")):
+            self._fail_n(dvlane.SHIP_TRIES)
+        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+            self.assertTrue(self.lane.remove(NAME))
+        disc.assert_called_once_with(HOST)
+
+    def test_an_unanswered_swap_check_is_not_taken_as_landed(self):
+        self._converted()
+        dvbook.update(NAME, phase="swap")
+        with mock.patch.object(nas_ssh, "stat", side_effect=RuntimeError("ssh")):
+            self.lane._fail(self.e(), "boom")
+        self.assertEqual((self.e()["state"], self.e()["tries"]), (dvbook.ACTIVE, 1))
+
+    def test_a_movie_queued_again_after_giving_up_runs_this_run(self):
+        # Re-adding it from the picker must not leave it 'Queued' until the run restarts (review).
+        self._converted()
+        with mock.patch.object(nas_ssh, "discard_stage"):
+            self._fail_n(dvlane.SHIP_TRIES)
+        dvbook.add([{"name": NAME, "dir": "/Media/Movies", "title": "Temple", "bytes": 100}])
+        with mock.patch.object(dvlane.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 15)):
+            self.assertEqual(self.lane._pick_fetch()["name"], NAME)
+
+    def test_a_lost_converted_file_starts_over_with_fresh_attempts(self):
+        self._converted()
+        dvbook.update(NAME, phase="upload", tries=3)
+        os.remove(os.path.join(dvlane.work_dir(HOST), "p81.mkv"))
+        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+            self.lane._ship(self.e(), self.ev)
+        e = self.e()
+        self.assertEqual((e["phase"], e.get("tries"), e.get("retry_at")), (None, None, None))
+        disc.assert_called_once_with(HOST)                 # the old file's staged copy is stale
+
+    def test_an_attempt_clears_its_pause_and_a_success_clears_the_count(self):
+        self._converted()
+        self._fail_n(1)
+        self.assertTrue(self.lane.retry(NAME))
+        seen = []
+        def ship(e, ev):
+            seen.append(self.e().get("retry_at"))
+            self.lane._finish(self.e())
+            self.lane._abort.set()
+        with mock.patch.object(self.lane, "_ship", side_effect=ship), \
+             mock.patch.object(self.lane, "_flush_plex"), \
+             mock.patch.object(nas_ssh, "link"):
+            self.lane._ship_loop()
+        self.assertEqual(seen, [None])
+        e = self.e()
+        self.assertEqual((e["state"], e.get("tries"), e.get("error")), (dvbook.DONE, None, None))
+
+    def test_waiting_out_a_nas_outage_is_not_an_attempt(self):
+        self._converted()
+        def offline(_ex):
+            self.lane._abort.set()
+            return True
+        with mock.patch.object(self.lane, "_ship", side_effect=RuntimeError("no route")), \
+             mock.patch.object(self.lane, "_offline", side_effect=offline), \
+             mock.patch.object(self.lane, "_flush_plex"):
+            self.lane._ship_loop()
+        self.assertFalse(self.e().get("tries"))
+
+    def test_a_movie_waiting_to_try_again_holds_back_new_downloads(self):
+        # Its new file is on this disk like a converted one's: while uploads fail, more conversions
+        # would only pile up.
+        self._converted()
+        self._fail_n(1)
+        host2 = "/volume1/Media/Movies/Other (2001).mkv"
+        dvbook.seed([{"nas_path": host2, "size_bytes": 100, "enhancement_layer": "MEL"}])
+        dvbook.add([{"name": os.path.basename(host2), "dir": "/Media/Movies", "bytes": 100}])
+        host3 = "/volume1/Media/Movies/Third (2002).mkv"
+        dvbook.seed([{"nas_path": host3, "size_bytes": 100, "enhancement_layer": "MEL"}])
+        dvbook.add([{"name": os.path.basename(host3), "dir": "/Media/Movies", "bytes": 100}])
+        dvbook.update(os.path.basename(host2), state=dvbook.ACTIVE, phase="converted")
+        with mock.patch.object(dvlane.shutil, "disk_usage",
+                               return_value=mock.Mock(free=10 ** 15)):
+            self.assertIsNone(self.lane._pick_fetch())
+        self.assertEqual(self.lane._note, "a movie that failed to upload is waiting to try again")
+
+    def test_a_failure_before_a_verified_file_existed_is_deleted_at_once(self):
+        d = dvlane.work_dir(HOST)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "source.mkv"), "wb") as fh:
+            fh.write(b"s" * 50)
+        dvbook.update(NAME, state=dvbook.ACTIVE, phase="convert")
+        self.lane._fail(self.e(), "the RPU would not parse")
+        self.assertEqual(self.e()["state"], dvbook.FAILED)
+        self.assertFalse(os.path.exists(d))
+
+    def test_a_kept_failure_from_before_gets_its_attempts(self):
+        self._converted()
+        dvbook.update(NAME, state=dvbook.FAILED, phase="upload", error="old")
+        self.lane._resume_kept_failures()
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"], e["tries"]), (dvbook.ACTIVE, "upload", 1))
+        self.assertEqual(self.lane._pick_ship()["name"], NAME)
+
+    def test_the_lane_takes_up_kept_failures_when_it_starts(self):
+        self._converted()
+        dvbook.update(NAME, state=dvbook.FAILED, phase="upload", error="old")
+        self.lane._guard("ship", lambda: None)            # what each thread runs first
+        self.assertEqual(self.e()["state"], dvbook.ACTIVE)
+
+    def test_a_kept_failure_whose_file_is_gone_starts_over_when_retried(self):
+        dvbook.update(NAME, state=dvbook.FAILED, phase="upload", size_out=90)
+        with mock.patch.object(nas_ssh, "discard_stage") as disc:
+            self.lane._resume_kept_failures()
+        e = self.e()
+        self.assertEqual((e["state"], e["phase"]), (dvbook.FAILED, None))
+        disc.assert_called_once_with(HOST)                 # its partial upload on the NAS goes too
+
+    def test_the_panel_sees_the_attempts(self):
+        self._converted()
+        self._fail_n(2)
+        st = self.lane.status()
+        self.assertEqual(st["ship_tries"], 5)
+        row = st["queue"][0]
+        self.assertEqual(row["tries"], 2)
+        self.assertGreater(row["retry_at"], 0)
 
 
 class OneTransferAtATime(unittest.TestCase):

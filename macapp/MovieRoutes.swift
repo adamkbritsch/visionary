@@ -133,8 +133,14 @@ enum DVConvert {
         return out
     }
 
+    /// Waiting out the pause before its next attempt (its upload or swap failed).
+    static func waitingToRetry(_ e: DVQueueEntryDTO) -> Bool {
+        e.state == "active" && (e.retry_at ?? 0) > 0
+    }
+
     /// One line for a queue entry. `lane` supplies live progress for the entry being worked.
-    static func entryLabel(_ e: DVQueueEntryDTO, lane: DVConvertDTO?) -> String {
+    static func entryLabel(_ e: DVQueueEntryDTO, lane: DVConvertDTO?, now: Date = Date()) -> String {
+        let of = lane?.ship_tries ?? 5
         switch e.state {
         case "done":
             let saved = (e.bytes ?? 0) - (e.size_out ?? e.bytes ?? 0)
@@ -145,8 +151,18 @@ enum DVConvert {
         case "failed":
             return "Failed: " + (e.error ?? "unknown error")
         case "active":
-            for step in [lane?.fetch, lane?.ship] {
-                if let step, step.name == e.name { return stepLabel(step) }
+            let tries = e.tries ?? 0
+            if let step = lane?.fetch, step.name == e.name { return stepLabel(step) }
+            if let step = lane?.ship, step.name == e.name {      // the attempts are the upload's
+                return stepLabel(step) + (tries > 0 ? " · attempt \(tries + 1) of \(of)" : "")
+            }
+            if waitingToRetry(e) {
+                let left = Int(((e.retry_at ?? 0) - now.timeIntervalSince1970).rounded(.up))
+                let when = left <= 0 ? "now" : left < 60 ? "in under a minute"
+                    : "in \(Int((Double(left) / 60).rounded(.up))) min"
+                var s = "Attempt \(tries) of \(of) failed · trying again \(when)"
+                if let err = e.error, !err.isEmpty { s += " — " + err }
+                return s
             }
             switch e.phase {
             case "converted": return "Converted · waiting to upload"
@@ -187,6 +203,8 @@ enum DVConvert {
         let total = d?.summary?.total ?? 0
         var parts = ["\(by["done"] ?? 0) of \(total) converted"]
         if let s = d?.summary?.saved_bytes, s > 0 { parts.append("\(gb(s)) saved") }
+        let retrying = (d?.queue ?? []).filter(waitingToRetry).count
+        if retrying > 0 { parts.append("\(retrying) retrying") }
         if let f = by["failed"], f > 0 { parts.append("\(f) failed") }
         return parts.joined(separator: " · ")
     }

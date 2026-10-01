@@ -62,6 +62,10 @@ PLEX_CACHE_SECS = 5             # both threads and every leg ask; Plex is asked 
 SHIP_BACKLOG = 2                # converted files allowed to wait for the ship thread: with one
                                 # transfer at a time the next download goes while the last movie
                                 # waits its turn to upload, so one must be allowed to wait
+SHIP_TRIES = 5                  # attempts a movie with a verified new file gets before its files are
+                                # deleted from this Mac (user, 2026-09-30: "try 5 times before deletion")
+SHIP_RETRY_WAITS = (60, 300, 900, 1800)   # seconds before attempts 2..5: a blip clears in the first,
+                                          # a NAS reboot or a full share has time by the last
 
 
 def work_dir(host: str) -> str:
@@ -175,7 +179,6 @@ class Lane:
         self._threads = {}
         self._events = {}                 # name -> Event: set to stop work on that movie
         self._cancelled = set()
-        self._failed_now = set()          # failed this run: not retried until re-added or restart
         self._plex = (0.0, None)
         self._plex_lock = threading.Lock()
         self._status = {"fetch": None, "ship": None}
@@ -192,7 +195,6 @@ class Lane:
             return            # a test run arms the orchestrator for real; it must never reach the NAS
         with self._lock:
             self._abort.clear()
-            self._failed_now.clear()
             for name, target in (("fetch", self._fetch_loop), ("ship", self._ship_loop)):
                 t = self._threads.get(name)
                 if not (t and t.is_alive()):
@@ -212,6 +214,7 @@ class Lane:
 
     def _guard(self, name, target):
         try:
+            self._resume_kept_failures()
             self._sweep_orphans()
             target()
         except Exception as e:  # noqa: BLE001 — never die silently
@@ -229,12 +232,13 @@ class Lane:
         link = nas_link.last()
         if link:                                  # how old the answer is: the UI shows it only fresh
             link = dict(link, age=int(time.time() - (link.get("at") or 0)))
-        return {"running": self.running(), "note": self._note,
+        return {"running": self.running(), "note": self._note, "ship_tries": SHIP_TRIES,
                 "link": link,                     # the link the last connection chose (no probing)
                 "fetch": pub(self._status.get("fetch")), "ship": pub(self._status.get("ship")),
                 "summary": dvbook.summary(),
                 "queue": [{k: e.get(k) for k in ("name", "title", "bytes", "state", "phase", "el",
-                                                 "error", "size_out", "plex_pending")}
+                                                 "error", "size_out", "plex_pending", "tries",
+                                                 "retry_at")}
                           for e in q]}
 
     # ---- queue control -------------------------------------------------------------------
@@ -269,16 +273,18 @@ class Lane:
         otherwise. Annihilation failed on one SSH blip with 43 GB converted and ready (2026-09-30);
         starting it over would have moved 90 GB again for nothing."""
         e = dvbook.entry(name)
+        if e and e.get("state") == dvbook.ACTIVE and e.get("retry_at"):
+            dvbook.update(name, retry_at=int(time.time()))     # waiting to try again: try now
+            return True
         if not e or e.get("state") != dvbook.FAILED:
             return False
-        self._failed_now.discard(name)
         out = os.path.join(work_dir(e["host"]), "p81.mkv")
         have_out = os.path.exists(out) and os.path.getsize(out) == int(e.get("size_out") or -1)
         if e.get("phase") == "swap" or (e.get("phase") in KEEP_ON_FAILURE and have_out):
-            dvbook.update(name, state=dvbook.ACTIVE, error=None)
+            dvbook.update(name, state=dvbook.ACTIVE, error=None, tries=0, retry_at=None)
         else:
             shutil.rmtree(work_dir(e["host"]), ignore_errors=True)
-            dvbook.update(name, state=dvbook.PENDING, phase=None, error=None)
+            dvbook.update(name, state=dvbook.PENDING, phase=None, error=None, tries=0, retry_at=None)
         return True
 
     # ---- helpers -------------------------------------------------------------------------
@@ -402,24 +408,89 @@ class Lane:
         return True
 
     def _fail(self, e, why):
-        """Mark a movie failed. A verified new file (converted, uploading, staged) is KEPT so a
-        retry resumes from it instead of moving the movie twice more; anything earlier (a part
-        download, a half conversion) is deleted — it is not worth the disk while the movie waits
-        for someone to look at the reason."""
-        self._failed_now.add(e["name"])
-        cur = dvbook.entry(e["name"]) or e
-        dvbook.update(e["name"], state=dvbook.FAILED, error=str(why)[:400], failed=int(time.time()))
-        if cur.get("phase") not in KEEP_ON_FAILURE:
+        """A movie's step failed. One with a verified new file (converted, uploading, staged) tries
+        again, resuming from that file, up to SHIP_TRIES attempts in all, after waits that let a
+        blip clear (user, 2026-09-30: "try 5 times before deletion"). After the last attempt — or
+        at once for a failure before a verified file existed (a part download, a half conversion)
+        — its files are deleted from this Mac, and a staged copy from the NAS, and it waits as
+        FAILED for a manual retry, which starts it over. Nothing is left holding disk."""
+        name, title = e["name"], e.get("title") or e["name"]
+        cur = dvbook.entry(name) or e
+        if cur.get("phase") == "swap":
+            landed = self._swap_landed(cur)
+            if landed:
+                # The rename ran but the session dropped before it could say so (it is never
+                # retried on the NAS side): the new file is live — finish it, never count or
+                # delete it.
+                logbook.event(f"DV 7->8.1 {title}: the swap reported a failure ({why}) but the "
+                              f"new file is in place on the NAS")
+                return self._finish(cur)
+            if landed is None and int(cur.get("tries") or 0) + 1 >= SHIP_TRIES:
+                # The last attempt, and the NAS cannot say whether its rename landed: never give
+                # up (and delete) on an unknown. The next attempt asks again (review 2026-09-30).
+                wait = SHIP_RETRY_WAITS[-1]
+                dvbook.update(name, state=dvbook.ACTIVE, retry_at=int(time.time()) + wait,
+                              error=f"could not check whether the swap landed ({why})"[:400])
+                logbook.event(f"DV 7->8.1 {title}: the swap failed ({why}) and the NAS cannot say "
+                              f"whether it landed; asking again in {wait // 60} min")
+                return
+        if cur.get("phase") in KEEP_ON_FAILURE:
+            tries = int(cur.get("tries") or 0) + 1
+            if tries < SHIP_TRIES:
+                wait = SHIP_RETRY_WAITS[min(tries, len(SHIP_RETRY_WAITS)) - 1]
+                dvbook.update(name, state=dvbook.ACTIVE, tries=tries, error=str(why)[:400],
+                              retry_at=int(time.time()) + wait)
+                logbook.event(f"DV 7->8.1 {title}: attempt {tries} of {SHIP_TRIES} failed ({why}); "
+                              f"trying again in {wait // 60} min")
+                return
+            why = (f"gave up after {SHIP_TRIES} attempts and deleted its files from this Mac — "
+                   f"the last error: {why}")
+            left = not self._clean(cur)
+        else:
+            tries, left = cur.get("tries"), False
             shutil.rmtree(work_dir(e["host"]), ignore_errors=True)
-        logbook.failure(f"DV 7->8.1 {e.get('title') or e['name']}: {why}")
+        dvbook.update(name, state=dvbook.FAILED, phase=None, tries=tries, retry_at=None,
+                      stage_left=left or None, error=str(why)[:400], failed=int(time.time()))
+        logbook.failure(f"DV 7->8.1 {title}: {why}")
 
-    def _clean(self, e):
+    def _swap_landed(self, e):
+        """After a failed swap: did the rename happen anyway? None when the NAS cannot say."""
+        try:
+            st, staged = nas_ssh.stat(e["host"]), nas_ssh.stat(nas_ssh.stage_path_for(e["host"]))
+        except Exception:  # noqa: BLE001 — unknown: the next attempt asks again
+            return None
+        return swapped_already(st[0] if st else None, bool(staged),
+                               int(e.get("size_in") or e.get("bytes") or 0), int(e.get("size_out") or 0))
+
+    def _resume_kept_failures(self):
+        """A movie that failed before attempts were counted kept its verified new file and waited
+        for a manual retry. It now gets its attempts like any other, the failure it already had
+        counting as the first (user, 2026-09-30). One whose file is gone has nothing to resume:
+        its leftovers go, here and on the NAS, and a retry starts it over. A staged copy a give-up
+        could not delete (the NAS did not answer) is deleted now."""
+        for e in dvbook.queue():
+            if e.get("state") == dvbook.FAILED and e.get("stage_left") and self._clean(e):
+                dvbook.update(e["name"], stage_left=None)   # the NAS answers again: it is gone
+            if e.get("state") != dvbook.FAILED or e.get("phase") not in KEEP_ON_FAILURE:
+                continue
+            out = os.path.join(work_dir(e["host"]), "p81.mkv")
+            if e.get("phase") == "swap" or (os.path.exists(out)
+                                            and os.path.getsize(out) == int(e.get("size_out") or -1)):
+                dvbook.update(e["name"], state=dvbook.ACTIVE, tries=1, retry_at=int(time.time()))
+            else:
+                self._clean(e)
+                dvbook.update(e["name"], phase=None)
+
+    def _clean(self, e) -> bool:
+        """Delete a movie's files on this Mac and any staged copy on the NAS. False when a staged
+        copy may be left because the NAS did not answer."""
         shutil.rmtree(work_dir(e["host"]), ignore_errors=True)
-        if e.get("phase") in ("upload", "swap"):
+        if e.get("phase") in ("upload", "swap") or e.get("stage_left"):
             try:
                 nas_ssh.discard_stage(e["host"])
-            except Exception:  # noqa: BLE001 — a stray .part in _claude-tmp is harmless
-                pass
+            except Exception:  # noqa: BLE001 — remembered as stage_left and tried again later
+                return False
+        return True
 
     def _sweep_orphans(self):
         """Working folders of movies no longer queued (removed while the app was down). A FAILED
@@ -512,13 +583,18 @@ class Lane:
         counting the pipeline's cached downloads as room it may clear. A movie already
         part-downloaded is preferred — its bytes are sunk."""
         todo = dvbook.open_entries(phases=(None, "download", "convert"),
-                                   skip=self._failed_now | self._cancelled)
+                                   skip=self._cancelled)
         if not todo:
             self._note = None
             return None
-        waiting = len(dvbook.open_entries(phases=("converted",)))
-        if waiting >= SHIP_BACKLOG:
-            self._note = "a converted movie is waiting to upload"
+        held = [x for x in dvbook.open_entries(phases=KEEP_ON_FAILURE)
+                if x.get("phase") == "converted" or x.get("retry_at")]
+        if len(held) >= SHIP_BACKLOG:
+            # A movie waiting to try its upload again holds its new file on this disk like one
+            # waiting its first turn: while uploads fail, more conversions would only pile up.
+            self._note = ("a movie that failed to upload is waiting to try again"
+                          if any(x.get("retry_at") for x in held)
+                          else "a converted movie is waiting to upload")
             return None
         os.makedirs(WORK_ROOT, exist_ok=True)
         todo.sort(key=lambda e: 0 if e.get("phase") else 1)       # stable: queue order otherwise
@@ -621,8 +697,10 @@ class Lane:
     # ---- ship: upload + swap + Plex ------------------------------------------------------
 
     def _pick_ship(self):
-        todo = dvbook.open_entries(phases=("converted", "upload", "swap"),
-                                   skip=self._failed_now | self._cancelled)
+        now = time.time()
+        todo = [e for e in dvbook.open_entries(phases=("converted", "upload", "swap"),
+                                               skip=self._cancelled)
+                if (e.get("retry_at") or 0) <= now]          # a failed one waits out its pause
         todo.sort(key=lambda e: {"swap": 0, "upload": 1}.get(e.get("phase"), 2))
         return todo[0] if todo else None
 
@@ -640,6 +718,8 @@ class Lane:
                     return
                 continue
             ev = self._event(e["name"])
+            if e.get("retry_at"):
+                dvbook.update(e["name"], retry_at=None)    # this IS the next attempt
             try:
                 self._ship(e, ev)
             except _Cancelled:
@@ -669,7 +749,13 @@ class Lane:
                 phase = "converted"                     # the staged copy is gone: send it again
         if phase in ("converted", "upload"):
             if not (os.path.exists(out) and os.path.getsize(out) == size_out):
-                dvbook.update(name, phase=None)         # the new file is gone: convert it again
+                # The new file is gone: convert it again. The next file is a new file — it gets
+                # its own attempts — and a staged copy of the old one is of no use to it.
+                try:
+                    nas_ssh.discard_stage(host)
+                except Exception:  # noqa: BLE001 — the conversion discards it again before uploading
+                    pass
+                dvbook.update(name, phase=None, tries=None, retry_at=None)
                 return
             dvbook.update(name, phase="upload")
             self._check(name, ev)
@@ -709,8 +795,8 @@ class Lane:
         name, host = e["name"], e["host"]
         size_out = int(e.get("size_out") or 0)
         dvbook.record_profile(name, size_out, 8, src="rpu", host=host)
-        dvbook.update(name, state=dvbook.DONE, phase=None, plex_pending=True,
-                      finished=int(time.time()))
+        dvbook.update(name, state=dvbook.DONE, phase=None, plex_pending=True, tries=None,
+                      retry_at=None, error=None, finished=int(time.time()))
         shutil.rmtree(work_dir(host), ignore_errors=True)
         saved = int(e.get("size_in") or e.get("bytes") or 0) - size_out
         logbook.event(f"DV 7->8.1 {e.get('title')}: replaced on the NAS (same name), "

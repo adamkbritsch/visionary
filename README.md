@@ -393,7 +393,10 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   above Visionary's own free-space floor — and it **outranks the upscales' cached
   downloads**: when a movie needs room, the sources downloaded ahead for later items are
   cleared (the furthest-off first; each downloads again in its turn), and the download-ahead
-  never takes the room a movie in progress still needs. Transfers resume after any interruption and are
+  never takes the room a movie in progress still needs. A movie whose upload or swap fails gets
+  **5 attempts in all** — each resuming from its converted file, after a pause that grows from
+  a minute to half an hour — and when the fifth fails its files are deleted from the Mac;
+  nothing that failed is left holding disk. Transfers resume after any interruption and are
   **throttled whenever anyone has a Plex session open** (the **Plex throttle** switch in Settings; off runs at full speed), a file is never replaced while it
   is being played, and Plex is only asked to rescan once nobody is streaming.
 

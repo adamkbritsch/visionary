@@ -2814,7 +2814,8 @@ private struct DVQueueRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 9) {
-                Image(systemName: e.state == "failed" ? "exclamationmark.triangle" : "film")
+                Image(systemName: e.state == "failed" ? "exclamationmark.triangle"
+                      : DVConvert.waitingToRetry(e) ? "exclamationmark.arrow.circlepath" : "film")
                     .foregroundStyle(.secondary).font(.system(size: 12))
                 Text(store.movieTitle(e.row ?? e.name, e.title ?? e.name)).font(.system(size: 13)).lineLimit(1)
                 Spacer()
@@ -2827,10 +2828,12 @@ private struct DVQueueRow: View {
                               : el == "dual" ? "The enhancement layer is a separate 1080p track — dropped"
                               : "Minimal enhancement layer — carries nothing the 8.1 file loses")
                 }
-                if e.state == "failed", let n = e.name {
+                if e.state == "failed" || DVConvert.waitingToRetry(e), let n = e.name {
                     Button { Task { await store.dvQueueRetry(n) } } label: {
                         Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
-                    }.buttonStyle(.plain).help("Try this movie again from the start")
+                    }.buttonStyle(.plain)
+                    .help(e.state == "failed" ? "Try this movie again from the start"
+                          : "Try again now instead of waiting out the pause")
                 }
                 if e.state != "done", let n = e.name {
                     Button { Task { await store.dvQueueRemove(n) } } label: {
@@ -2840,7 +2843,8 @@ private struct DVQueueRow: View {
                 }
             }
             Text(DVConvert.entryLabel(e, lane: dv))
-                .font(.system(size: 11)).foregroundStyle(e.state == "failed" ? DS.steelBright : DS.steelDim)
+                .font(.system(size: 11))
+                .foregroundStyle(e.state == "failed" || DVConvert.waitingToRetry(e) ? DS.steelBright : DS.steelDim)
                 .lineLimit(2)
             if let f = DVConvert.fraction(step) {
                 GeometryReader { g in
