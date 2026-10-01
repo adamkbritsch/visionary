@@ -19,6 +19,18 @@ Verified on the new file: DV side data profile 8 / compatibility 1 / no EL, an R
 profile 8, the same track count (one fewer for dual track), chapters and attachments, duration
 within 100 ms, the same video frame count, and the same first timestamp for the video and the first
 audio track. Anything else raises, and the caller keeps the original.
+
+Two release quirks the checks allow for, both proven on the NAS originals (2026-10-01):
+  - Some remuxes put the LAST frame's enhancement layer and RPU in a block of their own after it
+    (Joker, Last Night in Soho, Mamma Mia! Here We Go Again, Rogue Nation: EL picture + RPU + EL
+    end-of-stream, no base-layer picture, a duplicate timestamp). Discarding the EL leaves no
+    picture there, so the new file rightly has one frame fewer than the original has blocks.
+  - Some start the video track a millisecond or more after the audio (Mission: Impossible, 1 ms).
+    A raw HEVC stream carries no timestamps, so the new track would start at 0 and shift against
+    the audio: the original's start — its first PRESENTED frame, not its first block, which can be
+    a keyframe shown after leading pictures — is carried over with mkvmerge --sync.
+Because only the start is carried over, the video's LAST timestamp is checked as well: a jump in the
+original's timestamps mid-film would otherwise come out as a drift the other checks cannot see.
 """
 import json
 import os
@@ -32,6 +44,10 @@ FFPROBE = "/opt/homebrew/bin/ffprobe"
 DOVI = "/opt/homebrew/bin/dovi_tool"
 MKVMERGE = "/opt/homebrew/bin/mkvmerge"
 DURATION_SLACK_NS = 100e6       # the new file's duration may differ by at most 100 ms
+DV_NALS = {62, 63}              # Dolby Vision NAL types: the RPU, and an enhancement-layer NAL
+TAIL_SECS = 1.0                 # how much of a stream's end is read for picture-less blocks
+END_SLACK_MS = 5                # the new video's last timestamp may differ by at most this (ms
+                                # rounding on both sides: Planes, Trains & Automobiles is 1 ms off)
 NICE = 10                       # below the pipeline's own x265 remux, which shares these cores
 
 
@@ -117,6 +133,82 @@ def count_packets(path, sel, abort=None):
     return int(out.strip().split(",")[0])
 
 
+def nal_types(pkt: bytes):
+    """PURE: the NAL unit types of one Matroska HEVC block (4-byte length prefixes), in order; None
+    when it does not parse as one."""
+    out, i = [], 0
+    while i < len(pkt):
+        if i + 4 > len(pkt):
+            return None
+        n = int.from_bytes(pkt[i:i + 4], "big")
+        i += 4
+        if n < 2 or i + n > len(pkt):
+            return None
+        out.append((pkt[i] >> 1) & 0x3F)
+        i += n
+    return out
+
+
+def blocks_of(packets) -> list:
+    """PURE: ffprobe's -show_data packets as bytes, in file order. Each dump line is a 10-character
+    offset, a 40-character hex field, then the ASCII column."""
+    return [bytes.fromhex("".join(line[10:50].replace(" ", "")
+                                  for line in (p.get("data") or "").splitlines()))
+            for p in packets]
+
+
+def dumped_packets(text: str) -> list:
+    """PURE: the blocks of `ffprobe -show_packets -show_data -of json` text."""
+    return blocks_of(json.loads(text or "{}").get("packets", []))
+
+
+def last_pts(packets):
+    """PURE: the latest presentation timestamp among ffprobe packets, or None."""
+    ts = [float(p["pts_time"]) for p in packets if p.get("pts_time") not in (None, "", "N/A")]
+    return max(ts) if ts else None
+
+
+def dv_only_tail(blocks) -> int:
+    """PURE: how many blocks at the very end hold nothing but Dolby Vision data (EL NALs and RPUs)
+    — no base-layer picture. Only the trailing run counts: a block like that anywhere else is not
+    the known quirk, and the frame check must still refuse it."""
+    n = 0
+    for pkt in reversed(blocks):
+        t = nal_types(pkt)
+        if not t or not set(t) <= DV_NALS:
+            break
+        n += 1
+    return n
+
+
+def tail_packets(path, track_id, duration_ns, abort=None, data=False) -> list:
+    """The video track's packets over its last TAIL_SECS, from ffprobe; with their bytes if `data`."""
+    start = max(0.0, duration_ns / 1e9 - TAIL_SECS)
+    rc, out, err = _run([FFPROBE, "-v", "error", "-select_streams", str(track_id), "-read_intervals",
+                         f"{start:.3f}%", "-show_packets"] + (["-show_data"] if data else [])
+                        + ["-of", "json", path], abort=abort, timeout=900)
+    if rc:
+        raise RuntimeError(f"reading the end of the video track: {err[-300:]}")
+    return json.loads(out or "{}").get("packets", [])
+
+
+def video_start(path, track_id) -> float:
+    """The video track's first PRESENTED timestamp: the smallest in its first 2 s. A file can open
+    on a keyframe that is shown after the leading pictures decoded behind it, so its first block's
+    timestamp is not the one a rebuilt stream's first picture must be given (review 2026-10-01)."""
+    _rc, out, _err = _run([FFPROBE, "-v", "error", "-select_streams", str(track_id), "-read_intervals",
+                           "%+2", "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+                          timeout=300)
+    ts = []
+    for line in out.splitlines():
+        t = line.split(",")[0].strip()
+        try:
+            ts.append(float(t))
+        except ValueError:
+            pass
+    return min(ts) if ts else 0.0
+
+
 def frames_tag(info, track_id):
     """mkvmerge's NUMBER_OF_FRAMES statistics tag for a track, or None."""
     for t in info.get("tracks", []):
@@ -189,8 +281,9 @@ def inspect(path, work):
                             "stream=r_frame_rate", "-of", "csv=p=0", path], timeout=300)
         num, _, den = fr.strip().partition("/")
         dd = 1e9 * int(den or 1) / int(num)
+    start = video_start(path, bl["id"])
     return {"info": info, "bl": bl, "el": el, "dual": dual, "el_type": el_type,
-            "default_duration": dd}
+            "default_duration": dd, "video_start_ms": max(0, round(start * 1000))}
 
 
 def build(src, out, work, insp, *, abort=None, progress=None):
@@ -238,8 +331,10 @@ def build(src, out, work, insp, *, abort=None, progress=None):
             cmd += ["--track-name", f"0:{props['track_name']}"]
         cmd += ["--default-track-flag", f"0:{'yes' if props.get('default_track') else 'no'}",
                 "--forced-display-flag", f"0:{'yes' if props.get('forced_track') else 'no'}",
-                "--default-duration", f"0:{default_duration(insp['default_duration'])}",
-                v, "--video-tracks", drop, src]
+                "--default-duration", f"0:{default_duration(insp['default_duration'])}"]
+        if insp.get("video_start_ms"):             # a raw stream starts at 0: keep the original's
+            cmd += ["--sync", f"0:{int(insp['video_start_ms'])}"]
+        cmd += [v, "--video-tracks", drop, src]
         rc, o, err = _run(cmd, abort=abort, timeout=6 * 3600)
         if rc > 1:                           # 1 = warnings, which mkvmerge prints for many releases
             raise RuntimeError(f"mkvmerge {rc}: {(o + err)[-300:]}")
@@ -274,16 +369,29 @@ def verify(src, out, insp, work, *, abort=None):
     # by this mkvmerge from what it actually muxed — and a full packet count when either is missing
     # or they disagree, because a stale tag on a release must cost a recount, never a false pass.
     bl_id = insp["bl"]["id"]
+    src_tail = tail_packets(src, bl_id, d0, abort, data=not insp["dual"])
+    bare = 0 if insp["dual"] else dv_only_tail(blocks_of(src_tail))   # no EL in a dual track's BL
     f0, f1 = frames_tag(info, bl_id), frames_tag(oinfo, 0)
-    if f0 is None or f1 is None or f0 != f1:
+    if f0 is None or f1 is None or f0 - bare != f1:
         f0, f1 = count_packets(src, str(bl_id), abort), count_packets(out, "0", abort)
-    if f0 != f1:
-        raise RuntimeError(f"frame count {f1} != the original's {f0}")
+    if f0 - bare != f1:
+        raise RuntimeError(f"frame count {f1} != the original's {f0 - bare}"
+                           + (f" ({f0} blocks, the last {bare} Dolby Vision data with no picture)"
+                              if bare else ""))
+    e0, e1 = last_pts(src_tail), last_pts(tail_packets(out, "0", d1, abort))
+    if e0 is None or e1 is None or abs(e1 - e0) * 1000 > END_SLACK_MS:
+        raise RuntimeError(f"the video ends at {e1} s, not the original's {e0} s")
     a0 = next((str(t["id"]) for t in info["tracks"] if t["type"] == "audio"), None)
     a1 = next((str(t["id"]) for t in oinfo["tracks"] if t["type"] == "audio"), None)
+    # The video's start is its earliest PRESENTED frame (what --sync reproduces exactly), not its
+    # first block: a source that opens on a keyframe shown after leading pictures has its blocks'
+    # millisecond timestamps rounded from a finer clock, and its first block can sit 1 ms from the
+    # rebuilt one's while every frame lines up (review 2026-10-01). The audio is copied untouched,
+    # so its first block must match exactly.
+    v0, v1 = round(video_start(src, bl_id) * 1000), round(video_start(out, 0) * 1000)
     p0, p1 = first_pts(src), first_pts(out)
-    if p0.get(str(bl_id)) != p1.get("0") or (a0 and p0.get(a0) != p1.get(a1)):
-        raise RuntimeError(f"start timestamps differ: {p0} vs {p1}")
+    if v0 != v1 or (a0 and p0.get(a0) != p1.get(a1)):
+        raise RuntimeError(f"start timestamps differ: video {v0} vs {v1} ms, first blocks {p0} vs {p1}")
     return {"frames": f1, "size_out": os.path.getsize(out)}
 
 

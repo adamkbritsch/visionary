@@ -75,7 +75,8 @@ class Verify(unittest.TestCase):
                 "default_duration": 41708333}
 
     def _run(self, *, dv=None, rpu=8, out_tracks=3, out_frames="1000", dur_ms=0, chapters=1,
-             pts_src=None, pts_out=None, recount=(1000, 1000)):
+             pts_src=None, pts_out=None, recount=(1000, 1000), bare=0, end_src=6999.958,
+             end_out=6999.958, vs_src=0.0, vs_out=0.0):
         insp = self._insp()
         out_tr = [track(0, tag_number_of_frames=out_frames), track(1, "audio"), track(2, "subtitles"),
                   track(3, "audio")][:out_tracks]
@@ -89,6 +90,11 @@ class Verify(unittest.TestCase):
              mock.patch.object(dvp7, "rpu_profile", return_value=(rpu, None)), \
              mock.patch.object(dvp7, "mkv_info", return_value=oinfo), \
              mock.patch.object(dvp7, "count_packets", side_effect=list(recount)), \
+             mock.patch.object(dvp7, "tail_packets", side_effect=lambda path, *a, **k: [
+                 {"pts_time": str(end_src if path == "/src.mkv" else end_out)}]), \
+             mock.patch.object(dvp7, "dv_only_tail", return_value=bare), \
+             mock.patch.object(dvp7, "video_start",
+                               side_effect=lambda path, tid: vs_src if path == "/src.mkv" else vs_out), \
              mock.patch.object(dvp7, "first_pts", side_effect=[pts_src or {"0": 0.0, "1": 0.0},
                                                                 pts_out or {"0": 0.0, "1": 0.0}]):
             return dvp7.verify("/src.mkv", out, insp, d)
@@ -129,11 +135,160 @@ class Verify(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "frame count"):
             self._run(out_frames="998", recount=(1000, 998))
 
+    def test_a_first_block_a_millisecond_off_is_not_a_shifted_start(self):
+        # an open-GOP source: earliest frame 811 ms on both, first blocks 937 vs 936 from rounding
+        self.assertEqual(self._run(vs_src=0.811, vs_out=0.811, pts_src={"0": 0.937, "1": 0.0},
+                                   pts_out={"0": 0.936, "1": 0.0})["frames"], 1000)
+
+    def test_a_trailing_dolby_vision_only_block_is_not_a_lost_frame(self):
+        # Joker and three more (2026-10-01): the last block holds only the EL and RPU of the final
+        # frame. Dropping the EL leaves no picture there, so 999 frames from 1000 blocks is right.
+        self.assertEqual(self._run(out_frames="999", bare=1)["frames"], 999)
+
+    def test_a_real_loss_beside_the_quirk_is_still_refused(self):
+        with self.assertRaisesRegex(RuntimeError, r"frame count 998 != the original's 999 \(1000 blocks"):
+            self._run(out_frames="998", recount=(1000, 998), bare=1)
+
+    def test_the_quirk_never_excuses_a_frame_too_many(self):
+        # had the leftover RPU become a picture of its own, the new file would be wrong too
+        with self.assertRaisesRegex(RuntimeError, "frame count"):
+            self._run(out_frames="1000", recount=(1000, 1000), bare=1)
+
+    def test_a_video_that_ends_elsewhere_is_refused(self):
+        # Only the start is carried over to a raw stream: a mid-film timestamp jump in the original
+        # would come out as a drift that frame count, start and duration all miss (review).
+        self.assertEqual(self._run(end_out=6999.957)["frames"], 1000)      # ms rounding: fine
+        with self.assertRaisesRegex(RuntimeError, "the video ends at"):
+            self._run(end_out=6999.458)
+        with self.assertRaisesRegex(RuntimeError, "the video ends at"):
+            self._run(end_out=7000.000)
+
     def test_a_shifted_start_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "start timestamps"):
-            self._run(pts_out={"0": 0.042, "1": 0.0})
+            self._run(vs_out=0.042)
         with self.assertRaisesRegex(RuntimeError, "start timestamps"):
             self._run(pts_out={"0": 0.0, "1": 0.021})              # audio moved
+
+
+# Joker (2019) [2160p UHD BluRay REMUX ... NAHOM]: its last three video blocks, read from the NAS
+# original on 2026-10-01 — an ordinary frame (picture, then its EL and RPU), the final picture WITHOUT
+# its EL and RPU, then those on their own (EL SEI, EL picture, RPU, EL end-of-stream).
+JOKER_TAIL = [bytes.fromhex(h) for h in (
+    "00000003460150000000074e010102150780000000af0201eb1a523803c20d6f90ef7827cb9a055f80000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003002a60000000097e014e010102150780000000277e010201eb1a523c03c21ebcbbcf4000000300000300000300000947772d5c31000003000044c0000000bc7c011908090840613650af003ff801ffc00ffc001fffa000001000000d0000030080000068000004000003000040000020000020000003000400000302000003020000030000400000200000200000392b300001af512b37cfe758e12b3226500000080000030040000003004000000300e1b112180c3052f1847028a000000d31f2d7fff800000300000300000300030103ee700a8a300800410999810100000300040280000003000003000009060fa0003203e00078357edaf880",
+    "00000003460150000000074e010102160380000000af0201ea9bc8e803c20d6f90ef7827cb9a055f80000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003000003002a60",
+    "000000097e014e010102160380000000277e010201ea9bc8ec03c2092f5095e000000300000300000300000edb159ab86200000300008980000000bc7c011908090840613650af003ff801ffc00ffc001fffa000001000000d0000030080000068000004000003000040000020000020000003000400000302000003020000030000400000200000200000392b300001af512b37cfe758e12b3226500000080000030040000003004000000300e1b112180c3052f1847028a000000d31f2d7fff800000300000300000300030103ee700a8a300800410999810100000300040280000003000003000009060fa0003203e00078357edaf880000000047e014801",
+)]
+
+
+class PictureLessTail(unittest.TestCase):
+    def test_reads_the_nal_types_of_a_block(self):
+        self.assertEqual(dvp7.nal_types(JOKER_TAIL[0]), [35, 39, 1, 63, 63, 62])  # AUD SEI pic EL EL RPU
+        self.assertEqual(dvp7.nal_types(JOKER_TAIL[1]), [35, 39, 1])              # the bare last picture
+        self.assertEqual(dvp7.nal_types(JOKER_TAIL[-1]), [63, 63, 62, 63])         # EL, EL, RPU, EL
+
+    def test_a_block_that_does_not_parse_is_none(self):
+        self.assertIsNone(dvp7.nal_types(b"\x00\x00\x00\x09\x7e\x01"))       # length runs past the end
+        self.assertIsNone(dvp7.nal_types(b"\x00\x00"))
+
+    def test_joker_ends_with_one_block_and_no_picture(self):
+        self.assertEqual(dvp7.dv_only_tail(JOKER_TAIL), 1)
+
+    def test_only_the_trailing_run_counts(self):
+        # the same block anywhere but the end is not the known quirk: the frame check must decide
+        self.assertEqual(dvp7.dv_only_tail([JOKER_TAIL[-1], JOKER_TAIL[0]]), 0)
+        self.assertEqual(dvp7.dv_only_tail(JOKER_TAIL[:2]), 0)
+        self.assertEqual(dvp7.dv_only_tail([]), 0)
+
+    def test_a_block_with_anything_but_dolby_vision_data_is_a_picture_block(self):
+        eos = b"\x00\x00\x00\x02\x48\x01"                                  # a bare end-of-sequence
+        self.assertEqual(dvp7.dv_only_tail([JOKER_TAIL[0], eos]), 0)
+
+    def test_reads_ffprobes_dump_including_a_short_last_line(self):
+        dump = ("\n00000000: 0000 0019 0001 e5c2 2d49 fdc6 1411 a6a0  ........-I......\n"
+                "00000010: 953c cc26 64f7 4009 0b10 0012 f0         .<.&d.@......\n")
+        got = dvp7.dumped_packets('{"packets": [{"data": %s}]}' % __import__("json").dumps(dump))
+        self.assertEqual(got, [bytes.fromhex("00000019 0001e5c2 2d49fdc6 1411a6a0 953ccc26 64f74009 0b100012 f0"
+                                             .replace(" ", ""))])
+
+    def test_the_end_is_the_latest_timestamp_not_the_last_block(self):
+        # Joker's last blocks in file order: its picture-less block repeats an EARLIER timestamp, so
+        # "the last block's pts" would put the end 0.9 s early and fail every one of these films.
+        pk = [{"pts_time": t} for t in ("7309.052000", "7308.927000", "7308.968000", "N/A", "7308.134000")]
+        self.assertEqual(dvp7.last_pts(pk), 7309.052)
+        self.assertIsNone(dvp7.last_pts([{"pts_time": "N/A"}]))
+        self.assertIsNone(dvp7.last_pts([]))
+
+    def test_a_dual_track_base_layer_is_not_read(self):
+        # its EL is another track: the base layer cannot end in an EL-only block
+        insp = Verify()._insp()
+        insp["dual"] = True
+        reads = []
+        def tail(path, tid, dur, abort=None, data=False):
+            reads.append((path, data))
+            return [{"pts_time": "6999.958"}]
+        with mock.patch.object(dvp7, "tail_packets", side_effect=tail), \
+             mock.patch.object(dvp7, "dv_only_tail", side_effect=AssertionError("read")), \
+             mock.patch.object(dvp7, "probe_dv", return_value={
+                 "dv_profile": 8, "dv_bl_signal_compatibility_id": 1, "el_present_flag": 0}), \
+             mock.patch.object(dvp7, "rpu_profile", return_value=(8, None)), \
+             mock.patch.object(dvp7, "mkv_info", return_value=info(
+                 [track(0, tag_number_of_frames="1000"), track(1, "audio")])), \
+             mock.patch.object(dvp7, "first_pts", return_value={"0": 0.0, "1": 0.0}):
+            d = tempfile.mkdtemp()
+            out = os.path.join(d, "o.mkv")
+            open(out, "wb").close()
+            self.assertEqual(dvp7.verify("/src.mkv", out, insp, d)["frames"], 1000)
+        self.assertIn(("/src.mkv", False), reads)              # its end is still checked, bytes not read
+
+
+class StartOffset(unittest.TestCase):
+    """Mission: Impossible (1996): its video track starts 1 ms after the audio (2026-10-01)."""
+
+    def _mux(self, start_ms):
+        d = tempfile.mkdtemp()
+        insp = {"bl": {"id": 0, "properties": {}}, "el": None, "dual": False,
+                "info": {"container": {"properties": {}}}, "default_duration": 41708333,
+                "video_start_ms": start_ms}
+        seen = []
+        def run(cmd, **kw):
+            if isinstance(cmd, list) and cmd[0] == dvp7.MKVMERGE:
+                seen.append(cmd)
+            return 0, "", ""
+        with mock.patch.object(dvp7, "_run", side_effect=run):
+            dvp7.build("/src.mkv", os.path.join(d, "o.mkv"), d, insp)
+        return seen[0]
+
+    def test_the_original_start_is_carried_over_to_the_new_video(self):
+        cmd = self._mux(1)
+        i = cmd.index("--sync")
+        self.assertEqual(cmd[i + 1], "0:1")
+        self.assertLess(i, cmd.index("--video-tracks"))       # an option of the NEW video's file
+        self.assertTrue(cmd[i + 2].endswith("video_p81.hevc"))
+
+    def test_a_video_that_starts_at_zero_is_left_alone(self):
+        self.assertNotIn("--sync", self._mux(0))
+
+    def test_inspect_reads_the_start(self):
+        src = info([track(0), track(1, "audio")])
+        def run(cmd, **kw):
+            return 0, "hevc,3840\n", ""
+        with mock.patch.object(dvp7, "mkv_info", return_value=src), \
+             mock.patch.object(dvp7, "_run", side_effect=run), \
+             mock.patch.object(dvp7, "rpu_profile", return_value=(7, "MEL")), \
+             mock.patch.object(dvp7, "video_start", return_value=0.001):
+            src["tracks"][0]["properties"]["default_duration"] = 41708333
+            self.assertEqual(dvp7.inspect("/src.mkv", "/tmp")["video_start_ms"], 1)
+
+    def test_the_start_is_the_first_presented_frame_not_the_first_block(self):
+        # A file can open on a keyframe shown after the leading pictures decoded behind it: first
+        # block 0.125, earliest frame 0.000. Carrying 125 ms over would shift the video (review,
+        # reproduced with a cut open-GOP x265 stream 2026-10-01).
+        with mock.patch.object(dvp7, "_run", return_value=(0, "0.125000\n0.042000\n0.000000\n0.083000\n", "")):
+            self.assertEqual(dvp7.video_start("/src.mkv", 0), 0.0)
+        with mock.patch.object(dvp7, "_run", return_value=(0, "0.001000\n0.334000\nN/A\n0.167000\n", "")):
+            self.assertEqual(dvp7.video_start("/src.mkv", 0), 0.001)
+        with mock.patch.object(dvp7, "_run", return_value=(0, "", "")):
+            self.assertEqual(dvp7.video_start("/src.mkv", 0), 0.0)
 
 
 class Convert(unittest.TestCase):
