@@ -28,6 +28,46 @@ ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Resolve launch, or a long episode gets killed mid-analysis and fail-loops. Was 45 min
 # (< the 60-min analysis cap alone) — the exact recipe for a stuck resolve stage.
 RESOLVE_TIMEOUT = 120 * 60
+RESOLVE_CEILING_SECS = 8 * 3600   # no Resolve pass runs past this, however well it is moving
+RENDER_STALL_SECS = 15 * 60       # a render whose % has not moved for this long is wedged
+
+
+def resolve_deadline(now, start, deadline, watch, budget=RESOLVE_TIMEOUT) -> float:
+    """PURE. The Resolve pass's deadline once `now` is past its budget (`deadline`): unchanged (kill
+    it) unless a RENDER is visibly moving, which is not "Resolve unresponsive". Then the render gets
+    the time its own rate says it still needs, with a quarter and five minutes to spare. The caller
+    asks again on EVERY poll once past the budget, so a render that stops moving for
+    RENDER_STALL_SECS is killed then, not when a generous early estimate runs out (review).
+
+    The flat budget killed renders that were working: live 2026-10-01/02, "Let's Game It Out -
+    Astro Colony" (1080p60, SuperScale) finished its render at 1 h 47 m, peaked over the cap, and
+    was killed 12 minutes into the re-export the cap gate asked for — five times, ten hours, and
+    the resolve stall held the queue behind it. `watch`: t0 (this render's start), pct, moved (when
+    the % last changed), first (how long the previous render took), all time.monotonic().
+
+    Never past the ceiling, and no time at all for a render whose own pace — read optimistically,
+    one more percent than the truncated figure — says it cannot finish before the ceiling: holding
+    the queue for hours to kill it at 70% helps nobody (review)."""
+    ceiling = start + max(RESOLVE_CEILING_SECS, budget)
+    if now >= ceiling:
+        return deadline
+    t0, pct, moved, first = (watch.get(k) for k in ("t0", "pct", "moved", "first"))
+    if t0 is None or moved is None or now - moved > RENDER_STALL_SECS:
+        return deadline
+    if pct and 0 < pct < 100:
+        need = (100 - pct) * (now - t0) / pct
+        best = (100 - (pct + 1)) * (now - t0) / (pct + 1)
+        if now + best > ceiling:
+            return deadline
+    elif pct and pct >= 100:
+        need = 600                       # finishing: the file is closed and its peak measured
+    elif pct == 0:
+        need = first or RENDER_STALL_SECS   # just started: look again once it has a rate
+    elif first:
+        need = first                     # a re-export that has not reported yet
+    else:
+        return deadline
+    return max(deadline, min(ceiling, now + need * 1.25 + 300))
 
 
 def _resolve_budget(p) -> int:
@@ -1305,6 +1345,7 @@ def _resolve(p, abort, progress=None):
             logbook.exception(f"resolve {p.ep}: launch", e)
             return False, "", f"resolve launch failed: {e}"
         out_lines = []
+        watch = {"t0": None, "pct": None, "moved": None, "first": None}   # see resolve_deadline
 
         def _reader():
             # stream output live so the RENDER part's % surfaces as a progress bar;
@@ -1313,6 +1354,16 @@ def _resolve(p, abort, progress=None):
             for line in proc.stdout:
                 out_lines.append(line)
                 m = re.match(r"RENDER_PCT (\d+)", line.strip())
+                if m:
+                    now, pct = time.monotonic(), int(m.group(1))
+                    if watch["t0"] is None:
+                        watch["t0"] = now
+                    if pct != watch["pct"]:
+                        watch["pct"], watch["moved"] = pct, now
+                elif line.startswith("RENDER_REEXPORT"):
+                    now = time.monotonic()              # the cap gate asked for another render
+                    watch.update(first=(now - watch["t0"]) if watch["t0"] else watch["first"],
+                                 t0=now, pct=None, moved=now)
                 if m and progress:
                     # `rendering` gates the app's live screen preview OFF for the render
                     # phase (user-dictated 2026-08-06): the analysis worth watching is
@@ -1349,10 +1400,24 @@ def _resolve(p, abort, progress=None):
         # MONOTONIC: it pauses through a real sleep on macOS, so a laptop that slept
         # mid-pass wakes with its budget intact instead of a falsely-expired deadline
         # killing the subprocess ("starting over with resolve", user-caught 2026-08-06).
-        deadline = time.monotonic() + _resolve_budget(p)
+        budget = _resolve_budget(p)
+        start = time.monotonic()
+        base = start + budget
+        extended = False
         while proc.poll() is None:
             aborted = abort is not None and abort.is_set()
-            if aborted or time.monotonic() > deadline:
+            now = time.monotonic()
+            deadline = base
+            if not aborted and now > base:
+                # Past the budget, asked EVERY poll: a render that stops moving dies within one
+                # poll of RENDER_STALL_SECS, however long an earlier estimate would have allowed.
+                deadline = resolve_deadline(now, start, base, watch, budget)
+                if deadline > now and not extended:
+                    extended = True
+                    logbook.event(f"resolve {p.ep}: past its {budget // 60}-minute budget but "
+                                  f"rendering ({watch['pct'] or 0}%) — letting it finish while "
+                                  f"it keeps moving")
+            if aborted or now > deadline:
                 proc.kill()
                 reason = "aborted (stop-time)" if aborted else "TIMED OUT — Resolve unresponsive"
                 logbook.failure(f"resolve {p.ep}: killed subprocess — {reason}")

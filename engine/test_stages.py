@@ -679,6 +679,143 @@ class _InlineThread:
     def start(self): self._t()
 
 
+class ResolveRenderWatchdog(unittest.TestCase):
+    """The Resolve pass's budget kills an UNRESPONSIVE Resolve, never a render that is moving.
+    Live 2026-10-01/02: "Let's Game It Out - Astro Colony" (1080p60, SuperScale) finished its
+    render at 1 h 47 m, peaked over the cap, and was killed 12 minutes into the re-export the cap
+    gate asked for — five times, ten hours, with the queue held behind it."""
+
+    def test_rule_a_moving_render_gets_what_its_rate_needs(self):
+        w = {"t0": 0.0, "pct": 40, "moved": 7190.0, "first": None}
+        got = stages.resolve_deadline(7200.0, 0.0, 7200.0, w)
+        self.assertAlmostEqual(got, 7200 + (60 * 7200 / 40) * 1.25 + 300)
+
+    def test_rule_a_reexport_gets_as_long_as_the_render_before_it(self):
+        w = {"t0": 7000.0, "pct": None, "moved": 7000.0, "first": 2040.0}
+        self.assertAlmostEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, w),
+                               7200 + 2040 * 1.25 + 300)
+
+    def test_rule_no_render_or_a_stalled_one_is_killed(self):
+        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0,
+                                                 {"t0": None, "pct": None, "moved": None}), 7200.0)
+        stalled = {"t0": 0.0, "pct": 40, "moved": 7200.0 - stages.RENDER_STALL_SECS - 1}
+        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, stalled), 7200.0)
+
+    def test_rule_a_render_that_has_just_started_gets_a_look_again(self):
+        w = {"t0": 7180.0, "pct": 0, "moved": 7180.0, "first": None}
+        self.assertAlmostEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, w),
+                               7200 + stages.RENDER_STALL_SECS * 1.25 + 300)
+
+    def test_rule_a_finished_render_is_not_killed_while_its_peak_is_measured(self):
+        w = {"t0": 0.0, "pct": 100, "moved": 7150.0, "first": None}
+        self.assertAlmostEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, w), 7200 + 600 * 1.25 + 300)
+
+    def test_rule_never_past_the_ceiling(self):
+        crawl = {"t0": 0.0, "pct": 1, "moved": 7190.0}             # cannot finish before it: no time
+        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, crawl), 7200.0)
+        late = {"t0": 0.0, "pct": 28, "moved": 7190.0}              # can, just: capped at the ceiling
+        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, late),
+                         stages.RESOLVE_CEILING_SECS)
+        at = stages.RESOLVE_CEILING_SECS + 1.0
+        moving = {"t0": 0.0, "pct": 50, "moved": at - 5}            # still moving at the ceiling
+        self.assertEqual(stages.resolve_deadline(at, 0.0, at - 10, moving), at - 10)
+        finishing = {"t0": 0.0, "pct": 100, "moved": at - 5}        # even finishing: not past it
+        self.assertEqual(stages.resolve_deadline(at, 0.0, at - 10, finishing), at - 10)
+
+    def _drive(self, script, end_at=None, budget=7200):
+        """Run the real resolve stage against a fake Resolve whose lines arrive on a simulated
+        clock as the stage's poll loop sleeps. Returns (seconds at kill or None, logbook events)."""
+        import queue, threading, plan, settings
+        clock = {"t": 1000.0}
+        q, pending, killed = queue.Queue(), sorted(script), []
+
+        class Out:
+            busy = False
+            def __iter__(self): return self
+            def __next__(self):
+                if self.busy:
+                    q.task_done()            # the reader finished the line before this one
+                item = q.get()
+                self.busy = True
+                if item is None:
+                    q.task_done(); self.busy = False
+                    raise StopIteration
+                return item
+
+        class Proc:
+            def __init__(self):
+                self.stdout, self.returncode = Out(), None
+            def poll(self):
+                if self.returncode is None and end_at is not None and clock["t"] - 1000 >= end_at:
+                    self.returncode = 0
+                    q.put(None)
+                return self.returncode
+            def kill(self):
+                killed.append(clock["t"] - 1000)
+                self.returncode = -9
+                q.put(None)
+
+        def sleep(_s):
+            clock["t"] += 60
+            while pending and pending[0][0] <= clock["t"] - 1000:
+                q.put(pending.pop(0)[1])
+            q.join()                             # every line due by now has been read
+
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=FastPathDispatch.RES_PLAN), \
+             mock.patch.object(settings, "get_settings",
+                               return_value=dict(settings.DEFAULT_SETTINGS)), \
+             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
+             mock.patch.object(stages, "_resolve_budget", return_value=budget), \
+             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages.time, "monotonic", side_effect=lambda: clock["t"]), \
+             mock.patch.object(stages.time, "sleep", side_effect=sleep), \
+             mock.patch.object(stages, "_vstream", return_value=None), \
+             mock.patch.object(stages, "_is_dv81", return_value=False), \
+             mock.patch.object(stages, "_build_mezzanine", return_value=(False, "no")), \
+             mock.patch.object(stages.logbook, "event") as ev, \
+             mock.patch.object(stages.logbook, "failure"), \
+             mock.patch.object(stages.subprocess, "Popen", side_effect=lambda *a, **k: Proc()):
+            stages.run_stage("resolve", p)
+        return (killed[0] if killed else None), [c.args[0] for c in ev.call_args_list]
+
+    def test_astro_colony_finishes_its_re_export(self):
+        # setup + analysis 74 min, render 34 min, over the cap, re-export 34 min
+        script = [(4400, "RENDER_PCT 0\n"), (5400, "RENDER_PCT 50\n"), (6400, "RENDER_PCT 100\n"),
+                  (6460, "RENDER_REEXPORT 79.0 Mbps at 14000 kb/s > 50 cap — re-exporting at 9000 kb/s\n")]
+        script += [(6480 + 20 * i, f"RENDER_PCT {i}\n") for i in range(0, 101)]
+        killed, events = self._drive(script, end_at=8600)
+        self.assertIsNone(killed)
+        self.assertEqual(len([e for e in events if "past its 120-minute budget but rendering" in e]), 1)
+
+    def test_a_re_export_that_has_not_reported_yet_is_not_taken_for_a_wedge(self):
+        # the first render's last % is 20 minutes old when the budget runs out, but the re-export
+        # it handed over to started 50 s ago — that is not an unresponsive Resolve
+        script = [(4400, "RENDER_PCT 0\n"), (6000, "RENDER_PCT 100\n"),
+                  (7150, "RENDER_REEXPORT 79.0 Mbps at 14000 kb/s > 50 cap — re-exporting at 9000 kb/s\n")]
+        script += [(7400 + 16 * i, f"RENDER_PCT {i}\n") for i in range(0, 101)]
+        killed, events = self._drive(script, end_at=9100)
+        self.assertIsNone(killed)
+        self.assertTrue(any("letting it finish" in e for e in events))
+
+    def test_a_wedged_resolve_is_still_killed_at_its_budget(self):
+        killed, _ = self._drive([(300, "SCREEN_TAKEOVER_SOON\n")])
+        self.assertIsNotNone(killed)
+        self.assertLessEqual(killed, 7200 + 60)
+
+    def test_a_render_that_stops_moving_gets_no_more_time(self):
+        killed, events = self._drive([(5000, "RENDER_PCT 0\n"), (5600, "RENDER_PCT 40\n")])
+        self.assertTrue(7200 <= killed <= 7200 + 60)              # the budget, as before
+        self.assertFalse(any("letting it finish" in e for e in events))
+
+    def test_a_render_that_stalls_after_its_extension_is_killed_soon_after(self):
+        script = [(6000, "RENDER_PCT 0\n")] + [(6000 + 60 * i, f"RENDER_PCT {i}\n") for i in range(1, 25)]
+        killed, events = self._drive(script)                      # moving at the budget, then stuck at 24%
+        self.assertTrue(any("letting it finish" in e for e in events))
+        self.assertIsNotNone(killed)                              # within a poll of the stall rule,
+        self.assertLessEqual(killed, 6000 + 60 * 24 + stages.RENDER_STALL_SECS + 60)   # not hours on
+
+
 class MezzanineFallback(unittest.TestCase):
     """FAST-PATH compat mezzanine: a Resolve INGEST failure (VP9/AV1 the pinned Resolve
     can't decode → 'IMPORT FAILED'/'FPS UNREADABLE') builds a lightweight HEVC Main10
