@@ -611,7 +611,12 @@ def chosen_host():
                 missing.append("not attached")
                 continue
             if d["main"]:
-                return None, "chosen display is the main one"
+                # Driven exactly like main, but TRACKED BY ITS KEY: "main" is whichever screen
+                # is main right now, and opening the lid mid-pass makes the built-in main, so a
+                # shim told "main" followed the clicks onto the user's screen while Resolve sat
+                # on the dummy (live 2026-10-02: WorldBox, "analyze did not finish"). By key,
+                # dv_shim.host_view() follows this display to its new origin instead.
+                return d, "pinned (the main display right now)"
             if not d["eligible"]:
                 missing.append(d.get("why_not") or "not eligible")
                 continue

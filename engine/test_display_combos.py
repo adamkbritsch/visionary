@@ -165,18 +165,30 @@ class EitherPanelCanBeMain(unittest.TestCase):
         self.assertIsNotNone(host, why)
         self.assertEqual(host["key"], "uuid:MBP")
 
-    def test_pinning_the_main_display_just_drives_main(self):
+    def test_pinning_the_main_display_still_tracks_it_by_key(self):
+        # "main" moves when the lid opens; the pinned display does not (live 2026-10-02: WorldBox,
+        # the shim followed "main" onto the built-in while Resolve sat on the dummy)
         layout = [disp(MBP16, "uuid:MBP", (0.0, 0.0), main=True),
                   disp(UHD4K, "uuid:4K", (1728.0, 0.0))]
         host, why = self._pinned(layout, "uuid:MBP")
-        self.assertIsNone(host)
-        self.assertIn("main", why)
+        self.assertEqual(host["key"], "uuid:MBP")
+        self.assertIn("main display right now", why)
 
-    def test_a_single_4k_has_nothing_to_host_on_and_drives_main(self):
+    def test_a_lid_closed_dummy_is_tracked_by_key_so_opening_the_lid_cannot_move_the_clicks(self):
         layout = [disp(UHD4K, "uuid:4K", (0.0, 0.0), main=True)]
         host, why = self._pinned(layout, "uuid:4K")
-        self.assertIsNone(host, "a lone display is main — there is nowhere else to go")
-        self.assertIn("main", why)
+        self.assertEqual(host["key"], "uuid:4K")
+        import dv_shim
+        prev = dv_shim.get_host()
+        try:
+            dv_shim.set_host(host)
+            lid_open = [disp(MBP16, "uuid:MBP", (0.0, 0.0), main=True),
+                        disp(UHD4K, "uuid:4K", (1728.0, 1117.0))]
+            with mock.patch.object(displays, "enumerate_displays", return_value=lid_open):
+                ox, oy, _scale, w, h = dv_shim.host_view()
+            self.assertEqual((ox, oy), (1728.0, 1117.0))           # the dummy, not the new main
+        finally:
+            dv_shim.set_host(prev)
 
     def test_an_unplugged_pinned_display_never_silently_becomes_main(self):
         layout = [disp(MBP16, "uuid:MBP", (0.0, 0.0), main=True)]
