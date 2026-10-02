@@ -159,6 +159,71 @@ class TopazSegBounds(unittest.TestCase):
         self.assertIsNone(got["b"])                                     # [] → None → ~SEG_SECONDS plan
 
 
+class StaleCfrRate(unittest.TestCase):
+    """A CFR made before the CFR had to be a rate Resolve can host (a04f0eb) was reused as it
+    was: Rhett & Link "Fireworks Song" (23/1, made 2026-09-08) failed Resolve's conform on every
+    attempt and held every item queued behind it (live 2026-10-01)."""
+
+    def test_forgetting_bounds_drops_only_that_item(self):
+        d = tempfile.mkdtemp()
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")):
+            stages._write_topaz_bounds("a.mp4", [10, 20])
+            stages._write_topaz_bounds("b.mp4", [30])
+            stages._forget_topaz_bounds("a.mp4")
+            stages._forget_topaz_bounds("never.mp4")              # absent: fine
+            self.assertEqual(stages._read_topaz_bounds("a.mp4"), [])
+            self.assertEqual(stages._read_topaz_bounds("b.mp4"), [30])
+
+    def _ensure(self, hostable):
+        import topaz, plan, types
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        open(p.source_cfr, "wb").close()
+        made = []
+        def to_cfr(src, dst, **kw):
+            made.append(os.path.exists(dst))                         # was the stale one gone?
+            return types.SimpleNamespace(ok=True, rate="24000/1001", frames=4420, capped_secs=0,
+                                         error_tail="")
+        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
+             mock.patch("orchestrator.apply_container"), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "cfr_hostable", return_value=hostable), \
+             mock.patch.object(topaz, "_fps_fraction", return_value="23/1"), \
+             mock.patch.object(topaz, "to_cfr", side_effect=to_cfr), \
+             mock.patch.object(plan, "plan_for", return_value={"topaz": "resolve-only"}), \
+             mock.patch.object(stages.logbook, "event") as ev:
+            stages._write_topaz_bounds(p.source_basename, [2105, 4241])
+            ok, msg = stages._ensure_cfr(p, None)
+            bounds = stages._read_topaz_bounds(p.source_basename)
+        return ok, msg, made, bounds, ev
+
+    def test_a_cfr_resolve_cannot_host_is_made_again(self):
+        ok, msg, made, bounds, ev = self._ensure(hostable=False)
+        self.assertTrue(ok)
+        self.assertEqual(made, [False])                              # removed before the redo
+        self.assertEqual(bounds, [])                                 # its frame bounds re-plan
+        self.assertIn("cannot host", ev.call_args.args[0])
+        self.assertIn("24000/1001", msg)
+
+    def test_a_hostable_cfr_is_reused_as_before(self):
+        ok, msg, made, bounds, _ev = self._ensure(hostable=True)
+        self.assertEqual((ok, made, bounds), (True, [], [2105, 4241]))
+        self.assertIn("reused", msg)
+
+    def test_the_download_stage_is_not_done_on_an_unhostable_cfr(self):
+        import orchestrator, topaz
+        p = _paths(tempfile.mkdtemp())
+        open(p.source, "wb").close()
+        with mock.patch.object(orchestrator, "_remote_size", return_value=0), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "cfr_hostable", return_value=False):
+            self.assertFalse(orchestrator.stage_done("download", p))
+        with mock.patch.object(orchestrator, "_remote_size", return_value=0), \
+             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
+             mock.patch.object(topaz, "cfr_hostable", return_value=True):
+            self.assertTrue(orchestrator.stage_done("download", p))
+
+
 class ReplaceSourcePolicy(unittest.TestCase):
     """The per-item `replace_source` setting decides the source's fate at upload: ON
     (default) → transfer.replace_original deletes the verified-superseded source; OFF →

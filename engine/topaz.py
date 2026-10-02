@@ -228,6 +228,13 @@ class CfrResult:
                                  # and the pass was bounded (see cfr_duration_cap)
 
 
+def first_field(out) -> str:
+    """PURE: the first value of ffprobe `-of csv=p=0` output. ffprobe 8 trails a COMMA after it
+    for a stream that carries side data (HDR mastering metadata, a rotation, a Dolby Vision
+    record: "23/1,", "46,"), which every bare parse of the line rejected (review 2026-10-01)."""
+    return ((out or "").strip().splitlines() or [""])[0].split(",")[0].strip()
+
+
 def _fps_fraction(path, ffprobe=FFPROBE_HB):
     """The source's frame-rate fraction string (e.g. '24000/1001') for an EXACT -r,
     avoiding the precision loss of a float (23.976023976…). None if unreadable — the
@@ -235,7 +242,8 @@ def _fps_fraction(path, ffprobe=FFPROBE_HB):
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
                               "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
+                             capture_output=True, text=True, timeout=30).stdout
+        out = first_field(out)
     except Exception:
         return None
     if re.fullmatch(r"\d+/\d+", out) and not out.startswith("0/"):
@@ -262,7 +270,7 @@ def _cfr_height(path, ffprobe=FFPROBE_HB) -> int:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
                               "-show_entries", "stream=height", "-of", "csv=p=0", path],
                              capture_output=True, text=True, timeout=30).stdout.strip()
-        return int(out.splitlines()[0]) if out else 0
+        return int(first_field(out) or 0)
     except Exception:
         return 0
 
@@ -582,6 +590,41 @@ RESOLVE_TIMELINE_RATES = ("16/1", "18/1", "24000/1001", "24/1", "25/1", "30000/1
 HOSTABLE_RATE_TOLERANCE = 1e-4   # 2997/125 IS Resolve's 23.976 — do not re-encode over a rounding
 
 
+def is_hostable_rate(rate) -> bool:
+    """PURE: is `rate` one of Resolve's timeline rates (however it is spelled)? An unreadable rate
+    counts as hostable: nothing here can do better with it than ffmpeg's own choice."""
+    from fractions import Fraction
+    try:
+        want = Fraction(rate)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return True
+    if want <= 0:
+        return True
+    return any(abs(float(want) / float(Fraction(r)) - 1) <= HOSTABLE_RATE_TOLERANCE
+               for r in RESOLVE_TIMELINE_RATES)
+
+
+_HOSTABLE_CACHE = {}
+
+
+def cfr_hostable(path) -> bool:
+    """Is an existing CFR file at a rate Resolve can host? A CFR made before the CFR had to be
+    one (a04f0eb) was reused as it was: Rhett & Link "Fireworks Song", 23/1 since 2026-09-08,
+    failed Resolve's conform on every attempt and stalled every item behind it (live
+    2026-10-01). Cached per file version — the stage gate asks often."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True
+    key = (path, st.st_size, st.st_mtime_ns)
+    if key not in _HOSTABLE_CACHE:
+        rate = _fps_fraction(path)
+        if rate is None:
+            return True                  # unreadable now: ask again next time, never remember it
+        _HOSTABLE_CACHE[key] = is_hostable_rate(rate)
+    return _HOSTABLE_CACHE[key]
+
+
 def resolve_hostable_rate(rate):
     """The rate to encode at so Resolve can host the result: `rate` itself when Resolve knows it,
     otherwise the next one UP.
@@ -600,9 +643,8 @@ def resolve_hostable_rate(rate):
     if want <= 0:
         return rate
     known = sorted(Fraction(r) for r in RESOLVE_TIMELINE_RATES)
-    for r in known:
-        if abs(float(want) / float(r) - 1) <= HOSTABLE_RATE_TOLERANCE:
-            return rate                      # already one of Resolve's, however it is spelled
+    if is_hostable_rate(want):
+        return rate                          # already one of Resolve's, however it is spelled
     for r in known:
         if r > want:
             return "%d/%d" % (r.numerator, r.denominator)
@@ -975,9 +1017,9 @@ def _frame_count(path, ffprobe=FFPROBE_HB, *, decode=True) -> int:
                       *([(["-count_frames", "-show_entries", "stream=nb_read_frames"], 600)]
                         if decode else [])):   # decode=False: a CHECK must never cost a full decode
         try:
-            out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
-                                  *args, "-of", "csv=p=0", path],
-                                 capture_output=True, text=True, timeout=tmo).stdout.strip()
+            out = first_field(subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                                              *args, "-of", "csv=p=0", path],
+                                             capture_output=True, text=True, timeout=tmo).stdout)
             if out.isdigit():
                 return int(out)
         except Exception:

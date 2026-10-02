@@ -714,7 +714,8 @@ def count_frames(path: str, ffprobe: str = FFPROBE) -> int:
                             "-count_packets", "-show_entries", "stream=nb_read_packets",
                             "-of", "csv=p=0", path],
                            capture_output=True, text=True, timeout=600)
-        return int((r.stdout or "0").strip() or 0)
+        # the first field only: ffprobe 8 trails a comma when the stream carries side data
+        return int(((r.stdout or "").strip().splitlines() or [""])[0].split(",")[0].strip() or 0)
     except Exception:
         return 0
 

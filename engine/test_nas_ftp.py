@@ -599,6 +599,14 @@ class EthernetOnlyReasons(unittest.TestCase):
             self.assertEqual(nas_ftp._ethernet_only_reason(), "")
 
 
+class Reasons(unittest.TestCase):
+    def test_a_failure_with_no_message_is_named_by_its_type(self):
+        import socket
+        self.assertEqual(transfer._why(socket.timeout()), "TimeoutError")
+        self.assertEqual(transfer._why(EOFError()), "EOFError")
+        self.assertEqual(transfer._why(OSError("no route")), "no route")
+
+
 class NeverFromATest(unittest.TestCase):
     def test_a_test_cannot_open_an_ftp_connection(self):
         with self.assertRaisesRegex(RuntimeError, "mock it"):

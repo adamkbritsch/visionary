@@ -12,6 +12,14 @@ from unittest import mock
 import borders
 
 
+class CountFramesTrailingComma(unittest.TestCase):
+    def test_a_packet_count_past_ffprobe_8s_trailing_comma(self):
+        from unittest import mock
+        import borders
+        with mock.patch.object(borders.subprocess, "run", return_value=mock.Mock(stdout="46,\n")):
+            self.assertEqual(borders.count_frames("/x.mkv"), 46)
+
+
 class Geometry(unittest.TestCase):
     def test_square_pixel_4x3_sources_accepted(self):
         for w, h in ((640, 480), (720, 540), (1440, 1080)):

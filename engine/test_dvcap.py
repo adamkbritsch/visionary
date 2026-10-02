@@ -5,6 +5,16 @@ import dvcap
 import remux
 
 
+class TrailingComma(unittest.TestCase):
+    def test_a_packet_count_past_ffprobe_8s_trailing_comma(self):
+        import os, tempfile
+        f = os.path.join(tempfile.mkdtemp(), "seg.hevc")
+        with open(f, "wb") as fh:
+            fh.write(b"x")
+        with mock.patch.object(dvcap.subprocess, "run", return_value=mock.Mock(stdout="219,\n")):
+            self.assertEqual(dvcap.count_hevc_frames(f), 219)
+
+
 class X265Command(unittest.TestCase):
     def cmd(self, **kw):
         return dvcap.build_x265_command("/x265", "/r.bin", "/out.hevc", 50, **kw)

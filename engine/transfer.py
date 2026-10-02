@@ -115,6 +115,12 @@ def ftp_hosts() -> list:
     return nas_hosts()
 
 
+def _why(e) -> str:
+    """An exception's message, or its type when it has none — "download failed:" with nothing
+    after it said nothing (live 2026-09-30: two downloads failed so, a socket timeout)."""
+    return str(e).strip() or e.__class__.__name__
+
+
 class _WireFTP(ftplib.FTP):
     """FTP that can carry a path containing real Unicode. Everything else about the
     connection is unchanged — latin-1 in both directions — but a command line that latin-1
@@ -384,7 +390,7 @@ def download_head(remote_path, local_file, max_bytes, *, timeout=None):
     try:
         ftp = connect(timeout=timeout or TRANSFER_TIMEOUT)
     except ftplib.all_errors as e:
-        return False, f"FTP connect/login failed: {e}"
+        return False, f"FTP connect/login failed: {_why(e)}"
     got = 0
     try:
         with open(local_file, "wb") as f:
@@ -404,7 +410,7 @@ def download_head(remote_path, local_file, max_bytes, *, timeout=None):
     except ftplib.all_errors as e:
         # small files can finish BEFORE max_bytes: that path returns above; here the
         # transfer itself failed
-        return False, f"head read failed: {e}"
+        return False, f"head read failed: {_why(e)}"
     finally:
         # the deliberate mid-RETR abort leaves the control connection wedged — close
         # hard, never quit()
@@ -423,7 +429,7 @@ def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=No
     try:
         ftp = connect(timeout=timeout or TRANSFER_TIMEOUT)
     except ftplib.all_errors as e:
-        return False, local, f"FTP connect/login failed: {e}"
+        return False, local, f"FTP connect/login failed: {_why(e)}"
     try:
         total = remote_size(ftp, remote_path)   # the % denominator AND the verify target
         done = 0
@@ -450,7 +456,7 @@ def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=No
     except _Aborted:
         return False, local, "aborted mid-download"
     except ftplib.all_errors as e:
-        return False, local, f"download failed: {e}"
+        return False, local, f"download failed: {_why(e)}"
     finally:
         try: ftp.quit()
         except ftplib.all_errors: pass
@@ -466,7 +472,7 @@ def upload(local_file, remote_dir, *, timeout=None, on_progress=None):
     try:
         ftp = connect(timeout=timeout or TRANSFER_TIMEOUT)
     except ftplib.all_errors as e:
-        return False, final, f"FTP connect/login failed: {e}"
+        return False, final, f"FTP connect/login failed: {_why(e)}"
     try:
         # ALREADY SHIPPED? An upload cut AFTER its last byte (an app relaunch between the
         # transfer and the verify) leaves a complete master at the target; re-STORing it
@@ -498,7 +504,7 @@ def upload(local_file, remote_dir, *, timeout=None, on_progress=None):
             return False, final, f"size mismatch after upload: remote {rs} != local {lsz}"
         return True, final, f"uploaded {lsz} bytes (FTP → owner {MEDIA_OWNER})"
     except ftplib.all_errors as e:
-        return False, final, f"upload failed: {e}"
+        return False, final, f"upload failed: {_why(e)}"
     finally:
         try: ftp.quit()
         except ftplib.all_errors: pass
@@ -514,7 +520,7 @@ def replace_original(master_remote, original_remote, local_master) -> tuple:
     try:
         ftp = connect()
     except ftplib.all_errors as e:
-        return False, f"FTP connect/login failed: {e}"
+        return False, f"FTP connect/login failed: {_why(e)}"
     try:
         lsz = os.path.getsize(local_master)
         if remote_size(ftp, master_remote) != lsz:
@@ -524,7 +530,7 @@ def replace_original(master_remote, original_remote, local_master) -> tuple:
         ftp.delete(original_remote)
         return True, "replaced — deleted 1080p original"
     except ftplib.all_errors as e:
-        return False, f"replace-delete failed: {e}"
+        return False, f"replace-delete failed: {_why(e)}"
     finally:
         try: ftp.quit()
         except ftplib.all_errors: pass
@@ -635,7 +641,7 @@ def publish_master(local_master, master_remote, sidecar_src_dir, scratch_dir, *,
     try:
         ftp = connect(timeout=timeout or TRANSFER_TIMEOUT)
     except ftplib.all_errors as e:
-        return False, master_remote, f"FTP connect/login failed: {e}"
+        return False, master_remote, f"FTP connect/login failed: {_why(e)}"
     try:
         _makedirs(ftp, dest_dir)
         # What a cut attempt left at the target (the _link_retry after a lost link, or the
@@ -662,7 +668,7 @@ def publish_master(local_master, master_remote, sidecar_src_dir, scratch_dir, *,
         copied = _copy_sidecars(ftp, sidecar_src_dir, dest_dir, scratch_dir)
         return True, master_remote, f"published {lsz} bytes + {copied} sidecar(s) (owner {MEDIA_OWNER})"
     except ftplib.all_errors as e:
-        return False, master_remote, f"publish failed: {e}"
+        return False, master_remote, f"publish failed: {_why(e)}"
     finally:
         try: ftp.quit()
         except ftplib.all_errors: pass

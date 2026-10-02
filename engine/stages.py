@@ -132,6 +132,26 @@ def _write_topaz_bounds(basename: str, bounds: list) -> None:
         pass
 
 
+def _forget_topaz_bounds(basename: str) -> None:
+    """Drop an item's scene-plan frame bounds (they are re-planned from the new file)."""
+    try:
+        with _SEGBOUNDS_LOCK:
+            try:
+                with open(_SEGBOUNDS_FILE) as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                return
+            if not isinstance(d, dict) or basename not in d:
+                return
+            del d[basename]
+            tmp = _SEGBOUNDS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, _SEGBOUNDS_FILE)
+    except OSError:
+        pass
+
+
 _PEAKGATE_FILE = os.path.expanduser("~/.topaz-pipeline/source_peaks.json")
 _PEAKGATE_LOCK = threading.Lock()
 
@@ -264,8 +284,9 @@ def _source_video_kbps(path):
                  ["-show_entries", "format=bit_rate"]):
         try:
             out = subprocess.run([FFPROBE, "-v", "error", *args, "-of", "csv=p=0", path],
-                                 capture_output=True, text=True, timeout=30).stdout.strip()
-            if out and out not in ("N/A", "0"):
+                                 capture_output=True, text=True, timeout=30).stdout
+            out = ((out or "").strip().splitlines() or [""])[0].split(",")[0].strip()  # ffprobe 8
+            if out and out not in ("N/A", "0"):                       # trails a comma on side data
                 return int(int(out) / 1000)
         except Exception:
             pass
@@ -515,7 +536,20 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
     import plan
     orchestrator.apply_container(p)     # source is on disk now → lock the container (mkv vs mp4)
     if topaz.is_cfr_ready(p.source_cfr):
-        return True, "source + CFR already on disk (reused)"
+        if topaz.cfr_hostable(p.source_cfr):
+            return True, "source + CFR already on disk (reused)"
+        # Made before the CFR had to be a rate Resolve can host: redo it, and forget the scene
+        # plan's frame bounds, which counted the old rate's frames (the cut TIMES in scenes.json
+        # stay good). Live 2026-10-01: a 23/1 "Fireworks Song" CFR from 2026-09-08 failed
+        # Resolve's conform every time and held every item queued behind it.
+        rate = topaz._fps_fraction(p.source_cfr)
+        try:
+            os.remove(p.source_cfr)
+        except OSError:
+            pass
+        _forget_topaz_bounds(p.source_basename)
+        logbook.event(f"download {p.ep}: the CFR on disk runs at {rate}, which Resolve cannot "
+                      f"host — making it again at a rate it can")
     # FAST-PATH items (rpu-only / resolve-only) skip Topaz, so they don't need the true-CFR
     # re-encode that keeps Topaz's frame counts stable — this file only carries their AUDIO
     # (a bit-copy of the original's either way) and decodable frames for scene-cut planning.

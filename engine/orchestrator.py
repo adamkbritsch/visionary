@@ -968,10 +968,13 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
                     and os.path.getsize(p.companion_src) == p.companion_size)
         # Done = the original is verified complete (size == the NAS file) AND its
         # constant-frame-rate re-encode is present (that's what every later stage reads).
+        # A CFR at a rate Resolve cannot host is not done: it was made before the CFR had to be
+        # one, and reusing it fails Resolve on every attempt (topaz.cfr_hostable).
         import topaz
         return (os.path.exists(p.source)
                 and os.path.getsize(p.source) == _remote_size(p.nas_source, ftp)
-                and topaz.is_cfr_ready(p.source_cfr))
+                and topaz.is_cfr_ready(p.source_cfr)
+                and topaz.cfr_hostable(p.source_cfr))
     if stage == "extend":
         # AI border extension — done when the gate says there is no work (option off /
         # not 4:3 / HDR / movie / YouTube / combine: all cheap re-checks, the probe only

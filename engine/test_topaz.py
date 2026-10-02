@@ -616,6 +616,49 @@ class TheCfrMustBeSomethingResolveCanHost(unittest.TestCase):
             res = topaz.to_cfr("/in.mp4", "/out.mp4", copy_only=copy_only)
         return captured.get("cmd", []), res, removed
 
+    def test_which_rates_resolve_can_host(self):
+        for r in ("24000/1001", "2997/125", "24/1", "25", "30000/1001", "60/1", None, "junk", "0/1"):
+            self.assertTrue(topaz.is_hostable_rate(r), r)
+        for r in ("23/1", "29/1", "15/1", "12/1", "20/1"):
+            self.assertFalse(topaz.is_hostable_rate(r), r)
+
+    def test_an_existing_cfrs_rate_is_checked_once_per_file_version(self):
+        import os, tempfile
+        f = os.path.join(tempfile.mkdtemp(), "x_cfr.mp4")
+        open(f, "wb").close()
+        with mock.patch.object(topaz, "_fps_fraction", return_value="23/1") as fr:
+            self.assertFalse(topaz.cfr_hostable(f))
+            self.assertFalse(topaz.cfr_hostable(f))
+        self.assertEqual(fr.call_count, 1)
+        with open(f, "wb") as fh:
+            fh.write(b"remade")                                    # a new version is asked again
+        with mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"):
+            self.assertTrue(topaz.cfr_hostable(f))
+        self.assertTrue(topaz.cfr_hostable("/no/such/file.mp4"))  # absent: is_cfr_ready decides
+
+    def test_ffprobe_8s_trailing_comma_is_read_past(self):
+        # a stream with side data (HDR metadata, a rotation, a DV record) prints "23/1," and "46,"
+        self.assertEqual(topaz.first_field("23/1,\n"), "23/1")
+        self.assertEqual(topaz.first_field("46\n"), "46")
+        self.assertEqual(topaz.first_field(""), "")
+        run = lambda out: mock.patch.object(topaz.subprocess, "run",
+                                            return_value=mock.Mock(stdout=out))
+        with run("23/1,\n"):
+            self.assertEqual(topaz._fps_fraction("/x.mkv"), "23/1")
+        with run("46,\n"):
+            self.assertEqual(topaz._frame_count("/x.mkv", decode=False), 46)
+        with run("1080,\n"):
+            self.assertEqual(topaz._cfr_height("/x.mkv"), 1080)
+
+    def test_an_unreadable_rate_is_never_remembered(self):
+        import os, tempfile
+        f = os.path.join(tempfile.mkdtemp(), "y_cfr.mp4")
+        open(f, "wb").close()
+        with mock.patch.object(topaz, "_fps_fraction", return_value=None):
+            self.assertTrue(topaz.cfr_hostable(f))
+        with mock.patch.object(topaz, "_fps_fraction", return_value="29/1"):
+            self.assertFalse(topaz.cfr_hostable(f))                # asked again, and answered
+
     def test_a_rate_resolve_cannot_host_is_re_encoded_at_one_it_can(self):
         cmd, res, _ = self._run(already_cfr=True, rate="23/1", holes=0)
         self.assertIn("libx264", cmd)                       # a COPY could not change the rate
