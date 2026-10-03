@@ -716,9 +716,11 @@ class Lane:
         # A fresh conversion makes any staged copy from an earlier attempt stale: mkvmerge writes a
         # new segment UID every time, so resuming an upload onto it would splice two files. Best
         # effort here — a blip must not throw away a verified download (review 2026-10-01); the
-        # ship step clears it again before this conversion's first upload.
+        # ship step clears it again before this conversion's first upload. The folder stays: the
+        # ship thread may be starting an upload into it this very moment (same share), and this
+        # movie's own upload will use it next; the next swap on that share removes it once it is empty.
         try:
-            nas_ftp.discard_stage(host)
+            nas_ftp.discard_stage(host, keep_dir=True)
         except Exception:  # noqa: BLE001
             pass
         try:

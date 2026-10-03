@@ -110,7 +110,9 @@ class Steps(_Lane):
              mock.patch.object(nas_ftp, "discard_stage") as disc, \
              mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
             self.lane._fetch(self.e(), self.ev)
-        disc.assert_called_once_with(HOST)            # no stale staged copy survives a re-convert
+        # no stale staged copy survives a re-convert — and the folder stays: the ship thread may be
+        # starting an upload into it on the same share (2026-10-03)
+        disc.assert_called_once_with(HOST, keep_dir=True)
         e = self.e()
         self.assertEqual((e["state"], e["phase"], e["size_out"], e["expect_mtime"]),
                          (dvbook.ACTIVE, "converted", 90, 7))

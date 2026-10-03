@@ -90,6 +90,8 @@ class FakeFTP:
         if verb == "RETR" and path not in self.srv.files:
             raise ftplib.error_perm("550 not found")
         if verb == "STOR":
+            if path.rsplit("/", 1)[0] not in self.srv.dirs:
+                raise ftplib.error_perm(f"553 {path}: Permission denied.")   # smbftpd, missing folder
             self.srv.mtimes.setdefault(path, "20261001160000")
             self.srv.modes.setdefault(path, "0777")
         return FakeConn(self.srv, path, rest or 0, verb == "STOR")
@@ -374,6 +376,33 @@ class Upload(_Net):
         self.srv.put(nas_ftp.host_to_ftp(self.STAGE), b"z" * (len(data) + 10))
         nas_ftp.upload(self._local(data), self.STAGE)
         self.assertEqual(bytes(self.srv.files[nas_ftp.host_to_ftp(self.STAGE)]), data)
+
+    def test_a_staging_folder_removed_after_the_upload_began_is_made_again(self):
+        # The other thread clears out a stage on the same share as this upload starts: its RMD of
+        # the (still empty) shared folder lands between this upload's MKD and its STOR. Live
+        # 2026-10-03: every leg got "553 Permission denied" and the attempt failed.
+        data = os.urandom(2 * nas_ftp.SAMPLE_SPAN)
+        real_mkd, calls = FakeFTP.mkd, []
+
+        def mkd(ftp, path):
+            real_mkd(ftp, path)
+            calls.append(path)
+            if len(calls) == 1:
+                self.srv.dirs.discard(path)             # the other thread's RMD
+        with mock.patch.object(FakeFTP, "mkd", mkd):
+            nas_ftp.upload(self._local(data), self.STAGE)
+        self.assertEqual(bytes(self.srv.files[nas_ftp.host_to_ftp(self.STAGE)]), data)
+        self.assertEqual(len(calls), 2)                 # one leg lost, the next made it again
+
+    def test_a_stopped_upload_makes_nothing_on_the_nas(self):
+        # remove() cleans up after its 30 s wait even while a leg is still connecting: that leg must
+        # not make the folder again and leave an empty .part behind
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(nas_ftp.Stopped):
+            nas_ftp.upload(self._local(os.urandom(1000)), self.STAGE, abort=ev)
+        self.assertEqual(self.srv.dirs, {"/"})
+        self.assertNotIn("STOR", [v for v, _r in self.srv.rests])
 
     def test_a_bad_staged_copy_is_deleted_not_resumed_onto(self):
         data = os.urandom(2 * nas_ftp.SAMPLE_SPAN)

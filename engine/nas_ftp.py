@@ -535,13 +535,7 @@ def upload(local, stage_host, *, abort=None, limit=None, on_progress=None):
     """Resumable push of `local` to a NAS staging path, verified by size and sampled ranges."""
     size = os.path.getsize(local)
     path = _ftp_path(stage_host)
-
-    def mkdir(ftp):
-        try:
-            ftp.mkd(path.rsplit("/", 1)[0])
-        except ftplib.error_perm:
-            pass                            # 550: it is already there
-    _short(mkdir)
+    folder = path.rsplit("/", 1)[0]
 
     def have_fn():
         def go(ftp):
@@ -556,7 +550,19 @@ def upload(local, stage_host, *, abort=None, limit=None, on_progress=None):
         ftp = _connect()
         hard = True
         try:
+            if abort is not None and abort.is_set():
+                raise Stopped("stopped")    # a removed movie's cleanup may already have run: make
+                                            # nothing (no folder, no empty .part) behind it
             relink = _relinker(ftp)
+            # Every leg, on its own connection: the folder is shared by every movie on the share,
+            # and clearing out another movie's stage removes it whenever it is empty — which it is
+            # until this STOR creates the file. A STOR into a missing folder is "553 Permission
+            # denied", and with the folder made only once every first upload that started as the
+            # other thread finished a download from the same share failed all its legs (2026-10-03).
+            try:
+                ftp.mkd(folder)
+            except ftplib.error_perm:
+                pass                        # 550: it is already there
             ftp.voidcmd("TYPE I")
             conn = ftp.transfercmd("STOR " + path, rest=have)
             try:
