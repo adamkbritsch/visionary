@@ -454,6 +454,22 @@ class Small(_Net):
         self.assertNotIn(stage.rsplit("/", 1)[0], self.srv.dirs)
         nas_ftp.discard_stage(HOST)                     # nothing staged: fine
 
+    def test_clearing_before_an_upload_keeps_the_staging_folder(self):
+        stage = nas_ftp.host_to_ftp(nas_ftp.stage_path_for(HOST))
+        folder = stage.rsplit("/", 1)[0]
+        self.srv.dirs.add(folder)
+        self.srv.put(stage, b"old")
+        nas_ftp.discard_stage(HOST, keep_dir=True)
+        self.assertNotIn(stage, self.srv.files)
+        self.assertIn(folder, self.srv.dirs)
+
+    def test_a_transfer_out_of_attempts_says_what_failed(self):
+        data = os.urandom(1000)
+        self.srv.put(FTP, data)
+        with mock.patch.object(FakeFTP, "transfercmd", side_effect=ftplib.error_perm("553 no")):
+            with self.assertRaisesRegex(RuntimeError, "download incomplete — last error: error_perm: 553 no"):
+                nas_ftp.download(HOST, os.path.join(self.d, "src.mkv"), len(data))
+
     def test_the_dv_profile_comes_from_the_head(self):
         self.srv.put(FTP, b"h" * 100)
         with mock.patch.object(nas_ftp.subprocess, "run",

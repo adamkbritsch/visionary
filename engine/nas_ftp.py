@@ -453,6 +453,7 @@ def _legs(run_leg, have_fn, size, abort):
     that ended cleanly having moved nothing (a NAS file now shorter than expected) each cost a pause
     and count; a relink starts the next leg at once; Stopped and NoLink end the transfer."""
     failures, prev = 0, None
+    _legs.last_error = None
     while failures < MAX_FAILURES:
         try:
             have = have_fn()
@@ -470,9 +471,17 @@ def _legs(run_leg, have_fn, size, abort):
             raise
         except _Relink:
             continue
-        except Exception:  # noqa: BLE001 — a dropped leg: the bytes stay, the next leg resumes
+        except Exception as ex:  # noqa: BLE001 — a dropped leg: the bytes stay, the next resumes
+            _legs.last_error = f"{type(ex).__name__}: {str(ex)[:160]}"
             failures += 1
             _pause(abort, FAIL_PAUSE_SECS)
+
+
+def _last_leg_error() -> str:
+    """The last dropped leg's error, for a transfer that ran out of attempts — "upload incomplete
+    (0 of N)" alone hid why every first upload failed (2026-10-02)."""
+    err = getattr(_legs, "last_error", None)
+    return f" — last error: {err}" if err else ""
 
 
 def download(host_path, local, size, *, abort=None, limit=None, on_progress=None):
@@ -513,7 +522,7 @@ def download(host_path, local, size, *, abort=None, limit=None, on_progress=None
 
     _legs(run_leg, have_fn, size, abort)
     if not os.path.exists(local) or os.path.getsize(local) != size:
-        raise RuntimeError("download incomplete")
+        raise RuntimeError("download incomplete" + _last_leg_error())
     try:
         verify_copy(local, host_path)
     except Mismatch:
@@ -565,7 +574,7 @@ def upload(local, stage_host, *, abort=None, limit=None, on_progress=None):
     _legs(run_leg, have_fn, size, abort)
     st = stat(stage_host)
     if not st or st[0] != size:
-        raise RuntimeError(f"upload incomplete ({st[0] if st else 0} of {size})")
+        raise RuntimeError(f"upload incomplete ({st[0] if st else 0} of {size})" + _last_leg_error())
     try:
         verify_copy(local, stage_host)
     except Mismatch:
@@ -600,8 +609,9 @@ def swap(stage_host: str, host_path: str, *, expect_size: int, expect_mtime: int
         pass                                # another movie's stage is still in it
 
 
-def discard_stage(host_path: str):
-    """Delete a movie's staged copy on the NAS, and the staging folder once it is empty."""
+def discard_stage(host_path: str, keep_dir=False):
+    """Delete a movie's staged copy on the NAS, and the staging folder once it is empty — unless
+    `keep_dir`: an upload is about to write into it."""
     stage = _ftp_path(stage_path_for(host_path))
 
     def go(ftp):
@@ -609,6 +619,8 @@ def discard_stage(host_path: str):
             ftp.delete(stage)
         except ftplib.error_perm:
             pass                            # 550: nothing staged
+        if keep_dir:
+            return
         try:
             ftp.rmd(stage.rsplit("/", 1)[0])
         except ftplib.all_errors:

@@ -68,6 +68,8 @@ PLEX_RESCAN_GRACE_SECS = 600    # how long a folder rescan gets to pick a replac
 PLEX_GIVE_UP_SECS = 3 * PLEX_RESCAN_GRACE_SECS   # ...and how long before the lane stops trying:
 PLEX_MAX_TRIES = 5                               # Plex finds the file on its own scan, and one item
                                                  # Plex cannot take must not hold up every later one
+PLEX_UNSEEN_GIVE_UP_SECS = 2 * PLEX_GIVE_UP_SECS # a movie never even rescanned (streams all evening)
+                                                 # stops holding the swaps back after this long
 SHIP_BACKLOG = 2                # converted files allowed to wait for the ship thread: with one
                                 # transfer at a time the next download goes while the last movie
                                 # waits its turn to upload, so one must be allowed to wait
@@ -803,8 +805,8 @@ class Lane:
                 dvbook.update(name, phase=None, tries=None, retry_at=None)
                 return
             if phase == "converted":
-                nas_ftp.discard_stage(host)              # this conversion's first upload: any
-                                                         # staged copy is from an older one
+                nas_ftp.discard_stage(host, keep_dir=True)   # this conversion's first upload: any
+                                                             # staged copy is from an older one
             dvbook.update(name, phase="upload")
             self._check(name, ev)
             with self._transfer("ship", e, "upload", ev):
@@ -888,15 +890,27 @@ class Lane:
         pend = [e for e in dvbook.queue() if e.get("plex_pending")]
         if not pend:
             return
+        e = pend[0]
+        name, rk = e["name"], e.get("rk")
+        at, tries = e.get("plex_rescanned"), int(e.get("plex_tries") or 0)
+        # ALREADY TAKEN IN? Plex notices a changed file on its own, usually within a minute. Asking
+        # is one light metadata read — fine during a stream or while Plex is busy — and it is what
+        # the wait below would have waited for: live 2026-10-02, Hugo's new file was in Plex but
+        # the lane held every swap for an hour because someone was watching Dahmer.
+        if rk:
+            size = plex.part_size(rk, os.path.basename(e["host"]))
+            if size is not None and size == int(e.get("size_out") or -1):
+                dvbook.update(name, plex_pending=False, plex_rescanned=None, plex_tries=None)
+                return
+        if not at and time.time() - int(e.get("finished") or time.time()) >= PLEX_UNSEEN_GIVE_UP_SECS:
+            self._plex_give_up(e, "no quiet moment to rescan it")
+            return
         d = self._plex_detail()
         if d is None or d["count"] > 0:
             return
         busy = self._plex_busy()
         if busy is None or busy:
             return                                    # unknown or busy: never add to its work
-        e = pend[0]
-        name, rk = e["name"], e.get("rk")
-        at, tries = e.get("plex_rescanned"), int(e.get("plex_tries") or 0)
 
         def failed(what):
             if tries + 1 >= PLEX_MAX_TRIES:
@@ -920,10 +934,6 @@ class Lane:
         if not rk:
             dvbook.update(name, plex_pending=False, plex_rescanned=None, plex_tries=None)
             return
-        size = plex.part_size(rk, os.path.basename(e["host"]))
-        if size is not None and size == int(e.get("size_out") or -1):
-            dvbook.update(name, plex_pending=False, plex_rescanned=None, plex_tries=None)
-            return                                    # the rescan took it
         waited = time.time() - at
         if waited < PLEX_RESCAN_GRACE_SECS:
             return

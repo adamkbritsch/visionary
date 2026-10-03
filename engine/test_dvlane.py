@@ -153,16 +153,14 @@ class Steps(_Lane):
              mock.patch.object(dvlane.plex, "part_size", return_value=90), \
              mock.patch.object(dvlane.plex, "refresh_folder", return_value=True) as rf, \
              mock.patch.object(dvlane.plex, "analyze", return_value=True) as an:
-            self.lane._ship(self.e(), self.ev)
-            self.assertTrue(self.e().get("plex_pending"))      # rescanned; checked next time round
-            self.lane._flush_plex()
-        up.assert_called_once()
+            self.lane._ship(self.e(), self.ev)                  # Plex already has the new file:
+        up.assert_called_once()                                 # settled at once, no rescan
         self.assertEqual(sw.call_args.kwargs, {"expect_size": 100, "expect_mtime": 7,
                                                "new_size": 90})
         e = self.e()
         self.assertEqual((e["state"], e.get("plex_pending")), (dvbook.DONE, False))
-        rf.assert_called_once_with("2", "/media/Movies")
-        an.assert_not_called()                                 # the rescan picked it up
+        rf.assert_not_called()
+        an.assert_not_called()
         self.assertEqual(dvbook.profile_of(NAME)["profile"], 8)
         self.assertFalse(os.path.exists(dvlane.work_dir(HOST)))
         self.assertEqual(dvbook.summary()["saved_bytes"], 10)
@@ -175,15 +173,16 @@ class Steps(_Lane):
              mock.patch.object(nas_ftp, "swap", side_effect=AssertionError("must not swap")):
             with self.assertRaisesRegex(RuntimeError, "profile 7"):
                 self.lane._ship(self.e(), self.ev)
-        # once before this conversion's first upload (stale copies), once for the bad copy
-        self.assertEqual(disc.call_args_list, [mock.call(HOST), mock.call(HOST)])
+        # once before this conversion's first upload (stale copies, the folder kept for the upload),
+        # once for the bad copy
+        self.assertEqual(disc.call_args_list, [mock.call(HOST, keep_dir=True), mock.call(HOST)])
 
     def test_the_first_upload_of_a_conversion_clears_a_stale_stage_first(self):
         # mkvmerge writes a new segment UID every time: resuming onto an older conversion's staged
         # copy would splice two files (review 2026-10-01: the pre-convert discard is best effort)
         self._converted()
         order = []
-        with mock.patch.object(nas_ftp, "discard_stage", side_effect=lambda h: order.append("discard")), \
+        with mock.patch.object(nas_ftp, "discard_stage", side_effect=lambda h, **k: order.append("discard")), \
              mock.patch.object(nas_ftp, "upload", side_effect=lambda *a, **k: order.append("upload")), \
              mock.patch.object(nas_ftp, "remote_dv_profile", return_value=7):
             with self.assertRaises(RuntimeError):
@@ -606,6 +605,21 @@ class PlexGetsOneMovieAtATime(_Lane):
         rf.assert_called_once()                                 # only the first
         self.assertTrue(self.e().get("plex_rescanned"))
         self.assertFalse(dvbook.entry(other).get("plex_rescanned"))
+
+    def test_a_file_plex_already_took_in_settles_even_during_a_stream(self):
+        # live 2026-10-02: Hugo's new file was in Plex, but the lane held every swap for an hour
+        # because someone was watching Dahmer
+        self._done()
+        rf, an, _ps = self._flush(size=90, watching={"count": 1, "files": {"Dahmer S01E07.mkv"}})
+        rf.assert_not_called()
+        an.assert_not_called()
+        self.assertFalse(self.e().get("plex_pending"))
+
+    def test_a_movie_never_rescanned_stops_holding_the_swaps_after_its_deadline(self):
+        self._done()
+        dvbook.update(NAME, finished=int(time.time()) - dvlane.PLEX_UNSEEN_GIVE_UP_SECS - 1)
+        self._flush(size=100, watching={"count": 1, "files": {"x.mkv"}})   # streams all evening
+        self.assertFalse(self.e().get("plex_pending"))
 
     def test_nothing_while_plex_is_busy_or_unreachable(self):
         self._done()
