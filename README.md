@@ -398,7 +398,7 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   a minute to half an hour — and when the fifth fails its files are deleted from the Mac;
   nothing that failed is left holding disk. Transfers resume after any interruption and are
   **throttled whenever anyone has a Plex session open** (the **Plex throttle** switch in Settings; off runs at full speed), a file is never replaced while it
-  is being played, and Plex is only asked to rescan once nobody is streaming.
+  is being played, and Plex is told about one replaced movie at a time — once nobody is streaming and Plex has no heavy analysis running, and no movie is swapped while the last one is still settling in Plex (its chapter thumbnails and loudness pass read the whole file; back to back, they starved the NAS). Transfers also ease off while Plex is busy analyzing.
 
 - **AI border extension — 4:3 shows to 16:9** (optional, off by default): an old 4:3 show
   can have its **left and right borders generated** by a diffusion model

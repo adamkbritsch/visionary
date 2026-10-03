@@ -128,7 +128,10 @@ enum DVConvert {
         if let f = fraction(s) { out += " \(Int((f * 100).rounded(.down)))%" }
         if s.phase == "download" || s.phase == "upload" {
             if let r = s.rate, r > 0 { out += String(format: " · %.0f MB/s", Double(r) / 1e6) }
-            if s.throttled == true { out += " · throttled while Plex is in use" }
+            if s.throttled == true {
+                out += s.throttle_why == "plex-busy" ? " · eased off while Plex analyzes a movie"
+                                                     : " · throttled while Plex is in use"
+            }
         }
         return out
     }

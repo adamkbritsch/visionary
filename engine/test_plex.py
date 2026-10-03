@@ -4,6 +4,27 @@ from unittest import mock
 import plex
 
 
+class PlexBusyAndPartSize(unittest.TestCase):
+    def test_heavy_jobs_are_the_ones_that_read_a_whole_file(self):
+        xml = (b'<MediaContainer size="3">'
+               b'<Activity uuid="a" type="media.generate.chapter.thumbs" title="t" subtitle="Hereditary (2018)"/>'
+               b'<Activity uuid="b" type="media.generate.loudness" title="l"/>'
+               b'<Activity uuid="c" type="library.update.section" title="scan"/>'
+               b'</MediaContainer>')
+        self.assertEqual(plex.heavy_activities_of(xml),
+                         ["media.generate.chapter.thumbs", "media.generate.loudness"])
+        self.assertEqual(plex.heavy_activities_of(b'<MediaContainer size="0"/>'), [])
+        self.assertEqual(plex.heavy_activities_of(b"not xml"), [])
+
+    def test_the_part_size_is_the_one_for_this_file(self):
+        xml = (b'<MediaContainer><Video ratingKey="5"><Media><Part file="/media/Movies/Other.mkv" size="7"/>'
+               b'</Media><Media><Part file="/media/Movies/Temple (1984).mkv" size="90"/></Media></Video>'
+               b'</MediaContainer>')
+        self.assertEqual(plex.part_size_of(xml, "Temple (1984).mkv"), 90)
+        self.assertIsNone(plex.part_size_of(xml, "Missing.mkv"))
+        self.assertIsNone(plex.part_size_of(b"junk", "x"))
+
+
 class ParseLeaves(unittest.TestCase):
     XML = (b'<MediaContainer>'
            b'<Video parentIndex="1" index="1" viewCount="3"><Media><Part file="/media/TV-Shows/MyShow/S01/ep1.mp4"/></Media></Video>'

@@ -95,6 +95,9 @@ check(DVConvert.entry(for: lib[0], in: q) == nil, "a plain row has no entry")
 let live = DVConvert.entryLabel(q[0], lane: dv)
 check(live.hasPrefix("Downloading 50%"), "live step -> \(live)")
 check(live.contains("MB/s") && live.contains("throttled"), "rate + throttle -> \(live)")
+var busyStep = dv.fetch!; busyStep.throttle_why = "plex-busy"
+check(DVConvert.stepLabel(busyStep).contains("eased off while Plex analyzes a movie"),
+      "busy -> \(DVConvert.stepLabel(busyStep))")
 let done = DVConvert.entryLabel(q[1], lane: dv)
 check(done.hasPrefix("Converted to 8.1") && done.contains("8.0 GB smaller")
       && done.contains("Plex updates"), "done -> \(done)")

@@ -252,7 +252,8 @@ struct DVLaneStepDTO: Codable {          // what one of the lane's two threads i
     var done: Int?           // bytes moved (download/upload) or percent (convert)
     var total: Int?
     var note: String?        // e.g. "waiting: this movie is playing on Plex"
-    var throttled: Bool?     // someone has a Plex session open: transfers are capped
+    var throttled: Bool?     // transfers are capped: someone has a Plex session open, or Plex is busy
+    var throttle_why: String?  // "watching" | "plex-busy"
     var rate: Int?           // bytes per second over this step so far
 }
 

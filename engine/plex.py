@@ -142,6 +142,63 @@ def refresh_folder(section, folder, *, timeout=30) -> bool:
     return _send("GET", f"/library/sections/{section}/refresh?{q}", timeout=timeout)
 
 
+HEAVY_ACTIVITY_PREFIXES = ("media.generate", "media.analy")   # chapter thumbnails, loudness, video
+                                                              # previews, intro/credit markers, analysis
+
+
+def heavy_activities_of(xml_bytes) -> list:
+    """PURE (unit-tested): the types of the heavy background jobs in a /activities answer — the
+    ones that decode or read a whole file. A replaced 4K movie sets Plex generating chapter
+    thumbnails and loudness data, which reads all 60-130 GB of it; one after another, they starved
+    the NAS of memory until its services died (live 2026-10-02)."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return []
+    return [a.get("type") for a in root.iter("Activity")
+            if (a.get("type") or "").startswith(HEAVY_ACTIVITY_PREFIXES)]
+
+
+def heavy_activities(*, timeout=6):
+    """heavy_activities_of() of the live server, or None when Plex can't be reached or no token is
+    set — the caller decides; the DV lane treats unknown as busy before telling Plex anything."""
+    token = plex_token()
+    if not token:
+        return None
+    for base in plex_base_urls():
+        try:
+            return heavy_activities_of(_get(base, "/activities", token, timeout=timeout))
+        except Exception:
+            continue
+    return None
+
+
+def part_size_of(xml_bytes, name):
+    """PURE (unit-tested): the size Plex has on record for the media part whose file is `name`."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return None
+    for pt in root.iter("Part"):
+        if os.path.basename(pt.get("file") or "") == name:
+            v = pt.get("size") or ""
+            return int(v) if v.isdigit() else None
+    return None
+
+
+def part_size(rating_key, name, *, timeout=10):
+    """part_size_of() for one item of the live server, or None when it cannot be read."""
+    token = plex_token()
+    if not token:
+        return None
+    for base in plex_base_urls():
+        try:
+            return part_size_of(_get(base, f"/library/metadata/{rating_key}", token, timeout=timeout), name)
+        except Exception:
+            continue
+    return None
+
+
 def analyze(rating_key, *, timeout=60) -> bool:
     """Re-read one item's media info — a file replaced in place still shows its old streams (the
     profile 7 video, the old size) until this runs."""

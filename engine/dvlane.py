@@ -63,6 +63,11 @@ THROTTLE_BPS = 25_000_000       # per transfer while anyone has a Plex session o
 SIZE_FACTOR = 2.8               # peak local footprint: the source + its bare video + the new file
 IDLE_POLL_SECS = 30
 PLEX_CACHE_SECS = 5             # both threads and every leg ask; Plex is asked at most this often
+PLEX_RESCAN_GRACE_SECS = 600    # how long a folder rescan gets to pick a replaced file up before
+                                # Plex is told to re-read it
+PLEX_GIVE_UP_SECS = 3 * PLEX_RESCAN_GRACE_SECS   # ...and how long before the lane stops trying:
+PLEX_MAX_TRIES = 5                               # Plex finds the file on its own scan, and one item
+                                                 # Plex cannot take must not hold up every later one
 SHIP_BACKLOG = 2                # converted files allowed to wait for the ship thread: with one
                                 # transfer at a time the next download goes while the last movie
                                 # waits its turn to upload, so one must be allowed to wait
@@ -189,6 +194,7 @@ class Lane:
         self._note = None
         self._gate = TransferGate()
         self._throttle_cache = (0.0, True)
+        self._plex_busy_cache = (0.0, None)
         self._cache = None                # (scratch folder fn, evict fn) — see use_cache
         self._active = None               # the movie the fetch thread is working on
 
@@ -318,7 +324,26 @@ class Lane:
             self._throttle_cache = (time.monotonic(), on)
         return on
 
+    def _plex_busy(self):
+        """Plex's heavy background jobs (plex.heavy_activities), at most every PLEX_CACHE_SECS;
+        None when Plex cannot be reached."""
+        with self._plex_lock:
+            at, b = self._plex_busy_cache
+            if time.monotonic() - at < PLEX_CACHE_SECS:
+                return b
+            try:
+                b = plex.heavy_activities()
+            except Exception:  # noqa: BLE001
+                b = None
+            self._plex_busy_cache = (time.monotonic(), b)
+            return b
+
     def _limit(self):
+        # Plex decoding or reading a whole movie (chapter thumbnails, loudness) is the NAS's
+        # heaviest work: the lane eases off for it whatever the stream setting says — together
+        # they starved the NAS until its services died (live 2026-10-02).
+        if self._plex_busy():
+            return THROTTLE_BPS
         if not self._throttle_on():
             return None                       # off: no need to even ask Plex who is watching
         return throttle_for(self._plex_detail())
@@ -341,6 +366,15 @@ class Lane:
         if self._abort.is_set() or ev.is_set():
             raise nas_ftp.Stopped("stopped")
 
+    def _throttle_state(self) -> dict:
+        """For the panel: is a cap in force, and why — from the cached Plex answers only (a status
+        update must never wait on Plex)."""
+        busy = bool(self._plex_busy_cache[1])
+        watching = self._throttle_on() and bool(self._plex[1] is None
+                                                or (self._plex[1] or {}).get("count"))
+        return {"throttled": busy or watching,
+                "throttle_why": "plex-busy" if busy else ("watching" if watching else None)}
+
     def _wait(self, secs) -> bool:
         """Sleep, waking early on stop. True if stopping."""
         return self._abort.wait(secs)
@@ -349,8 +383,7 @@ class Lane:
         cur = self._status.get(lane) or {}
         st = {"name": e["name"], "title": e.get("title") or e["name"], "phase": phase,
               "done": done, "total": total, "note": note,
-              "throttled": self._throttle_on() and bool(self._plex[1] is None
-                                                         or (self._plex[1] or {}).get("count"))}
+              **self._throttle_state()}
         # The rate is measured from the first PROGRESS of this step. A status without progress (a
         # waiting note) must not start the clock at 0 bytes, or a resumed transfer would open with
         # its already-moved bytes counted as speed.
@@ -785,13 +818,31 @@ class Lane:
                 raise RuntimeError(f"the NAS reads DV profile {prof} in the staged file, not 8")
             dvbook.update(name, phase="swap")
         # The swap: never while someone is playing THIS file (their player holds the old one open,
-        # and a seek after the rename would land in a different file).
+        # and a seek after the rename would land in a different file) — and never while Plex is
+        # still taking in the last replaced movie or is busy with heavy work. Plex notices a changed
+        # file on its own (its watcher, its hourly scan), and the movies sit side by side in a few
+        # flat folders: swaps that piled up while it was busy would all be found by its next scan
+        # at once, each a whole-file read for chapter thumbnails and loudness — the load that
+        # starved the NAS (live 2026-10-02). One unsettled replaced movie at a time.
         while True:
             self._check(name, ev)
+            self._flush_plex()                     # the only caller while this waits
             d = self._plex_detail()
-            if d is not None and os.path.basename(host) not in d["files"]:
+            busy = self._plex_busy()
+            other = next((x for x in dvbook.queue()
+                          if x.get("plex_pending") and x.get("name") != name), None)
+            if d is None:
+                why = "waiting: Plex does not answer"
+            elif os.path.basename(host) in d["files"]:
+                why = "waiting: this movie is playing on Plex"
+            elif other is not None:
+                why = (f"waiting: Plex is still taking in "
+                       f"{other.get('title') or other.get('name')}")
+            elif busy is None or busy:
+                why = "waiting: Plex is busy analyzing — the NAS gets one heavy job at a time"
+            else:
                 break
-            self._set("ship", e, "swap", note="waiting: this movie is playing on Plex")
+            self._set("ship", e, "swap", note=why)
             try:
                 nas_ftp.link()              # a long wait here must not leave the panel's link stale
             except Exception:  # noqa: BLE001
@@ -818,23 +869,70 @@ class Lane:
                       f"{saved / 1e9:.1f} GB smaller")
         self._flush_plex()
 
+    def _plex_give_up(self, e, why):
+        """Stop trying to tell Plex about one movie: Plex finds the new file on its own scan, and an
+        item it cannot take (a stale rating key, a section that no longer answers) must not hold up
+        every movie after it — nor, with the swap waiting on it, the lane itself (review)."""
+        dvbook.update(e["name"], plex_pending=False, plex_rescanned=None, plex_tries=None)
+        logbook.event(f"DV 7->8.1 {e.get('title') or e['name']}: could not tell Plex ({why}); "
+                      f"it will find the new file on its own scan")
+
     def _flush_plex(self):
-        """Tell Plex about every replaced file — once nobody is streaming."""
+        """Tell Plex about replaced files — ONE at a time, while nobody is streaming and Plex has no
+        heavy job running. A replaced 4K movie sets Plex generating chapter thumbnails and loudness
+        data, which reads the whole file; told about every movie at once, with a forced re-analysis
+        each, Plex ran them back to back and starved the NAS of memory until its services died
+        (live 2026-10-02). So: a folder rescan, then the next movie only once Plex is idle again;
+        a forced re-read only if the rescan did not pick the new file up in PLEX_RESCAN_GRACE_SECS;
+        and after PLEX_MAX_TRIES failed calls or PLEX_GIVE_UP_SECS, the movie is let go."""
         pend = [e for e in dvbook.queue() if e.get("plex_pending")]
         if not pend:
             return
         d = self._plex_detail()
         if d is None or d["count"] > 0:
             return
-        for e in pend:
-            folder = nas_ftp.host_to_plex(os.path.dirname(e["host"]))
-            ok = True
-            if e.get("section") and folder:
-                ok = plex.refresh_folder(e["section"], folder) and ok
-            if e.get("rk"):
-                ok = plex.analyze(e["rk"]) and ok
-            if ok:
-                dvbook.update(e["name"], plex_pending=False)
+        busy = self._plex_busy()
+        if busy is None or busy:
+            return                                    # unknown or busy: never add to its work
+        e = pend[0]
+        name, rk = e["name"], e.get("rk")
+        at, tries = e.get("plex_rescanned"), int(e.get("plex_tries") or 0)
 
+        def failed(what):
+            if tries + 1 >= PLEX_MAX_TRIES:
+                self._plex_give_up(e, f"{what} failed {PLEX_MAX_TRIES} times")
+            else:
+                dvbook.update(name, plex_tries=tries + 1)
+
+        if not at:
+            folder = nas_ftp.host_to_plex(os.path.dirname(e["host"]))
+            if e.get("section") and folder:
+                if plex.refresh_folder(e["section"], folder):
+                    dvbook.update(name, plex_rescanned=int(time.time()))
+                else:
+                    failed("the folder rescan")
+                return                                # look again once Plex has scanned it
+            if not rk or plex.analyze(rk):            # no folder to rescan: a re-read is the way
+                dvbook.update(name, plex_pending=False, plex_tries=None)
+            else:
+                failed("the re-read")
+            return
+        if not rk:
+            dvbook.update(name, plex_pending=False, plex_rescanned=None, plex_tries=None)
+            return
+        size = plex.part_size(rk, os.path.basename(e["host"]))
+        if size is not None and size == int(e.get("size_out") or -1):
+            dvbook.update(name, plex_pending=False, plex_rescanned=None, plex_tries=None)
+            return                                    # the rescan took it
+        waited = time.time() - at
+        if waited < PLEX_RESCAN_GRACE_SECS:
+            return
+        if waited >= PLEX_GIVE_UP_SECS:
+            self._plex_give_up(e, f"Plex still had the old file after {int(waited // 60)} min")
+            return
+        if plex.analyze(rk):                          # the rescan missed it: re-read, Plex is idle
+            dvbook.update(name, plex_pending=False, plex_rescanned=None, plex_tries=None)
+        else:
+            failed("the re-read")
 
 LANE = Lane()

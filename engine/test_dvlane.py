@@ -4,6 +4,7 @@ decide whether an original is replaced, with every NAS and conversion call mocke
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -67,7 +68,8 @@ class _Lane(unittest.TestCase):
                         mock.patch.object(dvlane, "WORK_ROOT", os.path.join(d, "work")),
                         mock.patch.object(dvlane.logbook, "event"),
                         mock.patch.object(dvlane.logbook, "failure"),
-                        mock.patch.object(nas_ftp, "discard_stage")]   # a test patches it to look
+                        mock.patch.object(nas_ftp, "discard_stage"),   # a test patches it to look
+                        mock.patch.object(dvlane.plex, "heavy_activities", return_value=[])]  # never the live Plex
         for p in self.patches:
             p.start()
         dvbook.seed([{"nas_path": HOST, "size_bytes": 100, "enhancement_layer": "FEL",
@@ -147,16 +149,20 @@ class Steps(_Lane):
              mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
              mock.patch.object(nas_ftp, "swap") as sw, \
              mock.patch.object(dvlane.plex, "session_detail", return_value=idle), \
+             mock.patch.object(dvlane.plex, "heavy_activities", return_value=[]), \
+             mock.patch.object(dvlane.plex, "part_size", return_value=90), \
              mock.patch.object(dvlane.plex, "refresh_folder", return_value=True) as rf, \
              mock.patch.object(dvlane.plex, "analyze", return_value=True) as an:
             self.lane._ship(self.e(), self.ev)
+            self.assertTrue(self.e().get("plex_pending"))      # rescanned; checked next time round
+            self.lane._flush_plex()
         up.assert_called_once()
         self.assertEqual(sw.call_args.kwargs, {"expect_size": 100, "expect_mtime": 7,
                                                "new_size": 90})
         e = self.e()
         self.assertEqual((e["state"], e.get("plex_pending")), (dvbook.DONE, False))
         rf.assert_called_once_with("2", "/media/Movies")
-        an.assert_called_once_with("5")
+        an.assert_not_called()                                 # the rescan picked it up
         self.assertEqual(dvbook.profile_of(NAME)["profile"], 8)
         self.assertFalse(os.path.exists(dvlane.work_dir(HOST)))
         self.assertEqual(dvbook.summary()["saved_bytes"], 10)
@@ -562,6 +568,219 @@ class FiveAttempts(_Lane):
         row = st["queue"][0]
         self.assertEqual(row["tries"], 2)
         self.assertGreater(row["retry_at"], 0)
+
+
+class PlexGetsOneMovieAtATime(_Lane):
+    """2026-10-02: told about every replaced movie at once, each with a forced re-analysis, Plex
+    generated chapter thumbnails and loudness data for one 4K file after another and starved the
+    NAS of memory until its services died."""
+
+    IDLE = {"count": 0, "files": set()}
+
+    def _done(self, name=NAME, rk="5", size_out=90):
+        dvbook.update(name, state=dvbook.DONE, phase=None, plex_pending=True, size_out=size_out)
+
+    def _flush(self, busy=(), size=None, watching=None):
+        with mock.patch.object(dvlane.plex, "session_detail", return_value=watching or self.IDLE), \
+             mock.patch.object(dvlane.plex, "heavy_activities",
+                               return_value=(None if busy is None else list(busy))), \
+             mock.patch.object(dvlane.plex, "part_size", return_value=size) as ps, \
+             mock.patch.object(dvlane.plex, "refresh_folder", return_value=True) as rf, \
+             mock.patch.object(dvlane.plex, "analyze", return_value=True) as an:
+            self.lane._plex_busy_cache = (0.0, None)            # each call asks afresh
+            self.lane._flush_plex()
+        return rf, an, ps
+
+    def _second(self):
+        host2 = "/volume1/Media/Movies/Other (2001).mkv"
+        dvbook.seed([{"nas_path": host2, "size_bytes": 100, "enhancement_layer": "MEL",
+                      "plex_rating_key": "6", "plex_section": "2"}])
+        dvbook.add([{"name": os.path.basename(host2), "dir": "/Media/Movies", "bytes": 100}])
+        self._done(os.path.basename(host2))
+        return os.path.basename(host2)
+
+    def test_one_movie_at_a_time(self):
+        self._done()
+        other = self._second()
+        rf, _an, _ps = self._flush()
+        rf.assert_called_once()                                 # only the first
+        self.assertTrue(self.e().get("plex_rescanned"))
+        self.assertFalse(dvbook.entry(other).get("plex_rescanned"))
+
+    def test_nothing_while_plex_is_busy_or_unreachable(self):
+        self._done()
+        for busy in (["media.generate.loudness"], None):
+            rf, an, _ps = self._flush(busy=busy)
+            rf.assert_not_called()
+            an.assert_not_called()
+
+    def test_nothing_while_anyone_is_streaming(self):
+        self._done()
+        rf, _an, _ps = self._flush(watching={"count": 1, "files": {"x.mkv"}})
+        rf.assert_not_called()
+
+    def test_the_rescan_picking_up_the_new_file_needs_no_re_read(self):
+        self._done()
+        self._flush()                                           # rescan
+        rf, an, ps = self._flush(size=90)                       # Plex has the new size
+        rf.assert_not_called()
+        an.assert_not_called()
+        self.assertFalse(self.e().get("plex_pending"))
+
+    def test_a_rescan_that_missed_it_gets_a_re_read_only_after_the_grace(self):
+        self._done()
+        self._flush()
+        _rf, an, _ps = self._flush(size=100)                    # still the old file's size
+        an.assert_not_called()
+        self.assertTrue(self.e().get("plex_pending"))
+        dvbook.update(NAME, plex_rescanned=int(time.time()) - dvlane.PLEX_RESCAN_GRACE_SECS - 1)
+        _rf, an, _ps = self._flush(size=100)
+        an.assert_called_once_with("5")
+        self.assertFalse(self.e().get("plex_pending"))
+
+    def test_the_next_movie_waits_for_the_first_to_be_settled(self):
+        self._done()
+        other = self._second()
+        self._flush()                                           # first rescanned
+        rf, _an, _ps = self._flush(size=100)                    # first not settled yet
+        rf.assert_not_called()
+        self._flush(size=90)                                    # first settled
+        rf, _an, _ps = self._flush()                            # now the second
+        rf.assert_called_once()
+        self.assertTrue(dvbook.entry(other).get("plex_rescanned"))
+
+    def test_transfers_ease_off_while_plex_is_busy_whatever_the_stream_setting(self):
+        with mock.patch.object(self.lane, "_throttle_on", return_value=False), \
+             mock.patch.object(dvlane.plex, "heavy_activities", return_value=["media.generate.chapter.thumbs"]):
+            self.assertEqual(self.lane._limit(), dvlane.THROTTLE_BPS)
+        self.lane._plex_busy_cache = (0.0, None)
+        with mock.patch.object(self.lane, "_throttle_on", return_value=False), \
+             mock.patch.object(dvlane.plex, "heavy_activities", return_value=[]):
+            self.assertIsNone(self.lane._limit())
+
+
+class SwapWaitsForPlex(_Lane):
+    """Plex notices a changed file on its own, and the movies sit in a few flat folders: swaps that
+    pile up while it is busy would all be found by its next scan at once (review 2026-10-02). One
+    unsettled replaced movie at a time."""
+
+    IDLE = {"count": 0, "files": set()}
+
+    def _staged(self):
+        self._converted()
+        dvbook.update(NAME, phase="swap")
+
+    def _other_pending(self):
+        host2 = "/volume1/Media/Movies/Other (2001).mkv"
+        dvbook.seed([{"nas_path": host2, "size_bytes": 100, "enhancement_layer": "MEL",
+                      "plex_rating_key": "6", "plex_section": "2"}])
+        dvbook.add([{"name": os.path.basename(host2), "dir": "/Media/Movies", "bytes": 100}])
+        dvbook.update(os.path.basename(host2), state=dvbook.DONE, plex_pending=True, size_out=90,
+                      plex_rescanned=int(time.time()))
+        return os.path.basename(host2)
+
+    def _ship_with(self, waits, busy_seq=None, settle_on=None, other=None):
+        """Run _ship to the swap; `waits` = how many waits before stopping. Returns the notes."""
+        notes, n = [], {"w": 0}
+        def wait(_s):
+            notes.append((self.lane._status.get("ship") or {}).get("note"))
+            n["w"] += 1
+            if settle_on is not None and n["w"] == settle_on and other:
+                dvbook.update(other, plex_pending=False)
+            return n["w"] > waits
+        busy = iter(busy_seq) if busy_seq else None
+        with mock.patch.object(nas_ftp, "stat", side_effect=lambda p: (90, 7) if p.endswith(".part") else (100, 7)), \
+             mock.patch.object(dvlane.plex, "session_detail", return_value=self.IDLE), \
+             mock.patch.object(dvlane.plex, "heavy_activities",
+                               side_effect=(lambda: next(busy)) if busy else (lambda: [])), \
+             mock.patch.object(dvlane.plex, "part_size", return_value=None), \
+             mock.patch.object(dvlane.plex, "refresh_folder", return_value=True), \
+             mock.patch.object(nas_ftp, "swap") as sw, \
+             mock.patch.object(self.lane, "_wait", side_effect=wait), \
+             mock.patch.object(self.lane, "_finish"):
+            try:
+                self.lane._ship(self.e(), self.ev)
+            except nas_ftp.Stopped:
+                pass
+        return notes, sw
+
+    def test_no_swap_while_another_replaced_movie_is_still_settling(self):
+        self._staged()
+        other = self._other_pending()
+        notes, sw = self._ship_with(waits=2)
+        sw.assert_not_called()
+        self.assertTrue(notes and "still taking in Other" in notes[0])
+
+    def test_the_swap_goes_once_the_other_has_settled(self):
+        self._staged()
+        other = self._other_pending()
+        notes, sw = self._ship_with(waits=5, settle_on=1, other=other)
+        sw.assert_called_once()
+
+    def test_the_wait_itself_settles_the_other_movie_with_plex(self):
+        # the ship thread is the only caller of _flush_plex: waiting without calling it would wait
+        # forever for a movie only it can settle
+        self._staged()
+        other = self._other_pending()
+        with mock.patch.object(dvlane.plex, "part_size",
+                               side_effect=lambda rk, name: 90 if rk == "6" else None):
+            n = {"w": 0}
+            def wait(_s):
+                n["w"] += 1
+                return n["w"] > 3
+            with mock.patch.object(nas_ftp, "stat", side_effect=lambda p: (90, 7) if p.endswith(".part") else (100, 7)), \
+                 mock.patch.object(dvlane.plex, "session_detail", return_value=self.IDLE), \
+                 mock.patch.object(nas_ftp, "swap") as sw, \
+                 mock.patch.object(self.lane, "_wait", side_effect=wait), \
+                 mock.patch.object(self.lane, "_finish"):
+                self.lane._ship(self.e(), self.ev)
+        sw.assert_called_once()
+        self.assertFalse(dvbook.entry(other).get("plex_pending"))
+
+    def test_no_swap_while_plex_is_busy(self):
+        self._staged()
+        self.lane._plex_busy_cache = (0.0, None)
+        with mock.patch.object(dvlane, "PLEX_CACHE_SECS", 0):
+            notes, sw = self._ship_with(waits=2, busy_seq=[["media.generate.loudness"]] * 10)
+        sw.assert_not_called()
+        self.assertTrue(any(n and "busy analyzing" in n for n in notes))
+
+
+class PlexGivesUp(_Lane):
+    IDLE = {"count": 0, "files": set()}
+
+    def _flush(self, refresh=True, analyze=False, size=None):
+        with mock.patch.object(dvlane.plex, "session_detail", return_value=self.IDLE), \
+             mock.patch.object(dvlane.plex, "part_size", return_value=size), \
+             mock.patch.object(dvlane.plex, "refresh_folder", return_value=refresh), \
+             mock.patch.object(dvlane.plex, "analyze", return_value=analyze):
+            self.lane._plex_busy_cache = (0.0, None)
+            self.lane._flush_plex()
+
+    def test_a_rescan_that_keeps_failing_is_let_go(self):
+        dvbook.update(NAME, state=dvbook.DONE, plex_pending=True, size_out=90)
+        for _ in range(dvlane.PLEX_MAX_TRIES - 1):
+            self._flush(refresh=False)
+            self.assertTrue(self.e().get("plex_pending"))
+        self._flush(refresh=False)
+        self.assertFalse(self.e().get("plex_pending"))
+        self.assertIn("could not tell Plex", dvlane.logbook.event.call_args.args[0])
+
+    def test_an_item_plex_never_takes_is_let_go_after_the_deadline(self):
+        dvbook.update(NAME, state=dvbook.DONE, plex_pending=True, size_out=90,
+                      plex_rescanned=int(time.time()) - dvlane.PLEX_GIVE_UP_SECS - 1)
+        self._flush(size=None)                                    # a stale rating key: no size
+        self.assertFalse(self.e().get("plex_pending"))
+
+    def test_the_status_says_why_transfers_are_capped(self):
+        self.lane._plex_busy_cache = (0.0, ["media.generate.loudness"])
+        self.assertEqual(self.lane._throttle_state(), {"throttled": True, "throttle_why": "plex-busy"})
+        self.lane._plex_busy_cache = (0.0, [])
+        with mock.patch.object(self.lane, "_throttle_on", return_value=True):
+            self.lane._plex = (0.0, {"count": 1, "files": set()})
+            self.assertEqual(self.lane._throttle_state(), {"throttled": True, "throttle_why": "watching"})
+            self.lane._plex = (0.0, {"count": 0, "files": set()})
+            self.assertEqual(self.lane._throttle_state(), {"throttled": False, "throttle_why": None})
 
 
 class OneTransferAtATime(unittest.TestCase):
