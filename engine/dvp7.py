@@ -25,6 +25,10 @@ Two release quirks the checks allow for, both proven on the NAS originals (2026-
     (Joker, Last Night in Soho, Mamma Mia! Here We Go Again, Rogue Nation: EL picture + RPU + EL
     end-of-stream, no base-layer picture, a duplicate timestamp). Discarding the EL leaves no
     picture there, so the new file rightly has one frame fewer than the original has blocks.
+    Some put such blocks in the MIDDLE too (Gladiator, 2026-10-03: 21 of them, each a second
+    block on a timestamp a picture block already has, holding ten EL NALs and an RPU). When the
+    count comes up short, every block that repeats a timestamp is read and only the ones holding
+    no base-layer picture are allowed for (dv_only_blocks) — a lost picture still fails.
   - Some start the video track a millisecond or more after the audio (Mission: Impossible, 1 ms).
     A raw HEVC stream carries no timestamps, so the new track would start at 0 and shift against
     the audio: the original's start — its first PRESENTED frame, not its first block, which can be
@@ -179,6 +183,61 @@ def dv_only_tail(blocks) -> int:
             break
         n += 1
     return n
+
+
+def repeated_pts(path, track_id, abort=None) -> list:
+    """The timestamps (in the stream's time base) of every block after the first that repeats one —
+    where a picture-less Dolby Vision block can sit. One pass over the packet index."""
+    rc, out, err = _run([FFPROBE, "-v", "error", "-select_streams", str(track_id), "-show_entries",
+                         "packet=pts", "-of", "csv=p=0", path], abort=abort, timeout=6 * 3600)
+    if rc:
+        raise RuntimeError(f"reading the video track's timestamps: {err[-300:]}")
+    seen, dups = set(), []
+    for line in out.splitlines():
+        t = line.split(",")[0].strip()
+        if not t.lstrip("-").isdigit():
+            continue
+        v = int(t)
+        if v in seen:
+            dups.append(v)
+        else:
+            seen.add(v)
+    return dups
+
+
+def time_base(path, track_id) -> float:
+    """Seconds per timestamp unit of a track (Matroska: 1/1000)."""
+    _rc, out, _err = _run([FFPROBE, "-v", "error", "-select_streams", str(track_id), "-show_entries",
+                           "stream=time_base", "-of", "csv=p=0", path], timeout=300)
+    num, _, den = first_field_of(out).partition("/")
+    try:
+        return int(num) / int(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return 0.001
+
+
+def first_field_of(out) -> str:
+    """PURE: the first value of ffprobe csv output (ffprobe 8 can trail a comma after it)."""
+    return ((out or "").strip().splitlines() or [""])[0].split(",")[0].strip()
+
+
+def dv_only_blocks(path, track_id, pts_list, abort=None) -> int:
+    """How many of the repeated timestamps carry a block holding nothing but Dolby Vision data —
+    each one READ, never assumed from the repeat alone."""
+    tb = time_base(path, track_id)
+    found = 0
+    for pts in pts_list:
+        t = pts * tb
+        rc, out, _err = _run([FFPROBE, "-v", "error", "-select_streams", str(track_id),
+                              "-read_intervals", f"{max(0.0, t - 3):.3f}%{t + 1:.3f}", "-show_packets",
+                              "-show_data", "-of", "json", path], abort=abort, timeout=900)
+        if rc:
+            continue
+        same = [pk for pk in json.loads(out or "{}").get("packets", [])
+                if str(pk.get("pts")).lstrip("-").isdigit() and int(pk["pts"]) == pts]
+        if any(dv_only_tail([b]) for b in blocks_of(same)):
+            found += 1
+    return found
 
 
 def tail_packets(path, track_id, duration_ns, abort=None, data=False) -> list:
@@ -374,9 +433,15 @@ def verify(src, out, insp, work, *, abort=None):
     f0, f1 = frames_tag(info, bl_id), frames_tag(oinfo, 0)
     if f0 is None or f1 is None or f0 - bare != f1:
         f0, f1 = count_packets(src, str(bl_id), abort), count_packets(out, "0", abort)
+    if f0 - bare != f1 and not insp["dual"] and f1 < f0:
+        # Short: picture-less blocks in the MIDDLE too? Every repeated timestamp is read; only the
+        # blocks holding no base-layer picture count (Gladiator: 21 + the last one).
+        dups = repeated_pts(src, bl_id, abort)
+        if len(dups) >= f0 - f1:
+            bare = dv_only_blocks(src, bl_id, dups, abort)
     if f0 - bare != f1:
         raise RuntimeError(f"frame count {f1} != the original's {f0 - bare}"
-                           + (f" ({f0} blocks, the last {bare} Dolby Vision data with no picture)"
+                           + (f" ({f0} blocks, {bare} of them Dolby Vision data with no picture)"
                               if bare else ""))
     e0, e1 = last_pts(src_tail), last_pts(tail_packets(out, "0", d1, abort))
     if e0 is None or e1 is None or abs(e1 - e0) * 1000 > END_SLACK_MS:

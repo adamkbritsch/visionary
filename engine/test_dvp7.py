@@ -2,6 +2,7 @@
 replaced. Every verification is exercised in the direction that matters — a bad file must be
 REFUSED — because the caller replaces the NAS original, with no backup, the moment verify() returns.
 """
+import json
 import os
 import tempfile
 import unittest
@@ -76,7 +77,7 @@ class Verify(unittest.TestCase):
 
     def _run(self, *, dv=None, rpu=8, out_tracks=3, out_frames="1000", dur_ms=0, chapters=1,
              pts_src=None, pts_out=None, recount=(1000, 1000), bare=0, end_src=6999.958,
-             end_out=6999.958, vs_src=0.0, vs_out=0.0):
+             end_out=6999.958, vs_src=0.0, vs_out=0.0, dups=(), dv_only=0):
         insp = self._insp()
         out_tr = [track(0, tag_number_of_frames=out_frames), track(1, "audio"), track(2, "subtitles"),
                   track(3, "audio")][:out_tracks]
@@ -93,6 +94,8 @@ class Verify(unittest.TestCase):
              mock.patch.object(dvp7, "tail_packets", side_effect=lambda path, *a, **k: [
                  {"pts_time": str(end_src if path == "/src.mkv" else end_out)}]), \
              mock.patch.object(dvp7, "dv_only_tail", return_value=bare), \
+             mock.patch.object(dvp7, "repeated_pts", return_value=list(dups)), \
+             mock.patch.object(dvp7, "dv_only_blocks", return_value=dv_only), \
              mock.patch.object(dvp7, "video_start",
                                side_effect=lambda path, tid: vs_src if path == "/src.mkv" else vs_out), \
              mock.patch.object(dvp7, "first_pts", side_effect=[pts_src or {"0": 0.0, "1": 0.0},
@@ -144,6 +147,20 @@ class Verify(unittest.TestCase):
         # Joker and three more (2026-10-01): the last block holds only the EL and RPU of the final
         # frame. Dropping the EL leaves no picture there, so 999 frames from 1000 blocks is right.
         self.assertEqual(self._run(out_frames="999", bare=1)["frames"], 999)
+
+    def test_picture_less_blocks_in_the_middle_are_allowed_for_once_read(self):
+        # Gladiator (2026-10-03): 21 such blocks mid-film plus the last one — 22 fewer frames
+        self.assertEqual(self._run(out_frames="978", recount=(1000, 978), bare=1,
+                                   dups=list(range(22)), dv_only=22)["frames"], 978)
+
+    def test_repeated_blocks_that_hold_pictures_are_not_excused(self):
+        with self.assertRaisesRegex(RuntimeError, "frame count 978"):
+            self._run(out_frames="978", recount=(1000, 978), bare=1, dups=list(range(22)), dv_only=1)
+
+    def test_too_few_repeats_to_explain_the_shortfall_are_not_even_read(self):
+        with mock.patch.object(dvp7, "dv_only_blocks", side_effect=AssertionError("read")):
+            with self.assertRaisesRegex(RuntimeError, "frame count"):
+                self._run(out_frames="978", recount=(1000, 978), bare=1, dups=list(range(5)))
 
     def test_a_real_loss_beside_the_quirk_is_still_refused(self):
         with self.assertRaisesRegex(RuntimeError, r"frame count 998 != the original's 999 \(1000 blocks"):
@@ -239,6 +256,43 @@ class PictureLessTail(unittest.TestCase):
             open(out, "wb").close()
             self.assertEqual(dvp7.verify("/src.mkv", out, insp, d)["frames"], 1000)
         self.assertIn(("/src.mkv", False), reads)              # its end is still checked, bytes not read
+
+
+def _dump(b: bytes) -> str:
+    """bytes in ffprobe's -show_data layout."""
+    lines = []
+    for off in range(0, len(b), 16):
+        chunk = b[off:off + 16]
+        hexs = " ".join(chunk[i:i + 2].hex() for i in range(0, len(chunk), 2))
+        lines.append(f"{off:08x}: {hexs:<40}  " + "".join(chr(c) if 32 <= c < 127 else "." for c in chunk))
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def _nal(t: int, payload=b"\x01\x02\x03") -> bytes:
+    body = bytes([(t << 1) & 0x7E, 0x01]) + payload
+    return len(body).to_bytes(4, "big") + body
+
+
+class MidFilmBlocks(unittest.TestCase):
+    def test_repeated_timestamps_are_found_in_one_pass(self):
+        out = "0,\n41\n83,\n41\n125\n83\nN/A\n"
+        with mock.patch.object(dvp7, "_run", return_value=(0, out, "")):
+            self.assertEqual(dvp7.repeated_pts("/src.mkv", 0), [41, 83])
+
+    def test_only_a_block_with_no_picture_counts(self):
+        picture = _nal(35) + _nal(1) + _nal(63) + _nal(62)        # AUD, slice, EL, RPU
+        dv_only = _nal(63) + _nal(63) + _nal(62) + _nal(63)       # Gladiator's shape
+        def run(cmd, **kw):
+            if "stream=time_base" in cmd:
+                return 0, "1/1000\n", ""
+            at = cmd[cmd.index("-read_intervals") + 1]
+            pts = 982651 if at.startswith("979") else 4305012
+            second = dv_only if pts == 982651 else picture          # the 2nd one: two pictures
+            return 0, json.dumps({"packets": [{"pts": pts, "data": _dump(picture)},
+                                              {"pts": pts, "data": _dump(second)},
+                                              {"pts": pts + 42, "data": _dump(dv_only)}]}), ""
+        with mock.patch.object(dvp7, "_run", side_effect=run):
+            self.assertEqual(dvp7.dv_only_blocks("/src.mkv", 0, [982651, 4305012]), 1)
 
 
 class StartOffset(unittest.TestCase):
