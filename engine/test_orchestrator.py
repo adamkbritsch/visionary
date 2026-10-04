@@ -1050,6 +1050,23 @@ class HoldCodes(unittest.TestCase):
         self.assertFalse(o.state["stage_active"])                 # but nothing is executing
         self.assertEqual(o.state["hold"]["code"], "power")
 
+    def test_power_pauses_and_resumes_are_logged_once_each(self):
+        # Live 2026-10-03: a lid closed on battery left only "topaz S03E19: aborted (run
+        # stopped)" in the log, and nothing when the charger came back an hour later.
+        o = orch.Orchestrator()
+        with mock.patch.object(orch.logbook, "event") as ev, \
+             mock.patch.object(o, "_min_watts", return_value=140):
+            o._note_power("run", None)
+            o._note_power("pause", "paused — on battery (waiting for the 140 W adapter)")
+            self.assertTrue(o._power_paused)
+            o._note_power("pause", "paused — on battery (waiting for the 140 W adapter)")
+            o._note_power("run", None)
+            o._note_power("run", None)
+        self.assertFalse(o._power_paused)
+        self.assertEqual([c.args[0] for c in ev.call_args_list],
+                         ["paused — on battery (waiting for the 140 W adapter)",
+                          "resumed — the 140 W adapter is connected"])
+
     def test_a_between_items_hold_still_clears(self):
         o = orch.Orchestrator()
         o.state.update(stage="topaz", stage_active=True, progress={"pct": 25})

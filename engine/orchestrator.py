@@ -1978,6 +1978,18 @@ class Orchestrator:
         return "pause", (f"paused — {w} W adapter connected, needs {need} W" if w
                          else f"paused — adapter wattage unknown, needs {need} W")
 
+    def _note_power(self, pstatus, pmsg):
+        """Publish the power verdict (`_power_paused`, which the prefetcher reads) and LOG each
+        change. A pause aborts the stage in flight, and that stage's own line, "aborted (run
+        stopped)", read like a crash with no cause. Live 2026-10-03: the lid closed on battery at
+        14:48 and the charger came back at 15:51, and the log said neither."""
+        was = self._power_paused
+        self._power_paused = (pstatus == "pause")
+        if self._power_paused and not was:
+            logbook.event(pmsg or "paused — insufficient power")
+        elif was and not self._power_paused:
+            logbook.event(f"resumed — the {self._min_watts()} W adapter is connected")
+
     def _min_watts(self) -> int:
         try:
             return max(1, int(settings.get_settings().get("min_adapter_watts", 140)))
@@ -2136,7 +2148,7 @@ class Orchestrator:
                 self._maybe_resume_deferred()        # Quiet Mode off → resume items held before Resolve
                 self._maybe_retry_stall()            # stalled Resolve → release a held item to re-probe it
                 pstatus, pmsg = self._power_ok()
-                self._power_paused = (pstatus == "pause")        # let the prefetcher back off too
+                self._note_power(pstatus, pmsg)                  # let the prefetcher back off too
                 if pstatus == "pause":
                     self._stop_caffeinate()                      # don't hold the display/system awake
                     self._close_kept_resolve("the run paused for power")
