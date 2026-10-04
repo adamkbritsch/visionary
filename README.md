@@ -384,9 +384,13 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
   them, to be converted. **Nothing is re-encoded**: the file has already proven it carries
   Dolby Vision™, so the HDR10 video is copied bit for bit, `dovi_tool` rewrites each RPU to
   8.1 (dropping the enhancement layer, MEL, FEL or a separate 1080p EL track), and
-  `mkvmerge` puts every other track, chapter and attachment back unchanged (a malformed video
-  block that ffmpeg refuses to extract, as Risky Business has, is pulled with mkvtoolnix's
-  `mkvextract` instead, so no frame is lost). The new file is
+  `mkvmerge` puts every other track, chapter and attachment back unchanged. Release quirks are
+  handled rather than refused: a malformed video block that ffmpeg will not extract (Risky
+  Business) is pulled with mkvtoolnix's `mkvextract` instead; enhancement-layer data split off
+  into blocks of its own (Star Trek: Nemesis) is handed back to its picture; and uneven frame
+  times (The Mandalorian and Grogu) are carried over exactly, so the picture never drifts from
+  the sound. A file that was cut short on the NAS is refused before the conversion starts, saying
+  where it stops, since only a complete copy can fix it. The new file is
   verified twice (DV 8.1 side data and RPU, frame count, duration, tracks, start and end timestamps —
   on the Mac, then again on the copy read back from where it is staged on the NAS) and then
   **renamed over the original under the exact same name** and permissions, so Plex keeps the

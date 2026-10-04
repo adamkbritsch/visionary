@@ -132,6 +132,18 @@ class Steps(_Lane):
         self.assertIn("converted and verified", msg)
         self.assertIn("mkvextract", msg)
 
+    def test_the_log_says_when_blocks_were_rejoined_or_times_carried_over(self):
+        def convert(src, out, work, **kw):
+            return {**self._fake_convert(src, out, work), "moved": 9325, "timestamps": True}
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ftp, "discard_stage"), \
+             mock.patch.object(dvp7, "convert", side_effect=convert):
+            self.lane._fetch(self.e(), self.ev)
+        msg = dvlane.logbook.event.call_args.args[0]
+        self.assertIn("9325 split-off Dolby Vision blocks rejoined their pictures", msg)
+        self.assertIn("uneven frame timing carried over", msg)
+
     def test_a_file_that_changed_on_the_nas_is_not_touched(self):
         with mock.patch.object(nas_ftp, "stat", return_value=(123, 7)), \
              mock.patch.object(nas_ftp, "remote_dv_profile", return_value=7), \

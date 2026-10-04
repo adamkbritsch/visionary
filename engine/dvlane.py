@@ -740,8 +740,13 @@ class Lane:
         dvbook.update(name, phase="converted", size_out=res["size_out"], frames=res["frames"],
                       el=res.get("el") or e.get("el"), dual_track=res.get("dual_track"))
         os.remove(src)                     # the NAS original is still intact; the local copy is spent
-        how = ("; ffmpeg refused a malformed video packet, so mkvextract pulled the layers"
-               if res.get("extractor") == "mkvextract" else "")
+        notes = (["ffmpeg refused a malformed video packet, so mkvextract pulled the layers"]
+                 if res.get("extractor") == "mkvextract" else [])
+        if res.get("moved"):
+            notes.append(f"{res['moved']} split-off Dolby Vision blocks rejoined their pictures")
+        if res.get("timestamps"):
+            notes.append("the original's uneven frame timing carried over")
+        how = "".join("; " + n for n in notes)
         logbook.event(f"DV 7->8.1 {e.get('title')}: converted and verified "
                       f"({size / 1e9:.1f} -> {res['size_out'] / 1e9:.1f} GB{how})")
 

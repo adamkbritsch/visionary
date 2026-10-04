@@ -77,7 +77,7 @@ class Verify(unittest.TestCase):
 
     def _run(self, *, dv=None, rpu=8, out_tracks=3, out_frames="1000", dur_ms=0, chapters=1,
              pts_src=None, pts_out=None, recount=(1000, 1000), bare=0, end_src=6999.958,
-             end_out=6999.958, vs_src=0.0, vs_out=0.0, dups=(), dv_only=0):
+             end_out=6999.958, vs_src=0.0, vs_out=0.0, dups=(), dv_only=0, pictures=None):
         insp = self._insp()
         out_tr = [track(0, tag_number_of_frames=out_frames), track(1, "audio"), track(2, "subtitles"),
                   track(3, "audio")][:out_tracks]
@@ -100,7 +100,7 @@ class Verify(unittest.TestCase):
                                side_effect=lambda path, tid: vs_src if path == "/src.mkv" else vs_out), \
              mock.patch.object(dvp7, "first_pts", side_effect=[pts_src or {"0": 0.0, "1": 0.0},
                                                                 pts_out or {"0": 0.0, "1": 0.0}]):
-            return dvp7.verify("/src.mkv", out, insp, d)
+            return dvp7.verify("/src.mkv", out, insp, d, pictures=pictures)
 
     def test_a_faithful_file_passes(self):
         self.assertEqual(self._run()["frames"], 1000)
@@ -364,9 +364,12 @@ class MalformedPacket(unittest.TestCase):
                 fh.write(b"layer")
         def run(cmd, **kw):
             calls.append(cmd)
-            if isinstance(cmd, str):                     # the single-track ffmpeg | dovi_tool pipe
+            if isinstance(cmd, str):                     # a single-track pipe into dovi_tool
                 write(os.path.join(d, "video_p81.hevc"))
-                return 0, "", (self.DROP if drop_on == "pipe" else "")
+                counts = "nalfix pictures=%d moved=0\n" if "nalfix.py" in cmd else "%s"
+                if cmd.startswith(f"set -o pipefail; {dvp7.FFMPEG}"):
+                    return 0, "", (self.DROP if drop_on == "pipe" else "") + (counts % 9 if "%d" in counts else "")
+                return 0, "", counts % 10 if "%d" in counts else ""   # nalfix < bl.hevc | dovi_tool
             if cmd[0] == dvp7.FFMPEG:
                 dst = cmd[cmd.index("-f") + 2]
                 write(dst)
@@ -387,24 +390,27 @@ class MalformedPacket(unittest.TestCase):
 
     def test_a_clean_extraction_stays_on_ffmpeg(self):
         got, calls, _d = self._build()
-        self.assertEqual(got, "ffmpeg")
+        self.assertEqual((got["extractor"], got["pictures"]), ("ffmpeg", 9))
+        pipe = next(c for c in calls if isinstance(c, str) and c.startswith("set -o pipefail; " + dvp7.FFMPEG))
+        self.assertLess(pipe.index("hevc_mp4toannexb"), pipe.index("nalfix.py"))   # the Nemesis fix
+        self.assertLess(pipe.index("nalfix.py"), pipe.index(dvp7.DOVI))
         self.assertFalse(any(isinstance(c, list) and c[0] == dvp7.MKVEXTRACT for c in calls))
 
     def test_a_packet_ffmpeg_drops_sends_the_layer_through_mkvextract(self):
         got, calls, d = self._build(drop_on="pipe")
-        self.assertEqual(got, "mkvextract")
+        self.assertEqual((got["extractor"], got["pictures"]), ("mkvextract", 10))
         mkvx = [c for c in calls if isinstance(c, list) and c[0] == dvp7.MKVEXTRACT]
         self.assertEqual(mkvx, [[dvp7.MKVEXTRACT, "-q", "/src.mkv", "tracks",
                                  "0:" + os.path.join(d, "bl.hevc")]])
-        conv = [c for c in calls if isinstance(c, list) and c[0] == dvp7.DOVI]
-        self.assertEqual(conv[0][:6], [dvp7.DOVI, "-m", "2", "convert", "--discard",
-                                       os.path.join(d, "bl.hevc")])
+        conv = [c for c in calls if isinstance(c, str) and "nalfix.py" in c and "< " in c]
+        self.assertEqual(len(conv), 1)                   # the re-pulled layer goes through nalfix too
+        self.assertIn(os.path.join(d, "bl.hevc"), conv[0])
         mux = [c for c in calls if isinstance(c, list) and c[0] == dvp7.MKVMERGE]
         self.assertEqual(len(mux), 1)                    # one mux, of the re-pulled video
 
     def test_a_dual_track_movie_pulls_both_layers_in_one_mkvextract_pass(self):
         got, calls, d = self._build(dual=True, drop_on="el.hevc")
-        self.assertEqual(got, "mkvextract")
+        self.assertEqual((got["extractor"], got["pictures"]), ("mkvextract", None))
         mkvx = [c for c in calls if isinstance(c, list) and c[0] == dvp7.MKVEXTRACT]
         self.assertEqual(mkvx, [[dvp7.MKVEXTRACT, "-q", "/src.mkv", "tracks",
                                  "1:" + os.path.join(d, "bl.hevc"), "0:" + os.path.join(d, "el.hevc")]])
@@ -430,7 +436,7 @@ class MalformedPacket(unittest.TestCase):
         def build(src, o, work, insp, **kw):
             with open(o, "wb") as fh:
                 fh.write(b"new")
-            return "mkvextract"
+            return {"extractor": "mkvextract", "pictures": 1, "moved": 0, "timestamps": False}
         with mock.patch.object(dvp7, "tools_missing", return_value=[]), \
              mock.patch.object(dvp7, "inspect", return_value={"el_type": "FEL", "dual": False}), \
              mock.patch.object(dvp7, "build", side_effect=build), \
@@ -438,12 +444,192 @@ class MalformedPacket(unittest.TestCase):
             self.assertEqual(dvp7.convert("/src.mkv", os.path.join(d, "p81.mkv"), d)["extractor"],
                              "mkvextract")
 
+    def test_convert_hands_the_picture_count_to_verify_and_reports_the_fixes(self):
+        d = tempfile.mkdtemp()
+        def build(src, o, work, insp, **kw):
+            with open(o, "wb") as fh:
+                fh.write(b"new")
+            return {"extractor": "ffmpeg", "pictures": 167546, "moved": 9325, "timestamps": True}
+        with mock.patch.object(dvp7, "tools_missing", return_value=[]), \
+             mock.patch.object(dvp7, "inspect", return_value={"el_type": "FEL", "dual": False}), \
+             mock.patch.object(dvp7, "build", side_effect=build), \
+             mock.patch.object(dvp7, "verify", return_value={"frames": 167546, "size_out": 3}) as ver:
+            res = dvp7.convert("/src.mkv", os.path.join(d, "p81.mkv"), d)
+        self.assertEqual(ver.call_args.kwargs["pictures"], 167546)
+        self.assertEqual((res["moved"], res["timestamps"], res["frames"]), (9325, True, 167546))
+
     def test_mkvextract_is_a_required_tool_installed_with_mkvmerge(self):
         with mock.patch.object(dvp7, "tools_missing", return_value=["mkvmerge", "mkvextract"]):
             with self.assertRaisesRegex(RuntimeError, r"\(brew install mkvtoolnix\)$"):
                 dvp7.convert("/src.mkv", "/out.mkv", tempfile.mkdtemp())
         with mock.patch.object(dvp7.os.path, "exists", side_effect=lambda p: p != dvp7.MKVEXTRACT):
             self.assertEqual(dvp7.tools_missing(), ["mkvextract"])
+
+
+class TruncatedOriginal(unittest.TestCase):
+    """The Boy and the Heron (2026-10-04): the NAS file stops at 1:55:13 of its header's 2:03:57."""
+
+    def _inspect(self, out, err):
+        src = info([track(0), track(1, "audio")])
+        src["container"]["properties"]["duration"] = 7436960000000
+        def run(cmd, **kw):
+            if "-read_intervals" in cmd and "packet=pts_time" in cmd:
+                return 0, out, err
+            return 0, "hevc,3840\n", ""
+        with mock.patch.object(dvp7, "mkv_info", return_value=src), \
+             mock.patch.object(dvp7, "_run", side_effect=run), \
+             mock.patch.object(dvp7, "rpu_profile", return_value=(7, "FEL")), \
+             mock.patch.object(dvp7, "video_start", return_value=0.0):
+            src["tracks"][0]["properties"]["default_duration"] = 41708333
+            return dvp7.inspect("/src.mkv", "/tmp")
+
+    def test_a_file_cut_short_is_refused_before_any_work_and_says_why(self):
+        with self.assertRaisesRegex(RuntimeError, r"incomplete: its video stops at 1:55:13 of the "
+                                                  r"2:03:56 .*replace it with a complete copy"):
+            self._inspect("6913.115000\n", "[matroska,webm @ 0x1] File ended prematurely\n")
+
+    def test_a_whole_file_goes_on(self):
+        self.assertEqual(self._inspect("7436.875000,\n7436.917000\n", "")["el_type"], "FEL")
+
+    def test_a_video_well_short_of_the_header_without_the_warning_is_not_a_cut(self):
+        # audio or subtitles running long make the header's duration exceed the video's
+        self.assertEqual(self._inspect("7430.000000\n", "")["el_type"], "FEL")
+
+    def test_audio_running_a_little_past_the_video_is_not_a_cut(self):
+        # the demuxer's warning alone is not enough: the video must stop well short of the header
+        self.assertEqual(self._inspect("7436.400000\n", "File ended prematurely\n")["el_type"], "FEL")
+
+
+class FrameTimes(unittest.TestCase):
+    def test_picture_times_drop_the_blocks_with_no_picture(self):
+        # Nemesis: a split block on a picture's timestamp, another 1 ms after one; Gladiator: on one
+        self.assertEqual(dvp7.picture_times([0, 125, 42, 83, 42, 250, 167, 793, 792, 209], 41.708),
+                         [0, 42, 83, 125, 167, 209, 250, 792])
+
+    def test_even_is_the_default_durations_cadence_to_the_millisecond(self):
+        frames = [round(k * 1001 / 24) for k in range(500)]
+        self.assertTrue(dvp7.even(frames, 1001 / 24))
+        self.assertTrue(dvp7.even([t + 1 for t in frames], 1001 / 24))     # a later start: --sync
+        gap = frames[:300] + [t + 27 for t in frames[300:]]               # Mandalorian: +27 ms
+        self.assertFalse(dvp7.even(gap, 1001 / 24))
+
+    def test_ms_text_is_exact(self):
+        self.assertEqual([dvp7.ms_text(t) for t in (7925459.0, 41.70833, 0.0, 33.5)],
+                         ["7925459", "41.708", "0", "33.5"])
+
+    def test_hms(self):
+        self.assertEqual((dvp7.hms(6913.115), dvp7.hms(59.9), dvp7.hms(7436.96)),
+                         ("1:55:13", "0:00:59", "2:03:56"))
+
+
+class CarryTimestamps(unittest.TestCase):
+    """The Mandalorian and Grogu (2026-10-04): three gaps in the original's frame times (2, 12 and
+    27 ms over the 42) — with a default duration the new file ended one frame early."""
+
+    def _build(self, pts, pictures, dual=False, tb="1/1000"):
+        d = tempfile.mkdtemp()
+        insp = {"bl": {"id": 1 if dual else 0, "properties": {}},
+                "el": {"id": 0, "properties": {}} if dual else None, "dual": dual,
+                "info": {"container": {"properties": {}}}, "default_duration": 41708333,
+                "video_start_ms": 5}
+        seen = {}
+        def write(path):
+            with open(path, "wb") as fh:
+                fh.write(b"v")
+        def run(cmd, **kw):
+            if isinstance(cmd, str):
+                write(os.path.join(d, "video_p81.hevc"))
+                return 0, "", f"nalfix pictures={pictures} moved=0\n"
+            if cmd[0] == dvp7.FFMPEG:                    # a dual track's layer extraction
+                write(cmd[cmd.index("-f") + 2])
+                return 0, "", ""
+            if cmd[0] == dvp7.DOVI:
+                write(cmd[cmd.index("-o") + 1])
+                return 0, "", ""
+            if cmd[0] == dvp7.FFPROBE and "stream=time_base" in cmd:
+                return 0, tb + "\n", ""
+            if cmd[0] == dvp7.FFPROBE and "packet=pts" in cmd:
+                return 0, "".join(f"{t},\n" for t in pts), ""
+            if cmd[0] == dvp7.MKVMERGE:
+                seen["cmd"] = cmd
+                if "--timestamps" in cmd:
+                    with open(cmd[cmd.index("--timestamps") + 1].split(":", 1)[1]) as fh:
+                        seen["file"] = fh.read()
+            return 0, "", ""
+        with mock.patch.object(dvp7, "_run", side_effect=run):
+            got = dvp7.build("/src.mkv", os.path.join(d, "o.mkv"), d, insp)
+        self.assertEqual(os.listdir(d), [])
+        return got, seen
+
+    def test_uneven_frame_times_are_carried_over(self):
+        even = [5 + round(k * 1001 / 24) for k in range(400)]
+        pts = even[:100] + [t + 12 for t in even[100:300]] + [t + 39 for t in even[300:]]
+        got, seen = self._build(pts, pictures=400)
+        self.assertTrue(got["timestamps"])
+        self.assertNotIn("--sync", seen["cmd"])                      # the start comes with them
+        lines = seen["file"].splitlines()
+        self.assertEqual(lines[0], "# timestamp format v2")
+        self.assertEqual([int(x) for x in lines[1:]], sorted(pts))
+        i = seen["cmd"].index("--timestamps")
+        self.assertLess(i, seen["cmd"].index("--video-tracks"))     # an option of the NEW video
+
+    def test_a_dual_track_movie_carries_uneven_times_too(self):
+        even = [5 + round(k * 1001 / 24) for k in range(400)]
+        pts = even[:200] + [t + 27 for t in even[200:]]
+        got, seen = self._build(pts, pictures=None, dual=True)
+        self.assertTrue(got["timestamps"])
+        self.assertIn("--timestamps", seen["cmd"])
+
+    def test_a_dual_track_with_a_block_that_is_not_a_picture_is_not_trusted(self):
+        even = [5 + round(k * 1001 / 24) for k in range(400)]
+        pts = even[:200] + [even[199]] + [t + 27 for t in even[200:]]     # a repeat in a dual BL?
+        got, seen = self._build(pts, pictures=None, dual=True)
+        self.assertFalse(got["timestamps"])
+
+    def test_a_finer_time_base_is_written_in_milliseconds(self):
+        even = [5 + round(k * 1001 / 24) for k in range(400)]
+        ms = even[:300] + [t + 27 for t in even[300:]]
+        got, seen = self._build([t * 10 for t in ms], pictures=400, tb="1/10000")
+        self.assertTrue(got["timestamps"])
+        self.assertEqual([int(x) for x in seen["file"].splitlines()[1:]], ms)
+
+    def test_even_frame_times_keep_the_default_duration(self):
+        got, seen = self._build([5 + round(k * 1001 / 24) for k in range(400)], pictures=400)
+        self.assertFalse(got["timestamps"])
+        self.assertNotIn("--timestamps", seen["cmd"])
+        self.assertIn("--sync", seen["cmd"])
+
+    def test_times_that_do_not_match_the_picture_count_are_not_trusted(self):
+        even = [5 + round(k * 1001 / 24) for k in range(400)]
+        pts = even[:300] + [t + 27 for t in even[300:]]
+        got, seen = self._build(pts, pictures=401)                  # one picture unaccounted for
+        self.assertFalse(got["timestamps"])                         # verify judges the result
+        self.assertNotIn("--timestamps", seen["cmd"])
+
+
+class PictureCount(unittest.TestCase):
+    """Star Trek: Nemesis (2026-10-04): 176871 blocks, 167546 pictures — 9325 blocks of Dolby Vision
+    data split off the picture before them, most on a timestamp 1 ms from a picture's."""
+
+    def test_the_counted_pictures_settle_the_frame_check(self):
+        v = Verify()
+        v.setUp()
+        try:
+            res = v._run(out_frames="167546", recount=(176871, 167546),
+                         pictures=167546)
+        finally:
+            v.tearDown()
+        self.assertEqual(res["frames"], 167546)
+
+    def test_a_lost_picture_still_fails(self):
+        v = Verify()
+        v.setUp()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "frame count 167545"):
+                v._run(out_frames="167545", recount=(176871, 167545),
+                       pictures=167546)
+        finally:
+            v.tearDown()
 
 
 class Convert(unittest.TestCase):
