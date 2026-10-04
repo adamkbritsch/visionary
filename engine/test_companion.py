@@ -154,17 +154,25 @@ class RelayClient(unittest.TestCase):
                                    relay_base=mock.Mock(return_value=url),
                                    relay_token=mock.Mock(return_value=token))
 
+    def setUp(self):
+        companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
+
+    def tearDown(self):
+        companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
+
     def test_request_sends_the_bearer_header(self):
         seen = {}
         def fake_open(req, timeout=None):
             seen["auth"] = req.get_header("Authorization")
             seen["url"] = req.full_url
-            return io.BytesIO(b'{"entries": []}')
+            seen["timeout"] = timeout
+            return io.BytesIO(b'{"path": "/seedbox/downloads", "is_dir": true, "files": [], "bytes": 0}')
         with self._cfg(), mock.patch.object(companion.urllib.request, "urlopen",
                                             side_effect=fake_open):
-            companion.relay_get_json("/v1/search", {"q": "x", "side": "seedbox"})
+            companion.search("Movie (2021)")             # the index: one manifest of the seedbox
         self.assertEqual(seen["auth"], "Bearer tok")
-        self.assertIn("side=seedbox", seen["url"])
+        self.assertIn("/v1/manifest?path=%2Fseedbox%2Fdownloads", seen["url"])
+        self.assertGreater(seen["timeout"], 300)        # the relay's listing may take 300 s
 
     def test_unconfigured_is_a_relay_down_error(self):
         with mock.patch.object(companion, "relay_base", return_value=""):
@@ -237,12 +245,14 @@ class RelayClient(unittest.TestCase):
         self.assertEqual(len(calls), companion.FETCH_BUSY_TRIES)
 
     def test_search_keeps_folders_and_video_files_only(self):
+        # the relay's own search, as used when the index cannot be read
         data = {"entries": [
             {"name": "Movie.2160p.REMUX", "path": "/seedbox/a", "size": 0, "is_dir": True},
             {"name": "Movie.mkv", "path": "/seedbox/b.mkv", "size": 9, "is_dir": False},
             {"name": "Movie.nfo", "path": "/seedbox/c.nfo", "size": 1, "is_dir": False},
         ]}
-        with mock.patch.object(companion, "relay_get_json", return_value=data):
+        with mock.patch.object(companion, "_seedbox_index", return_value=None), \
+             mock.patch.object(companion, "relay_get_json", return_value=data):
             out = companion.search("Movie (2021)")
         self.assertEqual([c["name"] for c in out], ["Movie.2160p.REMUX", "Movie.mkv"])
 
@@ -260,6 +270,215 @@ class RelayClient(unittest.TestCase):
         with mock.patch.object(companion, "manifest", return_value=m):
             c = companion.resolve_candidate("/seedbox/movie.mkv")
         self.assertEqual(c["path"], "/seedbox/movie.mkv")
+
+
+MANIFEST = {"path": "/seedbox/downloads", "is_dir": True, "bytes": 0, "files": [
+    {"rel": "Movie.2021.2160p.REMUX/Movie.2021.2160p.REMUX.mkv", "size": 900},
+    {"rel": "Movie.2021.2160p.REMUX/Sample/movie.2021.sample.mkv", "size": 10},
+    {"rel": "Movie.2021.2160p.REMUX/movie.2021.nfo", "size": 1},
+    {"rel": "Other.Film.1999.1080p.mkv", "size": 50},
+    {"rel": ".hidden/Movie.2021.copy.mkv", "size": 7},
+    {"rel": "Apps/deep/deeper/Movie.2021.extras/clip.mkv", "size": 3},
+]}
+
+
+class SeedboxIndex(unittest.TestCase):
+    """One /v1/manifest per pass, matched locally — not a recursive seedbox listing per title
+    (18-30 s each over FTP; ~7 hours for the 1,001-movie library against 11 seedbox items)."""
+
+    def setUp(self):
+        companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
+        self.calls = []
+
+    def tearDown(self):
+        companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
+
+    def _relay(self, manifest=MANIFEST, search=None):
+        def get(path, params=None, timeout=30.0):
+            self.calls.append((path, dict(params or {}), timeout))
+            if path == "/v1/manifest":
+                if isinstance(manifest, Exception):
+                    raise manifest
+                return manifest
+            if path == "/v1/search":
+                return search or {"entries": []}
+            raise AssertionError(path)
+        return mock.patch.object(companion, "relay_get_json", side_effect=get)
+
+    def test_one_index_call_serves_every_search_in_a_pass(self):
+        with self._relay():
+            for i in range(1001):
+                companion.search(f"Title {i} (2001)")
+            hit = companion.search("Movie.2021")
+        self.assertEqual([c[0] for c in self.calls], ["/v1/manifest"])
+        self.assertEqual(self.calls[0][1], {"path": "/seedbox/downloads"})
+        self.assertTrue(hit)
+
+    def test_matches_exactly_like_the_relays_search(self):
+        with self._relay():
+            out = companion.search("movie.2021")
+        # folders first (at any depth), then by name, then path; hidden left out; videos + folders
+        self.assertEqual([(c["name"], c["path"], c["is_dir"]) for c in out], [
+            ("Movie.2021.2160p.REMUX", "/seedbox/downloads/Movie.2021.2160p.REMUX", True),
+            ("Movie.2021.extras", "/seedbox/downloads/Apps/deep/deeper/Movie.2021.extras", True),
+            ("Movie.2021.2160p.REMUX.mkv",
+             "/seedbox/downloads/Movie.2021.2160p.REMUX/Movie.2021.2160p.REMUX.mkv", False),
+            ("movie.2021.sample.mkv",
+             "/seedbox/downloads/Movie.2021.2160p.REMUX/Sample/movie.2021.sample.mkv", False),
+        ])
+        self.assertEqual(out[0]["size"], 911)           # a folder: the files beneath it
+        self.assertEqual(out[2]["size"], 900)
+
+    def test_the_limit_applies_before_the_video_filter_as_the_relays_does(self):
+        files = [{"rel": f"Movie.2021.part{i:02d}.nfo", "size": 1} for i in range(12)]
+        files.append({"rel": "Movie.2021.zz.mkv", "size": 9})
+        with self._relay(manifest={"files": files}):
+            self.assertEqual(companion.search("movie.2021"), [])  # 12 .nfo fill the relay's 12
+
+    def test_no_match_is_empty(self):
+        with self._relay():
+            self.assertEqual(companion.search("Argo (2012)"), [])
+
+    def test_the_index_is_rebuilt_after_its_ttl(self):
+        t = [1000.0]
+        with self._relay(), mock.patch.object(companion.time, "time", lambda: t[0]):
+            companion.search("Movie.2021")
+            t[0] += companion.INDEX_TTL - 1
+            companion.search("Movie.2021")
+            t[0] += 2
+            companion.search("Movie.2021")
+        self.assertEqual([c[0] for c in self.calls], ["/v1/manifest", "/v1/manifest"])
+
+    def test_a_search_the_user_starts_reads_an_index_at_most_a_minute_old(self):
+        t = [1000.0]
+        with self._relay(), mock.patch.object(companion.time, "time", lambda: t[0]):
+            companion.search("Movie.2021")                     # the sweep builds it
+            t[0] += companion.INDEX_FRESH - 1
+            companion.search("Movie.2021", fresh=True)         # young enough: shared
+            t[0] += 2
+            companion.search("Movie.2021", fresh=True)         # older: rebuilt
+            companion.search("Movie.2021")                     # and the sweep shares that
+        self.assertEqual([c[0] for c in self.calls], ["/v1/manifest", "/v1/manifest"])
+
+    def test_start_search_asks_for_a_fresh_index(self):
+        seen = {}
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        d = tempfile.mkdtemp()
+        with mock.patch.object(companion, "BOOK_FILE", os.path.join(d, "companions.json")), \
+             mock.patch.object(companion, "configured", return_value=True), \
+             mock.patch.object(companion.threading, "Thread", T), \
+             mock.patch.object(companion, "search",
+                               side_effect=lambda t, **kw: seen.update(kw) or []):
+            companion.start_search("g.mkv", "/m", "G")
+        self.assertEqual(seen, {"fresh": True})
+
+    def test_a_failed_index_falls_back_to_the_relays_search_without_retrying_per_title(self):
+        t = [1000.0]
+        found = {"entries": [{"name": "Movie.2021.mkv", "path": "/seedbox/downloads/Movie.2021.mkv",
+                              "size": 9, "is_dir": False}]}
+        with self._relay(manifest=companion.RelayError("relay HTTP 502: seedbox: timeout"),
+                         search=found), \
+             mock.patch.object(companion.time, "time", lambda: t[0]):
+            a = companion.search("Movie.2021")
+            b = companion.search("Movie (2021)")
+            t[0] += companion.INDEX_RETRY + 1
+            companion.search("Movie.2021")
+        self.assertEqual([c[0] for c in self.calls],
+                         ["/v1/manifest", "/v1/search", "/v1/search",
+                          "/v1/manifest", "/v1/search"])
+        self.assertEqual(self.calls[1][1], {"q": "Movie.2021", "side": "seedbox",
+                                            "limit": companion.SEARCH_LIMIT})
+        self.assertEqual(a[0]["name"], "Movie.2021.mkv")
+        self.assertEqual(b, a)
+
+    def test_a_404_is_never_taken_for_an_empty_seedbox(self):
+        # the relay answers 404 both for an empty seedbox and for a listing that failed; reading
+        # it as "empty" would cache "no companion" for every movie for hours
+        with self._relay(manifest=companion.RelayError("relay HTTP 404: no such item")):
+            companion.search("Movie.2021")
+        self.assertEqual([c[0] for c in self.calls], ["/v1/manifest", "/v1/search"])
+
+    def test_a_relay_that_is_down_raises_at_once_without_a_second_try(self):
+        for exc in (companion.RelayDownError("relay unreachable: timed out"),
+                    companion.RelayAuthError("relay rejected the token")):
+            companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
+            self.calls.clear()
+            with self._relay(manifest=exc):
+                with self.assertRaises(type(exc)):
+                    companion.search("Movie.2021")   # the sweep stops; a later refresh retries
+            self.assertEqual([c[0] for c in self.calls], ["/v1/manifest"])  # no futile fallback
+
+    def test_a_slow_failing_manifest_is_still_not_retried_per_title(self):
+        t = [1000.0]
+        def get(path, params=None, timeout=30.0):
+            self.calls.append(path)
+            if path == "/v1/manifest":
+                t[0] += 200                          # a listing that ran long, then failed
+                raise companion.RelayError("relay HTTP 502: seedbox: timed out")
+            return {"entries": []}
+        with mock.patch.object(companion, "relay_get_json", side_effect=get), \
+             mock.patch.object(companion.time, "time", lambda: t[0]):
+            for _ in range(5):
+                companion.search("Movie.2021")
+        self.assertEqual(self.calls, ["/v1/manifest"] + ["/v1/search"] * 5)
+
+    def test_a_manifest_that_does_not_parse_falls_back(self):
+        def get(path, params=None, timeout=30.0):
+            self.calls.append((path, params))
+            if path == "/v1/manifest":
+                raise ValueError("Expecting value: line 1 column 1")
+            return {"entries": []}
+        with mock.patch.object(companion, "relay_get_json", side_effect=get):
+            companion.search("Movie (2021)")
+        self.assertEqual(self.calls[1], ("/v1/search", {"q": "Movie (2021)", "side": "seedbox",
+                                                        "limit": companion.SEARCH_LIMIT}))
+
+    def test_order_is_casefolded_name_then_path_as_the_relays(self):
+        files = [{"rel": "b/movie.2021.mkv", "size": 1}, {"rel": "a/Movie.2021.mkv", "size": 1},
+                 {"rel": "MOVIE.2021.A.mkv", "size": 1}, {"rel": "Movie.2021.B/x.mkv", "size": 1}]
+        with self._relay(manifest={"files": files}):
+            out = companion.search("movie.2021")
+        self.assertEqual([c["path"] for c in out], [
+            "/seedbox/downloads/Movie.2021.B",                 # folders first
+            "/seedbox/downloads/MOVIE.2021.A.mkv",            # "movie.2021.a.mkv" < "movie.2021.mkv"
+            "/seedbox/downloads/a/Movie.2021.mkv",            # same name: the path decides
+            "/seedbox/downloads/b/movie.2021.mkv"])
+
+    def test_hidden_file_names_are_left_out_too(self):
+        files = [{"rel": "Movie.2021/.Movie.2021.partial.mkv", "size": 5},
+                 {"rel": ".Movie.2021.mkv", "size": 5}]
+        with self._relay(manifest={"files": files}):
+            out = companion.search("movie.2021")
+        self.assertEqual([c["path"] for c in out], ["/seedbox/downloads/Movie.2021"])
+
+    def test_searches_at_once_share_one_build(self):
+        import threading
+        gate = threading.Event()
+        def get(path, params=None, timeout=30.0):
+            self.calls.append(path)
+            gate.wait(2)
+            return MANIFEST
+        got = []
+        with mock.patch.object(companion, "relay_get_json", side_effect=get):
+            ts = [threading.Thread(target=lambda: got.append(companion.search("Movie.2021")))
+                  for _ in range(5)]
+            for t in ts:
+                t.start()
+            gate.set()
+            for t in ts:
+                t.join(5)
+        self.assertEqual(self.calls, ["/v1/manifest"])
+        self.assertEqual(len(got), 5)
+        self.assertTrue(all(g and g == got[0] for g in got))   # the waiters got the index
+
+    def test_index_entries_is_pure_and_skips_hidden_and_empty(self):
+        e = companion.index_entries([{"rel": "a/b/c.mkv", "size": 5}, {"rel": "", "size": 1},
+                                     {"rel": "a/.x/d.mkv", "size": 2}])
+        self.assertEqual(sorted((x["path"], x["size"], x["is_dir"]) for x in e), [
+            ("/seedbox/downloads/a", 7, True), ("/seedbox/downloads/a/b", 5, True),
+            ("/seedbox/downloads/a/b/c.mkv", 5, False)])      # a/.x and its file are hidden
 
 
 class Book(unittest.TestCase):
@@ -409,6 +628,32 @@ class CounterpartSweep(unittest.TestCase):
         self.assertIsNone(e.get("status"))               # NEVER creates a panel state
         self.assertNotIn("a.mkv", companion.book_view()) # and stays out of the app's view
         self.assertTrue(companion.counterparts()["a.mkv"]["counterpart"])
+
+    def test_the_sweep_paces_only_the_relays_own_search(self):
+        slept = []
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        names = ("Alpha", "Bravo", "Charlie")         # a title under 2 characters never searches
+        entries = [{"name": f"{c}.mkv", "title": c, "dir": "/m", "has_dv": False} for c in names]
+        def manifest_ok(path, params=None, timeout=30.0):
+            return {"files": []} if path == "/v1/manifest" else {"entries": []}
+        def manifest_bad(path, params=None, timeout=30.0):
+            if path == "/v1/manifest":
+                raise companion.RelayError("relay HTTP 502: seedbox: timed out")
+            return {"entries": []}
+        for relay, want in ((manifest_ok, []), (manifest_bad, [2.0, 2.0, 2.0])):
+            slept.clear()
+            companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
+            for c in names:
+                companion.mark(f"{c}.mkv", None, counterpart_at=0)
+            with mock.patch.object(companion, "configured", return_value=True), \
+                 mock.patch.object(companion.threading, "Thread", T), \
+                 mock.patch.object(companion.time, "sleep", slept.append), \
+                 mock.patch.object(companion, "relay_get_json", side_effect=relay):
+                companion.sweep_counterparts(entries)
+            self.assertEqual(slept, want, relay.__name__)
+        companion._INDEX.update(entries=None, at=0.0, failed_at=0.0)
 
     def test_no_match_caches_false(self):
         self._sweep([{"name": "b.mkv", "title": "B", "dir": "/m", "has_dv": True}], [[]])

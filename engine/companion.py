@@ -47,6 +47,11 @@ HEAD_BYTES = 48 * 1024 * 1024   # MKV headers (tracks, codecs, DV config, durati
 FETCH_BUSY_WAIT = 15.0          # relay /v1/fetch has a small slot pool → 503 when busy
 FETCH_BUSY_TRIES = 20
 SEARCH_LIMIT = 12
+INDEX_ROOT = "/seedbox/downloads"   # where the relay's seedbox search walks
+INDEX_TTL = 600.0               # seconds one seedbox index serves the background sweep
+INDEX_FRESH = 60.0              # ...and a search the user starts: something may just have landed
+INDEX_RETRY = 120.0             # after a failed index, searches use the relay's own until then
+INDEX_TIMEOUT = 330.0           # the relay gives its recursive listing 300 s (walk_files): it never warms
 
 
 class RelayError(Exception):
@@ -143,17 +148,98 @@ def relay_get_json(path: str, params: dict | None = None, timeout: float = 30.0)
         return json.loads(r.read().decode("utf-8"))
 
 
-def search(title: str, limit: int = SEARCH_LIMIT) -> list:
+_INDEX = {"entries": None, "at": 0.0, "failed_at": 0.0}
+_INDEX_LOCK = threading.Lock()
+
+
+def index_entries(files: list) -> list:
+    """PURE: a /v1/manifest file list (rel paths under INDEX_ROOT) → what the relay's seedbox
+    search matches against: every file, and every folder that holds one (its size the sum of
+    the files beneath it), each {name, path, size, is_dir} with a virtual path. Anything with a
+    hidden component is left out, as the relay's search leaves it out — but a visible folder
+    stays even when all it holds is hidden, as it does in the relay's listing."""
+    out, dirs = [], {}
+    for f in files:
+        rel = (f.get("rel") or "").strip("/")
+        if not rel:
+            continue
+        parts = rel.split("/")
+        hidden = next((i for i, p in enumerate(parts) if p.startswith(".")), len(parts))
+        size = int(f.get("size") or 0)
+        if hidden == len(parts):
+            out.append({"name": parts[-1], "path": f"{INDEX_ROOT}/{rel}", "size": size,
+                        "is_dir": False})
+        for i in range(1, min(len(parts), hidden + 1)):   # the visible folders above it
+            d = "/".join(parts[:i])
+            dirs[d] = dirs.get(d, 0) + size
+    out += [{"name": d.rsplit("/", 1)[-1], "path": f"{INDEX_ROOT}/{d}", "size": n, "is_dir": True}
+            for d, n in dirs.items()]
+    return out
+
+
+def match_index(entries: list, q: str, limit: int) -> list:
+    """PURE: the relay's seedbox search, run on an index: the query as a case-insensitive
+    substring of each NAME, folders first, then by name and path, the first `limit` kept."""
+    needle = q.strip().casefold()
+    hits = [e for e in entries if needle in e["name"].casefold()]
+    hits.sort(key=lambda e: (not e["is_dir"], e["name"].casefold(), e["path"].casefold()))
+    return hits[:limit]
+
+
+def _seedbox_index(max_age: float = INDEX_TTL):
+    """The seedbox's entries for search(), from ONE /v1/manifest of INDEX_ROOT — built on first
+    use and reused while younger than `max_age`, so a pass over the whole library costs one listing
+    instead of one per title (each 18-30 s: rclone walks the seedbox over FTP, and there is no
+    warm case). None when the relay answered but the manifest could not be had (the caller falls
+    back to the relay's own search); RelayDownError/RelayAuthError when the relay itself cannot be
+    used. Either failure is remembered for INDEX_RETRY so a pass does not ask again per title. A manifest of an EMPTY seedbox answers 404 — as
+    does a listing that failed — so a failure is never taken for "nothing there": that would
+    cache "no companion" for every movie for hours."""
+    with _INDEX_LOCK:                     # one build at a time; the others wait and share it
+        now = time.time()
+        if _INDEX["entries"] is not None and now - _INDEX["at"] < max_age:
+            return _INDEX["entries"]
+        if now - _INDEX["failed_at"] < INDEX_RETRY:
+            return None
+        try:
+            m = relay_get_json("/v1/manifest", {"path": INDEX_ROOT}, timeout=INDEX_TIMEOUT)
+            entries = index_entries(m.get("files") or [])
+        except (RelayDownError, RelayAuthError):
+            # the relay itself is unreachable or refuses the token: its own search would fail
+            # the same way, so say so now (the sweep stops; a later refresh retries)
+            _INDEX.update(entries=None, failed_at=time.time())
+            raise
+        except (RelayError, OSError, ValueError, AttributeError, TypeError):
+            _INDEX.update(entries=None, failed_at=time.time())
+            return None
+        _INDEX.update(entries=entries, at=time.time(), failed_at=0.0)
+        return entries
+
+
+def index_fresh() -> bool:
+    """Whether search() is being served from a current index (no relay call per title)."""
+    return _INDEX["entries"] is not None and time.time() - _INDEX["at"] < INDEX_TTL
+
+
+def search(title: str, limit: int = SEARCH_LIMIT, fresh: bool = False) -> list:
     """Seedbox name search for a movie title → candidate entries
     [{name, path, size, is_dir}, ...]. Directories are kept as candidates —
-    pair() flattens the chosen one to its largest video file via the manifest."""
+    pair() flattens the chosen one to its largest video file via the manifest.
+    Matched locally against the seedbox index; the relay's own per-title search only
+    when the index cannot be read. `fresh`: a search the user started, answered from an index
+    at most INDEX_FRESH old — the release they are looking for may have just landed."""
     q = (title or "").strip()
     if len(q) < 2:
         return []
-    data = relay_get_json("/v1/search", {"q": q, "side": "seedbox", "limit": limit},
-                          timeout=90.0)
+    idx = _seedbox_index(INDEX_FRESH if fresh else INDEX_TTL)
+    if idx is not None:
+        rows = match_index(idx, q, limit)
+    else:
+        data = relay_get_json("/v1/search", {"q": q, "side": "seedbox", "limit": limit},
+                              timeout=90.0)
+        rows = data.get("entries") or []
     out = []
-    for e in data.get("entries") or []:
+    for e in rows:
         name = e.get("name") or ""
         if not e.get("is_dir") and not _is_video_name(name):
             continue
@@ -605,7 +691,7 @@ def confirm(basename: str) -> dict:
 # ------------------------------------------------------------- async workers
 
 COUNTERPART_TTL = 6 * 3600      # a swept seedbox answer stays fresh this long
-_SWEEP_LOCK = threading.Lock()  # one sweep at a time (the relay has ONE search slot)
+_SWEEP_LOCK = threading.Lock()  # one sweep at a time
 
 
 def _probe_nas_atmos(m: dict) -> bool | None:
@@ -720,7 +806,8 @@ def sweep_counterparts(entries: list, on_update=None) -> None:
                      candidates=cands, title=m.get("title") or "", dir=m.get("dir") or "")
                 if on_update:
                     on_update()
-                time.sleep(2.0)               # pace: the relay search slot is shared
+                if not index_fresh():
+                    time.sleep(2.0)           # pace the relay's own search: its slots are shared
         finally:
             _SWEEP_LOCK.release()
 
@@ -762,7 +849,7 @@ def start_search(basename: str, nas_dir: str, title: str) -> dict:
     def work():
         try:
             import movies
-            cands = search(movies.movie_title(basename))
+            cands = search(movies.movie_title(basename), fresh=True)
             mark(basename, "found" if cands else "error",
                  candidates=cands,
                  error=None if cands else "no seedbox match for this title")
