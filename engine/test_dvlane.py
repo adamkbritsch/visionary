@@ -120,6 +120,18 @@ class Steps(_Lane):
         self.assertFalse(os.path.exists(os.path.join(d, "source.mkv")))
         self.assertTrue(os.path.exists(os.path.join(d, "p81.mkv")))
 
+    def test_the_log_says_when_mkvextract_pulled_the_video(self):
+        def convert(src, out, work, **kw):
+            return {**self._fake_convert(src, out, work), "extractor": "mkvextract"}
+        with mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=self._fake_download), \
+             mock.patch.object(nas_ftp, "discard_stage"), \
+             mock.patch.object(dvp7, "convert", side_effect=convert):
+            self.lane._fetch(self.e(), self.ev)
+        msg = dvlane.logbook.event.call_args.args[0]
+        self.assertIn("converted and verified", msg)
+        self.assertIn("mkvextract", msg)
+
     def test_a_file_that_changed_on_the_nas_is_not_touched(self):
         with mock.patch.object(nas_ftp, "stat", return_value=(123, 7)), \
              mock.patch.object(nas_ftp, "remote_dv_profile", return_value=7), \

@@ -8,10 +8,13 @@ of the original. No Topaz, no Resolve, no x265, and no peak cap: nothing about t
 so there is nothing for a cap to protect (user-dictated 2026-09-27/29).
 
 The recipe and every verification are ported one for one from the user's reference driver
-(~/dv-p7-to-p81/convert_batch.py), which converted Project Hail Mary and The Social Network:
+(~/dv-p7-to-p81/convert_batch.py), which converted Project Hail Mary and The Social Network — plus
+one fallback it does not have (mkvextract, below):
   single track:  ffmpeg -map BL -c copy -bsf hevc_mp4toannexb | dovi_tool -m 2 convert --discard
   dual track:    extract the 4K base layer and the 1080p EL+RPU track; dovi_tool -m 2 extract-rpu
                  from the EL; dovi_tool inject-rpu into the base layer (both old tracks dropped)
+  either way:    when ffmpeg reports a packet it dropped (it still exits 0), the layers are pulled
+                 again with mkvextract, which copies it
   mkvmerge:      the new video, then every other track, chapter and attachment of the original, with
                  the video track's language, name, default/forced flags and default duration copied,
                  and "P7" in the title renamed to "P8". mkvmerge writes the DV configuration itself.
@@ -20,7 +23,7 @@ profile 8, the same track count (one fewer for dual track), chapters and attachm
 within 100 ms, the same video frame count, and the same first timestamp for the video and the first
 audio track. Anything else raises, and the caller keeps the original.
 
-Two release quirks the checks allow for, both proven on the NAS originals (2026-10-01):
+Release quirks the build and the checks allow for, proven on the NAS originals (2026-10-01/03):
   - Some remuxes put the LAST frame's enhancement layer and RPU in a block of their own after it
     (Joker, Last Night in Soho, Mamma Mia! Here We Go Again, Rogue Nation: EL picture + RPU + EL
     end-of-stream, no base-layer picture, a duplicate timestamp). Discarding the EL leaves no
@@ -33,6 +36,11 @@ Two release quirks the checks allow for, both proven on the NAS originals (2026-
     A raw HEVC stream carries no timestamps, so the new track would start at 0 and shift against
     the audio: the original's start — its first PRESENTED frame, not its first block, which can be
     a keyframe shown after leading pictures — is carried over with mkvmerge --sync.
+  - Some carry a malformed NAL: Risky Business (2026-10-03) has one block whose end-of-sequence
+    NAL has a 1-byte length prefix. ffmpeg's hevc_mp4toannexb refuses the whole block (a picture
+    and its RPU), prints an error and still exits 0. That error sends the layers through
+    mkvextract instead, which copies the block, so every frame survives (decoded frames proven
+    identical to the original's around it) and the frame check still applies in full.
 Because only the start is carried over, the video's LAST timestamp is checked as well: a jump in the
 original's timestamps mid-film would otherwise come out as a drift the other checks cannot see.
 """
@@ -47,6 +55,9 @@ FFMPEG = "/opt/homebrew/bin/ffmpeg"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 DOVI = "/opt/homebrew/bin/dovi_tool"
 MKVMERGE = "/opt/homebrew/bin/mkvmerge"
+MKVEXTRACT = "/opt/homebrew/bin/mkvextract"
+BSF_DROPPED = "Error applying bitstream filters"   # ffmpeg dropped a packet it could not convert,
+                                                    # and still exits 0
 DURATION_SLACK_NS = 100e6       # the new file's duration may differ by at most 100 ms
 DV_NALS = {62, 63}              # Dolby Vision NAL types: the RPU, and an enhancement-layer NAL
 TAIL_SECS = 1.0                 # how much of a stream's end is read for picture-less blocks
@@ -69,7 +80,8 @@ class Aborted(Exception):
 
 def tools_missing():
     """The tools this route needs that are not installed — so the item can say which, plainly."""
-    return [os.path.basename(t) for t in (FFMPEG, FFPROBE, DOVI, MKVMERGE) if not os.path.exists(t)]
+    return [os.path.basename(t) for t in (FFMPEG, FFPROBE, DOVI, MKVMERGE, MKVEXTRACT)
+            if not os.path.exists(t)]
 
 
 def _run(cmd, *, abort=None, timeout=None, shell=False):
@@ -345,38 +357,72 @@ def inspect(path, work):
             "default_duration": dd, "video_start_ms": max(0, round(start * 1000))}
 
 
+def _bare_video(src, v, work, insp, tool, *, abort=None) -> bool:
+    """Write the profile 8.1 video stream, with no container, to `v`, its layers pulled out of `src`
+    by `tool` ("ffmpeg" or "mkvextract"). Returns False when ffmpeg dropped a packet it could not
+    convert to a raw stream: it says so on stderr and still exits 0, and the movie would come out a
+    frame short and drift against its audio after that point. mkvextract copies such a packet."""
+    bl, el, dual = insp["bl"], insp["el"], insp["dual"]
+    tmp_bl, tmp_el, rpu = (os.path.join(work, n) for n in ("bl.hevc", "el.hevc", "rpu81.bin"))
+    if tool == "ffmpeg" and not dual:
+        rc, _o, err = _run(
+            f"set -o pipefail; {FFMPEG} -nostdin -loglevel error -i {shlex.quote(src)} "
+            f"-map 0:{bl['id']} -c:v copy -bsf:v hevc_mp4toannexb -f hevc - "
+            f"| {DOVI} -m 2 convert --discard - -o {shlex.quote(v)}", shell=True, abort=abort)
+        if rc:
+            raise RuntimeError(f"convert: {err[-300:]}")
+        return BSF_DROPPED not in err
+    layers = [(bl["id"], tmp_bl)] + ([(el["id"], tmp_el)] if dual else [])
+    if tool == "ffmpeg":
+        for tid, dst in layers:
+            rc, _o, err = _run([FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-i", src, "-map",
+                                f"0:{tid}", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f",
+                                "hevc", dst], abort=abort)
+            if rc:
+                raise RuntimeError(f"extracting track {tid}: {err[-300:]}")
+            if BSF_DROPPED in err:
+                return False
+    else:
+        rc, o, err = _run([MKVEXTRACT, "-q", src, "tracks"] + [f"{tid}:{dst}" for tid, dst in layers],
+                          abort=abort, timeout=6 * 3600)
+        if rc < 0 or rc > 1:                 # 1 = warnings, as with mkvmerge; < 0 = killed
+            raise RuntimeError(f"mkvextract {rc}: {(o + err)[-300:]}")
+    if dual:
+        for cmd in ([DOVI, "-m", "2", "extract-rpu", tmp_el, "-o", rpu],
+                    [DOVI, "inject-rpu", "-i", tmp_bl, "--rpu-in", rpu, "-o", v]):
+            rc, _o, err = _run(cmd, abort=abort)
+            if rc:
+                raise RuntimeError(f"dovi_tool {cmd[1] if cmd[1] != '-m' else cmd[3]}: {err[-300:]}")
+    else:
+        rc, _o, err = _run([DOVI, "-m", "2", "convert", "--discard", tmp_bl, "-o", v], abort=abort)
+        if rc:
+            raise RuntimeError(f"convert: {err[-300:]}")
+    for f in (tmp_bl, tmp_el, rpu):                  # ~a movie's worth of disk: free it before the mux
+        if os.path.exists(f):
+            os.remove(f)
+    return True
+
+
 def build(src, out, work, insp, *, abort=None, progress=None):
-    """Write the profile 8.1 file to `out`. No verification — that is verify()'s job."""
+    """Write the profile 8.1 file to `out`. No verification — that is verify()'s job. Returns the
+    tool that pulled the video out: "ffmpeg", or "mkvextract" when ffmpeg dropped a packet."""
     bl, el, dual = insp["bl"], insp["el"], insp["dual"]
     v = os.path.join(work, "video_p81.hevc")
     temps = [v] + [os.path.join(work, n) for n in ("bl.hevc", "el.hevc", "rpu81.bin")]
     try:
         if progress:
             progress(5)
-        if dual:
-            tmp_bl, tmp_el, rpu = (os.path.join(work, n) for n in ("bl.hevc", "el.hevc", "rpu81.bin"))
-            for tid, dst in ((bl["id"], tmp_bl), (el["id"], tmp_el)):
-                rc, _o, err = _run([FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-i", src, "-map",
-                                    f"0:{tid}", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f",
-                                    "hevc", dst], abort=abort)
-                if rc:
-                    raise RuntimeError(f"extracting track {tid}: {err[-300:]}")
-            for cmd in ([DOVI, "-m", "2", "extract-rpu", tmp_el, "-o", rpu],
-                        [DOVI, "inject-rpu", "-i", tmp_bl, "--rpu-in", rpu, "-o", v]):
-                rc, _o, err = _run(cmd, abort=abort)
-                if rc:
-                    raise RuntimeError(f"dovi_tool {cmd[1] if cmd[1] != '-m' else cmd[3]}: {err[-300:]}")
-            for f in (tmp_bl, tmp_el, rpu):          # ~a movie's worth of disk: free it before the mux
-                os.remove(f)
-            drop = f"!{bl['id']},{el['id']}"
-        else:
-            rc, _o, err = _run(
-                f"set -o pipefail; {FFMPEG} -nostdin -loglevel error -i {shlex.quote(src)} "
-                f"-map 0:{bl['id']} -c:v copy -bsf:v hevc_mp4toannexb -f hevc - "
-                f"| {DOVI} -m 2 convert --discard - -o {shlex.quote(v)}", shell=True, abort=abort)
-            if rc:
-                raise RuntimeError(f"convert: {err[-300:]}")
-            drop = f"!{bl['id']}"
+        extractor = "ffmpeg"
+        if not _bare_video(src, v, work, insp, "ffmpeg", abort=abort):
+            # Risky Business (2026-10-03): one block holds an end-of-sequence NAL whose length
+            # prefix says 1 byte (a NAL header is 2), so ffmpeg refused the whole block — a picture
+            # and its RPU — and the frame check caught a file one frame short.
+            for f in temps:
+                if os.path.exists(f):
+                    os.remove(f)
+            extractor = "mkvextract"
+            _bare_video(src, v, work, insp, "mkvextract", abort=abort)
+        drop = f"!{bl['id']},{el['id']}" if dual else f"!{bl['id']}"
         if progress:
             progress(45)
         props = bl["properties"]
@@ -399,6 +445,7 @@ def build(src, out, work, insp, *, abort=None, progress=None):
             raise RuntimeError(f"mkvmerge {rc}: {(o + err)[-300:]}")
         if progress:
             progress(85)
+        return extractor
     finally:
         for f in temps:                              # every intermediate, on success AND failure
             if os.path.exists(f):
@@ -474,20 +521,21 @@ def convert(src, out, work, *, abort=None, progress=None):
     missing = tools_missing()
     if missing:
         raise RuntimeError("not installed: " + ", ".join(missing)
-                           + " (brew install " + " ".join(
-                               "mkvtoolnix" if m == "mkvmerge" else m for m in missing) + ")")
+                           + " (brew install " + " ".join(dict.fromkeys(
+                               "mkvtoolnix" if m.startswith("mkv") else m for m in missing)) + ")")
     tmp = building_path(out)
     try:
         for f in (tmp, out):
             if os.path.exists(f):
                 os.remove(f)
         insp = inspect(src, work)
-        build(src, tmp, work, insp, abort=abort, progress=progress)
+        extractor = build(src, tmp, work, insp, abort=abort, progress=progress)
         res = verify(src, tmp, insp, work, abort=abort)
         os.replace(tmp, out)
         if progress:
             progress(100)
-        return {"el": insp["el_type"], "dual_track": insp["dual"], **res}
+        return {"el": insp["el_type"], "dual_track": insp["dual"],
+                "extractor": extractor or "ffmpeg", **res}
     except BaseException:
         for f in (tmp, out):
             if os.path.exists(f):

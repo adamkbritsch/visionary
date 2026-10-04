@@ -345,6 +345,107 @@ class StartOffset(unittest.TestCase):
             self.assertEqual(dvp7.video_start("/src.mkv", 0), 0.0)
 
 
+class MalformedPacket(unittest.TestCase):
+    """Risky Business (2026-10-03): one block's end-of-sequence NAL has a 1-byte length prefix.
+    ffmpeg's hevc_mp4toannexb refuses the whole block — a picture and its RPU — prints an error and
+    still exits 0, so the new file came out one frame short. mkvextract copies the block."""
+
+    DROP = ("[vost#0:0/copy @ 0x9e5534000] Error applying bitstream filters to a packet: "
+            "Invalid data found when processing input\n")
+
+    def _build(self, *, dual=False, drop_on=None, mkvextract_rc=0, mkvextract_stop=False, d=None):
+        d = d or tempfile.mkdtemp()
+        insp = {"bl": {"id": 1 if dual else 0, "properties": {}},
+                "el": {"id": 0, "properties": {}} if dual else None, "dual": dual,
+                "info": {"container": {"properties": {}}}, "default_duration": 41708333}
+        calls = []
+        def write(path):
+            with open(path, "wb") as fh:
+                fh.write(b"layer")
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if isinstance(cmd, str):                     # the single-track ffmpeg | dovi_tool pipe
+                write(os.path.join(d, "video_p81.hevc"))
+                return 0, "", (self.DROP if drop_on == "pipe" else "")
+            if cmd[0] == dvp7.FFMPEG:
+                dst = cmd[cmd.index("-f") + 2]
+                write(dst)
+                return 0, "", (self.DROP if drop_on == os.path.basename(dst) else "")
+            if cmd[0] == dvp7.MKVEXTRACT:
+                for spec in cmd[cmd.index("tracks") + 1:]:
+                    write(spec.split(":", 1)[1])
+                if mkvextract_stop:
+                    raise dvp7.Aborted("stopped")
+                return mkvextract_rc, "", ("Error: boom" if mkvextract_rc else "")
+            if cmd[0] == dvp7.DOVI:
+                write(cmd[cmd.index("-o") + 1])
+            return 0, "", ""
+        with mock.patch.object(dvp7, "_run", side_effect=run):
+            got = dvp7.build("/src.mkv", os.path.join(d, "o.mkv"), d, insp)
+        self.assertEqual(os.listdir(d), [])              # every intermediate gone
+        return got, calls, d
+
+    def test_a_clean_extraction_stays_on_ffmpeg(self):
+        got, calls, _d = self._build()
+        self.assertEqual(got, "ffmpeg")
+        self.assertFalse(any(isinstance(c, list) and c[0] == dvp7.MKVEXTRACT for c in calls))
+
+    def test_a_packet_ffmpeg_drops_sends_the_layer_through_mkvextract(self):
+        got, calls, d = self._build(drop_on="pipe")
+        self.assertEqual(got, "mkvextract")
+        mkvx = [c for c in calls if isinstance(c, list) and c[0] == dvp7.MKVEXTRACT]
+        self.assertEqual(mkvx, [[dvp7.MKVEXTRACT, "-q", "/src.mkv", "tracks",
+                                 "0:" + os.path.join(d, "bl.hevc")]])
+        conv = [c for c in calls if isinstance(c, list) and c[0] == dvp7.DOVI]
+        self.assertEqual(conv[0][:6], [dvp7.DOVI, "-m", "2", "convert", "--discard",
+                                       os.path.join(d, "bl.hevc")])
+        mux = [c for c in calls if isinstance(c, list) and c[0] == dvp7.MKVMERGE]
+        self.assertEqual(len(mux), 1)                    # one mux, of the re-pulled video
+
+    def test_a_dual_track_movie_pulls_both_layers_in_one_mkvextract_pass(self):
+        got, calls, d = self._build(dual=True, drop_on="el.hevc")
+        self.assertEqual(got, "mkvextract")
+        mkvx = [c for c in calls if isinstance(c, list) and c[0] == dvp7.MKVEXTRACT]
+        self.assertEqual(mkvx, [[dvp7.MKVEXTRACT, "-q", "/src.mkv", "tracks",
+                                 "1:" + os.path.join(d, "bl.hevc"), "0:" + os.path.join(d, "el.hevc")]])
+        steps = [c[1] if c[1] != "-m" else c[3] for c in calls
+                 if isinstance(c, list) and c[0] == dvp7.DOVI]
+        self.assertEqual(steps[-2:], ["extract-rpu", "inject-rpu"])
+
+    def test_an_mkvextract_error_fails_the_build_and_leaves_nothing(self):
+        for rc in (2, -9):                               # an error, and a kill from outside
+            d = tempfile.mkdtemp()
+            with self.assertRaisesRegex(RuntimeError, f"mkvextract {rc}: Error: boom"):
+                self._build(drop_on="pipe", mkvextract_rc=rc, d=d)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_a_stop_during_mkvextract_ends_the_build_and_leaves_nothing(self):
+        d = tempfile.mkdtemp()
+        with self.assertRaises(dvp7.Aborted):
+            self._build(drop_on="pipe", mkvextract_stop=True, d=d)
+        self.assertEqual(os.listdir(d), [])
+
+    def test_convert_reports_which_tool_pulled_the_video(self):
+        d = tempfile.mkdtemp()
+        def build(src, o, work, insp, **kw):
+            with open(o, "wb") as fh:
+                fh.write(b"new")
+            return "mkvextract"
+        with mock.patch.object(dvp7, "tools_missing", return_value=[]), \
+             mock.patch.object(dvp7, "inspect", return_value={"el_type": "FEL", "dual": False}), \
+             mock.patch.object(dvp7, "build", side_effect=build), \
+             mock.patch.object(dvp7, "verify", return_value={"frames": 1, "size_out": 3}):
+            self.assertEqual(dvp7.convert("/src.mkv", os.path.join(d, "p81.mkv"), d)["extractor"],
+                             "mkvextract")
+
+    def test_mkvextract_is_a_required_tool_installed_with_mkvmerge(self):
+        with mock.patch.object(dvp7, "tools_missing", return_value=["mkvmerge", "mkvextract"]):
+            with self.assertRaisesRegex(RuntimeError, r"\(brew install mkvtoolnix\)$"):
+                dvp7.convert("/src.mkv", "/out.mkv", tempfile.mkdtemp())
+        with mock.patch.object(dvp7.os.path, "exists", side_effect=lambda p: p != dvp7.MKVEXTRACT):
+            self.assertEqual(dvp7.tools_missing(), ["mkvextract"])
+
+
 class Convert(unittest.TestCase):
     def test_missing_tools_are_named_with_the_install_command(self):
         with mock.patch.object(dvp7, "tools_missing", return_value=["mkvmerge"]):
