@@ -1248,6 +1248,226 @@ class QuietMode(unittest.TestCase):
         self.assertFalse(o2.reclaim_screen()); self.assertFalse(o2._abort.is_set())
 
 
+class PinnedDisplayGone(unittest.TestCase):
+    """Resolve's pinned display (the 4K dummy plug) unplugged is not the item's fault: hold it
+    before Resolve, never count it toward parking, release it when the display is back. Live
+    2026-10-04: the dummy out for half an hour, every attempt counted as a Resolve failure, and a
+    YouTube video was parked (and its files swept) after 12 of them."""
+
+    MISSING = "not attached"
+
+    def _process(self, o, p, run, missing):
+        miss = list(missing) if isinstance(missing, (list, tuple)) else None
+        with contextlib.ExitStack() as es:
+            for cm in (
+                mock.patch.object(orch, "stage_done",
+                                  side_effect=lambda st, _p: st in ("download", "extend", "topaz")),
+                mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+                mock.patch.object(o, "_claim_prefetched"),
+                mock.patch.object(o, "_reclaim_for_pipeline"),
+                mock.patch.object(o, "_sleep"),
+                mock.patch.object(o, "_quiet_mode", return_value=False),
+                mock.patch.object(o, "_hand_to_finisher"),
+                mock.patch.object(o, "_display_missing",
+                                  side_effect=(lambda: miss.pop(0)) if miss is not None
+                                  else (lambda: missing)),
+                mock.patch.object(o, "_park_item", side_effect=AssertionError("parked")),
+                mock.patch.object(orch.logbook, "event"),
+                mock.patch("stages.run_stage", side_effect=run),
+            ):
+                es.enter_context(cm)
+            o._process(p)
+
+    def test_the_doorstep_holds_without_attempting_resolve(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("Community (2009)", "S04E02", SRC)
+        ran = []
+        self._process(o, p, lambda st, *_a, **_k: ran.append(st) or (True, "ok"), self.MISSING)
+        self.assertNotIn("resolve", ran)                   # no attempt, no red failure line
+        self.assertIn(o._skip_key(p), o._display_held)
+        self.assertEqual(o.state["hold"]["code"], "display")
+        self.assertIn("pinned display", o.state["message"])
+        self.assertEqual((o._resolve_fails, o._fail_counts, o._parked), ({}, {}, set()))
+
+    def test_a_display_that_vanished_during_the_attempt_is_held_not_counted(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("Community (2009)", "S04E02", SRC)
+        run = lambda st, *_a, **_k: ((False, "host-display: not attached") if st == "resolve"
+                                     else (True, "ok"))
+        self._process(o, p, run, [None, self.MISSING])     # there at the door, gone after
+        self.assertIn(o._skip_key(p), o._display_held)
+        self.assertEqual(o._resolve_fails, {})
+        self.assertFalse(o._stall_active)
+
+    def test_an_attached_display_that_refused_the_window_still_counts(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("Community (2009)", "S04E02", SRC)
+        run = lambda st, *_a, **_k: ((False, "host-display: could not put Resolve on the pinned "
+                                             "display") if st == "resolve" else (True, "ok"))
+        self._process(o, p, run, None)                     # the display IS attached
+        self.assertNotIn(o._skip_key(p), o._display_held)
+        self.assertEqual(o._resolve_fails.get(o._skip_key(p)), 1)   # a genuine failure
+
+    def test_an_unplugged_dummy_never_parks_however_long(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("Community (2009)", "S04E02", SRC)
+        run = lambda st, *_a, **_k: ((False, "host-display: not attached") if st == "resolve"
+                                     else (True, "ok"))
+        for _ in range(orch.STALL_MAX_ITEM_RETRIES + 8):
+            o._display_held.clear()                        # re-selected, as after a release
+            self._process(o, p, run, [None, self.MISSING])
+        self.assertEqual((o._resolve_fails, o._parked), ({}, set()))
+
+    def test_held_items_go_on_once_the_display_is_back(self):
+        o = orch.Orchestrator()
+        o._display_held = {"A", "B"}
+        with mock.patch.object(o, "_display_missing", return_value=None), \
+             mock.patch.object(orch.logbook, "event") as ev:
+            o._maybe_release_display_held()
+        self.assertEqual(o._display_held, set())
+        self.assertIn("2 item(s) go on to Resolve", ev.call_args.args[0])
+
+    def test_still_missing_keeps_them_and_the_look_is_paced(self):
+        o = orch.Orchestrator()
+        o._display_held = {"A"}
+        with mock.patch.object(o, "_display_missing", return_value=self.MISSING):
+            o._maybe_release_display_held()
+        self.assertEqual(o._display_held, {"A"})
+        with mock.patch.object(o, "_display_missing", side_effect=AssertionError("too soon")):
+            o._maybe_release_display_held()               # within DISPLAY_RECHECK_SECS: no look
+        self.assertEqual(o._display_held, {"A"})
+
+    def test_selection_skips_them_and_a_start_retries_them(self):
+        o = orch.Orchestrator()
+        o._display_held = {"K"}
+        self.assertIn("K", o._selection_skip())
+        with mock.patch.object(orch.settings, "get_settings", return_value={}), \
+             mock.patch.object(orch.logbook, "event"), \
+             mock.patch.object(o, "_start_caffeinate"), \
+             mock.patch.object(o, "_ensure"):
+            o.enable()
+        self.assertEqual(o._display_held, set())
+
+    def _one_loop(self, o, next_ep, missing, **extra):
+        """Run ONE pass of the run loop (its sleep stops it); returns [(hold, slept)]."""
+        o._enabled = True
+        o._caffeinate = object()
+        seen = []
+        def stop(secs):
+            seen.append((dict(o.state.get("hold") or {}), secs))
+            self.message = o.state.get("message")          # the run's exit resets it
+            o._enabled = False
+        with contextlib.ExitStack() as es:
+            for cm in (mock.patch.object(o, "_power_ok", return_value=("run", None)),
+                       mock.patch.object(o, "_low_disk_pause", return_value=None),
+                       mock.patch.object(o, "_finisher_backlogged", return_value=False),
+                       mock.patch.object(o, "_refresh_youtube"),
+                       mock.patch.object(o, "_next_episode", return_value=next_ep),
+                       mock.patch.object(o, "_close_kept_resolve"),
+                       mock.patch.object(o, "_display_missing", return_value=missing),
+                       mock.patch.object(o, "_process", side_effect=AssertionError("processed")),
+                       mock.patch.object(orch.logbook, "event"),
+                       mock.patch.object(o, "_sleep", side_effect=stop)):
+                es.enter_context(cm)
+            for name, value in extra.items():
+                es.enter_context(mock.patch.object(o, name, return_value=value))
+            o._run()
+        return seen
+
+    def test_with_no_show_active_held_items_are_not_nothing_queued(self):
+        # a YouTube-only or movie-only queue: selection reports "no-series" once all are held
+        o = orch.Orchestrator()
+        o._display_held = {"K"}
+        seen = self._one_loop(o, (None, "no-series"), self.MISSING)
+        self.assertEqual(seen, [({"code": "display"}, orch.DISPLAY_RECHECK_SECS)])
+
+    def test_the_run_loop_releases_them_when_the_display_is_back(self):
+        o = orch.Orchestrator()
+        o._display_held = {"K"}
+        seen = self._one_loop(o, (None, "complete"), None)
+        self.assertEqual(o._display_held, set())
+        self.assertNotEqual(seen[0][0].get("code"), "display")
+
+    def test_two_held_upscales_pause_topaz_under_the_right_name(self):
+        ep = episode_paths("Community (2009)", "S04E04", SRC)
+        o = orch.Orchestrator()
+        o._display_held = {"A", "B"}
+        o._display_why = self.MISSING
+        seen = self._one_loop(o, (ep, None), self.MISSING,
+                              _dual_remux_pauses_topaz=True, _dual_remux_live=False)
+        self.assertEqual(seen[0][0], {"code": "display"})
+        self.assertIn("pinned display", self.message)
+        o = orch.Orchestrator()                            # a real dual remux keeps its own name
+        o._display_held = {"A"}
+        seen = self._one_loop(o, (ep, None), self.MISSING,
+                              _dual_remux_pauses_topaz=True, _dual_remux_live=True)
+        self.assertEqual(seen[0][0], {"code": "dual-remux"})
+
+    def test_held_upscales_count_as_used_disk(self):
+        # their intermediates stay on scratch; available_gb would call them reclaimable
+        o = orch.Orchestrator()
+        with mock.patch.object(o, "_quiet_mode", return_value=False), \
+             mock.patch.object(o, "_in_finisher_keys", return_value=set()), \
+             mock.patch.object(orch.scratch, "physical_free_gb", return_value=10), \
+             mock.patch.object(o, "_free_scratch_gb", return_value=900):
+            self.assertIsNone(o._low_disk_pause())
+            o._display_held = {"A"}
+            msg = o._low_disk_pause()
+        self.assertIn("plug the pinned display back in", msg)
+
+    def test_a_held_video_is_not_owed_by_the_cadence(self):
+        o = orch.Orchestrator()
+        o._display_held = {"vid"}
+        seen = {}
+        def next_due(skip=()):
+            seen["skip"] = set(skip)
+            return None
+        with mock.patch.object(o, "_yt_burst", return_value=3), \
+             mock.patch.object(o, "_yt_every_tv", return_value=1), \
+             mock.patch.object(orch.youtube, "next_due", side_effect=next_due):
+            o._tv_since_yt = 5
+            self.assertFalse(o._yt_cadence_owed())
+        self.assertIn("vid", seen["skip"])
+
+    def test_a_kept_resolve_is_closed_and_a_new_reason_is_logged(self):
+        o = orch.Orchestrator()
+        p = youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T")
+        with mock.patch.object(o, "_close_kept_resolve") as close, \
+             mock.patch.object(orch.logbook, "event") as ev:
+            o._hold_for_display(p, "vid", self.MISSING)
+            o._hold_for_display(p, "vid", self.MISSING)    # same reason: logged once
+        close.assert_called_with("the pinned display is gone")
+        self.assertEqual(ev.call_count, 1)
+        o._display_checked = 0.0
+        with mock.patch.object(o, "_display_missing", return_value="templates not proven on it yet"), \
+             mock.patch.object(orch.logbook, "event") as ev:
+            o._maybe_release_display_held()
+        self.assertIn("templates not proven", ev.call_args.args[0])
+        self.assertEqual(o._display_why, "templates not proven on it yet")
+        self.assertEqual(o._display_held, {o._skip_key(p)})
+
+    def test_with_only_held_items_left_the_run_says_it_waits_for_the_display(self):
+        o = orch.Orchestrator()
+        o._enabled = True
+        o._caffeinate = object()
+        o._display_held = {"K"}
+        seen = []
+        def stop(_secs):
+            seen.append(dict(o.state.get("hold") or {}))   # the hold while it waits (the run's
+            o._enabled = False                             # exit clears it afterwards)
+        with mock.patch.object(o, "_power_ok", return_value=("run", None)), \
+             mock.patch.object(o, "_low_disk_pause", return_value=None), \
+             mock.patch.object(o, "_finisher_backlogged", return_value=False), \
+             mock.patch.object(o, "_refresh_youtube"), \
+             mock.patch.object(o, "_next_episode", return_value=(None, "complete")), \
+             mock.patch.object(o, "_close_kept_resolve"), \
+             mock.patch.object(o, "_display_missing", return_value=self.MISSING), \
+             mock.patch.object(o, "_sleep", side_effect=stop) as sl:
+            o._run()
+        self.assertEqual(seen, [{"code": "display"}])           # not "series complete"
+        sl.assert_called_once_with(orch.DISPLAY_RECHECK_SECS)
+
+
 class ResolveStall(unittest.TestCase):
     """A stalled Resolve (its weekly update prompt blocks automation): HOLD topaz'd items before
     Resolve and keep upscaling the next ones into a buffer (down to STALL_FLOOR_GB), re-probing

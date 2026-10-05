@@ -55,7 +55,7 @@ struct ProgressDTO: Codable {
 
 struct HoldDTO: Codable {
     var code: String?           // "power"|"power-grace"|"disk"|"backlog"|"resolve-gate"|"dual-remux"
-                                // |"quiet"|"stall"|"retry"|"nas"|"empty"|"done"|"parked"
+                                // |"quiet"|"stall"|"retry"|"nas"|"empty"|"done"|"parked"|"display"
     var secs: Int?              // power-grace: seconds until the run pauses
     var held: Int?              // stall: items waiting behind the stalled Resolve
     var attempt: Int?           // retry: which attempt this is...

@@ -133,6 +133,7 @@ class DiskGateDuringDrain(unittest.TestCase):
         o._in_finisher_movies = {"m"} if fin_movie else set()
         o._stall_active = False
         o._quiet_mode = lambda: False
+        o._display_held = set()                  # nothing waiting for the pinned display
         o._reclaim_for_pipeline = lambda **kw: None
         o._drain_backlog = lambda: backlog
         o._free_scratch_gb = lambda: 9999

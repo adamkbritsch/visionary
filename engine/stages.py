@@ -1313,6 +1313,39 @@ def _build_mezzanine(p, abort, progress=None, src=None):
     return True, dst
 
 
+def _chosen_host():
+    try:
+        import preflight as _pf
+        return _pf.chosen_host()
+    except Exception as e:
+        return None, "%s: %s" % (e.__class__.__name__, e)
+
+
+def _host_problem(host, host_why):
+    """Why the Resolve stage may not run now for want of its display — the reason it reports as
+    "host-display: <why>" — or None when it may: a display was chosen, or none is pinned, or
+    pinning is off, or the user allowed the main display instead (resolve_host_fallback_main)."""
+    import settings as _st
+    s = _st.get_settings()
+    if host or not (s.get("resolve_host_pinning") and _st.get_display_priority()):
+        return None
+    if host_why == "chosen display is the main one" or s.get("resolve_host_fallback_main"):
+        return None
+    return host_why or "pinned display unavailable"
+
+
+def host_display_problem():
+    """The same verdict, read now: what the orchestrator asks before it lets an item reach Resolve,
+    and again before it counts a "host-display:" failure (a display that IS attached but refused
+    the window is a genuine failure). Never raises."""
+    if _UNDER_TEST:
+        return None             # the real screens must not steer a test; tests patch this
+    try:
+        return _host_problem(*_chosen_host())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _resolve(p, abort, progress=None):
     """ProRes -> mute Dolby Vision .mov, run in a KILLABLE SUBPROCESS (setup + DV
     Analyze All + render, via resolve_pipeline.py episode). The Resolve scripting
@@ -1356,22 +1389,16 @@ def _resolve(p, abort, progress=None):
     # WHICH SCREEN. Resolved ONCE here, before the subprocess spawns, so an unplugged or
     # unproven display is a clean stage-level decision with a log line — not a surprise
     # 200 seconds into a Resolve cold start.
-    try:
-        import preflight as _pf
-        host, host_why = _pf.chosen_host()
-    except Exception as e:
-        host, host_why = None, "%s: %s" % (e.__class__.__name__, e)
+    host, host_why = _chosen_host()
     if host:
         print(f"resolve: hosting on {host.get('name')} ({host.get('key')})", flush=True)
-    elif (_st.get_settings().get("resolve_host_pinning") and _st.get_display_priority()
-            and host_why != "chosen display is the main one"
-            and not _st.get_settings().get("resolve_host_fallback_main")):
+    elif (problem := _host_problem(host, host_why)) is not None:
         # A PINNED display that is gone/unproven must not silently become "drive the main
         # display" — the whole point of pinning is that the main screen belongs to the
-        # user. Same "host-display:" reason as the post-spawn HOST_UNAVAILABLE path, so
-        # the orchestrator's resolve-failure ladder treats it as a retryable hold (plug
-        # the display back in, or set resolve_host_fallback_main to allow main instead).
-        return False, "host-display: %s" % (host_why or "pinned display unavailable")
+        # user. Same "host-display:" reason as the post-spawn HOST_UNAVAILABLE path; the
+        # orchestrator HOLDS the item before Resolve until the display is back (never counted
+        # toward parking), or set resolve_host_fallback_main to allow main instead.
+        return False, "host-display: %s" % problem
     fast = pl.get("topaz") in ("rpu-only", "resolve-only")
     # YouTube runs single-mode too (no Topaz segdir), but on the TRUE-CFR file — web
     # sources are routinely VFR, and the render-completeness gate counts frames against

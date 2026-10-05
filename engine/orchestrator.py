@@ -174,6 +174,7 @@ STALL_RETRY_SECONDS = 300     # while stalled, release ONE held item this often 
                               # (only the probe attempts Resolve — a blocked attempt can hang for up to
                               # RESOLVE_TIMEOUT, so we never spend one per buffered item)
 STALL_MAX_ITEM_RETRIES = 12   # one item failing Resolve this many times TOTAL = genuinely unrenderable
+DISPLAY_RECHECK_SECS = 15     # while items wait for the pinned Resolve display, how often to look for it
                               # (Resolve works for others but not this file) → park it so it can't loop
                               # forever. Comfortably above STALL_TRIGGER_ATTEMPTS so the item that first
                               # detected a real stall is never parked while the prompt is simply still up.
@@ -1168,6 +1169,11 @@ class Orchestrator:
         self._refused = self._load_refused()   # skip-key -> reason: PERMANENT refusals (already-DV).
                                                # Durable — survives Starts, unlike _parked. Written
                                                # only by the run thread (_park_permanent); no lock.
+        self._display_held = set()             # items held before Resolve because its PINNED DISPLAY is gone
+                                               # (unplugged dummy): never counted toward parking, released
+                                               # the moment the display is back (_maybe_release_display_held)
+        self._display_checked = 0.0            # monotonic time of the last look for that display
+        self._display_why = ""                 # ...and why it could not be used, as last seen
         self._resolve_deferred = set()         # items topaz'd but held before Resolve by QUIET MODE (in-memory;
                                                # self-heals each run — re-encountered items re-add themselves)
         self._gate_deferred = set()            # FAST-PATH items (no topaz of their own) deferred at the
@@ -1512,7 +1518,7 @@ class Orchestrator:
                 if k not in keep_keys:
                     for st in (self._in_finisher, self._in_finisher_movies,
                                self._resolve_stall, self._resolve_deferred,
-                               self._gate_deferred, self._parked):
+                               self._gate_deferred, self._display_held, self._parked):
                         st.discard(k)
                     self._fail_counts.pop(self._skip_key(p), None)
                 sweep.append(p.source_basename)
@@ -1584,7 +1590,8 @@ class Orchestrator:
                 k = self._skip_key(p)
                 if k not in keep_keys:
                     for st in (self._in_finisher, self._in_finisher_movies,
-                               self._resolve_stall, self._resolve_deferred, self._parked):
+                               self._resolve_stall, self._resolve_deferred,
+                               self._display_held, self._parked):
                         st.discard(k)
                     self._fail_counts.pop(k, None)
                 sweep.append(p.source_basename)
@@ -1868,6 +1875,7 @@ class Orchestrator:
             # STALL_TRIGGER_ATTEMPTS before we'd re-conclude a stall) — e.g. after you dismiss its prompt.
             self._stall_active = False
             self._gate_deferred.clear()
+            self._display_held.clear()
             self._resolve_stall.clear()
             self._resolve_fails.clear()
             self._stall_probe = None
@@ -2152,6 +2160,7 @@ class Orchestrator:
                 self._abort.clear()          # fresh iteration — consume any mid-stage power abort
                 self._maybe_resume_deferred()        # Quiet Mode off → resume items held before Resolve
                 self._maybe_retry_stall()            # stalled Resolve → release a held item to re-probe it
+                self._maybe_release_display_held()   # the pinned display is back → items go on to Resolve
                 pstatus, pmsg = self._power_ok()
                 self._note_power(pstatus, pmsg)                  # let the prefetcher back off too
                 if pstatus == "pause":
@@ -2200,6 +2209,16 @@ class Orchestrator:
                         self.state["episode"] = None
                         self._hold("nas", msg)
                         self._sleep(DRAIN_POLL_SECONDS)
+                    elif self._display_held:
+                        # Everything left is upscaled and waiting for the display Resolve runs on —
+                        # checked BEFORE "no-series": with no show active, a held video or movie
+                        # makes selection report that, and its branch sleeps the poll interval.
+                        # Short cadence: the release at the loop top drains it within a look.
+                        self.state["episode"] = None
+                        self._hold("display", f"{len(self._display_held)} item(s) held before "
+                                              f"Resolve — waiting for the pinned display "
+                                              f"({self._display_why or 'unavailable'})")
+                        self._sleep(DISPLAY_RECHECK_SECS)
                     elif why == "no-series":
                         # A TV show is NOT a prerequisite: with none active, selection still
                         # serves due movies and the YouTube queue (see _next_episode's tail).
@@ -2243,7 +2262,15 @@ class Orchestrator:
                     # 2 remuxes have the machine — hold fresh Topaz until a lane frees (already-
                     # upscaled items still flow through Resolve to feed the lanes).
                     self.state["current"] = None
-                    self._hold("dual-remux", "two remuxes running — Topaz paused until a lane frees")
+                    if self._display_held and not self._dual_remux_live():
+                        # No remux runs: the upscaled items waiting for the display ARE the two.
+                        # Two such working sets is the cap — say why it is holding.
+                        self._hold("display",
+                            f"Topaz paused — {len(self._display_held)} upscaled item(s) wait "
+                            f"before Resolve for the pinned display "
+                            f"({self._display_why or 'unavailable'})")
+                    else:
+                        self._hold("dual-remux", "two remuxes running — Topaz paused until a lane frees")
                     self._sleep(DRAIN_POLL_SECONDS); continue
                 self._process(ep)
         except Exception as e:                       # never die silently — leave a trace
@@ -2420,6 +2447,53 @@ class Orchestrator:
             f"{ep_disp}: Resolve stalled — held, buffering the next upscale "
             f"({len(self._resolve_stall)} waiting)", held=len(self._resolve_stall))
 
+    def _display_missing(self):
+        """Why Resolve's pinned display cannot be used right now, or None (stages.host_display_problem
+        — the very check the Resolve stage makes). Never raises."""
+        try:
+            import stages
+            return stages.host_display_problem()
+        except Exception:
+            return None
+
+    def _hold_for_display(self, p, ep_disp, why):
+        """Resolve's pinned display is gone (the dummy unplugged): hold this item before Resolve —
+        NOT a failure, nothing counted toward parking, nothing swept — and let the run go on with
+        other work (upscaling the next items). Live 2026-10-04: the dummy out for half an hour,
+        every attempt counted as a Resolve failure, and a video was parked after 12 of them."""
+        if not self._display_held or why != self._display_why:
+            logbook.event(f"Resolve waiting — the pinned display is unavailable ({why}); items stop "
+                          f"before Resolve until it is back (not counted against them)")
+        self._display_why = why
+        self._display_held.add(self._skip_key(p))
+        # A Resolve a YouTube run kept open cannot serve a held item — and with its display gone,
+        # macOS has moved its window onto the user's screen.
+        self._close_kept_resolve("the pinned display is gone")
+        self.state["current"] = None
+        self._hold("display",
+            f"{ep_disp}: waiting for the pinned display ({why}) — held before Resolve, not "
+            f"counted against it ({len(self._display_held)} waiting)",
+            held=len(self._display_held))
+
+    def _maybe_release_display_held(self):
+        """Look for the pinned display every DISPLAY_RECHECK_SECS while items wait for it; once it
+        is usable again, every held item re-enters selection and goes on to Resolve."""
+        if not self._display_held:
+            return
+        now = time.monotonic()
+        if now - self._display_checked < DISPLAY_RECHECK_SECS:
+            return
+        self._display_checked = now
+        why = self._display_missing()
+        if why is None:
+            logbook.event(f"the pinned display is back — {len(self._display_held)} item(s) go on "
+                          f"to Resolve")
+            self._display_held.clear()
+            self._display_why = ""
+        elif why != self._display_why:              # e.g. plugged back in, templates not proven
+            logbook.event(f"Resolve still waiting — the pinned display: {why}")
+            self._display_why = why
+
     def _resolve_recovered(self):
         """A Resolve render SUCCEEDED while items were held before a stalled Resolve → the update prompt
         is gone. Release the whole held buffer so every waiting item drains through Resolve."""
@@ -2461,6 +2535,13 @@ class Orchestrator:
             phys = scratch.physical_free_gb()
             if phys is not None and phys < _min_free_gb():
                 return f"paused — low disk ({phys} GB): turn off Quiet Mode to drain items through Resolve"
+        if self._display_held:
+            # The same blind spot as Quiet Mode: items held before Resolve keep their upscaled
+            # intermediates, which available_gb counts as reclaimable — gate on RAW free.
+            phys = scratch.physical_free_gb()
+            if phys is not None and phys < _min_free_gb():
+                return (f"paused — low disk ({phys} GB): plug the pinned display back in to drain "
+                        f"{len(self._display_held)} held item(s) through Resolve")
         if self._in_finisher_keys():
             # OVERLAP: an item is finishing in the background (remux/upload). Its topaz ProRes was
             # dropped at hand-off so it's small (~10 GB), but available_gb still counts scratch as
@@ -2886,6 +2967,7 @@ class Orchestrator:
                 | self._gate_deferred                        # + fast items still waiting at the doorstep
                 | self._resolve_deferred                     # + items QUIET MODE is holding before Resolve
                 | self._resolve_stall                        # + items HELD before a STALLED Resolve (buffered)
+                | self._display_held                         # + items waiting for the pinned DISPLAY
                 | self._in_finisher_keys()                   # + items the FINISHER already owns (still
                                                              #   un-mastered on the NAS — must not re-pick)
                 | self._finisher_persisted_keys())           # + DURABLE finisher items momentarily absent
@@ -3114,6 +3196,10 @@ class Orchestrator:
                 continue
             if st == "resolve" and self._quiet_mode():     # SCREEN CONTROL OFF: hold before the screen-
                 self._defer_resolve(p, ep_disp); return    # invasive Resolve stage; process other items
+            if st == "resolve":                            # its PINNED DISPLAY is gone (dummy unplugged):
+                why = self._display_missing()              # hold, never count it — other work goes on
+                if why:
+                    self._hold_for_display(p, ep_disp, why); return
             if st == "resolve" and self._stall_active:     # Resolve known-stalled (update prompt): don't
                 if self._skip_key(p) != self._stall_probe: # attempt it (a blocked attempt hangs to
                     self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
@@ -3380,6 +3466,14 @@ class Orchestrator:
                 if str(msg).startswith("permanent:"):
                     self._park_permanent(p, ep_disp, st, msg)
                     return
+                if st == "resolve" and str(msg).startswith("host-display:"):
+                    # The display went away during the attempt. Verified by looking for it, never by
+                    # the message alone: one that IS attached and still refused Resolve's window is
+                    # a genuine failure, and that one goes on to the ladder below.
+                    why = self._display_missing()
+                    if why:
+                        self._hold_for_display(p, ep_disp, why)
+                        return
                 if st == "resolve":
                     # Resolve failed. Retry the same item a few times (fluke window); once confirmed a real
                     # stall, hold it and buffer the next upscales (down to STALL_FLOOR_GB) instead of parking.
@@ -3694,7 +3788,7 @@ class Orchestrator:
             if self._tv_since_yt < self._yt_every_tv():
                 return False
             import youtube
-            skip = self._parked | set(self._refused) | self._in_finisher_keys()
+            skip = self._parked | set(self._refused) | self._in_finisher_keys() | self._display_held
             name = (self.state.get("current") or {}).get("name") or ""
             if name:
                 skip = skip | {os.path.splitext(os.path.basename(name))[0]}

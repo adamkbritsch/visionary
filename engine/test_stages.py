@@ -2911,3 +2911,39 @@ class YouTubeKeepsResolveOpen(unittest.TestCase):
         self._pass()
         self.assertTrue(stages.close_kept_resolve("test"))
         self.assertEqual(self.kills, [1])
+
+
+class HostDisplayProblem(unittest.TestCase):
+    """The one verdict both the Resolve stage and the orchestrator use: may Resolve run now, or is
+    its pinned display missing? (the orchestrator holds the item instead of counting a failure)"""
+
+    def _problem(self, host=None, why="not attached", **s):
+        base = {"resolve_host_pinning": True, "resolve_host_fallback_main": False}
+        base.update(s)
+        prio = base.pop("prio", ["uuid:DUMMY"])
+        import settings
+        with mock.patch.object(settings, "get_settings", return_value=base), \
+             mock.patch.object(settings, "get_display_priority", return_value=prio):
+            return stages._host_problem(host, why)
+
+    def test_a_missing_pinned_display_is_the_problem(self):
+        self.assertEqual(self._problem(), "not attached")
+        self.assertEqual(self._problem(why=""), "pinned display unavailable")
+
+    def test_nothing_stops_resolve_otherwise(self):
+        self.assertIsNone(self._problem(host={"key": "uuid:DUMMY"}))           # it is there
+        self.assertIsNone(self._problem(resolve_host_pinning=False))           # pinning off
+        self.assertIsNone(self._problem(prio=[]))                              # nothing pinned
+        self.assertIsNone(self._problem(resolve_host_fallback_main=True))      # main allowed
+        self.assertIsNone(self._problem(why="chosen display is the main one"))
+
+    def test_tests_never_read_the_real_screens(self):
+        import preflight, settings
+        calls = []
+        with mock.patch.object(settings, "get_settings",
+                               return_value={"resolve_host_pinning": True}), \
+             mock.patch.object(settings, "get_display_priority", return_value=["uuid:DUMMY"]), \
+             mock.patch.object(preflight, "chosen_host",
+                               side_effect=lambda: calls.append(1) or (None, "not attached")):
+            self.assertIsNone(stages.host_display_problem())
+        self.assertEqual(calls, [])                       # not even asked
