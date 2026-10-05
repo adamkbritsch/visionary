@@ -1022,12 +1022,87 @@ _UNDER_TEST = "unittest" in sys.modules
 
 def _kill_resolve():
     """Force-quit Resolve (a graceful quit hangs on its 'cancel renders?' prompt) and forget
-    any kept-open state."""
+    any kept-open state — then point the user's Resolve back at their own screen."""
     if not _UNDER_TEST:
         subprocess.run(["pkill", "-9", "-f", "DaVinci Resolve.app"], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with _RESOLVE_KEPT_LOCK:
-        _RESOLVE_KEPT.update(open=False, mode=None, passes=0)
+        _RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
+    unpin_resolve_display(wait=5.0)
+
+
+def _resolve_pids() -> tuple:
+    """The running Resolve's PIDs; () under tests or when they cannot be read (never raises —
+    it runs at the end of a successful pass)."""
+    if _UNDER_TEST:
+        return ()
+    try:
+        r = subprocess.run(["pgrep", "-f", "DaVinci Resolve.app/Contents/MacOS/Resolve"],
+                           capture_output=True, text=True)
+        return tuple(sorted(int(x) for x in r.stdout.split() if x.isdigit()))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def unpin_resolve_display(wait: float = 0.0) -> list:
+    """Once Resolve is not running: point any Resolve screen choice that names the pinned display
+    back at the main one (resolve_prefs) — every DV pass puts Resolve's window on the dummy, and
+    Resolve saves that as where it belongs, so the user's own Resolve opened there, invisible
+    (live 2026-10-04). Waits up to `wait` s for a just-killed Resolve to be gone. Never raises;
+    never touches anything under tests."""
+    if _UNDER_TEST:
+        return []
+    try:
+        import resolve_prefs
+        end = time.time() + wait
+        while resolve_prefs.resolve_running() and time.time() < end:
+            time.sleep(0.25)
+        changed = resolve_prefs.unpin()
+        if changed:
+            logbook.event("pointed DaVinci Resolve back at the main display (it had saved the "
+                          "pinned one): " + ", ".join(f"{lay} {key} {a}->{b}"
+                                                      for lay, key, a, b in changed))
+        return changed
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _display_watch_tick(seen):
+    """One look: unpin when Resolve's preferences OR the attached screens changed since `seen`
+    and Resolve is not running. A save made while the dummy was unplugged or the lid closed (no
+    host to point away from then) is looked at again once the screens change. Returns the new
+    `seen` (unchanged while Resolve runs, so its saves are looked at once it has quit)."""
+    import resolve_prefs
+    key = (os.stat(resolve_prefs.PRESET).st_mtime_ns, resolve_prefs.screens_now())
+    if key == seen or resolve_prefs.resolve_running():
+        return seen
+    unpin_resolve_display()
+    return (os.stat(resolve_prefs.PRESET).st_mtime_ns, resolve_prefs.screens_now())
+
+
+_DISPLAY_WATCH = {"started": False}
+DISPLAY_WATCH_SECS = 15.0
+
+
+def start_resolve_display_watch() -> bool:
+    """A daemon that runs unpin_resolve_display whenever Resolve has saved UI.preset and is no
+    longer running — so a Resolve the user quits, or one a restart closed, never leaves its next
+    launch on the dummy, whether or not a run is armed. One stat per tick otherwise."""
+    if _UNDER_TEST or _DISPLAY_WATCH["started"]:
+        return False
+    _DISPLAY_WATCH["started"] = True
+
+    def loop():
+        seen = None
+        while True:
+            try:
+                seen = _display_watch_tick(seen)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(DISPLAY_WATCH_SECS)
+
+    threading.Thread(target=loop, daemon=True, name="resolve-display-watch").start()
+    return True
 
 
 def _refocus_app():
@@ -1061,7 +1136,7 @@ def _quit_resolve_focus_app():
 # (RESOLVE_REUSE_MAX passes: a fresh Resolve now and then costs one launch, a slowly
 # degrading one costs a hang).
 RESOLVE_REUSE_MAX = 20
-_RESOLVE_KEPT = {"open": False, "mode": None, "passes": 0}
+_RESOLVE_KEPT = {"open": False, "mode": None, "passes": 0, "pids": ()}
 _RESOLVE_KEPT_LOCK = threading.Lock()
 
 
@@ -1072,7 +1147,7 @@ def _keep_resolve_open(mode) -> bool:
         n = int(_RESOLVE_KEPT.get("passes") or 0) + 1
         if n >= RESOLVE_REUSE_MAX:
             return False
-        _RESOLVE_KEPT.update(open=True, mode=mode, passes=n)
+        _RESOLVE_KEPT.update(open=True, mode=mode, passes=n, pids=_resolve_pids())
     _refocus_app()
     return True
 
@@ -1089,6 +1164,14 @@ def close_kept_resolve(why: str) -> bool:
     with _RESOLVE_KEPT_LOCK:
         if not _RESOLVE_KEPT.get("open"):
             return False
+        kept = set(_RESOLVE_KEPT.get("pids") or ())
+    if kept and not _UNDER_TEST and not (kept & set(_resolve_pids())):
+        # The Resolve this run kept is gone (the user quit it): whatever runs now is theirs, and
+        # a pkill here would take their unsaved work with it.
+        with _RESOLVE_KEPT_LOCK:
+            _RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
+        unpin_resolve_display()
+        return False
     _kill_resolve()
     logbook.event(f"closed DaVinci Resolve — {why}")
     return True

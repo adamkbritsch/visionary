@@ -1876,6 +1876,11 @@ class Orchestrator:
             # _tv_since_yt deliberately NOT reset — it's processing HISTORY
             # (see CADENCE_FILE); resetting them on every re-arm starved the YouTube cadence.
             self._start_caffeinate()           # display + system awake for the whole run
+            try:                               # a Resolve left pointing at the pinned display
+                import stages
+                stages.unpin_resolve_display()
+            except Exception:
+                pass
             msg = "started — running until you stop it"   # no auto-stop; ends only on a manual stop
             self.state.update(enabled=True, ended_reason=None, message=msg)
             logbook.event(msg)

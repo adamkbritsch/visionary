@@ -2024,6 +2024,11 @@ def main(port=8765):
         except (ValueError, OSError):
             pass
     threading.Thread(target=_rearm_loop, daemon=True, name="rearm").start()
+    try:                                  # keep the user's Resolve off the pinned display
+        import stages
+        stages.start_resolve_display_watch()
+    except Exception:
+        pass
     print(f"Dashboard (automation_enabled={AUTOMATION_ENABLED}) on http://localhost:{port}")
     ThreadingHTTPServer((BIND_ADDR, port), Handler).serve_forever()
 
