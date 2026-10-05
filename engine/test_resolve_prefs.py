@@ -94,6 +94,10 @@ class Unpinned(unittest.TestCase):
         vals = {("1728x1117", rp.PRIMARY): 0, ("1728x1117", rp.PROJECTS): -1}
         self.assertEqual(rp.unpinned(vals, host=1, layout="1728x1117"), {})
 
+    def test_a_real_monitor_as_secondary_stays(self):
+        self.assertEqual(rp.unpinned({("L", rp.PRIMARY): 1, ("L", rp.SECONDARY): 2}, host=1,
+                                     layout="L"), {("L", rp.PRIMARY): 0})
+
     def test_a_primary_without_a_secondary_key(self):
         self.assertEqual(rp.unpinned({("a", rp.PRIMARY): 1}, host=1, layout="a"),
                          {("a", rp.PRIMARY): 0})
@@ -226,18 +230,47 @@ class StageHooks(unittest.TestCase):
 
     def test_kill_unpins_only_after_resolve_is_gone(self):
         order = []
-        alive = iter([True, True, False, False])
+        alive = [True, True, False]
+        def running():
+            order.append("running?")
+            return alive.pop(0)
         with mock.patch.object(stages, "_UNDER_TEST", False), \
              mock.patch.object(stages.subprocess, "run",
                                side_effect=lambda cmd, **kw: order.append(cmd[0])), \
              mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(rp, "resolve_running", side_effect=lambda: next(alive)), \
+             mock.patch.object(rp, "resolve_running", side_effect=running), \
              mock.patch.object(rp, "unpin", side_effect=lambda: order.append("unpin") or
                                [("1728x1117", rp.PRIMARY, 1, 0)]), \
              mock.patch.object(stages.logbook, "event") as ev:
             stages._kill_resolve()
-        self.assertEqual(order, ["pkill", "unpin"])
+        self.assertEqual(order, ["pkill", "running?", "running?", "running?", "unpin"])
         self.assertIn("1728x1117 PrimaryScreenIdx 1->0", ev.call_args.args[0])
+
+    def test_a_resolve_that_outlives_the_wait_is_left_to_unpin_itself(self):
+        # past the deadline unpin is still asked — and it refuses while Resolve runs
+        t = [100.0]
+        def sleep(secs):
+            t[0] += secs
+        with mock.patch.object(stages, "_UNDER_TEST", False), \
+             mock.patch.object(stages.subprocess, "run"), \
+             mock.patch.object(stages.time, "time", lambda: t[0]), \
+             mock.patch.object(stages.time, "sleep", side_effect=sleep), \
+             mock.patch.object(rp, "resolve_running", return_value=True), \
+             mock.patch.object(rp, "unpin", return_value=[]) as up:
+            stages._kill_resolve()
+        up.assert_called_once()
+        self.assertGreaterEqual(t[0], 105.0)                  # it did wait the 5 s first
+
+    def test_a_kept_resolve_records_whose_it_is(self):
+        stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
+        try:
+            with mock.patch.object(stages, "_UNDER_TEST", False), \
+                 mock.patch.object(stages, "_resolve_pids", return_value=(111,)), \
+                 mock.patch.object(stages, "_refocus_app"):
+                self.assertTrue(stages._keep_resolve_open("dv1000"))
+            self.assertEqual(stages._RESOLVE_KEPT["pids"], (111,))
+        finally:
+            stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
 
     def test_the_watcher_looks_again_when_the_screens_change(self):
         screens = [(None, "1728x1117")]                     # dummy unplugged when Resolve saved
