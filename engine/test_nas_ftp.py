@@ -12,6 +12,8 @@ from unittest import mock
 import nas_ftp
 import transfer
 
+_REAL_PAUSE = nas_ftp._pause
+
 
 class FakeServer:
     def __init__(self):
@@ -631,6 +633,21 @@ class Review20261001(_Net):
         self.assertEqual(len([v for v, _r in self.srv.rests if v == "RETR"]),
                          1 + len(nas_ftp.sample_ranges(len(data))))   # one leg, then the read-back
 
+    def test_a_dropped_leg_retries_through_the_real_pause_under_the_slot(self):
+        # review 2026-10-07: the slot hands the legs a combined abort; the retry pause WAITS on it.
+        # Every other test mocks _pause, which is how an AttributeError there went unseen.
+        data = os.urandom(nas_ftp.SAMPLE_SPAN)
+        local = os.path.join(self.d, "p81.mkv")
+        with open(local, "wb") as fh:
+            fh.write(data)
+        stage = nas_ftp.stage_path_for(HOST)
+        with mock.patch.object(nas_ftp, "FAIL_PAUSE_SECS", 0.01), \
+             mock.patch.object(nas_ftp, "SHORT_RETRY_WAITS", (0.01, 0.01)), \
+             mock.patch.object(nas_ftp, "_pause", _REAL_PAUSE), \
+             self._flaky("size", 3, OSError("reset")):
+            nas_ftp.upload(local, stage, abort=threading.Event())
+        self.assertEqual(bytes(self.srv.files[nas_ftp.host_to_ftp(stage)]), data)
+
     def test_a_failed_size_check_between_upload_legs_counts_like_a_dropped_leg(self):
         data = os.urandom(nas_ftp.SAMPLE_SPAN)
         local = os.path.join(self.d, "p81.mkv")
@@ -640,7 +657,8 @@ class Review20261001(_Net):
         with self._flaky("size", 3, OSError("reset")):     # outlasts the short exchange's retries
             nas_ftp.upload(local, stage)
         self.assertEqual(bytes(self.srv.files[nas_ftp.host_to_ftp(stage)]), data)
-        self.assertIn(mock.call(None, nas_ftp.FAIL_PAUSE_SECS), nas_ftp._pause.call_args_list)
+        # (the abort is the lane's own plus the slot's step-aside request — any one will do)
+        self.assertTrue(any(c.args[1] == nas_ftp.FAIL_PAUSE_SECS for c in nas_ftp._pause.call_args_list))
 
 
 
@@ -677,6 +695,50 @@ class OverloadIsNotADroppedLeg(unittest.TestCase):
             return v
         with mock.patch.object(nas_ftp, "_pause"):
             self.assertEqual(nas_ftp._retrying(fn), "ok")
+
+
+
+class SharedTransferSlot(unittest.TestCase):
+    """The DV lane's transfers hold the NAS transfer slot shared with the pipeline and Expurgate —
+    once per transfer, never per leg."""
+
+    def test_a_whole_transfer_runs_inside_one_slot(self):
+        entered, notes = [], []
+        import contextlib
+        @contextlib.contextmanager
+        def slot(abort=None, on_wait=None, prio=None):
+            entered.append((abort, on_wait, prio))
+            on_wait and on_wait(transfer.WAIT_OTHER_APP)
+            yield "BODY-ABORT"
+        calls = []
+        @nas_ftp._slotted
+        def body(*a, **kw):
+            calls.append(kw)
+            return "done"
+        ev = threading.Event()
+        with mock.patch.object(transfer, "nas_slot", side_effect=slot):
+            self.assertEqual(body("h", "l", 1, abort=ev, on_wait=notes.append), "done")
+        self.assertEqual(len(entered), 1)
+        self.assertIs(entered[0][0], ev)
+        self.assertEqual(entered[0][2], transfer.BACKGROUND)   # the lane steps aside for the pipeline
+        self.assertNotIn("on_wait", calls[0])          # consumed by the slot, not the body
+        self.assertEqual(calls[0]["abort"], "BODY-ABORT")      # the legs watch the step-aside too
+        self.assertEqual(notes, [transfer.WAIT_OTHER_APP])
+
+    def test_a_stop_while_waiting_is_the_lanes_stop(self):
+        def slot(abort=None, on_wait=None, prio=None):
+            raise transfer.SlotStopped("stopped")
+        with mock.patch.object(transfer, "nas_slot", side_effect=slot):
+            with self.assertRaises(nas_ftp.Stopped):
+                nas_ftp._slotted(lambda *a, **k: None)("h", "l", 1)
+
+    def test_download_and_upload_are_slotted(self):
+        import inspect
+        src = inspect.getsource(nas_ftp)
+        self.assertIn("@_slotted\ndef download(", src)
+        self.assertIn("@_slotted\ndef upload(", src)
+        for short in ("read_range", "stat", "mode_of", "swap"):
+            self.assertNotIn("@_slotted\ndef %s(" % short, src)
 
 
 class Relinker(unittest.TestCase):

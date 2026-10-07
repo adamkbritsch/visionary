@@ -1603,6 +1603,12 @@ struct StageProgress: View {
                             .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
                     }
                 }
+                // Queued for the NAS transfer slot (shared with Expurgate, one transfer at a time):
+                // say so, or a download sits at 0% with its stopwatch running and no reason given.
+                if let w = pr.waiting, !w.isEmpty {
+                    Text(w.prefix(1).uppercased() + w.dropFirst())
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
             }
             .padding(.top, 3)
         }

@@ -473,14 +473,18 @@ def _download_body(p, abort, progress=None, low_prio=False):
             def on_prog(done, total):          # the pull is the first ~20% of the stage bar
                 progress({"stage": "download", "ep": p.ep, "pct": round(done / total * 20)})
         ok, _local, reason = transfer.download(p.nas_source, os.path.dirname(p.source),
-                                               on_progress=on_prog, abort=abort)
+                                               on_progress=on_prog, abort=abort,
+                                               on_wait=_slot_note(progress, "download", p.ep),
+                                               # the download-ahead steps aside for the pipeline
+                                               prio=(transfer.BACKGROUND if low_prio
+                                                     else transfer.FOREGROUND))
         # Anything at p.source after a stopped/failed transfer is a partial stub — drop it so
         # it can never be mistaken for a finished source (the exact break: quitting mid-download).
         if not ok:
             if os.path.exists(p.source):
                 try: os.remove(p.source)
                 except OSError: pass
-            return ok, reason
+            return ok, _stopped_is_interrupted(reason)
     # Refuse an already-Dolby-Vision source HERE, before the expensive CFR re-encode.
     # Queue building already excludes DV items (NAS dv-manifest / name mark); this catches
     # the slip-throughs (manifest gap, unmarked name) the moment the file can be probed.
@@ -545,12 +549,13 @@ def _download_combine(p, abort, progress=None):
             def on_prog(done, total):          # NAS pull = the front half of the bar
                 progress({"stage": "download", "ep": p.ep, "pct": round(done / total * 50)})
         ok, _local, reason = transfer.download(p.nas_source, os.path.dirname(p.source),
-                                               on_progress=on_prog, abort=abort)
+                                               on_progress=on_prog, abort=abort,
+                                               on_wait=_slot_note(progress, "download", p.ep))
         if not ok:
             if os.path.exists(p.source):
                 try: os.remove(p.source)
                 except OSError: pass
-            return ok, reason
+            return ok, _stopped_is_interrupted(reason)
     # -- companion (relay-streamed from the seedbox) --------------------------------
     if progress:
         progress({"stage": "download", "ep": p.ep, "pct": 50, "step": "fetching companion"})
@@ -626,6 +631,28 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
         logbook.event(f"download {p.ep}: container runs past the picture — "
                       f"CFR capped at {res.capped_secs:.1f}s")
     return True, f"downloaded + CFR @ {res.rate} ({res.frames} frames)"
+
+
+def _stopped_is_interrupted(reason):
+    """A download WE stopped — a stop, a Plex stream starting, or the download-ahead stepping aside
+    for the pipeline's own transfer (transfer.nas_slot) — is "interrupted:", the benign class
+    run_stage logs as an event, not a red failure line."""
+    r = str(reason or "")
+    return ("interrupted: " + r) if r.startswith("aborted") else reason
+
+
+def _slot_note(progress, stage, ep):
+    """`on_wait` for a pipeline transfer: put "waiting for another app's NAS transfer" on the
+    stage's own surface while the shared NAS transfer slot is taken, and take it off again."""
+    if not progress:
+        return None
+
+    def note(text):
+        info = {"stage": stage, "ep": ep, "pct": 0}
+        if text:
+            info["waiting"] = text
+        progress(info)
+    return note
 
 
 def _nas_down_word() -> str:
@@ -1882,13 +1909,15 @@ def _upload(p, abort, progress=None):
         # path, youtarr's stem) + copy sidecars so Plex keeps the metadata. Staging is purged in
         # cleanup (resume-safe), never here — so a re-run can always re-pull the source if needed.
         ok, _remote, reason = transfer.publish_master(
-            p.final, p.nas_final, p.sidecar_dir, os.path.dirname(p.source), on_progress=on_prog)
+            p.final, p.nas_final, p.sidecar_dir, os.path.dirname(p.source), on_progress=on_prog,
+            abort=abort, on_wait=_slot_note(progress, "upload", p.ep))
         if ok:
             _remember_finished(p, p.nas_final)
-        return ok, reason
-    ok, remote, reason = transfer.upload(p.final, p.nas_dir, on_progress=on_prog)
+        return ok, (reason if ok else _stopped_is_interrupted(reason))
+    ok, remote, reason = transfer.upload(p.final, p.nas_dir, on_progress=on_prog, abort=abort,
+                                         on_wait=_slot_note(progress, "upload", p.ep))
     if not ok:
-        return False, reason
+        return False, _stopped_is_interrupted(reason)
     _remember_finished(p, remote)
     import settings as settings_mod
     if settings_mod.get_show_replace_source(p.series):

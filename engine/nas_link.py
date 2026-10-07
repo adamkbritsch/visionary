@@ -318,6 +318,7 @@ def forget():
         for k, v in list(_ts_seen.items()):
             _ts_seen[k] = (0.0,) + tuple(v[1:])
         _ifc_cache.update(at=0.0, ifaces=None)
+        _mac_cache.clear()
 
 
 def detect(host: str, priority: str = None) -> dict:
@@ -521,6 +522,133 @@ def tailscale_lan_ip(ts_ip: str, wait: bool = True):
     return hit[2] if usable else None
 
 
+# ---- the third proof: the NAS's own hardware address -------------------------------------------
+# Expurgate added this on 2026-10-07 (~/discretion/engine/naslink.py): with mDNS silent and Tailscale
+# sometimes reaching the NAS through the house's PUBLIC address (a router hairpin) instead of
+# directly, neither proof above can bind the cable. ARP still knows who answers at the LAN address.
+#
+# Visionary's rule is stricter about LEARNING than Expurgate's. Expurgate records the hardware
+# address after any successful login to a configured literal, and lists the literal first in its
+# plain host order — so at a café whose 192.168.1.195 runs an FTP server that accepts any login, it
+# would first send the NAS credentials there and then learn the stranger. Here an address is learned
+# only after a login over a LAN route that was ALREADY PROVEN (a fresh mDNS answer or a direct
+# Tailscale pong): the hardware address then belongs to the box those proofs vouched for. Later the
+# literal is proven again when ARP shows exactly that one address and an active interface is on its
+# subnet — a café's 192.168.1.195 is a different box with a different address. No literal needs to be
+# added to the configured hosts for any of this.
+ARP = "/usr/sbin/arp"
+MAC_BOOK = os.path.expanduser("~/.topaz-pipeline/nas_macs.json")
+_mac_cache = {}                 # (ip, attachment) -> (wall time, proven)
+
+
+def parse_arp(text: str, ip: str, iface=None) -> set:
+    """PURE: the hardware addresses `arp -n <ip>` reports for `ip`, normalised (zero-padded, lower)
+    — only those seen on `iface` when one is given (the interface a login would bind to)."""
+    out = set()
+    for line in (text or "").splitlines():
+        if "(%s)" % ip not in line:
+            continue
+        if iface is not None:
+            on = re.search(r" on (\S+)", line)
+            if not on or on.group(1) != iface:
+                continue
+        m = re.search(r" at ((?:[0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})\b", line)
+        if m:
+            out.add(":".join("%02x" % int(b, 16) for b in m.group(1).split(":")))
+    return out
+
+
+def private_literal(host) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except (ValueError, TypeError):
+        return False
+    return (ip.version == 4 and ip.is_private and ip not in _TAILSCALE_NET and not ip.is_loopback
+            and not ip.is_link_local)
+
+
+def _mac_book() -> dict:
+    try:
+        import json
+        with open(MAC_BOOK) as f:
+            d = json.load(f)
+        macs = d.get("macs") if isinstance(d, dict) else None
+        return dict(macs) if isinstance(macs, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _arp_macs(ip, populate=True, iface=None) -> set:
+    macs = parse_arp(_run([ARP, "-n", ip]), ip, iface)
+    if not macs and populate and not _under_test():
+        try:                       # no entry yet: one SYN fills it — no login, no credentials
+            socket.create_connection((ip, 21), timeout=1.0).close()
+        except OSError:
+            pass
+        macs = parse_arp(_run([ARP, "-n", ip]), ip, iface)
+    return macs
+
+
+def learn_mac(ip, src=None):
+    """After a SUCCESSFUL login over a PROVEN LAN route to `ip` bound to local address `src`
+    (transfer.connect calls this only then): remember the one hardware address answering there, as
+    seen on that route's interface. Two would mean ARP cannot say."""
+    if _under_test() or not private_literal(ip):
+        return
+    iface = next((d for d, i in _ifaces_now().items() if src and i.get("inet") == src), None)
+    if src and iface is None:
+        return                       # the bound interface is gone already: learn nothing
+    macs = _arp_macs(ip, populate=False, iface=iface)
+    if len(macs) != 1:
+        return
+    mac = next(iter(macs))
+    book = _mac_book()
+    if book.get(ip) == mac:
+        return
+    book[ip] = mac
+    try:
+        import json
+        os.makedirs(os.path.dirname(MAC_BOOK), exist_ok=True)
+        tmp = MAC_BOOK + ".part"
+        with open(tmp, "w") as f:
+            json.dump({"macs": book, "learned": time.time()}, f, indent=1, sort_keys=True)
+        os.replace(tmp, MAC_BOOK)
+    except OSError:
+        pass
+    with _lock:
+        _mac_cache.clear()
+
+
+def mac_proven(ip, wait: bool = True, iface=None) -> bool:
+    """`ip` (a private literal whose hardware address was learned) answers with that same single
+    address — on `iface`, the interface the login would bind to, when given — on a subnet an active
+    interface of this Mac is on. Cached CACHE_SECS per attachment and interface. `wait=False` never
+    sends the SYN that fills an empty ARP entry (a leg's 2 s check), and an answer it could only
+    give WITHOUT that fill is not cached, so the next connect still fills and asks (review
+    2026-10-07)."""
+    if not private_literal(ip):
+        return False
+    known = _mac_book().get(ip)
+    if not known:
+        return False
+    ifaces = _ifaces_now()
+    att = attachment(ip, ifaces)
+    if not att:
+        return False
+    key = (ip, att, iface)
+    now = time.time()
+    with _lock:
+        hit = _mac_cache.get(key)
+    if hit and 0 <= now - hit[0] < CACHE_SECS:
+        return hit[1]
+    macs = _arp_macs(ip, populate=wait, iface=iface)
+    proven = macs == {known}
+    if proven or wait or macs:
+        with _lock:
+            _mac_cache[key] = (time.time(), proven)
+    return proven
+
+
 def lan_link(hosts, wait: bool = True):
     """The detect() link for the NAS's LAN address, when the chosen link reaches it DIRECTLY and
     the address is PROVEN to be the NAS's, else None. Never None because of ethernet_only: that
@@ -532,7 +660,9 @@ def lan_link(hosts, wait: bool = True):
       1. a configured NAME that resolves FRESHLY on the local link (mDNS) — a kept answer could be
          a stranger's on another network (review 2026-09-30);
       2. a configured TAILSCALE address whose peer answers a tailscale ping directly from a LAN
-         address (tailscale_lan_ip) — so a dead mDNS responder no longer costs the LAN route."""
+         address (tailscale_lan_ip) — so a dead mDNS responder no longer costs the LAN route;
+      3. a LAN address whose hardware address was learned over a route proven by 1 or 2 and still
+         answers there alone (mac_proven) — so a router hairpin no longer costs it either."""
     for h in hosts or ():
         if is_literal(h):
             continue
@@ -545,6 +675,13 @@ def lan_link(hosts, wait: bool = True):
             continue
         ln = detect(ip)
         if ln.get("bound") and ln.get("src") and ln.get("ip"):
+            return ln
+    for ip in sorted(_mac_book()):
+        if not private_literal(ip):
+            continue
+        ln = detect(ip)                 # where a login would BIND — the proof must hold there
+        if (ln.get("bound") and ln.get("src") and ln.get("ip")
+                and mac_proven(ip, wait, iface=ln.get("iface"))):
             return ln
     return None
 

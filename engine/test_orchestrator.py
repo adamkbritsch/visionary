@@ -1023,6 +1023,42 @@ class NasHoldMessage(unittest.TestCase):
             self.assertEqual(orch.Orchestrator._nas_hold_msg(), "NAS unreachable — retrying")
 
 
+
+class SlotWaitShown(unittest.TestCase):
+    def test_the_run_line_says_it_and_then_stops(self):
+        o = orch.Orchestrator()
+        o.state["message"] = "S04E07: download"
+        o._show_slot_wait({"stage": "download", "waiting": "waiting for another app's NAS transfer to finish"})
+        self.assertEqual(o.state["message"],
+                         "S04E07: download — waiting for another app's NAS transfer to finish")
+        o._show_slot_wait({"stage": "download", "pct": 3})
+        self.assertEqual(o.state["message"], "S04E07: download")
+
+    def test_other_messages_are_untouched(self):
+        o = orch.Orchestrator()
+        o.state["message"] = "S04E07: topaz waits — discretion has the machine for another 600s"
+        o._show_slot_wait({"stage": "topaz", "pct": 40})
+        self.assertEqual(o.state["message"],
+                         "S04E07: topaz waits — discretion has the machine for another 600s")
+
+    def test_the_finisher_card_says_it_and_then_stops(self):
+        o = orch.Orchestrator()
+        o.state["finishing"] = {"ep": "S04E06", "stage": "upload"}
+        o._set_finishing_progress({"stage": "upload", "pct": 0,
+                                   "waiting": "waiting for another app's NAS transfer to finish"})
+        self.assertEqual(o.state["finishing"]["holding"],
+                         "waiting for another app's NAS transfer to finish")
+        o._set_finishing_progress({"stage": "upload", "pct": 5})
+        self.assertNotIn("holding", o.state["finishing"])
+
+    def test_another_holding_reason_is_never_cleared_by_it(self):
+        o = orch.Orchestrator()
+        o.state["finishing"] = {"ep": "S04E06", "stage": "remux",
+                                "holding": "AI outpainting has the machine"}
+        o._set_finishing_progress({"stage": "remux", "pct": 5})
+        self.assertEqual(o.state["finishing"]["holding"], "AI outpainting has the machine")
+
+
 class PipelineOverQueue(unittest.TestCase):
     """Pipeline > queue: when the active item's write needs disk, the prefetch buffer is sacrificed."""
 

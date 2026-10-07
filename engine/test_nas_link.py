@@ -1,6 +1,7 @@
 """engine/nas_link.py — picking the wired link to the NAS. Fed the real text of this Mac's
 `ifconfig` / `networksetup` output (2026-09-30), where the lane had been on Wi-Fi beside a 2.5 GbE
 adapter on the same subnet."""
+import os
 import unittest
 from unittest import mock
 
@@ -469,6 +470,128 @@ class TailscaleProof(unittest.TestCase):
 
     def test_never_from_a_test_unless_fed(self):
         self.assertIsNone(nas_link.tailscale_lan_ip("100.101.182.68"))   # _run is silent in tests
+
+
+
+class MacProof(unittest.TestCase):
+    """The third proof (Expurgate's, 2026-10-07), with Visionary's stricter learning rule."""
+    ARP = ("? (192.168.1.195) at 6c:1f:f7:2a:16:d5 on en0 ifscope [ethernet]\n"
+           "? (192.168.1.195) at 6c:1f:f7:2a:16:d5 on en12 ifscope [ethernet]\n")
+
+    def setUp(self):
+        import tempfile
+        self.book = os.path.join(tempfile.mkdtemp(), "nas_macs.json")
+        for p in (mock.patch.object(nas_link, "MAC_BOOK", self.book),):
+            p.start(); self.addCleanup(p.stop)
+        nas_link._mac_cache.clear()
+        nas_link._ifc_cache.update(at=0.0, ifaces=None)
+        self.addCleanup(nas_link._mac_cache.clear)
+
+    def _runner(self, arp):
+        return lambda cmd: IFCONFIG if cmd[0] == "ifconfig" else arp
+
+    def _learn(self, arp=None):
+        with mock.patch.object(nas_link, "_under_test", return_value=False), \
+             mock.patch.object(nas_link, "_run", side_effect=self._runner(arp or self.ARP)):
+            nas_link.learn_mac("192.168.1.195")
+
+    def test_arp_lines_parse_to_one_normalised_address(self):
+        self.assertEqual(nas_link.parse_arp(self.ARP, "192.168.1.195"), {"6c:1f:f7:2a:16:d5"})
+        self.assertEqual(nas_link.parse_arp("? (192.168.1.195) at 6c:1f:f7:2a:6:d5 on en0", "192.168.1.195"),
+                         {"6c:1f:f7:2a:06:d5"})
+        self.assertEqual(nas_link.parse_arp("? (192.168.1.195) at (incomplete) on en0", "192.168.1.195"), set())
+        self.assertEqual(nas_link.parse_arp(self.ARP, "192.168.1.19"), set())
+
+    def test_only_private_lan_literals(self):
+        for good in ("192.168.1.195", "10.0.0.5", "172.16.3.4"):
+            self.assertTrue(nas_link.private_literal(good), good)
+        for bad in ("100.101.182.68", "8.8.8.8", "127.0.0.1", "169.254.1.1", "adamsnas.local", None):
+            self.assertFalse(nas_link.private_literal(bad), bad)
+
+    def test_learned_then_proven(self):
+        self._learn()
+        with open(self.book) as f:
+            self.assertEqual(__import__("json").load(f)["macs"], {"192.168.1.195": "6c:1f:f7:2a:16:d5"})
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner(self.ARP)):
+            self.assertTrue(nas_link.mac_proven("192.168.1.195"))
+
+    def test_another_box_at_the_same_address_is_not_proven(self):
+        self._learn()
+        cafe = "? (192.168.1.195) at 00:11:22:33:44:55 on en0 ifscope [ethernet]\n"
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner(cafe)):
+            self.assertFalse(nas_link.mac_proven("192.168.1.195"))
+
+    def test_two_answers_prove_nothing_and_teach_nothing(self):
+        two = self.ARP + "? (192.168.1.195) at 00:11:22:33:44:55 on en0 ifscope [ethernet]\n"
+        self._learn(two)
+        self.assertFalse(os.path.exists(self.book))
+        self._learn()
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner(two)):
+            self.assertFalse(nas_link.mac_proven("192.168.1.195"))
+
+    def test_not_on_this_network_is_not_proven(self):
+        self._learn()
+        nas_link._ifc_cache.update(at=0.0, ifaces=None)          # (re-read every few seconds in life)
+        away = IFCONFIG.replace("192.168.1.", "10.9.9.")
+        with mock.patch.object(nas_link, "_run",
+                               side_effect=lambda cmd: away if cmd[0] == "ifconfig" else self.ARP):
+            self.assertFalse(nas_link.mac_proven("192.168.1.195"))
+
+    def test_nothing_learned_nothing_proven(self):
+        with mock.patch.object(nas_link, "_run", side_effect=AssertionError("no lookup needed")):
+            self.assertFalse(nas_link.mac_proven("192.168.1.195"))
+
+    def test_a_leg_check_never_sends_the_arp_filling_syn(self):
+        self._learn()
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner("")), \
+             mock.patch.object(nas_link.socket, "create_connection",
+                               side_effect=AssertionError("no SYN from a leg")):
+            self.assertFalse(nas_link.mac_proven("192.168.1.195", wait=False))
+
+    def test_the_third_tier_routes_when_the_first_two_cannot(self):
+        LAN = {"bound": True, "ip": "192.168.1.195", "src": "192.168.1.92", "fresh": True}
+        SILENT = {"bound": False, "ip": None, "src": None, "fresh": False}
+        links = {"adamsnas.local": SILENT, "192.168.1.195": LAN}
+        with mock.patch.object(nas_link, "detect", side_effect=lambda h: links[h]), \
+             mock.patch.object(nas_link, "tailscale_lan_ip", return_value=None), \
+             mock.patch.object(nas_link, "_mac_book", return_value={"192.168.1.195": "6c:1f:f7:2a:16:d5"}), \
+             mock.patch.object(nas_link, "mac_proven", return_value=True):
+            self.assertEqual(nas_link.lan_route(["100.101.182.68", "adamsnas.local"]),
+                             ("192.168.1.195", "192.168.1.92"))
+        with mock.patch.object(nas_link, "detect", side_effect=lambda h: links[h]), \
+             mock.patch.object(nas_link, "tailscale_lan_ip", return_value=None), \
+             mock.patch.object(nas_link, "_mac_book", return_value={"192.168.1.195": "x"}), \
+             mock.patch.object(nas_link, "mac_proven", return_value=False):
+            self.assertIsNone(nas_link.lan_route(["100.101.182.68", "adamsnas.local"]))
+
+    def test_only_the_interface_a_login_binds_to_counts(self):
+        self._learn()
+        mixed = ("? (192.168.1.195) at 6c:1f:f7:2a:16:d5 on en0 ifscope [ethernet]\n"
+                 "? (192.168.1.195) at 00:11:22:33:44:55 on en12 ifscope [ethernet]\n")
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner(mixed)):
+            self.assertTrue(nas_link.mac_proven("192.168.1.195", iface="en0"))
+            self.assertFalse(nas_link.mac_proven("192.168.1.195", iface="en12"))
+
+    def test_learning_reads_the_bound_interface_only(self):
+        mixed = ("? (192.168.1.195) at 6c:1f:f7:2a:16:d5 on en12 ifscope [ethernet]\n"
+                 "? (192.168.1.195) at 00:11:22:33:44:55 on en0 ifscope [ethernet]\n")
+        with mock.patch.object(nas_link, "_under_test", return_value=False), \
+             mock.patch.object(nas_link, "_run", side_effect=self._runner(mixed)):
+            nas_link.learn_mac("192.168.1.195", "192.168.1.92")     # en12's address in IFCONFIG
+        with open(self.book) as f:
+            self.assertEqual(__import__("json").load(f)["macs"], {"192.168.1.195": "6c:1f:f7:2a:16:d5"})
+
+    def test_a_leg_check_without_an_entry_is_not_cached(self):
+        self._learn()
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner("")):
+            self.assertFalse(nas_link.mac_proven("192.168.1.195", wait=False))
+        with mock.patch.object(nas_link, "_run", side_effect=self._runner(self.ARP)):
+            self.assertTrue(nas_link.mac_proven("192.168.1.195"))   # the next connect still asks
+
+    def test_never_learned_or_touched_from_a_test(self):
+        with mock.patch.object(nas_link, "_run", side_effect=AssertionError("no arp under test")):
+            nas_link.learn_mac("192.168.1.195")
+        self.assertFalse(os.path.exists(self.book))
 
 
 class Detect(unittest.TestCase):

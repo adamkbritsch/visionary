@@ -120,6 +120,57 @@ class Steps(_Lane):
         self.assertFalse(os.path.exists(os.path.join(d, "source.mkv")))
         self.assertTrue(os.path.exists(os.path.join(d, "p81.mkv")))
 
+    def test_waiting_for_the_shared_nas_slot_shows_on_the_lanes_row(self):
+        import contextlib, transfer
+        notes, order = [], []
+        @contextlib.contextmanager
+        def slot(abort=None, on_wait=None, prio=None):
+            order.append(("slot", prio))
+            on_wait("waiting for another app's NAS transfer to finish")
+            notes.append(dict(self.lane._status.get("fetch") or {}))
+            on_wait(None)
+            notes.append(dict(self.lane._status.get("fetch") or {}))
+            yield "BODY-ABORT"
+        def room(e):
+            order.append("room")
+            return True
+        def download(host, local, size, **kw):
+            order.append(("download", kw["abort"]))
+            self._fake_download(host, local, size)
+        with mock.patch.object(transfer, "nas_slot", side_effect=slot), \
+             mock.patch.object(self.lane, "_room", side_effect=room), \
+             mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=download), \
+             mock.patch.object(nas_ftp, "discard_stage"), \
+             mock.patch.object(dvp7, "convert", side_effect=self._fake_convert):
+            self.lane._fetch(self.e(), self.ev)
+        self.assertEqual((notes[0]["phase"], notes[0]["note"]),
+                         ("download", "waiting for another app's NAS transfer to finish"))
+        self.assertIsNone(notes[1]["note"])                  # gone once the slot is ours
+        # the disk budget is judged AFTER the wait, inside the slot, as background work
+        self.assertEqual(order, [("slot", transfer.BACKGROUND), "room", ("download", "BODY-ABORT")])
+
+    def test_no_room_once_the_slot_is_ours_downloads_nothing(self):
+        import contextlib, transfer
+        @contextlib.contextmanager
+        def slot(abort=None, on_wait=None, prio=None):
+            yield abort
+        with mock.patch.object(transfer, "nas_slot", side_effect=slot), \
+             mock.patch.object(self.lane, "_room", return_value=False), \
+             mock.patch.object(nas_ftp, "stat", return_value=(100, 7)), \
+             mock.patch.object(nas_ftp, "download", side_effect=AssertionError("no download")):
+            with self.assertRaises(dvlane._NoRoom):
+                self.lane._fetch(self.e(), self.ev)
+
+    def test_a_stop_while_waiting_is_the_lanes_stop(self):
+        import transfer
+        def slot(abort=None, on_wait=None, prio=None):
+            raise transfer.SlotStopped("stopped")
+        with mock.patch.object(transfer, "nas_slot", side_effect=slot), \
+             mock.patch.object(nas_ftp, "stat", return_value=(100, 7)):
+            with self.assertRaises(nas_ftp.Stopped):
+                self.lane._fetch(self.e(), self.ev)
+
     def test_the_log_says_when_mkvextract_pulled_the_video(self):
         def convert(src, out, work, **kw):
             return {**self._fake_convert(src, out, work), "extractor": "mkvextract"}
@@ -190,6 +241,43 @@ class Steps(_Lane):
         self.assertEqual(dvbook.profile_of(NAME)["profile"], 8)
         self.assertFalse(os.path.exists(dvlane.work_dir(HOST)))
         self.assertEqual(dvbook.summary()["saved_bytes"], 10)
+
+    def test_the_upload_also_reports_its_wait(self):
+        self._converted()
+        idle = {"count": 0, "files": set()}
+        seen = []
+        def upload(out, stage, **kw):
+            kw["on_wait"]("waiting for another NAS transfer on this Mac to finish")
+            seen.append(dict(self.lane._status.get("ship") or {}))
+        with mock.patch.object(nas_ftp, "upload", side_effect=upload), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "swap"), \
+             mock.patch.object(dvlane.plex, "session_detail", return_value=idle), \
+             mock.patch.object(dvlane.plex, "heavy_activities", return_value=[]), \
+             mock.patch.object(dvlane.plex, "part_size", return_value=90), \
+             mock.patch.object(dvlane.plex, "refresh_folder", return_value=True), \
+             mock.patch.object(dvlane.plex, "analyze", return_value=True):
+            self.lane._ship(self.e(), self.ev)
+        self.assertEqual(seen[0]["note"], "waiting for another NAS transfer on this Mac to finish")
+
+    def test_the_upload_note_clears_when_it_has_the_slot(self):
+        self._converted()
+        idle = {"count": 0, "files": set()}
+        seen = []
+        def upload(out, stage, **kw):
+            kw["on_wait"]("waiting for another app's NAS transfer to finish")
+            kw["on_wait"](None)
+            seen.append(dict(self.lane._status.get("ship") or {}))
+        with mock.patch.object(nas_ftp, "upload", side_effect=upload), \
+             mock.patch.object(nas_ftp, "remote_dv_profile", return_value=8), \
+             mock.patch.object(nas_ftp, "swap"), \
+             mock.patch.object(dvlane.plex, "session_detail", return_value=idle), \
+             mock.patch.object(dvlane.plex, "heavy_activities", return_value=[]), \
+             mock.patch.object(dvlane.plex, "part_size", return_value=90), \
+             mock.patch.object(dvlane.plex, "refresh_folder", return_value=True), \
+             mock.patch.object(dvlane.plex, "analyze", return_value=True):
+            self.lane._ship(self.e(), self.ev)
+        self.assertIsNone(seen[0]["note"])
 
     def test_a_staged_file_the_nas_does_not_read_as_8_is_never_swapped(self):
         self._converted()

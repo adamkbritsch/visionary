@@ -15,6 +15,7 @@ library is `/Media/TV-Shows`. Credentials come from env (`TOPAZ_NAS_FTP_*`) or
 hard-coded here.
 """
 from __future__ import annotations
+import contextlib
 import ftplib
 import threading
 import functools
@@ -169,6 +170,266 @@ def _link_retry(fn):
         finally:
             _LINK.bound, _LINK.plain = False, False
     return wrapper
+
+
+# ---- one NAS transfer at a time, across apps -----------------------------------------------
+# Expurgate (the sibling, ~/discretion) serialises its NAS transfers through a lock file and Visionary
+# takes the same one, so the two apps never move big files to the NAS at once. Live 2026-10-07:
+# Expurgate's 47 GB download crawled at 36 MB/s while Visionary's DV lane uploaded an 82 GB Titanic,
+# and the NAS sat in login-overload for 18 minutes. Same file, same rules as Expurgate's
+# transfer._Slot: an in-process gate (one transfer at a time inside this app too), then an exclusive
+# flock on LOCK_FILE, each polled every LOCK_POLL_SECS so a stop is still honoured while waiting.
+# Big transfers only — the downloads, uploads and publishes below, and the DV lane's
+# (nas_ftp.download/upload, once per transfer, never per leg). Listings, SIZE/MDTM, header probes
+# and verify reads never take it. The kernel drops a flock when its holder dies, so a crashed app
+# can never wedge the other; a lock file that cannot be opened lets the transfer go ahead.
+#
+# PRIORITY inside Visionary (review 2026-10-07). The upscale pipeline's own transfers — the run
+# thread's download and the finisher's upload — are FOREGROUND; the DV lane and the download-ahead
+# are BACKGROUND. A foreground transfer goes first among those waiting here, and one that has to wait
+# for a background holder asks it to step aside (`yielded`, below): a DV transfer resumes from its
+# bytes later, a download-ahead is pulled again in its turn. Otherwise an 82 GB DV transfer, held to
+# 25 MB/s while anyone watches Plex, would idle the GPU for most of an hour. Across apps nothing is
+# pre-empted: Expurgate's transfer always runs to its end.
+#
+# FAIR HANDOFF. Expurgate tries the lock every 2 s; Visionary's next transfer used to re-take it a
+# millisecond after the last one let go, so Expurgate almost never got a turn. After every release the
+# lock stays free for HANDOFF_SECS before Visionary may take it again.
+LOCK_FILE = os.path.expanduser("~/Library/Caches/nas-transfer.lock")
+LOCK_POLL_SECS = 2
+HANDOFF_SECS = 2.5
+WAIT_HERE = "waiting for another NAS transfer on this Mac to finish"
+WAIT_OTHER_APP = "waiting for another app's NAS transfer to finish"
+FOREGROUND, BACKGROUND = "foreground", "background"
+_SLOT_DEPTH = threading.local()
+_LAST_RELEASE = {"at": -1e9}           # monotonic time this app last let go of the flock
+
+
+class SlotStopped(Exception):
+    """A stop arrived while a transfer was still waiting for the NAS transfer slot."""
+
+
+class _Gate(object):
+    """The in-process half: one holder; foreground waiters before background ones; a foreground
+    waiter asks a background holder to yield (sets the holder's event). A foreground waiter counts
+    as waiting for its WHOLE wait (enter/leave), not just inside one timed acquire — or a background
+    one could slip in between two of its polls (review 2026-10-07)."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._owner = None
+        self._prio = None
+        self._yield = None
+        self._fg_waiting = 0
+
+    def enter(self, prio):
+        if prio == FOREGROUND:
+            with self._cv:
+                self._fg_waiting += 1
+
+    def leave(self, prio):
+        if prio == FOREGROUND:
+            with self._cv:
+                self._fg_waiting -= 1
+                self._cv.notify_all()
+
+    def acquire(self, prio, yield_ev, timeout):
+        end = time.monotonic() + timeout
+        fg = prio == FOREGROUND
+        with self._cv:
+            # a foreground waiter does not hold itself back: it is one of the _fg_waiting
+            while self._owner is not None or (not fg and self._fg_waiting > 0):
+                if fg and self._prio == BACKGROUND and self._yield is not None:
+                    self._yield.set()          # step aside: a foreground transfer is waiting
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cv.wait(left)
+            self._owner, self._prio, self._yield = threading.get_ident(), prio, yield_ev
+            return True
+
+    def release(self):
+        with self._cv:
+            self._owner, self._prio, self._yield = None, None, None
+            self._cv.notify_all()
+
+
+_GATE = _Gate()
+
+
+class _AnyEvent(object):
+    """is_set() when any of the events is (None entries ignored) — an abort plus a yield. Has the
+    Event's wait() too: the DV lane's retry pause waits on its abort (review 2026-10-07 — without
+    it the first dropped connection of a DV transfer raised AttributeError)."""
+
+    def __init__(self, *events):
+        self._events = [e for e in events if e is not None]
+
+    def is_set(self):
+        return any(e.is_set() for e in self._events)
+
+    def wait(self, timeout=None):
+        end = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                break
+            time.sleep(0.25 if left is None else min(0.25, left))
+        return self.is_set()
+
+
+def _lock_path():
+    """The cross-app lock file — never the real one from a test (Expurgate may be holding it)."""
+    return None if _under_test() else LOCK_FILE
+
+
+class _StepAside(Exception):
+    """A background waiter was asked to make way while it still waited for the other app."""
+
+
+@contextlib.contextmanager
+def nas_slot(abort=None, on_wait=None, prio=FOREGROUND):
+    """Hold the NAS transfer slot for the body; yields the body's ABORT — the caller's `abort` plus,
+    for a BACKGROUND transfer, the request to step aside for a foreground one. `abort` stops the
+    WAIT (SlotStopped). `on_wait(note)` is told what it is waiting for whenever that changes, and
+    `on_wait(None)` once it has the slot. Re-entrant on one thread: a nested slot is the outer one."""
+    depth = getattr(_SLOT_DEPTH, "n", 0)
+    if depth:
+        _SLOT_DEPTH.n = depth + 1
+        try:
+            yield getattr(_SLOT_DEPTH, "abort", abort)
+        finally:
+            _SLOT_DEPTH.n -= 1
+        return
+    last = [None]
+
+    def tell(note):
+        if on_wait and note != last[0]:
+            last[0] = note
+            try:
+                on_wait(note)
+            except Exception:  # noqa: BLE001 — a display hook never decides a transfer
+                pass
+
+    def stopped():
+        if abort is not None and abort.is_set():
+            raise SlotStopped("stopped while waiting for the NAS transfer slot")
+
+    yielded = threading.Event() if prio == BACKGROUND else None
+    fh, locked = None, False
+    _GATE.enter(prio)
+    try:
+        while True:                             # (again after stepping aside while still waiting)
+            while not _GATE.acquire(prio, yielded, LOCK_POLL_SECS):
+                stopped()
+                tell(WAIT_HERE)
+            try:
+                path = _lock_path()
+                if path:
+                    try:
+                        import fcntl
+                        while True:             # the other app's turn between two of ours
+                            gap = HANDOFF_SECS - (time.monotonic() - _LAST_RELEASE["at"])
+                            if gap <= 0:
+                                break
+                            stopped()
+                            if yielded is not None and yielded.is_set():
+                                raise _StepAside()
+                            time.sleep(min(gap, 0.25))
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        fh = open(path, "a")
+                        while True:
+                            try:
+                                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                locked = True
+                                break
+                            except OSError:
+                                stopped()
+                                if yielded is not None and yielded.is_set():
+                                    raise _StepAside()
+                                tell(WAIT_OTHER_APP)
+                                time.sleep(LOCK_POLL_SECS)
+                    except (SlotStopped, _StepAside):
+                        raise
+                    except Exception:  # noqa: BLE001 — a lock file we cannot open must not stop a transfer
+                        if fh is not None:
+                            try:
+                                fh.close()
+                            except OSError:
+                                pass
+                        fh, locked = None, False
+            except _StepAside:
+                # still waiting for the other app when a foreground transfer of ours asked for the
+                # turn: give it the gate (never having held the lock) and queue again behind it
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+                fh, locked = None, False
+                _GATE.release()
+                yielded.clear()
+                tell(WAIT_HERE)
+                continue
+            except BaseException:
+                _GATE.release()
+                raise
+            break
+    finally:
+        _GATE.leave(prio)
+    try:
+        if last[0] is not None:
+            tell(None)
+        body_abort = _AnyEvent(abort, yielded) if yielded is not None else abort
+        _SLOT_DEPTH.n, _SLOT_DEPTH.abort = 1, body_abort
+        try:
+            yield body_abort
+        finally:
+            _SLOT_DEPTH.n, _SLOT_DEPTH.abort = 0, None
+    finally:
+        if fh is not None:
+            try:
+                fh.close()                      # closing drops the flock
+            except OSError:
+                pass
+            if locked:
+                _LAST_RELEASE["at"] = time.monotonic()
+        _GATE.release()
+
+
+SMALL_TRANSFER_BYTES = 64 * 1024 * 1024   # below this an upload is a short exchange: no slot
+
+
+def _one_transfer(fn=None, *, size_of=None):
+    """Run a big NAS transfer inside the slot — once for the whole call, _link_retry's second
+    attempt included. Adds `on_wait=` and `prio=` (see nas_slot); a stop while waiting, or a
+    background transfer stepping aside, is an abort. `size_of(args)` lets a SMALL transfer (the
+    DV probe's few KB, review 2026-10-07) skip the queue altogether."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **kw):
+            on_wait = kw.pop("on_wait", None)
+            prio = kw.pop("prio", FOREGROUND)
+            if size_of is not None:
+                try:
+                    small = size_of(a, kw) < SMALL_TRANSFER_BYTES
+                except (OSError, TypeError, ValueError, IndexError):
+                    small = False
+                if small:
+                    return fn(*a, **kw)
+            try:
+                with nas_slot(kw.get("abort"), on_wait, prio) as body_abort:
+                    if body_abort is not None:
+                        kw["abort"] = body_abort
+                    return fn(*a, **kw)
+            except SlotStopped as e:
+                return False, None, "aborted: %s" % e
+        return wrapper
+    return deco(fn) if fn is not None else deco
+
+
+def _local_size(a, kw):
+    return os.path.getsize(a[0])
 
 
 def _route_order(hosts, wait=True):
@@ -481,6 +742,12 @@ def _open(timeout, lan_only, login_wait=None, observe=True):
                 pass
             ftp.set_pasv(True)   # passive (smbftpd PassiveModePortRange 40000-50000)
             _LINK.bound = bool(src)
+            if src:                # a login over the PROVEN LAN route: remember who answered there
+                try:
+                    import nas_link
+                    nas_link.learn_mac(host, src)
+                except Exception:  # noqa: BLE001 — learning is a bonus, never a failure
+                    pass
             return ftp
         except NasBusy:
             raise                        # the NAS itself is stalled: no other route helps
@@ -690,6 +957,7 @@ def download_head(remote_path, local_file, max_bytes, *, timeout=None):
         except Exception: pass
 
 
+@_one_transfer
 @_link_retry
 def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=None):
     """Pull a source from the NAS via FTP. Returns (ok, local_path, reason).
@@ -726,16 +994,23 @@ def download(remote_path, local_dir, *, timeout=None, on_progress=None, abort=No
             return False, local, f"PARTIAL download: remote {total} != local {lsz} bytes"
         return True, local, f"downloaded {lsz} bytes (size-verified)"
     except _Aborted:
+        # close HARD: the server is still streaming the RETR we walked away from, so a polite QUIT
+        # can sit unanswered for the whole TRANSFER_TIMEOUT — holding the NAS transfer slot while
+        # the transfer that asked for it waits (review 2026-10-07)
+        try: ftp.close()
+        except Exception: pass  # noqa: BLE001
         return False, local, "aborted mid-download"
     except ftplib.all_errors as e:
         return False, local, f"download failed: {_why(e)}"
     finally:
-        try: ftp.quit()
-        except ftplib.all_errors: pass
+        if getattr(ftp, "sock", None) is not None:
+            try: ftp.quit()
+            except ftplib.all_errors: pass
 
 
+@_one_transfer(size_of=_local_size)
 @_link_retry
-def upload(local_file, remote_dir, *, timeout=None, on_progress=None):
+def upload(local_file, remote_dir, *, timeout=None, on_progress=None, abort=None):
     """Push the finished file to the NAS via FTP (spacey paths OK, no quoting).
     smbftpd writes it as uid 1000 / gid 10 (umask 007) — Plex-readable, no chown.
     on_progress(done_bytes, total_bytes) fires per block sent. Returns (ok, remote, reason)."""
@@ -901,9 +1176,10 @@ def _copy_sidecars(ftp, src_dir, dst_dir, scratch_dir) -> int:
     return copied
 
 
+@_one_transfer(size_of=_local_size)
 @_link_retry
 def publish_master(local_master, master_remote, sidecar_src_dir, scratch_dir, *,
-                   timeout=None, on_progress=None) -> tuple:
+                   timeout=None, on_progress=None, abort=None) -> tuple:
     """Publish a finished master into a NEW library path (folder-split YouTube): make the dest dir
     tree, STOR the master (size-verified — never accept an unverifiable upload), then copy the
     source folder's SIDECARS alongside it so Plex keeps youtarr's .nfo/thumbnail/subs. Does NOT

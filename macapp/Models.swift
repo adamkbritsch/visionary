@@ -42,6 +42,8 @@ struct ProgressDTO: Codable {
     var ep_secs_total: Double?
     var eta_secs: Double?
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
+    var waiting: String?      // download/upload: queued for the NAS transfer slot shared with
+                              // Expurgate ("waiting for another app's NAS transfer to finish")
     // No timer. A countdown has to start somewhere, and the only place with slack is the
     // top of the stage — but the takeover lands whenever setup() finishes (Resolve's cold
     // start plus a 20-chunk import), so the number hit zero and then sat at "now..." for

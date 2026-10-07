@@ -398,6 +398,39 @@ class WrongClockInputIsRebuilt(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(p.segdir, "seg_0000.mov")))
 
 
+class SlotNotes(unittest.TestCase):
+    def test_the_stage_surface_says_it_is_waiting_and_then_stops(self):
+        seen = []
+        note = stages._slot_note(seen.append, "download", "S04E07")
+        note("waiting for another app's NAS transfer to finish")
+        note(None)
+        self.assertEqual(seen[0]["waiting"], "waiting for another app's NAS transfer to finish")
+        self.assertNotIn("waiting", seen[1])
+        self.assertEqual((seen[1]["stage"], seen[1]["ep"]), ("download", "S04E07"))
+
+    def test_no_surface_no_hook(self):
+        self.assertIsNone(stages._slot_note(None, "upload", "S01E01"))
+
+    def test_a_download_we_stopped_is_interrupted_not_a_failure(self):
+        self.assertEqual(stages._stopped_is_interrupted("aborted mid-download"),
+                         "interrupted: aborted mid-download")
+        self.assertEqual(stages._stopped_is_interrupted("aborted: stopped while waiting for the NAS transfer slot"),
+                         "interrupted: aborted: stopped while waiting for the NAS transfer slot")
+        self.assertEqual(stages._stopped_is_interrupted("download failed: 550"), "download failed: 550")
+
+    def test_the_download_ahead_is_background_and_the_run_is_foreground(self):
+        import tempfile
+        from orchestrator import episode_paths
+        seen = []
+        def dl(remote, local_dir, **kw):
+            seen.append(kw.get("prio"))
+            return False, None, "download failed: test"
+        for low in (True, False):
+            p = episode_paths("Show", "S01E01", "Show - S01E01.mkv", scratch_dir=tempfile.mkdtemp())
+            with mock.patch.object(stages.transfer, "download", side_effect=dl):
+                stages._download_body(p, None, None, low_prio=low)
+        self.assertEqual(seen, [stages.transfer.BACKGROUND, stages.transfer.FOREGROUND])
+
 if __name__ == "__main__":
     unittest.main()
 

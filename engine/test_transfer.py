@@ -694,6 +694,303 @@ class LoginBreaker(unittest.TestCase):
         self.assertFalse(transfer._BREAKER["checking"])
 
 
+class NasTransferSlot(unittest.TestCase):
+    """One NAS transfer at a time, across apps (Expurgate takes the same lock file). Live
+    2026-10-07: a 47 GB Expurgate download crawled at 36 MB/s beside Visionary's 82 GB Titanic
+    upload while the NAS sat in login-overload for 18 minutes."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        self.lock = os.path.join(self.d, "nas-transfer.lock")
+        for p in (mock.patch.object(transfer, "LOCK_POLL_SECS", 0.02),
+                  mock.patch.object(transfer, "HANDOFF_SECS", 0),
+                  mock.patch.object(transfer, "_lock_path", return_value=self.lock)):
+            p.start(); self.addCleanup(p.stop)
+
+    def test_never_the_real_lock_file_from_a_test(self):
+        mock.patch.stopall()
+        self.assertIsNone(transfer._lock_path())
+
+    def test_the_lock_file_is_the_one_expurgate_takes(self):
+        self.assertEqual(transfer.LOCK_FILE,
+                         os.path.expanduser("~/Library/Caches/nas-transfer.lock"))
+
+    def test_another_app_holding_it_makes_us_wait_and_say_so(self):
+        import fcntl, threading
+        other = open(self.lock, "a")                 # another process's open file = its own lock
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        notes, got = [], threading.Event()
+        def run():
+            with transfer.nas_slot(on_wait=notes.append):
+                got.set()
+        t = threading.Thread(target=run); t.start()
+        self.assertFalse(got.wait(0.2))              # held off while the other app transfers
+        fcntl.flock(other, fcntl.LOCK_UN); other.close()
+        self.assertTrue(got.wait(2)); t.join(2)
+        self.assertEqual(notes, [transfer.WAIT_OTHER_APP, None])
+
+    def test_a_stop_while_waiting_is_honoured(self):
+        import fcntl, threading
+        other = open(self.lock, "a")
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        stop = threading.Event(); stop.set()
+        with self.assertRaises(transfer.SlotStopped):
+            with transfer.nas_slot(abort=stop):
+                self.fail("must not run")
+        other.close()
+
+    def test_our_own_transfers_take_turns_too(self):
+        import threading
+        live, peak, notes = [0], [0], []
+        lock = threading.Lock()
+        def work():
+            with transfer.nas_slot(on_wait=notes.append):
+                with lock:
+                    live[0] += 1; peak[0] = max(peak[0], live[0])
+                import time as _t; _t.sleep(0.05)
+                with lock:
+                    live[0] -= 1
+        ts = [threading.Thread(target=work) for _ in range(4)]
+        [t.start() for t in ts]; [t.join(5) for t in ts]
+        self.assertEqual(peak[0], 1)
+        self.assertIn(transfer.WAIT_HERE, notes)
+
+    def test_a_foreground_transfer_asks_a_background_holder_to_step_aside(self):
+        import threading
+        holding, asked, done = threading.Event(), [], threading.Event()
+        def background():
+            with transfer.nas_slot(prio=transfer.BACKGROUND) as body_abort:
+                holding.set()
+                for _ in range(200):                     # a DV leg checks its abort as it goes
+                    if body_abort.is_set():
+                        asked.append(True)
+                        return
+                    import time as _t; _t.sleep(0.01)
+        t = threading.Thread(target=background); t.start()
+        self.assertTrue(holding.wait(2))
+        with transfer.nas_slot(prio=transfer.FOREGROUND):
+            done.set()
+        t.join(2)
+        self.assertEqual(asked, [True])
+        self.assertTrue(done.is_set())
+
+    def test_a_foreground_holder_is_never_asked_to_step_aside(self):
+        with transfer.nas_slot(prio=transfer.FOREGROUND) as body_abort:
+            self.assertIsNone(body_abort)                # nothing but the caller's own abort
+
+    def test_foreground_waiters_go_before_background_ones(self):
+        import threading
+        order, gate = [], threading.Event()
+        def hold():
+            with transfer.nas_slot(prio=transfer.FOREGROUND):
+                gate.wait(2)
+        def take(name, prio):
+            with transfer.nas_slot(prio=prio):
+                order.append(name)
+        h = threading.Thread(target=hold); h.start()
+        import time as _t; _t.sleep(0.05)
+        bg = threading.Thread(target=take, args=("background", transfer.BACKGROUND)); bg.start()
+        _t.sleep(0.05)
+        fg = threading.Thread(target=take, args=("foreground", transfer.FOREGROUND)); fg.start()
+        _t.sleep(0.05)
+        gate.set()
+        for t in (h, bg, fg):
+            t.join(3)
+        self.assertEqual(order, ["foreground", "background"])
+
+    def test_the_other_app_gets_a_turn_between_two_of_ours(self):
+        import time as _t
+        with mock.patch.object(transfer, "HANDOFF_SECS", 0.3):
+            with transfer.nas_slot():
+                pass
+            t0 = _t.monotonic()
+            with transfer.nas_slot():                     # the lock stays free for the handoff
+                pass
+            self.assertGreaterEqual(_t.monotonic() - t0, 0.25)
+
+    def test_the_note_follows_what_it_waits_for(self):
+        import fcntl, threading, time as _t
+        notes, release = [], threading.Event()
+        with mock.patch.object(transfer, "HANDOFF_SECS", 0.5):
+            def holder():
+                with transfer.nas_slot():
+                    release.wait(2)
+            h = threading.Thread(target=holder); h.start()
+            _t.sleep(0.05)
+            def waiter():
+                with transfer.nas_slot(on_wait=notes.append):
+                    pass
+            w = threading.Thread(target=waiter); w.start()
+            _t.sleep(0.1)                                  # queued behind our own transfer
+            release.set(); h.join(2)                       # ours is done: the handoff window opens
+            other = open(self.lock, "a")                   # ...and the other app takes its turn in it
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _t.sleep(0.7)
+            fcntl.flock(other, fcntl.LOCK_UN); other.close()
+            w.join(3)
+        self.assertEqual(notes, [transfer.WAIT_HERE, transfer.WAIT_OTHER_APP, None])
+
+    def test_a_background_body_still_honours_the_callers_own_stop(self):
+        stop = __import__("threading").Event()
+        with transfer.nas_slot(abort=stop, prio=transfer.BACKGROUND) as body_abort:
+            self.assertFalse(body_abort.is_set())
+            stop.set()
+            self.assertTrue(body_abort.is_set())          # the caller's own stop still counts
+
+    def test_the_combined_abort_can_be_waited_on_like_an_event(self):
+        # review 2026-10-07: the DV lane's retry pause calls abort.wait(); without it the first
+        # dropped connection of every DV transfer raised AttributeError and failed the movie
+        import threading, time as _t
+        a, y = threading.Event(), threading.Event()
+        any_ = transfer._AnyEvent(a, y)
+        t0 = _t.monotonic()
+        self.assertFalse(any_.wait(0.1))
+        self.assertGreaterEqual(_t.monotonic() - t0, 0.09)
+        threading.Timer(0.05, y.set).start()
+        self.assertTrue(any_.wait(2))
+        import nas_ftp
+        with self.assertRaises(nas_ftp.Stopped):
+            nas_ftp._pause(any_, 5)                    # set already: stops at once, no crash
+
+    def test_a_background_waiter_steps_aside_even_before_it_has_the_lock(self):
+        import fcntl, threading, time as _t
+        other = open(self.lock, "a")                   # the other app transfers
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        order = []
+        def background():
+            with transfer.nas_slot(prio=transfer.BACKGROUND):
+                order.append("background")
+        def foreground():
+            with transfer.nas_slot(prio=transfer.FOREGROUND):
+                order.append("foreground")
+        b = threading.Thread(target=background); b.start()
+        _t.sleep(0.1)                                  # background holds the gate, waits on the app
+        f = threading.Thread(target=foreground); f.start()
+        _t.sleep(0.1)                                  # it must hand the gate to the foreground
+        fcntl.flock(other, fcntl.LOCK_UN); other.close()
+        b.join(3); f.join(3)
+        self.assertEqual(order, ["foreground", "background"])
+
+    def test_a_foreground_waiter_keeps_priority_between_its_polls(self):
+        transfer._GATE.enter(transfer.FOREGROUND)       # a foreground waiter between two polls
+        try:
+            self.assertFalse(transfer._GATE.acquire(transfer.BACKGROUND, None, 0.05))
+        finally:
+            transfer._GATE.leave(transfer.FOREGROUND)
+        self.assertTrue(transfer._GATE.acquire(transfer.BACKGROUND, None, 0.05))
+        transfer._GATE.release()
+
+    def test_a_small_upload_never_queues(self):
+        small = os.path.join(self.d, "dv_probe.py")
+        open(small, "w").write("x" * 1000)
+        with mock.patch.object(transfer, "nas_slot", side_effect=AssertionError("no slot for a few KB")), \
+             mock.patch.object(transfer, "connect", side_effect=transfer.ftplib.error_temp("offline")):
+            ok, _r, why = transfer.upload(small, "/Media/x")
+        self.assertFalse(ok)
+        self.assertIn("offline", why)
+
+    def test_a_stopped_download_closes_hard_instead_of_waiting_on_quit(self):
+        import threading
+        stop = threading.Event()
+        closed, quit_called = [], []
+        class Fake(object):
+            sock = object()
+            def voidcmd(self, *a): return "200"
+            def size(self, path): return 10
+            def retrbinary(self, cmd, cb):
+                stop.set(); cb(b"x")
+            def close(self):
+                closed.append(1); self.sock = None
+            def quit(self):
+                quit_called.append(1)
+        with mock.patch.object(transfer, "connect", return_value=Fake()):
+            ok, _l, why = transfer.download("/Media/x.mkv", self.d, abort=stop)
+        self.assertEqual((ok, why), (False, "aborted mid-download"))
+        self.assertEqual((closed, quit_called), ([1], []))
+
+    def test_a_nested_transfer_on_the_same_thread_never_deadlocks(self):
+        with transfer.nas_slot():
+            with transfer.nas_slot():
+                pass
+
+    def test_a_lock_file_that_cannot_be_opened_never_stops_a_transfer(self):
+        with mock.patch.object(transfer, "_lock_path", return_value="/nonexistent/dir/x.lock"), \
+             mock.patch("os.makedirs", side_effect=OSError("read-only")):
+            with transfer.nas_slot():
+                pass
+
+    def test_the_slot_is_released_when_the_transfer_raises(self):
+        with self.assertRaises(RuntimeError):
+            with transfer.nas_slot():
+                raise RuntimeError("boom")
+        with transfer.nas_slot():                     # free again
+            pass
+
+    def test_one_slot_for_a_whole_transfer_including_its_lan_retry(self):
+        entered = []
+        real = transfer.nas_slot
+        def counting(abort=None, on_wait=None, prio=transfer.FOREGROUND):
+            entered.append(1)
+            return real(abort, on_wait, prio)
+        attempts = []
+        def fake_body(*a, **kw):
+            attempts.append(1)
+            transfer._LINK.bound = True               # took the LAN route...
+            return False, "x", "download failed: link lost"      # ...and lost it
+        with mock.patch.object(transfer, "nas_slot", side_effect=counting), \
+             mock.patch.object(transfer, "connect", side_effect=AssertionError("unused")):
+            wrapped = transfer._one_transfer(transfer._link_retry(fake_body))
+            wrapped("/Media/x.mkv", "/tmp")
+        self.assertEqual((len(entered), len(attempts)), (1, 2))
+
+    def test_a_stop_while_waiting_reads_as_an_abort_to_callers(self):
+        import fcntl, threading
+        other = open(self.lock, "a")
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        stop = threading.Event(); stop.set()
+        ok, _local, why = transfer.download("/Media/x.mkv", self.d, abort=stop)
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("aborted"), why)
+        other.close()
+
+    def test_every_big_transfer_is_wrapped_and_short_ones_are_not(self):
+        import inspect
+        src = inspect.getsource(transfer)
+        import re
+        for name in ("download", "upload", "publish_master"):
+            self.assertRegex(src, r"@_one_transfer(\(size_of=_local_size\))?\n@_link_retry\ndef %s\(" % name)
+        for name in ("download_head", "remote_size", "ftp_listdir", "ftp_walk_files"):
+            self.assertNotIn("@_one_transfer\ndef %s(" % name, src)
+
+
+class LearnsOnlyOverAProvenRoute(unittest.TestCase):
+    SETTINGS = {"port": 21, "user": "u", "passwd": "p"}
+
+    def _connect(self, routes):
+        import nas_link
+        class Fake(transfer._WireFTP):
+            def connect(self, host, port, timeout=None, source_address=None):
+                return "220 ready"
+            def login(self, *a): pass
+            def sendcmd(self, *a): return "200"
+            def set_pasv(self, *a): pass
+        with mock.patch.object(transfer, "_WireFTP", Fake), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["100.101.182.68"]), \
+             mock.patch.object(transfer, "ftp_settings", return_value=self.SETTINGS), \
+             mock.patch.object(transfer, "_route_order", return_value=routes), \
+             mock.patch.object(nas_link, "learn_mac") as learn:
+            transfer.connect(timeout=15)
+        return learn
+
+    def test_a_login_over_the_proven_lan_route_teaches_its_address(self):
+        self._connect([("192.168.1.195", "192.168.1.92")]).assert_called_once_with(
+            "192.168.1.195", "192.168.1.92")
+
+    def test_a_plain_route_login_teaches_nothing(self):
+        self._connect([("100.101.182.68", None)]).assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 

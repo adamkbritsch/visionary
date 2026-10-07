@@ -378,7 +378,9 @@ def _revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
             nas_path, d,
             on_progress=lambda done, total: _step(
                 label, "download", pct=(round(done / total * 100, 1) if total else None),
-                step="fetching the master", kind=kind))
+                step="fetching the master", kind=kind),
+            on_wait=lambda note: _step(label, "download", pct=0,
+                                       step=note or "fetching the master", kind=kind))
         if not got:
             return {"status": "download-failed", "detail": msg}
 
@@ -446,7 +448,9 @@ def _revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
             fixed, os.path.dirname(nas_path),
             on_progress=lambda done, total: _step(
                 label, "upload", pct=(round(done / total * 100, 1) if total else None),
-                step="putting it back", kind=kind))
+                step="putting it back", kind=kind),
+            on_wait=lambda note: _step(label, "upload", pct=0,
+                                       step=note or "putting it back", kind=kind))
         if not up:
             return {"status": "upload-failed", "detail": umsg}
         sok, smsg = _swap_in(revised_remote, nas_path)

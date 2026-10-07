@@ -1406,6 +1406,16 @@ class Orchestrator:
                     m = _elapsed_map(); m[self._elapsed_key] = round(info["elapsed_secs"], 1); _elapsed_write(m)
                 self._elapsed_last_save = mono
         self.state["progress"] = info
+        self._show_slot_wait(info)
+
+    def _show_slot_wait(self, info):
+        """A pipeline transfer waiting for the shared NAS transfer slot says so on the run line
+        ("S04E07: download — waiting for another app's NAS transfer to finish"), and stops saying
+        so the moment it has it."""
+        msg = self.state.get("message") or ""
+        base = msg.split(" — waiting for another", 1)[0]
+        wait = (info or {}).get("waiting")
+        self.state["message"] = "%s — %s" % (base, wait) if wait else base
 
     def _start_caffeinate(self):
         """Keep the display + system awake for the WHOLE run (not just the resolve
@@ -4112,6 +4122,10 @@ class Orchestrator:
         """The finisher's own progress surface (state['finishing']) — NEVER _set_progress, whose
         ETA window state is single-slot and belongs to the run thread."""
         f = dict(self.state.get("finishing") or {})
+        if info.get("waiting"):            # the shared NAS transfer slot is taken (transfer.nas_slot)
+            f["holding"] = info["waiting"]
+        elif str(f.get("holding") or "").startswith("waiting for another"):
+            f.pop("holding", None)
         f.update({"stage": info.get("stage") or f.get("stage"), "pct": info.get("pct"),
                   "frames": info.get("frames"), "total": info.get("total"),
                   # segment bar (remux is segmented like topaz); explicit so a non-segmented stage
@@ -4147,6 +4161,10 @@ class Orchestrator:
         bookkeeping stays single-slot on lane 1. Without an ETA here the UI could only ever say
         "Remux x2 - 3% / 41%" with no time against the slower lane."""
         f = dict(self.state.get("finishing2") or {})
+        if info.get("waiting"):            # the shared NAS transfer slot is taken (transfer.nas_slot)
+            f["holding"] = info["waiting"]
+        elif str(f.get("holding") or "").startswith("waiting for another"):
+            f.pop("holding", None)
         f.update({"stage": info.get("stage") or f.get("stage"), "pct": info.get("pct"),
                   "frames": info.get("frames"), "total": info.get("total"),
                   "notches": info.get("notches"), "seg_done": info.get("seg_done"),

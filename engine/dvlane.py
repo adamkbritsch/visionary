@@ -56,6 +56,7 @@ import dvp7
 import logbook
 import nas_ftp
 import plex
+import transfer
 
 WORK_ROOT = (os.path.join(tempfile.gettempdir(), "visionary-test-dvlane")
              if "unittest" in sys.modules else os.path.expanduser("~/topaz-dv-convert"))
@@ -721,12 +722,19 @@ class Lane:
         self._check(name, ev)
         with self._transfer("fetch", e, "download", ev):
             # The budget was judged when the movie was picked; the turn to transfer can come a whole
-            # upload later, and the pipeline's own upscale writes to the same disk meanwhile.
-            if not self._room(e):
-                raise _NoRoom(name)
-            logbook.event(f"DV 7->8.1 {e.get('title')}: downloading {size / 1e9:.1f} GB")
-            nas_ftp.download(host, src, size, abort=ev, limit=self._limit,
-                             on_progress=lambda b, t: self._set("fetch", e, "download", b, t))
+            # upload later — or a whole other app's transfer later (the shared NAS slot) — and the
+            # pipeline's own upscale writes to the same disk meanwhile. So it is judged again once
+            # the slot is ours (review 2026-10-07); the download's own slot nests inside this one.
+            note = lambda n: self._set("fetch", e, "download", note=n)
+            try:
+                with transfer.nas_slot(ev, note, transfer.BACKGROUND) as body_abort:
+                    if not self._room(e):
+                        raise _NoRoom(name)
+                    logbook.event(f"DV 7->8.1 {e.get('title')}: downloading {size / 1e9:.1f} GB")
+                    nas_ftp.download(host, src, size, abort=body_abort, limit=self._limit,
+                                     on_progress=lambda b, t: self._set("fetch", e, "download", b, t))
+            except transfer.SlotStopped:
+                raise nas_ftp.Stopped("stopped while waiting for the NAS transfer slot")
         self._set("fetch", e, "convert", 0, 100)      # the download row must not look live now
         self._check(name, ev)
         dvbook.update(name, phase="convert")
@@ -838,7 +846,8 @@ class Lane:
             with self._transfer("ship", e, "upload", ev):
                 logbook.event(f"DV 7->8.1 {e.get('title')}: uploading {size_out / 1e9:.1f} GB")
                 nas_ftp.upload(out, stage, abort=ev, limit=self._limit,
-                               on_progress=lambda b, t: self._set("ship", e, "upload", b, t))
+                               on_progress=lambda b, t: self._set("ship", e, "upload", b, t),
+                               on_wait=lambda note: self._set("ship", e, "upload", note=note))
             self._set("ship", e, "swap", note="checking the uploaded copy on the NAS")
             prof = nas_ftp.remote_dv_profile(stage)
             if prof != 8:

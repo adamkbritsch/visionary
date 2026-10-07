@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import calendar
 import ftplib
+import functools
 import hashlib
 import ipaddress
 import os
@@ -514,6 +515,27 @@ def _last_leg_error() -> str:
     return f" — last error: {err}" if err else ""
 
 
+def _slotted(fn):
+    """The whole transfer — every leg and the verify — inside the NAS transfer slot shared with
+    the pipeline and with Expurgate (transfer.nas_slot): taken once per transfer, never per leg.
+    The DV lane is BACKGROUND work: when the upscale pipeline needs the NAS it is asked to step
+    aside, which ends the transfer as Stopped — its bytes stay, and the next attempt resumes from
+    them. `on_wait(note)` says what it is waiting for; a stop while waiting is Stopped too."""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        import transfer
+        on_wait = kw.pop("on_wait", None)
+        try:
+            with transfer.nas_slot(kw.get("abort"), on_wait, transfer.BACKGROUND) as body_abort:
+                if body_abort is not None:
+                    kw["abort"] = body_abort
+                return fn(*a, **kw)
+        except transfer.SlotStopped:
+            raise Stopped("stopped while waiting for the NAS transfer slot")
+    return wrapper
+
+
+@_slotted
 def download(host_path, local, size, *, abort=None, limit=None, on_progress=None):
     """Resumable pull of a NAS file to `local`, verified by size and sampled ranges. A dropped leg
     resumes from the bytes already on disk; a leg never reads past `size`, so a NAS file that grew
@@ -561,6 +583,7 @@ def download(host_path, local, size, *, abort=None, limit=None, on_progress=None
     return local
 
 
+@_slotted
 def upload(local, stage_host, *, abort=None, limit=None, on_progress=None):
     """Resumable push of `local` to a NAS staging path, verified by size and sampled ranges."""
     size = os.path.getsize(local)
