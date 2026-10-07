@@ -425,19 +425,36 @@ class Lane:
 
     def _offline(self, ex) -> bool:
         """A step that failed because the NAS dropped off the network (asleep, the Mac away from
-        home) is not the movie's fault: wait for the NAS instead of failing it."""
-        if nas_ftp.reachable():
+        home) is not the movie's fault: wait for the NAS instead of failing it.
+
+        Nor is one that failed of an OVERLOAD: a NasBusy, or ANY failure while the NAS is in
+        overload mode — a slow login then still succeeds, so reachable() says yes while the step
+        itself died of the overload (a read that timed out, a connection the NAS dropped) — and
+        even when the breaker closed between the failure and this check. While overloaded the
+        wait spends no login of its own: the breaker's check finds the end (review 2026-10-06)."""
+        busy = nas_ftp._is_busy(ex) or nas_ftp.overloaded()
+        if not busy and nas_ftp.reachable():
             return False
+
         def why(ex):
             if isinstance(ex, nas_ftp.NoLink):
                 return (f"waiting: {ex.note}" if getattr(ex, "note", None) else
                         "waiting for an Ethernet link to the NAS (Settings: NAS network is Ethernet only)")
+            if nas_ftp.overloaded():
+                import transfer
+                return f"waiting for the NAS — {transfer.busy_text()}"   # live, never the moment
+            if busy:                                                   # it failed at
+                return "waiting for the NAS (it was overloaded — checking that it answers again)"
             return f"waiting for the NAS (it does not answer over FTP: {str(ex)[:120]})"
         self._note = why(ex)
-        while not self._abort.is_set() and not nas_ftp.reachable():
+        while not self._abort.is_set():
+            if nas_ftp.overloaded():
+                self._note = why(ex)
+            elif nas_ftp.reachable():
+                break
             # The reason follows what is true NOW (a cable plugged back in while the NAS is still
             # rebooting is no longer a cable problem — review 2026-09-30).
-            if (nas_ftp.link() or {}).get("unavailable"):
+            elif (nas_ftp.link() or {}).get("unavailable"):
                 self._note = why(nas_ftp.NoLink(""))
             elif getattr(ex, "note", None):
                 self._note = why(ex)           # a configuration Ethernet only cannot pin: still so

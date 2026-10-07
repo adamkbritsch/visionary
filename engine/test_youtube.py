@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -1698,6 +1699,11 @@ class Warmup(unittest.TestCase):
             p = mock.patch.object(youtube, name, 0.0)
             p.start()
             self.addCleanup(p.stop)
+        # A private tick lock: orchestrator threads another test left running call warm_up every
+        # 20 s, and one holding the module's lock made this test's tick a no-op (a flaky failure).
+        p = mock.patch.object(youtube, "_WARMUP_RUN", threading.Lock())
+        p.start()
+        self.addCleanup(p.stop)
         self.asked = []
         for target, fn in (("youtarr.download_videos", lambda ids, **k: self.asked.append(list(ids)) or True),
                            ("youtarr.channel_folder", lambda c, **k: "Chan"),

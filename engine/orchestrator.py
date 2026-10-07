@@ -2198,9 +2198,10 @@ class Orchestrator:
                         # fault while the real problem was a show whose folder yields nothing
                         # (wrong volume cached, renamed/moved on the NAS). Probe the NAS once:
                         # if it answers, name the show instead of blaming the network.
-                        msg = "NAS unreachable — retrying"
+                        msg = self._nas_hold_msg()
                         try:
-                            if series.list_series():          # NAS answered → not a network fault
+                            if not transfer.nas_busy() and series.list_series():   # (no slow
+                                # login spent on a probe while overloaded — and no folder blame)          # NAS answered → not a network fault
                                 shows = ", ".join(self._participants()) or "the selected show"
                                 msg = (f"no episodes found for {shows} — check the show's folder "
                                        f"on the NAS (retrying)")
@@ -2872,6 +2873,8 @@ class Orchestrator:
                 self._sleep(20); continue                         # NAS quiet so precache can't stutter it
             if self._extend_active.is_set():                      # AI outpainting owns the machine — a
                 self._sleep(20); continue                         # background CFR would contend for it
+            if transfer.nas_busy():                               # the NAS is overloaded (login breaker
+                self._sleep(60); continue                         # open): every pull would fail at once
             try:
                 cands = self._prefetch_candidates()
                 self._purge_prefetch_orphans(cands)               # drop buffer files for now-gone items
@@ -2896,10 +2899,14 @@ class Orchestrator:
 
                     if self._plex_started_now():                  # FRESH check at the decision point: never
                         break                                     # even START a pull if a stream just began
-                    self._download_once(p, low_prio=True,                                 # → prefetch buffer;
+                    ok, _msg = self._download_once(p, low_prio=True,                      # → prefetch buffer;
                         extra_abort=_AnyEvent(self._plex_abort, self._prefetch_yield))
                                                                   # E-cores only + aborts if a Plex stream starts
-                    did = True
+                    if (not ok and not p.movie and not p.youtube  # the cached queue may list a source
+                            and str(_msg).startswith("download failed:")   # that is gone (550) —
+                            and not transfer.nas_busy()):         # re-list before retrying it
+                        series.mark_stale(p.series)
+                    did = bool(ok)                                # a failure waits the relaxed minute
                     break                                         # one at a time; re-evaluate the pool
             except Exception:
                 pass
@@ -3488,10 +3495,11 @@ class Orchestrator:
                 # lost 147 GB the same morning). Verified by probing the NAS, never by
                 # matching the failure message; a reachable NAS refusing the file is still a
                 # genuine failure and still counts.
-                if st == "download" and self._nas_unreachable():
-                    logbook.event(f"{ep_disp}: download waiting — NAS unreachable "
+                if st == "download" and (self._overload_fault(msg) or self._nas_unreachable()):
+                    why = "NAS overloaded" if transfer.nas_busy() else "NAS unreachable"
+                    logbook.event(f"{ep_disp}: download waiting — {why} "
                                   f"(not counted against the item)")
-                    self._hold("nas", "NAS unreachable — retrying")
+                    self._hold("nas", self._nas_hold_msg())
                     self._sleep(DRAIN_POLL_SECONDS)
                     return
                 n = self._fail_counts.get(self._skip_key(p), 0) + 1
@@ -3634,13 +3642,27 @@ class Orchestrator:
                 n += 1
         return n
 
+    @staticmethod
+    def _nas_hold_msg() -> str:
+        """The hold line for a NAS that cannot be used: an OVERLOADED NAS (it answers, but its
+        logins take minutes — the login breaker is open) is not an unreachable one, and saying
+        "unreachable" sent the user hunting a network fault all day (2026-10-06)."""
+        busy = transfer.busy_text()
+        return f"{busy} (retrying)" if busy else "NAS unreachable — retrying"
+
+    @staticmethod
+    def _overload_fault(msg="") -> bool:
+        """The NAS is OVERLOADED, or this failure says it was: never the item's fault, even if a
+        slow login would get through now (review 2026-10-06 — dvlane._offline's rule)."""
+        return bool(transfer.nas_busy()) or "NAS overloaded" in str(msg or "")
+
     def _nas_unreachable(self) -> bool:
         """Can the NAS be reached AT ALL right now? Used to tell an environmental upload
         failure (outage — hold, don't count) from a genuine one (reachable NAS refusing the
         file — count toward the park). Verified independently of the failure message, which
         would be brittle to match on."""
         try:
-            ftp = transfer.connect(timeout=8)
+            ftp = transfer.connect(timeout=8)    # quick: refused at once while overloaded (= outage)
             try:
                 ftp.quit()
             except Exception:
@@ -4307,7 +4329,8 @@ class Orchestrator:
                         movies.refresh_library()                    # removed mid-pipeline is still a movie,
                                                                     # NOT a TV ep
                     else:                                     # a TV episode finished
-                        series.refresh_queue(p.series)
+                        series.forget_episode(p.series, p.ep)  # out of the cached queue NOW —
+                        series.refresh_queue(p.series)          # the re-list can fail (NAS down)
                         movies.decrement_positions()          # an episode finished → every movie advances
                 except Exception:
                     pass
@@ -4320,8 +4343,9 @@ class Orchestrator:
                 # thread's downloads have had a no-fault "NAS unreachable — retrying" hold
                 # for months; the finisher now gets the same. Verified by probing the NAS,
                 # not by matching the failure message. Genuine refusals still count.
-                if st == "upload" and self._nas_unreachable():
-                    logbook.event(f"{ep_disp}: upload waiting — NAS unreachable "
+                if st == "upload" and (self._overload_fault(msg) or self._nas_unreachable()):
+                    why = "NAS overloaded" if transfer.nas_busy() else "NAS unreachable"
+                    logbook.event(f"{ep_disp}: upload waiting — {why} "
                                   f"(not counted against the item)")
                     time.sleep(30)
                     return

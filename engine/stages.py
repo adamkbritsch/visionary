@@ -465,7 +465,7 @@ def _download_body(p, abort, progress=None, low_prio=False):
             # (default ON) then deletes the real source. A truncated master and a deleted
             # original, every stage reporting success. Keep the file, refuse to trust it:
             # a retryable failure re-verifies the moment the NAS answers.
-            return False, ("NAS unreachable — cannot verify the local source is complete; "
+            return False, (f"{_nas_down_word()} — cannot verify the local source is complete; "
                            "not reusing it (it is kept for the next attempt)")
     if not have_source:
         on_prog = None
@@ -528,7 +528,14 @@ def _download_combine(p, abort, progress=None):
     if avail is not None and nas_size and avail < need_gb:
         return False, f"holding: combine needs ~{need_gb:.0f} GB free ({avail:.0f} GB available)"
     # -- NAS copy (FTP, verified) ---------------------------------------------------
-    have_source = os.path.exists(p.source) and _source_complete(p) is not False
+    # The classic path's rule (_download_body): reuse a local NAS copy only when it is VERIFIED
+    # complete. "Not verified incomplete" let an unverifiable partial — a kill mid-pull, then an
+    # unreachable or overloaded NAS — through as a finished source (review 2026-10-06).
+    state = _source_complete(p) if os.path.exists(p.source) else False
+    if state is None:
+        return False, (f"{_nas_down_word()} — cannot verify the local NAS copy is complete; "
+                       "not reusing it (it is kept for the next attempt)")
+    have_source = state is True
     if os.path.exists(p.source) and not have_source:
         try: os.remove(p.source)               # verified INCOMPLETE → re-pull clean
         except OSError: pass
@@ -619,6 +626,12 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
         logbook.event(f"download {p.ep}: container runs past the picture — "
                       f"CFR capped at {res.capped_secs:.1f}s")
     return True, f"downloaded + CFR @ {res.rate} ({res.frames} frames)"
+
+
+def _nas_down_word() -> str:
+    """"NAS overloaded" while transfer's login breaker is open — the orchestrator never charges an
+    item for that (Orchestrator._overload_fault) — else "NAS unreachable"."""
+    return "NAS overloaded" if transfer.nas_busy() else "NAS unreachable"
 
 
 def _source_complete(p):

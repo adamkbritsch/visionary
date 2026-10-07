@@ -845,7 +845,7 @@ class DVQueueOverCache(unittest.TestCase):
              mock.patch.object(orch.scratch, "folder_used_gb", return_value=0), \
              mock.patch.object(o, "_plex_started_now", return_value=False), \
              mock.patch.object(orch, "_dv_reserve_gb", return_value=reserve_gb), \
-             mock.patch.object(o, "_download_once") as dl, \
+             mock.patch.object(o, "_download_once", return_value=(True, "ok")) as dl, \
              mock.patch.object(o, "_sleep", side_effect=lambda _s: setattr(o, "_enabled", False)):
             o._prefetch()
         return dl
@@ -875,6 +875,152 @@ class DVQueueOverCache(unittest.TestCase):
             self.assertEqual(dvlane.LANE._cache[1], o._evict_prefetch)
         finally:
             dvlane.LANE._cache = old
+
+
+
+class StaleQueueCache(unittest.TestCase):
+    """Live 2026-10-06: a finished episode's re-list failed (NAS thrashing), so the cached
+    queue kept its replaced 1080p source as up next and the prefetcher tried to download
+    the deleted file all day. The finisher now drops the episode from the cache at once,
+    and a failed TV prefetch marks the show's cached queue stale."""
+
+    def _prefetch_one(self, p, result):
+        o = orch.Orchestrator(); o._enabled = True
+        with mock.patch.object(orch, "_prefetch_cap_gb", return_value=100), \
+             mock.patch.object(o, "_prefetch_candidates", return_value=[p]), \
+             mock.patch.object(o, "_purge_prefetch_orphans"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda q: q), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch.scratch, "physical_free_gb",
+                               return_value=orch._prefetch_gate_gb() + 10), \
+             mock.patch.object(orch.scratch, "folder_used_gb", return_value=0), \
+             mock.patch.object(o, "_plex_started_now", return_value=False), \
+             mock.patch.object(orch, "_dv_reserve_gb", return_value=0), \
+             mock.patch.object(o, "_download_once", return_value=result), \
+             mock.patch.object(orch.series, "mark_stale") as stale, \
+             mock.patch.object(o, "_sleep", side_effect=lambda _s: setattr(o, "_enabled", False)):
+            o._prefetch()
+        return stale
+
+    def test_a_failed_tv_prefetch_marks_the_shows_queue_stale(self):
+        p = episode_paths("Community (2009)", "S04E06", SRC)
+        self._prefetch_one(p, (False, "download failed: 550 Permission denied")) \
+            .assert_called_once_with("Community (2009)")
+
+    def test_only_a_real_download_failure_relists(self):
+        p = episode_paths("Community (2009)", "S04E06", SRC)
+        for msg in ("interrupted: a Plex stream started", "paused: a video you sent is ready",
+                    "NAS unreachable — cannot verify the local source is complete; not reusing it",
+                    "CFR pass failed: ffmpeg exited 1"):
+            self._prefetch_one(p, (False, msg)).assert_not_called()
+
+    def test_an_overload_never_reads_as_a_missing_source(self):
+        p = episode_paths("Community (2009)", "S04E06", SRC)
+        with mock.patch.object(orch.transfer, "nas_busy", side_effect=[None, {"since": 1}]):
+            self._prefetch_one(p, (False, "download failed: NAS overloaded")).assert_not_called()
+
+    def test_the_prefetcher_sits_out_an_overload(self):
+        o = orch.Orchestrator(); o._enabled = True
+        slept = []
+        with mock.patch.object(orch, "_prefetch_cap_gb", return_value=100), \
+             mock.patch.object(orch.transfer, "nas_busy", return_value={"since": 1}), \
+             mock.patch.object(o, "_prefetch_candidates",
+                               side_effect=AssertionError("no candidates while overloaded")), \
+             mock.patch.object(o, "_sleep",
+                               side_effect=lambda s: slept.append(s) or setattr(o, "_enabled", False)):
+            o._prefetch()
+        self.assertEqual(slept, [60])
+
+    def test_a_failed_prefetch_waits_the_relaxed_minute(self):
+        p = episode_paths("Community (2009)", "S04E06", SRC)
+        o = orch.Orchestrator(); o._enabled = True
+        slept = []
+        with mock.patch.object(orch, "_prefetch_cap_gb", return_value=100), \
+             mock.patch.object(o, "_prefetch_candidates", return_value=[p]), \
+             mock.patch.object(o, "_purge_prefetch_orphans"), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda q: q), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch.scratch, "physical_free_gb",
+                               return_value=orch._prefetch_gate_gb() + 10), \
+             mock.patch.object(orch.scratch, "folder_used_gb", return_value=0), \
+             mock.patch.object(o, "_plex_started_now", return_value=False), \
+             mock.patch.object(orch, "_dv_reserve_gb", return_value=0), \
+             mock.patch.object(o, "_download_once", return_value=(False, "download failed: x")), \
+             mock.patch.object(orch.series, "mark_stale"), \
+             mock.patch.object(o, "_sleep",
+                               side_effect=lambda s: slept.append(s) or setattr(o, "_enabled", False)):
+            o._prefetch()
+        self.assertEqual(slept, [60])
+
+    def test_a_good_prefetch_leaves_the_cache_alone(self):
+        p = episode_paths("Community (2009)", "S04E07", SRC)
+        self._prefetch_one(p, (True, "ok")).assert_not_called()
+
+    def test_a_failed_movie_or_youtube_prefetch_is_not_a_tv_queue(self):
+        m = orch.movie_paths("Movie.mkv", "/Media/Movies/M", "M")
+        self._prefetch_one(m, (False, "x")).assert_not_called()
+        y = youtube_paths("Chan", "Video [abc123def45].mp4")
+        self._prefetch_one(y, (False, "x")).assert_not_called()
+
+    def test_a_finished_episode_leaves_the_cached_queue_before_the_relist(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("Community (2009)", "S04E06", SRC)
+        o._drain_backlog = lambda: 0
+        calls = []
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(orch.series, "forget_episode",
+                               side_effect=lambda *a: calls.append(("forget",) + a)), \
+             mock.patch.object(orch.series, "refresh_queue",
+                               side_effect=lambda *a: calls.append(("refresh",) + a)), \
+             mock.patch.object(orch.movies, "decrement_positions"), \
+             mock.patch.object(o, "_finisher_persist_remove"), \
+             mock.patch.object(o, "_save_cadence"):
+            o._finish_item(p, lambda st, *a, **k: (True, "ok"), lane=2)
+        self.assertEqual(calls, [("forget", "Community (2009)", "S04E06"),
+                                 ("refresh", "Community (2009)")])
+
+
+
+class NasHoldMessage(unittest.TestCase):
+    """An overloaded NAS answers but cannot log anyone in: saying "unreachable" sent the user
+    hunting a network fault all day (2026-10-06)."""
+
+    def test_overloaded_is_not_unreachable(self):
+        with mock.patch.object(orch.transfer, "busy_text",
+                               return_value="NAS overloaded — a login took 138 s (normally under 1 s); "
+                                            "backing off, next check in 2 min"):
+            m = orch.Orchestrator._nas_hold_msg()
+        self.assertTrue(m.startswith("NAS overloaded — a login took 138 s"))
+        self.assertTrue(m.endswith("(retrying)"))
+
+    def test_an_overload_is_never_the_items_fault(self):
+        with mock.patch.object(orch.transfer, "nas_busy", return_value={"since": 1}):
+            self.assertTrue(orch.Orchestrator._overload_fault("download failed: 550"))   # while busy
+        with mock.patch.object(orch.transfer, "nas_busy", return_value=None):
+            self.assertTrue(orch.Orchestrator._overload_fault(
+                "download failed: FTP connect/login failed: NAS overloaded — a login took 138 s"))
+            self.assertFalse(orch.Orchestrator._overload_fault("download failed: 550 not found"))
+
+    def test_an_overload_download_failure_is_held_not_counted_even_if_the_nas_answers_now(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("The Office", "S02E10", SRC)
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: False), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_nas_unreachable", return_value=False), \
+             mock.patch.object(o, "_sleep"), \
+             mock.patch("stages.run_stage", return_value=(
+                 False, "download failed: FTP connect/login failed: NAS overloaded — a login took 180 s")):
+            o._process(p)
+        self.assertEqual(o._fail_counts, {})
+        self.assertEqual(o._parked, set())
+        self.assertEqual((o.state.get("hold") or {}).get("code"), "nas")   # held as an outage
+
+    def test_an_unanswering_nas_is_still_unreachable(self):
+        with mock.patch.object(orch.transfer, "busy_text", return_value=""):
+            self.assertEqual(orch.Orchestrator._nas_hold_msg(), "NAS unreachable — retrying")
 
 
 class PipelineOverQueue(unittest.TestCase):

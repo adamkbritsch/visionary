@@ -318,6 +318,30 @@ class EthernetOnly(_Lane):
         self.assertEqual(notes[1], "waiting for the NAS (it does not answer over FTP)")  # cable back
         self.assertEqual(self.e()["state"], dvbook.PENDING)          # not failed
 
+    def test_an_overload_is_never_the_movies_fault_even_if_it_just_cleared(self):
+        import transfer
+        busy = transfer.NasBusy("NAS overloaded — a login took 138 s (normally under 1 s)")
+        with mock.patch.object(nas_ftp, "reachable", return_value=True), \
+             mock.patch.object(self.lane, "_wait", side_effect=AssertionError("no wait needed")):
+            self.assertTrue(self.lane._offline(busy))      # breaker closed a moment ago: still offline
+
+    def test_an_overload_waits_without_logging_in_and_says_so_live(self):
+        import transfer
+        notes = []
+        over = lambda: len(notes) < 3                   # overloaded for three polls, then over
+        text = lambda: ("NAS overloaded — a login took 138 s; next check in 30 s" if not notes else
+                        "NAS overloaded — a login took 26 s; next check in 60 s")
+        with mock.patch.object(nas_ftp, "overloaded", side_effect=over), \
+             mock.patch.object(transfer, "busy_text", side_effect=text), \
+             mock.patch.object(nas_ftp, "reachable", return_value=True) as reach, \
+             mock.patch.object(self.lane, "_wait",
+                               side_effect=lambda s: notes.append(self.lane._note) or False):
+            self.assertTrue(self.lane._offline(OSError("timed out")))   # ANY failure, not only NasBusy
+        self.assertEqual(reach.call_count, 1)            # no login while it was overloaded
+        self.assertEqual(notes[-1], "waiting for the NAS — NAS overloaded — a login took 26 s; "
+                                    "next check in 60 s")       # the note moves with the breaker
+        self.assertEqual(self.e()["state"], dvbook.PENDING)          # not failed
+
     def test_a_configuration_reason_is_shown_for_as_long_as_it_waits(self):
         reach = iter([False, False, False, True])
         notes = []

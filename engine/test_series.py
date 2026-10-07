@@ -353,6 +353,15 @@ class NextUpSlot(unittest.TestCase):
         self.assertEqual(series.get_active_series(), ["B", "C"])   # slot ORDER preserved
         self.assertFalse(series.get_next_up("A"))                  # mapping consumed
 
+    def test_a_count_only_forget_episode_made_never_promotes(self):
+        series.set_next_up("A", "B")
+        series._QUEUE_DERIVED.add("A")
+        try:
+            with self._queues({"A": (0, 50), "B": (20, 0)}):
+                self.assertEqual(series.promote_finished_slots(), [])
+        finally:
+            series._QUEUE_DERIVED.discard("A")
+
     def test_unreachable_nas_never_promotes(self):
         series.set_next_up("A", "B")
         with self._queues({"A": (0, 0)}):        # empty listing = unknown, NOT finished
@@ -558,19 +567,21 @@ class UnreachableIsNotEmpty(unittest.TestCase):
                         return
                 _t.sleep(0.02)
 
-        series._QUEUE_CACHE.pop("Show", None)
+        _reset_queue_cache()
         with mock.patch.object(series, "episode_queue", return_value=None):
             self.assertIsNone(series.cached_queue("Show"))          # the poll never blocks
             _settled()
             self.assertNotIn("Show", series._QUEUE_CACHE)           # ...and a failure retries later
-        with mock.patch.object(series, "episode_queue", return_value=good):
+        with mock.patch.object(series, "episode_queue", return_value=good), \
+             mock.patch.object(series, "QUEUE_RETRY", 0):         # (the retry throttle, elsewhere)
             series.cached_queue("Show")                             # kicks the warm
             _settled()
             self.assertEqual(series.cached_queue("Show"), good)
         with mock.patch.object(series, "episode_queue", return_value=None):
             self.assertEqual(series.refresh_queue("Show"), good)    # keeps the good one
             self.assertEqual(series.cached_queue("Show"), good)
-        series._QUEUE_CACHE.pop("Show", None)
+            _settled()
+        _reset_queue_cache()
 
 
 class StatePollingNeverWalksTheNAS(unittest.TestCase):
@@ -580,9 +591,7 @@ class StatePollingNeverWalksTheNAS(unittest.TestCase):
     (live-caught 2026-08-25). Only a COLD cache walks the NAS, which is what hid it."""
 
     def setUp(self):
-        series._QUEUE_CACHE.clear()
-        with series._QUEUE_WARM_LOCK:
-            series._QUEUE_WARMING.clear()
+        _reset_queue_cache()
 
     def test_a_miss_returns_immediately_and_warms_behind(self):
         import threading, time
@@ -618,7 +627,263 @@ class StatePollingNeverWalksTheNAS(unittest.TestCase):
             self.assertNotIn("Show", series._QUEUE_WARMING)   # the slot was released
 
     def test_a_warm_cache_is_served_synchronously_as_before(self):
+        import time
         series._QUEUE_CACHE["Show"] = {"remaining_items": [1, 2]}
+        series._QUEUE_AT["Show"] = time.monotonic()                # computed just now: fresh
         with mock.patch.object(series, "episode_queue",
                                side_effect=AssertionError("must not compute")):
             self.assertEqual(series.cached_queue("Show"), {"remaining_items": [1, 2]})
+
+
+def _reset_queue_cache():
+    with series._QUEUE_WARM_LOCK:
+        for d in (series._QUEUE_CACHE, series._QUEUE_AT, series._QUEUE_STORED,
+                  series._QUEUE_TRIED, series._QUEUE_WARMING, series._QUEUE_DERIVED):
+            d.clear()
+
+
+def _settle(name="Show"):
+    """Wait for the background warmer (if any) to finish — inside the caller's patches."""
+    import time
+    for _ in range(100):
+        with series._QUEUE_WARM_LOCK:
+            if name not in series._QUEUE_WARMING:
+                return
+        time.sleep(0.01)
+    raise AssertionError("the queue warmer never finished")
+
+
+def _q(*eps, done=0):
+    items = [{"ep": e, "source_name": f"Show - {e}.mkv"} for e in eps]
+    return {"next": dict(items[0], has_source=True, has_dv=False, watched=False) if items else None,
+            "remaining": list(eps), "remaining_items": items, "remaining_count": len(eps),
+            "unwatched_count": len(eps), "done_count": done, "featurette_count": 0,
+            "source_count": len(eps) + done}
+
+
+class QueueCacheNeverGoesStaleForever(unittest.TestCase):
+    """Live 2026-10-06: Community S04E06 was replaced at 08:37 but the post-upload re-list hit
+    a thrashing NAS, and the cache had no age — so it listed the deleted 1080p source as up
+    next all day, and the prefetcher tried to download it 15 times (550 each time)."""
+
+    def setUp(self):
+        _reset_queue_cache()
+
+    def tearDown(self):
+        _reset_queue_cache()
+
+    def _fresh(self, q):
+        import time
+        series._QUEUE_CACHE["Show"] = q
+        series._QUEUE_AT["Show"] = time.monotonic()
+
+    def test_an_old_queue_is_served_at_once_and_refreshed_behind(self):
+        import time
+        self._fresh(_q("S01E01"))
+        series._QUEUE_AT["Show"] = time.monotonic() - series.QUEUE_TTL - 1
+        with mock.patch.object(series, "episode_queue", return_value=_q("S01E02", done=1)):
+            self.assertEqual(series.cached_queue("Show")["remaining"], ["S01E01"])   # no waiting
+            _settle()
+        self.assertEqual(series.cached_queue("Show")["remaining"], ["S01E02"])
+
+    def test_a_failed_refresh_leaves_it_stale_and_retries_without_hammering(self):
+        self._fresh(_q("S01E01"))
+        calls = []
+        def down(name):
+            calls.append(name)
+            return None
+        with mock.patch.object(series, "episode_queue", side_effect=down):
+            self.assertEqual(series.refresh_queue("Show")["remaining"], ["S01E01"])  # kept
+            self.assertEqual(series.cached_queue("Show")["remaining"], ["S01E01"])
+            _settle()
+            self.assertEqual(len(calls), 1)            # inside QUEUE_RETRY: no second walk yet
+            with mock.patch.object(series, "QUEUE_RETRY", 0):
+                series.cached_queue("Show")            # ...but it IS stale, so it retries
+                _settle()
+            self.assertEqual(len(calls), 2)
+        with mock.patch.object(series, "episode_queue", return_value=_q("S01E02", done=1)), \
+             mock.patch.object(series, "QUEUE_RETRY", 0):
+            series.cached_queue("Show"); _settle()
+        self.assertEqual(series.cached_queue("Show")["remaining"], ["S01E02"])
+
+    def test_stale_means_stale_even_right_after_boot(self):
+        # monotonic() counts from boot: a "0 = stale" marker would read as fresh for the
+        # first QUEUE_TTL seconds of uptime
+        self._fresh(_q("S01E01"))
+        series.mark_stale("Show")
+        clock = mock.Mock(); clock.monotonic.return_value = 5.0
+        with mock.patch.object(series, "time", clock), \
+             mock.patch.object(series, "episode_queue", return_value=_q("S01E02")) as eq:
+            series.cached_queue("Show"); _settle()
+        eq.assert_called_once()
+
+    def test_forget_episode_drops_it_at_once_without_the_nas(self):
+        self._fresh(_q("S04E06", "S04E07", "S04E08", done=5))
+        with mock.patch.object(series, "episode_queue", side_effect=AssertionError("no NAS I/O")):
+            series.forget_episode("Show", "S04E06")
+        q = series._QUEUE_CACHE["Show"]
+        self.assertEqual(q["remaining"], ["S04E07", "S04E08"])
+        self.assertEqual([it["ep"] for it in q["remaining_items"]], ["S04E07", "S04E08"])
+        self.assertEqual(q["next"]["ep"], "S04E07")
+        self.assertEqual(q["next"]["source_name"], "Show - S04E07.mkv")
+        self.assertEqual((q["remaining_count"], q["done_count"], q["unwatched_count"]), (2, 6, 2))
+        self.assertTrue(series._queue_stale("Show"))   # ...and the next read re-lists for real
+
+    def test_forgetting_the_last_episode_leaves_no_next(self):
+        self._fresh(_q("S01E09", done=8))
+        series.forget_episode("Show", "S01E09")
+        q = series._QUEUE_CACHE["Show"]
+        self.assertIsNone(q["next"])
+        self.assertEqual((q["remaining_count"], q["done_count"]), (0, 9))
+
+    def test_forget_never_touches_the_original_dict(self):
+        orig = _q("S01E01", "S01E02")
+        self._fresh(orig)
+        series.forget_episode("Show", "S01E01")
+        self.assertEqual(orig["remaining"], ["S01E01", "S01E02"])   # a reader may still hold it
+
+    def test_forgetting_an_unlisted_episode_changes_nothing_but_staleness(self):
+        self._fresh(_q("S01E02"))
+        series.forget_episode("Show", "S01E01")
+        self.assertEqual(series._QUEUE_CACHE["Show"]["remaining"], ["S01E02"])
+        self.assertEqual(series._QUEUE_CACHE["Show"]["done_count"], 0)
+
+    def test_a_listing_taken_before_the_upload_never_lands_after_it(self):
+        import threading
+        self._fresh(_q("S01E01", "S01E02"))
+        series.mark_stale("Show")
+        started, release = threading.Event(), threading.Event()
+        def slow(name):                                 # listed BEFORE the upload landed
+            started.set(); release.wait(2)
+            return _q("S01E01", "S01E02")
+        with mock.patch.object(series, "episode_queue", side_effect=slow):
+            series.cached_queue("Show")
+            self.assertTrue(started.wait(2))
+            series.forget_episode("Show", "S01E01")    # the upload finishes mid-listing
+            release.set(); _settle()
+        self.assertEqual(series._QUEUE_CACHE["Show"]["remaining"], ["S01E02"])
+
+    def test_an_older_warm_never_overwrites_a_refresh(self):
+        import threading
+        self._fresh(_q("S01E01"))
+        series.mark_stale("Show")
+        started, release = threading.Event(), threading.Event()
+        def slow(name):
+            started.set(); release.wait(2)
+            return _q("S01E01")                         # the old listing
+        with mock.patch.object(series, "episode_queue", side_effect=slow):
+            series.cached_queue("Show")
+            self.assertTrue(started.wait(2))
+        with mock.patch.object(series, "episode_queue", return_value=_q("S01E05", done=4)):
+            self.assertEqual(series.refresh_queue("Show")["remaining"], ["S01E05"])
+        with mock.patch.object(series, "episode_queue", side_effect=slow):
+            release.set(); _settle()
+        self.assertEqual(series._QUEUE_CACHE["Show"]["remaining"], ["S01E05"])
+
+    def test_mark_stale_makes_the_next_read_relist(self):
+        self._fresh(_q("S04E06"))
+        series.mark_stale("Show")
+        with mock.patch.object(series, "episode_queue", return_value=_q("S04E07")) as eq:
+            self.assertEqual(series.cached_queue("Show")["remaining"], ["S04E06"])  # served at once
+            _settle()
+        eq.assert_called_once()
+        self.assertEqual(series.cached_queue("Show")["remaining"], ["S04E07"])
+
+    def test_a_later_failed_refresh_never_discards_an_earlier_one_that_worked(self):
+        import threading
+        self._fresh(_q("S01E01"))
+        started, release = threading.Event(), threading.Event()
+        def slow_good(name):
+            started.set(); release.wait(2)
+            return _q("S01E03", done=2)
+        out = {}
+        with mock.patch.object(series, "episode_queue", side_effect=slow_good):
+            t = threading.Thread(target=lambda: out.setdefault("r", series.refresh_queue("Show")))
+            t.start()
+            self.assertTrue(started.wait(2))
+        with mock.patch.object(series, "episode_queue", return_value=None):
+            series.refresh_queue("Show")               # starts later, fails at once
+        release.set(); t.join(2)
+        self.assertEqual(series._QUEUE_CACHE["Show"]["remaining"], ["S01E03"])
+        self.assertFalse(series._queue_stale("Show"))  # the earlier one landed, and is current
+
+    def test_a_miss_is_throttled_too_after_a_failure(self):
+        calls = []
+        def down(name):
+            calls.append(name)
+            return None
+        with mock.patch.object(series, "episode_queue", side_effect=down):
+            for _ in range(5):                          # five polls, one listing
+                self.assertIsNone(series.cached_queue("Show"))
+                _settle()
+        self.assertEqual(len(calls), 1)
+
+    def test_an_overloaded_nas_serves_what_is_cached_without_relisting(self):
+        self._fresh(_q("S01E01"))
+        series.mark_stale("Show")
+        import transfer
+        with mock.patch.object(transfer, "nas_busy", return_value={"since": 1}), \
+             mock.patch.object(series, "episode_queue", side_effect=AssertionError("no listing")):
+            self.assertEqual(series.cached_queue("Show")["remaining"], ["S01E01"])   # served
+        self.assertNotIn("Show", series._QUEUE_WARMING)
+
+    def test_an_overloaded_nas_still_fills_a_show_that_has_nothing(self):
+        import transfer
+        with mock.patch.object(transfer, "nas_busy", return_value={"since": 1}), \
+             mock.patch.object(series, "episode_queue", return_value=_q("S01E01")) as eq:
+            self.assertIsNone(series.cached_queue("Show"))
+            _settle()
+        eq.assert_called_once()
+        self.assertEqual(series._QUEUE_CACHE["Show"]["remaining"], ["S01E01"])
+
+    def test_an_overloaded_nas_skips_the_post_upload_relist(self):
+        self._fresh(_q("S01E01", "S01E02"))
+        series.forget_episode("Show", "S01E01")
+        import transfer
+        with mock.patch.object(transfer, "nas_busy", return_value={"since": 1}), \
+             mock.patch.object(series, "episode_queue", side_effect=AssertionError("no listing")):
+            self.assertEqual(series.refresh_queue("Show")["remaining"], ["S01E02"])
+        self.assertTrue(series._queue_stale("Show"))
+
+    def test_forget_alone_never_promotes_a_slot(self):
+        self._fresh(_q("S01E09", done=8))
+        series.forget_episode("Show", "S01E09")          # "nothing left" — by our own arithmetic
+        self.assertFalse(series.queue_confirmed("Show"))
+        series._store_queue("Show", _q(done=9), next(series._QUEUE_SEQ))   # a real listing agrees
+        self.assertTrue(series.queue_confirmed("Show"))
+
+    def test_mark_stale_keeps_the_retry_throttle(self):
+        self._fresh(_q("S01E01"))
+        calls = []
+        def down(name):
+            calls.append(name)
+            return None
+        with mock.patch.object(series, "episode_queue", side_effect=down):
+            series.refresh_queue("Show")                # a failed listing, just now
+            for _ in range(5):                          # five failed downloads → five mark_stales
+                series.mark_stale("Show")
+                series.cached_queue("Show"); _settle()
+        self.assertEqual(len(calls), 1)                 # still one listing per QUEUE_RETRY
+
+    def test_a_refresh_counts_as_the_shows_warmer(self):
+        import threading
+        self._fresh(_q("S01E01"))
+        series.mark_stale("Show")
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        def slow(name):
+            calls.append(name); started.set(); release.wait(2)
+            return _q("S01E02")
+        with mock.patch.object(series, "episode_queue", side_effect=slow):
+            t = threading.Thread(target=series.refresh_queue, args=("Show",))
+            t.start()
+            self.assertTrue(started.wait(2))
+            series.cached_queue("Show")                 # stale, but a listing is already running
+            release.set(); t.join(2)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("Show", series._QUEUE_WARMING)
+
+    def test_mark_stale_and_forget_ignore_unknown_shows(self):
+        series.mark_stale("Nope"); series.mark_stale("")
+        series.forget_episode("Nope", "S01E01"); series.forget_episode("", "S01E01")
+        self.assertNotIn("Nope", series._QUEUE_CACHE)

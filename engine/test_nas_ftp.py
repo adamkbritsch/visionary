@@ -201,6 +201,45 @@ class Paths(unittest.TestCase):
                          "/volume3/MediaVolume3/_claude-tmp/7fc5ed2de231.part")
 
 
+
+class PanelLink(unittest.TestCase):
+    """The lane's panel reported "unresolved" all day while mDNS was dead (2026-10-06): it must
+    show the link the transfers really take once Tailscale proves the NAS's LAN address."""
+    LAN = {"iface": "en12", "bound": True, "wired": True, "kind": "Ethernet", "ip": "192.168.1.195",
+           "src": "192.168.1.92", "fresh": True, "speed": "2.5 GbE"}
+    SILENT = {"iface": None, "bound": False, "ip": None, "unresolved": True, "fresh": False}
+
+    def _link(self, mdns, alt):
+        import nas_link
+        with mock.patch.object(nas_ftp, "_lan_name", return_value="adamsnas.local"), \
+             mock.patch.object(nas_link, "detect", return_value=mdns), \
+             mock.patch.object(nas_link, "lan_link", side_effect=lambda h, wait=True: alt) as ll, \
+             mock.patch.object(nas_link, "remember", side_effect=lambda ln: ln), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["100.101.182.68", "adamsnas.local"]):
+            return nas_ftp.link(), ll
+
+    def test_a_silent_mdns_name_shows_the_proven_lan_link(self):
+        ln, ll = self._link(self.SILENT, self.LAN)
+        ll.assert_called_once_with(["100.101.182.68", "adamsnas.local"], wait=False)   # no ping on a leg
+        self.assertEqual((ln["iface"], ln["kind"], ln["ip"]), ("en12", "Ethernet", "192.168.1.195"))
+        self.assertIn("via", ln)
+
+    def test_a_fresh_mdns_link_is_used_as_before(self):
+        ln, ll = self._link(self.LAN, None)
+        ll.assert_not_called()
+        self.assertEqual(ln["iface"], "en12")
+
+    def test_the_relink_check_never_pings(self):
+        with mock.patch.object(transfer, "_route_order", return_value=[]) as ro, \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["100.101.182.68"]):
+            nas_ftp._lan_offered()
+        self.assertEqual(ro.call_args.kwargs.get("wait"), False)
+
+    def test_no_proof_keeps_the_unresolved_answer(self):
+        ln, _ = self._link(self.SILENT, None)
+        self.assertTrue(ln["unresolved"])
+
+
 class Pure(unittest.TestCase):
     def test_mdtm_is_utc(self):
         # the pair read on the NAS: MDTM 20261001155717 for a file whose stat %Y was 1790870237
@@ -602,6 +641,42 @@ class Review20261001(_Net):
             nas_ftp.upload(local, stage)
         self.assertEqual(bytes(self.srv.files[nas_ftp.host_to_ftp(stage)]), data)
         self.assertIn(mock.call(None, nas_ftp.FAIL_PAUSE_SECS), nas_ftp._pause.call_args_list)
+
+
+
+class OverloadIsNotADroppedLeg(unittest.TestCase):
+    """Review 2026-10-06: with the login breaker open, twelve instant NasBusy failures burned a
+    transfer's attempts in two minutes and charged the overload to the movie."""
+
+    def test_the_first_overload_ends_the_transfer_uncounted(self):
+        legs, pauses = [], []
+        def run_leg(have):
+            legs.append(have)
+            raise transfer.NasBusy("NAS overloaded — a login took 138 s")
+        with mock.patch.object(nas_ftp, "_pause", side_effect=lambda *a: pauses.append(a)):
+            with self.assertRaises(transfer.NasBusy):
+                nas_ftp._legs(run_leg, lambda: 0, 100, None)
+        self.assertEqual((len(legs), pauses), (1, []))
+
+    def test_a_short_exchange_does_not_retry_an_open_breaker(self):
+        calls = []
+        def fn():
+            calls.append(1)
+            raise transfer.NasBusy("busy")
+        with mock.patch.object(nas_ftp, "_pause", side_effect=AssertionError("no 25 s of retries")):
+            with self.assertRaises(transfer.NasBusy):
+                nas_ftp._retrying(fn)
+        self.assertEqual(len(calls), 1)
+
+    def test_an_ordinary_blip_is_still_retried(self):
+        seq = iter([OSError("reset"), "ok"])
+        def fn():
+            v = next(seq)
+            if isinstance(v, Exception):
+                raise v
+            return v
+        with mock.patch.object(nas_ftp, "_pause"):
+            self.assertEqual(nas_ftp._retrying(fn), "ok")
 
 
 class Relinker(unittest.TestCase):

@@ -29,6 +29,7 @@ never anything on the NAS.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 import subprocess
@@ -312,6 +313,11 @@ def forget():
     """Drop every cached choice — a transfer on the chosen link just failed, so look again."""
     with _lock:
         _cache.clear()
+        # a proof is only marked for re-checking, never dropped here: forget() runs after any
+        # failed LAN transfer, and a running leg must not lose its link to a sample not yet back
+        for k, v in list(_ts_seen.items()):
+            _ts_seen[k] = (0.0,) + tuple(v[1:])
+        _ifc_cache.update(at=0.0, ifaces=None)
 
 
 def detect(host: str, priority: str = None) -> dict:
@@ -366,24 +372,188 @@ def remember(link):
     return link
 
 
-def lan_route(hosts):
-    """(NAS LAN address, local address to bind) for the first configured host the chosen link
-    reaches DIRECTLY, or None — the pipeline's FTP then keeps its configured order. Never None
-    because of ethernet_only: that choice only makes the Dolby Vision lane wait.
+TAILSCALE_CLIS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                  "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale")
+_TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+_PONG = re.compile(r"pong from .*?\((?P<ts>[0-9.]+)\) via (?P<ip>\d{1,3}(?:\.\d{1,3}){3}):\d+")
+_PONG_ANY = re.compile(r"pong from .*?\((?P<ts>[0-9.]+)\) via ")
+# tailscale ip -> (wall time sampled, attachment, LAN ipv4 or None, wall time last PROVEN). The
+# attachment of a proof is the Mac's interface(s) on the proven address's subnet — what a pulled
+# cable or a move to another network changes, and a Wi-Fi lease renewal elsewhere does not; of a
+# negative sample, the Mac's whole address set (review 2026-10-06).
+_ts_seen = {}
+_ts_refreshing = set()          # single-flight: one background sample per address at a time
+_ifc_cache = {"at": 0.0, "ifaces": None}
 
-    Only NAMES count, never an IP literal: a name that resolves on the local link (mDNS) is proof
-    the Mac is on the NAS's network, while a bare 192.168.1.x matches half the networks in the
-    world, and trying it first on someone else's would send the FTP login to whatever answered
-    there (review 2026-09-30)."""
+
+def _spawn(fn):
+    threading.Thread(target=fn, daemon=True, name="nas-tailscale-proof").start()
+
+
+def _ifaces_now() -> dict:
+    """parse_ifconfig, re-read at most every few seconds (a leg asks every 2 s)."""
+    now = time.time()
+    with _lock:
+        if _ifc_cache["ifaces"] is not None and 0 <= now - _ifc_cache["at"] < 5:
+            return _ifc_cache["ifaces"]
+    ifaces = parse_ifconfig(_run(["ifconfig"]))
+    with _lock:
+        _ifc_cache.update(at=now, ifaces=ifaces)
+    return ifaces
+
+
+def attachment(ip, ifaces) -> tuple:
+    """PURE: the active interfaces whose subnet holds `ip`, as (device, address, prefix)."""
+    try:
+        nas = ipaddress.ip_address(ip)
+    except (ValueError, TypeError):
+        return ()
+    out = []
+    for dev, i in ifaces.items():
+        if i.get("active") is False or not i.get("inet"):
+            continue
+        try:
+            if nas in ipaddress.ip_network(f"{i['inet']}/{i['mask']}", strict=False):
+                out.append((dev, i["inet"], i["mask"]))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return tuple(sorted(out))
+
+
+def _proof_key(ip, ifaces) -> tuple:
+    return attachment(ip, ifaces) if ip else net_signature(ifaces)
+
+
+def local_address_active(addr) -> bool:
+    """`addr` is still an address of an ACTIVE interface on this Mac — local only, no I/O to the
+    NAS. What a pulled cable changes; what a NAS that stalls a login does not."""
+    return any(i.get("inet") == addr and i.get("active") is not False
+               for i in _ifaces_now().values())
+
+
+def is_tailscale(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host) in _TAILSCALE_NET
+    except ValueError:
+        return False
+
+
+def parse_pong(text: str, ts_ip: str):
+    """PURE: the private IPv4 a `tailscale ping` reply from `ts_ip` came back over DIRECTLY, or
+    None — relayed through DERP, a public address, another peer's reply, or nothing at all."""
+    for m in _PONG.finditer(text or ""):
+        if m.group("ts") != ts_ip:
+            continue
+        try:
+            ip = ipaddress.ip_address(m.group("ip"))
+        except ValueError:
+            continue
+        if (ip.version == 4 and ip.is_private and ip not in _TAILSCALE_NET
+                and not ip.is_loopback and not ip.is_link_local and not ip.is_unspecified):
+            return str(ip)
+    return None
+
+
+def _ts_sample(cli, ts_ip, ifaces):
+    """Ping once (up to five pongs, stopping at the first direct one) and record the result.
+    A proof is kept through samples that got NO answer at all (the NAS's tailscaled restarting,
+    a lost packet) for KNOWN_SECS on the same attachment — one bad sample must not flip a running
+    leg's link — and dropped at once on CONTRARY evidence: the NAS answered, but not directly
+    from a LAN address (review 2026-10-06)."""
+    out = _run([cli, "ping", "--c", "5", "--timeout", "2s", ts_ip])
+    ip = parse_pong(out, ts_ip)
+    answered = any(m.group("ts") == ts_ip for m in _PONG_ANY.finditer(out or ""))
+    now = time.time()
+    with _lock:
+        prev = _ts_seen.get(ts_ip)
+        if ip:
+            _ts_seen[ts_ip] = (now, _proof_key(ip, ifaces), ip, now)
+        elif (not answered and prev and prev[2] and prev[3] is not None
+              and prev[1] == _proof_key(prev[2], ifaces) and 0 <= now - prev[3] < KNOWN_SECS):
+            _ts_seen[ts_ip] = (now, prev[1], prev[2], prev[3])
+        else:
+            _ts_seen[ts_ip] = (now, _proof_key(None, ifaces), None, None)
+        return _ts_seen[ts_ip][2]
+
+
+def tailscale_lan_ip(ts_ip: str, wait: bool = True):
+    """The NAS's LAN address as Tailscale proves it, or None. A `tailscale ping` is answered
+    by the peer's own tailscaled and sealed with its key, and says which path the answer took:
+    "pong from adamsnas-tailscale (100.101.182.68) via 192.168.1.195:41691" means the NAS itself
+    answered from that address, on a network this Mac reaches directly, a moment ago. That is as
+    strong as a fresh mDNS answer — stronger: a stranger on a café's 192.168.1.x cannot forge it
+    — and it still works when the NAS's mDNS responder has died (live 2026-10-06: avahi silent,
+    so every transfer of the day went over Tailscale at ~7 MB/s instead of the 2.5 GbE cable).
+
+    A proof is used only on the attachment it was made on (the Mac's interface on that subnet)
+    and only within KNOWN_SECS of its last confirmation, by the wall clock — a monotonic clock
+    stops while the lid is closed, which would carry a home proof into a café (nas_ipv4's rule).
+    It is re-sampled every CACHE_SECS OFF the caller's thread: a leg asks every 2 s and must never
+    stall on a ping (review 2026-10-06). The one blocking sample is a cold one, and only when
+    `wait` — a connect choosing its route; a leg's checks pass wait=False. Never from a test."""
+    if not is_tailscale(ts_ip):
+        return None
+    cli = next((c for c in TAILSCALE_CLIS if os.path.exists(c)), None)
+    if not cli:
+        return None
+    ifaces = _ifaces_now()
+    now = time.time()
+    with _lock:
+        hit = _ts_seen.get(ts_ip)
+    usable = (hit is not None and hit[1] == _proof_key(hit[2], ifaces)
+              and (hit[2] is None or (hit[3] is not None and 0 <= now - hit[3] < KNOWN_SECS)))
+    if usable and 0 <= now - hit[0] < CACHE_SECS:
+        return hit[2]
+    if not usable and wait:
+        return _ts_sample(cli, ts_ip, ifaces)    # cold here: the first answer, now
+    with _lock:
+        start = ts_ip not in _ts_refreshing
+        if start:
+            _ts_refreshing.add(ts_ip)
+    if start:
+        def refresh():
+            try:
+                _ts_sample(cli, ts_ip, _ifaces_now())
+            finally:
+                with _lock:
+                    _ts_refreshing.discard(ts_ip)
+        _spawn(refresh)
+    return hit[2] if usable else None
+
+
+def lan_link(hosts, wait: bool = True):
+    """The detect() link for the NAS's LAN address, when the chosen link reaches it DIRECTLY and
+    the address is PROVEN to be the NAS's, else None. Never None because of ethernet_only: that
+    choice only makes the Dolby Vision lane wait.
+
+    Proof is one of two things, never a bare address: a bare 192.168.1.x matches half the networks
+    in the world, and trying it first on someone else's would send the FTP login to whatever
+    answered there (review 2026-09-30).
+      1. a configured NAME that resolves FRESHLY on the local link (mDNS) — a kept answer could be
+         a stranger's on another network (review 2026-09-30);
+      2. a configured TAILSCALE address whose peer answers a tailscale ping directly from a LAN
+         address (tailscale_lan_ip) — so a dead mDNS responder no longer costs the LAN route."""
     for h in hosts or ():
         if is_literal(h):
             continue
         ln = detect(h)
-        # only a FRESH answer: a kept address could be a stranger's on another network, and must
-        # never carry an FTP login (review 2026-09-30)
         if ln.get("bound") and ln.get("src") and ln.get("ip") and ln.get("fresh"):
-            return ln["ip"], ln["src"]
+            return ln
+    for h in hosts or ():
+        ip = tailscale_lan_ip(h, wait)
+        if not ip:
+            continue
+        ln = detect(ip)
+        if ln.get("bound") and ln.get("src") and ln.get("ip"):
+            return ln
     return None
+
+
+def lan_route(hosts, wait: bool = True):
+    """(NAS LAN address, local address to bind) for lan_link(hosts), or None — the pipeline's FTP
+    then keeps its configured order. `wait=False` never pings on the caller's thread."""
+    ln = lan_link(hosts, wait)
+    return (ln["ip"], ln["src"]) if ln else None
 
 
 def last() -> dict | None:

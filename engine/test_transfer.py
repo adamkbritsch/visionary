@@ -397,6 +397,303 @@ class Connect(unittest.TestCase):
         self.assertIn("OPTS UTF8 ON", rec.cmds)
 
 
+def _reset_breaker():
+    with transfer._BREAKER_LOCK:
+        transfer._BREAKER.update(open=False, since=None, until=0.0, fails=0, login_secs=None,
+                                 checking=False, seen=0.0)
+
+
+class LoginBreaker(unittest.TestCase):
+    """Live 2026-10-06: the NAS answered the banner at once but took 138 s to finish a login.
+    Every caller gave up at 8-30 s and retried, leaving the NAS running each abandoned password
+    check — and the whole day read "NAS unreachable"."""
+
+    SETTINGS = {"port": 21, "user": "u", "passwd": "p"}
+
+    def setUp(self):
+        _reset_breaker()
+
+    tearDown = setUp
+
+    def _fake(self, login_raises=None, calls=None):
+        calls = [] if calls is None else calls
+        class Fake(transfer._WireFTP):
+            def connect(self, host, port, timeout=None, source_address=None):
+                calls.append(host)
+                return "220 adamsnas FTP server ready."
+            def login(self, *a):
+                if login_raises:
+                    raise login_raises
+            def sendcmd(self, *a): return "200 ok"
+            def set_pasv(self, *a): pass
+            def close(self): pass
+            def quit(self): pass
+        return Fake, calls
+
+    def _connect(self, fake, timeout=15):
+        with mock.patch.object(transfer, "_WireFTP", fake), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["a", "b"]), \
+             mock.patch.object(transfer, "ftp_settings", return_value=self.SETTINGS), \
+             mock.patch.object(transfer, "_route_order", return_value=[("a", None), ("b", None)]):
+            return transfer.connect(timeout=timeout)
+
+    def test_a_patient_login_that_stalls_opens_the_breaker_and_skips_the_other_routes(self):
+        import socket
+        fake, calls = self._fake(login_raises=socket.timeout("timed out"))
+        with self.assertRaises(transfer.NasBusy) as cm:
+            self._connect(fake)
+        self.assertEqual(calls, ["a"])                 # same NAS behind every route: one try
+        self.assertIsNotNone(transfer.nas_busy())
+        self.assertIn("NAS overloaded", str(cm.exception))
+
+    def test_python39_timeouts_trip_it_too(self):
+        # the app's engine runs on Python 3.9, where socket.timeout is NOT TimeoutError
+        fake, _ = self._fake(login_raises=TimeoutError("timed out"))
+        with self.assertRaises(transfer.NasBusy):
+            self._connect(fake)
+
+    def test_while_overloaded_a_quick_probe_never_touches_the_network(self):
+        import socket
+        fake, _ = self._fake(login_raises=socket.timeout("timed out"))
+        with self.assertRaises(transfer.NasBusy):
+            self._connect(fake)
+        boom = mock.Mock(side_effect=AssertionError("no new connection for a probe"))
+        with mock.patch.object(transfer, "_WireFTP", boom), \
+             mock.patch.object(transfer, "_route_order", side_effect=AssertionError("no routing")):
+            for t in (6, 8, 10):
+                with self.assertRaises(transfer.NasBusy):
+                    transfer.connect(timeout=t)
+        boom.assert_not_called()
+
+    def _overloaded_fake(self, login_secs, timeouts, live=None, peak=None):
+        """A fake whose login 'takes' login_secs (monotonic jumps) and records socket timeouts."""
+        import threading
+        live = live if live is not None else [0]
+        peak = peak if peak is not None else [0]
+        lock = threading.Lock()
+        class Fake(transfer._WireFTP):
+            def connect(self, host, port, timeout=None, source_address=None):
+                self.sock = mock.Mock()
+                self.sock.settimeout.side_effect = lambda t: timeouts.append(t)
+                return "220 ready"
+            def login(self, *a):
+                with lock:
+                    live[0] += 1; peak[0] = max(peak[0], live[0])
+                import time as _t; _t.sleep(0.05)
+                with lock:
+                    live[0] -= 1
+            def sendcmd(self, *a): return "200"
+            def set_pasv(self, *a): pass
+            def close(self): pass
+        return Fake
+
+    def test_overload_mode_still_logs_in_one_patient_login_at_a_time(self):
+        transfer._trip(138.0)
+        timeouts = []
+        fake = self._overloaded_fake(26.0, timeouts)
+        ftp = self._connect(fake, timeout=30)
+        self.assertIsNotNone(ftp)
+        # the login alone gets the overload patience; the caller's own timeout comes back after
+        self.assertEqual(timeouts, [transfer.LOGIN_PATIENT, 30])
+
+    def test_concurrent_callers_never_stack_logins_on_an_overloaded_nas(self):
+        import threading
+        transfer._trip(138.0)
+        live, peak, errors = [0], [0], []
+        fake = self._overloaded_fake(26.0, [], live, peak)
+        with mock.patch.object(transfer, "_WireFTP", fake), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["a"]), \
+             mock.patch.object(transfer, "ftp_settings", return_value=self.SETTINGS), \
+             mock.patch.object(transfer, "_route_order", return_value=[("a", None)]), \
+             mock.patch.object(transfer, "LOGIN_HEALTHY", -1):     # every login counts as slow
+            def go():
+                try:
+                    transfer.connect(timeout=30)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+            ts = [threading.Thread(target=go) for _ in range(5)]
+            [t.start() for t in ts]; [t.join(5) for t in ts]
+        self.assertEqual((peak[0], errors), (1, []))      # five logins, never two at once
+
+    def test_a_healthy_login_ends_overload_mode(self):
+        transfer._trip(138.0)
+        fake = self._overloaded_fake(0.05, [])
+        self._connect(fake, timeout=30)                   # a fast login now
+        self.assertIsNone(transfer.nas_busy())
+
+    def test_a_slow_successful_login_keeps_overload_mode_and_says_how_slow(self):
+        transfer._trip(138.0)
+        fake = self._overloaded_fake(26.0, [])
+        clock = iter([1000.0, 1026.0])
+        real = transfer.time.monotonic
+        with mock.patch.object(transfer.time, "monotonic",
+                               side_effect=lambda: next(clock, None) or real()):
+            self._connect(fake, timeout=30)
+        self.assertEqual(int(transfer.nas_busy()["login_secs"]), 26)
+
+    def test_no_turn_within_the_patience_is_busy(self):
+        transfer._trip(138.0)
+        self.assertTrue(transfer._LOGIN_SLOT.acquire(timeout=1))     # someone else's long login
+        try:
+            with mock.patch.object(transfer, "LOGIN_PATIENT", 0.05), \
+                 mock.patch.object(transfer, "_WireFTP", side_effect=AssertionError("no login")):
+                with self.assertRaises(transfer.NasBusy):
+                    transfer.connect(timeout=30)
+        finally:
+            transfer._LOGIN_SLOT.release()
+
+    def test_the_recovery_check_stands_aside_while_real_logins_measure(self):
+        transfer._trip(138.0)
+        with transfer._BREAKER_LOCK:
+            transfer._BREAKER.update(until=0.0, seen=transfer.time.time())
+        sleeps = []
+        def sleep(s):
+            sleeps.append(s)
+            with transfer._BREAKER_LOCK:                  # meanwhile a real login found it healthy
+                transfer._BREAKER["open"] = False
+        with mock.patch.object(transfer, "_recover_once",
+                               side_effect=AssertionError("no extra password check")), \
+             mock.patch.object(transfer.time, "sleep", side_effect=sleep):
+            transfer._recover()
+        self.assertEqual(len(sleeps), 1)
+
+    def test_it_is_an_ftp_error_every_caller_already_handles(self):
+        import ftplib
+        self.assertTrue(issubclass(transfer.NasBusy, ftplib.error_temp))
+        self.assertTrue(issubclass(transfer.NasBusy, ftplib.all_errors))
+
+    def test_an_impatient_callers_timeout_says_nothing_about_the_nas(self):
+        import socket
+        fake, calls = self._fake(login_raises=socket.timeout("timed out"))
+        with self.assertRaises(socket.timeout):
+            self._connect(fake, timeout=6)             # a UI probe: its own business
+        self.assertIsNone(transfer.nas_busy())
+
+    def test_a_refused_login_is_not_an_overload(self):
+        import ftplib
+        fake, _ = self._fake(login_raises=ftplib.error_perm("530 Login incorrect."))
+        with self.assertRaises(ftplib.error_perm):
+            self._connect(fake)
+        self.assertIsNone(transfer.nas_busy())
+
+    def test_a_healthy_recovery_login_closes_it(self):
+        transfer._trip(138.0)
+        with mock.patch.object(transfer, "_open", return_value=mock.Mock()):
+            self.assertTrue(transfer._recover_once())
+        self.assertIsNone(transfer.nas_busy())
+
+    def test_a_login_that_completes_slowly_is_still_overloaded_and_backs_off(self):
+        transfer._trip(138.0)
+        clock = iter([0.0, 141.0])
+        with mock.patch.object(transfer, "_open", return_value=mock.Mock()), \
+             mock.patch.object(transfer.time, "monotonic", side_effect=lambda: next(clock)):
+            self.assertFalse(transfer._recover_once())
+        b = transfer.nas_busy()
+        self.assertEqual(int(b["login_secs"]), 141)
+        first = b["retry_in"]
+        with mock.patch.object(transfer, "_open", side_effect=transfer.NasBusy("still")):
+            self.assertFalse(transfer._recover_once())
+        self.assertGreater(transfer.nas_busy()["retry_in"], first)      # it backs off further...
+        for _ in range(10):
+            with mock.patch.object(transfer, "_open", side_effect=transfer.NasBusy("still")):
+                transfer._recover_once()
+        self.assertLessEqual(transfer.nas_busy()["retry_in"], transfer.BREAKER_MAX)   # ...to a cap
+
+    def test_a_nas_that_stops_answering_at_all_is_unreachable_not_overloaded(self):
+        transfer._trip(138.0)
+        with mock.patch.object(transfer, "_open", side_effect=OSError("No route to host")):
+            self.assertTrue(transfer._recover_once())
+        self.assertIsNone(transfer.nas_busy())
+
+    def test_the_message_says_what_happened_and_when_it_looks_again(self):
+        transfer._trip(138.4)
+        t = transfer.busy_text()
+        self.assertIn("a login took 138 s", t)
+        self.assertIn("next check in", t)
+        _reset_breaker()
+        self.assertEqual(transfer.busy_text(), "")
+
+    def test_a_connect_racing_the_close_never_reopens_it(self):
+        self.assertFalse(transfer._ensure_recovery())   # closed: nothing to do, and still closed
+        self.assertIsNone(transfer.nas_busy())
+
+    def _connect_routes(self, fake, routes):
+        with mock.patch.object(transfer, "_WireFTP", fake), \
+             mock.patch.object(transfer, "ftp_hosts", return_value=["100.1.2.3", "nas.local"]), \
+             mock.patch.object(transfer, "ftp_settings", return_value=self.SETTINGS), \
+             mock.patch.object(transfer, "_route_order", return_value=routes):
+            return transfer.connect(timeout=15)
+
+    def test_a_kernel_timeout_is_a_dead_path_and_the_next_route_is_tried(self):
+        import errno
+        calls = []
+        class Fake(transfer._WireFTP):
+            def connect(self, host, port, timeout=None, source_address=None):
+                calls.append(host); self._h = host
+                return "220 ready"
+            def login(self, *a):
+                if self._h == "192.168.1.195":
+                    raise TimeoutError(errno.ETIMEDOUT, "Operation timed out")
+            def sendcmd(self, *a): return "200"
+            def set_pasv(self, *a): pass
+            def close(self): pass
+        self._connect_routes(Fake, [("192.168.1.195", "192.168.1.92"), ("100.1.2.3", None)])
+        self.assertEqual(calls, ["192.168.1.195", "100.1.2.3"])
+        self.assertIsNone(transfer.nas_busy())
+
+    def _lan_login_stalls(self, still_offered):
+        import nas_link, socket
+        calls = []
+        class Fake(transfer._WireFTP):
+            def connect(self, host, port, timeout=None, source_address=None):
+                calls.append(host); self._h = host
+                return "220 ready"
+            def login(self, *a):
+                if self._h == "192.168.1.195":
+                    raise socket.timeout("timed out")
+            def sendcmd(self, *a): return "200"
+            def set_pasv(self, *a): pass
+            def close(self): pass
+        with mock.patch.object(nas_link, "local_address_active", return_value=still_offered) as la, \
+             mock.patch.object(nas_link, "lan_route",
+                               side_effect=AssertionError("never re-prove against a stalling NAS")), \
+             mock.patch.object(nas_link, "forget", side_effect=AssertionError("no forget")):
+            try:
+                self._connect_routes(Fake, [("192.168.1.195", "192.168.1.92"), ("100.1.2.3", None)])
+            except transfer.NasBusy:
+                pass
+        la.assert_called_once_with("192.168.1.92")
+        return calls
+
+    def test_a_cable_pulled_after_the_banner_falls_back_instead_of_tripping(self):
+        self.assertEqual(self._lan_login_stalls(still_offered=False), ["192.168.1.195", "100.1.2.3"])
+        self.assertIsNone(transfer.nas_busy())
+
+    def test_a_lan_route_still_offered_means_the_nas_itself_stalled(self):
+        self.assertEqual(self._lan_login_stalls(still_offered=True), ["192.168.1.195"])
+        self.assertIsNotNone(transfer.nas_busy())
+
+    def test_no_test_ever_reaches_the_nas(self):
+        with self.assertRaises(OSError) as cm:
+            transfer._WireFTP().connect("192.168.1.195", 21, timeout=1)
+        self.assertIn("mock transfer._WireFTP", str(cm.exception))
+
+    def test_no_recovery_thread_from_a_test(self):
+        with mock.patch.object(transfer.threading, "Thread",
+                               side_effect=AssertionError("no thread under test")):
+            transfer._trip(5.0)
+        self.assertFalse(transfer._BREAKER["checking"])
+
+    def test_the_recovery_loop_waits_out_the_window_then_checks(self):
+        transfer._trip(138.0)
+        with transfer._BREAKER_LOCK:
+            transfer._BREAKER["until"] = 0.0
+        with mock.patch.object(transfer, "_recover_once", return_value=True) as once:
+            transfer._recover()
+        once.assert_called_once()
+        self.assertFalse(transfer._BREAKER["checking"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

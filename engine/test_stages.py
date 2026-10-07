@@ -1701,6 +1701,36 @@ class CombineStages(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(msg.startswith("permanent:"))
 
+    def test_an_unverifiable_partial_nas_copy_is_kept_but_never_reused(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        os.makedirs(os.path.dirname(p.source), exist_ok=True)
+        open(p.source, "w").write("partial")
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_remote_size", return_value=None), \
+             mock.patch.object(stages.transfer, "download",
+                               side_effect=AssertionError("must not pull over an unverified copy")), \
+             mock.patch.object(companion, "fetch_to_file",
+                               side_effect=AssertionError("must not get that far")):
+            ok, msg = stages.run_stage("download", p)
+        self.assertFalse(ok)
+        self.assertIn("cannot verify the local NAS copy is complete", msg)
+        self.assertTrue(os.path.exists(p.source))        # kept for the next attempt
+
+    def test_an_unverifiable_copy_during_an_overload_says_overloaded(self):
+        import companion
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        os.makedirs(os.path.dirname(p.source), exist_ok=True)
+        open(p.source, "w").write("partial")
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_remote_size", return_value=None), \
+             mock.patch.object(stages.transfer, "nas_busy", return_value={"since": 1}):
+            ok, msg = stages.run_stage("download", p)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("NAS overloaded — cannot verify"), msg)
+
     def test_download_pulls_both_copies(self):
         import companion
         d = tempfile.mkdtemp()

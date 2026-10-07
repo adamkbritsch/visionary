@@ -10,10 +10,12 @@ a small JSON file the dashboard and the (future) orchestrator both read.
 """
 from __future__ import annotations
 import ftplib
+import itertools
 import json
 import os
 import re
 import threading
+import time
 
 from transfer import connect as ftp_connect, ftp_listdir, ftp_walk_files, NAS_FTP_TV_ROOT, NAS_FTP_TV_ROOTS
 
@@ -239,7 +241,8 @@ def list_episode_files(series, *, timeout=40):
     except ftplib.all_errors:
         return None
     try:
-        pairs = ftp_walk_files(ftp, root.rstrip("/") + "/" + series, with_dirs=True)
+        pairs = ftp_walk_files(ftp, root.rstrip("/") + "/" + series, with_dirs=True,
+                               strict=True)   # a walk cut short is unreadable, never "fewer files"
         remember_episode_dirs(series, pairs)
         return [name for _d, name in pairs]
     except ftplib.all_errors:
@@ -299,10 +302,53 @@ def episode_queue(series, skip=()) -> dict:
 
 # ---- queue cache (so /api/state polling never hits the NAS) ---------------
 _QUEUE_CACHE = {}
+# When each cached queue was computed (monotonic; ABSENT = stale — never 0, which a Mac
+# that booted under QUEUE_TTL ago would read as fresh). The cache used to have no
+# age at all: a queue read once was served for the life of the process unless a refresh
+# SUCCEEDED, and a refresh that met an unreachable NAS kept the old one. Live 2026-10-06:
+# Community S04E06 was replaced at 08:37, the post-upload refresh hit a thrashing NAS, and
+# the cache went on listing the deleted 1080p file as up next all day; the prefetcher
+# tried to download it 15 times (550 every time) and the app showed it as "up next".
+_QUEUE_AT = {}
+# Stores are ordered by when each listing STARTED: every warm/refresh draws a number, and a result
+# lands only if no newer listing — or a newer event (forget_episode) — has landed since. A listing
+# that began before an upload finished can never overwrite the queue that already knows about it,
+# and a refresh that fails can never throw away a concurrent one that worked (review 2026-10-06).
+_QUEUE_SEQ = itertools.count(1)
+_QUEUE_STORED = {}          # series -> the number of what the cache holds now
+_QUEUE_TRIED = {}           # when a listing last FINISHED (monotonic): the retry throttle's clock
+_QUEUE_DERIVED = set()      # shows whose cached counts came from forget_episode, not a listing
+QUEUE_TTL = 600             # a cached queue older than this is refreshed behind the poll
+QUEUE_RETRY = 60            # ...but a failed listing is not retried sooner than this
 
 
 _QUEUE_WARMING = set()
 _QUEUE_WARM_LOCK = threading.Lock()
+
+
+def _store_queue(series_name, q, seq) -> bool:
+    """Cache `q` unless something newer has landed since its listing began."""
+    with _QUEUE_WARM_LOCK:
+        if seq <= _QUEUE_STORED.get(series_name, 0):
+            return False
+        _QUEUE_CACHE[series_name] = q
+        _QUEUE_AT[series_name] = time.monotonic()
+        _QUEUE_STORED[series_name] = seq
+        _QUEUE_DERIVED.discard(series_name)
+        return True
+
+
+def _queue_stale(series_name) -> bool:
+    at = _QUEUE_AT.get(series_name)
+    return at is None or time.monotonic() - at >= QUEUE_TTL
+
+
+def _nas_busy() -> bool:
+    try:
+        import transfer
+        return bool(transfer.nas_busy())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def cached_queue(series_name):
@@ -315,43 +361,131 @@ def cached_queue(series_name):
 
     A miss now returns None immediately and warms in the BACKGROUND, one warmer per series;
     every caller already tolerates None (`or {}` at each site) and picks the queue up on a
-    later call. A failed computation is still not cached — the next miss retries — and
-    refresh_queue keeps its synchronous behaviour for callers that genuinely want to wait."""
+    later call. A failed computation is still not cached, and refresh_queue keeps its
+    synchronous behaviour for callers that genuinely want to wait.
+
+    A STALE queue (older than QUEUE_TTL, or marked stale) is still served at once and
+    refreshed behind the poll the same way. A failed listing is retried no sooner than
+    QUEUE_RETRY after it FINISHED — a miss included: with the NAS failing fast, a miss used to
+    start a warmer (and a Plex query) on every 2 s poll. While the NAS is OVERLOADED (logins
+    one at a time, minutes each) a queue we have is served as it is — a listing then costs
+    several of those logins — but a show with none still gets its throttled warmer."""
     if not series_name:
         return None
     q = _QUEUE_CACHE.get(series_name)
-    if q is not None:
+    if q is not None and not _queue_stale(series_name):
+        return q
+    if q is not None and _nas_busy():
         return q
     with _QUEUE_WARM_LOCK:
         if series_name in _QUEUE_WARMING:
-            return None                    # a warmer is already on it — never stack them
+            return q                       # a warmer is already on it — never stack them
+        tried = _QUEUE_TRIED.get(series_name)
+        if tried is not None and time.monotonic() - tried < QUEUE_RETRY:
+            return q                       # the last listing just failed — don't hammer the NAS
         _QUEUE_WARMING.add(series_name)
+        seq = next(_QUEUE_SEQ)
 
     def warm():
         try:
             r = episode_queue(series_name)
             if r is not None:
-                _QUEUE_CACHE[series_name] = r
+                _store_queue(series_name, r, seq)
         finally:
             with _QUEUE_WARM_LOCK:
                 _QUEUE_WARMING.discard(series_name)
+                _QUEUE_TRIED[series_name] = time.monotonic()
 
     threading.Thread(target=warm, daemon=True,
                      name="queue-warm-" + series_name[:24]).start()
-    return None
+    return q
+
+
+def mark_stale(series_name):
+    """The cached queue may be wrong (a listed source just failed to download): refresh it
+    on the next read instead of at the TTL — still no sooner than QUEUE_RETRY after the last
+    listing, so repeated failures cannot turn into a listing per failure."""
+    if not series_name:
+        return
+    with _QUEUE_WARM_LOCK:
+        _QUEUE_AT.pop(series_name, None)
+
+
+def forget_episode(series_name, ep):
+    """`ep` of `series_name` now has its DV master: drop it from the cached queue AT ONCE,
+    with no NAS I/O, so neither the up-next view nor the prefetcher can reach for its
+    replaced source while the NAS is too slow to re-list. Any listing already under way began
+    before this and is dropped when it lands; the entry is left stale, so the next read
+    re-lists the show for real."""
+    if not series_name or not ep:
+        return
+    with _QUEUE_WARM_LOCK:
+        _QUEUE_STORED[series_name] = next(_QUEUE_SEQ)
+        q = _QUEUE_CACHE.get(series_name)
+        if q is None:
+            return
+        rem = list(q.get("remaining") or [])
+        if ep in rem:
+            q = dict(q)
+            rem.remove(ep)
+            q["remaining"] = rem
+            q["remaining_items"] = [it for it in (q.get("remaining_items") or [])
+                                    if it.get("ep") != ep]
+            q["remaining_count"] = max(0, int(q.get("remaining_count") or 0) - 1)
+            q["done_count"] = int(q.get("done_count") or 0) + 1
+            nxt = q.get("next") or {}
+            if nxt.get("ep") == ep:
+                if nxt.get("watched") is False:
+                    q["unwatched_count"] = max(0, int(q.get("unwatched_count") or 0) - 1)
+                # every remaining item has a source and no master — that much of the row is known
+                q["next"] = next(({"ep": it["ep"], "source_name": it["source_name"],
+                                   "has_source": True, "has_dv": False}
+                                  for it in q["remaining_items"]), None)
+            _QUEUE_CACHE[series_name] = q
+            _QUEUE_DERIVED.add(series_name)        # counts no listing has confirmed yet
+        _QUEUE_AT.pop(series_name, None)
+        _QUEUE_TRIED.pop(series_name, None)
+
+
+def queue_confirmed(series_name) -> bool:
+    """The cached counts come from a real NAS listing — not only from forget_episode, whose
+    "nothing left" a slot promotion must never act on (review 2026-10-06)."""
+    return series_name not in _QUEUE_DERIVED
 
 
 def refresh_queue(series_name):
     """Recompute the queue from the NAS and update the cache. Called when the picker
     opens, a series is selected, and after each upload finishes (so 'done' / 'next up'
-    advance live instead of only when the run stops)."""
+    advance live instead of only when the run stops). An unreachable NAS never overwrites
+    a good queue — but it leaves it STALE, so a later read tries again. Counts as the
+    show's warmer while it runs, so no background warm stacks on top of it.
+
+    While the NAS is OVERLOADED it does not list at all: the listing would queue for logins
+    that take minutes each — stalling the finisher after every episode, and the picker — and
+    forget_episode has already taken a finished episode out. The entry is left stale."""
     if not series_name:
         return None
-    q = episode_queue(series_name)
-    if q is None:
-        return _QUEUE_CACHE.get(series_name)   # unreachable NAS never overwrites a good queue
-    _QUEUE_CACHE[series_name] = q
-    return q
+    if _nas_busy():
+        with _QUEUE_WARM_LOCK:
+            _QUEUE_AT.pop(series_name, None)
+            return _QUEUE_CACHE.get(series_name)
+    with _QUEUE_WARM_LOCK:
+        seq = next(_QUEUE_SEQ)
+        added = series_name not in _QUEUE_WARMING
+        _QUEUE_WARMING.add(series_name)
+    try:
+        q = episode_queue(series_name)
+        if q is not None and _store_queue(series_name, q, seq):
+            return q
+        with _QUEUE_WARM_LOCK:
+            if q is None and _QUEUE_STORED.get(series_name, 0) < seq:
+                _QUEUE_AT.pop(series_name, None)   # nothing newer landed: what is cached is stale
+            return _QUEUE_CACHE.get(series_name)
+    finally:
+        with _QUEUE_WARM_LOCK:
+            if added:
+                _QUEUE_WARMING.discard(series_name)
+            _QUEUE_TRIED[series_name] = time.monotonic()
 
 
 # ---- selection persistence ------------------------------------------------
@@ -505,7 +639,7 @@ def promote_finished_slots() -> list:
         if not nxt or nxt in slots:
             continue
         rem, total, _frac = slot_progress(s)
-        if total > 0 and rem == 0:
+        if total > 0 and rem == 0 and queue_confirmed(s):   # a listing says so, not only forget
             slots[i] = nxt
             promos.append((s, nxt))
     if promos:

@@ -201,6 +201,16 @@ def link():
     import nas_link
     name = _lan_name()
     ln = dict(nas_link.detect(name)) if name else {"iface": None, "bound": False}
+    if not (ln.get("bound") and ln.get("fresh")):
+        # mDNS silent: Tailscale may still prove the NAS's LAN address (nas_link.lan_link) —
+        # report the link the transfers will really take, not "unresolved"
+        try:
+            import transfer
+            alt = nas_link.lan_link(transfer.ftp_hosts(), wait=False)   # never ping on a leg
+        except Exception:  # noqa: BLE001
+            alt = None
+        if alt:
+            ln = dict(alt)
     ln["via"] = _via["route"]
     return nas_link.remember(ln)
 
@@ -209,7 +219,7 @@ def _lan_offered() -> bool:
     """Would a new connection take the LAN route right now (transfer._route_order)?"""
     try:
         import transfer
-        return any(src for _h, src in transfer._route_order(transfer.ftp_hosts()))
+        return any(src for _h, src in transfer._route_order(transfer.ftp_hosts(), wait=False))
     except Exception:  # noqa: BLE001
         return False
 
@@ -264,6 +274,18 @@ def _close(ftp, hard=False):
             pass
 
 
+def _is_busy(ex) -> bool:
+    """`ex` is the login breaker refusing a connection (transfer.NasBusy)."""
+    import transfer
+    return isinstance(ex, transfer.NasBusy)
+
+
+def overloaded() -> bool:
+    """The NAS is in overload mode (transfer's login breaker) — local state, no I/O."""
+    import transfer
+    return bool(transfer.nas_busy())
+
+
 def _retrying(fn, retry=True):
     """fn(), tried again after SHORT_RETRY_WAITS when the connection blips — never on an FTP
     refusal (5xx: the answer), NoLink, Stopped or anything of the caller's own."""
@@ -271,8 +293,8 @@ def _retrying(fn, retry=True):
     for i in range(len(waits) + 1):
         try:
             return fn()
-        except _TRANSIENT:
-            if i >= len(waits):
+        except _TRANSIENT as ex:
+            if i >= len(waits) or _is_busy(ex):  # an open breaker answers the same in 25 s
                 raise
             _pause(None, waits[i])
 
@@ -335,7 +357,9 @@ def mode_of(host_path: str):
         return None
     try:
         return _short(go)
-    except ftplib.all_errors:
+    except ftplib.all_errors as ex:
+        if _is_busy(ex):
+            raise                                # wait the overload out: never swap without the mode
         return None                              # a mode is a nicety: never fail a swap on it
 
 
@@ -472,6 +496,12 @@ def _legs(run_leg, have_fn, size, abort):
         except _Relink:
             continue
         except Exception as ex:  # noqa: BLE001 — a dropped leg: the bytes stay, the next resumes
+            if _is_busy(ex):
+                # The NAS is overloaded and the login breaker is failing every connect at once:
+                # twelve instant failures would burn the transfer's attempts in two minutes and
+                # charge the overload to the movie (a partial download deleted, a ship attempt
+                # spent). Hand it up as what it is — the lane waits out an offline NAS.
+                raise
             _legs.last_error = f"{type(ex).__name__}: {str(ex)[:160]}"
             failures += 1
             _pause(abort, FAIL_PAUSE_SECS)

@@ -20,6 +20,9 @@ import threading
 import functools
 import json
 import os
+import socket
+import sys
+import time
 
 CONFIG_FILE = os.path.expanduser("~/.topaz-pipeline/config.json")
 # THE BUILT-IN LAYOUT — the fallback, and the exact behavior before media folders became
@@ -129,6 +132,16 @@ class _WireFTP(ftplib.FTP):
     def putcmd(self, line):
         super().putcmd(to_wire(line))
 
+    def connect(self, *a, **kw):
+        # The same rule as nas_ftp._connect, scratch and dvbook: a test never reaches the NAS.
+        # Several did (history's audio revision, prefetch threads an orchestrator test left
+        # running) — harmless while a dead login failed fast, but a live one took 21 s and
+        # tripped the login breaker for the rest of the run (2026-10-06). An OSError, so the
+        # code under test sees exactly an unreachable NAS. Test fakes subclass and override this.
+        if _under_test():
+            raise OSError("a test tried to reach the NAS over FTP — mock transfer._WireFTP")
+        return super().connect(*a, **kw)
+
 
 _LINK = threading.local()        # per-thread: did this transfer's connection use the LAN route?
 
@@ -158,7 +171,7 @@ def _link_retry(fn):
     return wrapper
 
 
-def _route_order(hosts):
+def _route_order(hosts, wait=True):
     """[(host, local address to bind or None)] in the order to try. When the NAS network setting's
     link (nas_link.py: Ethernet first by default) reaches the NAS DIRECTLY, its LAN address goes
     FIRST, bound to that link — ahead of the Tailscale address the host list leads with, which is
@@ -172,7 +185,7 @@ def _route_order(hosts):
         return plain                                  # a forced host is the user's call
     try:
         import nas_link
-        route = nas_link.lan_route(hosts)
+        route = nas_link.lan_route(hosts, wait)
     except Exception:  # noqa: BLE001 — never let link detection keep the pipeline off the NAS
         return plain
     return ([route] + plain) if route else plain
@@ -182,10 +195,230 @@ class NoLanRoute(ftplib.error_temp):
     """connect(lan_only=True) found no route bound to the chosen link."""
 
 
+class NasBusy(ftplib.error_temp):
+    """The NAS answers but cannot finish a login: Visionary is backing off (see _BREAKER)."""
+
+
+# ---- the login breaker --------------------------------------------------------------------
+# A NAS that is out of memory still answers: the FTP banner comes back at once and the
+# Tailscale/LAN paths ping in under a millisecond, but the LOGIN (smbftpd's password check)
+# stalls behind the swap. Live 2026-10-06: USER answered in 1 s and PASS in 138 s. Every caller
+# gave up at its own 8-30 s and tried again, from half a dozen threads — while the NAS went on
+# running each abandoned password check to the end, so Visionary kept a pile of them going on
+# the box it was waiting for, and reported the whole day as "NAS unreachable".
+#
+# So the first patient login that times out AFTER the banner puts the NAS in OVERLOAD MODE (the
+# breaker opens). From then on logins go ONE AT A TIME, each allowed LOGIN_PATIENT — the work still
+# gets done, slowly, with at most one password check of ours on the NAS instead of a pile of
+# abandoned ones — while a quick probe (a caller's timeout under LOGIN_TRIP_MIN: UI checks,
+# reachability) is answered at once with NasBusy. A login that completes healthy again
+# (LOGIN_HEALTHY) ends overload mode; while nothing logs in, one background check per back-off
+# window finds that out. Connections already open — a transfer under way — are untouched.
+LOGIN_TRIP_MIN = 15      # a caller's timeout below this says nothing about the NAS (UI probes)
+BREAKER_BASE = 30        # the first back-off; it doubles after each failed check...
+BREAKER_MAX = 300        # ...up to this
+LOGIN_HEALTHY = 10       # a login slower than this still counts as overloaded
+LOGIN_PATIENT = 180      # overload mode: how long a login may take, and wait for its turn
+RECOVERY_WAIT = LOGIN_PATIENT    # the background check gets the same (it takes the same turn)
+_LOGIN_SLOT = threading.Semaphore(1)   # overload mode: one login in flight from this process
+_BREAKER = {"open": False, "since": None, "until": 0.0, "fails": 0, "login_secs": None,
+            "waited": None, "checking": False, "seen": 0.0}
+_BREAKER_LOCK = threading.Lock()
+
+
+def _under_test() -> bool:
+    return "unittest" in sys.modules
+
+
+def nas_busy():
+    """None while logins work; else {"since", "retry_in", "login_secs"} — for the hold message."""
+    with _BREAKER_LOCK:
+        if not _BREAKER["open"]:
+            return None
+        return {"since": _BREAKER["since"], "login_secs": _BREAKER["login_secs"],
+                "waited": _BREAKER["waited"],
+                "retry_in": max(0, int(_BREAKER["until"] - time.time()))}
+
+
+def busy_text(b=None) -> str:
+    """The plain-words state of an open breaker."""
+    b = b or nas_busy()
+    if not b:
+        return ""
+    took, waited = b.get("login_secs"), b.get("waited")
+    took = (f"a login took {int(took)} s" if took else
+            f"a login did not finish in {int(waited)} s" if waited else
+            "a login did not finish in time")
+    left = int(b.get("retry_in") or 0)
+    nxt = (f"next check in {left // 60} min" if left >= 90 else
+           f"next check in {left} s" if left else "checking now")
+    return f"NAS overloaded — {took} (normally under 1 s); logging in one at a time, {nxt}"
+
+
+def _note(text):
+    """One line in the run log — the breaker opening and closing is news the user needs."""
+    try:
+        import logbook
+        logbook.event(text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _trip(login_secs=None, waited=None):
+    """Open the breaker (or keep it open) and make sure one recovery check is scheduled.
+    `login_secs` is a login that COMPLETED that slowly; `waited` one that never finished."""
+    with _BREAKER_LOCK:
+        opened = not _BREAKER["open"]
+        if opened:
+            _BREAKER.update(open=True, since=time.time(), fails=0, login_secs=None, waited=None,
+                            until=time.time() + BREAKER_BASE)
+        if login_secs is not None:
+            _BREAKER["login_secs"] = login_secs
+        if waited is not None and _BREAKER["login_secs"] is None:
+            _BREAKER["waited"] = waited
+        start = not _BREAKER["checking"] and not _under_test()
+        if start:
+            _BREAKER["checking"] = True
+    if opened:
+        _note(f"{busy_text()} — quick checks are refused until a login is healthy again")
+    if start:
+        threading.Thread(target=_recover, daemon=True, name="nas-login-recovery").start()
+
+
+def _observe(secs):
+    """A login completed in `secs`: a healthy one ends overload mode; a slow one is the news."""
+    with _BREAKER_LOCK:
+        if not _BREAKER["open"]:
+            return
+        _BREAKER["seen"] = time.time()
+        if secs > LOGIN_HEALTHY:
+            _BREAKER["login_secs"] = secs
+            return
+        since = _BREAKER["since"]
+        _BREAKER.update(open=False, since=None, until=0.0, fails=0, login_secs=None, waited=None)
+    mins = int((time.time() - since) / 60) if since else 0
+    _note(f"NAS logins are healthy again ({secs:.1f} s) after {mins} min — resuming")
+
+
+def _recover_once() -> bool:
+    """One recovery check: log in with all the time it takes. True when the breaker closed —
+    the login was healthy, or the check failed some OTHER way (no answer at all, a refused
+    login): the overload diagnosis no longer holds, and connecting to a NAS that is not there
+    costs it nothing, so the ordinary unreachable handling takes over."""
+    other = None
+    if not _LOGIN_SLOT.acquire(timeout=LOGIN_PATIENT):
+        secs = None                      # real logins kept the slot busy: still overloaded
+    else:
+        t0 = time.monotonic()
+        try:
+            ftp = _open(RECOVERY_WAIT, False, login_wait=RECOVERY_WAIT, observe=False)
+            secs = time.monotonic() - t0
+            try:
+                ftp.quit()
+            except Exception:  # noqa: BLE001
+                pass
+        except NasBusy:
+            secs = None                  # the login stalled even with all this time: still overloaded
+        except Exception as e:  # noqa: BLE001
+            secs, other = None, e
+        finally:
+            _LOGIN_SLOT.release()
+    with _BREAKER_LOCK:
+        healthy = secs is not None and secs <= LOGIN_HEALTHY
+        if healthy or other is not None:
+            since = _BREAKER["since"]
+            _BREAKER.update(open=False, since=None, until=0.0, fails=0, login_secs=None,
+                            waited=None)
+    if healthy or other is not None:
+        mins = int((time.time() - since) / 60) if since else 0
+        _note(f"NAS logins are healthy again ({secs:.1f} s) after {mins} min — resuming" if healthy
+              else f"NAS login check: {_why(other)} — no longer treated as an overload")
+        return True
+    with _BREAKER_LOCK:
+        _BREAKER["fails"] += 1
+        if secs is not None:
+            _BREAKER["login_secs"] = secs        # it completed — slowly
+        _BREAKER["until"] = time.time() + min(BREAKER_BASE * 2 ** _BREAKER["fails"], BREAKER_MAX)
+        return False
+
+
+def _recover():
+    try:
+        while True:
+            with _BREAKER_LOCK:
+                if not _BREAKER["open"]:
+                    return                       # a real login found it healthy first
+                wait = _BREAKER["until"] - time.time()
+                if wait <= 0 and time.time() - _BREAKER["seen"] < BREAKER_BASE:
+                    # real logins are measuring the NAS already: no extra password check
+                    _BREAKER["until"] = time.time() + BREAKER_BASE
+                    wait = BREAKER_BASE
+            if wait > 0:
+                time.sleep(min(wait, 30))
+                continue
+            if _recover_once():
+                return
+    finally:
+        with _BREAKER_LOCK:
+            _BREAKER["checking"] = False
+            rearm = _BREAKER["open"]             # a _trip() landed while this thread was leaving
+        if rearm:
+            _ensure_recovery()
+
+
+def _route_died(e, host, src, hosts) -> bool:
+    """A login timeout that is the PATH failing, not the NAS stalling: the kernel gave up on the
+    connection (an errno — ETIMEDOUT — where a slow reply is a bare "timed out"), or the bound
+    local address is no longer on an active interface (a cable pulled after the banner). Those
+    walk on to the next route, as before, instead of opening the breaker for everyone. Local
+    checks only: re-proving the route would ask the very NAS that is stalling (review 2026-10-06)."""
+    if getattr(e, "errno", None):
+        return True
+    if not src:
+        return False
+    try:
+        import nas_link
+        return not nas_link.local_address_active(src)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def connect(timeout=15, lan_only=False):
     """Open an FTP connection, trying each host in order (_route_order). `lan_only`: only the route
     bound to the NAS network setting's link — the Dolby Vision lane's 'Ethernet only', which waits
-    for the cable rather than fall back to another route."""
+    for the cable rather than fall back to another route. While the NAS is in overload mode (the
+    login breaker), logins go one at a time with LOGIN_PATIENT each, and a quick probe (timeout
+    under LOGIN_TRIP_MIN) fails at once with NasBusy."""
+    if not _ensure_recovery():
+        return _open(timeout, lan_only)
+    if timeout < LOGIN_TRIP_MIN:             # a quick probe: answered at once, no login
+        raise NasBusy(busy_text())
+    if not _LOGIN_SLOT.acquire(timeout=LOGIN_PATIENT):
+        raise NasBusy(busy_text())
+    try:
+        return _open(timeout, lan_only, login_wait=max(timeout, LOGIN_PATIENT))
+    finally:
+        _LOGIN_SLOT.release()
+
+
+def _ensure_recovery() -> bool:
+    """True while the NAS is in overload mode — and then a recovery check is running (restarted if it
+    ever died). Never OPENS the breaker: a connect() racing the check that just closed it must
+    not reopen it with no new evidence (review 2026-10-06)."""
+    with _BREAKER_LOCK:
+        if not _BREAKER["open"]:
+            return False
+        start = not _BREAKER["checking"] and not _under_test()
+        if start:
+            _BREAKER["checking"] = True
+    if start:
+        threading.Thread(target=_recover, daemon=True, name="nas-login-recovery").start()
+    return True
+
+
+def _open(timeout, lan_only, login_wait=None, observe=True):
+    """`login_wait`: overload mode — the login alone may take this long (the caller's own timeout
+    is restored for everything after it). `observe`: a completed login reports its time."""
     s = ftp_settings()
     hosts = ftp_hosts()
     if not hosts:
@@ -210,7 +443,26 @@ def connect(timeout=15, lan_only=False):
             # source_address to both) to the chosen link.
             ftp.connect(host, s["port"], timeout=timeout,
                         source_address=(src, 0) if src else None)
-            ftp.login(s["user"], s["passwd"])
+            t0 = time.monotonic()
+            try:
+                if login_wait and getattr(ftp, "sock", None) is not None:
+                    ftp.sock.settimeout(login_wait)
+                ftp.login(s["user"], s["passwd"])
+                if login_wait and getattr(ftp, "sock", None) is not None:
+                    ftp.sock.settimeout(timeout)
+            except (socket.timeout, TimeoutError) as e:
+                # The banner came back, so this route reaches the NAS: the stall is the NAS's own
+                # password check, and every other route leads to the same box — don't walk them.
+                try:
+                    ftp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if (login_wait or timeout >= LOGIN_TRIP_MIN) and not _route_died(e, host, src, hosts):
+                    _trip(waited=time.monotonic() - t0)
+                    raise NasBusy(busy_text())
+                raise                            # a route failure: the next route is tried
+            if observe:
+                _observe(time.monotonic() - t0)
             # ASK FOR UTF-8 EXPLICITLY. ftplib only sends this itself when its encoding is
             # utf-8, and ours is deliberately latin-1 (above) — so we never asked, and
             # smbftpd fell back to its configured legacy codepage and transcoded every
@@ -230,6 +482,8 @@ def connect(timeout=15, lan_only=False):
             ftp.set_pasv(True)   # passive (smbftpd PassiveModePortRange 40000-50000)
             _LINK.bound = bool(src)
             return ftp
+        except NasBusy:
+            raise                        # the NAS itself is stalled: no other route helps
         except ftplib.all_errors as e:
             last = e
     raise last or ftplib.error_temp("no FTP host reachable")
@@ -339,7 +593,7 @@ _VIDEO_EXT = (".mp4", ".mkv", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".avi", ".
               ".webm", ".mpg", ".mpeg", ".vob", ".flv", ".ogv", ".m2v", ".divx", ".mpv")
 
 
-def ftp_walk_files(ftp, base, depth=3, with_dirs=False) -> list:
+def ftp_walk_files(ftp, base, depth=3, with_dirs=False, strict=False) -> list:
     """Recursively collect file basenames under an FTP dir (series → season → files).
     Uses MLSD types when the server supports them; otherwise falls back to NLST and
     guesses dir-vs-file by extension (smbftpd may not implement MLSD).
@@ -348,7 +602,12 @@ def ftp_walk_files(ftp, base, depth=3, with_dirs=False) -> list:
     caller needs that because season folders are NOT reliably named `S01`: real
     libraries carry things like `Season 1` or
     `Arrested Development Season 2 S02 1080p BluRay x264-BiA`. Synthesizing the season
-    path from the episode number silently 550s on those shows (live-caught 2026-07-30)."""
+    path from the episode number silently 550s on those shows (live-caught 2026-07-30).
+
+    `strict=True` raises when any listing fails for a reason other than a refusal (5xx: no
+    MLSD, no such folder) — a timeout or a dropped connection mid-walk otherwise returned the
+    folders listed so far as if they were the whole show, and a cached queue built from that
+    is short (review 2026-10-06: the queue cache now re-lists every QUEUE_TTL)."""
     out = []
     if depth < 0:
         return out
@@ -356,7 +615,11 @@ def ftp_walk_files(ftp, base, depth=3, with_dirs=False) -> list:
     base = base.rstrip("/")
     try:
         entries = list(ftp.mlsd(base))
+    except ftplib.error_perm:
+        entries = None
     except ftplib.all_errors:
+        if strict:
+            raise
         entries = None
     if entries:
         for name, facts in entries:
@@ -364,16 +627,25 @@ def ftp_walk_files(ftp, base, depth=3, with_dirs=False) -> list:
                 continue
             t = facts.get("type")
             if t == "dir":
-                out.extend(ftp_walk_files(ftp, base + "/" + name, depth - 1, with_dirs))
+                out.extend(ftp_walk_files(ftp, base + "/" + name, depth - 1, with_dirs, strict))
             elif t == "file":
                 hit(base, name)
     else:
-        for name in ftp_listdir(ftp, base):     # NLST fallback (no types)
+        names = _nlst_strict(ftp, base) if strict else ftp_listdir(ftp, base)
+        for name in names:                      # NLST fallback (no types)
             if name.lower().endswith(_VIDEO_EXT):
                 hit(base, name)                 # a video file
             else:
-                out.extend(ftp_walk_files(ftp, base + "/" + name, depth - 1, with_dirs))
+                out.extend(ftp_walk_files(ftp, base + "/" + name, depth - 1, with_dirs, strict))
     return out
+
+
+def _nlst_strict(ftp, path) -> list:
+    """NLST basenames; [] for a refusal (an empty or missing folder), raising anything else."""
+    try:
+        return [p.rsplit("/", 1)[-1] for p in ftp.nlst(path)]
+    except ftplib.error_perm:
+        return []
 
 
 class _Aborted(Exception):

@@ -705,6 +705,15 @@ everything, including Plex detection.
   two x265 encodes run, so the CPU is theirs). Nothing is lost or parked; you just reclaim
   the idle GPU time the stall would've wasted.
 
+- **An overloaded NAS slows Visionary down, it doesn't stop it or make it fail.** A NAS that
+  has run out of memory still answers, but its logins can take minutes. When that happens
+  Visionary says so ("NAS overloaded — a login took 138 s"), logs in **one connection at a
+  time** instead of retrying from every thread, and never counts the delay against an
+  episode or a movie. The download-ahead and the queue refresh wait it out, and normal
+  service resumes on its own once a login is quick again. Transfers use the Ethernet even
+  when the NAS's network name stops resolving: Tailscale's signed reply from the NAS shows
+  that its LAN address really belongs to it.
+
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless and scales with runtime —
   about **4.1 GiB (4.4 GB) per minute of content** (re-measured 2026-09-16), so a
