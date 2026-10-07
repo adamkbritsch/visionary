@@ -536,6 +536,25 @@ class NeverLeaveEncodersFrozen(unittest.TestCase):
         self.assertTrue(any("-CONT" in c and "x265" in c for c in ran),
                         "must SIGCONT any orphaned x265, not just its own")
 
+    def test_nothing_of_ours_ever_kills_expurgates_engine(self):
+        # Expurgate runs its engine as .../Expurgate.app/.../engine/dashboard/server.py — the same
+        # relative path. A bare `pkill -f "dashboard/server.py"` in the deploy script and in the
+        # app's own launch killed it on every Visionary deploy (live 2026-10-06).
+        import os, re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(orch.__file__)))
+        for rel in ("deploy-now.sh", "macapp/main.swift"):
+            text = open(os.path.join(root, rel)).read()
+            code = "\n".join(l for l in text.splitlines()
+                             if not l.strip().startswith(("#", "//")))
+            for m in re.finditer(r"p(?:kill|grep)[^\n]*", code):
+                line = m.group(0)
+                if "server" in line and ("$SERVER_PAT" not in line):
+                    self.assertIn("Visionary[.]app/Contents/Resources/engine/dashboard/server", line,
+                                  "%s: %s" % (rel, line))
+            self.assertNotRegex(code, r'pkill[^\n]*"dashboard/server\.py"', rel)
+        sh = open(os.path.join(root, "deploy-now.sh")).read()
+        self.assertIn("SERVER_PAT='Visionary[.]app/Contents/Resources/engine/dashboard/server[.]py'", sh)
+
     def test_the_deploy_script_unfreezes_before_waiting(self):
         # It waits for x265 to EXIT; a stopped one never will.
         import os

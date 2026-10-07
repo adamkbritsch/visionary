@@ -95,9 +95,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func startServer() {
         guard let res = Bundle.main.resourcePath else { return }
+        // Kill a stale server of OURS only. Expurgate starts its engine from the same relative path,
+        // so a bare "dashboard/server.py" killed ITS engine too, on every Visionary launch and
+        // deploy (live 2026-10-06: a deploy left an open, activated Expurgate with no engine).
+        // The bundle path keeps it to this app; the brackets keep the pattern from matching itself.
         let pkill = Process()
         pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-f", "dashboard/server.py"]
+        pkill.arguments = ["-f", "Visionary[.]app/Contents/Resources/engine/dashboard/server[.]py"]
         try? pkill.run(); pkill.waitUntilExit()
 
         let dashDir = res + "/engine/dashboard"
