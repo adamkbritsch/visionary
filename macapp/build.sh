@@ -76,11 +76,13 @@ PLIST
 # renamed in the repo lived on inside the .app forever — test_drain_gate.py survived months that
 # way, shipped in a release zip once, and turned up again in an audit as evidence that the build
 # had been made from an old commit. The bundle is the thing that runs; it must be the repo.
-rsync -a --delete --exclude __pycache__ --exclude '*.pyc' "$ROOT/engine/" "$APP/Contents/Resources/engine/"
+# --delete-excluded: an EXCLUDED path is otherwise protected from --delete, so bytecode some older
+# Python wrote into the bundle (cpython-312, June) rode along in every release zip since.
+rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' "$ROOT/engine/" "$APP/Contents/Resources/engine/"
 # Ship the SETUP-TIME artifacts too, mirroring the repo layout (import_resolve.py derives
 # its paths from its own location, so Resources/{setup,bundle,nas} beside engine/ makes a
 # drop-in .app fully self-sufficient — the in-app Setup section drives all three):
-rsync -a --delete --exclude __pycache__ --exclude '*.pyc' "$ROOT/setup/" "$APP/Contents/Resources/setup/"
+rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' "$ROOT/setup/" "$APP/Contents/Resources/setup/"
 rsync -a "$ROOT/bundle/resolve/" "$APP/Contents/Resources/bundle/resolve/"
 mkdir -p "$APP/Contents/Resources/nas"
 cp "$ROOT/nas/dv_probe.py" "$APP/Contents/Resources/nas/dv_probe.py"
