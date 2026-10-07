@@ -5,6 +5,20 @@ import unittest
 import yield_lease
 
 
+class TrustingGate(object):
+    """For tests of the lease's TTL/identity mechanics, not of WHO may hold it (that is
+    test_expurgate_gate / GatedLease). Production has no such gate: the default is the real one."""
+    def verify_request(self, peer):
+        return True, "", 4242, False
+    def check_engine(self, owner):
+        return True, "", False
+    def identify(self, peer):
+        return 4242, True
+
+
+TRUST = TrustingGate()
+
+
 class Clock(object):
     def __init__(self, t=1000.0):
         self.t = t
@@ -16,7 +30,7 @@ class Clock(object):
 class TakeTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        self.lease = yield_lease.YieldLease(now=self.clock)
+        self.lease = yield_lease.YieldLease(gate=TRUST, now=self.clock)
 
     def test_a_lease_makes_stages_stand_down(self):
         self.assertFalse(self.lease.active())
@@ -76,7 +90,7 @@ class TakeTests(unittest.TestCase):
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        self.lease = yield_lease.YieldLease(now=self.clock)
+        self.lease = yield_lease.YieldLease(gate=TRUST, now=self.clock)
 
     def test_release_frees_it_immediately(self):
         self.lease.take("discretion", 3600)
@@ -103,7 +117,7 @@ class ReleaseTests(unittest.TestCase):
 
 class ProtectedStageTests(unittest.TestCase):
     def setUp(self):
-        self.lease = yield_lease.YieldLease(now=Clock())
+        self.lease = yield_lease.YieldLease(gate=TRUST, now=Clock())
         self.lease.take("discretion", 3600)
 
     def test_resolve_upload_and_extend_never_stand_down(self):
@@ -125,7 +139,7 @@ class ProtectedStageTests(unittest.TestCase):
 class StateTests(unittest.TestCase):
     def test_state_says_who_has_the_machine_and_for_how_long(self):
         clock = Clock()
-        lease = yield_lease.YieldLease(now=clock)
+        lease = yield_lease.YieldLease(gate=TRUST, now=clock)
         lease.take("discretion", 600, "Pass 2 on Arrival")
         clock.t += 60
         s = lease.state()
@@ -137,14 +151,14 @@ class StateTests(unittest.TestCase):
 
     def test_an_expired_lease_reports_as_free_without_needing_a_poll(self):
         clock = Clock()
-        lease = yield_lease.YieldLease(now=clock)
+        lease = yield_lease.YieldLease(gate=TRUST, now=clock)
         lease.take("discretion", 60)
         clock.t += 61
         self.assertFalse(lease.state()["held"])
         self.assertIsNone(lease.state()["holder"])
 
     def test_no_lease_reports_as_free(self):
-        self.assertFalse(yield_lease.YieldLease().state()["held"])
+        self.assertFalse(yield_lease.YieldLease(gate=TRUST).state()["held"])
 
 
 class LeaseIdentityTests(unittest.TestCase):
@@ -157,7 +171,7 @@ class LeaseIdentityTests(unittest.TestCase):
 
     def setUp(self):
         self.clock = Clock()
-        self.lease = yield_lease.YieldLease(now=self.clock)
+        self.lease = yield_lease.YieldLease(gate=TRUST, now=self.clock)
 
     def test_a_held_lease_has_an_id(self):
         self.lease.take("discretion", 600)
@@ -185,8 +199,8 @@ class LeaseIdentityTests(unittest.TestCase):
 
     def test_a_fresh_process_cannot_reissue_an_id(self):
         """A restart is exactly the case the id exists for, so two lives must not collide."""
-        a = yield_lease.YieldLease(now=Clock())
-        b = yield_lease.YieldLease(now=Clock())
+        a = yield_lease.YieldLease(gate=TRUST, now=Clock())
+        b = yield_lease.YieldLease(gate=TRUST, now=Clock())
         a.take("discretion", 600)
         b.take("discretion", 600)
         self.assertNotEqual(a.state()["id"], b.state()["id"])
@@ -223,7 +237,7 @@ class TransitionLogTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.seen = []
-        self.lease = yield_lease.YieldLease(now=self.clock, on_change=self.seen.append)
+        self.lease = yield_lease.YieldLease(gate=TRUST, now=self.clock, on_change=self.seen.append)
 
     def test_a_take_an_extension_and_a_release_are_each_reported(self):
         self.lease.take("discretion", 600, "Pass 2 on Arrival")
@@ -247,7 +261,7 @@ class TransitionLogTests(unittest.TestCase):
     def test_whichever_read_notices_the_expiry_first_reports_it(self):
         for read in (lambda l: l.active(), lambda l: l.state(), lambda l: l.blocks("remux")):
             seen = []
-            lease = yield_lease.YieldLease(now=Clock(), on_change=seen.append)
+            lease = yield_lease.YieldLease(gate=TRUST, now=Clock(), on_change=seen.append)
             lease.take("discretion", 60)
             lease._now = Clock(1061.0)
             read(lease)
@@ -261,7 +275,7 @@ class TransitionLogTests(unittest.TestCase):
     def test_a_reporting_callback_that_raises_never_breaks_the_lease(self):
         def boom(_m):
             raise RuntimeError("the log is not the point")
-        lease = yield_lease.YieldLease(now=Clock(), on_change=boom)
+        lease = yield_lease.YieldLease(gate=TRUST, now=Clock(), on_change=boom)
         self.assertTrue(lease.take("discretion", 600)[0])
         self.assertTrue(lease.active())
         self.assertTrue(lease.release("discretion")[0])
@@ -276,7 +290,7 @@ class ARenewalNeverShortens(unittest.TestCase):
 
     def setUp(self):
         self.clock = Clock()
-        self.lease = yield_lease.YieldLease(now=self.clock)
+        self.lease = yield_lease.YieldLease(gate=TRUST, now=self.clock)
 
     def test_a_shorter_renewal_leaves_the_longer_expiry_alone(self):
         self.lease.take("discretion", 3600, "Pass 1 detection")
@@ -303,6 +317,241 @@ class ARenewalNeverShortens(unittest.TestCase):
         self.lease.take("discretion", 900)
         self.assertEqual(self.lease.state()["seconds_left"], 900)
 
+
+class FakeGate(object):
+    def __init__(self, verdict=(True, "", 4242, False), check=(True, "", False)):
+        self.verdict, self.check, self.peers, self.owners = verdict, check, [], []
+    def verify_request(self, peer):
+        self.peers.append(peer)
+        v = self.verdict
+        if isinstance(v, Exception):
+            raise v
+        return v
+    def check_engine(self, owner):
+        self.owners.append(owner)
+        c = self.check
+        if isinstance(c, Exception):
+            raise c
+        return c
+
+    sender = (4242, True)
+    def identify(self, peer):
+        return self.sender
+
+
+class GatedLease(unittest.TestCase):
+    """User rule 2026-10-06: Expurgate gets the machine only while it is open and activated, and the
+    rule cannot be bypassed — an orphaned training script held Visionary off all day by saying
+    "discretion" while Expurgate was not even running."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.seen = []
+        self.gate = FakeGate()
+        self.lease = yield_lease.YieldLease(now=self.clock, gate=self.gate,
+                                            on_change=self.seen.append)
+
+    def test_the_production_default_is_the_real_gate(self):
+        import expurgate_gate
+        self.assertIs(yield_lease.YieldLease()._gate, expurgate_gate)
+        import orchestrator
+        self.assertIs(orchestrator.Orchestrator()._yield_lease._gate, expurgate_gate)
+
+    def test_a_refused_request_gets_nothing_whatever_its_holder_says(self):
+        self.gate.verdict = (False, "Expurgate is not open", None, True)
+        ok, why = self.lease.take("discretion", 900, "Expurgate: overnight training harvest",
+                                  peer=("127.0.0.1", 50123))
+        self.assertFalse(ok)
+        self.assertEqual(why, "Expurgate is not open")
+        self.assertFalse(self.lease.state()["held"])
+        self.assertEqual(self.gate.peers, [("127.0.0.1", 50123)])
+        self.assertEqual(self.seen, ["discretion refused: Expurgate is not open"])
+
+    def test_every_renewal_is_checked_too(self):
+        self.assertTrue(self.lease.take("discretion", 900, peer=("127.0.0.1", 1))[0])
+        self.gate.verdict = (False, "Expurgate is open but not activated", 4242, True)
+        self.assertFalse(self.lease.take("discretion", 900, peer=("127.0.0.1", 2))[0])
+        self.assertEqual(len(self.gate.peers), 2)
+
+    def test_a_gate_that_errors_grants_nothing(self):
+        self.gate.verdict = RuntimeError("lsof is gone")
+        ok, why = self.lease.take("discretion", 900, peer=("127.0.0.1", 1))
+        self.assertFalse(ok)
+        self.assertIn("check failed", why)
+
+    def test_a_repeated_refusal_is_logged_once_per_window(self):
+        self.gate.verdict = (False, "Expurgate is not open", None, True)
+        for _ in range(5):
+            self.lease.take("discretion", 900)
+        self.assertEqual(len(self.seen), 1)
+        self.clock.t += yield_lease.REFUSAL_LOG_SECS + 1
+        self.lease.take("discretion", 900)
+        self.assertEqual(len(self.seen), 2)
+
+    def test_a_held_lease_is_revoked_the_moment_expurgate_closes(self):
+        self.lease.take("discretion", 3600)
+        self.gate.check = (False, "Expurgate is not open", True)
+        self.assertFalse(self.lease.guard_tick())
+        self.assertFalse(self.lease.state()["held"])
+        self.assertIn("revoked", self.seen[-1])
+        self.assertIn("Expurgate is not open", self.seen[-1])
+        self.assertEqual(self.gate.owners, [4242])        # the engine verified at take time
+
+    def test_deactivating_expurgate_revokes_too(self):
+        self.lease.take("discretion", 3600)
+        self.gate.check = (False, "Expurgate is open but not activated", True)
+        self.lease.guard_tick()
+        self.assertFalse(self.lease.state()["held"])
+
+    def test_one_unanswered_check_is_tolerated_two_are_not(self):
+        self.lease.take("discretion", 3600)
+        self.gate.check = (False, "Expurgate did not say whether it is activated", False)
+        self.assertTrue(self.lease.guard_tick())
+        self.assertTrue(self.lease.state()["held"])
+        self.assertFalse(self.lease.guard_tick())
+        self.assertFalse(self.lease.state()["held"])
+
+    def test_an_answer_resets_the_miss_count(self):
+        self.lease.take("discretion", 3600)
+        self.gate.check = (False, "no answer", False)
+        self.lease.guard_tick()
+        self.gate.check = (True, "", False)
+        self.lease.guard_tick()
+        self.gate.check = (False, "no answer", False)
+        self.assertTrue(self.lease.guard_tick())          # one miss again, not two
+
+    def test_a_check_that_errors_counts_as_no_answer(self):
+        self.lease.take("discretion", 3600)
+        self.gate.check = RuntimeError("boom")
+        self.assertTrue(self.lease.guard_tick())
+        self.assertFalse(self.lease.guard_tick())
+
+    def test_a_restarted_expurgate_gets_a_new_lease_not_the_old_one(self):
+        self.lease.take("discretion", 3600)
+        old = self.lease.state()["id"]
+        self.gate.verdict = (True, "", 9999, False)       # a new engine pid
+        self.lease.take("discretion", 900)
+        self.assertNotEqual(self.lease.state()["id"], old)
+
+    def test_the_guard_starts_once_and_stops_when_nothing_is_held(self):
+        spawned, sleeps = [], []
+        lease = yield_lease.YieldLease(now=self.clock, gate=self.gate,
+                                       spawn=spawned.append, sleep=sleeps.append)
+        lease.take("discretion", 3600)
+        lease.take("discretion", 3600)                    # a renewal: no second guard
+        self.assertEqual(len(spawned), 1)
+        self.gate.check = (False, "Expurgate is not open", True)
+        spawned[0]()                                      # run the loop: one check, revoke, exit
+        self.assertEqual(sleeps, [yield_lease.GUARD_SECS])
+        self.assertFalse(lease._guarding)
+        lease.take("discretion", 3600)                    # a later lease gets a guard again
+        self.assertEqual(len(spawned), 2)
+
+    def test_a_renewal_survives_one_check_that_could_not_complete(self):
+        self.lease.take("discretion", 900)
+        self.gate.verdict = (False, "Expurgate did not say whether it is activated", 4242, False)
+        self.clock.t += 400
+        self.assertTrue(self.lease.take("discretion", 900)[0])        # the same engine, one miss
+        self.assertFalse(self.lease.take("discretion", 900)[0])       # two in a row: no
+        self.gate.verdict = (True, "", 4242, False)
+        self.assertTrue(self.lease.take("discretion", 900)[0])        # an answer resets it
+
+    def test_no_such_allowance_for_a_hard_no_or_an_unknown_program(self):
+        self.lease.take("discretion", 900)
+        self.gate.verdict = (False, "Expurgate is open but not activated", 4242, True)
+        self.assertFalse(self.lease.take("discretion", 900)[0])
+        self.gate.verdict = (False, "could not identify the program", None, False)
+        self.assertFalse(self.lease.take("discretion", 900)[0])
+        self.gate.verdict = (False, "no answer", 5555, False)         # a DIFFERENT engine
+        self.assertFalse(self.lease.take("discretion", 900)[0])
+
+    def test_nor_for_a_first_take(self):
+        self.gate.verdict = (False, "Expurgate did not say whether it is activated", 4242, False)
+        self.assertFalse(self.lease.take("discretion", 900)[0])
+
+    def test_a_guard_that_cannot_start_never_fails_the_take_and_is_retried(self):
+        calls = []
+        def spawn(fn):
+            calls.append(fn)
+            if len(calls) == 1:
+                raise RuntimeError("can't start new thread")
+        lease = yield_lease.YieldLease(now=self.clock, gate=self.gate, spawn=spawn)
+        self.assertTrue(lease.take("discretion", 900)[0])
+        self.assertFalse(lease._guarding)
+        lease.take("discretion", 900)
+        self.assertEqual(len(calls), 2)
+
+    def test_the_refusal_book_stays_small_whatever_callers_call_themselves(self):
+        self.gate.verdict = (False, "Expurgate is not open", None, True)
+        for i in range(500):
+            self.lease.take("holder-%d" % i, 900)
+            self.clock.t += yield_lease.REFUSAL_LOG_SECS / 50.0
+        self.assertLessEqual(len(self.lease._refused_at), 64)
+
+    def test_its_own_engine_releases_it(self):
+        self.lease.take("discretion", 3600)
+        self.gate.sender = (4242, True)
+        self.assertTrue(self.lease.release("discretion", peer=("c", "l"))[0])
+        self.assertFalse(self.lease.state()["held"])
+
+    def test_another_program_cannot_release_expurgates_lease(self):
+        # harvest.py "released discretion" after every scan: that must not end the real lease
+        self.lease.take("discretion", 3600)
+        self.gate.sender = (47649, True)
+        ok, why = self.lease.release("discretion", peer=("c", "l"))
+        self.assertFalse(ok)
+        self.assertTrue(self.lease.state()["held"])
+        self.assertIn("another program", self.seen[-1])
+        self.gate.sender = (None, True)                   # from another device
+        self.assertFalse(self.lease.release("discretion", peer=("c", "l"))[0])
+
+    def test_an_unidentifiable_sender_errs_toward_releasing(self):
+        self.lease.take("discretion", 3600)
+        self.gate.sender = (None, False)
+        self.assertTrue(self.lease.release("discretion", peer=("c", "l"))[0])
+
+    def test_a_soft_renewal_never_revives_a_lease_revoked_in_the_meantime(self):
+        self.lease.take("discretion", 900)
+        lease, gate = self.lease, self.gate
+        def soft_after_a_revoke(peer):
+            gate.check = (False, "Expurgate is open but not activated", True)
+            lease.guard_tick()                            # the guard revokes mid-request
+            return False, "Expurgate did not say", 4242, False
+        gate.verify_request = soft_after_a_revoke
+        ok, _ = lease.take("discretion", 900)
+        self.assertFalse(ok)
+        self.assertFalse(lease.state()["held"])
+
+    def test_a_leaving_guard_never_clears_a_newer_guards_flag(self):
+        spawned = []
+        lease = yield_lease.YieldLease(now=self.clock, gate=self.gate, spawn=spawned.append,
+                                       sleep=lambda s: None)
+        lease.take("discretion", 900)
+        old = spawned[0]
+        lease.release("discretion")                       # the old guard will find nothing...
+        lease.take("discretion", 900)                     # ...but a new lease got its own guard?
+        with lease._lock:
+            lease._guarding = True                        # (simulate: the new take armed a guard)
+            lease._guard_gen += 1
+        lease.release("discretion")
+        old()                                             # the OLD guard exits now
+        self.assertTrue(lease._guarding)                  # the newer guard's flag stands
+
+    def test_a_guard_that_decides_to_leave_never_strands_a_new_lease(self):
+        spawned = []
+        lease = yield_lease.YieldLease(now=self.clock, gate=self.gate, spawn=spawned.append,
+                                       sleep=lambda s: None)
+        lease.take("discretion", 900)
+        lease.release("discretion")
+        spawned[0]()                                      # the guard finds nothing and leaves...
+        self.assertFalse(lease._guarding)                 # ...clearing its flag as it decides
+        lease.take("discretion", 900)                     # so the next lease arms a guard
+        self.assertEqual(len(spawned), 2)
+
+    def test_a_release_without_a_connection_is_an_internal_one(self):
+        self.lease.take("discretion", 3600)
+        self.gate.sender = (47649, True)
+        self.assertTrue(self.lease.release("discretion")[0])
 
 if __name__ == "__main__":
     unittest.main()

@@ -614,8 +614,14 @@ def api_youtube_queue(body):
     return out
 
 
-def api_yield(body):
+def api_yield(body, peer=None):
     """POST /api/yield — a sibling app asks for the machine, with a TTL.
+
+    ONLY Expurgate's own engine, with Expurgate open and activated, is granted one — `peer` (the
+    connection's (client address, our address)) is how the lease identifies the program asking —
+    by the exact address pair, never by a port alone; the body's `holder`
+    is a label, not a credential (user rule 2026-10-06; see expurgate_gate.py). A release must
+    come from the lease's own engine too — see YieldLease.release.
 
     Discretion (the content filter) needs the whole machine for a scan or a masked render, the same
     way Resolve and outpainting stages do. It asks here rather than by pausing automation, because
@@ -631,10 +637,10 @@ def api_yield(body):
         # `id` is optional and SCOPES the release to the lease that was granted: a release that
         # arrives late, from a pass whose lease already lapsed or from before a restart, must not
         # free whatever holds the machine now. A caller that sends no id keeps the old behaviour.
-        ok, detail = lease.release(holder or None, lease_id=(body.get("id") or None))
+        ok, detail = lease.release(holder or None, lease_id=(body.get("id") or None), peer=peer)
     else:
         ok, detail = lease.take(holder, body.get("seconds", yield_lease.DEFAULT_SECONDS),
-                                body.get("reason") or "")
+                                body.get("reason") or "", peer=peer)
     now = lease.state()
     # `created` answers "is this lease MINE to release?". One holder can be several tasks — the
     # sibling runs them all under one name — and a task that only RENEWED somebody else's lease
@@ -1679,7 +1685,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/mode":
             self._json(api_mode((body.get("mode") or "tv").strip()))
         elif path == "/api/yield":
-            self._json(api_yield(body or {}))
+            self._json(api_yield(body or {}, peer=(self.client_address,
+                                                   self.connection.getsockname())))
         elif path == "/api/movie-queue":
             self._json(api_movie_queue(body or {}))
         elif path == "/api/companion":

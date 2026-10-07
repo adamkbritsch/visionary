@@ -1141,9 +1141,23 @@ class YieldEndpoint(unittest.TestCase):
     def _lease(self, stage="topaz"):
         import orchestrator as _orch
         import yield_lease
-        return (mock.patch.object(_orch.ORCH, "_yield_lease", yield_lease.YieldLease()),
+        from test_yield_lease import TRUST
+        return (mock.patch.object(_orch.ORCH, "_yield_lease", yield_lease.YieldLease(gate=TRUST)),
                 mock.patch.object(_orch.ORCH, "snapshot",
                                   return_value={"current": {"stage": stage}}))
+
+    def test_the_requests_own_address_reaches_the_gate(self):
+        import orchestrator as _orch
+        lease = mock.Mock()
+        lease.state.return_value = {"id": None, "held": False}
+        lease.take.return_value = (False, "Expurgate is not open")
+        with mock.patch.object(_orch.ORCH, "_yield_lease", lease), \
+             mock.patch.object(_orch.ORCH, "snapshot", return_value={"current": None}):
+            peer = (("127.0.0.1", 50123), ("127.0.0.1", 8765))
+            out = server.api_yield({"holder": "discretion", "seconds": 600}, peer=peer)
+        self.assertEqual(lease.take.call_args.kwargs["peer"], peer)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["detail"], "Expurgate is not open")
 
     def test_a_granted_lease_comes_back_with_an_id(self):
         pl, ps = self._lease()

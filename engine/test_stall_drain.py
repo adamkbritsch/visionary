@@ -12,6 +12,7 @@ from unittest import mock
 
 import orchestrator as orch
 import yield_lease
+from test_yield_lease import TRUST
 
 
 class DrainFloorInvariant(unittest.TestCase):
@@ -276,7 +277,7 @@ class SiblingYieldLease(unittest.TestCase):
         o = orch.Orchestrator.__new__(orch.Orchestrator)
         o._resolve_active = threading.Event()
         o._extend_active = threading.Event()
-        o._yield_lease = yield_lease.YieldLease()
+        o._yield_lease = yield_lease.YieldLease(gate=TRUST)
         o._resolve_fast = False
         o._drain_backlog = lambda: 0
         o._last_resolve_at = 0.0
@@ -292,7 +293,7 @@ class SiblingYieldLease(unittest.TestCase):
         """The safety property: a crashed sibling cannot wedge an overnight queue."""
         clock = [1000.0]
         o = self._orch()
-        o._yield_lease = yield_lease.YieldLease(now=lambda: clock[0])
+        o._yield_lease = yield_lease.YieldLease(gate=TRUST, now=lambda: clock[0])
         o._yield_lease.take("discretion", 60)
         self.assertTrue(o._remux_must_wait())
         clock[0] += 61
@@ -323,7 +324,7 @@ class ALeaseStopsWorkStarting(unittest.TestCase):
     def _orch(self):
         import threading
         o = orch.Orchestrator.__new__(orch.Orchestrator)
-        o._yield_lease = yield_lease.YieldLease()
+        o._yield_lease = yield_lease.YieldLease(gate=TRUST)
         return o
 
     def test_no_lease_holds_nothing(self):
@@ -332,7 +333,7 @@ class ALeaseStopsWorkStarting(unittest.TestCase):
     def test_a_live_lease_names_the_holder_and_the_wait(self):
         o = self._orch()
         clock = [1000.0]
-        o._yield_lease = yield_lease.YieldLease(now=lambda: clock[0])
+        o._yield_lease = yield_lease.YieldLease(gate=TRUST, now=lambda: clock[0])
         o._yield_lease.take("discretion", 600, "Pass 2 on Arrival")
         clock[0] += 60
         held = o._lease_hold("topaz")
@@ -372,7 +373,7 @@ class NoRemuxingDuringResolve(unittest.TestCase):
         o = orch.Orchestrator.__new__(orch.Orchestrator)
         o._resolve_active = threading.Event()
         o._extend_active = threading.Event()
-        o._yield_lease = yield_lease.YieldLease()  # idle here — pinned in ExtendExclusivity
+        o._yield_lease = yield_lease.YieldLease(gate=TRUST)  # idle here — pinned in ExtendExclusivity
         o._resolve_fast = False               # the whole-machine case these tests pin
         if resolve_active:
             o._resolve_active.set()
@@ -563,7 +564,7 @@ class RemuxRunsDuringAnUpload(unittest.TestCase):
         o._finish_q = mock.Mock(qsize=lambda: queued)
         o._resolve_active = threading.Event()
         o._extend_active = threading.Event()
-        o._yield_lease = yield_lease.YieldLease()   # idle here — pinned in ExtendExclusivity
+        o._yield_lease = yield_lease.YieldLease(gate=TRUST)   # idle here — pinned in ExtendExclusivity
         o._resolve_fast = False
         o._drain_backlog = lambda: backlog
         o._last_resolve_at = 0.0
