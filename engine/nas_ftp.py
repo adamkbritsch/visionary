@@ -350,7 +350,8 @@ def mode_of(host_path: str):
     folder, name = _ftp_path(host_path).rsplit("/", 1)
     def go(ftp):
         try:
-            for n, facts in ftp.mlsd(folder or "/", facts=["unix.mode"]):
+            import transfer                   # brackets in the folder's name: listed from inside
+            for n, facts in transfer._mlsd(ftp, folder or "/", facts=["unix.mode"]):
                 if n == name:                    # both in wire form
                     return facts.get("unix.mode")
         except ftplib.error_perm:

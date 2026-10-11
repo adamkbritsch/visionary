@@ -824,6 +824,38 @@ def remote_mtime(ftp, path):
         return None
 
 
+_GLOB_CHARS = "[]*?{}"
+
+
+def _mlsd(ftp, path, facts=()):
+    """ftp.mlsd(path) as a list — for a folder whose NAME has glob characters, listed from inside.
+    smbftpd treats `[x]`, `*` and `?` in a LIST/MLSD/NLST argument as a pattern, so a folder named
+    "... x264-maximersk [mrsktv]" listed EMPTY and its whole season was invisible (Community season
+    6, live 2026-10-11). CWD takes the name literally, and a listing with no argument cannot glob.
+    SIZE, RETR and STOR take the literal path too, so only listings need this."""
+    kw = {"facts": list(facts)} if facts else {}
+    if not any(c in path for c in _GLOB_CHARS):
+        return list(ftp.mlsd(path, **kw))
+    back = ftp.pwd()
+    ftp.cwd(path)
+    try:
+        return list(ftp.mlsd(**kw))
+    finally:
+        ftp.cwd(back)
+
+
+def _nlst(ftp, path) -> list:
+    """NLST basenames, from inside the folder when its name has glob characters (see _mlsd)."""
+    if not any(c in path for c in _GLOB_CHARS):
+        return [p.rsplit("/", 1)[-1] for p in ftp.nlst(path)]
+    back = ftp.pwd()
+    ftp.cwd(path)
+    try:
+        return [p.rsplit("/", 1)[-1] for p in ftp.nlst()]
+    finally:
+        ftp.cwd(back)
+
+
 def ftp_listdir_sized(ftp, path) -> list:
     """[(basename, bytes)] for one FTP dir. MLSD already carries a `size` fact and
     ftp_listdir throws it away — this keeps it, so a listing that had to happen anyway also
@@ -832,7 +864,7 @@ def ftp_listdir_sized(ftp, path) -> list:
     """
     try:
         out = []
-        for name, facts in ftp.mlsd(path):
+        for name, facts in _mlsd(ftp, path):
             if name in (".", ".."):
                 continue
             try:
@@ -847,10 +879,10 @@ def ftp_listdir_sized(ftp, path) -> list:
 def ftp_listdir(ftp, path) -> list:
     """Entry basenames in an FTP dir (MLSD preferred, NLST fallback)."""
     try:
-        return [n for n, _ in ftp.mlsd(path) if n not in (".", "..")]
+        return [n for n, _ in _mlsd(ftp, path) if n not in (".", "..")]
     except ftplib.all_errors:
         try:
-            return [p.rsplit("/", 1)[-1] for p in ftp.nlst(path)]
+            return _nlst(ftp, path)
         except ftplib.all_errors:
             return []
 
@@ -881,7 +913,7 @@ def ftp_walk_files(ftp, base, depth=3, with_dirs=False, strict=False) -> list:
     hit = (lambda d, n: out.append((d, n))) if with_dirs else (lambda d, n: out.append(n))
     base = base.rstrip("/")
     try:
-        entries = list(ftp.mlsd(base))
+        entries = _mlsd(ftp, base)
     except ftplib.error_perm:
         entries = None
     except ftplib.all_errors:
@@ -910,7 +942,7 @@ def ftp_walk_files(ftp, base, depth=3, with_dirs=False, strict=False) -> list:
 def _nlst_strict(ftp, path) -> list:
     """NLST basenames; [] for a refusal (an empty or missing folder), raising anything else."""
     try:
-        return [p.rsplit("/", 1)[-1] for p in ftp.nlst(path)]
+        return _nlst(ftp, path)
     except ftplib.error_perm:
         return []
 

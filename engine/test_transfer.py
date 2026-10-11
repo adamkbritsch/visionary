@@ -991,6 +991,50 @@ class LearnsOnlyOverAProvenRoute(unittest.TestCase):
         self._connect([("100.101.182.68", None)]).assert_not_called()
 
 
+class BracketedFolders(unittest.TestCase):
+    """smbftpd globs `[x]` in a listing's argument: "Community (2009) S06 ... [mrsktv]" listed empty
+    and Visionary never saw season 6 (live 2026-10-11). Such a folder is listed from inside."""
+    S6 = "/TV/Community (2009)/Community (2009) S06 Season 6 PROPER [mrsktv]"
+
+    class Ftp(object):
+        def __init__(self, tree):
+            self.tree, self.cwd_, self.log = tree, "/", []
+        def pwd(self): return self.cwd_
+        def cwd(self, d): self.log.append(("cwd", d)); self.cwd_ = d
+        def mlsd(self, path="", facts=()):
+            self.log.append(("mlsd", path))
+            if any(c in path for c in "[]*?"):
+                return iter(())                       # the server globs it: nothing matches
+            return iter(self.tree.get(path or self.cwd_, []))
+        def nlst(self, path=""):
+            self.log.append(("nlst", path))
+            return [] if "[" in path else [n for n, _ in self.tree.get(path or self.cwd_, [])]
+
+    def _ftp(self):
+        show = "/TV/Community (2009)"
+        return self.Ftp({show: [("S05", {"type": "dir"}), (self.S6.rsplit("/", 1)[1], {"type": "dir"})],
+                         show + "/S05": [("Community - S05E13.mkv", {"type": "file", "size": "5"})],
+                         self.S6: [("Community (2009) - S06E01 1080p.mkv", {"type": "file", "size": "9"})]})
+
+    def test_a_season_in_a_bracketed_folder_is_found(self):
+        ftp = self._ftp()
+        names = transfer.ftp_walk_files(ftp, "/TV/Community (2009)", strict=True)
+        self.assertEqual(sorted(names), ["Community (2009) - S06E01 1080p.mkv", "Community - S05E13.mkv"])
+        self.assertEqual(ftp.cwd_, "/")                   # and the connection is left where it was
+
+    def test_plain_folders_are_listed_exactly_as_before(self):
+        ftp = self._ftp()
+        transfer.ftp_listdir(ftp, "/TV/Community (2009)/S05")
+        self.assertEqual(ftp.log, [("mlsd", "/TV/Community (2009)/S05")])
+
+    def test_listdir_and_sizes_too(self):
+        ftp = self._ftp()
+        self.assertEqual(transfer.ftp_listdir(ftp, self.S6), ["Community (2009) - S06E01 1080p.mkv"])
+        self.assertEqual(transfer.ftp_listdir_sized(ftp, self.S6), [("Community (2009) - S06E01 1080p.mkv", 9)])
+        self.assertEqual(transfer._nlst(ftp, self.S6), ["Community (2009) - S06E01 1080p.mkv"])
+        self.assertEqual(ftp.cwd_, "/")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -567,7 +567,12 @@ def private_literal(host) -> bool:
             and not ip.is_link_local)
 
 
+_REAL_MAC_BOOK = MAC_BOOK
+
+
 def _mac_book() -> dict:
+    if _under_test() and MAC_BOOK == _REAL_MAC_BOOK:
+        return {}                      # a test never reads the real learned addresses
     try:
         import json
         with open(MAC_BOOK) as f:
