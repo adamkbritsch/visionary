@@ -938,3 +938,58 @@ class WrongDeclaredRateOnRealMedia(unittest.TestCase):
                     self.assertEqual(topaz._fps_fraction(dst), "24000/1001")
                     self.assertEqual(topaz._frame_count(dst), want)
                     self.assertIsNone(topaz.declared_rate_mismatch(dst))
+
+
+@unittest.skipUnless(__import__("os").path.exists(topaz.FFMPEG_HB), "needs ffmpeg")
+class MezzanineSegmentsKeepEveryFrame(unittest.TestCase):
+    """The mezzanine's midpoint seek + `-fps_mode cfr` emitted each segment's first frame
+    twice (a, a, a+1, ...), and on a 1 ms-timebase input repeated the last frame instead and
+    dropped one — with the exact frame count intact. Every frame here has its own level;
+    hevc_videotoolbox is lossy, so frames are identified against the same encoder's output
+    for the whole clip (no seek), not by their nominal level."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os, subprocess, tempfile, stages
+        cls.td = tempfile.mkdtemp()
+        ff = topaz.FFMPEG_HB
+        cls.mov = os.path.join(cls.td, "n.mov")
+        subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "nullsrc=s=128x128:r=24000/1001:d=1,geq=lum='16+9*N':cb=128:cr=128",
+                        "-c:v", "libx265", "-x265-params", "log-level=none:bframes=0:lossless=1",
+                        "-video_track_timescale", "24000", "-pix_fmt", "yuv420p", cls.mov], check=True)
+        cls.mkv = os.path.join(cls.td, "n.mkv")          # millisecond timebase: jittered PTS
+        subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-i", cls.mov, "-c", "copy", cls.mkv],
+                       check=True)
+        full = os.path.join(cls.td, "full.mp4")
+        r = subprocess.run(stages.build_mezzanine_command(ff, cls.mov, full, rate="24000/1001", kbps=20000),
+                           capture_output=True)
+        if r.returncode != 0:
+            raise unittest.SkipTest("hevc_videotoolbox unavailable")
+        cls.table = cls._means(full)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    @staticmethod
+    def _means(path, w=128, h=128):
+        import subprocess
+        out = subprocess.run([topaz.FFMPEG_HB, "-hide_banner", "-loglevel", "error", "-i", path,
+                              "-pix_fmt", "gray", "-f", "rawvideo", "-"], capture_output=True).stdout
+        sz = w * h
+        return [sum(out[i * sz:(i + 1) * sz]) / sz for i in range(len(out) // sz)]
+
+    def test_every_segment_is_exactly_frames_a_to_a_plus_n(self):
+        import os, subprocess
+        for src in (self.mov, self.mkv):
+            for a in (4, 7, 10, 13, 16):
+                with self.subTest(src=os.path.basename(src), a=a):
+                    dst = os.path.join(self.td, f"seg_{a}.mp4")
+                    subprocess.run(topaz.build_mezzanine_segment_command(
+                        topaz.FFMPEG_HB, src, dst, start_frame=a, n=4, rate="24000/1001", kbps=20000),
+                        capture_output=True, check=True)
+                    got = [min(range(len(self.table)), key=lambda k: abs(self.table[k] - m))
+                           for m in self._means(dst)]
+                    self.assertEqual(got, [a, a + 1, a + 2, a + 3])

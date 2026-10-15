@@ -744,14 +744,21 @@ def build_mezzanine_segment_command(ffmpeg, src, dst, *, start_frame, n, rate,
     Input `-ss` = dvcap's proven seek (keyframe seek + decode-to-exact-frame); the
     caller gates each chunk on an EXACT frame count, so a seek miss fails loudly
     instead of shipping drift. Inputs are CFR by construction (the fast path requires
-    it; YouTube passes its true-CFR file), which is what makes frame->seconds exact."""
+    it; YouTube passes its true-CFR file), which is what makes frame->seconds exact.
+
+    `setpts=PTS-STARTPTS` puts the first kept frame at 0 before `-fps_mode cfr` sees it.
+    After the midpoint seek that frame sits half a frame in; cfr rounded it to slot 1 and
+    filled slot 0 by emitting it TWICE (frames a, a, a+1, ...) on every segment, and on a
+    1 ms-timebase (webm/mkv) input the jitter instead repeated the LAST frame and dropped
+    one — the exact count still matched, so nothing noticed (measured 2026-10-15). cfr
+    stays: it is what regenerates uniform PTS from a millisecond timebase."""
     import dvcap
     ss = dvcap.seg_seek_seconds(start_frame, rate)
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
     if ss is not None:
         cmd += ["-ss", f"{ss:.6f}"]
     rate_flags = ["-r", rate] if rate else []
-    return [*cmd, "-i", src, "-map", "0:v:0", "-an",
+    return [*cmd, "-i", src, "-map", "0:v:0", "-an", "-vf", "setpts=PTS-STARTPTS",
             "-frames:v", str(n),
             "-c:v", "hevc_videotoolbox", "-b:v", f"{int(kbps)}k",
             "-pix_fmt", "p010le", "-tag:v", "hvc1", "-allow_sw", "1",
