@@ -215,6 +215,44 @@ class Segmentation(unittest.TestCase):
         c0 = dvcap.build_seg_decode_command("/ff", "/r.mov", 0, 100, "24000/1001")
         self.assertNotIn("-ss", c0)                               # frame 0 → no seek
 
+    def test_render_decode_is_unchanged_without_native_options(self):
+        # pinned LITERALLY (what HEAD built before `decode` existed, plus the -fps_mode
+        # passthrough fix): comparing the function with itself could never catch a change
+        want = ["/ff", "-hide_banner", "-nostdin", "-loglevel", "error", "-ss", "299.987188",
+                "-i", "/r.mov", "-map", "0:v:0", "-frames:v", "100",
+                "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le", "-strict", "-1", "-f", "yuv4mpegpipe", "-"]
+        for extra in ((), (None,), ({},), ({"chunks": [], "vf": ""},)):   # every "no native" form
+            with self.subTest(decode=extra):
+                self.assertEqual(dvcap.build_seg_decode_command(
+                    "/ff", "/r.mov", 7193, 100, "24000/1001", *extra), want)
+        self.assertEqual(dvcap.build_seg_decode_command("/ff", "/r.mov", 0, 100, "24000/1001"),
+                         ["/ff", "-hide_banner", "-nostdin", "-loglevel", "error",
+                          "-i", "/r.mov", "-map", "0:v:0", "-frames:v", "100",
+                          "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le", "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+
+    CHUNKS = [[0, "/c0.mov"], [2217, "/c1.mov"], [4398, "/c2.mov"], [6000, None]]
+
+    def test_native_decode_reads_the_chunk_holding_the_segment(self):
+        c = dvcap.build_seg_decode_command("/ff", "/ignored", 2217, 2181, "24000/1001",
+                                           {"chunks": self.CHUNKS, "vf": "lut3d=file=/l.cube"})
+        self.assertEqual(c[c.index("-i") + 1], "/c1.mov")
+        self.assertNotIn("-ss", c)                                # chunk start → no seek at all
+        self.assertEqual(c[c.index("-vf") + 1], "lut3d=file=/l.cube")
+        self.assertLess(c.index("-vf"), c.index("-pix_fmt"))
+        self.assertEqual(c[c.index("-frames:v") + 1], "2181")
+
+    def test_native_decode_seeks_within_its_chunk_only(self):
+        c = dvcap.build_seg_decode_command("/ff", "/ignored", 2300, 50, "24000/1001",
+                                           {"chunks": self.CHUNKS})
+        self.assertEqual(c[c.index("-i") + 1], "/c1.mov")
+        self.assertEqual(c[c.index("-ss") + 1], f"{(83 - 0.5) * 1001 / 24000:.6f}")   # local 83
+
+    def test_a_segment_crossing_a_chunk_end_is_refused(self):
+        with self.assertRaises(ValueError):
+            dvcap.chunk_for(self.CHUNKS, 2200, 100)               # 2200..2299 spans c0|c1
+        with self.assertRaises(ValueError):
+            dvcap.chunk_for(self.CHUNKS, 6000, 1)                 # past the end sentinel
+
     def test_concat_missing_segment_fails(self):
         import tempfile, os
         with tempfile.TemporaryDirectory() as td:
@@ -584,6 +622,180 @@ class ReencodeTighter(unittest.TestCase):
         self.assertFalse(ok); self.assertIn("out of range", why)
 
 
+class NativeDecodePassThrough(unittest.TestCase):
+    """`decode` (native DV: Topaz's own ProRes chunks + the captured LUT chain) must reach the
+    decoder of every segment BOTH encoders run — the main encode and the peak repair. Dropping
+    it at either call site would silently encode SDR pixels (or the wrong file) under PQ tags,
+    and the build_seg_decode_command tests alone would never notice (review-caught). A plan
+    that does not fit the chunks fails with the normal return, before anything is sliced,
+    deleted or tight-capped."""
+
+    FPS = "24000/1001"
+    CHUNKS = [[0, "/c0.mov"], [2217, "/c1.mov"], [4398, "/c2.mov"], [6000, None]]
+    BOUNDS = [2217, 3000, 4398]       # -> (0,2217) (2217,3000) (3000,4398) (4398,6000): seg 2
+                                      #    starts MID-chunk (c1, local frame 783)
+    DECODE = {"chunks": CHUNKS, "vf": "X"}
+    # segment 2 with DECODE: chunk c1, seek to LOCAL frame 783, the LUT before -pix_fmt
+    NATIVE_SEG2 = ["/ff", "-hide_banner", "-nostdin", "-loglevel", "error", "-ss", "32.636771",
+                   "-i", "/c1.mov", "-map", "0:v:0", "-frames:v", "1398", "-vf", "X",
+                   "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le", "-strict", "-1", "-f", "yuv4mpegpipe", "-"]
+
+    @staticmethod
+    def _idx(path):
+        import os
+        return int(os.path.basename(path).split("_")[1].split(".")[0])
+
+    def _encode(self, td, decode, boundaries=BOUNDS, total=6000):
+        import os
+        decs = {}
+        def fake_pipe(dec, enc, out, abort, on_frame):
+            decs[self._idx(out)] = dec
+            open(out, "wb").write(b"y")
+            return int(dec[dec.index("-frames:v") + 1]), "ok", []
+        segdir = os.path.join(td, "segs")
+        with mock.patch.object(dvcap, "count_hevc_frames", return_value=0), \
+             mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")) as sl, \
+             mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe) as pipe, \
+             mock.patch.object(dvcap, "concat_segments", return_value=(True, "ok")):
+            res = dvcap.encode_capped_segmented(
+                "/r.mov", "/rpu.bin", os.path.join(td, "out.hevc"), 50, segdir=segdir,
+                total_frames=total, fps=self.FPS, boundaries=boundaries, decode=decode,
+                ffmpeg="/ff")
+        return res, decs, sl, pipe, segdir
+
+    def _repair(self, td, indices, decode, boundaries=BOUNDS, total=6000):
+        decs = {}
+        def fake_pipe(dec, enc, out, abort, cb):
+            decs[self._idx(out)] = dec
+            open(out, "wb").write(b"NEW")
+            return int(dec[dec.index("-frames:v") + 1]), "ok", []
+        with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")) as sl, \
+             mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe) as pipe:
+            res = dvcap.reencode_segments_tighter(
+                "/r.mov", "/rpu.bin", td, indices, 42, total_frames=total, fps=self.FPS,
+                boundaries=boundaries, decode=decode, ffmpeg="/ff")
+        return res, decs, sl, pipe
+
+    def test_main_encode_hands_each_segment_its_chunk_and_the_lut(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, frames, why), decs, sl, _p, _s = self._encode(td, self.DECODE)
+        self.assertTrue(ok, why)
+        self.assertEqual(frames, 6000)
+        for i, src in enumerate(["/c0.mov", "/c1.mov", "/c1.mov", "/c2.mov"]):
+            with self.subTest(segment=i):
+                self.assertEqual(decs[i][decs[i].index("-i") + 1], src)
+                self.assertEqual(decs[i][decs[i].index("-vf") + 1], "X")
+        for i in (0, 1, 3):
+            self.assertNotIn("-ss", decs[i])                      # chunk starts → no seek at all
+        self.assertEqual(decs[2], self.NATIVE_SEG2)
+        # the RPU slices stay on GLOBAL frames — only the decoder is chunk-local
+        self.assertEqual([c[0][1:3] for c in sl.call_args_list],
+                         [(0, 2217), (2217, 3000), (3000, 4398), (4398, 6000)])
+
+    def test_main_encode_render_path_decode_is_the_pre_change_command(self):
+        # decode=None (every production caller today) → literally the pre-native argv
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, _f, why), decs, _sl, _p, _s = self._encode(td, None)
+        self.assertTrue(ok, why)
+        self.assertEqual(decs[0], ["/ff", "-hide_banner", "-nostdin", "-loglevel", "error",
+                                   "-i", "/r.mov", "-map", "0:v:0", "-frames:v", "2217",
+                                   "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le", "-strict", "-1",
+                                   "-f", "yuv4mpegpipe", "-"])
+        self.assertEqual(decs[2], ["/ff", "-hide_banner", "-nostdin", "-loglevel", "error",
+                                   "-ss", "125.104146", "-i", "/r.mov", "-map", "0:v:0",
+                                   "-frames:v", "1398", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le",
+                                   "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+        for dec in decs.values():
+            self.assertNotIn("-vf", dec)
+
+    def test_repair_hands_its_segment_its_chunk_and_the_lut(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, why), decs, sl, _p = self._repair(td, [2], self.DECODE)
+        self.assertTrue(ok, why)
+        self.assertEqual(list(decs), [2])
+        self.assertEqual(decs[2], self.NATIVE_SEG2)
+        self.assertEqual(sl.call_args[0][1:3], (3000, 4398))       # global RPU frames
+
+    def test_flat_plan_across_chunks_fails_before_slicing(self):
+        # no topaz_segbounds → the flat ~5-min plan: one (0, 6000) segment crossing chunk 0's end
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, frames, why), _d, sl, pipe, segdir = self._encode(
+                td, {"chunks": self.CHUNKS}, boundaries=None)
+            self.assertEqual(os.listdir(segdir), [])              # no seg_*.rpu left behind
+        self.assertFalse(ok)
+        self.assertEqual(frames, 0)
+        self.assertIn("cross the chunk ending at 2216", why)
+        sl.assert_not_called()
+        pipe.assert_not_called()
+
+    def test_drift_tail_past_the_last_chunk_fails_before_slicing(self):
+        # RPU count 2 over the chunk total → plan_segments pads (6000, 6002). Segments 1-3 fit,
+        # but the WHOLE plan is checked first, so not even segment 1 is sliced or encoded.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, frames, why), _d, sl, pipe, _s = self._encode(
+                td, self.DECODE, boundaries=[2217, 4398, 6000], total=6002)
+        self.assertFalse(ok)
+        self.assertEqual(frames, 0)
+        self.assertIn("segment 4/4", why)
+        self.assertIn("outside the chunk list", why)
+        sl.assert_not_called()
+        pipe.assert_not_called()
+
+    def test_repair_on_a_plan_that_misses_the_chunks_keeps_the_segment(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "seg_0000.hevc")
+            open(sf, "wb").write(b"GOOD")
+            (ok, why), _d, sl, pipe = self._repair(td, [0], {"chunks": self.CHUNKS},
+                                                   boundaries=None)
+            self.assertFalse(ok)
+            self.assertIn("cross the chunk ending at 2216", why)
+            self.assertEqual(open(sf, "rb").read(), b"GOOD")      # not deleted
+            self.assertEqual(dvcap.read_tight_caps(td), {})       # no tight cap recorded
+        sl.assert_not_called()
+        pipe.assert_not_called()
+
+    def test_repair_checks_the_whole_plan_not_just_its_segment(self):
+        # segment 0 itself fits chunk c0, but the drift-padded tail does not: same plan as the
+        # main encode, so the repair refuses it too, before touching segment 0
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "seg_0000.hevc")
+            open(sf, "wb").write(b"GOOD")
+            (ok, why), _d, sl, pipe = self._repair(td, [0], self.DECODE,
+                                                   boundaries=[2217, 4398, 6000], total=6002)
+            self.assertFalse(ok)
+            self.assertIn("outside the chunk list", why)
+            self.assertEqual(open(sf, "rb").read(), b"GOOD")
+            self.assertEqual(dvcap.read_tight_caps(td), {})
+        sl.assert_not_called()
+        pipe.assert_not_called()
+
+    def test_decode_error_in_the_loop_is_a_failure_return_not_an_exception(self):
+        # the per-segment backstop: a decode command that can't be built fails BEFORE the
+        # RPU slice (main encode) and before the tight-cap note + delete (repair)
+        import os, tempfile
+        with mock.patch.object(dvcap, "build_seg_decode_command",
+                               side_effect=ValueError("boom")):
+            with tempfile.TemporaryDirectory() as td:
+                (ok, frames, why), _d, sl, pipe, _s = self._encode(td, None)
+                self.assertEqual((ok, frames, why), (False, 0, "segment 1/4: boom"))
+                sl.assert_not_called(); pipe.assert_not_called()
+            with tempfile.TemporaryDirectory() as td:
+                sf = os.path.join(td, "seg_0002.hevc")
+                open(sf, "wb").write(b"GOOD")
+                (ok, why), _d, sl, pipe = self._repair(td, [2], None)
+                self.assertEqual((ok, why), (False, "repair segment 2: boom"))
+                self.assertEqual(open(sf, "rb").read(), b"GOOD")
+                self.assertEqual(dvcap.read_tight_caps(td), {})
+                sl.assert_not_called(); pipe.assert_not_called()
+
+
 class InjectBuilders(unittest.TestCase):
     """FAST-PATH builders: the source ES copy and the RPU inject — never a re-encode."""
 
@@ -795,3 +1007,38 @@ class MkvFrameCount(unittest.TestCase):
     def test_unprobeable_still_reports_zero(self):
         out, _c = self._probe(None, 0)                   # both unavailable -> honest 0
         self.assertEqual(out["frames"], 0)
+
+
+@__import__("unittest").skipUnless(__import__("os").path.exists(dvcap.FFMPEG), "needs ffmpeg")
+class SeekNeverDuplicatesAFrame(__import__("unittest").TestCase):
+    """Live-caught on a Resolve render: the midpoint seek + y4m's default cfr padding emitted
+    the first frame twice (20098, 20098, 20099, ...) — on every segment start whose 6-decimal
+    seek lands just past half a frame (about half of them), and only in a file with a
+    timecode track, which Resolve always writes (01:00:00:00). This clip reproduces both:
+    a tmcd track, and every frame its own luma level (16 + 4*N) so the order is readable."""
+
+    @staticmethod
+    def _levels(y4m, w=64, h=64):
+        import struct
+        body, out = y4m[y4m.index(b"\n") + 1:], []
+        while body:
+            body = body[body.index(b"\n") + 1:]
+            y = struct.unpack("<%dH" % (w * h), body[:w * h * 2])
+            out.append(round((sum(y) / len(y) / 4 - 16) / 4))
+            body = body[w * h * 3:]
+        return out
+
+    def test_segment_decode_starts_at_a_and_keeps_every_frame(self):
+        import os, subprocess, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            clip = os.path.join(td, "n.mov")
+            subprocess.run([dvcap.FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "nullsrc=s=64x64:r=24000/1001:d=2.2,geq=lum='16+4*N':cb=128:cr=128",
+                            "-c:v", "libx265", "-x265-params", "log-level=none:bframes=0",
+                            "-video_track_timescale", "24000", "-timecode", "01:00:00:00",
+                            "-pix_fmt", "yuv420p", clip], check=True)
+            for a in (4, 7, 10):                     # seeks that land just past half a frame
+                with self.subTest(a=a):
+                    out = subprocess.run(dvcap.build_seg_decode_command(dvcap.FFMPEG, clip, a, 4, "24000/1001"),
+                                         capture_output=True, check=True).stdout
+                    self.assertEqual(self._levels(out), [a, a + 1, a + 2, a + 3])

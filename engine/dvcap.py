@@ -448,14 +448,66 @@ def seg_seek_seconds(a: int, fps_str: str):
     return max(0.0, (a - 0.5) / fps)
 
 
-def build_seg_decode_command(ffmpeg: str, src: str, a: int, n: int, fps_str: str) -> list:
+def chunk_for(chunks: list, a: int, n: int):
+    """PURE. (path, local_first_frame) of the chunk holding frames [a, a+n). `chunks` is
+    [[first_frame, path], ...] in order; each chunk ends where the next begins (the last at
+    its "end" sentinel entry [total, None]). Raises ValueError if the range is not inside
+    exactly one chunk."""
+    for (start, path), (nxt, _p) in zip(chunks, chunks[1:]):
+        if start <= a < nxt:
+            if a + n > nxt or path is None:
+                raise ValueError(f"frames {a}-{a + n - 1} cross the chunk ending at {nxt - 1}")
+            return path, a - start
+    raise ValueError(f"frame {a} is outside the chunk list")
+
+
+def plan_chunk_error(segs: list, decode: dict | None):
+    """PURE. None when every [a, b) segment of the plan lies inside one decode chunk (or there
+    are no chunks: the render path); otherwise the reason for the FIRST that does not. A plan
+    can legitimately miss the chunks at runtime: a missing topaz_segbounds entry gives the flat
+    ~5-min plan (its first segment crosses chunk 0's end), and RPU/chunk drift pads a tail past
+    the last chunk. Both encoders check the WHOLE plan once, up front, so nothing is sliced,
+    deleted or tight-capped for a plan that cannot work (review-caught)."""
+    chunks = (decode or {}).get("chunks")
+    if not chunks:
+        return None
+    for i, (a, b) in enumerate(segs):
+        try:
+            chunk_for(chunks, a, b - a)
+        except ValueError as e:
+            return "segment plan does not fit the decode chunks: segment %d/%d: %s" % (
+                i + 1, len(segs), e)
+    return None
+
+
+def build_seg_decode_command(ffmpeg: str, src: str, a: int, n: int, fps_str: str,
+                             decode: dict | None = None) -> list:
     """DV render frames [a, a+n) -> 10-bit y4m on stdout. Input `-ss` (fast keyframe seek +
-    decode-to-exact-frame) at the midpoint timestamp; `-frames:v n` bounds the count."""
+    decode-to-exact-frame) at the midpoint timestamp; `-frames:v n` bounds the count.
+    `decode` (native DV only, None = the render path, unchanged):
+      {"chunks": [[first_frame, path], ...]} decodes from Topaz's own ProRes chunk holding
+      frame `a`, seeking only within it (the concat demuxer decodes every earlier chunk to
+      seek: ~5 min per segment, measured). A segment must not cross a chunk end — the remux
+      plan's boundaries ARE the chunk ends (topaz_segbounds) — so one that does raises.
+      {"vf": "..."} is the filter chain (the captured Resolve SDR->PQ LUT)."""
+    decode = decode or {}
+    chunks = decode.get("chunks")
+    if chunks:
+        src, a = chunk_for(chunks, a, n)
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error"]
     ss = seg_seek_seconds(a, fps_str)
     if ss is not None:
         cmd += ["-ss", f"{ss:.6f}"]
-    cmd += ["-i", src, "-map", "0:v:0", "-frames:v", str(n),
+    cmd += ["-i", src, "-map", "0:v:0", "-frames:v", str(n)]
+    if decode.get("vf"):
+        cmd += ["-vf", decode["vf"]]
+    # -fps_mode passthrough: y4m is a constant-rate muxer, so ffmpeg's default ("cfr") pads
+    # the output timeline. After the midpoint seek the first kept frame sits half a frame in,
+    # and cfr filled the gap by emitting it TWICE — frames a, a, a+1, ... a+n-2 (measured on a
+    # Resolve render: 20098, 20098, 20099, 20100). Every non-first segment then ran one frame
+    # late against the audio and its own RPU slice, opened on a frozen frame and lost its last
+    # one, and the frame count still matched. Passthrough emits the decoded frames as they are.
+    cmd += ["-fps_mode", "passthrough",
             "-pix_fmt", "yuv420p10le", "-strict", "-1", "-f", "yuv4mpegpipe", "-"]
     return cmd
 
@@ -632,6 +684,7 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
                             master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
                             boundaries: list | None = None,
                             abort=None, on_progress=None, on_plan=None, should_pause=None,
+                            decode: dict | None = None,
                             ffmpeg=FFMPEG, x265=X265, ffprobe=FFPROBE, dovi_tool=DOVI_TOOL):
     """Resumable peak-cap encode: per-segment native-DV x265 (own RPU slice) → concat.
     Segments persist in `segdir`; a completed segment is skipped on the next attempt.
@@ -645,6 +698,9 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         return False, 0, "unknown total frame count"
     os.makedirs(segdir, exist_ok=True)
     segs = plan_segments(total_frames, fps, seg_seconds, boundaries=boundaries)
+    bad = plan_chunk_error(segs, decode)
+    if bad:
+        return False, 0, bad
     if on_plan:
         on_plan([b for (_a, b) in segs], total_frames)
     tights = read_tight_caps(segdir)   # repair-tightened segments resume at THEIR cap, not the global
@@ -662,6 +718,12 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
             if on_progress:
                 on_progress(base, total_frames)
             continue
+        # built BEFORE any side effect: a segment that can't be decoded deletes and slices
+        # nothing, and fails with the normal (ok, frames, reason) return, not an exception
+        try:
+            dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps, decode)
+        except ValueError as e:
+            return False, base, "segment %d/%d: %s" % (i + 1, len(segs), e)
         _rm(sf)                                          # partial/stale → redo clean
         stmp = sf + ".part"                              # ATOMIC: encode to temp, publish sf only on
         _rm(stmp)                                        # a clean got==n — a hard kill never leaves a
@@ -669,7 +731,6 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
         if not ok:
             return False, base, why
-        dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps)
         enc = build_x265_command(x265, rslice, stmp, tights.get(i, cap_mbps),
                                  master_display, max_cll)
         b0 = base
@@ -699,6 +760,7 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
                               tight_cap_mbps: int, *, total_frames: int, fps: str,
                               master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
                               boundaries: list | None = None, abort=None, on_repair=None,
+                              decode: dict | None = None,
                               ffmpeg=FFMPEG, x265=X265, dovi_tool=DOVI_TOOL):
     """PEAK REPAIR: delete and re-encode ONLY `indices` segments at a TIGHTER cap. The full-cap
     encode can measure over the gate — VBV bufsize == maxrate legally allows a 1-second burst
@@ -708,6 +770,9 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
     (same source, same GLOBAL cap): a tighter segment is strictly safer to resume, and a
     mid-repair kill just resumes with the already-tightened segments. Returns (ok, reason)."""
     segs = plan_segments(total_frames, fps, seg_seconds, boundaries=boundaries)
+    bad = plan_chunk_error(segs, decode)
+    if bad:
+        return False, bad
     for k, i in enumerate(indices, 1):
         if abort is not None and abort.is_set():
             return False, "aborted"
@@ -715,6 +780,12 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
             return False, f"repair segment index {i} out of range (plan has {len(segs)})"
         a, b = segs[i]
         n = b - a
+        # built BEFORE the tight-cap note and the delete: a segment that can't be decoded
+        # keeps its encoded file and records nothing
+        try:
+            dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps, decode)
+        except ValueError as e:
+            return False, f"repair segment {i}: {e}"
         sf = os.path.join(segdir, f"seg_{i:04d}.hevc")
         stmp = sf + ".part"
         _remember_tight_cap(segdir, i, tight_cap_mbps)   # BEFORE the delete: a kill from here on
@@ -724,7 +795,6 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
         ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
         if not ok:
             return False, why
-        dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps)
         enc = build_x265_command(x265, rslice, stmp, tight_cap_mbps, master_display, max_cll)
         # Surface WHICH segment is being re-capped and its LIVE frame progress — the k'th
         # of the flagged set, re-encoding frame `done` of the segment's `n`. Without this
