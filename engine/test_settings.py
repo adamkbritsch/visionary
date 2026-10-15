@@ -591,3 +591,52 @@ class DoFeaturettesReplacesFeaturettesLast(unittest.TestCase):
         settings.set_show_do_featurettes("A", False)
         self.assertFalse(settings.get_show_do_featurettes("A"))
         self.assertTrue(settings.get_show_do_featurettes("B"))
+
+
+class DvEngine(unittest.TestCase):
+    """`dv_engine` decides who makes a TV episode's Dolby Vision. 'resolve' is the default
+    and the old, safe path, so EVERYTHING that is not exactly 'native' must read as
+    'resolve' — on write (VALIDATORS) and on read (dv_engine()), because get_settings()
+    merges a hand-edited file over the defaults without checking it."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        p = mock.patch.multiple(settings, CONFIG_DIR=d,
+                                SETTINGS_FILE=os.path.join(d, "settings.json"),
+                                PROFILES_FILE=os.path.join(d, "show_profiles.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_defaults_to_resolve(self):
+        self.assertEqual(settings.DEFAULT_SETTINGS["dv_engine"], "resolve")
+        self.assertEqual(settings.dv_engine(), "resolve")          # no settings file at all
+        self.assertEqual(settings.get_settings()["dv_engine"], "resolve")
+
+    def test_only_the_two_exact_choices_survive(self):
+        for v in ("resolve", "native"):
+            self.assertEqual(settings._valid_dv_engine(v), v)
+        for junk in ("Native", "NATIVE", " native", "", None, 1, True, ["native"], {"x": 1}):
+            self.assertEqual(settings._valid_dv_engine(junk), "resolve", repr(junk))
+        self.assertIs(settings.VALIDATORS["dv_engine"], settings._valid_dv_engine)
+
+    def test_set_settings_accepts_and_round_trips_the_key(self):
+        self.assertEqual(settings.set_settings({"dv_engine": "native"})["dv_engine"], "native")
+        self.assertEqual(settings.dv_engine(), "native")
+        self.assertEqual(settings.set_settings({"dv_engine": "resolve"})["dv_engine"], "resolve")
+        self.assertEqual(settings.dv_engine(), "resolve")
+
+    def test_set_settings_turns_junk_into_resolve(self):
+        settings.set_settings({"dv_engine": "native"})
+        self.assertEqual(settings.set_settings({"dv_engine": "x"})["dv_engine"], "resolve")
+        self.assertEqual(settings.dv_engine(), "resolve")
+
+    def test_a_hand_edited_value_is_validated_on_read(self):
+        for raw, want in (("Native", "resolve"), ("x", "resolve"), (None, "resolve"),
+                          (7, "resolve"), ("native", "native"), ("resolve", "resolve")):
+            settings._save(settings.SETTINGS_FILE, {"dv_engine": raw})
+            self.assertEqual(settings.get_settings()["dv_engine"], raw)   # unvalidated merge
+            self.assertEqual(settings.dv_engine(), want, repr(raw))      # validated accessor
+
+    def test_an_unrelated_write_leaves_a_native_choice_alone(self):
+        settings.set_settings({"dv_engine": "native"})
+        settings.set_settings({"poll_minutes": 45})
+        self.assertEqual(settings.dv_engine(), "native")

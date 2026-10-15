@@ -477,16 +477,18 @@ struct PowerPill: View {
     // why it showed up with the pipeline deactivated. Clears the worst case with a little air.
     private static let pctSlot: CGFloat = 36
 
-    /// (pipeline index, SF Symbol, percent) — EXACTLY the Dock bar's number in percentage
-    /// form (user-dictated: the header readout IS the bar under the app icon). One shared
-    /// computation, PipelineCard.unifiedProgress, so the two can never disagree.
-    private var leadStage: (Int, String, Int)? {
+    /// (pipeline index, SF Symbol, percent, step name) — EXACTLY the Dock bar's number in
+    /// percentage form (user-dictated: the header readout IS the bar under the app icon). One
+    /// shared computation, PipelineCard.unifiedProgress, so the two can never disagree.
+    private var leadStage: (Int, String, Int, String?)? {
         guard let up = PipelineCard.unifiedProgress(store.state) else { return nil }
         // `cleanup` has no PIPELINE card; it is past upload, so it borrows the upload glyph.
-        let idx = PIPELINE.firstIndex { $0.key == up.stage } ?? (up.stage == "cleanup" ? PIPELINE.count : -1)
+        // `dvnative` has the card in Resolve's slot (pipelineCards), so it reads as that one.
+        let cards = pipelineCards(for: up.stage)
+        let idx = cards.firstIndex { $0.key == up.stage } ?? (up.stage == "cleanup" ? cards.count : -1)
         guard idx >= 0 else { return nil }
-        let sym = PIPELINE.indices.contains(idx) ? PIPELINE[idx].symbol : PIPELINE.last!.symbol
-        return (idx, sym, Int(up.pct))
+        let sym = cards.indices.contains(idx) ? cards[idx].symbol : cards.last!.symbol
+        return (idx, sym, Int(up.pct), cards.indices.contains(idx) ? cards[idx].name : nil)
     }
 
     /// A battery glyph that actually reports the level, rather than a decorative one.
@@ -555,8 +557,8 @@ struct PowerPill: View {
         .help({
             var t = ac ? "Adapter wattage and battery level"
                        : "Running on battery — the pipeline pauses until the adapter is back"
-            if let lead, PIPELINE.indices.contains(lead.0) {
-                t += "\n\(PIPELINE[lead.0].name) \(lead.2)% — the same bar the Dock icon shows"
+            if let lead, let name = lead.3 {
+                t += "\n\(name) \(lead.2)% — the same bar the Dock icon shows"
             }
             return t
         }())
@@ -815,6 +817,23 @@ let EXTEND_STAGE = StageInfo(
         + "are generated; the original picture ships untouched.",
     how: "WAN VACE \u{00B7} chunked")
 
+// The native Dolby Vision lane's analysis (run stage 'dvnative': dv_engine 'native', TV only).
+// It is the step Resolve fills on every other path, so while it runs its card takes Resolve's
+// slot rather than joining as a sixth beside an idle Resolve. Display only: dv_engine dictates
+// the output bytes, so like the cap and the loudness target it has no control here.
+let DVNATIVE_STAGE = StageInfo(
+    key: "dvnative", name: "DV analysis", symbol: "wand.and.rays",
+    desc: "Measure every frame's light straight from the Topaz chunks, through the SDR→PQ LUT, and "
+        + "generate the Dolby Vision metadata — no screen, no render.",
+    how: "hdr_analyzer · CM v4.0 · DV 8.1")
+
+/// PIPELINE as it reads while `stage` runs: 'dvnative' stands in Resolve's slot. Every other
+/// stage gets PIPELINE itself. The card row and the header readout both go through this.
+func pipelineCards(for stage: String?) -> [StageInfo] {
+    guard stage == DVNATIVE_STAGE.key else { return PIPELINE }
+    return PIPELINE.map { $0.key == "resolve" ? DVNATIVE_STAGE : $0 }
+}
+
 let PIPELINE: [StageInfo] = [
     .init(key: "download", name: "Download", symbol: "arrow.down.circle",
           desc: "Pull the 1080p source from the NAS to local scratch.", how: "FTP RETR · size-verified"),
@@ -900,9 +919,10 @@ struct PipelineCard: View {
                 else { return false }
                 return (s.extend_borders ?? false) && s.aspect == "4:3"
             }()
+            // The native DV analysis takes Resolve's card while it runs (DVNATIVE_STAGE).
             let stages: [StageInfo] = {
-                guard showExtend else { return PIPELINE }
-                var a = PIPELINE
+                guard showExtend else { return pipelineCards(for: runStage) }
+                var a = pipelineCards(for: runStage)
                 a.insert(EXTEND_STAGE, at: 1)
                 return a
             }()

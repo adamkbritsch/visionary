@@ -468,6 +468,60 @@ class ResumeFingerprint(unittest.TestCase):
                          dvcap.DV_STREAM_CEILING_MBPS - dvcap.TRUEHD_HEADROOM_MBPS)
 
 
+class NativeResumeIdentity(unittest.TestCase):
+    """Native DV has no render to stat. Its resume identity is the native marker's id, which
+    hashes the chunks, the generated RPU and the LUT — stat'ing the nominal chunk-0 path would
+    miss a regenerated RPU and resume segments graded with the old one. Absent (every Resolve
+    run), the manifest must be exactly the pre-native one, or every in-flight segdir would be
+    wiped by the deploy."""
+
+    def test_absent_native_id_is_the_pre_native_manifest(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            dv = os.path.join(td, "r.mov"); open(dv, "wb").write(b"x" * 100)
+            st = os.stat(dv)
+            pre_native = {"src": f"{st.st_size}:{int(st.st_mtime)}", "cap": 50, "frames": 100,
+                          "fps": "24/1", "seg": 300, "crf": float(dvcap.X265_CRF),
+                          "preset": dvcap.X265_PRESET, "segb": [50, 100]}
+            seg = os.path.join(td, "segs"); os.makedirs(seg)
+            with open(os.path.join(seg, "manifest.json"), "w") as f:
+                json.dump(pre_native, f)                  # written by the pre-native code
+            open(os.path.join(seg, "seg_0000.hevc"), "wb").write(b"y")
+            for m in (dvcap.resume_manifest(dv, 50, 100, "24/1", 300, boundaries=[50, 100]),
+                      dvcap.resume_manifest(dv, 50, 100, "24/1", 300, boundaries=[50, 100],
+                                            native_id=None)):
+                self.assertEqual(m, pre_native)           # no new key, no changed value
+                self.assertEqual(dvcap.ensure_segdir(seg, m), "resume")
+            self.assertTrue(os.path.exists(os.path.join(seg, "seg_0000.hevc")))
+
+    def test_native_id_replaces_the_render_stat(self):
+        import os, tempfile, time
+        m = dvcap.resume_manifest("/no/such/seg_0000.mov", 50, 6000, "24000/1001", 300,
+                                  boundaries=[2217, 4398, 6000], native_id="abc")
+        self.assertEqual(m["src"], "native:abc")          # never "missing": the path is not stat'ed
+        self.assertEqual(m["segb"], [2217, 4398, 6000])
+        with tempfile.TemporaryDirectory() as td:
+            c0 = os.path.join(td, "seg_0000.mov"); open(c0, "wb").write(b"x")
+            m1 = dvcap.resume_manifest(c0, 50, 6000, "24000/1001", 300, native_id="abc")
+            open(c0, "wb").write(b"x" * 50)               # the nominal path's stat changes...
+            os.utime(c0, (time.time() + 5, time.time() + 5))
+            m2 = dvcap.resume_manifest(c0, 50, 6000, "24000/1001", 300, native_id="abc")
+            self.assertEqual(m1, m2)                      # ...the identity does not
+            self.assertNotEqual(m1, dvcap.resume_manifest(c0, 50, 6000, "24000/1001", 300))
+
+    def test_changed_native_id_wipes_stale_segments(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            seg = os.path.join(td, "segs")
+            ma = dvcap.resume_manifest("/c0.mov", 50, 6000, "24000/1001", 300, native_id="abc")
+            self.assertEqual(dvcap.ensure_segdir(seg, ma), "fresh")
+            open(os.path.join(seg, "seg_0000.hevc"), "wb").write(b"y")
+            self.assertEqual(dvcap.ensure_segdir(seg, ma), "resume")      # same id → resume
+            mb = dvcap.resume_manifest("/c0.mov", 50, 6000, "24000/1001", 300, native_id="def")
+            self.assertEqual(dvcap.ensure_segdir(seg, mb), "fresh")       # re-analysed → wipe
+            self.assertFalse(os.path.exists(os.path.join(seg, "seg_0000.hevc")))
+
+
 class ResumeRobustness(unittest.TestCase):
     """Kill-during-remux is the COMMON case for segmented remux — every persisted artifact must
     be atomic, and a transient probe must never destroy resume state (review-caught)."""

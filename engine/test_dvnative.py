@@ -1,9 +1,15 @@
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 import dvnative
 
@@ -291,6 +297,333 @@ class GenerateRoundTrip(unittest.TestCase):
             self.assertIn("CM v4.0", info)
             self.assertIn("0.0001/1000 nits", info)
             self.assertIn("Scene/shot count: 60", info)      # long_play_mode: refresh every frame
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+PY = sys.executable
+
+
+def _read(path) -> str:
+    with open(path) as f:
+        return f.read()
+
+
+def _pid_gone(pid, wait=3.0) -> bool:
+    """True once `pid` no longer exists (a killed grandchild is reaped by launchd, not us)."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < wait:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+class StepTimeouts(unittest.TestCase):
+    def test_300_s_plus_frames_over_5_rounded_up(self):
+        self.assertEqual(dvnative.step_timeout(0), 300)
+        self.assertEqual(dvnative.step_timeout(5), 301)
+        self.assertEqual(dvnative.step_timeout(6), 302)
+        self.assertEqual(dvnative.step_timeout(7058), 1712)     # S06E05's long chunk
+
+    def test_niced_prefix(self):
+        self.assertEqual(dvnative.niced(["/ff", "-i", "x"]), ["/usr/bin/nice", "-n", "10", "/ff", "-i", "x"])
+        self.assertEqual(dvnative.niced(["/ff"], nice=0), ["/ff"])
+
+
+class RunStep(unittest.TestCase):
+    """Real child processes: the poll loop must kill (and reap) what it started, never hang."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.procs = []
+        real = subprocess.Popen
+
+        def record(*a, **k):
+            pr = real(*a, **k)
+            self.procs.append(pr)
+            return pr
+        self.patch = mock.patch.object(dvnative.subprocess, "Popen", side_effect=record)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        for pr in self.procs:
+            if pr.returncode is None:
+                try:
+                    os.killpg(pr.pid, 9)
+                except OSError:
+                    pass
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _sleeper(self, secs=30):
+        return [PY, "-c", f"import time; time.sleep({secs})"]
+
+    def test_returncode_output_tail_and_cpu(self):
+        rc, tail, cpu = dvnative.run_step(
+            [PY, "-c", "import sys,time\nt=time.process_time()\nwhile time.process_time()-t<0.3: pass\n"
+                       "print('boom'); sys.exit(3)"], timeout=30, poll=0.05)
+        self.assertEqual(rc, 3)
+        self.assertIn("boom", tail)
+        self.assertGreater(cpu, 0.2)                     # os.wait4 user+sys of the child
+        self.assertEqual(self.procs[0].returncode, 3)    # reaped: Popen never waits on it again
+
+    def test_timeout_raises_instead_of_hanging_and_kills_the_child(self):
+        t0 = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            dvnative.run_step(self._sleeper(), timeout=0.5, poll=0.05, what="chunk 1 analyzer")
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertIsNotNone(self.procs[0].returncode)
+        self.assertTrue(_pid_gone(self.procs[0].pid))
+
+    def test_abort_kills_the_child_mid_step_and_its_children(self):
+        pidfile = os.path.join(self.d, "grandchild.pid")
+        cmd = [PY, "-c", "import subprocess,sys,time\n"
+                         "g=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])\n"
+                         f"open({pidfile!r},'w').write(str(g.pid))\ntime.sleep(30)"]
+        ev = threading.Event()
+
+        def later():
+            for _ in range(100):
+                if os.path.exists(pidfile) and _read(pidfile):
+                    break
+                time.sleep(0.05)
+            ev.set()
+        threading.Thread(target=later, daemon=True).start()
+        t0 = time.monotonic()
+        with self.assertRaises(dvnative.Aborted):
+            dvnative.run_step(cmd, timeout=60, abort=ev, poll=0.05)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertTrue(_pid_gone(self.procs[0].pid))
+        self.assertTrue(_pid_gone(int(_read(pidfile))))   # the whole process group died
+
+    def test_should_pause_kills_the_child_and_raises_paused(self):
+        t0 = time.monotonic()
+        with self.assertRaises(dvnative.Paused) as cm:
+            dvnative.run_step(self._sleeper(), timeout=60, poll=0.05,
+                              should_pause=lambda: time.monotonic() - t0 > 0.3)
+        self.assertTrue(str(cm.exception).startswith("paused:"))
+        self.assertTrue(_pid_gone(self.procs[0].pid))
+
+    def test_niced_child_runs_ten_lower(self):
+        out = os.path.join(self.d, "nice.txt")
+        rc, _tail, _cpu = dvnative.run_step(
+            dvnative.niced([PY, "-c", f"import os; open({out!r},'w').write(str(os.nice(0)))"]),
+            timeout=30, poll=0.05)
+        self.assertEqual(rc, 0)
+        self.assertEqual(int(_read(out)), min(20, os.nice(0) + 10))
+
+
+def _fake_sidecar(frames, cll=500, fall=100):
+    return {"version": 5, "scenes": [_scene(0, frames - 1, 1, 600, 2400)],
+            "source": {"stream_frames": frames, "leading_skipped_frames": 0},
+            "light_level": {"max_cll_nits": cll, "max_fall_nits": fall}}
+
+
+class AnalyzeChunks(unittest.TestCase):
+    """analyze_chunks with run_step faked: each step writes what the real tool would."""
+
+    FRAMES = (24, 30, 18)
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.work = os.path.join(self.d, "work")
+        self.chunks, a = [], 0
+        for i, n in enumerate(self.FRAMES):
+            path = os.path.join(self.d, f"seg_{i:04d}.mov")
+            open(path, "wb").close()
+            self.chunks.append([a, path])
+            a += n
+        self.chunks.append([a, None])
+        self.total = a
+        self.calls = []
+        self.l4_short = set()            # chunk indices whose L4 child writes one frame too few
+        self.analyzer_frames = {}        # chunk index -> frames the analyzer claims
+        self.fail = {}                   # (k, step) -> rc
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _k(self, path):
+        return int(os.path.basename(path).split("_")[1].split(".")[0])
+
+    def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, cwd=None, what="step", poll=0.5):
+        self.assertEqual(cmd[:3], ["/usr/bin/nice", "-n", "10"])
+        cmd = cmd[3:]
+        if cmd[0] == "/ff":
+            step, k = "intermediate", self._k(cmd[-1])
+            open(cmd[-1], "wb").close()
+        elif cmd[0] == "/an":
+            step, k = "analyzer", self._k(cmd[2])
+            n = self.analyzer_frames.get(k, self.FRAMES[k])
+            with open(dvnative.sidecar_path(cmd[cmd.index("-o") + 1]), "w") as f:
+                json.dump(_fake_sidecar(n), f)
+        else:
+            step, k = "l4", self._k(cmd[4])
+            self.assertEqual(cmd[1:4], ["-m", "dvnative", "l4"])
+            self.assertEqual(cwd, dvnative.ENGINE_DIR)
+            n = self.FRAMES[k] - (1 if k in self.l4_short else 0)
+            with open(cmd[5], "w") as f:
+                json.dump([[k, 1]] * n, f)
+        self.assertEqual(timeout, dvnative.step_timeout(self.FRAMES[k]))
+        self.calls.append((k, step))
+        rc = self.fail.get((k, step), 0)
+        return rc, f"{step} said no" if rc else "", 0.25
+
+    def analyze(self, **kw):
+        kw.setdefault("cube", None)
+        with mock.patch.object(dvnative, "run_step", side_effect=self.fake_step):
+            return dvnative.analyze_chunks(self.chunks, self.work, analyzer="/an", ffmpeg="/ff",
+                                           python="/py", **kw)
+
+    def _leftovers(self):
+        return sorted(n for n in os.listdir(self.work) if n.endswith((".mkv", ".part")))
+
+    def test_every_chunk_measured_and_merged(self):
+        cpu = []
+        sc = self.analyze(on_cpu=lambda k, s, n: cpu.append((k, s, n)))
+        self.assertEqual(dvnative.stream_frames(sc), self.total)
+        self.assertEqual(len(sc["l4"]), self.total)
+        self.assertEqual([s["start"] for s in sc["scenes"]], [0, 24, 54])
+        self.assertEqual(self.calls, [(k, s) for k in range(3) for s in ("intermediate", "analyzer", "l4")])
+        self.assertEqual(cpu, [(0, 0.75, 24), (1, 0.75, 30), (2, 0.75, 18)])   # 3 steps x 0.25 s
+        self.assertEqual(self._leftovers(), [])
+
+    def test_resume_skips_published_sidecars(self):
+        self.analyze()
+        self.calls.clear()
+        os.remove(os.path.join(self.work, "chunk_0001.bin.l1.json"))      # only chunk 1 is unfinished
+        progress = []
+        sc = self.analyze(on_chunk=lambda done, of: progress.append((done, of)))
+        self.assertEqual(self.calls, [(1, "intermediate"), (1, "analyzer"), (1, "l4")])
+        self.assertEqual(progress, [(1, 3), (2, 3), (3, 3)])                 # resumed ones report too
+        self.assertEqual(dvnative.stream_frames(sc), self.total)
+
+    def test_should_pause_between_chunks_gives_paused_and_resumes_there(self):
+        with self.assertRaises(dvnative.Paused) as cm:
+            self.analyze(should_pause=lambda: any(k == 0 and s == "l4" for k, s in self.calls))
+        self.assertTrue(str(cm.exception).startswith("paused:"))
+        self.assertEqual({k for k, _s in self.calls}, {0})
+        self.assertTrue(os.path.exists(os.path.join(self.work, "chunk_0000.bin.l1.json")))
+        self.calls.clear()
+        self.analyze()
+        self.assertEqual({k for k, _s in self.calls}, {1, 2})
+
+    def test_before_chunk_hook_pauses_with_its_reason_before_any_step(self):
+        seen = []
+
+        def floor(k, frames):
+            seen.append((k, frames))
+            return "low disk — under the floor" if k == 1 else None
+        with self.assertRaises(dvnative.Paused) as cm:
+            self.analyze(before_chunk=floor)
+        self.assertEqual(str(cm.exception), "paused: low disk — under the floor")
+        self.assertEqual(seen, [(0, 24), (1, 30)])
+        self.assertNotIn(1, {k for k, _s in self.calls})            # nothing spawned for chunk 1
+
+    def test_before_chunk_is_not_asked_for_finished_chunks(self):
+        self.analyze()
+        seen = []
+        self.analyze(before_chunk=lambda k, n: seen.append(k))
+        self.assertEqual(seen, [])
+
+    def test_abort_before_a_chunk(self):
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(dvnative.Aborted):
+            self.analyze(abort=ev)
+        self.assertEqual(self.calls, [])
+
+    def test_a_pause_mid_step_leaves_no_partial_files(self):
+        def step(cmd, **kw):
+            if "analyzer" in kw.get("what", "") and "chunk 2" in kw["what"]:
+                raise dvnative.Paused("paused: yielded during chunk 2 analyzer")
+            return self.fake_step(cmd, **kw)
+        with mock.patch.object(dvnative, "run_step", side_effect=step):
+            with self.assertRaises(dvnative.Paused):
+                dvnative.analyze_chunks(self.chunks, self.work, cube=None, analyzer="/an",
+                                        ffmpeg="/ff", python="/py")
+        self.assertEqual(self._leftovers(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "chunk_0001.bin.l1.json")))
+
+    def test_a_failed_step_raises_and_cleans_up(self):
+        self.fail[(1, "analyzer")] = 1
+        with self.assertRaisesRegex(RuntimeError, "chunk 1: analyzer failed: analyzer said no"):
+            self.analyze()
+        self.assertEqual(self._leftovers(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "chunk_0001.bin.l1.json")))
+
+    def test_short_l4_is_refused_and_never_reused(self):
+        self.l4_short.add(1)
+        with self.assertRaisesRegex(RuntimeError, "chunk 1: L4 has 29 frames, the chunk has 30"):
+            self.analyze()
+        self.assertFalse(os.path.exists(os.path.join(self.work, "chunk_0001.bin.l1.json")))
+        self.l4_short.clear()
+        self.calls.clear()
+        self.analyze()
+        self.assertIn((1, "l4"), self.calls)                          # measured again
+
+    def test_analysis_of_the_wrong_length_is_refused(self):
+        self.analyzer_frames[2] = 17
+        with self.assertRaisesRegex(RuntimeError, "chunk 2: analysis covers 17 frames"):
+            self.analyze()
+
+    def test_the_end_sentinel_is_required(self):
+        with self.assertRaises(ValueError):
+            dvnative.analyze_chunks(self.chunks[:-1], self.work, cube=None)
+
+
+class L4Command(unittest.TestCase):
+    def test_module_entry_with_ffmpeg_and_size(self):
+        self.assertEqual(dvnative.build_l4_command("/py", "/w/c.mkv", "/w/c.l4.json.part", ffmpeg="/ff"),
+                         ["/py", "-m", "dvnative", "l4", "/w/c.mkv", "/w/c.l4.json.part",
+                          "--ffmpeg", "/ff", "--size", "1920x1080"])
+
+    def test_bad_size_is_a_usage_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(dvnative.main(["l4", "/x.mkv", "/o.json", "--size", "big"]), 2)
+            self.assertEqual(dvnative.main([]), 2)
+
+
+def _have_numpy() -> bool:
+    try:
+        import numpy  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG) and _have_numpy(), "ffmpeg/numpy not installed")
+class L4SubprocessMatchesInProcess(unittest.TestCase):
+    """The L4 child (`python3 -m dvnative l4`, run exactly as analyze_chunks runs it) must give
+    the same per-frame values as frame_l4 in-process, on a tiny synthetic PQ 4:4:4 clip."""
+
+    def test_child_equals_in_process(self):
+        d = tempfile.mkdtemp()
+        try:
+            mkv = os.path.join(d, "tiny.mkv")
+            r = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                                "-f", "lavfi", "-i", "testsrc2=size=64x36:rate=24", "-frames:v", "6",
+                                "-pix_fmt", "yuv444p10le", "-color_primaries", "bt2020",
+                                "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                                "-color_range", "tv", "-c:v", "ffv1", mkv], capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = os.path.join(d, "tiny.l4.json")
+            rc, tail, cpu = dvnative.run_step(
+                dvnative.niced(dvnative.build_l4_command(PY, mkv, out, width=64, height=36)),
+                timeout=dvnative.step_timeout(6), cwd=dvnative.ENGINE_DIR, poll=0.05)
+            self.assertEqual(rc, 0, tail)
+            with open(out) as f:
+                child = json.load(f)
+            here = dvnative.frame_l4(mkv, width=64, height=36)
+            self.assertEqual(len(here), 6)
+            self.assertEqual(child, here)
+            self.assertTrue(any(v[0] > 0 for v in here))     # a real picture, not all black
+            self.assertGreater(cpu, 0.0)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

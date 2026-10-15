@@ -7,6 +7,8 @@ measured 139 Mbps single-second spikes on a 27.5 Mbps average, which underruns p
      in its native Dolby Vision mode with a HARD VBV ceiling (settings `max_peak_mbps`,
      default 50) and interleaves the RPU itself. NO UNCAPPED FALLBACK (user-dictated):
      if capping fails in any way, the stage FAILS — an uncapped file IS the broken file.
+     Native DV (settings dv_engine 'native', `remux(native=)`) has no render: the RPU is
+     dvnative's generated one and x265 reads Topaz's ProRes chunks through the SDR->PQ LUT.
   1. ffmpeg extracts every audio + subtitle track from the source (its `-map`
      is reliable; subs -> mov_text) into a temp track file.
   2. MP4Box muxes the capped ES (`:dvp=8.1:fps=`) + those tracks into the final
@@ -610,11 +612,31 @@ def _verify(output: str, ffprobe: str) -> RemuxResult:
     return RemuxResult(ok, output, s["dovi_profile"], s["audio"], s["subtitle"], reason)
 
 
+def _copy_native_rpu(src: str, rpu_out: str):
+    """Native DV: the generated RPU -> segdir/rpu.bin, in place of dvcap.extract_rpu. ATOMIC
+    like extract_rpu (.part, then os.replace): a kill mid-copy must never leave a truncated
+    rpu.bin, which the segmented resume would reuse verbatim. A COPY, never a move or link:
+    ensure_segdir wipes segdir on any manifest mismatch, and the canonical RPU (the one the
+    native marker hashes) lives outside it and must survive that. Returns (ok, reason)."""
+    tmp = rpu_out + ".part"
+    _rm(tmp)
+    try:
+        shutil.copyfile(src, tmp)
+        size = os.path.getsize(tmp)
+        if size <= 0:
+            raise OSError("the generated RPU is empty")
+        os.replace(tmp, rpu_out)          # atomic publish
+    except OSError as e:
+        _rm(tmp)
+        return False, f"native RPU copy failed: {e}"
+    return True, "native rpu copied (%d bytes)" % size
+
+
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
           audio_gain_db=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
-          encode_source=None, rpu_mode=None,
+          encode_source=None, rpu_mode=None, native=None,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -627,10 +649,42 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     `encode_source`: the peak-gated rpu-only fallback (SHIELD DV ceiling) — the RPU still
     comes from `dv_video` (Resolve's analysis), but the video that gets the capped re-encode
     is THIS file (the original HDR10 stream; frame-aligned because Resolve rendered from the
-    same CFR copy) instead of the render, whose floor-bitrate video was never meant to ship."""
+    same CFR copy) instead of the render, whose floor-bitrate video was never meant to ship.
+    `native` (settings dv_engine 'native'; None = the Resolve path above, unchanged): the
+    nativelane bundle {chunks, vf, rpu, fps, max_cll, total, bounds, id}. There is NO render:
+    every segment decodes its own Topaz ProRes chunk through the LUT (`decode`, at the main
+    encode, the repair rung AND the re-concat — a missing one would encode the wrong file),
+    the RPU is dvnative's generated one (copied, not extracted), frames/fps/max_cll come from
+    the bundle (nothing to probe), the segment plan is the chunk ends (`bounds`, overriding
+    `boundaries`), and the mastering display is dvcap's 1000-nit P3 fallback — what the
+    generated RPU's L6 declares. `dv_video` is unused: chunk 0 stands in as the nominal
+    source, which the decode chunks override segment by segment."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-    enc = encode_source or dv_video   # the video the x265 pass re-encodes (RPU: always dv_video)
-    info = dvcap.probe_video(enc, ffprobe)
+    nat_kw, dec_kw = {}, {}   # Resolve path: NO extra kwargs — every dvcap call is the pre-native call
+    if native is not None:
+        # GUARD BEFORE touching the resume state, like the probe guard below: a bundle whose
+        # chunk list does not end at its total would plan (and wipe/resume) a different episode.
+        chunks = native.get("chunks") or []
+        total = int(native.get("total") or 0)
+        if (total <= 0 or len(chunks) < 2 or chunks[-1][0] != total or not chunks[0][1]
+                or not native.get("id")):
+            return RemuxResult(False, output,
+                               reason=f"native bundle is malformed (total {total}, "
+                                      f"{max(0, len(chunks) - 1)} chunk(s)) — resume state left intact")
+        if encode_source is not None or rpu_mode is not None:
+            return RemuxResult(False, output,
+                               reason="native DV has no render to swap the encode source or "
+                                      "RPU mode of (shipped nothing)")
+        enc = chunks[0][1]                # NOMINAL only: decode["chunks"] picks each segment's chunk
+        info = {"frames": total, "fps": str(native["fps"]),
+                "master_display": None,   # -> dvcap.FALLBACK_MASTER_DISPLAY (1000-nit P3 D65)
+                "max_cll": native.get("max_cll")}
+        boundaries = [int(b) for b in native["bounds"]]
+        nat_kw = {"native_id": native["id"]}
+        dec_kw = {"decode": {"chunks": chunks, "vf": native["vf"]}}
+    else:
+        enc = encode_source or dv_video   # the video the x265 pass re-encodes (RPU: always dv_video)
+        info = dvcap.probe_video(enc, ffprobe)
     # GUARD BEFORE touching the resume state (review-caught): a transient ffprobe failure returns
     # frames=0, which would build a mismatched manifest and make ensure_segdir WIPE hours of
     # finished segments. Fail the attempt cleanly instead — the segdir is untouched, next try resumes.
@@ -645,14 +699,17 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     # a re-rendered dv_video or changed cap would otherwise concat stale/wrong segments
     dvcap.ensure_segdir(segdir, dvcap.resume_manifest(
         dv_video, cap_mbps, info["frames"], info["fps"], dvcap.SEG_SECONDS, boundaries=boundaries,
-        encode_source=encode_source, rpu_mode=rpu_mode))
+        encode_source=encode_source, rpu_mode=rpu_mode, **nat_kw))
     rpu = os.path.join(segdir, "rpu.bin")
     hevc = output + ".capped.hevc"          # transient: the concat of the segments, rebuilt each attempt
     tracks = dv_mp4 = None
     try:
         if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):   # resume keeps the extracted RPU
-            ok, why = dvcap.extract_rpu(dv_video, rpu, mode=rpu_mode, ffmpeg=ffmpeg,
-                                        timeout=timeout)
+            if native is not None:
+                ok, why = _copy_native_rpu(native["rpu"], rpu)
+            else:
+                ok, why = dvcap.extract_rpu(dv_video, rpu, mode=rpu_mode, ffmpeg=ffmpeg,
+                                            timeout=timeout)
             if not ok:
                 return RemuxResult(False, output, reason=why)
         # RPU frame count is GROUND TRUTH (one per coded frame). The container nb_frames HEADER
@@ -661,6 +718,15 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         real_frames = dvcap.rpu_frame_count(rpu)
         if real_frames <= 0:
             return RemuxResult(False, output, reason="could not read RPU frame count — resume state intact")
+        if native is not None and real_frames != info["frames"]:
+            # FAIL FAST before the hours-long encode: the chunks ARE the video, so an RPU of any
+            # other length is not their analysis. A shorter one would QUIETLY plan a shorter
+            # episode (the last chunk's tail dropped, against the CFR's audio); a longer one
+            # pads a tail no chunk holds. Drop the copy so a retry re-copies the canonical.
+            _rm(rpu)
+            return RemuxResult(False, output,
+                               reason=f"native RPU/chunk frame mismatch: rpu {real_frames} != "
+                                      f"chunks {info['frames']} (shipped nothing)")
         if encode_source is not None:
             # FAIL FAST before the hours-long encode: when the RPU donor and the encoded
             # video are different files (rpu-only fallback / companion combine), a frame
@@ -677,7 +743,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
             master_display=info["master_display"], max_cll=info["max_cll"],
             abort=abort, on_progress=on_progress, on_plan=on_plan,
-            should_pause=should_pause, ffmpeg=ffmpeg)
+            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw)
         if not ok:
             if why.startswith("paused:"):
                 return RemuxResult(False, output, reason=why)   # benign hold, not a failure
@@ -756,15 +822,16 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     enc, rpu, segdir, offenders, tight,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
-                    abort=abort, on_repair=on_repair, ffmpeg=ffmpeg)
+                    abort=abort, on_repair=on_repair, ffmpeg=ffmpeg, **dec_kw)
                 if not ok:
                     return RemuxResult(False, output, reason="peak repair: " + why)
                 # every segment is complete now → this call just re-verifies counts and re-concats
+                # (it still needs the native decode: a segment found missing here is re-encoded)
                 ok, frames, why = dvcap.encode_capped_segmented(
                     enc, rpu, hevc, cap_mbps, segdir=segdir,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
-                    abort=abort, ffmpeg=ffmpeg)
+                    abort=abort, ffmpeg=ffmpeg, **dec_kw)
                 if not ok or frames != real_frames:
                     return RemuxResult(False, output, reason="peak repair concat: " + why)
                 repair_note = f" · peak repair: {len(offenders)} seg(s) re-capped @ {tight} Mbps"

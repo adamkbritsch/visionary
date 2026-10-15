@@ -1072,3 +1072,268 @@ class NoFreeMeasurementNames(unittest.TestCase):
                 if node.id not in bound:
                     problems.append("%s: line %d loads %s with no binding" % (fn.name, node.lineno, node.id))
         self.assertEqual(problems, [])
+
+
+class NativeBundle(unittest.TestCase):
+    """remux(native=bundle): no Resolve render. Every encoder call — main encode, repair rung
+    AND the re-concat — decodes Topaz's own ProRes chunks through the LUT; the RPU is the
+    generated one, COPIED (atomically) into the segdir instead of extracted; frames, fps and
+    MaxCLL come from the bundle (nothing is probed); the mastering display is dvcap's 1000-nit
+    fallback; the segment plan is the chunk ends; and an RPU that is not exactly the chunk
+    total fails before the encode."""
+
+    CHUNKS = [[0, "/scratch/ep/seg_0000.mov"], [2217, "/scratch/ep/seg_0001.mov"],
+              [4398, "/scratch/ep/seg_0002.mov"], [6000, None]]
+    BOUNDS = [2217, 4398, 6000]
+    VF = "scale=out_range=full,lut3d=file=/luts/x.cube,format=yuv420p10le"
+    FPS = "24000/1001"
+    RPU_BYTES = b"RPU" * 100
+
+    def _bundle(self, tmp, **over):
+        import os
+        rpu = os.path.join(tmp, "native", "native.rpu")
+        os.makedirs(os.path.dirname(rpu), exist_ok=True)
+        with open(rpu, "wb") as f:
+            f.write(self.RPU_BYTES)
+        b = {"chunks": self.CHUNKS, "vf": self.VF, "rpu": rpu, "fps": self.FPS,
+             "max_cll": "1000,400", "total": 6000, "bounds": self.BOUNDS, "id": "abc123"}
+        b.update(over)
+        return b
+
+    def _run(self, tmp, bundle, buckets_seq=({1: 45.0},), rpu_frames=6000, **kw):
+        """MKV output (no audio machinery to mock). The REAL resume_manifest/ensure_segdir run,
+        so the segdir, manifest.json and the copied rpu.bin are real files under `tmp`."""
+        import os
+        out = os.path.join(tmp, "master.mkv")
+        segdir = out + ".remuxsegs"
+        seen = {"enc": [], "repair": [], "rpu_bytes": [], "manifest": []}
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+
+        def snapshot(rpu):
+            self.assertEqual(rpu, os.path.join(segdir, "rpu.bin"))
+            with open(rpu, "rb") as f:
+                seen["rpu_bytes"].append(f.read())
+            with open(os.path.join(segdir, "manifest.json")) as f:
+                seen["manifest"].append(json.load(f))
+
+        def fake_encode(src, rpu, hevc, cap, **k):
+            snapshot(rpu)
+            seen["enc"].append((src, k))
+            return True, k["total_frames"], "ok"
+
+        def fake_repair(src, rpu, sd, idx, tight, **k):
+            snapshot(rpu)
+            seen["repair"].append((src, list(idx), tight, k))
+            return True, "ok"
+
+        with mock.patch.object(remux.dvcap, "probe_video",
+                               side_effect=AssertionError("native mode probes nothing")), \
+             mock.patch.object(remux.dvcap, "extract_rpu",
+                               side_effect=AssertionError("native RPU is copied, not extracted")), \
+             mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=rpu_frames), \
+             mock.patch.object(remux.dvcap, "encode_capped_segmented", side_effect=fake_encode) as enc, \
+             mock.patch.object(remux.dvcap, "reencode_segments_tighter", side_effect=fake_repair), \
+             mock.patch.object(remux.dvcap, "video_peak_buckets", side_effect=list(buckets_seq)), \
+             mock.patch.object(remux, "_verify",
+                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1, "ok")), \
+             mock.patch.object(remux.subprocess, "run", return_value=ran) as run:
+            res = remux.remux("/unused/render.mov", "cfr.mkv", "orig.mkv", out, native=bundle, **kw)
+        seen["segdir"], seen["enc_mock"], seen["runs"] = segdir, enc, run.call_args_list
+        return res, seen
+
+    def test_every_encoder_call_gets_the_chunks_and_the_lut(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, seen = self._run(tmp, self._bundle(tmp), [{1: 58.6}, {1: 40.0}])   # over → repair
+        self.assertTrue(res.ok, res.reason)
+        self.assertIn("peak repair: 1 seg(s) re-capped @ 42", res.reason)
+        want_decode = {"chunks": self.CHUNKS, "vf": self.VF}
+        calls = [k for _s, k in seen["enc"]] + [r[3] for r in seen["repair"]]
+        self.assertEqual(len(seen["enc"]), 2)            # main encode + the repair re-concat
+        self.assertEqual(len(seen["repair"]), 1)         # the repair rung
+        for k in calls:
+            self.assertEqual(k["decode"], want_decode)
+            self.assertEqual(k["boundaries"], self.BOUNDS)   # the chunk ends, not topaz_segbounds
+            self.assertEqual(k["total_frames"], 6000)
+            self.assertEqual(k["fps"], self.FPS)
+            self.assertIsNone(k["master_display"])           # → FALLBACK_MASTER_DISPLAY
+            self.assertEqual(k["max_cll"], "1000,400")
+        for src in [s for s, _k in seen["enc"]] + [r[0] for r in seen["repair"]]:
+            self.assertEqual(src, "/scratch/ep/seg_0000.mov")   # nominal: decode overrides it
+        self.assertEqual(seen["repair"][0][1:3], ([0], 42))
+        # the MP4Box wrap carries the bundle's exact fps fraction
+        wraps = [c[0][0] for c in seen["runs"] if ":dvp=8.1:" in " ".join(map(str, c[0][0]))]
+        self.assertTrue(wraps)
+        self.assertTrue(all(w[2].endswith(":dvp=8.1:fps=24000/1001") for w in wraps))
+
+    def test_the_generated_rpu_is_copied_into_the_segdir(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = self._bundle(tmp)
+            res, seen = self._run(tmp, bundle)
+            self.assertTrue(res.ok, res.reason)
+            self.assertEqual(seen["rpu_bytes"], [self.RPU_BYTES])     # encoded from the copy
+            with open(bundle["rpu"], "rb") as f:
+                self.assertEqual(f.read(), self.RPU_BYTES)            # the canonical survives
+            self.assertFalse(os.path.exists(seen["segdir"]))          # success removes the segdir
+
+    def test_the_resume_identity_is_the_native_id(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, seen = self._run(tmp, self._bundle(tmp))
+        self.assertTrue(res.ok, res.reason)
+        m = seen["manifest"][0]
+        self.assertEqual(m["src"], "native:abc123")       # not a stat of any render
+        self.assertEqual(m["frames"], 6000)
+        self.assertEqual(m["fps"], self.FPS)
+        self.assertEqual(m["segb"], self.BOUNDS)
+        self.assertNotIn("enc", m)
+        self.assertNotIn("rpu_mode", m)
+
+    def test_bundle_bounds_override_caller_boundaries(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, seen = self._run(tmp, self._bundle(tmp), boundaries=[1000, 6000])
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(seen["enc"][0][1]["boundaries"], self.BOUNDS)
+
+    def test_rpu_chunk_frame_mismatch_fails_before_encoding(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, seen = self._run(tmp, self._bundle(tmp), rpu_frames=5999)
+            self.assertFalse(res.ok)
+            self.assertIn("native RPU/chunk frame mismatch: rpu 5999 != chunks 6000", res.reason)
+            seen["enc_mock"].assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(seen["segdir"], "rpu.bin")))  # re-copied next try
+            self.assertTrue(os.path.exists(os.path.join(seen["segdir"], "manifest.json")))
+
+    def test_missing_generated_rpu_fails_cleanly(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, seen = self._run(tmp, self._bundle(tmp, rpu=os.path.join(tmp, "gone.rpu")))
+            self.assertFalse(res.ok)
+            self.assertIn("native RPU copy failed", res.reason)
+            seen["enc_mock"].assert_not_called()
+            self.assertEqual(sorted(os.listdir(seen["segdir"])), ["manifest.json"])  # no .part left
+
+    def test_empty_generated_rpu_is_not_published(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = self._bundle(tmp)
+            open(bundle["rpu"], "wb").close()
+            res, seen = self._run(tmp, bundle)
+            self.assertFalse(res.ok)
+            self.assertIn("native RPU copy failed", res.reason)
+            self.assertEqual(sorted(os.listdir(seen["segdir"])), ["manifest.json"])
+
+    def test_resume_reuses_the_copied_rpu(self):
+        # same native id → ensure_segdir resumes, and the rpu.bin already there is the one used
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = self._bundle(tmp)
+            segdir = os.path.join(tmp, "master.mkv.remuxsegs")
+            remux.dvcap.ensure_segdir(segdir, remux.dvcap.resume_manifest(
+                "/scratch/ep/seg_0000.mov", remux.dvcap.DEFAULT_PEAK_MBPS, 6000, self.FPS,
+                remux.dvcap.SEG_SECONDS, boundaries=self.BOUNDS, native_id="abc123"))
+            with open(os.path.join(segdir, "rpu.bin"), "wb") as f:
+                f.write(b"KEPT")
+            res, seen = self._run(tmp, bundle)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(seen["rpu_bytes"], [b"KEPT"])
+
+    def test_malformed_bundle_leaves_the_resume_state_alone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self._bundle(tmp)
+            for name, bad in (("total past the chunks", dict(good, total=6001)),
+                              ("no id", dict(good, id="")),
+                              ("no chunks", dict(good, chunks=[])),
+                              ("zero total", dict(good, total=0))):
+                with self.subTest(name), \
+                     mock.patch.object(remux.dvcap, "ensure_segdir") as ens, \
+                     mock.patch.object(remux.dvcap, "encode_capped_segmented") as enc:
+                    res = remux.remux("/r.mov", "cfr.mkv", "orig.mkv", tmp + "/m.mkv", native=bad)
+                    self.assertFalse(res.ok)
+                    self.assertIn("native bundle is malformed", res.reason)
+                    ens.assert_not_called()
+                    enc.assert_not_called()
+
+    def test_native_refuses_an_encode_source_or_rpu_mode(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            for kw in ({"encode_source": "/src.mkv"}, {"rpu_mode": 2}):
+                with self.subTest(**kw), \
+                     mock.patch.object(remux.dvcap, "ensure_segdir") as ens:
+                    res = remux.remux("/r.mov", "cfr.mkv", "orig.mkv", tmp + "/m.mkv",
+                                      native=self._bundle(tmp), **kw)
+                    self.assertFalse(res.ok)
+                    ens.assert_not_called()
+
+
+class ResolvePathPinned(unittest.TestCase):
+    """native=None (dv_engine 'resolve', the default) must leave the Resolve remux exactly as
+    it was: the same dvcap calls with the same arguments — no `decode`, no `native_id`, the
+    probed mastering data — whether `native` is omitted or passed as None."""
+
+    MD = "G(1,2)B(3,4)R(5,6)WP(7,8)L(9,10)"
+
+    def _run(self, tmp, **kw):
+        import os
+        out = os.path.join(tmp, "master.mkv")
+        render = os.path.join(tmp, "render.mov")
+        info = {"frames": 100, "fps": "24000/1001", "start_time": 0.0,
+                "master_display": self.MD, "max_cll": "900,300"}
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+        with mock.patch.object(remux.dvcap, "probe_video", return_value=info) as probe, \
+             mock.patch.object(remux.dvcap, "resume_manifest", return_value={"m": 1}) as man, \
+             mock.patch.object(remux.dvcap, "ensure_segdir", return_value="fresh") as ens, \
+             mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")) as ext, \
+             mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+             mock.patch.object(remux.dvcap, "encode_capped_segmented",
+                               return_value=(True, 100, "ok")) as enc, \
+             mock.patch.object(remux.dvcap, "reencode_segments_tighter",
+                               return_value=(True, "ok")) as rep, \
+             mock.patch.object(remux.dvcap, "video_peak_buckets",
+                               side_effect=[{1: 58.6}, {1: 40.0}]), \
+             mock.patch.object(remux, "_verify",
+                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1, "ok")), \
+             mock.patch.object(remux.subprocess, "run", return_value=ran):
+            res = remux.remux(render, "cfr.mkv", "orig.mkv", out, boundaries=[50, 100], **kw)
+        calls = {"probe": probe.call_args_list, "manifest": man.call_args_list,
+                 "ensure": ens.call_args_list, "extract": ext.call_args_list,
+                 "encode": enc.call_args_list, "repair": rep.call_args_list}
+        return res, calls, render, out
+
+    def test_call_arguments_are_the_pre_native_ones(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, calls, render, out = self._run(tmp)
+        self.assertTrue(res.ok, res.reason)
+        segdir = out + ".remuxsegs"
+        rpu, hevc = segdir + "/rpu.bin", out + ".capped.hevc"
+        fps, ff = "24000/1001", remux.FFMPEG
+        self.assertEqual(calls["probe"], [mock.call(render, remux.FFPROBE)])
+        self.assertEqual(calls["manifest"], [mock.call(
+            render, 50, 100, fps, remux.dvcap.SEG_SECONDS, boundaries=[50, 100],
+            encode_source=None, rpu_mode=None)])
+        self.assertEqual(calls["ensure"], [mock.call(segdir, {"m": 1})])
+        self.assertEqual(calls["extract"], [mock.call(render, rpu, mode=None, ffmpeg=ff, timeout=None)])
+        self.assertEqual(calls["encode"], [
+            mock.call(render, rpu, hevc, 50, segdir=segdir, total_frames=100, fps=fps,
+                      boundaries=[50, 100], master_display=self.MD, max_cll="900,300",
+                      abort=None, on_progress=None, on_plan=None, should_pause=None, ffmpeg=ff),
+            mock.call(render, rpu, hevc, 50, segdir=segdir, total_frames=100, fps=fps,
+                      boundaries=[50, 100], master_display=self.MD, max_cll="900,300",
+                      abort=None, ffmpeg=ff)])
+        self.assertEqual(calls["repair"], [
+            mock.call(render, rpu, segdir, [0], 42, total_frames=100, fps=fps,
+                      boundaries=[50, 100], master_display=self.MD, max_cll="900,300",
+                      abort=None, on_repair=None, ffmpeg=ff)])
+
+    def test_explicit_none_is_the_same_as_omitting_it(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res_a, calls_a, _r, _o = self._run(tmp)
+            res_b, calls_b, _r, _o = self._run(tmp, native=None)
+        self.assertEqual((res_a.ok, res_a.reason), (res_b.ok, res_b.reason))
+        self.assertEqual(calls_a, calls_b)

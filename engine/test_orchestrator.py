@@ -62,12 +62,22 @@ def setUpModule():
                      ("PRIORITY_FILE", "yt_priority.json"), ("IMPORTS_FILE", "yt_imports.json"),
                      ("ROTATION_FILE", "yt_rotation.json")):
         p = mock.patch.object(_yt, name, _os.path.join(d, fn)); p.start(); _YT_PATCHES.append(p)
+    # dv_engine is read from the REAL settings file at use time: pin it to the shipped default
+    # so every _process test means the same thing on a machine where the user has flipped it to
+    # 'native'. The native tests below patch it back per test.
+    global _DV_ENGINE_PATCH
+    import settings as _settings
+    _DV_ENGINE_PATCH = mock.patch.object(_settings, "dv_engine", return_value="resolve")
+    _DV_ENGINE_PATCH.start()
 
 
 _NAS_PATCH = None
+_DV_ENGINE_PATCH = None
 
 
 def tearDownModule():
+    if _DV_ENGINE_PATCH is not None:
+        _DV_ENGINE_PATCH.stop()
     if _NAS_PATCH is not None:
         _NAS_PATCH.stop()
     if _FINISHER_PATCH is not None:
@@ -5181,3 +5191,1018 @@ class SweepListsEachFolderOnce(SweepOrphanedYouTubeWorkfiles):
             orch.sweep_orphaned_youtube_workfiles()
         self.assertEqual(calls, ["First We Feast"])
         self.assertFalse(any(os.path.exists(f) for f in files))
+
+
+# ---- native DV (settings dv_engine 'native') ----------------------------------------------
+
+SRC2 = "The Office  Superfan Episodes S02e11 Drug Testing (Extended Cut).mp4"
+
+
+def _claim(p, state="ready"):
+    """A native marker on disk — the lane's claim. What is inside is the lane's business: the
+    orchestrator only asks has_marker / has_fallback / check_ready (stubbed where it matters)."""
+    d = os.path.join(p.segdir, "native")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "native.json"), "w") as f:
+        f.write('{"state": "%s"}' % state)
+
+
+def _chunk(p, nbytes=10):
+    os.makedirs(p.segdir, exist_ok=True)
+    with open(os.path.join(p.segdir, "seg_0000.mov"), "wb") as f:
+        f.write(b"x" * nbytes)
+
+
+class NativeOffChangesNothing(unittest.TestCase):
+    """U1 — dv_engine 'resolve' (the shipped default): every path is today's, byte for byte. The
+    native lane's decision, analysis, bookkeeping and writes are booby-trapped here, so touching
+    any of them fails the test."""
+
+    TRAPS = ("decide", "run_analysis", "toolchain_ok", "toolchain_problems", "disk_fits",
+             "begin_marker", "write_marker", "publish_ready", "count_failure", "write_fallback",
+             "record_cpu", "check_ready", "ready", "bundle", "eligible", "probe_stream", "chunks",
+             "held_native_bytes", "read_marker")
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _traps(self):
+        import nativelane
+        return [mock.patch.object(nativelane, n, side_effect=AssertionError(f"nativelane.{n} touched"))
+                for n in self.TRAPS]
+
+    def test_a_tv_episode_runs_topaz_then_resolve_exactly_as_before(self):
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(p)
+        seen = []
+
+        def run(st, *_a, **kw):
+            seen.append((st, o.state.get("stage"), o._resolve_active.is_set()))
+            return True, "ok"
+        with contextlib.ExitStack() as es:
+            for cm in self._traps() + [
+                    mock.patch.object(orch, "stage_done",
+                                      side_effect=lambda st, _p: st in ("download", "extend")),
+                    mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+                    mock.patch.object(o, "_claim_prefetched"),
+                    mock.patch.object(o, "_reclaim_for_pipeline"),
+                    mock.patch.object(o, "_advance_cadence_at_handoff"),
+                    mock.patch.object(o, "_quiet_mode", return_value=False),
+                    mock.patch.object(o, "_display_missing", return_value=None),
+                    mock.patch.object(o, "_drain_backlog", return_value=0),
+                    mock.patch.object(o, "_resume_remuxes"),
+                    mock.patch("stages.run_stage", side_effect=run)]:
+                es.enter_context(cm)
+            suspend = es.enter_context(mock.patch.object(o, "_suspend_remuxes"))
+            o._process(p)
+        self.assertEqual(seen, [("topaz", "topaz", False), ("resolve", "resolve", True)])
+        suspend.assert_called_once()                         # Resolve still gets the whole machine
+        self.assertGreater(o._last_resolve_at, 0)
+        self.assertIn(o._skip_key(p), o._in_finisher_keys())
+        self.assertFalse(os.path.exists(p.segdir))            # dropped at hand-off, as always
+        self.assertEqual(o._native_fin, {})
+
+    def test_stage_done_resolve_is_the_render_check_alone(self):
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(p)
+        with contextlib.ExitStack() as es:
+            for cm in self._traps():
+                es.enter_context(cm)
+            self.assertFalse(orch.stage_done("resolve", p))
+            with mock.patch.object(orch, "_vstream", return_value=[{"codec_type": "video"}]), \
+                 mock.patch.object(orch, "_is_dv81", return_value=True), \
+                 mock.patch.object(orch, "render_is_complete", return_value=True):
+                self.assertTrue(orch.stage_done("resolve", p))
+
+    def test_the_overlap_gate_is_untouched(self):
+        o = orch.Orchestrator()
+        o._in_finisher.add("k")
+        reclaims = []
+        with mock.patch.object(o, "_native_low_disk", side_effect=AssertionError("native gate")), \
+             mock.patch.object(o, "_reclaim_for_pipeline",
+                               side_effect=lambda **kw: reclaims.append(kw.get("need_gb"))), \
+             mock.patch.object(o, "_drain_backlog", return_value=1), \
+             mock.patch.object(orch, "_min_free_gb", return_value=400), \
+             mock.patch.object(orch.scratch, "physical_free_gb", return_value=349):
+            msg = o._low_disk_pause()
+        self.assertEqual(msg, "paused — low disk (349 GB) while an item finishes in the "
+                              "background (frees at its cleanup)")
+        self.assertEqual(reclaims, [400])
+
+    def test_quiet_mode_and_the_display_hold_are_untouched(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(o, "_quiet_mode", return_value=True), \
+             mock.patch.object(o, "_drain_backlog", side_effect=AssertionError("drain asked")), \
+             mock.patch.object(o, "_native_low_disk", side_effect=AssertionError("native gate")), \
+             mock.patch.object(orch, "_min_free_gb", return_value=400), \
+             mock.patch.object(orch.scratch, "physical_free_gb", return_value=335):
+            self.assertEqual(o._low_disk_pause(), "paused — low disk (335 GB): turn off Quiet "
+                                                  "Mode to drain items through Resolve")
+            o._display_held = {"Movie.mkv": 1}
+            with mock.patch.object(o, "_quiet_mode", return_value=False):
+                self.assertIn("plug the pinned display back in", o._low_disk_pause())
+
+    def test_stage_done_topaz_never_reads_a_marker(self):
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(p)
+        with contextlib.ExitStack() as es:
+            for cm in self._traps():
+                es.enter_context(cm)
+            self.assertFalse(orch.stage_done("topaz", p))      # no manifest, no render, no marker
+
+    def test_the_progress_card_is_the_generic_one(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(o, "_native_set_progress", side_effect=AssertionError("native card")):
+            o._set_progress({"stage": "topaz", "ep": "S01E01", "pct": 10})
+            o._set_progress({"stage": "resolve", "ep": "S01E01", "pct": 50})
+        self.assertEqual(o.state["progress"]["stage"], "resolve")
+
+    def test_the_next_item_gates_never_look_at_the_disk(self):
+        o = orch.Orchestrator()
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        with mock.patch.object(orch.scratch, "physical_free_gb", side_effect=AssertionError("disk")), \
+             mock.patch.object(orch, "stage_done", side_effect=AssertionError("stage_done")):
+            self.assertIsNone(o._native_overlap_hold(p))
+
+    def test_the_stall_reserve_is_unchanged(self):
+        import plan
+        o = orch.Orchestrator()
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        with mock.patch.object(plan, "plan_for", side_effect=AssertionError("probed")):
+            self.assertFalse(o._native_eligible(p))
+
+    def test_a_finisher_park_still_sweeps_nothing(self):
+        import plan
+        o = orch.Orchestrator(); o._enabled = True
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        with open(p.dv_render, "w") as f:
+            f.write("render")
+        o._fail_counts[o._skip_key(p)] = 4
+        with mock.patch.object(orch, "_max_episode_fails", return_value=5), \
+             mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(o, "_sweep_parked_files", side_effect=AssertionError("swept")), \
+             mock.patch.object(orch.time, "sleep"):
+            o._finish_item(p, lambda st, *a, **k: (False, "genuine failure"))
+        self.assertIn(o._skip_key(p), o._parked)
+        self.assertTrue(os.path.exists(p.dv_render))           # a Resolve item keeps its render
+
+    def test_reconcile_flags_only_movies(self):
+        o = orch.Orchestrator()
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(p, 4096)                                        # no marker: not native
+        d = o._finisher_descriptor(p)
+        o._finisher_persisted = {o._desc_cid(d): d}
+        with mock.patch.object(orch, "MOVIE_SIZED_BYTES", 1024), \
+             mock.patch.object(o, "_finisher_reconstruct", return_value=p), \
+             mock.patch.object(orch.logbook, "event"):
+            o._finisher_reconcile()
+        self.assertIn(o._skip_key(p), o._in_finisher)
+        self.assertNotIn(o._skip_key(p), o._in_finisher_movies)
+        self.assertEqual(o._native_fin, {})
+
+
+class _NativeRun(unittest.TestCase):
+    """_process with dv_engine 'native' and a decided-native episode; run_stage is faked."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.o = orch.Orchestrator(); self.o._enabled = True
+        self.p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(self.p)
+        self.key = self.o._skip_key(self.p)
+        self.ran, self.slept, self.at_run = [], [], {}
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _ready(self, _st):
+        _claim(self.p, "ready")
+        return True, "native DV metadata ready: 1 chunks, 10 frames"
+
+    def _process(self, results=None, *, decide=("native", "eligible"), engine="native",
+                 done=("download", "extend", "topaz"), extra=()):
+        import nativelane, settings
+        o, results = self.o, results or {}
+
+        def run(st, *_a, **kw):
+            self.ran.append(st)
+            self.at_run[st] = {"stage": o.state.get("stage"), "sp": kw.get("should_pause"),
+                               "resolve_active": o._resolve_active.is_set()}
+            r = results.get(st, (True, "ok"))
+            return r(st) if callable(r) else r
+        with contextlib.ExitStack() as es:
+            cms = [mock.patch.object(settings, "dv_engine", return_value=engine),
+                   mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in done),
+                   mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+                   mock.patch.object(o, "_claim_prefetched"),
+                   mock.patch.object(o, "_reclaim_for_pipeline"),
+                   mock.patch.object(o, "_advance_cadence_at_handoff"),
+                   mock.patch.object(o, "_quiet_mode", return_value=False),
+                   mock.patch.object(o, "_display_missing", return_value=None),
+                   mock.patch.object(o, "_drain_backlog", return_value=0),
+                   mock.patch.object(o, "_suspend_remuxes"),
+                   mock.patch.object(o, "_resume_remuxes"),
+                   mock.patch.object(o, "_sleep", side_effect=self.slept.append),
+                   mock.patch.object(nativelane, "check_ready", return_value=(True, "ready")),
+                   mock.patch("stages.run_stage", side_effect=run)]
+            if decide is not None:
+                cms.append(mock.patch.object(nativelane, "decide", return_value=decide))
+            for cm in cms + list(extra):
+                es.enter_context(cm)
+            o._process(self.p)
+
+    def _handed_off(self):
+        return self.key in self.o._in_finisher_keys()
+
+
+class NativeSlot(_NativeRun):
+    """An eligible TV episode fills the "resolve" slot with the run-only 'dvnative' stage —
+    nothing Resolve-keyed applies to it — and falls back to Resolve in the same pass."""
+
+    def test_it_never_touches_the_resolve_machinery(self):
+        o = self.o
+        o._last_resolve_at = 123.0
+        traps = [mock.patch.object(o, n, side_effect=AssertionError(n))
+                 for n in ("_on_resolve_failure", "_resolve_recovered", "_defer_resolve",
+                           "_hold_for_display", "_hold_before_stalled_resolve")]
+        self._process({"dvnative": self._ready}, extra=traps)
+        self.assertEqual(self.ran, ["dvnative"])
+        self.assertEqual(self.at_run["dvnative"]["stage"], "dvnative")
+        self.assertFalse(self.at_run["dvnative"]["resolve_active"])     # no SIGSTOP of the remuxes
+        self.assertTrue(callable(self.at_run["dvnative"]["sp"]))
+        self.assertEqual(o._last_resolve_at, 123.0)
+        self.assertTrue(self._handed_off())
+        self.assertTrue(os.path.isdir(self.p.segdir))                   # kept for the native remux
+        self.assertEqual(o._native_fin, {self.key: self.p.segdir})
+
+    def test_quiet_mode_a_missing_display_and_a_stall_hold_nothing(self):
+        o = self.o
+        o._stall_active = True
+        extra = [mock.patch.object(o, "_quiet_mode", return_value=True),
+                 mock.patch.object(o, "_display_missing", return_value="not attached")] + \
+                [mock.patch.object(o, n, side_effect=AssertionError(n))
+                 for n in ("_defer_resolve", "_hold_for_display", "_hold_before_stalled_resolve")]
+        self._process({"dvnative": self._ready}, extra=extra)
+        self.assertEqual(self.ran, ["dvnative"])
+        self.assertTrue(self._handed_off())
+
+    def test_a_declined_item_takes_resolve_and_says_why_once(self):
+        with mock.patch.object(orch.logbook, "event") as ev:
+            self._process(decide=("resolve", "disk: projected 300 GiB < 316 GiB"))
+            self.o._finish_q.get_nowait()                # (else the re-pick holds at the doorstep)
+            self._process(decide=("resolve", "disk: projected 300 GiB < 316 GiB"))
+        self.assertEqual(self.ran, ["resolve", "resolve"])
+        self.assertTrue(self.at_run["resolve"]["resolve_active"])       # the ordinary Resolve
+        said = [c.args[0] for c in ev.call_args_list if "DV via Resolve" in c.args[0]]
+        self.assertEqual(said, ["S01E01: DV via Resolve — disk: projected 300 GiB < 316 GiB"])
+
+    def test_a_failure_retries_on_the_next_pass_and_never_runs_resolve(self):
+        import nativelane
+
+        def fail(_st):
+            _claim(self.p, "analyzing")
+            nativelane.count_failure(self.p, "boom")
+            return False, "native analysis failed: boom (native attempt 1 of 2)"
+        self._process({"dvnative": fail})
+        self.assertEqual(self.ran, ["dvnative"])
+        self.assertEqual(self.o.state["hold"], {"code": "retry", "attempt": 1, "of": 2})
+        self.assertIn(60, self.slept)
+        self.assertFalse(self._handed_off())
+        self.assertEqual((self.o._fail_counts, self.o._resolve_fails), ({}, {}))   # its own ladder
+
+    def test_a_fallback_runs_resolve_in_the_same_pass(self):
+        import nativelane
+
+        def fall(_st):
+            _claim(self.p, "analyzing")
+            nativelane.write_fallback(self.p, "toolchain: dovi_tool is 2.2.0")
+            return False, "native-fallback: toolchain: dovi_tool is 2.2.0 — Resolve takes this item"
+        self._process({"dvnative": fall})
+        self.assertEqual(self.ran, ["dvnative", "resolve"])
+        self.assertTrue(self.at_run["resolve"]["resolve_active"])
+        self.assertTrue(self._handed_off())
+        self.assertFalse(os.path.exists(self.p.segdir))         # a Resolve item: dropped at hand-off
+
+    def test_a_low_disk_pause_holds_on_disk_and_is_not_a_yield(self):
+        self._process({"dvnative": (False, "paused: low disk — analysis chunk 3 needs ~27 GiB")})
+        self.assertEqual(self.o.state["hold"]["code"], "disk")
+        self.assertIn(orch.DRAIN_POLL_SECONDS, self.slept)
+        self.assertEqual(self.o._yield_streak, {})
+        self.assertFalse(self._handed_off())
+
+    def test_repeated_yields_feed_the_livelock_guard(self):
+        for _ in range(orch.YIELD_LIVELOCK_LIMIT):
+            self._process({"dvnative": (False, "paused: yielded during chunk 2 analyzer")})
+        self.assertIn(self.key, self.o._yield_block)
+        self.assertEqual(self.o.state["hold"]["code"], "native")
+        self.assertEqual(self.ran, ["dvnative"] * orch.YIELD_LIVELOCK_LIMIT)
+
+    def test_a_lease_holds_it_before_it_starts(self):
+        o = self.o
+        self._process({"dvnative": self._ready},
+                      extra=[mock.patch.object(o, "_lease_hold",
+                                               return_value="Discretion has the machine for another 30s")])
+        self.assertEqual(self.ran, [])
+        self.assertEqual(o.state["hold"]["code"], "yield-lease")
+        self.assertIn(orch.LEASE_POLL_SECONDS, self.slept)
+
+    def test_movies_and_videos_never_ask_the_lane(self):
+        import nativelane
+        self.p.youtube = True
+        self._process(decide=None, extra=[
+            mock.patch.object(nativelane, "decide", side_effect=AssertionError("decided")),
+            mock.patch.object(self.o, "_resolve_should_hold", return_value=False)])
+        self.assertEqual(self.ran, ["resolve"])
+
+    def test_a_claimed_item_stays_native_after_the_setting_flips_back(self):
+        _claim(self.p, "analyzing")
+        self._process({"dvnative": self._ready}, decide=None, engine="resolve")   # the real decide
+        self.assertEqual(self.ran, ["dvnative"])
+        self.assertTrue(self._handed_off())
+
+    def test_a_stop_mid_analysis_is_not_a_failure(self):
+        def stopped(_st):
+            self.o._abort.set()
+            return False, "interrupted: DV analysis stopped — the next pass resumes it chunk by chunk"
+        self._process({"dvnative": stopped})
+        self.assertEqual(self.ran, ["dvnative"])
+        self.assertNotIn(60, self.slept)
+        self.assertFalse(self._handed_off())
+
+    def test_the_pause_predicate_ignores_two_live_remuxes_and_is_throttled(self):
+        o = self.o
+        sp = o._native_pause_predicate(self.p)
+        clock = [1000.0]
+        gate = [False]
+        with mock.patch.object(orch.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(o, "_dual_remux_live", return_value=True), \
+             mock.patch.object(o._yield_lease, "blocks", return_value=False), \
+             mock.patch.object(o, "_gate_release_pending", side_effect=lambda: gate[0]), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=False), \
+             mock.patch.object(o, "_yt_cadence_due", return_value=False):
+            self.assertFalse(sp())                     # two remuxes alone are no reason
+            gate[0] = True
+            self.assertFalse(sp())                     # re-asked only every few seconds...
+            clock[0] += orch.NATIVE_PAUSE_POLL_SECONDS
+            self.assertTrue(sp())                      # ...then the gate release is seen
+            o._yield_block.add(self.key)
+            clock[0] += orch.NATIVE_PAUSE_POLL_SECONDS
+            self.assertFalse(sp())                     # the livelock guard silences it
+        with mock.patch.object(orch.time, "monotonic", return_value=clock[0] + 60), \
+             mock.patch.object(o._yield_lease, "blocks", return_value=True):
+            self.assertTrue(sp())                      # a sibling's lease is always honoured
+
+
+class NativeGate(_NativeRun):
+    """The native hand-off gate: one-at-a-time pacing, plus another finisher-owned native item
+    still holding chunks; applied after a relaunch too; the starvation guard reused."""
+
+    ALL = ("download", "extend", "topaz", "resolve")
+
+    def test_it_holds_while_the_previous_remux_runs_even_after_a_relaunch(self):
+        o = self.o
+        _claim(self.p, "ready")                         # stage_done("resolve") is already true
+        o.state["finishing"] = {"stage": "remux", "ep": "S06E03"}
+        holds = []
+
+        def tick(_s):
+            holds.append((dict(o.state.get("hold") or {}), o.state.get("message")))
+            o.state["finishing"] = None                 # that remux passes
+        self._process(done=self.ALL, extra=[mock.patch.object(orch.time, "sleep", side_effect=tick)])
+        self.assertEqual(self.ran, [])
+        self.assertEqual(holds[0][0]["code"], "native-gate")
+        self.assertIn("finishing S06E03's remux first", holds[0][1])
+        self.assertTrue(self._handed_off())
+        self.assertTrue(os.path.isdir(self.p.segdir))
+
+    def test_it_holds_while_another_native_item_keeps_its_chunks(self):
+        # The failed-remux window: no lane shows "remux", nothing queued — but the other
+        # native item's chunks are still on disk, so this one must not hand off yet.
+        import shutil
+        o = self.o
+        _claim(self.p, "ready")
+        p2 = episode_paths("A", "S01E02", SRC2, scratch_dir=self.td)
+        _chunk(p2)
+        _claim(p2, "ready")
+        d2 = o._finisher_descriptor(p2)
+        o._finisher_persisted[o._desc_cid(d2)] = d2
+        o._native_fin[o._skip_key(p2)] = p2.segdir
+        ticks = []
+
+        def tick(_s):
+            ticks.append(o.state["hold"]["code"])
+            shutil.rmtree(p2.segdir)                    # its remux passes and frees them
+        self._process(done=self.ALL, extra=[mock.patch.object(orch.time, "sleep", side_effect=tick)])
+        self.assertEqual(ticks, ["native-gate"])
+        self.assertTrue(self._handed_off())
+
+    def test_a_resolve_item_passes_straight_through(self):
+        o = self.o
+        self._process(done=self.ALL, extra=[
+            mock.patch.object(o, "_native_should_hold", side_effect=AssertionError("gated"))])
+        self.assertTrue(self._handed_off())
+        self.assertFalse(os.path.exists(self.p.segdir))
+
+    def test_the_starvation_guard_steps_back_for_a_deferred_item(self):
+        o = self.o
+        _claim(self.p, "ready")
+        o._gate_deferred.add("Borat.mkv")               # deferred at the doorstep EARLIER
+        self._process(done=self.ALL)
+        self.assertFalse(self._handed_off())
+        self.assertEqual(o.state["hold"]["code"], "native-gate")
+        self.assertIn("yielding", o.state["message"])
+
+    def test_a_stale_marker_is_re_measured_then_falls_back(self):
+        import nativelane
+        _claim(self.p, "ready")
+        stale = mock.patch.object(nativelane, "check_ready",
+                                  return_value=(False, "chunk seg_0000.mov changed"))
+        self._process(done=self.ALL, extra=[stale])
+        self.assertFalse(self._handed_off())
+        self.assertEqual(nativelane.failure_count(self.p), 1)
+        self.assertFalse(nativelane.has_fallback(self.p))
+        self._process(done=self.ALL, extra=[stale])
+        self.assertTrue(nativelane.has_fallback(self.p))
+        self.assertFalse(nativelane.has_marker(self.p))
+        self.assertFalse(self._handed_off())
+
+    def test_a_stop_while_holding_hands_nothing_off(self):
+        o = self.o
+        _claim(self.p, "ready")
+        o.state["finishing"] = {"stage": "remux", "ep": "S06E03"}
+
+        def stop(_s):
+            o._enabled = False
+        self._process(done=self.ALL, extra=[mock.patch.object(orch.time, "sleep", side_effect=stop)])
+        self.assertFalse(self._handed_off())
+
+
+class NativeHandoffAndFinisher(unittest.TestCase):
+    """Hand-off KEEPS a native item's chunks (its remux reads them) and tracks it; the finisher's
+    park sweeps them; a relaunch restores the claim and the movie-sized flag."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.o = orch.Orchestrator(); self.o._enabled = True
+        self.p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(self.p, 4096)
+        _claim(self.p, "ready")
+        self.key = self.o._skip_key(self.p)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _hand_off(self):
+        with mock.patch.object(self.o, "_advance_cadence_at_handoff"), \
+             mock.patch.object(orch, "MOVIE_SIZED_BYTES", 1024), \
+             mock.patch.object(orch.logbook, "event") as ev:
+            self.o._hand_to_finisher(self.p)
+        return [c.args[0] for c in ev.call_args_list]
+
+    def test_hand_off_keeps_the_chunks_and_tracks_the_item(self):
+        said = self._hand_off()
+        self.assertTrue(os.path.isdir(self.p.segdir))
+        self.assertEqual(self.o._native_fin, {self.key: self.p.segdir})
+        self.assertEqual(self.o._finisher_native_segdirs(), [self.p.segdir])
+        self.assertTrue(any("Topaz chunks for the native remux" in s for s in said))
+        self.assertIn(self.key, self.o._in_finisher_movies)      # gauged WITH the chunks
+
+    def test_a_finisher_owned_native_item_is_never_reselected(self):
+        self._hand_off()
+        self.assertIn(self.key, self.o._selection_skip())
+
+    def test_a_parked_native_item_is_swept(self):
+        import plan
+        self._hand_off()
+        self.o._fail_counts[self.key] = 4
+        with mock.patch.object(orch, "_max_episode_fails", return_value=5), \
+             mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch.time, "sleep"):
+            self.o._finish_item(self.p, lambda st, *a, **k: (False, "native RPU/chunk frame mismatch"))
+        self.assertIn(self.key, self.o._parked)
+        self.assertFalse(os.path.exists(self.p.segdir))          # ~190 GiB not leaked
+        self.assertEqual(self.o._finisher_native_segdirs(), [])  # ...and no longer counted
+
+    def test_reconcile_restores_the_claim_and_the_movie_flag(self):
+        d = self.o._finisher_descriptor(self.p)
+        self.o._finisher_persisted = {self.o._desc_cid(d): d}
+        with mock.patch.object(orch, "MOVIE_SIZED_BYTES", 1024), \
+             mock.patch.object(self.o, "_finisher_reconstruct", return_value=self.p), \
+             mock.patch.object(orch.logbook, "event"):
+            self.o._finisher_reconcile()
+        self.assertIn(self.key, self.o._in_finisher_movies)
+        self.assertEqual(self.o._native_fin, {self.key: self.p.segdir})
+        self.assertEqual(self.o._finisher_native_segdirs(), [self.p.segdir])
+
+
+class NativeOverlapGates(unittest.TestCase):
+    """U2 where the next item is known: after selection in _run, and at the Topaz doorstep in
+    _process (where its runtime can be measured). Both are inert unless a finisher-owned native
+    item still holds its chunks."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.o = orch.Orchestrator()
+        held = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(held)
+        _claim(held, "ready")
+        d = self.o._finisher_descriptor(held)
+        self.o._finisher_persisted = {self.o._desc_cid(d): d}
+        self.o._native_fin = {self.o._skip_key(held): held.segdir}
+        self.o._in_finisher.add(self.o._skip_key(held))
+        self.nxt = episode_paths("A", "S01E02", SRC2, scratch_dir=self.td)
+        with open(self.nxt.source, "w") as f:
+            f.write("downloaded")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _one_loop(self, phys, **extra):
+        o = self.o
+        o._enabled = True
+        o._caffeinate = object()
+        seen = []
+
+        def stop(secs):
+            seen.append(dict(o.state.get("hold") or {}))
+            o._enabled = False
+        with contextlib.ExitStack() as es:
+            for cm in (mock.patch.object(o, "_power_ok", return_value=("run", None)),
+                       mock.patch.object(o, "_low_disk_pause", return_value=None),
+                       mock.patch.object(o, "_finisher_backlogged", return_value=False),
+                       mock.patch.object(o, "_refresh_youtube"),
+                       mock.patch.object(o, "_next_episode", return_value=(self.nxt, None)),
+                       mock.patch.object(o, "_dual_remux_pauses_topaz", return_value=False),
+                       mock.patch.object(o, "_reclaim_for_pipeline"),
+                       mock.patch.object(orch, "_item_projection", return_value=(296, True)),
+                       mock.patch.object(orch, "stage_done", return_value=False),
+                       mock.patch.object(orch.scratch, "physical_free_gb", return_value=phys),
+                       mock.patch.object(orch.logbook, "event"),
+                       mock.patch.object(o, "_sleep", side_effect=stop)):
+                es.enter_context(cm)
+            for name, value in extra.items():
+                es.enter_context(mock.patch.object(o, name, return_value=value))
+            proc = es.enter_context(mock.patch.object(o, "_process",
+                                                      side_effect=lambda _p: setattr(o, "_enabled", False)))
+            o._run()
+        return seen, proc
+
+    def test_the_next_item_waits_for_its_own_projected_need(self):
+        seen, proc = self._one_loop(250)
+        proc.assert_not_called()
+        self.assertEqual(seen[0]["code"], "disk")
+        self.assertIn("needs ~296 GB", self.o.state["message"] if self.o.state["message"] != "stopped"
+                      else "needs ~296 GB")
+
+    def test_it_starts_below_400_when_its_need_fits(self):
+        _seen, proc = self._one_loop(300)
+        proc.assert_called_once_with(self.nxt)
+
+    def test_a_stall_gives_a_native_eligible_fresh_item_the_ordinary_floor(self):
+        self.o._native_fin = {}                          # no native chunks held: stall rules only
+        self.o._stall_active = True
+        seen, proc = self._one_loop(350, _native_eligible=True)
+        proc.assert_not_called()
+        self.assertEqual(seen[0]["code"], "stall")       # 350 < min_free_gb 400
+        self.o._stall_active = True
+        _seen, proc = self._one_loop(350, _native_eligible=False)
+        proc.assert_called_once()                        # a Resolve-path item: 100 + 200 as before
+
+    def test_the_topaz_doorstep_measures_the_downloaded_item(self):
+        o = self.o
+        o._enabled = True
+        ran = []
+        with mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend")), \
+             mock.patch.object(orch, "apply_container", side_effect=lambda x: x), \
+             mock.patch.object(o, "_claim_prefetched"), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(o, "_sleep"), \
+             mock.patch.object(orch, "_item_projection", return_value=(296, True)), \
+             mock.patch.object(orch.scratch, "physical_free_gb", return_value=250), \
+             mock.patch("stages.run_stage", side_effect=lambda st, *a, **k: ran.append(st) or (True, "ok")):
+            o._process(self.nxt)
+        self.assertEqual(ran, [])                        # Topaz never started
+        self.assertEqual(o.state["hold"]["code"], "disk")
+        self.assertIn("needs ~296 GB", o.state["message"])
+
+    def test_an_unknown_movie_or_video_never_starts_at_150(self):
+        # The disk-safety finding: a movie (or a video) picked while a native item holds its
+        # chunks used to need only 150 GiB. Its size is not MEASURED (not downloaded, or a
+        # flat stand-in), so it keeps today's need.
+        import plan
+        o = self.o
+        movie = orch.movie_paths("Big Movie (2001).mkv", "/Media/Movies/Big", "Big Movie",
+                                 scratch_dir=self.td)
+        video = youtube_paths("Chan", "/YouTube-raw/Chan/clip [abc].mp4", scratch_dir=self.td)
+        with open(video.source, "w") as f:
+            f.write("downloaded")
+        fast = episode_paths("A", "S01E03", "Fast S01E03.mkv", scratch_dir=self.td)
+        with open(fast.source, "w") as f:
+            f.write("downloaded")
+        with mock.patch.object(orch, "_min_free_gb", return_value=400), \
+             mock.patch.object(o, "_reclaim_for_pipeline"), \
+             mock.patch.object(plan, "plan_for",
+                               side_effect=lambda src: {"topaz": "rpu-only" if "Fast" in src
+                                                        else "upscale"}), \
+             mock.patch("topaz.media_timing", return_value=(None, None)), \
+             mock.patch.object(orch.scratch, "physical_free_gb", return_value=399):
+            for item in (movie, video, fast):
+                self.assertEqual(o._native_overlap_need_gb(item), 400, item.source_basename)
+                self.assertIn("needs ~400 GB", o._native_overlap_hold(item))
+
+    def test_a_measured_movie_needs_its_whole_projection(self):
+        import plan
+        o = self.o
+        movie = orch.movie_paths("Long Movie (1999).mkv", "/Media/Movies/Long", "Long Movie",
+                                 scratch_dir=self.td)
+        with open(movie.source, "w") as f:
+            f.write("downloaded")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch("topaz.media_timing", return_value=(23.976, 2 * 3600)), \
+             mock.patch("topaz.projected_prores_gib", return_value=504), \
+             mock.patch.object(orch, "stage_done", return_value=False):
+            self.assertEqual(orch._item_projection(movie), (624, True))
+            self.assertEqual(o._native_overlap_need_gb(movie), 624)
+
+
+class ProjectionUnchanged(unittest.TestCase):
+    """_projected_item_gb answers exactly as before (_item_projection only adds whether the
+    answer was measured)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_every_branch(self):
+        import plan
+        p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        y = youtube_paths("Chan", "/YouTube-raw/Chan/clip [abc].mp4", scratch_dir=self.td)
+        with mock.patch.object(orch, "_min_free_gb", return_value=400):
+            self.assertEqual(orch._item_projection(y), (orch.ITEM_TAIL_GB, False))
+            self.assertEqual(orch._projected_item_gb(y), orch.ITEM_TAIL_GB)
+            with mock.patch.object(plan, "plan_for", return_value={"topaz": "resolve-only"}):
+                self.assertEqual(orch._item_projection(p), (orch.ITEM_TAIL_GB, False))
+            with mock.patch.object(plan, "plan_for", side_effect=RuntimeError("probe")):
+                self.assertEqual(orch._item_projection(p), (400, False))
+                self.assertEqual(orch._projected_item_gb(p), 400)
+            with mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+                 mock.patch("topaz.media_timing", return_value=(23.976, 2520)), \
+                 mock.patch("topaz.projected_prores_gib", return_value=176):
+                self.assertEqual(orch._item_projection(p), (296, False))   # nothing on disk
+                self.assertEqual(orch._projected_item_gb(p), 296)
+                with open(p.source, "w") as f:
+                    f.write("downloaded")
+                self.assertEqual(orch._item_projection(p), (296, True))
+                self.assertEqual(orch._projected_item_gb(p), 296)
+
+
+def _encode(p, body=b"m" * 64):
+    """What stages._native_master_passed leaves: the master on disk, the chunks gone and the
+    marker stamped 'encoded' with the master's path, size and mtime."""
+    import stages
+    with open(p.final, "wb") as f:
+        f.write(body)
+    _claim(p, "ready")
+    stages._native_master_passed(p, {"id": "ready-id", "chunks": []})
+
+
+class NativeEncodedProof(unittest.TestCase):
+    """F2 (review: 'nothing on disk records a native item's Topaz/DV work after remux passes').
+    The chunks go when the master passes the peak gate; the 'encoded' marker naming that
+    master proves the work until cleanup rmtree's the segdir, so an item re-picked after a
+    park goes straight back to its upload instead of re-running Topaz and the analysis."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.o = orch.Orchestrator(); self.o._enabled = True
+        self.p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        _chunk(self.p, 4096)
+        with mock.patch.object(orch.logbook, "event"):
+            _encode(self.p)
+        self.key = self.o._skip_key(self.p)
+        self.dv = True                        # what ffprobe would say about the master
+        p = self.p
+        self.probe = [
+            mock.patch.object(orch, "_vstream",
+                              side_effect=lambda path: ({"v": 1} if path == p.final and self.dv
+                                                        else None)),
+            mock.patch.object(orch, "_is_dv81", side_effect=bool),
+            mock.patch.object(orch, "_has_audio", side_effect=bool)]
+        for pt in self.probe:
+            pt.start()
+
+    def tearDown(self):
+        for pt in self.probe:
+            pt.stop()
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_the_stamp_is_what_the_remux_leaves(self):
+        import nativelane
+        m = nativelane.read_marker(self.p)
+        st = os.stat(self.p.final)
+        self.assertEqual(m["state"], orch.NATIVE_ENCODED)
+        self.assertEqual((m["final"], m["final_size"], m["final_mtime_ns"], m["ready_id"]),
+                         (self.p.final, st.st_size, st.st_mtime_ns, "ready-id"))
+        self.assertFalse(os.path.exists(os.path.join(self.p.segdir, "seg_0000.mov")))
+        self.assertTrue(os.path.isdir(self.p.segdir))
+
+    def test_topaz_and_resolve_are_done(self):
+        self.assertTrue(orch.stage_done("topaz", self.p))
+        self.assertTrue(orch.stage_done("resolve", self.p))
+
+    def test_a_changed_master_is_no_proof(self):
+        with open(self.p.final, "ab") as f:
+            f.write(b"more")
+        self.assertFalse(orch.stage_done("topaz", self.p))
+        self.assertFalse(orch.stage_done("resolve", self.p))
+
+    def test_a_missing_or_broken_master_is_no_proof(self):
+        self.dv = False                                      # not a DV 8.1 master with audio
+        self.assertFalse(orch.stage_done("topaz", self.p))
+        self.dv = True
+        os.remove(self.p.final)
+        self.assertFalse(orch.stage_done("topaz", self.p))
+        self.assertFalse(orch.stage_done("resolve", self.p))
+
+    def test_a_stamp_naming_another_master_is_no_proof(self):
+        import json, nativelane
+        m = nativelane.read_marker(self.p)
+        m["final"] = self.p.final + ".other.mp4"
+        with open(nativelane.marker_path(self.p), "w") as f:
+            json.dump(m, f)
+        self.assertFalse(orch.stage_done("topaz", self.p))
+
+    def test_a_fallback_beside_it_is_no_proof(self):
+        import nativelane
+        nativelane._write_json(nativelane.fallback_path(self.p), {"why": "test"})
+        self.assertFalse(orch.stage_done("topaz", self.p))
+        self.assertFalse(orch.stage_done("resolve", self.p))
+
+    def test_it_holds_no_chunks_for_any_gate(self):
+        import nativelane
+        d = self.o._finisher_descriptor(self.p)
+        self.o._finisher_persisted = {self.o._desc_cid(d): d}
+        self.o._native_fin = {self.key: self.p.segdir}
+        self.assertTrue(orch._native_claimed(self.p.segdir))
+        self.assertFalse(orch._native_holds_chunks(self.p.segdir))
+        self.assertEqual(self.o._finisher_native_segdirs(), [])
+        self.assertEqual(nativelane.held_native_segdirs(self.td), [])
+        self.assertEqual(nativelane.held_native_bytes(self.td), 0)
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=self.td):
+            self.assertEqual(self.o._drain_backlog(), 0)
+
+    def test_a_re_picked_item_goes_straight_back_to_the_finisher(self):
+        # The review's scenario: the master passed, the upload parked, enable() cleared
+        # _parked, selection picks it again. No Topaz, no analysis, no gate hold.
+        import nativelane
+        o = self.o
+        real = orch.stage_done
+        with contextlib.ExitStack() as es:
+            for cm in (mock.patch.object(orch, "stage_done",
+                                         side_effect=lambda st, p: st in ("download", "extend")
+                                         or real(st, p)),
+                       mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+                       mock.patch.object(o, "_claim_prefetched"),
+                       mock.patch.object(o, "_reclaim_for_pipeline"),
+                       mock.patch.object(o, "_advance_cadence_at_handoff"),
+                       mock.patch.object(nativelane, "check_ready",
+                                         side_effect=AssertionError("re-checked")),
+                       mock.patch.object(nativelane, "decide", side_effect=AssertionError("decided")),
+                       mock.patch.object(o, "_native_should_hold",
+                                         side_effect=AssertionError("held")),
+                       mock.patch("stages.run_stage", side_effect=AssertionError("a stage ran"))):
+                es.enter_context(cm)
+            o._process(self.p)
+        self.assertIn(self.key, o._in_finisher_keys())
+        self.assertTrue(os.path.isdir(self.p.segdir))            # the proof rides along
+        self.assertNotIn(self.key, o._native_fin)                # ...but holds no chunks
+        self.assertTrue(os.path.exists(self.p.final))
+
+    def test_the_gate_passes_it_straight_through(self):
+        import nativelane
+        with mock.patch.object(nativelane, "check_ready", side_effect=AssertionError("checked")), \
+             mock.patch.object(self.o, "_native_should_hold", side_effect=AssertionError("held")):
+            self.assertTrue(self.o._native_gate(self.p, "A S01E01"))
+
+    def test_a_finisher_park_keeps_the_master_and_the_proof(self):
+        import plan
+        o = self.o
+        with mock.patch.object(o, "_advance_cadence_at_handoff"), \
+             mock.patch.object(orch.logbook, "event"):
+            o._hand_to_finisher(self.p)
+        with open(self.p.source, "w") as f:
+            f.write("source")
+        o._fail_counts[self.key] = 4
+        with mock.patch.object(orch, "_max_episode_fails", return_value=5), \
+             mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(o, "_sweep_parked_files", side_effect=AssertionError("swept")), \
+             mock.patch.object(orch.time, "sleep"):
+            o._finish_item(self.p, lambda st, *a, **k: (False, "553 refused"))
+        self.assertIn(self.key, o._parked)
+        self.assertTrue(os.path.isdir(self.p.segdir))
+        self.assertTrue(os.path.exists(self.p.final))
+        self.assertTrue(os.path.exists(self.p.source))
+        self.assertTrue(orch.stage_done("topaz", self.p))        # the re-pick resumes at upload
+
+    def test_a_run_thread_park_sweep_keeps_the_proof_with_the_master(self):
+        with open(self.p.source, "w") as f:
+            f.write("source")
+        with mock.patch.object(orch.logbook, "event"):
+            self.o._sweep_parked_files(self.p, "A S01E01")
+        self.assertTrue(os.path.exists(self.p.final))
+        self.assertTrue(os.path.isdir(self.p.segdir))
+        self.assertFalse(os.path.exists(self.p.source))          # intermediates still go
+        self.dv = False                                          # an unverifiable master...
+        with mock.patch.object(orch.logbook, "event"):
+            self.o._sweep_parked_files(self.p, "A S01E01")
+        self.assertFalse(os.path.isdir(self.p.segdir))           # ...proves nothing: swept
+
+    def test_reconcile_never_tracks_it_as_holding_chunks(self):
+        d = self.o._finisher_descriptor(self.p)
+        self.o._finisher_persisted = {self.o._desc_cid(d): d}
+        with mock.patch.object(self.o, "_finisher_reconstruct", return_value=self.p), \
+             mock.patch.object(orch.logbook, "event"):
+            self.o._finisher_reconcile()
+        self.assertIn(self.key, self.o._in_finisher)
+        self.assertEqual(self.o._native_fin, {})
+
+
+class NativeGateBookkeepingNeverEscapes(_NativeRun):
+    """F2 (review: an OSError from native/failures.json or fallback.json in _native_gate left
+    _process and ended the run loop for good). The books are files on a disk that may be
+    full; the gate logs and the next pass re-measures."""
+
+    ALL = ("download", "extend", "topaz", "resolve")
+
+    def _stale(self, **kw):
+        import nativelane
+        _claim(self.p, "ready")
+        self.logged = mock.Mock()
+        return [mock.patch.object(nativelane, "check_ready",
+                                  return_value=(False, "the CFR source changed")),
+                mock.patch.object(orch.logbook, "exception", self.logged)] + [
+                mock.patch.object(nativelane, n, side_effect=e) for n, e in kw.items()]
+
+    def test_a_full_disk_while_counting(self):
+        extra = self._stale(count_failure=OSError(28, "No space left on device"))
+        self._process(done=self.ALL, extra=extra)               # never raises
+        self.assertFalse(self._handed_off())
+        self.logged.assert_called_once()
+
+    def test_a_full_disk_while_falling_back(self):
+        import nativelane
+        extra = self._stale(write_fallback=OSError(28, "No space left on device"))
+        extra.append(mock.patch.object(nativelane, "count_failure",
+                                       return_value=nativelane.MAX_FAILURES))
+        self._process(done=self.ALL, extra=extra)
+        self.assertFalse(self._handed_off())
+        self.logged.assert_called_once()
+
+    def test_the_run_loop_survives_it(self):
+        # End to end through _run: the loop keeps going after the gate's failed booking.
+        o = self.o
+        o._caffeinate = object()
+        passes = []
+
+        def proc(p):
+            passes.append(p)
+            if len(passes) >= 2:
+                o._enabled = False
+            o._native_gate(p, "A S01E01")
+        extra = self._stale(count_failure=OSError(28, "No space left on device"))
+        with contextlib.ExitStack() as es:
+            for cm in extra + [mock.patch.object(o, "_power_ok", return_value=("run", None)),
+                               mock.patch.object(o, "_low_disk_pause", return_value=None),
+                               mock.patch.object(o, "_finisher_backlogged", return_value=False),
+                               mock.patch.object(o, "_refresh_youtube"),
+                               mock.patch.object(o, "_next_episode", return_value=(self.p, None)),
+                               mock.patch.object(o, "_dual_remux_pauses_topaz", return_value=False),
+                               mock.patch.object(o, "_native_overlap_hold", return_value=None),
+                               mock.patch.object(o, "_sleep"),
+                               mock.patch.object(o, "_process", side_effect=proc)]:
+                es.enter_context(cm)
+            o._run()
+        self.assertEqual(len(passes), 2)                         # the loop did not die on pass 1
+
+
+class NativeProgressCard(unittest.TestCase):
+    """F2 (design step 9, Task E's ChunkClock): the 'dvnative' card's ETA comes from the chunk
+    clock, and a heartbeat moves its pct/countdown inside a chunk. Every other stage keeps the
+    generic estimator."""
+
+    NOTCHES = [0.25, 0.5, 0.75, 1.0]
+
+    def setUp(self):
+        import types
+        self.o = orch.Orchestrator()
+        self.now = [1000.0]
+        self.clock = mock.patch.object(orch, "time", types.SimpleNamespace(
+            time=lambda: self.now[0], monotonic=time.monotonic, sleep=time.sleep))
+        self.clock.start()
+
+    def tearDown(self):
+        self.clock.stop()
+
+    def _boundary(self, done, at):
+        self.now[0] = at
+        self.o._set_progress({"stage": "dvnative", "ep": "S01E01",
+                              "pct": round(self.NOTCHES[done - 1] * 100) if done else 0,
+                              "notches": self.NOTCHES, "seg_done": done, "seg_total": 4})
+        return dict(self.o.state["progress"])
+
+    def _tick(self, at):
+        self.now[0] = at
+        self.o._native_set_progress(self.o.state["progress"], tick=True)
+        return dict(self.o.state["progress"])
+
+    def test_no_eta_before_the_first_live_chunk(self):
+        d = self._boundary(0, 1000)
+        self.assertNotIn("eta_secs", d)
+        self.assertEqual(self._tick(1300)["pct"], 0)           # nothing measured: nothing moves
+
+    def test_the_eta_comes_from_the_live_chunk_rate(self):
+        self._boundary(0, 1000)
+        d = self._boundary(1, 1600)                             # chunk 1: 25% in 600 s
+        self.assertEqual((d["eta_secs"], d["seg_eta_secs"], d["seg_secs"]), (1800.0, 600.0, 600.0))
+        self.assertEqual(d["pct"], 25)
+        self.assertIsNone(self.o._progress_key)                 # the generic window never anchored
+
+    def test_the_heartbeat_moves_pct_and_the_countdown_inside_a_chunk(self):
+        self._boundary(0, 1000)
+        self._boundary(1, 1600)
+        d = self._tick(1900)                                    # halfway through chunk 2
+        self.assertEqual(d["pct"], 37)
+        self.assertIsInstance(d["pct"], int)                    # the app decodes pct as Int
+        self.assertEqual(d["eta_secs"], 1500.0)
+        self.assertEqual(d["seg_done"], 1)                      # the boundary is still the real one
+        late = self._tick(2500)                                 # overrunning chunk 2
+        self.assertLessEqual(late["pct"], 49)                   # never the next boundary's 50
+        self.assertGreaterEqual(late["seg_eta_secs"], eta_math.TAIL_MIN_SECS)
+
+    def test_a_resume_replay_is_not_banked(self):
+        self._boundary(0, 1000)
+        self._boundary(1, 1600)
+        self._boundary(0, 5000)                                 # new attempt (after a pause)
+        d = self._boundary(1, 5000.5)                           # replayed within a second
+        self.assertEqual(d["seg_secs"], 600.0)                  # the rate is still the live one
+        self.assertEqual(d["eta_secs"], 1800.0)
+
+    def test_a_tick_after_the_card_moved_on_publishes_nothing(self):
+        self.o.state["progress"] = None
+        self.o._dvn_last = None
+        self.o._native_set_progress({"stage": "dvnative"}, tick=True)
+        self.assertIsNone(self.o.state["progress"])
+
+    def test_other_stages_keep_the_generic_estimator(self):
+        self.now[0] = 1000.0
+        self.o._set_progress({"stage": "topaz", "ep": "S01E01", "pct": 10})
+        self.assertEqual(self.o._progress_key, ("topaz", "S01E01"))
+        self.assertIsNone(self.o._dvn_clock)
+
+
+class NativeProgressHeartbeat(_NativeRun):
+    """_native_slot runs the card's heartbeat only while the analysis runs, and stops it
+    before it clears the card."""
+
+    def test_it_ticks_during_the_stage_and_never_after(self):
+        o = self.o
+        ticks = []
+        real = o._native_set_progress
+
+        def spy(info, *, tick=False):
+            if tick:
+                ticks.append(o.state.get("stage"))
+            return real(info, tick=tick)
+
+        def analysis(_st):
+            o._set_progress({"stage": "dvnative", "ep": "S01E01", "pct": 0,
+                             "notches": [0.5, 1.0], "seg_done": 0, "seg_total": 2})
+            deadline = time.monotonic() + 2
+            while not ticks and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return self._ready(_st)
+        with mock.patch.object(orch, "NATIVE_PROGRESS_TICK_SECONDS", 0.01), \
+             mock.patch.object(o, "_native_set_progress", side_effect=spy):
+            self._process({"dvnative": analysis})
+            n = len(ticks)
+            time.sleep(0.05)
+            self.assertEqual(len(ticks), n)                     # stopped with the stage
+        self.assertTrue(ticks)
+        self.assertEqual(set(ticks), {"dvnative"})
+        self.assertFalse([t for t in __import__("threading").enumerate()
+                          if t.name == "dvnative-progress"])
+        self.assertTrue(self._handed_off())

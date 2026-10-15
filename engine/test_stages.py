@@ -6,6 +6,7 @@ from unittest import mock
 import audiogain
 import history
 import stages
+import test_nativelane as _tn
 from orchestrator import episode_paths
 from orchestrator import youtube_paths as orch_youtube_paths
 
@@ -3010,3 +3011,397 @@ class HostDisplayProblem(unittest.TestCase):
                                side_effect=lambda: calls.append(1) or (None, "not attached")):
             self.assertIsNone(stages.host_display_problem())
         self.assertEqual(calls, [])                       # not even asked
+
+
+# ---- native DV (settings dv_engine 'native') ----------------------------------------------
+
+class _NativeItem(_tn.Fixture):
+    """test_nativelane's fixture — a real Topaz segdir (3 chunks + segments.json), a CFR and the
+    native pins on a temp LUT/analyzer — re-homed on real EpisodePaths, so the stages see an
+    ordinary TV episode."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = _paths(self.root)
+        self.segdir = self.p.segdir
+        self.make_segdir(self.segdir)
+        self.cfr = self.p.source_cfr
+        with open(self.cfr, "wb") as f:
+            f.write(b"cfr" * 10)
+
+
+class NativeAnalysisStage(_NativeItem):
+    """The run-only 'dvnative' stage: run_stage dispatches it with should_pause (it is
+    resumable per chunk), the marker moves analyzing -> ready, and the stage books failures so
+    the orchestrator can fall back to Resolve."""
+
+    def setUp(self):
+        super().setUp()
+        import nativelane
+        self.lane = nativelane
+        self.extra = [
+            mock.patch.object(nativelane, "toolchain_ok", return_value=(True, "ok")),
+            mock.patch.object(nativelane.topaz, "_frame_count", return_value=_tn.TOTAL),
+            mock.patch.object(nativelane, "fps_fraction", return_value=_tn.FPS),
+            mock.patch.object(nativelane.dvcap, "rpu_frame_count", return_value=_tn.TOTAL),
+            mock.patch.object(nativelane.dvnative, "generate_rpu", side_effect=self._generate),
+        ]
+        for pt in self.extra:
+            pt.start()
+
+    def tearDown(self):
+        for pt in self.extra:
+            pt.stop()
+        super().tearDown()
+
+    @staticmethod
+    def _generate(sc, rpu, **kw):
+        with open(rpu, "wb") as f:
+            f.write(b"generated-rpu")
+        return {}
+
+    def _run(self, analyze, *, should_pause=None, abort=None):
+        sp = should_pause or (lambda: False)
+        with mock.patch.object(self.lane.dvnative, "analyze_chunks", side_effect=analyze):
+            return stages.run_stage("dvnative", self.p, abort=abort, progress=lambda d: None,
+                                    should_pause=sp)
+
+    def test_the_marker_moves_from_analyzing_to_ready(self):
+        seen = {}
+        sp = lambda: False
+
+        def analyze(chunk_list, workdir, **kw):
+            seen["state"] = self.lane.read_marker(self.p)["state"]
+            seen["should_pause"] = kw["should_pause"]
+            return _tn._sc()
+        with mock.patch.object(self.lane.dvnative, "analyze_chunks", side_effect=analyze):
+            ok, msg = stages.run_stage("dvnative", self.p, should_pause=sp)
+        self.assertTrue(ok, msg)
+        self.assertEqual(seen["state"], "analyzing")            # claimed before measuring
+        self.assertIs(seen["should_pause"], sp)                  # the yield reaches the analysis
+        self.assertEqual(self.lane.read_marker(self.p)["state"], "ready")
+        self.assertTrue(self.lane.ready(self.p))
+        self.assertEqual(self.lane.failure_count(self.p), 0)
+
+    def test_a_toolchain_failure_never_leaves_the_item_native(self):
+        # Whether the lane reports it as "native-fallback:" (fallback.json, sticky) or as a
+        # plain reason on a first claim (no marker: the next decide() sends it to Resolve),
+        # the item must not stay claimed, and Resolve's input must be untouched.
+        with mock.patch.object(self.lane, "toolchain_ok", return_value=(False, "dovi_tool is 2.2.0")):
+            ok, msg = self._run(lambda *a, **k: _tn._sc())
+        self.assertFalse(ok)
+        self.assertIn("dovi_tool is 2.2.0", msg)
+        self.assertTrue(self.lane.has_fallback(self.p) or not self.lane.has_marker(self.p))
+        self.assertTrue(os.path.exists(os.path.join(self.segdir, "seg_0000.mov")))   # Resolve's input
+
+    def test_a_first_claim_toolchain_failure_is_this_time_only(self):
+        # The lane's contract pinned at the STAGE: a broken toolchain on a first claim is not a
+        # sticky fallback (no fallback.json, no "native-fallback:" prefix) and claims nothing —
+        # the next decide() simply sends the item to Resolve while the tools are broken.
+        with mock.patch.object(self.lane, "toolchain_ok", return_value=(False, "dovi_tool is 2.2.0")):
+            ok, msg = self._run(lambda *a, **k: _tn._sc())
+        self.assertFalse(ok)
+        self.assertFalse(msg.startswith("native-fallback:"), msg)
+        self.assertFalse(self.lane.has_fallback(self.p))
+        self.assertFalse(self.lane.has_marker(self.p))
+
+    def test_a_full_disk_while_booking_a_failure_is_not_a_crash(self):
+        def broken(*a, **k):
+            raise RuntimeError("chunk 1: analyzer failed: boom")
+        with mock.patch.object(self.lane, "count_failure",
+                               side_effect=OSError(28, "No space left on device")), \
+             mock.patch.object(stages.logbook, "exception") as logged:
+            ok, msg = self._run(broken)
+        self.assertFalse(ok)
+        self.assertIn("analyzer failed: boom", msg)
+        self.assertIn("not booked", msg)
+        self.assertNotIn("crashed", msg)
+        logged.assert_called_once()
+
+    def test_the_analysis_cpu_is_booked_per_chunk(self):
+        def analyze(chunk_list, workdir, **kw):
+            for k in range(3):
+                kw["on_cpu"](k, 10.0 + k, 100)
+            return _tn._sc()
+        ok, msg = self._run(analyze)
+        self.assertTrue(ok, msg)
+        book = self.lane._read_json(self.lane.cpu_path(self.p))
+        self.assertEqual(sorted(book["analysis"]), ["chunk_0000", "chunk_0001", "chunk_0002"])
+        self.assertEqual(book["analysis"]["chunk_0002"], {"cpu_s": 12.0, "frames": 100})
+
+    def test_the_second_failure_falls_back_the_first_retries(self):
+        def broken(*a, **k):
+            raise RuntimeError("chunk 1: analyzer failed: boom")
+        ok, msg = self._run(broken)
+        self.assertFalse(ok)
+        self.assertIn("(native attempt 1 of 2)", msg)
+        self.assertFalse(self.lane.has_fallback(self.p))
+        self.assertEqual(self.lane.read_marker(self.p)["state"], "analyzing")   # resumes next pass
+        ok, msg = self._run(broken)
+        self.assertTrue(msg.startswith("native-fallback:"), msg)
+        self.assertTrue(self.lane.has_fallback(self.p))
+        self.assertFalse(self.lane.has_marker(self.p))
+        self.assertTrue(all(os.path.exists(os.path.join(self.segdir, f"seg_{i:04d}.mov"))
+                            for i in range(3)))                  # the chunks are untouched
+
+    def test_a_pause_and_a_stop_are_never_counted(self):
+        def pause(*a, **k):
+            raise self.lane.dvnative.Paused("paused: low disk — under the floor")
+
+        def stop(*a, **k):
+            raise self.lane.dvnative.Aborted("aborted (run stopped) during chunk 2 analyzer")
+        self.assertEqual(self._run(pause), (False, "paused: low disk — under the floor"))
+        ok, msg = self._run(stop)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("interrupted:"), msg)     # benign in the log, not counted
+        self.assertEqual(self.lane.failure_count(self.p), 0)
+        self.assertFalse(self.lane.has_fallback(self.p))
+
+    def test_a_set_abort_is_an_interruption_whatever_the_lane_said(self):
+        import threading
+        ev = threading.Event()
+        ev.set()
+
+        def broken(*a, **k):
+            raise RuntimeError("killed")
+        ok, msg = self._run(broken, abort=ev)
+        self.assertTrue(msg.startswith("interrupted:"), msg)
+        self.assertEqual(self.lane.failure_count(self.p), 0)
+
+    def test_a_lane_crash_costs_one_attempt_and_never_escapes(self):
+        with mock.patch.object(self.lane, "run_analysis", side_effect=KeyError("state")):
+            ok, msg = stages.run_stage("dvnative", self.p)
+        self.assertFalse(ok)
+        self.assertIn("native analysis crashed: KeyError", msg)
+        self.assertEqual(self.lane.failure_count(self.p), 1)
+
+
+class NativeRemuxBranch(_NativeItem):
+    """stages._remux: an item with a ready native marker remuxes from its chunks
+    (remux.remux(native=bundle)) and drops them once the master passes; every other item
+    reaches remux.remux with exactly the pre-native arguments."""
+
+    PRE_NATIVE_KWARGS = {"cap_mbps", "audio_target_lufs", "audio_gain_db", "boundaries", "abort",
+                         "on_progress", "on_plan", "should_pause", "on_repair", "encode_source"}
+
+    def _remux(self, ok=True, *, write_final=True, drive=None):
+        import types, remux, settings
+        got = {}
+
+        def fake_remux(dv, cfr, orig, out, **kw):
+            got.update(kw)
+            got["_args"] = (dv, cfr, orig, out)
+            if drive:
+                drive(kw)
+            if ok and write_final:
+                with open(out, "wb") as f:
+                    f.write(b"master" * 10)
+            return types.SimpleNamespace(ok=ok, reason="shipped" if ok else "peak gate failed")
+        with mock.patch.object(remux, "remux", side_effect=fake_remux) as rm, \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": 0}):
+            res = stages.run_stage("remux", self.p, progress=lambda d: None)
+        return res, got, rm
+
+    def _chunk_files(self):
+        return sorted(f for f in os.listdir(self.segdir) if f.startswith("seg_"))
+
+    def test_a_ready_item_remuxes_from_its_chunks_and_frees_them_on_success(self):
+        import nativelane
+        m = self.make_ready(self.p)
+        (ok, msg), got, _rm = self._remux(ok=True)
+        self.assertTrue(ok, msg)
+        native = got["native"]
+        self.assertEqual(native["id"], m["id"])
+        self.assertEqual(native["rpu"], nativelane.rpu_path(self.p))
+        self.assertEqual(native["chunks"][-1], [_tn.TOTAL, None])
+        self.assertEqual(native["total"], _tn.TOTAL)
+        self.assertEqual(set(got) - {"_args", "native"}, self.PRE_NATIVE_KWARGS)
+        self.assertEqual(self._chunk_files(), [])               # the ProRes is freed before the upload
+        self.assertTrue(os.path.isdir(self.segdir))              # ...the proof stays until cleanup
+
+    def test_the_pass_stamps_the_marker_with_the_master(self):
+        import nativelane
+        from orchestrator import NATIVE_ENCODED
+        m = self.make_ready(self.p)
+        (ok, msg), _got, _rm = self._remux(ok=True)
+        self.assertTrue(ok, msg)
+        stamp = nativelane.read_marker(self.p)
+        st = os.stat(self.p.final)
+        self.assertEqual(stamp["state"], NATIVE_ENCODED)
+        self.assertEqual(stamp["final"], self.p.final)
+        self.assertEqual((stamp["final_size"], stamp["final_mtime_ns"]), (st.st_size, st.st_mtime_ns))
+        self.assertEqual(stamp["ready_id"], m["id"])
+        self.assertFalse(nativelane.ready(self.p))               # never mistaken for a ready analysis
+        self.assertTrue(nativelane.has_marker(self.p))
+        self.assertEqual(nativelane.held_native_bytes(self.root), 0)
+        self.assertTrue(os.path.exists(nativelane.rpu_path(self.p)))   # the small files stay
+        self.assertTrue(os.path.exists(os.path.join(self.segdir, "segments.json")))
+
+    def test_without_a_stamp_the_whole_segdir_goes_as_before(self):
+        self.make_ready(self.p)
+        with mock.patch.object(stages.logbook, "exception"):
+            (ok, msg), _got, _rm = self._remux(ok=True, write_final=False)   # nothing to stat
+        self.assertTrue(ok, msg)
+        self.assertFalse(os.path.exists(self.segdir))
+
+    def test_the_proof_and_the_ledger_are_cleanups_to_remove(self):
+        import nativelane
+        self.make_ready(self.p)
+        self._remux(ok=True)
+        with mock.patch.object(stages.transfer, "delete_tree", create=True):
+            ok, msg = stages._cleanup(self.p, None)
+        self.assertTrue(ok, msg)
+        self.assertFalse(os.path.exists(self.segdir))
+        self.assertFalse(nativelane.has_marker(self.p))
+
+    def test_each_live_segment_is_timed_into_the_ledger(self):
+        import nativelane
+        self.make_ready(self.p)
+        nativelane.record_cpu(self.p, "analysis", "chunk_0000", 42.0, 10)
+        now = [100.0]
+
+        def drive(kw):                       # the remux's own callbacks, as dvcap fires them
+            kw["on_plan"]([10, 20, 30], 30)
+            kw["on_progress"](10, 30)                    # segment 1 resumed: never timed
+            now[0] = 160.0
+            kw["on_progress"](15, 30)                    # segment 2 live...
+            now[0] = 400.0
+            kw["on_progress"](20, 30)                    # ...done: 300 s since segment 1 ended
+            now[0] = 410.0
+            kw["on_progress"](25, 30)
+            now[0] = 500.0
+            kw["on_progress"](30, 30)                    # segment 3: 100 s
+            now[0] = 600.0
+            kw["on_repair"](1, 1, 1, 0, 10)              # a peak repair of segment 2 (index 1)
+            now[0] = 650.0
+            kw["on_repair"](1, 1, 1, 7, 10)
+            now[0] = 680.0
+            kw["on_repair"](1, 1, 1, 10, 10)
+        with mock.patch.object(stages.time, "monotonic", side_effect=lambda: now[0]):
+            (ok, msg), got, _rm = self._remux(ok=True, drive=drive)
+        self.assertTrue(ok, msg)
+        book = nativelane._read_json(nativelane.cpu_path(self.p))
+        self.assertEqual(book["remux"], {"seg_0001": {"wall_s": 300.0, "frames": 10},
+                                         "seg_0002": {"wall_s": 100.0, "frames": 10}})
+        self.assertEqual(book["remux_repair"], {"seg_0001": {"wall_s": 80.0, "frames": 10}})
+        self.assertEqual(book["analysis"]["chunk_0000"]["cpu_s"], 42.0)   # survives the pass
+
+    def test_the_resolve_call_gets_the_original_callbacks(self):
+        (ok, _msg), got, _rm = self._remux(ok=True)
+        self.assertTrue(ok)
+        self.assertEqual((got["on_progress"].__name__, got["on_plan"].__name__,
+                          got["on_repair"].__name__), ("_prog", "_on_plan", "_on_repair"))
+        self.make_ready(self.p)
+        (ok, _msg), got, _rm = self._remux(ok=True)
+        self.assertEqual(got["on_progress"].__name__, "on_prog")     # only native is wrapped
+
+    def test_a_failed_remux_keeps_the_chunks_for_the_retry(self):
+        import nativelane
+        self.make_ready(self.p)
+        (ok, _msg), got, _rm = self._remux(ok=False)
+        self.assertFalse(ok)
+        self.assertIn("native", got)
+        self.assertTrue(nativelane.ready(self.p))                # chunks, RPU and marker all kept
+
+    def test_a_marker_that_no_longer_matches_ships_nothing(self):
+        self.make_ready(self.p)
+        _tn._append(os.path.join(self.segdir, "seg_0001.mov"), b"re-encoded")
+        (ok, msg), _got, rm = self._remux()
+        self.assertFalse(ok)
+        self.assertIn("no longer matches", msg)
+        self.assertIn("seg_0001.mov changed", msg)
+        rm.assert_not_called()
+        self.assertTrue(os.path.isdir(self.segdir))
+
+    def test_a_resolve_item_gets_exactly_the_pre_native_call(self):
+        # No marker (and a leftover segdir that must not be touched by the remux).
+        (ok, _msg), got, _rm = self._remux(ok=True)
+        self.assertTrue(ok)
+        self.assertEqual(set(got) - {"_args"}, self.PRE_NATIVE_KWARGS)    # no `native` at all
+        self.assertEqual(got["_args"], (self.p.dv_render, self.p.source_cfr, self.p.source,
+                                        self.p.final))
+        self.assertTrue(os.path.isdir(self.segdir))
+
+    def test_a_fallen_back_item_is_a_resolve_item(self):
+        import nativelane
+        self.make_ready(self.p)
+        nativelane.write_fallback(self.p, "test")
+        (ok, _msg), got, _rm = self._remux(ok=True)
+        self.assertTrue(ok)
+        self.assertNotIn("native", got)
+        self.assertTrue(os.path.isdir(self.segdir))
+
+
+class NativeRemuxClock(unittest.TestCase):
+    """The native remux's wall-time ledger (segdir/native/cpu.json): only LIVE segments, rows
+    replaced on a retry, and booking never fails the remux."""
+
+    def setUp(self):
+        import tempfile
+        self.root = tempfile.mkdtemp()
+        self.p = _paths(self.root)
+        os.makedirs(self.p.segdir)
+        self.now = [0.0]
+        self.c = stages._NativeRemuxClock(self.p, clock=lambda: self.now[0])
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _book(self):
+        import nativelane
+        return nativelane._read_json(nativelane.cpu_path(self.p)) or {}
+
+    def _at(self, t, frames, **extra):
+        self.now[0] = t
+        self.c.progress(frames, 30, **extra)
+
+    def test_a_resumed_attempt_times_only_what_it_encoded(self):
+        self.c.plan([10, 20, 30], 30)
+        self._at(1, 10)
+        self._at(2, 20)                                  # two resumed segments: instant jumps
+        self._at(50, 25)
+        self._at(100, 30)
+        self.assertEqual(self._book(), {"remux": {"seg_0002": {"wall_s": 98.0, "frames": 10}}})
+
+    def test_a_retry_replaces_the_row(self):
+        self.c.plan([10, 20], 20)
+        self._at(5, 5)
+        self._at(60, 10)
+        self.c.plan([10, 20], 20)                        # a new attempt re-encodes segment 1
+        self._at(70, 5)
+        self._at(100, 10)
+        self.assertEqual(self._book()["remux"]["seg_0000"], {"wall_s": 40.0, "frames": 10})
+
+    def test_progress_before_the_plan_and_repair_ticks_are_ignored(self):
+        self._at(5, 5)
+        self.c.plan([10], 10)
+        self._at(6, 10, repair_seg=1, repair_done=3)
+        self.assertEqual(self._book(), {})
+
+    def test_two_repair_rungs_of_one_segment_add_up(self):
+        for t, done in ((0, 0), (30, 5), (50, 10), (60, 0), (70, 4), (90, 10)):
+            self.now[0] = t
+            self.c.repair(3, done, 10)
+        self.c.finish()
+        self.assertEqual(self._book()["remux_repair"], {"seg_0002": {"wall_s": 80.0, "frames": 10}})
+
+    def test_an_unwritable_ledger_never_raises(self):
+        import nativelane
+        with open(nativelane.native_dir(self.p), "w") as f:      # a FILE where the dir should be
+            f.write("x")
+        self.c.plan([10], 10)
+        self._at(5, 5)
+        with mock.patch.object(stages.logbook, "exception") as logged:
+            self._at(9, 10)
+        logged.assert_called_once()
+
+    def test_the_log_line_sums_the_ledger(self):
+        self.c.plan([10, 20], 20)
+        self._at(5, 5)
+        self._at(10, 10)
+        self._at(15, 15)
+        self._at(30, 20)
+        self.assertEqual(stages.native_wall_line(self.p),
+                         "remux wall 30 s over 20 frames (2 segments, 1500.0 ms/frame)")

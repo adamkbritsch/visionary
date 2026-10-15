@@ -13,6 +13,7 @@ import tooling, and the tests. The pins are LOAD-BEARING, not advisory:
 Do NOT edit these to make a mismatched machine pass preflight — install the exact builds
 instead (see README "Requirements").
 """
+import os
 
 # DaVinci Resolve — must be the STUDIO edition (the free edition lacks the needed features).
 RESOLVE_APP = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
@@ -91,3 +92,23 @@ MODELS_BELOW_140W = frozenset({    # 14-inch M1/M2 MacBook Pro (96 W max) + ever
     "Mac14,5", "Mac14,9",                            # 14-inch M2 Max / M2 Pro
     "MacBookAir10,1", "Mac14,2", "Mac14,15", "Mac15,12", "Mac15,13",
 })
+
+# THE NATIVE DOLBY VISION LANE (settings `dv_engine` = 'native'; engine/dvnative.py). ADDITIVE
+# pins, checked ONLY while dv_engine is 'native' (preflight.check_native_dv: a warn row in
+# the full report, and the 409 when switching TO native; never the arm gate — a broken
+# toolchain only sends items through Resolve), so a default 'resolve' install is unchanged.
+# They pin the toolchain the blind A/B on the TV was judged on.
+DOVI_TOOL_VERSION = "2.3.0"         # `dovi_tool --version`. The `generate` config the lane writes
+                                    # (CM v4.0, l1_avg_pq_cm_version) is version-sensitive. NOT
+                                    # gated for the Resolve path, which only extracts/injects RPUs.
+HDR_ANALYZER_PATH = os.path.expanduser("~/.topaz-pipeline/bin/hdr_analyzer_mvp")
+HDR_ANALYZER_COMMIT = "383b0ad"     # tinof/hdr-analyze, built from source (cargo) at this commit
+HDR_ANALYZER_SHA256 = "41727312f4a960b27d59cb0c0f24c2922dc82768da3503f083e4842a87fc099e"
+                                    # ...of THAT build. A hash cannot see a `brew upgrade ffmpeg`
+                                    # breaking its libav*.62 links, so preflight also RUNS it.
+NATIVE_LUT_PATH = os.path.expanduser("~/.topaz-pipeline/luts/rcm_sdr709_to_pq1000.cube")
+NATIVE_LUT_SHA256 = "e410e5b7b899a07096a77e2f65bdeb6a4ab3cc60126358a81c8050251d8c59b0"
+                                    # the SDR->PQ conversion fitted to Resolve's own renders; any
+                                    # other file changes the picture
+NATIVE_FFMPEG_MAJOR = 8             # Homebrew ffmpeg: the LUT's colour was measured on 8.0, and
+                                    # the analyzer links ffmpeg 8's major-versioned libraries

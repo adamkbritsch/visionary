@@ -200,10 +200,16 @@ def regime_of(*, run_stage: str | None, run_active: bool,
     each other; calling that 'solo' banks the halved rate as this lane's best case and then
     predicts no speed-up for when the other lane finishes -- so the estimate stays pessimistic
     for the whole remainder. It is the same two-phase shape the model already exists for, just
-    with the other lane playing the part Topaz usually plays."""
+    with the other lane playing the part Topaz usually plays.
+
+    THE NATIVE DV ANALYSIS ('dvnative') COUNTS TOO. It is CPU work at nice 10 beside this lane's
+    normal-priority x265, exactly where Topaz sits, and when it ends the run thread parks at the
+    native gate until this remux finishes: contended now, solo after, the same shape again.
+    Banking it as solo would drag this item's own k toward 1. The stage never runs while
+    dv_engine is 'resolve', so every existing stage keeps the regime it always had."""
     if other_lane_live:
         return CONTENDED
-    if run_active and run_stage in ("download", "extend", "topaz"):
+    if run_active and run_stage in ("download", "extend", "topaz", "dvnative"):
         return CONTENDED
     return SOLO
 
@@ -214,5 +220,104 @@ def correction_applies(*, run_stage: str | None, run_active: bool) -> bool:
     NO while the run thread is in `resolve`: that stage PREEMPTS the lane entirely
     (`_resolve_active` -> `should_pause`), so the remux's next regime is rate ZERO, not a
     speed-up. Predicting a speed-up there would be wrong in the dangerous direction, so the
-    estimate falls back to today's conservative formula."""
+    estimate falls back to today's conservative formula.
+
+    'dvnative' is NOT that case: the native analysis never suspends a lane, so it is ordinary
+    contention and the correction applies."""
     return not (run_active and run_stage == "resolve")
+
+
+# ---- the 'dvnative' stage: native Dolby Vision analysis, timed by CHUNK ----------------------
+# nativelane.run_analysis publishes progress ONLY when a Topaz chunk is finished — one callback
+# per chunk, minutes apart — and a resume re-fires one callback per chunk it measured before,
+# within about a second (dvnative.analyze_chunks just reloads each published sidecar). Fed to a
+# plain pct extrapolation, that replay is banked as work and the ETA reads several times too low
+# until the stage ends: the failure the Topaz replay guard and accept_sample exist for. The clock
+# below times LIVE chunks only.
+
+# A boundary is a replay, not analysis, when it lands this soon after the previous one ...
+CHUNK_REPLAY_SECS = 5.0
+# ... or at a pace that would analyse the WHOLE item in under this. A real chunk runs three
+# processes and writes a ~26 GiB intermediate, so neither is reachable; a replay beats both by
+# an order of magnitude. Dropping a genuinely tiny last chunk is the safe error to make.
+CHUNK_REPLAY_STAGE_SECS = 60.0
+
+
+def chunk_is_replay(width, dt) -> bool:
+    """Is a boundary that advanced `width` of the stage (0..1) in `dt` seconds a resume replay
+    rather than measured analysis? Unusable input counts as a replay: it is never banked."""
+    try:
+        w, t = float(width), float(dt)
+    except (TypeError, ValueError):
+        return True
+    if not (w > 0 and t > 0) or t < CHUNK_REPLAY_SECS:
+        return True
+    return w / t > 1.0 / CHUNK_REPLAY_STAGE_SECS
+
+
+class ChunkClock:
+    """The ETA of ONE item's 'dvnative' stage, from its chunk boundaries alone.
+
+    observe() every progress dict's (seg_done, notches); estimate(now) returns the keys
+    StageProgress shows — eta_secs, seg_eta_secs, seg_secs — or {} while there is nothing
+    honest to say: before the first LIVE chunk lands, and once the last one has.
+
+    `notches` are the chunk ENDS as fractions of the item's frames, so a chunk's width is its
+    share of the frames and rate = banked width / banked seconds is the frames-weighted form
+    RateBook uses (the Jensen test pins why). A new attempt on the same clock (seg_done going
+    back, after a pause) keeps what was measured: same chunks, same machine. New notches mean a
+    different item, and start over. `now` is separate from observe() so a caller can refresh
+    the countdown between boundaries, which are minutes apart."""
+
+    def __init__(self):
+        self._reset(None)
+
+    def _reset(self, notches):
+        self._notches = notches   # this item's chunk ends, 0..1
+        self._done = None         # chunks finished at the last boundary seen
+        self._at = None           # when that boundary (or the attempt's anchor) was seen
+        self._f = 0.0             # banked LIVE work, as a fraction of the stage
+        self._s = 0.0             # ... and the seconds it took
+
+    def observe(self, seg_done, notches, now) -> bool:
+        """Note one progress callback. True when it banked a live chunk as rate evidence."""
+        try:
+            done, t = int(seg_done), float(now)
+            ends = [float(x) for x in notches]
+        except (TypeError, ValueError):
+            return False
+        if not ends or not 0 <= done <= len(ends) or any(b < a for a, b in zip(ends, ends[1:])):
+            return False
+        if ends != self._notches:
+            self._reset(ends)
+        if self._done is None or done < self._done:     # first sight, or a new attempt
+            self._done, self._at = done, t
+            return False
+        if done == self._done:                           # the same boundary, re-published
+            return False
+        width = ends[done - 1] - (ends[self._done - 1] if self._done else 0.0)
+        dt = t - self._at
+        self._done, self._at = done, t                   # replay or not, the next chunk starts now
+        if chunk_is_replay(width, dt):
+            return False
+        self._f += width
+        self._s += dt
+        return True
+
+    def rate(self):
+        """Stage fraction per second over the live chunks, or None before the first one."""
+        return self._f / self._s if self._f > 0 and self._s > 0 else None
+
+    def estimate(self, now) -> dict:
+        r, ends, done = self.rate(), self._notches, self._done
+        if r is None or ends is None or done is None or done >= len(ends):
+            return {}
+        try:
+            spent = max(0.0, float(now) - self._at)
+        except (TypeError, ValueError):
+            spent = 0.0
+        seg = (ends[done] - (ends[done - 1] if done else 0.0)) / r   # this chunk's projected total
+        # An overrunning chunk holds at the floor rather than reading 0 while it still runs.
+        seg_left = max(TAIL_MIN_SECS, seg - spent)
+        return {"eta_secs": round(seg_left + max(0.0, ends[-1] - ends[done]) / r, 1),
+                "seg_eta_secs": round(seg_left, 1), "seg_secs": round(seg, 1)}

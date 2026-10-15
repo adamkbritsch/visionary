@@ -8,11 +8,15 @@
 #   the other stage, if mid-segment, simply resumes from its own last segment.
 #   - topaz encoding  -> watch progress.seg_done ; a boundary there → deploy.
 #   - finisher = remux -> watch finishing.seg_done ; a boundary there → deploy.
+#   - stage = dvnative -> watch progress.seg_done (= CHUNKS analysed) ; a boundary there → deploy.
+#     The native DV analysis (dv_engine 'native') resumes from its last finished chunk, so a stop
+#     mid-chunk throws that chunk's minutes away. Never seen while dv_engine is 'resolve'.
 #   - stage = resolve -> wait it out (screen-capture render, NOT segmented/resumable).
 #   - finisher = upload/cleanup -> wait (a mid-STOR upload leaves a partial on the NAS; both are quick).
 #   - nothing encoding (download/idle, no remux) -> nothing precious, deploy immediately.
 # The stop waits for BOTH encoders (topaz tvai + remux x265) to exit before relaunching, so a resumed
-# stage can never collide with a still-dying old one on the same segdir.
+# stage can never collide with a still-dying old one on the same segdir. The native DV analysis's
+# children count too: they write into that same segdir.
 ROOT="${VISIONARY_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 # ONE WAITER AT A TIME. A deploy can wait a long time for a safe boundary, so it is easy to
 # queue several by accident — and they would then all stop and relaunch the app on top of
@@ -50,6 +54,11 @@ fi
 LOG="$ROOT/.deploy-dockbar.log"
 BIN="Visionary.app/Contents/MacOS/Visionary"
 API=http://127.0.0.1:8765
+# The native DV analysis's children (dvnative.analyze_chunks: the LUT intermediate's ffmpeg, the
+# analyzer, the L4 child and its ffmpeg). Each names its chunk's intermediate on its command line,
+# ~/topaz-scratch/<stem>_prob4_upscaled.segments/native/work/chunk_NNNN.mkv, so this matches them
+# all and nothing else: not a Topaz chunk, and not an analysis run outside the pipeline's scratch.
+ANALYSIS_PAT='/topaz-scratch/[^/]*_upscaled[.]segments/native/work/chunk_[0-9]+[.]mkv'
 : > "$LOG"
 say(){ echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
 is_num(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
@@ -78,13 +87,16 @@ except Exception: print('down')" 2>/dev/null; }
 say "deploy requested — holding for the first segment boundary (topaz OR remux; the other resumes; never resolve/upload)"
 deadline=$(( $(date +%s) + 10800 ))  # 3 h ceiling. Rarely bites now — only outlasts a resolve/upload
                                      # the deploy is briefly waiting out.
-tseg0=""; rseg0=""; rseg20=""
+tseg0=""; rseg0=""; rseg20=""; aseg0=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 <<< "$s"
+  # The chunk baseline belongs to ONE analysis pass: a later pass (another item, or this one
+  # resumed after a resolve) counts from its own start.
+  [ "$stage" = "dvnative" ] || aseg0=""
   # Non-resumable / partial-risk stages → wait them out; reset the segment baselines.
   case "$fin$fin2" in
     *upload*|*cleanup*) say "waiting: finisher=$fin/$fin2 (short, not cleanly resumable)"
-                        tseg0=""; rseg0=""; rseg20=""; sleep 5; continue ;;
+                        tseg0=""; rseg0=""; rseg20=""; aseg0=""; sleep 5; continue ;;
   esac
   case "$stage" in
     resolve|upload) say "waiting: stage=$stage (never interrupt — not resumable)"; tseg0=""; rseg0=""; sleep 5; continue ;;
@@ -93,11 +105,19 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # EITHER encoder that's actually running — the other stage, if mid-segment, resumes from its own last.
   tenc=$(pgrep -f tvai_up | wc -l | tr -d ' ')      # topaz (Video AI)
   xenc=$(pgrep -x x265 | wc -l | tr -d ' ')          # remux (x265)
+  aenc=$(pgrep -f "$ANALYSIS_PAT" | wc -l | tr -d ' ')  # native DV analysis (any of its steps)
   watching=0
   if [ "$stage" = "topaz" ] && [ "$tenc" != "0" ] && is_num "$tseg"; then
     watching=1
     if [ -z "$tseg0" ]; then tseg0="$tseg"; say "watching topaz at segment_done=$tseg"
     elif [ "$tseg" -gt "$tseg0" ]; then say "TOPAZ segment boundary ($tseg0 -> $tseg) — deploying (remux, if any, resumes)"; break; fi
+  fi
+  # The native DV analysis holds the run thread the way topaz does, and progress.seg_done counts its
+  # finished CHUNKS. A count that went DOWN is a new attempt replaying from 0: re-baseline on it.
+  if [ "$stage" = "dvnative" ] && [ "$aenc" != "0" ] && is_num "$tseg"; then
+    watching=1
+    if [ -z "$aseg0" ] || [ "$tseg" -lt "$aseg0" ]; then aseg0="$tseg"; say "watching DV analysis at chunks_done=$tseg"
+    elif [ "$tseg" -gt "$aseg0" ]; then say "DV ANALYSIS chunk boundary ($aseg0 -> $tseg) — deploying (it resumes from its last chunk)"; break; fi
   fi
   if [ "$fin" = "remux" ] && [ "$xenc" != "0" ] && is_num "$rseg"; then
     watching=1
@@ -137,7 +157,8 @@ curl -s --max-time 8 -X POST "$API/api/automation" -H 'Content-Type: application
 for i in $(seq 1 30); do
   [ "$(running_now)" = "False" ] \
     && [ "$(pgrep -f tvai_up | wc -l | tr -d ' ')" = "0" ] \
-    && [ "$(pgrep -x x265 | wc -l | tr -d ' ')" = "0" ] && break
+    && [ "$(pgrep -x x265 | wc -l | tr -d ' ')" = "0" ] \
+    && [ "$(pgrep -f "$ANALYSIS_PAT" | wc -l | tr -d ' ')" = "0" ] && break
   sleep 1
 done
 if [ "$WAS_ARMED" = "True" ]; then
@@ -149,6 +170,9 @@ fi
 # "dashboard/server.py" killed it on every deploy (live 2026-10-06 — an open, activated Expurgate
 # was left with no engine).
 SERVER_PAT='Visionary[.]app/Contents/Resources/engine/dashboard/server[.]py'
+# An analysis step runs in its OWN session (dvnative.run_step), so killing the server would orphan
+# it, still writing into the segdir the relaunched app resumes. Only a step that outlived the wait.
+pkill -f "$ANALYSIS_PAT" 2>/dev/null
 pkill -f tvai_up 2>/dev/null; pkill -f "$SERVER_PAT" 2>/dev/null; pkill -f "$BIN" 2>/dev/null
 # Refresh LaunchServices BEFORE the relaunch. The bundle is rebuilt in place, and the app takes its
 # icon (NSApp.applicationIconImage, which its progress Dock tile draws) from that cache at launch —

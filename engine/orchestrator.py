@@ -53,6 +53,20 @@ STAGES = ["download", "extend", "topaz", "resolve", "remux", "upload", "cleanup"
 # whose show OPTED IN and whose source actually probes 4:3 — see borders.extend_gate.
 RUN_STAGES = ["download", "extend", "topaz", "resolve"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
+# NATIVE DV (settings `dv_engine` 'native'): an eligible TV episode fills the "resolve" slot
+# with the run-only stage 'dvnative' instead (_native_slot) — a different NAME on purpose, so
+# no Resolve-keyed rule (Quiet Mode, the pinned display, the stall ladder, SIGSTOP, the
+# doorstep gate, deploy-now's wait) ever applies to it. It is not in STAGES: stage_done
+# ("resolve") is what reports it done (nativelane.ready), and the lists above are unchanged.
+NATIVE_PAUSE_POLL_SECONDS = 5   # the analysis polls should_pause every 0.5 s; the reasons behind it
+                                # (gate release, sends, cadence) are re-asked at most this often
+NATIVE_PROGRESS_TICK_SECONDS = 5   # the analysis reports only at chunk boundaries (minutes apart); the
+                                   # card's pct/ETA/stopwatch are re-published this often in between
+NATIVE_ENCODED = "encoded"      # the native marker's state once the item's master PASSED the peak gate:
+                                # stages._remux deletes the Topaz chunks and stamps the marker (with the
+                                # master's path, size and mtime), which keeps proving the Topaz and DV work
+                                # done until cleanup rmtree's the segdir (_native_encoded). Written by
+                                # stages (NATIVE_ENCODED, imported) — the lane never writes this state.
 PLEX_COLLECTION_SYNC_DELAY = 90   # let Plex's scan create the item before tagging it
 YIELD_LIVELOCK_LIMIT = 3      # yields in a row with nothing else running -> the reason can't be met
 LEASE_POLL_SECONDS = 10       # while a sibling holds the machine, how often the run thread re-checks.
@@ -69,6 +83,9 @@ OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/u
                              # hand-off so the finisher item is small (~10 GB), but available_gb still
                              # counts scratch as reclaimable — so gate on physical free to reserve room
                              # for the NEXT item's own intermediate. Room for one movie ProRes + margin.
+                             # EXCEPT a NATIVE DV item, which keeps its ~130-190 GiB of chunks until its
+                             # remux passes: while one does, the next item's own projected need
+                             # replaces this flat figure (U2 — see _native_overlap_hold).
 DIM_IDLE_MINUTES_DEFAULT = 15   # fallback for the 'dim_after_minutes' setting (idle this long → backlight 0)
 DRAIN_POLL_SECONDS = 30      # how often to re-check while paused for power
 UNPLUG_GRACE_SECONDS = 60    # DEFAULT for the 'unplug_grace_seconds' setting (read via
@@ -92,6 +109,10 @@ MIN_FREE_GB = 400            # DEFAULT for the 'min_free_gb' setting — ALWAYS 
                              # for the current all-TV workload.) Was 600 back when topaz lingered into
                              # the finisher and TWO intermediates could coexist during a tail-overlap.
                              # Keep >= OVERLAP_MIN_PHYS_GB (the finisher-overlap gate reuses this floor).
+                             # NATIVE DV brings that coexistence back for TV (dv_engine 'native': the
+                             # finisher item keeps its chunks through its remux), so while it does the
+                             # overlap gate asks for the next item's PROJECTED need instead (U2,
+                             # _native_overlap_hold); this floor still governs everything else.
 CADENCE_FILE = os.path.expanduser("~/.topaz-pipeline/orch_cadence.json")
                               # the YouTube cadence counter PERSISTS here: it's a fact about
                               # processing HISTORY (episodes since the last video), so a re-arm or
@@ -210,21 +231,33 @@ def _projected_item_gb(p) -> int:
     Items that SKIP Topaz (already-DV, rpu-only/resolve-only fast paths, combine, YouTube's
     Resolve-scales path) write no ProRes, so they only need the tail. Unprobeable duration
     falls back to the flat floor — never gate on a guess."""
+    return _item_projection(p)[0]
+
+
+def _item_projection(p) -> tuple:
+    """(gb, measured): _projected_item_gb's answer, and whether it was MEASURED from this
+    item's own runtime — a Topaz item (plan 'upscale'/'clean') whose source or CFR is on disk
+    and probes a duration. Every other answer is a stand-in rather than this item's size: the
+    flat floor for an unprobeable (or not yet downloaded) item, and the flat ITEM_TAIL_GB for
+    an item that writes no ProRes (combine, YouTube, the fast paths) — a figure that ignores
+    how big that item really is (a 4K fast-path movie's working set is ~318 GB). U2's gate
+    (Orchestrator._native_overlap_need_gb) relaxes only on a MEASURED projection."""
     try:
         import plan as _plan
         import topaz as _topaz
         if getattr(p, "combine", False) or getattr(p, "youtube", False):
-            return ITEM_TAIL_GB
+            return ITEM_TAIL_GB, False
         pl = _plan.plan_for(p.source)
         if pl.get("topaz") not in ("upscale", "clean"):
-            return ITEM_TAIL_GB                     # no ProRes intermediate at all
-        _fps, dur = _topaz.media_timing(p.source_cfr if os.path.exists(p.source_cfr)
-                                        else p.source)
+            return ITEM_TAIL_GB, False              # no ProRes intermediate at all
+        on_disk = os.path.exists(p.source_cfr)
+        _fps, dur = _topaz.media_timing(p.source_cfr if on_disk else p.source)
         if not dur:
-            return _min_free_gb()
-        return _topaz.projected_prores_gib(dur) + ITEM_TAIL_GB
+            return _min_free_gb(), False
+        return (_topaz.projected_prores_gib(dur) + ITEM_TAIL_GB,
+                on_disk or os.path.exists(p.source))
     except Exception:
-        return _min_free_gb()
+        return _min_free_gb(), False
 
 
 def _prefetch_gate_gb() -> int:
@@ -956,6 +989,76 @@ def topaz_is_noop(p: EpisodePaths) -> bool:
     return bool(getattr(p, "youtube", False))
 
 
+def _native_claimed(p) -> bool:
+    """The native DV lane owns this item: its segdir carries a native marker (any state) and
+    no fallback.json. One stat for every item without a marker — every Resolve item, whose
+    segdir is gone by the finisher — so the Resolve path is never slowed or changed by it.
+    `p` may also be a segdir path. Never raises."""
+    if not (p if isinstance(p, str) else getattr(p, "segdir", None)):
+        return False
+    try:
+        import nativelane
+        return nativelane.has_marker(p) and not nativelane.has_fallback(p)
+    except Exception:  # noqa: BLE001 — the lane's bookkeeping must never break a gate
+        return False
+
+
+def _native_ready(p) -> bool:
+    """_native_claimed AND the analysis is published and still matches the disk
+    (nativelane.ready). Never raises."""
+    if not _native_claimed(p):
+        return False
+    try:
+        import nativelane
+        return nativelane.ready(p)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _native_marker_state(p):
+    """The claimed item's native marker state ('analyzing' | 'ready' | NATIVE_ENCODED), or
+    None — no claim, or a marker that does not parse. Never raises."""
+    if not _native_claimed(p):
+        return None
+    try:
+        import nativelane
+        m = nativelane.read_marker(p)
+    except Exception:  # noqa: BLE001
+        return None
+    return m.get("state") if isinstance(m, dict) else None
+
+
+def _native_holds_chunks(p) -> bool:
+    """A claimed native item whose Topaz chunks are still on disk for its remux: every marker
+    state but NATIVE_ENCODED (stages._remux deletes the chunks the moment the master passes
+    the peak gate, and stamps the marker). `p` may be a segdir path. Never raises."""
+    return _native_claimed(p) and _native_marker_state(p) != NATIVE_ENCODED
+
+
+def _native_encoded(p) -> bool:
+    """A NATIVE item whose master already passed the peak gate — what stage_done("topaz") and
+    stage_done("resolve") accept in place of chunks or a render, because both are gone by
+    design: the remux deleted the chunks and there never was a render. True only while the
+    marker says NATIVE_ENCODED, names THIS item's final master, and that master is still the
+    file the remux shipped (same size and mtime) and still a DV 8.1 master with audio
+    (stage_done("remux")). Anything else is not proof, and the item re-runs Topaz as before.
+    One stat for every item without a marker (every Resolve item). Never raises."""
+    if not _native_claimed(p):
+        return False
+    try:
+        import nativelane
+        m = nativelane.read_marker(p) or {}
+        final = getattr(p, "final", None)
+        if m.get("state") != NATIVE_ENCODED or not final or m.get("final") != final:
+            return False
+        st = os.stat(final)
+        if (st.st_size, st.st_mtime_ns) != (m.get("final_size"), m.get("final_mtime_ns")):
+            return False
+        return stage_done("remux", p)
+    except Exception:  # noqa: BLE001 — unprovable is "not encoded": Topaz re-runs, as before
+        return False
+
+
 def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
     combine = getattr(p, "combine", False)   # duck-typed callers (tests) predate the field
     if stage == "download":
@@ -1000,7 +1103,12 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         import topaz
         if _is_dv81(_vstream(p.dv_render)) and render_is_complete(p):
             return True
-        return topaz.segments_complete(p.segdir)
+        if topaz.segments_complete(p.segdir):
+            return True
+        # NATIVE DV: no render, and the chunks went when the master passed the peak gate —
+        # the 'encoded' marker naming that master is the proof (a Resolve item has no marker:
+        # one stat, and the answer above stands).
+        return _native_encoded(p)
     if stage == "resolve":
         if combine:
             # A REAL RPU (from either copy) makes Resolve unnecessary — real DV beats
@@ -1010,7 +1118,13 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
             if cv and cv["verdict"].get("rpu_from") != "resolve":
                 return True
         # DV profile AND length: a truncated render carries a perfectly valid DOVI record.
-        return _is_dv81(_vstream(p.dv_render)) and render_is_complete(p)
+        if _is_dv81(_vstream(p.dv_render)) and render_is_complete(p):
+            return True
+        # NATIVE DV: there is no render at all — the native lane's published analysis (its
+        # 'ready' marker, still matching the chunks, LUT, RPU and CFR on disk) is the proof,
+        # and once the master has passed the peak gate (chunks deleted) the 'encoded' one is.
+        # A Resolve item has no marker, so this answer is the render check's, as always.
+        return (not combine) and (_native_ready(p) or _native_encoded(p))
     if stage == "remux":
         s = _vstream(p.final)
         return _is_dv81(s) and _has_audio(s)
@@ -1115,6 +1229,11 @@ class Orchestrator:
         self._run_contended = False            # was the finisher's remux running at topaz's last tick?
                                                # (the run thread still re-anchors on that flip; the
                                                #  finisher uses per-regime books instead — see _lane_eta)
+        self._dvn_lock = threading.Lock()      # 'dvnative' card: the run thread's chunk callbacks vs the
+                                               # heartbeat that re-publishes between them (_native_set_progress)
+        self._dvn_clock = None                 # eta.ChunkClock of the item analysed last (kept across its
+        self._dvn_ep = None                    # attempts: a resume keeps the measured rate)
+        self._dvn_last = None                  # its last REAL progress dict (the heartbeat re-publishes it)
         # per-(item, stage) elapsed accumulator (survives stop / turn / pause / restart — see _elapsed_*)
         self._elapsed_key = None               # f"{source_basename}|{stage}" of the running stage, or None
         self._elapsed_base = 0.0               # accumulated seconds BEFORE the current interval
@@ -1155,6 +1274,14 @@ class Orchestrator:
         self._finisher_persisted = self._load_finisher_persisted()   # cid -> descriptor; DURABLE finisher
                                                # ownership (survives deactivate/relaunch mid-remux). Seeded
                                                # back into _finish_q/_in_finisher by _finisher_reconcile.
+        self._native_fin = {}                  # skip-key -> segdir of finisher items handed off NATIVE
+                                               # (their Topaz chunks stay until the remux passes). Filled at
+                                               # hand-off and by _finisher_reconcile; pruned against
+                                               # _finisher_persisted, and the marker on disk is the truth
+                                               # (see _finisher_native_segdirs). Empty unless dv_engine
+                                               # has been 'native'.
+        self._native_said = {}                 # skip-key -> the last "DV via Resolve" reason logged for a
+                                               # TV item the native lane declined (one line per change)
         self._cadence_advanced = set()         # items whose HAND-OFF already advanced the cadence —
                                                # loaded below with the counters (survives restarts)
         self._lane_books = {}                  # lane -> eta.RateBook: per-REGIME (frames, seconds)
@@ -1333,6 +1460,9 @@ class Orchestrator:
         is what keeps the ETA sane across a stop/resume: a resumable Topaz encode instantly REPLAYS
         its finished chunks on resume (pct leaps with no real-time work), and a stop leaves an idle
         gap — both would wreck a from-zero `elapsed × remaining / pct`."""
+        if info.get("stage") == "dvnative":
+            self._native_set_progress(info)     # timed by CHUNK (eta.ChunkClock), not by pct
+            return
         now = time.time()
         key = (info.get("stage"), info.get("ep"))
         pct = info.get("pct") or 0
@@ -1398,6 +1528,13 @@ class Orchestrator:
                 span_pct = max(0.0, (hi - lo)) * 100.0
                 if span_pct > 0:
                     info["seg_secs"] = span_pct * (elapsed / advanced)
+        self._publish_elapsed(info)
+        self.state["progress"] = info
+        self._show_slot_wait(info)
+
+    def _publish_elapsed(self, info):
+        """The stage's accumulated real time (survives stop / pause / restart) into `info`, with
+        a checkpoint to disk at most every 30 s so a hard crash loses at most that much."""
         if self._elapsed_anchor is not None:    # accumulated real time in THIS stage of THIS item
             info["elapsed_secs"] = self._elapsed_value()
             mono = time.monotonic()
@@ -1405,8 +1542,61 @@ class Orchestrator:
                 with _ELAPSED_LOCK:
                     m = _elapsed_map(); m[self._elapsed_key] = round(info["elapsed_secs"], 1); _elapsed_write(m)
                 self._elapsed_last_save = mono
-        self.state["progress"] = info
-        self._show_slot_wait(info)
+
+    # ---- native DV: the 'dvnative' card's progress, timed by chunk --------------------------
+
+    def _native_set_progress(self, info, *, tick=False):
+        """The 'dvnative' stage's progress (nativelane.run_analysis -> _set_progress): one call
+        per finished Topaz chunk, minutes apart, and on a resume a burst of replays of the
+        chunks measured before. The generic pct extrapolation would re-anchor on every one of
+        them (a > 30 s gap) and never show an ETA, so eta.ChunkClock — per item, kept across
+        attempts — times the LIVE chunks only and gives eta_secs / seg_eta_secs / seg_secs the
+        way the Topaz card has them. `tick` = the heartbeat between boundaries
+        (_native_progress_ticker): the last real callback re-published with the countdown,
+        stopwatch and pct moved on, the pct interpolated inside the chunk by the measured rate
+        and never past the chunk's own end (only a real boundary crosses it). The app decodes
+        pct as an integer, so it stays one."""
+        with self._dvn_lock:
+            now = time.time()
+            if not tick:
+                ep = info.get("ep")
+                if self._dvn_clock is None or self._dvn_ep != ep:
+                    self._dvn_ep, self._dvn_clock = ep, eta_math.ChunkClock()
+                self._dvn_clock.observe(info.get("seg_done"), info.get("notches"), now)
+                self._dvn_last = dict(info)
+            elif self._dvn_last is None or self._dvn_clock is None:
+                return
+            out = dict(self._dvn_last)
+            est = self._dvn_clock.estimate(now)
+            out.update(est)
+            if est and est.get("seg_secs"):
+                try:
+                    ends = [float(x) for x in out.get("notches") or []]
+                    done = int(out.get("seg_done") or 0)
+                    lo = ends[done - 1] if done > 0 else 0.0
+                    hi = ends[done]
+                    spent = max(0.0, est["seg_secs"] - est["seg_eta_secs"])
+                    frac = min(1.0, spent / est["seg_secs"])
+                    base = int(out.get("pct") or 0)
+                    cap = int(round(hi * 100.0)) - 1          # never the next boundary's own pct
+                    out["pct"] = max(base, min(cap, int((lo + frac * (hi - lo)) * 100.0)))
+                except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                    pass
+            self._publish_elapsed(out)
+            self.state["progress"] = out
+
+    def _native_progress_ticker(self, stop):
+        """Heartbeat thread for the 'dvnative' stage (started and joined by _native_slot around
+        run_stage): re-publishes its card every NATIVE_PROGRESS_TICK_SECONDS so the countdown,
+        stopwatch and pct move inside a chunk. Only while the run thread's progress is still a
+        'dvnative' one; it never raises."""
+        while not stop.wait(NATIVE_PROGRESS_TICK_SECONDS):
+            try:
+                cur = self.state.get("progress")
+                if isinstance(cur, dict) and cur.get("stage") == "dvnative":
+                    self._native_set_progress(cur, tick=True)
+            except Exception:  # noqa: BLE001 — a display refresh must never cost the stage
+                pass
 
     def _show_slot_wait(self, info):
         """A pipeline transfer waiting for the shared NAS transfer slot says so on the run line
@@ -1853,12 +2043,21 @@ class Orchestrator:
             if p is None:
                 continue
             key = self._skip_key(p)
+            # A NATIVE item still holds its chunks (kept through its remux), so its movie-sized
+            # flag can be re-measured exactly as _hand_to_finisher measured it — without this a
+            # relaunch dropped it, and the overlap gate's drain exemption applied to a ~190 GiB
+            # working set. A Resolve item's segdir is long gone: nothing to measure, as before;
+            # nor is there anything for a native item whose master already passed ('encoded').
+            native = _native_holds_chunks(p)
+            big = bool(p.movie) or (native and self._topaz_working_bytes(p) > MOVIE_SIZED_BYTES)
             with self._finisher_lock:
                 if key in self._in_finisher:      # another thread claimed it between the snapshot and now
                     continue
                 self._in_finisher.add(key)
-                if p.movie:
+                if big:
                     self._in_finisher_movies.add(key)
+                if native:
+                    self._native_fin[key] = p.segdir
             self._finish_q.put(p)
             logbook.event(f"finisher resume: {transfer.display_name(p.ep)} re-queued "
                           f"(remux/upload continues on the finisher)")
@@ -2261,14 +2460,29 @@ class Orchestrator:
                     # its intermediate fits above the floor — else the buffer is full: wait and let the
                     # retry cadence re-probe Resolve (nothing else is productive until the prompt clears).
                     reserve = STALL_MOVIE_RESERVE_GB if (ep.movie or ep.youtube) else STALL_ITEM_RESERVE_GB
+                    need = STALL_FLOOR_GB + reserve
+                    if self._native_eligible(ep):
+                        # A NATIVE-ELIGIBLE item does not join the stall buffer: it goes on to its
+                        # DV analysis, which must land above the 150 GiB mid-analysis floor AFTER
+                        # its ProRes is written, then keeps its chunks through its remux. Filling
+                        # toward STALL_FLOOR_GB first would strand it there, paused on low disk,
+                        # re-picked ahead of the stall probe — so it gets the ordinary floor.
+                        need = max(need, _min_free_gb())
                     phys = scratch.physical_free_gb()
-                    if phys is not None and phys < STALL_FLOOR_GB + reserve:
+                    if phys is not None and phys < need:
                         self.state["current"] = None
                         self._hold("stall",
                             f"Resolve stalled — upscale buffer full ({phys} GB free); dismiss "
                             f"Resolve's update prompt to drain {len(self._resolve_stall)} held item(s)",
                             held=len(self._resolve_stall))
                         self._sleep(DRAIN_POLL_SECONDS); continue
+                if (dmsg := self._native_overlap_hold(ep)) is not None:
+                    # U2: a native finisher item still holds its chunks — this item starts only
+                    # once raw free covers its OWN projected need (the loop-top gate could not
+                    # know which item comes next; it kept only the hard minimum).
+                    self.state["current"] = None
+                    self._hold("disk", dmsg)
+                    self._sleep(DRAIN_POLL_SECONDS); continue
                 if self._dual_remux_pauses_topaz(ep):
                     # 2 remuxes have the machine — hold fresh Topaz until a lane frees (already-
                     # upscaled items still flow through Resolve to feed the lanes).
@@ -2326,9 +2540,13 @@ class Orchestrator:
         `_parked`, and the item simply re-downloads."""
         import shutil as _shutil
         freed = 0
+        # A NATIVE item whose master already passed keeps its segdir: no chunks are left in it,
+        # only the 'encoded' marker that proves the kept master is this item's Topaz + DV work
+        # (without it a re-pick would re-run Topaz for a master already on disk).
+        stamp = p.segdir if _native_encoded(p) else None
         for d in (p.segdir, str(p.final) + ".remuxsegs",
                   (str(p.source_wide) + ".segments") if getattr(p, "source_wide", "") else ""):
-            if d and os.path.isdir(d):
+            if d and d != stamp and os.path.isdir(d):
                 freed += self._dir_gb(d)
                 _shutil.rmtree(d, ignore_errors=True)
         # A FINISHED MASTER IS NEVER SWEPT. Parking means "skip this for now", and the
@@ -2541,16 +2759,28 @@ class Orchestrator:
             phys = scratch.physical_free_gb()
             if phys is not None and phys < STALL_FLOOR_GB:
                 return f"paused — low disk ({phys} GB): dismiss Resolve's update prompt to drain held items"
+            held = self._finisher_native_segdirs()
+            if held:
+                # ...but a NATIVE finisher item's chunks are not part of that buffer's arithmetic:
+                # they stay until its remux passes. The finisher-overlap need applies (U2 — its
+                # hard minimum here, the next item's own need after selection).
+                return self._native_low_disk(held)
             return None
         if self._quiet_mode():
             phys = scratch.physical_free_gb()
             if phys is not None and phys < _min_free_gb():
+                held = self._native_only_held()
+                if held:                # U2: nothing waits on Resolve — only native chunks hold disk
+                    return self._native_low_disk(held)
                 return f"paused — low disk ({phys} GB): turn off Quiet Mode to drain items through Resolve"
         if self._display_held:
             # The same blind spot as Quiet Mode: items held before Resolve keep their upscaled
             # intermediates, which available_gb counts as reclaimable — gate on RAW free.
             phys = scratch.physical_free_gb()
             if phys is not None and phys < _min_free_gb():
+                held = self._native_only_held()
+                if held:                # U2, as above: the held items keep no upscale on disk
+                    return self._native_low_disk(held)
                 return (f"paused — low disk ({phys} GB): plug the pinned display back in to drain "
                         f"{len(self._display_held)} held item(s) through Resolve")
         if self._in_finisher_keys():
@@ -2560,8 +2790,17 @@ class Orchestrator:
             # prefetch buffer up) so the next item's own intermediate has guaranteed room. (Since the
             # drop, a finishing MOVIE no longer holds its ProRes, so both demands converge whenever
             # the floor is at or below OVERLAP_MIN_PHYS_GB — i.e. at every shipped default.)
+            # A NATIVE DV finisher item is the exception: it keeps its chunks until its remux
+            # passes. While one does, U2 ("Allow below 400 GB", user-decided 2026-10-15) replaces
+            # the flat need below with the next item's own projected need — asked after selection
+            # (_native_overlap_hold); this pre-selection gate keeps only its hard minimum.
             with self._finisher_lock:
                 fin_movie = bool(self._in_finisher_movies)
+            # ...but never while a MOVIE is finishing: its floor rule below stands (U2 relaxes
+            # only the TV overlap need; a movie's working set has never been measured).
+            held = [] if fin_movie else self._finisher_native_segdirs()
+            if held:
+                return self._native_low_disk(held)
             floor = _min_free_gb()
             # A finishing MOVIE gets the full floor; a TV episode's overlap demand is the measured
             # OVERLAP_MIN_PHYS_GB. Both are CAPPED BY the live floor, so lowering the setting on a
@@ -2589,6 +2828,137 @@ class Orchestrator:
         if free is not None and free < floor:
             return f"paused — low disk: {free} GB free (need ~{floor} GB)"
         return None
+
+    # ---- native DV: chunks a finisher item keeps, and the U2 disk policy around them ----------
+
+    def _finisher_native_segdirs(self, exclude=None) -> list:
+        """Segdirs of FINISHER-OWNED native items that still hold their Topaz chunks (a native
+        marker on disk, in any state but NATIVE_ENCODED): an item handed off native keeps them
+        until its remux passes, then the remux stage deletes them and stamps the marker
+        'encoded' (the segdir itself stays, a few MB, until cleanup). Built from _native_fin
+        (hand-off + reconcile) pruned against the durable work-list, so a parked or abandoned
+        item stops counting the moment it leaves it. Empty — with no disk access at all —
+        unless something was handed off native."""
+        fin = getattr(self, "_native_fin", None)
+        if not fin:
+            return []
+        with self._finisher_lock:
+            owned = {self._desc_skip_key(d) for d in self._finisher_persisted.values()}
+            for k in [k for k in fin if k not in owned]:
+                del fin[k]
+            dirs = list(fin.values())
+        skip = os.path.abspath(exclude) if exclude else None
+        out = []
+        for d in dirs:
+            if os.path.abspath(d) != skip and _native_holds_chunks(d):
+                out.append(d)
+        return out
+
+    def _native_only_held(self) -> list:
+        """U2 in _low_disk_pause's Quiet Mode and pinned-display branches: the finisher-owned
+        native segdirs still holding chunks — but ONLY when they are all that holds disk there,
+        i.e. no upscaled item waits on Resolve (_drain_backlog() == 0: no Topaz-finished segdir
+        without a native claim). Those two branches exist because items held before Resolve
+        pile up un-cleanable ProRes; with none on disk, the native chunks are the finisher
+        overlap U2 already governs. [] otherwise — and with no disk access at all unless
+        something was handed off native (always, with dv_engine 'resolve')."""
+        held = self._finisher_native_segdirs()
+        # The run thread's OWN native item (claimed, still analysing or ready, not yet handed
+        # off) holds its chunks just the same: without it a native item that yielded mid-
+        # analysis paused the run in Quiet Mode on its own chunks (verifier-caught). Only
+        # reached in these two branches, below the floor — one listdir of the scratch root.
+        # With dv_engine 'resolve' and nothing handed off native, no scan at all (the Resolve
+        # path stays untouched).
+        try:
+            import nativelane
+            if held or nativelane.engine_setting() == "native":
+                seen = {os.path.abspath(d) for d in held}
+                held += [d for d in nativelane.held_native_segdirs(states=("analyzing", "ready"))
+                         if os.path.abspath(d) not in seen and _native_holds_chunks(d)]
+        except Exception:  # noqa: BLE001 — bookkeeping must never break a gate
+            pass
+        if not held or self._drain_backlog() > 0:
+            return []
+        return held
+
+    def _native_low_disk(self, held) -> str | None:
+        """U2 BEFORE selection (the next item is not known yet): only the hard minimum of the
+        native overlap need, nativelane.NEXT_ITEM_MIN_GB. _native_overlap_hold asks the item's
+        own need once it is picked. A pause message, or None."""
+        import nativelane
+        need = nativelane.NEXT_ITEM_MIN_GB
+        self._reclaim_for_pipeline(need_gb=need)
+        phys = scratch.physical_free_gb()
+        if phys is not None and phys < need:
+            return (f"paused — low disk ({phys} GB) while {len(held)} native item(s) keep their "
+                    f"Topaz chunks for the remux (freed when it passes)")
+        return None
+
+    def _native_overlap_need_gb(self, ep) -> int:
+        """U2 ("Allow below 400 GB", user-decided 2026-10-15): the raw free `ep` still needs while
+        a native finisher item holds its chunks.
+          * Its size UNKNOWN — not downloaded yet, unprobeable, or an item that writes no ProRes
+            (YouTube, combine, the fast paths: _item_projection's flat stand-ins ignore how big
+            that item really is): today's need, min(OVERLAP_MIN_PHYS_GB, min_free_gb). Never
+            gate on a guess — this is what keeps a movie or a video from starting at 150 GiB.
+          * Its size KNOWN (a Topaz item's runtime, measured on disk): its projected need
+            (ProRes estimate + ITEM_TAIL_GB) less the ProRes it has already written, never below
+            nativelane.NEXT_ITEM_MIN_GB; with its Topaz done, only the tail is still to come.
+        The full projection is asked again at the Topaz doorstep in _process, once the item is
+        downloaded and its runtime can be measured."""
+        import nativelane
+        with self._finisher_lock:
+            fin_movie = bool(self._in_finisher_movies)
+        if fin_movie:                   # a finishing MOVIE keeps today's full floor (as above)
+            return _min_free_gb()
+        projected, measured = _item_projection(ep)
+        if not measured:
+            return min(OVERLAP_MIN_PHYS_GB, _min_free_gb())
+        if stage_done("topaz", ep):
+            return nativelane.next_item_need_gb(ITEM_TAIL_GB)
+        written = self._topaz_working_bytes(ep) // (1024 ** 3)
+        return nativelane.next_item_need_gb(projected - written)
+
+    def _native_overlap_hold(self, ep) -> str | None:
+        """U2's gate: while a FINISHER-OWNED native item still holds its chunks, `ep` may start
+        (or go on into Topaz) only when raw free covers _native_overlap_need_gb(ep) — this
+        replaces the flat min(OVERLAP_MIN_PHYS_GB, floor) for exactly that window. Asked after
+        selection in _run and again before Topaz in _process. None (no hold) whenever no native
+        chunks are held — always, with dv_engine 'resolve'. The hard floors never move:
+        STALL_FLOOR_GB, the 150 GiB mid-analysis floor, min_free_gb everywhere else."""
+        held = self._finisher_native_segdirs(exclude=getattr(ep, "segdir", None))
+        if not held:
+            return None
+        need = self._native_overlap_need_gb(ep)
+        self._reclaim_for_pipeline(need_gb=need)
+        phys = scratch.physical_free_gb()
+        if phys is not None and phys < need:
+            return (f"paused — low disk ({phys} GB) while {len(held)} native item(s) keep their "
+                    f"Topaz chunks for the remux: {transfer.display_name(ep.ep)} needs ~{need} GB "
+                    f"(frees when that remux passes)")
+        return None
+
+    def _native_eligible(self, ep) -> bool:
+        """Could this not-yet-upscaled item take the native lane? dv_engine 'native', a TV
+        episode, and nativelane.eligible on its plan once the source is on disk (before that
+        the plan is unknown, and unknown counts as eligible — the stricter side). False with
+        dv_engine 'resolve', after one settings read."""
+        try:
+            import nativelane
+            if nativelane.engine_setting() != "native":
+                return False
+        except Exception:  # noqa: BLE001 — no lane, no native items
+            return False
+        try:
+            if ep.movie or ep.youtube or getattr(ep, "combine", False):
+                return False
+            if not os.path.exists(ep.source):
+                return True
+            import plan as _plan
+            return nativelane.eligible(ep, _plan.plan_for(ep.source),
+                                       nativelane.effective_mode(ep))[0]
+        except Exception:  # noqa: BLE001 — unknown is the stricter answer here
+            return True
 
     def refresh_youtube_meta(self):
         """A setting the baked popular sets depend on changed (max_youtube_minutes):
@@ -3211,6 +3581,26 @@ class Orchestrator:
                 return
             if stage_done(st, p):
                 continue
+            if st == "topaz" and (dmsg := self._native_overlap_hold(p)) is not None:
+                # U2 at the Topaz doorstep: now that the source is on disk its runtime — so its
+                # ProRes — can be measured. Never holds unless a native finisher item still
+                # keeps its chunks (so never with dv_engine 'resolve').
+                self.state["current"] = None
+                self._hold("disk", dmsg)
+                self._sleep(DRAIN_POLL_SECONDS)
+                return
+            if st == "resolve":
+                # NATIVE DV SLOT (settings dv_engine 'native'): an eligible TV episode is analysed
+                # headless here instead — BEFORE every Resolve-keyed rule below (Quiet Mode, the
+                # pinned display, the stall ladder, the doorstep gate, SIGSTOP), none of which a
+                # screen-free analysis needs. "done" -> the RUN_STAGES loop ends and the native
+                # gate paces the hand-off; "stop" -> held/paused/failed; None -> Resolve, exactly
+                # as below (always, with dv_engine 'resolve' and no marker on the item).
+                slot = self._native_slot(p, ep_disp)
+                if slot == "done":
+                    continue
+                if slot == "stop":
+                    return
             if st == "resolve" and self._quiet_mode():     # SCREEN CONTROL OFF: hold before the screen-
                 self._defer_resolve(p, ep_disp); return    # invasive Resolve stage; process other items
             if st == "resolve":                            # its PINNED DISPLAY is gone (dummy unplugged):
@@ -3523,8 +3913,218 @@ class Orchestrator:
                 return
         if not self._enabled or self._abort.is_set():
             return
+        if not self._native_gate(p, ep_disp):   # a NATIVE item paces its hand-off here (a Resolve
+            return                              # item passes straight through — no marker)
         self._hand_to_finisher(p)   # GPU/screen stages done → remux/upload/cleanup run in the
                                     # background while the loop moves on to the next item
+
+    # ---- native DV: the 'dvnative' slot and the gate before its hand-off -----------------------
+
+    def _native_slot(self, p: EpisodePaths, ep_disp: str):
+        """The native DV lane's turn at the "resolve" slot (settings `dv_engine` 'native'; the
+        design's flow step 2). nativelane.decide picks the engine — a marker already on the
+        item keeps it native whatever the setting says now, a fallback.json sends it to Resolve
+        — and a native item runs the run-only 'dvnative' stage (stages._dvnative) here.
+
+        Deliberately NOT the Resolve stage: no Quiet Mode, display, stall or doorstep gate, no
+        _resolve_active / SIGSTOP of the remuxes, no _last_resolve_at, no _on_resolve_failure or
+        _resolve_recovered. It runs straight after Topaz, overlapping the previous item's x265
+        tail; the one-at-a-time pacing applies at the hand-off instead (_native_gate). A
+        sibling's lease holds it ('dvnative' is not a protected stage).
+
+        Returns None -> run Resolve as today (also in the same pass after a fallback); "done" ->
+        the analysis is ready; "stop" -> return from _process (held, paused, failed, stopped).
+        With dv_engine 'resolve' and no marker on the item it returns None after a stat and a
+        settings read: nothing else in the lane runs."""
+        try:
+            import nativelane
+            if not nativelane.has_marker(p) and nativelane.engine_setting() != "native":
+                return None                          # the default: today's path, byte for byte
+            if p.movie or p.youtube or p.combine:
+                return None                          # TV only — never claimed, nothing to probe
+            engine, why = nativelane.decide(p)
+        except Exception as e:  # noqa: BLE001 — a lane bug must cost Resolve, never the item
+            logbook.exception(f"native DV decision for {ep_disp}", e)
+            return None
+        key = self._skip_key(p)
+        if engine != "native":
+            if self._native_said.get(key) != why:
+                self._native_said[key] = why          # once per reason, not once per re-pick
+                logbook.event(f"{ep_disp}: DV via Resolve — {why}")
+            return None
+        held = self._lease_hold("dvnative")
+        if held:
+            self.state["current"] = None
+            self._hold("yield-lease", f"{ep_disp}: dvnative waits — {held}")
+            self._sleep(LEASE_POLL_SECONDS)
+            return "stop"
+        from stages import run_stage
+        self.state.update(stage="dvnative", message=f"{ep_disp}: dvnative", progress=None, hold=None)
+        self._reclaim_for_pipeline()
+        ekey = p.source_basename + "|dvnative"
+        self._elapsed_begin(ekey)
+        self._stage_active = True
+        self.state["stage_active"] = True
+        stop_tick = threading.Event()       # the card's heartbeat between chunk boundaries
+        ticker = threading.Thread(target=self._native_progress_ticker, args=(stop_tick,),
+                                  daemon=True, name="dvnative-progress")
+        ticker.start()
+        try:
+            ok, msg = run_stage("dvnative", p, abort=self._abort, progress=self._set_progress,
+                                should_pause=self._native_pause_predicate(p))
+        finally:
+            stop_tick.set()
+            ticker.join(timeout=5)          # before the card is cleared below: no late re-publish
+            self._stage_active = False
+            self.state["stage_active"] = False
+        if ok:
+            self._elapsed_done(ekey)
+        else:
+            self._elapsed_pause()
+        msg = str(msg)
+        self.state.update(message=" ".join(f"{ep_disp}: dvnative — {msg}".split()), progress=None)
+        if ok:
+            self._fail_counts.pop(key, None)
+            self._yield_streak.pop(key, None)
+            self._yield_block.discard(key)
+            return "done"
+        if msg.startswith("paused:"):
+            held = self._lease_hold("dvnative")
+            self.state["current"] = None
+            if held:                                # external, with its own clock: never counted
+                self._hold("yield-lease", f"{ep_disp}: dvnative paused — {held}")
+                self._sleep(LEASE_POLL_SECONDS)
+                return "stop"
+            if msg.startswith("paused: low disk"):  # the 150 GiB mid-analysis floor: room comes
+                self._hold("disk", f"{ep_disp}: DV analysis {msg}")   # back when a remux passes
+                self._sleep(DRAIN_POLL_SECONDS)
+                return "stop"
+            # The same LIVELOCK GUARD as a Topaz yield: worth something only if other work runs.
+            self._yield_streak[key] = self._yield_streak.get(key, 0) + 1
+            if self._yield_streak[key] >= YIELD_LIVELOCK_LIMIT:
+                self._yield_block.add(key)
+                logbook.event(f"{ep_disp}: yielded {self._yield_streak[key]} times with "
+                              f"nothing else able to run — keeping the machine")
+            if self._yt_priority_waiting():
+                self._hold("yt-priority", f"{ep_disp}: DV analysis paused — running the YouTube "
+                                          f"video you sent (this resumes after)")
+            elif self._gate_release_pending():
+                self._hold("resolve-gate", f"{ep_disp}: DV analysis paused — a waiting item's "
+                                           f"Resolve gets the machine (it resumes after)")
+            elif self._yt_cadence_due():
+                self._hold("yt-cadence", f"{ep_disp}: DV analysis paused — a YouTube video is "
+                                         f"due (it resumes after the burst)")
+            else:
+                self._hold("native", f"{ep_disp}: DV analysis paused — it resumes on the next pass")
+            return "stop"
+        if self._abort.is_set() or not self._enabled:
+            return "stop"                           # a stop/power abort is not the item's failure
+        try:
+            if msg.startswith("dvnative crashed"):  # run_stage caught it before the lane counted it
+                n = nativelane.count_failure(p, msg)
+                if nativelane.should_fall_back(msg, n):
+                    nativelane.write_fallback(p, msg)
+            if nativelane.has_fallback(p):
+                logbook.event(f"{ep_disp}: native DV fell back — Resolve takes it now "
+                              f"(the Topaz chunks are untouched)")
+                return None                         # ...in this same pass
+            n = nativelane.failure_count(p)
+        except Exception as e:  # noqa: BLE001
+            logbook.exception(f"native DV bookkeeping for {ep_disp}", e)
+            n = 0
+        self._hold("retry", f"{ep_disp}: DV analysis failed (native attempt {n} of "
+                            f"{nativelane.MAX_FAILURES}) — retrying; it resumes chunk by chunk",
+                   attempt=n, of=nativelane.MAX_FAILURES)
+        self._sleep(60)
+        return "stop"
+
+    def _native_pause_predicate(self, p: EpisodePaths):
+        """`should_pause` for the 'dvnative' stage: Topaz's yield reasons — a sibling's lease, a
+        gate-released fast item, a sent video, a due cadence video (the last three behind the
+        livelock guard) — WITHOUT the two-live-remuxes one: an analysis yielding to remuxes is
+        re-picked at once (its Topaz is done, so nothing holds it at selection) and would only
+        throw its chunk in hand away each time. A yield kills the step in progress (it restarts
+        on resume), and the analysis asks every 0.5 s, so the answer is re-computed at most every
+        NATIVE_PAUSE_POLL_SECONDS — _gate_release_pending can probe every buffered chunk."""
+        key = self._skip_key(p)
+
+        def reasons():
+            return (self._yield_lease.blocks("dvnative")
+                    or ((key not in self._yield_block)
+                        and (self._gate_release_pending()
+                             or self._yt_priority_waiting()
+                             or self._yt_cadence_due())))
+        last = {"at": None, "answer": False}
+
+        def should_pause():
+            now = time.monotonic()
+            if last["at"] is None or now - last["at"] >= NATIVE_PAUSE_POLL_SECONDS:
+                last["at"], last["answer"] = now, bool(reasons())
+            return last["answer"]
+        return should_pause
+
+    def _native_should_hold(self, p: EpisodePaths) -> bool:
+        """The native gate's hold rule (D3): the user-dictated one-at-a-time pacing — the same
+        _resolve_should_hold(False) the Resolve doorstep uses — OR another finisher-owned native
+        item still has its chunks on disk. The second half closes a real gap: resolve_must_wait
+        counts only lanes whose stage is "remux", and a failed remux clears its lane for its 30 s
+        backoff while its chunks stay put. So at most two ProRes sets ever coexist."""
+        return (self._resolve_should_hold(False)
+                or bool(self._finisher_native_segdirs(exclude=p.segdir)))
+
+    def _native_gate(self, p: EpisodePaths, ep_disp: str) -> bool:
+        """Immediately before _hand_to_finisher: True = hand the item off now. A Resolve item (no
+        native marker, or a fallback.json) passes straight through — today's hand-off, untouched.
+        A NATIVE item — including one re-picked after a relaunch whose stage_done("resolve") was
+        already true, so the gate is never skipped — is held here while _native_should_hold, then
+        steps back to selection if a fast-path/YouTube item was deferred at the doorstep ahead of
+        it (the Resolve doorstep's starvation guard, reused). A marker whose analysis no longer
+        matches the disk is not handed off at all: the next pass re-measures it (counted, so a
+        mismatch that keeps coming back falls back to Resolve)."""
+        if not _native_claimed(p):
+            return True
+        if _native_encoded(p):
+            # Its master already passed the peak gate (an item re-picked after a finisher park,
+            # or a lost work-list): no chunks to keep, no remux to pace — the finisher just
+            # uploads it. Nothing for this gate to hold.
+            return True
+        import nativelane
+        try:
+            ok, why = nativelane.check_ready(p)
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, f"{e.__class__.__name__}: {e}"
+        if not ok:
+            why = f"not ready at hand-off: {why}"
+            try:
+                # The lane's books are files on a disk that may be full right now: an OSError
+                # here must never leave _process — it would end the run loop for good (the
+                # re-arm daemon only restarts a DISABLED run). The next pass re-measures.
+                n = nativelane.count_failure(p, why)
+                if nativelane.should_fall_back(why, n):
+                    nativelane.write_fallback(p, why)
+                    logbook.event(f"{ep_disp}: native DV {why} — Resolve takes it")
+                else:
+                    logbook.event(f"{ep_disp}: native DV {why} — the next pass re-measures it")
+            except Exception as e:  # noqa: BLE001
+                logbook.exception(f"native DV bookkeeping for {ep_disp}", e)
+            return False
+        while self._native_should_hold(p):
+            if not self._enabled or self._abort.is_set():
+                return False
+            fin = self.state.get("finishing") or {}
+            self._hold("native-gate",
+                f"{ep_disp}: DV analysis done — finishing "
+                f"{fin.get('ep') or 'the previous item'}'s remux first")
+            time.sleep(10)
+        if self._gate_deferred and self._gate_release_pending():
+            # STARVATION GUARD, as at the Resolve doorstep: a fast-path/YouTube item deferred
+            # there was promised first pick when the remux ends. Handing off now would start
+            # this item's remux and re-defer it. Step back; this item is re-picked right after
+            # with everything on disk (stage_done("resolve") is its ready marker).
+            self.state["current"] = None
+            self._hold("native-gate", f"{ep_disp}: yielding to the item deferred ahead of it")
+            return False
+        return True
 
     # ---- finisher: the headless tail (remux/upload/cleanup) overlapped with the next item ----
 
@@ -3547,6 +4147,13 @@ class Orchestrator:
         Counting segdirs is exact rather than approximate, because outside a stall the code
         already guarantees AT MOST ONE exists — _drop_topaz_intermediates rmtree's each at
         hand-off. So >= 2 segdirs IS the stall buffer, by the pipeline's own invariant.
+        NATIVE DV items break that invariant on purpose (dv_engine 'native': a finisher item
+        keeps its chunks through its remux, and the next item analyses beside it) — and they
+        never wait on Resolve, so a segdir carrying a native marker (native/native.json, in
+        any state, with no fallback.json beside it) is not part of any Resolve backlog and is
+        never counted. Without that, the steady native state read as a two-item stall: pacing
+        skipped, fresh Topaz held, the remux lanes standing down, the overlap gate dropped to
+        80 GB.
 
         A segdir counts ONLY once it holds a real upscaled segment (`seg_NNNN.mov`). A dir
         containing nothing but the `scenes.json` scene-plan cache is not buffered work:
@@ -3566,6 +4173,8 @@ class Orchestrator:
                 d = os.path.join(base, name)
                 if not (name.endswith(".segments") and os.path.isdir(d)):
                     continue
+                if _native_claimed(d):
+                    continue        # a native item's chunks: never a Resolve backlog (see above)
                 # ...and the topaz must be FINISHED. "Has a segment in it" is not the same
                 # as buffered work: an ABORTED topaz leaves real seg_NNNN.mov files behind
                 # and is the very item still waiting to be upscaled. Two of those (a deploy
@@ -3598,7 +4207,9 @@ class Orchestrator:
         # per item. Holding Resolve behind the remuxes leaves those enormous intermediates on
         # disk for the length of a ~75-minute x265 encode each. Converting first frees the
         # disk fastest and leaves a queue of SMALL items that two lanes can then chew through
-        # in parallel — which is the whole point of having two lanes.
+        # in parallel — which is the whole point of having two lanes. (Only RESOLVE items are
+        # in that arithmetic: a native item frees nothing at conversion — it keeps its chunks
+        # until its remux passes — and _drain_backlog never counts one.)
         if self._drain_backlog() >= 2:
             return False
         # The pure rule holds while a remux is queued — so give it the count of queued items
@@ -3617,7 +4228,9 @@ class Orchestrator:
         pipeline: no download/topaz ran for the entire ~65-min remux (user-caught). A single queued
         finisher item holds only ~10 GB post-drop, the resolve gate already holds the NEXT item at
         the resolve doorstep while anything is queued, and the disk gates guard raw free — so one
-        waiter is safe to overlap; two says the finisher is genuinely behind."""
+        waiter is safe to overlap; two says the finisher is genuinely behind. (A NATIVE item holds
+        its ~130-190 GiB of chunks instead of ~10 GB until its remux passes; the native gate keeps
+        at most one such item ahead, and U2's projected-need gate covers its disk.)"""
         # ...EXCEPT while draining a Resolve-stall backlog, where the backpressure is exactly
         # backwards. A queued finisher item is already past hand-off, so its ProRes is gone
         # and it costs ~18 GiB; the items still waiting to convert cost ~190 GiB EACH. Holding
@@ -4010,7 +4623,11 @@ class Orchestrator:
         they lingered ~35 min until cleanup; the finisher window is now HOURS and overlaps the
         next item's topaz writes — ~250-350 GB of scratch held for nothing (user-caught). The
         recovery ladder is unchanged: if the DV render were ever lost, resolve re-runs, which
-        re-runs topaz from the KEPT source/CFR — same as after any cleanup."""
+        re-runs topaz from the KEPT source/CFR — same as after any cleanup.
+
+        NOT for a NATIVE DV item (_hand_to_finisher skips the call): it has no render — its
+        remux and that remux's peak repair read these very chunks through the LUT, so they stay
+        until the master passes the peak gate (stages._remux deletes them then)."""
         try:
             os.remove(p.prores)
         except OSError:
@@ -4025,12 +4642,26 @@ class Orchestrator:
             # after the drop (and only probed the legacy single-file name the no-concat design
             # never writes), so it always raised OSError and `big` stayed False (user-caught).
             big = self._topaz_working_bytes(p) > MOVIE_SIZED_BYTES
-        self._drop_topaz_intermediates(p)   # frees ~250-350 GB the finisher never reads
+        # A NATIVE item (claimed by the lane; _native_gate just confirmed it ready) KEEPS its
+        # chunks: they are its remux's source. Every other item drops them, as always — except
+        # a native one whose master already passed ('encoded': re-picked after a park). It has
+        # no chunks left, and its segdir is only the marker proving that master is this item's
+        # Topaz + DV work: dropping it would re-run Topaz if the upload parked again.
+        claimed = _native_claimed(p)
+        native = claimed and _native_holds_chunks(p)
+        if native:
+            logbook.event(f"{transfer.display_name(p.ep)}: keeping "
+                          f"{self._topaz_working_bytes(p) / 1024 ** 3:.0f} GiB of Topaz chunks "
+                          f"for the native remux")
+        elif not claimed:
+            self._drop_topaz_intermediates(p)   # frees ~250-350 GB the finisher never reads
         self._advance_cadence_at_handoff(p)
         with self._finisher_lock:
             self._in_finisher.add(self._skip_key(p))
             if big:
                 self._in_finisher_movies.add(self._skip_key(p))
+            if native:
+                self._native_fin[self._skip_key(p)] = p.segdir
             d = self._finisher_descriptor(p)     # record DURABLE ownership so a deactivate/relaunch
             self._finisher_persisted[self._desc_cid(d)] = d   # mid-remux RESUMES it (see _finisher_reconcile)
             self._save_finisher_persisted_locked()
@@ -4378,6 +5009,16 @@ class Orchestrator:
                             self._tv_since_yt = 0
                         self._save_cadence()
                     self._finisher_persist_remove(p)   # parked → terminal; stop resuming it every arm
+                    if _native_holds_chunks(p):
+                        # A NATIVE item parked here still holds its ~130-190 GiB of Topaz chunks
+                        # (kept for its remux) — sweep them like a run-thread park does. A Resolve
+                        # item keeps its render as before: the finisher park never swept those —
+                        # nor one whose master already passed ('encoded', e.g. parked at upload):
+                        # its chunks are gone, and the master + marker resume it at upload.
+                        try:
+                            self._sweep_parked_files(p, ep_disp)
+                        except Exception as e:
+                            logbook.exception(f"sweeping parked files for {ep_disp}", e)
                     logbook.failure(f"{p.ep}: parked after {n} failures at {st} — skipping so the "
                                     f"series keeps moving (last: {' '.join(str(msg).split())[-120:]})")
                 else:

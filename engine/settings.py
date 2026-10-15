@@ -181,6 +181,17 @@ DEFAULT_SETTINGS = {
                                 # before the first click. A timer was tried and removed — it had to
                                 # start at the top of the stage, but the takeover lands whenever
                                 # setup() finishes, so it hit zero and sat at "now..." for minutes.
+
+    # --- WHO MAKES A TV EPISODE'S DOLBY VISION (defaults to today's behaviour) ---------
+    "dv_engine": "resolve",     # 'resolve' | 'native'. 'resolve' = Resolve's DV pass for every item,
+                                # exactly as it always was. 'native' = an ELIGIBLE TV episode (Topaz
+                                # path, SDR intake, dv1000 output; never a movie, YouTube, fast path
+                                # or combine) is analysed by hdr_analyzer_mvp + the pinned LUT
+                                # instead (dvnative.py), with no screen takeover. This IS how a file
+                                # is encoded, hence no app control (POST /api/settings only, which
+                                # refuses 'native' with a 409 while preflight.check_native_dv fails).
+                                # Read at USE time via dv_engine(); an item that has started native
+                                # stays native whatever this says later (its segdir marker decides).
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -377,10 +388,26 @@ def _valid_nas_network(v):
     return v if v in ("ethernet", "wifi", "ethernet_only") else "ethernet"
 
 
+DV_ENGINES = ("resolve", "native")
+
+
+def _valid_dv_engine(v):
+    """Only the exact two values survive; anything else is 'resolve', the old safe path."""
+    return v if isinstance(v, str) and v in DV_ENGINES else "resolve"
+
+
+def dv_engine() -> str:
+    """The live DV-engine choice, validated on READ: get_settings() merges the file over the
+    defaults without checking it, so a hand-edited "Native" or "x" must not reach the engine
+    as-is. Engine code calls this at USE time (like tunable()), never at import."""
+    return _valid_dv_engine(get_settings().get("dv_engine", "resolve"))
+
+
 VALIDATORS = {"resolve_host_displays": _valid_display_list,
               "quiet_until": _valid_quiet_until,
               "nas_network": _valid_nas_network,
-              "plex_throttle": _valid_plex_throttle}
+              "plex_throttle": _valid_plex_throttle,
+              "dv_engine": _valid_dv_engine}
 
 
 def set_settings(updates: dict) -> dict:

@@ -34,12 +34,23 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
+import sys
+import tempfile
+import time
+
+import versions as _versions
 
 DOVI_TOOL = "/opt/homebrew/bin/dovi_tool"
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
-HDR_ANALYZER = os.path.expanduser("~/.topaz-pipeline/bin/hdr_analyzer_mvp")
-HDR_ANALYZER_COMMIT = "383b0ad"     # tinof/hdr-analyze, built from source (cargo, Homebrew ffmpeg 8)
+# The analyzer binary and its commit are pinned in versions.py (the native lane's toolchain
+# pins). Read with defaults so this module still imports beside an older versions.py.
+HDR_ANALYZER = os.path.expanduser(getattr(_versions, "HDR_ANALYZER_PATH",
+                                          "~/.topaz-pipeline/bin/hdr_analyzer_mvp"))
+HDR_ANALYZER_COMMIT = getattr(_versions, "HDR_ANALYZER_COMMIT", "383b0ad")
+                                    # tinof/hdr-analyze, built from source (cargo, Homebrew ffmpeg 8)
+ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # What Resolve's 1000-nit DV project writes (read from Resolve masters' RPUs with
 # `dovi_tool export`): mastering 0.0001..1000 nits, BT.2020 source primaries (L9 index 2),
@@ -181,12 +192,121 @@ def x265_max_cll(sc: dict):
 # hdr_analyzer_mvp drops frames on a piped input (measured: a 72-frame y4m pipe read as 1
 # frame, NUT as 21), so each Topaz chunk is rendered to a lossless FILE first: the PQ
 # picture after the LUT, area-downscaled IN RGB to 1080p, then 4:4:4 (no chroma-subsampling
-# overshoot in max-RGB), FFV1. ~4 MB/frame, ~9 GB per ~90 s chunk, one at a time, deleted as
-# soon as it is measured (Visionary gates on 400 GB raw free, so never batch these). Topaz
-# cuts its chunks at strong scene changes, so every chunk start is a scene start and per-chunk
-# results join without a seam.
+# overshoot in max-RGB), FFV1. ~4 MB/frame, and a chunk has no upper length: Topaz closes it
+# at the first strong cut at least ~90 s in, so a quiet stretch runs long (S06E05's 7,058-frame
+# chunk made a 26-28 GiB intermediate, not the ~9 GB once written here). One at a time,
+# deleted as soon as it is measured, and never started without room for it: the caller's
+# before_chunk hook checks free space against the chunk's frames first (the native lane's
+# 150 GiB floor). Topaz cuts its chunks at strong scene changes, so every chunk start is a
+# scene start and per-chunk results join without a seam.
+#
+# Every step is a child process run by run_step(): at nice 10 in its own process group, polled
+# so an abort or should_pause kills it (and anything it started) within a second, and bounded
+# by step_timeout(). The per-frame L4 pass runs in a child too (`python3 -m dvnative l4`), so
+# its numpy work and memory stay out of the engine process.
 
 ANALYSIS_WIDTH, ANALYSIS_HEIGHT = 1920, 1080
+NICE = 10                       # analysis children run below x265 and Topaz
+NICE_BIN = "/usr/bin/nice"
+POLL_SECONDS = 0.5              # how often a running step checks abort / should_pause / time
+STEP_BASE_SECONDS = 300         # per-step timeout = this + frames / STEP_FRAMES_PER_SECOND:
+STEP_FRAMES_PER_SECOND = 5      # far above any healthy step, so only a wedged child trips it
+OUTPUT_TAIL_BYTES = 1000        # how much of a failed child's output a reason quotes
+
+
+class Paused(Exception):
+    """analyze_chunks stopped cleanly: should_pause or before_chunk asked it to. The step in
+    flight was killed and its partial files removed; every published chunk is kept, so the
+    next call resumes at the chunk that was interrupted. str() starts with "paused:"."""
+
+
+class Aborted(RuntimeError):
+    """The run was stopped (abort set) mid-analysis; the step in flight was killed."""
+
+
+def step_timeout(frames) -> int:
+    """PURE. Seconds one analysis step of a `frames`-frame chunk may take: 300 + frames / 5,
+    rounded up (7,058 frames -> 1,712 s)."""
+    return STEP_BASE_SECONDS + -(-max(0, int(frames or 0)) // STEP_FRAMES_PER_SECOND)
+
+
+def niced(cmd: list, nice: int = NICE) -> list:
+    """PURE. `cmd` prefixed to run at `nice` (0 = unchanged). nice(1) execs the command, so
+    the child keeps the pid Popen reports, and its own children inherit the priority."""
+    return [NICE_BIN, "-n", str(int(nice)), *cmd] if nice else list(cmd)
+
+
+def wait4_cpu(proc, block: bool = True):
+    """Reap `proc` with os.wait4 and return the user+sys CPU seconds it used, including every
+    descendant it waited for (the L4 child's ffmpeg). None while it is still running
+    (block=False). Sets proc.returncode, as Popen.wait would, so nothing waits on the pid
+    again. 0.0 when the pid was already reaped elsewhere."""
+    if proc.returncode is not None:
+        return 0.0
+    try:
+        pid, status, ru = os.wait4(proc.pid, 0 if block else os.WNOHANG)
+    except ChildProcessError:
+        proc.returncode = proc.returncode if proc.returncode is not None else -1
+        return 0.0
+    if pid == 0:
+        return None
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    return ru.ru_utime + ru.ru_stime
+
+
+def _kill_group(proc) -> None:
+    """SIGKILL the step's whole process group (it was started in its own session) and reap it."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    wait4_cpu(proc, block=True)
+
+
+def _tail(f) -> str:
+    try:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - OUTPUT_TAIL_BYTES))
+        return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def run_step(cmd: list, *, timeout: float, abort=None, should_pause=None, cwd: str | None = None,
+             what: str = "step", poll: float = POLL_SECONDS) -> tuple:
+    """Run one analysis child to completion -> (returncode, output tail, CPU seconds).
+
+    The child gets its own session (so a kill takes its children too), stdin closed, and its
+    stdout+stderr in an anonymous temp file (a full pipe can never stall it). While it runs,
+    every `poll` seconds: abort set -> kill, raise Aborted; should_pause() -> kill, raise
+    Paused; past `timeout` -> kill, raise RuntimeError. Whatever ends the wait, a child still
+    running on the way out is killed and reaped."""
+    with tempfile.TemporaryFile() as log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                cwd=cwd, start_new_session=True)
+        t0 = time.monotonic()
+        try:
+            while True:
+                cpu = wait4_cpu(proc, block=False)
+                if cpu is not None:
+                    break
+                if abort is not None and abort.is_set():
+                    raise Aborted(f"aborted (run stopped) during {what}")
+                if should_pause is not None and should_pause():
+                    raise Paused(f"paused: yielded during {what} — it restarts on resume")
+                if time.monotonic() - t0 > timeout:
+                    raise RuntimeError(f"{what} timed out after {int(timeout)} s")
+                if abort is not None:
+                    abort.wait(poll)
+                else:
+                    time.sleep(poll)
+        finally:
+            if proc.returncode is None:
+                _kill_group(proc)
+        return proc.returncode, _tail(log), cpu
 
 
 def analysis_vf(cube: str | None) -> str:
@@ -229,7 +349,8 @@ def maxrgb_pq12_stats(frame, width: int, height: int):
 def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
              height: int = ANALYSIS_HEIGHT) -> list:
     """Per-frame [anchor_pq, anchor_power] (rounded mean, std of PQ max-RGB) of a yuv444p10le
-    PQ file — the analysis intermediate, so it costs one more decode of a file we already made."""
+    PQ file — the analysis intermediate, so it costs one more decode of a file we already made.
+    analyze_chunks runs this in a child (build_l4_command), never in the engine process."""
     size = width * height * 3 * 2
     p = subprocess.Popen(build_raw444_decode_command(ffmpeg, src), stdout=subprocess.PIPE)
     out = []
@@ -246,6 +367,13 @@ def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
     if p.returncode != 0:
         raise RuntimeError(f"L4 decode failed (rc={p.returncode})")
     return out
+
+
+def build_l4_command(python: str, src: str, out_json: str, *, ffmpeg: str = FFMPEG,
+                     width: int = ANALYSIS_WIDTH, height: int = ANALYSIS_HEIGHT) -> list:
+    """`python3 -m dvnative l4 ...` (run with cwd = ENGINE_DIR): frame_l4 of `src` as JSON."""
+    return [python, "-m", "dvnative", "l4", src, out_json, "--ffmpeg", ffmpeg,
+            "--size", f"{int(width)}x{int(height)}"]
 
 
 def merge_sidecars(parts: list, total: int | None = None) -> dict:
@@ -282,47 +410,112 @@ def merge_sidecars(parts: list, total: int | None = None) -> dict:
     return out
 
 
+def _rm_quiet(*paths) -> None:
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _load_chunk(side: str, l4_path: str | None, frames: int) -> tuple:
+    """(sidecar with its "l4" list attached, None) for a published chunk that covers exactly
+    `frames` frames; (None, why) for one that cannot be used."""
+    try:
+        sc = load_sidecar(side)
+        if stream_frames(sc) != frames:
+            return None, f"analysis covers {stream_frames(sc)} frames, the chunk has {frames}"
+        if l4_path:
+            with open(l4_path) as f:
+                sc["l4"] = json.load(f)
+            got = len(sc["l4"]) if isinstance(sc["l4"], list) else None
+            if got != frames:
+                return None, f"L4 has {got} frames, the chunk has {frames}"
+        return sc, None
+    except (OSError, ValueError) as e:
+        return None, f"unreadable result: {e}"
+
+
 def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: str = HDR_ANALYZER,
                    ffmpeg: str = FFMPEG, peak_estimator: str = "max", with_l4: bool = True,
-                   threads: int | None = None, abort=None, on_chunk=None) -> dict:
-    """Measure every chunk ([[first_frame, path], ..., [total, None]]) and return the merged
-    sidecar. A finished chunk's sidecar (and its L4 list) is kept in `workdir` and reused on
-    resume; the ~9 GB intermediate is always deleted."""
+                   threads: int | None = None, abort=None, on_chunk=None, should_pause=None,
+                   before_chunk=None, on_cpu=None, python: str | None = None,
+                   nice: int = NICE) -> dict:
+    """Measure every chunk ([[first_frame, path], ..., [total, None]] — the end sentinel is
+    required: it gives each chunk its frame count) and return the merged sidecar.
+
+    A finished chunk's sidecar (and its L4 list) is kept in `workdir` and reused on resume;
+    the intermediate is always deleted. Before a chunk that still needs work:
+      abort set                   -> Aborted
+      should_pause()              -> Paused (also polled while each step runs; the step dies)
+      before_chunk(k, frames)     -> a non-empty string pauses with that reason (the caller's
+                                     disk floor); it may also raise Paused itself
+    Each step (intermediate, analyzer, L4) runs through run_step at `nice`, bounded by
+    step_timeout(frames). on_chunk(done, of) after every chunk, resumed ones included;
+    on_cpu(k, cpu_seconds, frames) after each chunk measured in THIS call (os.wait4 user+sys
+    over its three steps). A chunk whose results do not cover exactly its frames (sidecar or
+    L4) is deleted and fails the call, so a retry measures it again instead of reusing it."""
+    if not chunks or chunks[-1][1] is not None:
+        raise ValueError("the chunk list must end with its [total, None] sentinel")
     os.makedirs(workdir, exist_ok=True)
-    total = chunks[-1][0] if chunks and chunks[-1][1] is None else None
+    total = int(chunks[-1][0])
+    python = python or sys.executable
     real = [(a, p) for a, p in chunks if p]
+    ends = [int(a) for a, _p in chunks[1:]]
     parts = []
     for k, (first, path) in enumerate(real):
-        if abort is not None and abort.is_set():
-            raise RuntimeError("aborted")
+        frames = ends[k] - int(first)
         out_bin = os.path.join(workdir, f"chunk_{k:04d}.bin")
         side = sidecar_path(out_bin)
         l4_path = os.path.join(workdir, f"chunk_{k:04d}.l4.json")
         if not os.path.exists(side) or (with_l4 and not os.path.exists(l4_path)):
+            if abort is not None and abort.is_set():
+                raise Aborted("aborted (run stopped)")
+            if should_pause is not None and should_pause():
+                raise Paused(f"paused: yielded before analysis chunk {k + 1} of {len(real)}")
+            if before_chunk is not None:
+                why = before_chunk(k, frames)
+                if why:
+                    why = str(why)
+                    raise Paused(why if why.startswith("paused:") else "paused: " + why)
             mkv = os.path.join(workdir, f"chunk_{k:04d}.mkv")
+            tmo = step_timeout(frames)
+            cpu = 0.0
+
+            def step(cmd, what, cwd=None):
+                nonlocal cpu
+                rc, tail, used = run_step(niced(cmd, nice), timeout=tmo, abort=abort,
+                                          should_pause=should_pause, cwd=cwd,
+                                          what=f"chunk {k + 1} {what}")
+                cpu += used or 0.0
+                return rc, tail
+
             try:
-                r = subprocess.run(build_analysis_intermediate_command(ffmpeg, path, mkv, cube),
-                                   capture_output=True, text=True, errors="replace")
-                if r.returncode != 0:
-                    raise RuntimeError(f"chunk {k}: intermediate failed: {r.stderr[-300:]}")
-                r = subprocess.run(build_analyzer_command(analyzer, mkv, out_bin + ".part",
-                                                          peak_estimator=peak_estimator, threads=threads),
-                                   capture_output=True, text=True, errors="replace")
-                if r.returncode != 0 or not os.path.exists(sidecar_path(out_bin + ".part")):
-                    raise RuntimeError(f"chunk {k}: analyzer failed: {(r.stderr or r.stdout)[-300:]}")
+                rc, tail = step(build_analysis_intermediate_command(ffmpeg, path, mkv, cube), "intermediate")
+                if rc != 0:
+                    raise RuntimeError(f"chunk {k}: intermediate failed: {tail[-300:]}")
+                rc, tail = step(build_analyzer_command(analyzer, mkv, out_bin + ".part",
+                                                       peak_estimator=peak_estimator, threads=threads),
+                                "analyzer")
+                if rc != 0 or not os.path.exists(sidecar_path(out_bin + ".part")):
+                    raise RuntimeError(f"chunk {k}: analyzer failed: {tail[-300:]}")
                 if with_l4:
-                    with open(l4_path + ".part", "w") as f:
-                        json.dump(frame_l4(mkv, ffmpeg=ffmpeg), f)
+                    rc, tail = step(build_l4_command(python, mkv, l4_path + ".part", ffmpeg=ffmpeg),
+                                    "L4", cwd=ENGINE_DIR)
+                    if rc != 0 or not os.path.exists(l4_path + ".part"):
+                        raise RuntimeError(f"chunk {k}: L4 failed: {tail[-300:]}")
                     os.replace(l4_path + ".part", l4_path)
+                load_sidecar(sidecar_path(out_bin + ".part"))       # never publish an invalid one
                 os.replace(sidecar_path(out_bin + ".part"), side)   # publish last: resume trusts it
             finally:
-                for junk in (mkv, out_bin + ".part"):
-                    if os.path.exists(junk):
-                        os.remove(junk)
-        sc = load_sidecar(side)
-        if with_l4:
-            with open(l4_path) as f:
-                sc["l4"] = json.load(f)
+                _rm_quiet(mkv, out_bin + ".part", sidecar_path(out_bin + ".part"), l4_path + ".part")
+            if on_cpu:
+                on_cpu(k, cpu, frames)
+        sc, bad = _load_chunk(side, l4_path if with_l4 else None, frames)
+        if bad:
+            _rm_quiet(side, l4_path)            # never reuse it: the retry measures it again
+            raise RuntimeError(f"chunk {k}: {bad}")
         parts.append((first, sc))
         if on_chunk:
             on_chunk(k + 1, len(real))
@@ -439,3 +632,36 @@ def generate_rpu(sidecar, rpu_out: str, *, dovi_tool: str = DOVI_TOOL, l4: bool 
         raise RuntimeError("dovi_tool generate failed: " + (r.stderr or r.stdout)[-400:])
     os.replace(part, rpu_out)
     return cfg
+
+
+# ---- child entry point ------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    """`python3 -m dvnative l4 <intermediate.mkv> <out.json> [--ffmpeg PATH] [--size WxH]`:
+    frame_l4 of the intermediate written as JSON. analyze_chunks runs this as a child (nice 10,
+    killable, its numpy memory gone when it exits) and publishes `out` only on exit status 0."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="dvnative")
+    sub = ap.add_subparsers(dest="cmd")
+    l4 = sub.add_parser("l4", help="per-frame L4 of a yuv444p10le PQ file, as JSON")
+    l4.add_argument("src")
+    l4.add_argument("out")
+    l4.add_argument("--ffmpeg", default=FFMPEG)
+    l4.add_argument("--size", default=f"{ANALYSIS_WIDTH}x{ANALYSIS_HEIGHT}")
+    a = ap.parse_args(argv)
+    if a.cmd != "l4":
+        ap.print_usage(sys.stderr)
+        return 2
+    try:
+        width, height = (int(v) for v in a.size.lower().split("x"))
+    except ValueError:
+        print(f"--size must be WxH, got {a.size!r}", file=sys.stderr)
+        return 2
+    data = frame_l4(a.src, ffmpeg=a.ffmpeg, width=width, height=height)
+    with open(a.out, "w") as f:
+        json.dump(data, f)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,7 +6,8 @@ All Shots @ 1000-nit, and the DV Profile 8.1 dropdown) go through dv_shim, which
 needs this process to have macOS Screen-Recording + Accessibility grants and
 `cliclick`. Missing grants surface in preflight/Setup (check_tcc_grants); if they
 are missing at run time the resolve stage returns not-ok and the episode stays
-parked at this stage (resumable).
+parked at this stage (resumable). The 'dvnative' stage is the headless alternative
+for an eligible TV episode when settings `dv_engine` is 'native' (see _dvnative).
 """
 from __future__ import annotations
 import json
@@ -336,14 +337,16 @@ def _source_video_kbps(path):
 def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pause=None):
     fn = {
         "download": _download, "extend": _extend, "topaz": _topaz, "resolve": _resolve,
-        "remux": _remux, "upload": _upload, "cleanup": _cleanup,
+        "dvnative": _dvnative, "remux": _remux, "upload": _upload, "cleanup": _cleanup,
     }.get(stage, lambda *_a, **_k: (False, f"unknown stage {stage}"))
     ep = getattr(p, "ep", "?")
     try:
         # `should_pause` = yield at the next segment boundary: topaz yields to two live
         # remuxes; a remux yields to an active Resolve (Resolve gets the whole machine).
-        # Both are segmented, so a pause costs nothing — the retry resumes in place.
-        if stage in ("topaz", "remux"):
+        # Both are segmented, so a pause costs nothing — the retry resumes in place. The
+        # native DV analysis ('dvnative', run thread only) is per-chunk resumable too: a
+        # pause there loses at most the chunk in hand.
+        if stage in ("topaz", "remux", "dvnative"):
             ok, msg = fn(p, abort, progress, should_pause)
         elif stage == "download":
             # download yields too — to a sent video only (see _download); the orchestrator
@@ -1660,6 +1663,214 @@ def _resolve(p, abort, progress=None):
             _quit_resolve_focus_app()
 
 
+def _dvnative(p, abort, progress=None, should_pause=None):
+    """NATIVE DOLBY VISION (settings `dv_engine` 'native'): an eligible TV episode's DV analysis
+    WITHOUT Resolve — hdr_analyzer_mvp over Topaz's ProRes chunks through the pinned SDR->PQ
+    LUT, then dovi_tool's RPU (nativelane.run_analysis: chunk list -> 'analyzing' marker ->
+    per-chunk analysis -> RPU -> 'ready' marker, published last). Run thread only, and only
+    for an item orchestrator._native_slot routed here — never the screen, never a SIGSTOP:
+    it runs at nice 10 beside the previous item's x265 tail.
+
+    "paused: ..." (a yield, or the 150 GiB mid-analysis disk floor) and "interrupted: ..."
+    (the run stopped) are not failures: the next pass resumes chunk by chunk. Every other
+    failure is booked in native/failures.json; the MAX_FAILURES-th, or one the lane says no
+    retry can fix (on a first claim: chunks or CFR that do not fit; on a resume: a changed
+    analyzer or LUT, or a changed chunk set), writes native/fallback.json and comes back as
+    "native-fallback: ..." — the orchestrator then runs the item through Resolve in the same
+    pass, on the chunks the lane never touched. A broken TOOLCHAIN is never sticky: it claims
+    nothing, and nativelane.decide() sends items to Resolve until it is fixed."""
+    import nativelane
+    try:
+        ok, msg = nativelane.run_analysis(p, abort=abort, progress=progress,
+                                          should_pause=should_pause)
+    except Exception as e:      # a lane bug costs one native attempt — it must never loop the item
+        logbook.exception(f"dvnative {getattr(p, 'ep', '?')}", e)
+        ok, msg = False, f"native analysis crashed: {e.__class__.__name__}: {e}"
+    msg = str(msg)
+    if ok or msg.startswith("paused:"):
+        return ok, msg
+    if msg.startswith("aborted") or (abort is not None and abort.is_set()):
+        return False, "interrupted: DV analysis stopped — the next pass resumes it chunk by chunk"
+    try:
+        n = nativelane.count_failure(p, msg)
+        if nativelane.should_fall_back(msg, n):
+            nativelane.write_fallback(p, msg)
+            why = msg[len(nativelane.FALLBACK_PREFIX):].strip() \
+                if msg.startswith(nativelane.FALLBACK_PREFIX) else msg
+            return False, f"{nativelane.FALLBACK_PREFIX} {why} — Resolve takes this item"
+    except Exception as e:      # the books are files on a disk that may be full: never a crash
+        logbook.exception(f"dvnative {getattr(p, 'ep', '?')} bookkeeping", e)
+        return False, f"{msg} (native attempt not booked: {e.__class__.__name__})"
+    return False, f"{msg} (native attempt {n} of {nativelane.MAX_FAILURES})"
+
+
+def _tree_gib(path) -> float:
+    """GiB under a directory (0 when it is missing)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total / 1024 ** 3
+
+
+# ---- native DV remux: the wall-time ledger and the pass ----------------------------------
+
+def _never_raise(fn, *a, **k) -> None:
+    """Call a bookkeeping hook from inside dvcap's encode loop: an exception there would end
+    the x265 pipe ("pipe error"), so a ledger bug must never get that far."""
+    try:
+        fn(*a, **k)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _NativeRemuxClock:
+    """Wall time per LIVE-encoded segment of a native item's remux, booked into
+    segdir/native/cpu.json beside the analysis CPU (design §4 'Measure': the trial compares a
+    native episode's cost with a Resolve one's). Fed by the remux's own callbacks — nothing in
+    dvcap or its processes changes:
+      plan(ends, total)             on_plan: the segment ends; this attempt's clock starts
+      progress(frames, total, **x)  on_progress: cumulative frames. A segment counts only when
+                                    an in-segment frame was seen before its end was reached —
+                                    a resumed segment jumps straight to its end and is never
+                                    booked (it cost this attempt nothing).
+      repair(seg, done, n)          the peak repair's per-frame callback: wall from its first
+                                    frame report to its last, per re-capped segment ('remux_repair').
+    Rows are {key: {"wall_s", "frames"}} under phases "remux" and "remux_repair"; a segment
+    measured again (a retry) replaces its row. Booking never fails the remux."""
+
+    def __init__(self, p, clock=None):
+        self.p, self._now = p, (clock or time.monotonic)
+        self.ends, self.mark, self.done, self.live = None, None, 0, False
+        self._rep = None          # [seg (1-based), started, last, frames, max done] of a repair
+        self._rep_sum = {}        # seg -> wall booked by the repairs of this call (rungs add up)
+
+    def plan(self, ends, _total=None):
+        try:
+            self.ends = [int(e) for e in ends]
+        except (TypeError, ValueError):
+            self.ends = None
+        self.mark, self.done, self.live = self._now(), 0, False
+
+    def progress(self, frames, _total=None, **extra):
+        if extra.get("repair_seg") is not None or not self.ends or self.mark is None:
+            return
+        try:
+            frames = int(frames)
+        except (TypeError, ValueError):
+            return
+        crossed = sum(1 for e in self.ends if frames >= e)
+        if crossed <= self.done:
+            if frames > (self.ends[self.done - 1] if self.done else 0):
+                self.live = True                    # real x265 progress inside this segment
+            return
+        now = self._now()
+        if crossed == self.done + 1 and self.live:
+            k = self.done
+            n = self.ends[k] - (self.ends[k - 1] if k else 0)
+            self._book("remux", f"seg_{k:04d}", now - self.mark, n)
+        self.done, self.mark, self.live = crossed, now, False
+
+    def repair(self, seg, done, n):
+        now = self._now()
+        cur = self._rep
+        if cur is None or cur[0] != seg or (done == 0 and cur[4] > 0):   # a new segment / rung
+            self.finish()
+            self._rep = [seg, now, now, n, 0]
+            return
+        cur[2], cur[4] = now, max(cur[4], done or 0)
+
+    def finish(self):
+        """Book the repair in flight (its last frame report ends it)."""
+        cur, self._rep = self._rep, None
+        if cur is None or cur[2] <= cur[1]:
+            return
+        seg = cur[0]
+        self._rep_sum[seg] = self._rep_sum.get(seg, 0.0) + (cur[2] - cur[1])
+        self._book("remux_repair", f"seg_{seg - 1:04d}", self._rep_sum[seg], cur[3])
+
+    def _book(self, phase, key, wall_s, frames):
+        try:
+            import nativelane
+            with nativelane._LOCK:
+                book = nativelane._read_json(nativelane.cpu_path(self.p))
+                book = book if isinstance(book, dict) else {}
+                if not isinstance(book.get(phase), dict):
+                    book[phase] = {}
+                book[phase][key] = {"wall_s": round(float(wall_s), 1), "frames": int(frames or 0)}
+                nativelane._write_json(nativelane.cpu_path(self.p), book)
+        except Exception as e:  # noqa: BLE001 — a ledger row is never worth a remux
+            logbook.exception(f"remux {getattr(self.p, 'ep', '?')}: native wall ledger", e)
+
+
+def native_wall_line(p) -> str:
+    """One line of the native remux's booked wall time (all of its segments, every attempt),
+    for the log — cpu.json goes with the segdir at cleanup, the log line stays."""
+    import nativelane
+    book = nativelane._read_json(nativelane.cpu_path(p))
+    parts = []
+    for phase in ("remux", "remux_repair"):
+        rows = (book or {}).get(phase) if isinstance(book, dict) else None
+        rows = [r for r in rows.values() if isinstance(r, dict)] if isinstance(rows, dict) else []
+        if not rows:
+            continue
+        wall = sum(float(r.get("wall_s") or 0) for r in rows)
+        frames = sum(int(r.get("frames") or 0) for r in rows)
+        per = f", {wall * 1000.0 / frames:.1f} ms/frame" if frames else ""
+        parts.append(f"{phase} wall {wall:.0f} s over {frames} frames ({len(rows)} segments{per})")
+    return "; ".join(parts) or "no remux segment timed (all resumed)"
+
+
+def _native_master_passed(p, native: dict) -> None:
+    """A NATIVE master just passed the peak gate: free its Topaz chunks — the ProRes seg_*.mov
+    files, ~130-190 GiB, the very thing the next item's disk gates wait on — and keep a proof
+    that survives them. The marker turns NATIVE_ENCODED (written FIRST, so a kill in between
+    leaves a proof, never a chunk-less 'ready' marker) and records the master's path, size and
+    mtime: orchestrator.stage_done("topaz"/"resolve") accept it while that master is unchanged,
+    so an item that parks at upload and is re-picked goes straight back to the upload instead
+    of re-running Topaz and the analysis. The rest of the segdir (the marker, RPU, sidecar,
+    cpu.json; a few MB) goes with cleanup's rmtree. If the stamp cannot be written, the whole
+    segdir goes at once, exactly as before the stamp existed."""
+    import glob
+    import nativelane
+    from orchestrator import NATIVE_ENCODED
+    ep = getattr(p, "ep", "?")
+    try:
+        m = nativelane.read_marker(p)
+        if not isinstance(m, dict):
+            raise ValueError("no native marker to stamp")
+        st = os.stat(p.final)
+        m.update(state=NATIVE_ENCODED, ready_id=native.get("id"), final=p.final,
+                 final_size=st.st_size, final_mtime_ns=st.st_mtime_ns, encoded_at=int(time.time()))
+        nativelane.write_marker(p, m)
+    except Exception as e:  # noqa: BLE001
+        logbook.exception(f"remux {ep}: stamping the native marker", e)
+        gib = _tree_gib(p.segdir)
+        shutil.rmtree(p.segdir, ignore_errors=True)
+        logbook.event(f"remux {ep}: native master passed the peak gate — freed {gib:.0f} GiB "
+                      f"of Topaz chunks (no 'encoded' stamp: a re-pick re-runs Topaz)")
+        return
+    files = set(glob.glob(os.path.join(p.segdir, "seg_*.mov")))
+    files.update(path for _a, path in (native.get("chunks") or []) if path)
+    freed = 0
+    for f in sorted(files):
+        try:
+            size = os.path.getsize(f)
+            os.remove(f)
+            freed += size
+        except OSError:
+            pass
+    try:
+        timing = f"{nativelane.cpu_line(p, 'analysis')}; {native_wall_line(p)}"
+    except Exception:  # noqa: BLE001
+        timing = "timing unavailable"
+    logbook.event(f"remux {ep}: native master passed the peak gate — freed "
+                  f"{freed / 1024 ** 3:.0f} GiB of Topaz chunks ({timing})")
+
+
 def _combine_result(res, real_rpu_donor):
     """Map a combine RemuxResult to the stage's (ok, reason). A frame/fps mismatch
     against a REAL companion donor means the two releases are different cuts — that can
@@ -1868,11 +2079,48 @@ def _remux(p, abort, progress=None, should_pause=None):
                             abort=abort, on_progress=_prog, on_plan=_on_plan,
                             should_pause=should_pause, on_repair=_on_repair)
         return _combine_result(res, combine_call["real_rpu"])
+    # NATIVE DV (settings dv_engine 'native'): this item never rendered. Its RPU is the
+    # native lane's, and x265 reads Topaz's ProRes chunks through the LUT (remux.remux(
+    # native=)) — for the peak repair as well, which is why the chunks were KEPT at hand-off.
+    # They go the moment the master passes the peak gate, before the upload; the marker stays,
+    # stamped 'encoded', as the proof of that work (_native_master_passed). An item without
+    # a native marker (every Resolve item: its segdir was dropped at hand-off) takes the
+    # call below exactly as before — no extra keyword at all.
+    native = None
+    if not (p.movie or p.youtube) and encode_source is None:
+        import nativelane
+        if nativelane.has_marker(p) and not nativelane.has_fallback(p):
+            native = nativelane.bundle(p)
+            if native is None:
+                return False, (f"native DV metadata no longer matches the chunks "
+                               f"({nativelane.check_ready(p)[1]}) — shipped nothing")
+    on_prog, on_plan, on_repair, wall = _prog, _on_plan, _on_repair, None
+    if native is not None:
+        # ...and only a native call is timed per segment (the trial's ledger, cpu.json): the
+        # same callbacks, each also feeding the wall clock, which can never raise into dvcap.
+        wall = _NativeRemuxClock(p)
+
+        def on_prog(frames, total, **extra):
+            _never_raise(wall.progress, frames, total, **extra)
+            _prog(frames, total, **extra)
+
+        def on_plan(ends, exact_total):
+            _never_raise(wall.plan, ends, exact_total)
+            _on_plan(ends, exact_total)
+
+        def on_repair(k, of, seg_index, done, seg_frames):
+            _never_raise(wall.repair, seg_index + 1, done, seg_frames)
+            _on_repair(k, of, seg_index, done, seg_frames)
     res = remux.remux(p.dv_render, p.source_cfr, p.source, p.final,
                       cap_mbps=cap, audio_target_lufs=lufs, audio_gain_db=audio_gain,
                       boundaries=bounds, abort=abort,
-                      on_progress=_prog, on_plan=_on_plan, should_pause=should_pause,
-                      on_repair=_on_repair, encode_source=encode_source)
+                      on_progress=on_prog, on_plan=on_plan, should_pause=should_pause,
+                      on_repair=on_repair, encode_source=encode_source,
+                      **({"native": native} if native is not None else {}))
+    if wall is not None:
+        _never_raise(wall.finish)
+    if res.ok and native is not None:
+        _native_master_passed(p, native)
     return res.ok, res.reason
 
 

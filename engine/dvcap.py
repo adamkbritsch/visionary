@@ -331,16 +331,23 @@ def _rm(path: str):
 def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
                     seg_seconds: int, crf: float = X265_CRF, preset: str = X265_PRESET,
                     boundaries: list | None = None, encode_source: str | None = None,
-                    rpu_mode: int | None = None) -> dict:
+                    rpu_mode: int | None = None, native_id: str | None = None) -> dict:
     """Identity of a segmented-encode run. If ANY of this changes between attempts, the
     persisted segments/RPU describe a DIFFERENT encode and must not be resumed: a re-rendered
     dv_video would pass the frame-count check yet concat WRONG CONTENT into the master. `segb`
-    is included so switching the plan (topaz-aligned vs ~seg_seconds) also wipes stale segments."""
-    try:
-        st = os.stat(dv_video)
-        src_id = f"{st.st_size}:{int(st.st_mtime)}"
-    except OSError:
-        src_id = "missing"
+    is included so switching the plan (topaz-aligned vs ~seg_seconds) also wipes stale segments.
+    `native_id` (native DV only): there is no render to stat — the source is Topaz's chunks +
+    a generated RPU + the LUT, and the native marker's id already hashes all of them (chunk
+    size:mtime, RPU and LUT sha). Stat'ing the nominal chunk-0 path instead would miss a
+    regenerated RPU and resume segments encoded against the old one."""
+    if native_id:
+        src_id = f"native:{native_id}"      # never collides with a "size:mtime" stat
+    else:
+        try:
+            st = os.stat(dv_video)
+            src_id = f"{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            src_id = "missing"
     m = {"src": src_id, "cap": int(cap_mbps), "frames": int(total_frames),
          "fps": str(fps), "seg": int(seg_seconds), "crf": float(crf), "preset": preset}
     if boundaries:                          # only when a topaz-aligned plan is in force — so a fallback

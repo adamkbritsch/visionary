@@ -12,6 +12,7 @@ from unittest import mock
 
 import orchestrator as orch
 import yield_lease
+from types import SimpleNamespace as types_ns
 from test_yield_lease import TRUST
 
 
@@ -123,6 +124,22 @@ class DrainBacklog(unittest.TestCase):
         self.assertEqual(self._count(d), 3)
         self.assertEqual(self._count(d), 3)      # a "restart" changes nothing
 
+    def test_native_items_are_never_a_resolve_backlog(self):
+        """dv_engine 'native': a finisher item keeps its chunks through its remux while the
+        next one analyses beside it — the lane's steady state, two finished segdirs. They
+        never wait on Resolve, so counting them read as a stall: pacing skipped, fresh Topaz
+        held, the remux lanes standing down, the overlap gate dropped to 80 GB."""
+        d = self._with_segdirs(3)
+        names = sorted(n for n in os.listdir(d) if n.endswith(".segments"))
+        for name, files in ((names[0], ("native.json",)),
+                            (names[1], ("native.json",)),
+                            (names[2], ("native.json", "fallback.json"))):
+            os.makedirs(os.path.join(d, name, "native"))
+            for f in files:
+                open(os.path.join(d, name, "native", f), "w").close()
+        # the fallen-back item IS Resolve's again; the two claimed ones are not counted
+        self.assertEqual(self._count(d), 1)
+
 
 class DiskGateDuringDrain(unittest.TestCase):
     def _pause(self, *, phys, backlog, fin_movie=False, in_finisher=True):
@@ -159,6 +176,253 @@ class DiskGateDuringDrain(unittest.TestCase):
 
     def test_the_drain_gate_still_stops_a_genuinely_full_disk(self):
         self.assertIsNotNone(self._pause(phys=40, backlog=3))
+
+
+class NativeOverlapDisk(unittest.TestCase):
+    """U2 ("Allow below 400 GB", user-decided 2026-10-15). While a FINISHER-OWNED native item
+    still holds its Topaz chunks, the flat min(OVERLAP_MIN_PHYS_GB, floor) start gate gives way
+    to the next item's OWN projected need (orchestrator._item_projection), never below 150 GiB
+    — but only when that size is MEASURED; an unknown one keeps today's need. The
+    pre-selection gate can only keep the minimum; the item's own need is asked once it is
+    known. Quiet Mode and a pinned-display hold apply U2 too, when the native chunks are all
+    that holds disk. The hard floors never move."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.held = os.path.join(self.td, "Show S01E01_prob4_upscaled.segments")
+        os.makedirs(os.path.join(self.held, "native"))
+        open(os.path.join(self.held, "native", "native.json"), "w").close()
+        self.reclaims = []
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _orch(self, *, held=True, owned=True, stall=False):
+        import threading
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._finisher_lock = threading.Lock()
+        d = {"kind": "episode", "series": "Show", "ep": "S01E01",
+             "source_basename": "Show S01E01.mkv"}
+        key = orch.Orchestrator._desc_skip_key(d)
+        o._finisher_persisted = {orch.Orchestrator._desc_cid(d): d} if owned else {}
+        o._native_fin = {key: self.held} if held else {}
+        o._in_finisher = {key}
+        o._in_finisher_movies = set()
+        o._stall_active = stall
+        o._quiet_mode = lambda: False
+        o._display_held = set()
+        o._reclaim_for_pipeline = lambda **kw: self.reclaims.append(kw.get("need_gb"))
+        o._drain_backlog = lambda: 0
+        o._free_scratch_gb = lambda: 9999
+        return o
+
+    def _pause(self, o, phys):
+        with mock.patch.object(orch.scratch, "physical_free_gb", return_value=phys), \
+             mock.patch.object(orch, "_min_free_gb", return_value=400):
+            return o._low_disk_pause()
+
+    def _next(self, *, downloaded=True, ep="S01E02"):
+        p = orch.episode_paths("Show", ep, f"Show {ep}.mkv", scratch_dir=self.td)
+        if downloaded:
+            open(p.source, "w").close()
+        return p
+
+    def test_the_next_item_may_start_below_400(self):
+        self.assertIsNone(self._pause(self._orch(), 349))
+        self.assertEqual(self.reclaims, [150])         # the prefetch buffer survives above that
+
+    def test_its_hard_minimum_still_holds(self):
+        msg = self._pause(self._orch(), 140)
+        self.assertIn("low disk (140 GB)", msg)
+        self.assertIn("native item(s) keep their Topaz chunks", msg)
+
+    def test_without_native_chunks_the_flat_gate_is_untouched(self):
+        msg = self._pause(self._orch(held=False), 349)
+        self.assertEqual(msg, "paused — low disk (349 GB) while an item finishes in the "
+                              "background (frees at its cleanup)")
+        self.assertEqual(self.reclaims, [400])
+
+    def test_an_item_that_left_the_finisher_stops_counting(self):
+        o = self._orch(owned=False)                    # parked / abandoned: off the work-list
+        self.assertIsNotNone(self._pause(o, 349))       # the flat gate again
+        self.assertEqual(o._native_fin, {})              # ...and pruned
+
+    def test_chunks_freed_by_the_remux_stop_counting(self):
+        import shutil
+        o = self._orch()
+        shutil.rmtree(self.held)                        # stages._remux rmtree's them on success
+        self.assertIsNotNone(self._pause(o, 349))
+
+    def test_a_stall_no_longer_skips_the_overlap_need_while_native_chunks_are_held(self):
+        self.assertIn("native item(s)", self._pause(self._orch(stall=True), 120))
+        self.assertIsNone(self._pause(self._orch(stall=True, held=False), 120))   # as before
+        self.assertIn("update prompt", self._pause(self._orch(stall=True), 90))  # floor first
+
+    def test_the_need_is_the_next_items_projected_need(self):
+        o = self._orch()
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "_item_projection", return_value=(296, True)):
+            self.assertEqual(o._native_overlap_need_gb(self._next()), 296)
+
+    def test_prores_already_written_is_not_needed_twice(self):
+        o = self._orch()
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "_item_projection", return_value=(296, True)), \
+             mock.patch.object(orch.Orchestrator, "_topaz_working_bytes",
+                               return_value=100 * 1024 ** 3):
+            self.assertEqual(o._native_overlap_need_gb(self._next()), 196)
+
+    def test_never_below_the_hard_minimum(self):
+        o = self._orch()
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "_item_projection", return_value=(130, True)):
+            self.assertEqual(o._native_overlap_need_gb(self._next()), 150)
+
+    def test_topaz_done_needs_only_the_tail(self):
+        o = self._orch()
+        with mock.patch.object(orch, "_item_projection", return_value=(296, True)), \
+             mock.patch.object(orch, "stage_done", return_value=True), \
+             mock.patch.object(orch.Orchestrator, "_topaz_working_bytes",
+                               side_effect=AssertionError("nothing left to write")):
+            self.assertEqual(o._native_overlap_need_gb(self._next()), 150)
+
+    def test_a_finishing_movie_keeps_its_full_floor_over_u2(self):
+        # U2 relaxes the TV overlap need only: a movie remuxing in the finisher keeps today's
+        # rule (need = min_free_gb), here 600 > 400 so the difference shows (verifier-caught).
+        o = self._orch()
+        o._in_finisher_movies = {"movie"}
+        with mock.patch.object(orch.scratch, "physical_free_gb", return_value=450), \
+             mock.patch.object(orch, "_min_free_gb", return_value=600):
+            msg = o._low_disk_pause()
+            self.assertIn("while an item finishes in the background", msg)
+            with mock.patch.object(orch, "_item_projection", side_effect=AssertionError("not asked")):
+                self.assertEqual(o._native_overlap_need_gb(self._next()), 600)
+
+    def test_quiet_mode_counts_the_run_threads_own_native_item(self):
+        # A native item still on the run thread (claimed, analysing) holds its chunks just as a
+        # finisher one does: Quiet Mode must not pause the run on them (verifier-caught).
+        import json, nativelane
+        own = os.path.join(self.td, "Show S01E03_prob4_upscaled.segments")
+        os.makedirs(os.path.join(own, "native"))
+        with open(os.path.join(own, "native", "native.json"), "w") as f:
+            json.dump({"state": "analyzing"}, f)
+        o = self._orch(held=False)
+        o._quiet_mode = lambda: True
+        with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
+             mock.patch.object(orch.scratch, "default_scratch", return_value=self.td, create=True), \
+             mock.patch.object(nativelane.scratch, "default_scratch", return_value=self.td):
+            self.assertIsNone(self._pause(o, 349))                 # U2: above the 150 minimum
+            self.assertIn("native item(s)", self._pause(o, 140))
+        # dv_engine 'resolve' and nothing handed off native: no scan, today's message
+        with mock.patch.object(nativelane, "engine_setting", return_value="resolve"), \
+             mock.patch.object(nativelane, "held_native_segdirs",
+                               side_effect=AssertionError("no scan in resolve mode")):
+            self.assertIn("turn off Quiet Mode", self._pause(o, 349))
+
+    def test_an_unknown_size_keeps_todays_need(self):
+        # Not downloaded, unprobeable, or an item whose projection is a flat stand-in (YouTube,
+        # combine, a fast-path movie): never gate on a guess -- min(OVERLAP_MIN_PHYS_GB, floor).
+        o = self._orch()
+        with mock.patch.object(orch, "stage_done", side_effect=AssertionError("not asked")):
+            for floor in (400, 300, 600):
+                with mock.patch.object(orch, "_min_free_gb", return_value=floor), \
+                     mock.patch.object(orch, "_item_projection",
+                                       return_value=(orch.ITEM_TAIL_GB, False)):
+                    self.assertEqual(o._native_overlap_need_gb(self._next()),
+                                     min(orch.OVERLAP_MIN_PHYS_GB, floor))
+
+    def test_a_not_downloaded_item_is_unknown(self):
+        o = self._orch()
+        nxt = self._next(downloaded=False, ep="S01E03")
+        with mock.patch.object(orch, "_min_free_gb", return_value=400), \
+             mock.patch("plan.plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch("topaz.media_timing", return_value=(None, None)):
+            self.assertEqual(orch._item_projection(nxt), (400, False))
+            self.assertEqual(o._native_overlap_need_gb(nxt), 400)
+
+    def test_the_hold_asks_raw_free_for_that_need(self):
+        o = self._orch()
+        nxt = self._next()
+        with mock.patch.object(orch, "stage_done", return_value=False), \
+             mock.patch.object(orch, "_item_projection", return_value=(296, True)):
+            with mock.patch.object(orch.scratch, "physical_free_gb", return_value=250):
+                msg = o._native_overlap_hold(nxt)
+            with mock.patch.object(orch.scratch, "physical_free_gb", return_value=300):
+                self.assertIsNone(o._native_overlap_hold(nxt))
+        self.assertIn("needs ~296 GB", msg)
+        self.assertEqual(self.reclaims, [296, 296])
+
+    def test_an_unknown_item_waits_for_todays_400(self):
+        o = self._orch()
+        nxt = self._next(downloaded=False, ep="S01E03")
+        with mock.patch.object(orch, "_min_free_gb", return_value=400), \
+             mock.patch.object(orch, "_item_projection", return_value=(400, False)):
+            with mock.patch.object(orch.scratch, "physical_free_gb", return_value=399):
+                self.assertIn("needs ~400 GB", o._native_overlap_hold(nxt))
+            with mock.patch.object(orch.scratch, "physical_free_gb", return_value=400):
+                self.assertIsNone(o._native_overlap_hold(nxt))
+
+    def test_an_encoded_item_holds_no_chunks(self):
+        # Its master passed: stages._remux deleted the chunks and stamped the marker. The
+        # segdir stays (a few MB) until cleanup, but it no longer counts as held.
+        import json
+        with open(os.path.join(self.held, "native", "native.json"), "w") as f:
+            json.dump({"state": orch.NATIVE_ENCODED}, f)
+        o = self._orch()
+        self.assertEqual(o._finisher_native_segdirs(), [])
+        msg = self._pause(o, 349)
+        self.assertEqual(msg, "paused — low disk (349 GB) while an item finishes in the "
+                              "background (frees at its cleanup)")   # today's flat gate again
+
+    # ---- U2 in the Quiet Mode and pinned-display branches -------------------------------
+
+    def _quiet(self, o, *, quiet=True, display=False, backlog=0):
+        o._quiet_mode = lambda: quiet
+        o._display_held = {"Movie.mkv": 1} if display else set()
+        o._drain_backlog = lambda: backlog
+        return o
+
+    def test_quiet_mode_with_only_native_chunks_held_applies_u2(self):
+        o = self._quiet(self._orch())
+        self.assertIsNone(self._pause(o, 335))                  # was: "turn off Quiet Mode..."
+        self.assertEqual(self.reclaims, [150])
+        msg = self._pause(o, 140)
+        self.assertIn("native item(s) keep their Topaz chunks", msg)
+        self.assertNotIn("Quiet Mode", msg)
+
+    def test_quiet_mode_with_an_upscale_waiting_on_resolve_keeps_the_floor(self):
+        o = self._quiet(self._orch(), backlog=1)
+        self.assertEqual(self._pause(o, 335),
+                         "paused — low disk (335 GB): turn off Quiet Mode to drain items "
+                         "through Resolve")
+
+    def test_quiet_mode_without_native_chunks_is_todays_rule(self):
+        o = self._quiet(self._orch(held=False))
+        self.assertEqual(self._pause(o, 335),
+                         "paused — low disk (335 GB): turn off Quiet Mode to drain items "
+                         "through Resolve")
+        self.assertIsNone(self._pause(o, 400))                  # at the floor: no pause here
+
+    def test_a_display_hold_with_only_native_chunks_held_applies_u2(self):
+        o = self._quiet(self._orch(), quiet=False, display=True)
+        self.assertIsNone(self._pause(o, 335))
+        self.assertIn("native item(s)", self._pause(o, 140))
+
+    def test_a_display_hold_with_an_upscale_waiting_keeps_the_floor(self):
+        o = self._quiet(self._orch(), quiet=False, display=True, backlog=2)
+        self.assertEqual(self._pause(o, 335),
+                         "paused — low disk (335 GB): plug the pinned display back in to "
+                         "drain 1 held item(s) through Resolve")
+        o = self._quiet(self._orch(held=False), quiet=False, display=True)
+        self.assertIn("plug the pinned display back in", self._pause(o, 335))
+
+    def test_the_item_itself_is_never_its_own_obstacle(self):
+        o = self._orch()
+        me = types_ns(segdir=self.held)
+        with mock.patch.object(orch.scratch, "physical_free_gb",
+                               side_effect=AssertionError("no hold to compute")):
+            self.assertIsNone(o._native_overlap_hold(me))
 
 
 class TruncatedRender(unittest.TestCase):

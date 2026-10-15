@@ -20,9 +20,11 @@ succeeding but not intentionally, so they only fail the strict exit code, not ha
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -289,6 +291,133 @@ def check_brew_tools():
                   ("all present: " + ", ".join(BREW_TOOLS)) if not missing
                   else "missing from /opt/homebrew/bin: " + ", ".join(missing),
                   "brew install ffmpeg x265 dovi_tool gpac cliclick")
+
+
+_SHA_CACHE = {}     # path -> ((size, mtime_ns), sha256 hex)
+
+
+def _sha256_cached(path):
+    """sha256 of a file, re-hashed only when its size or mtime moves. The LUT is ~7 MB and the
+    arm gate re-runs every 60 s while waiting to re-arm, so the hash is remembered — but any
+    edit or replacement of the file changes one of the two and is hashed afresh."""
+    st = os.stat(path)
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _SHA_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    _SHA_CACHE[path] = (key, h.hexdigest())
+    return _SHA_CACHE[path][1]
+
+
+def _sha256_or_none(path):
+    """_sha256_cached, or None when the file is missing or can't be read."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        return _sha256_cached(path)
+    except OSError:
+        return None
+
+
+def _probe(argv, timeout=10):
+    """(returncode, stdout+stderr) of a short tool probe; returncode None when it could not
+    run at all or did not answer within `timeout` (the text then says why)."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"no answer within {timeout} s"
+    except OSError as e:
+        return None, str(e)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def _native_dv_problems():
+    """[(problem, fix)] for the native DV lane's toolchain; empty = ready. Every sub-check
+    runs, so one pass names everything that is wrong rather than the first thing."""
+    out = []
+    an = versions.HDR_ANALYZER_PATH
+    major = versions.NATIVE_FFMPEG_MAJOR
+    build = (f"Build tinof/hdr-analyze at commit {versions.HDR_ANALYZER_COMMIT} (cargo build "
+             f"--release, against Homebrew ffmpeg {major}) and copy hdr_analyzer_mvp to {an}.")
+    sha = _sha256_or_none(an)
+    if sha is None:
+        out.append((f"hdr_analyzer_mvp missing or unreadable at {an}", build))
+    elif sha != versions.HDR_ANALYZER_SHA256:
+        out.append((f"hdr_analyzer_mvp is not the pinned build (sha256 {sha[:12]}..., want "
+                    f"{versions.HDR_ANALYZER_SHA256[:12]}...)", build))
+    else:
+        # Only the PINNED build is ever executed. The hash can't see its dylibs: it links
+        # Homebrew ffmpeg's libav*.62 by major version, so a `brew upgrade ffmpeg` breaks it
+        # while the file is byte-identical — running it is the only proof it still loads.
+        rc, text = _probe([an, "--help"])
+        if rc != 0:
+            tail = (text or "").strip().splitlines()[-1:] or ["no output"]
+            out.append((f"hdr_analyzer_mvp does not run (--help: "
+                        f"{'exit %s' % rc if rc is not None else 'failed'}: {tail[0][:160]})",
+                        f"Its Homebrew ffmpeg libraries probably moved (brew upgrade ffmpeg?): "
+                        f"reinstall ffmpeg {major}, or rebuild. {build}"))
+    lut = versions.NATIVE_LUT_PATH
+    lut_fix = (f"Restore the pinned LUT (sha256 {versions.NATIVE_LUT_SHA256[:12]}...) to {lut}: "
+               f"it IS the SDR->PQ conversion, so any other file changes the picture.")
+    sha = _sha256_or_none(lut)
+    if sha is None:
+        out.append((f"LUT missing or unreadable at {lut}", lut_fix))
+    elif sha != versions.NATIVE_LUT_SHA256:
+        out.append((f"LUT is not the pinned file (sha256 {sha[:12]}...)", lut_fix))
+    rc, text = _probe([os.path.join(BREW, "dovi_tool"), "--version"])
+    m = re.search(r"dovi_tool\s+v?(\d[\w.+-]*)", text or "") if rc == 0 else None
+    if not m or m.group(1) != versions.DOVI_TOOL_VERSION:
+        got = m.group(1) if m else ("not runnable" if rc is None else "unreadable")
+        out.append((f"dovi_tool is {got}; the native lane needs exactly "
+                    f"{versions.DOVI_TOOL_VERSION}",
+                    f"Install dovi_tool {versions.DOVI_TOOL_VERSION} at {BREW}/dovi_tool and "
+                    f"`brew pin dovi_tool`: the `generate` config this lane writes is "
+                    f"version-sensitive."))
+    rc, text = _probe([os.path.join(BREW, "ffmpeg"), "-version"])
+    m = re.match(r"\s*ffmpeg version n?(\d+)\.", text or "") if rc == 0 else None
+    if not m or int(m.group(1)) != major:
+        got = m.group(1) if m else ("not runnable" if rc is None else "unreadable")
+        out.append((f"ffmpeg major is {got}; the native lane needs {major}",
+                    f"Install Homebrew ffmpeg {major} and `brew pin ffmpeg`: the LUT's colour "
+                    f"was measured on {major}, and hdr_analyzer_mvp links its libraries."))
+    return out
+
+
+def check_native_dv(required=True):
+    """The native Dolby Vision lane's toolchain (settings dv_engine = 'native'): the pinned
+    hdr_analyzer_mvp (sha256, AND it executes), the pinned LUT (sha256), dovi_tool's exact
+    version and ffmpeg's major. ADDITIVE — no existing pin is touched, and it is NEVER part
+    of the arm gate. `required` (POST /api/settings switching dv_engine TO 'native' — the one
+    moment to refuse) makes it severity "fail"; required=False is run_checks' "warn" row while
+    dv_engine is 'native': a broken toolchain there only sends each new item through Resolve
+    (nativelane.decide) until it is fixed, so it must not stop the pipeline arming."""
+    problems = _native_dv_problems()
+    if problems:
+        detail = "; ".join(p for p, _ in problems)
+        fix = " ".join(dict.fromkeys(f for _, f in problems))     # de-duplicated, in order
+        if not required:
+            detail = "native items fall back to Resolve until this is fixed: " + detail
+    else:
+        detail = (f"hdr_analyzer_mvp {versions.HDR_ANALYZER_COMMIT} (pinned, runs), LUT pinned, "
+                  f"dovi_tool {versions.DOVI_TOOL_VERSION}, ffmpeg {versions.NATIVE_FFMPEG_MAJOR}")
+        fix = (f"Needs hdr_analyzer_mvp built at {versions.HDR_ANALYZER_COMMIT}, the pinned LUT, "
+               f"dovi_tool {versions.DOVI_TOOL_VERSION} and Homebrew ffmpeg "
+               f"{versions.NATIVE_FFMPEG_MAJOR}.")
+    return _check("native_dv", not problems, "fail" if required else "warn", detail, fix)
+
+
+def _dv_engine():
+    """settings.dv_engine(), FAIL-SAFE: anything that stops it being read means 'resolve',
+    so the default check list can never change because settings.json is unreadable."""
+    try:
+        import settings
+        return settings.dv_engine()
+    except Exception:
+        return "resolve"
 
 
 # check_sublercli was RETIRED (2026-08-09): the enforced-VBV x265 + fresh MP4Box mux
@@ -664,7 +793,12 @@ def run_arm_gate():
     missing x265 or a broken cv2 used to surface as a stage failure HOURS into a job;
     now it refuses to arm with a named check. Not run_cheap(): check_python_deps spawns
     /usr/bin/python3 (~0.3 s), too heavy for the selftest poll, fine at arm time and in
-    the 60 s re-arm tick."""
+    the 60 s re-arm tick.
+
+    The native DV toolchain (check_native_dv) is deliberately NOT here, whatever dv_engine
+    says: a broken one only sends items through Resolve (nativelane.decide), so it must never
+    stop Movies, YouTube and every TV episode from running. Switching TO 'native' is where it
+    is gated (POST /api/settings -> 409)."""
     return run_cheap() + [check_brew_tools(), check_python_deps()]
 
 
@@ -674,10 +808,21 @@ def run_checks(network=False, smoke=False, post_setup=False, in_app=False):
         check_shim_templates(), check_tcc_grants(in_app=in_app),
         check_resolve_artifacts(post_setup=post_setup), check_config(network=network),
     ]
+    # The native DV lane's toolchain: a row ONLY while dv_engine is 'native', and then a
+    # "warn" (it never gates hard_ok — native items fall back to Resolve until it is fixed).
+    # With the default 'resolve' there is no row and no probe: the output is exactly what it
+    # was before the lane existed (hide what nothing uses — never show it disabled).
+    if _dv_engine() == "native":
+        checks.append(check_native_dv(required=False))
     if smoke:
         checks.append(check_shim_smoke())
     hard_ok = all(c["ok"] for c in checks if c["severity"] == "fail")
-    return {"ok": all(c["ok"] for c in checks), "hard_ok": hard_ok, "checks": checks}
+    # native_dv never counts toward "ok" either: "ok" is setup_complete, and Setup has no row
+    # that could fix it (the lane is switched through the API, not the app) — a broken
+    # toolchain only sends native items through Resolve, so it must not raise a "Finish setup"
+    # card nobody can act on. The warn row itself stays visible in the report.
+    ok = all(c["ok"] for c in checks if c["id"] != "native_dv")
+    return {"ok": ok, "hard_ok": hard_ok, "checks": checks}
 
 
 def main(argv=None):

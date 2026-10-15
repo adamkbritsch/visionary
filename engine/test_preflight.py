@@ -29,6 +29,20 @@ class Pins(unittest.TestCase):
         self.assertEqual([c["backing"] for c in versions.SUPPORTED_DISPLAYS],
                          [(3456, 2234), (3840, 2160)])
 
+    def test_native_dv_pin_values(self):
+        # ADDITIVE pins for the native DV lane: the toolchain the blind A/B was judged on
+        self.assertEqual(versions.DOVI_TOOL_VERSION, "2.3.0")
+        self.assertEqual(versions.HDR_ANALYZER_COMMIT, "383b0ad")
+        self.assertEqual(versions.HDR_ANALYZER_SHA256,
+                         "41727312f4a960b27d59cb0c0f24c2922dc82768da3503f083e4842a87fc099e")
+        self.assertEqual(versions.NATIVE_LUT_SHA256,
+                         "e410e5b7b899a07096a77e2f65bdeb6a4ab3cc60126358a81c8050251d8c59b0")
+        self.assertEqual(versions.NATIVE_FFMPEG_MAJOR, 8)
+        self.assertEqual(versions.HDR_ANALYZER_PATH,
+                         os.path.expanduser("~/.topaz-pipeline/bin/hdr_analyzer_mvp"))
+        self.assertEqual(versions.NATIVE_LUT_PATH,
+                         os.path.expanduser("~/.topaz-pipeline/luts/rcm_sdr709_to_pq1000.cube"))
+
 
 class VersionChecks(unittest.TestCase):
     def test_missing_app_fails_with_install_fix(self):
@@ -160,7 +174,9 @@ class Semantics(unittest.TestCase):
              mock.patch.object(preflight, "check_shim_templates", return_value=fails[0]), \
              mock.patch.object(preflight, "check_tcc_grants", return_value=warns[0]), \
              mock.patch.object(preflight, "check_resolve_artifacts", return_value=warns[0]), \
-             mock.patch.object(preflight, "check_config", return_value=warns[0]):
+             mock.patch.object(preflight, "check_config", return_value=warns[0]), \
+             mock.patch.object(preflight, "check_native_dv", return_value=fails[0]), \
+             mock.patch.object(preflight, "_dv_engine", return_value="native"):
             r = preflight.run_checks()
         self.assertTrue(r["hard_ok"])            # warn failures don't gate arming
         self.assertFalse(r["ok"])                # but strict ok reflects them
@@ -302,7 +318,10 @@ class FixStringsAlwaysPresent(unittest.TestCase):
 
 class ArmGate(unittest.TestCase):
     def test_arm_gate_is_cheap_plus_instant_deps(self):
+        # dv_engine 'resolve' (the default): EXACTLY the list it always was — and the
+        # native toolchain is not even looked at.
         from unittest import mock
+        import settings
         fake = lambda cid: {"id": cid, "ok": True, "severity": "fail", "detail": "", "fix": ""}
         with mock.patch.object(preflight, "run_cheap",
                                return_value=[fake("resolve_version"), fake("topaz_version"),
@@ -310,10 +329,13 @@ class ArmGate(unittest.TestCase):
              mock.patch.object(preflight, "check_brew_tools",
                                return_value=fake("brew_tools")), \
              mock.patch.object(preflight, "check_python_deps",
-                               return_value=fake("python_deps")):
+                               return_value=fake("python_deps")), \
+             mock.patch.object(settings, "dv_engine", return_value="resolve"), \
+             mock.patch.object(preflight, "check_native_dv") as ndv:
             ids = [c["id"] for c in preflight.run_arm_gate()]
         self.assertEqual(ids, ["resolve_version", "topaz_version", "display",
                                "brew_tools", "python_deps"])
+        ndv.assert_not_called()
 
 
 class ArtifactsAcceptNewProjectNames(unittest.TestCase):
@@ -330,4 +352,328 @@ class ArtifactsAcceptNewProjectNames(unittest.TestCase):
         with mock.patch.object(preflight, "RESOLVE_PROJECT_DIR", d), \
              mock.patch.object(preflight, "DELIVER_PRESETS", presets):
             c = preflight.check_resolve_artifacts()
+        self.assertTrue(c["ok"], c["detail"])
+
+
+class _NativeToolchain:
+    """A fake native-DV toolchain in a temp dir: the analyzer and LUT are real files whose
+    hashes ARE the pins (versions patched to them), and every tool probe is answered by
+    `self.answers` — so each sub-check can be broken on its own."""
+
+    def setUp(self):
+        import hashlib, tempfile
+        d = tempfile.mkdtemp()
+        self.an = os.path.join(d, "hdr_analyzer_mvp")
+        self.lut = os.path.join(d, "rcm.cube")
+        with open(self.an, "wb") as f:
+            f.write(b"analyzer build 383b0ad")
+        with open(self.lut, "wb") as f:
+            f.write(b"LUT_3D_SIZE 2\n")
+        sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+        p = mock.patch.multiple(versions, HDR_ANALYZER_PATH=self.an, NATIVE_LUT_PATH=self.lut,
+                                HDR_ANALYZER_SHA256=sha(self.an), NATIVE_LUT_SHA256=sha(self.lut),
+                                DOVI_TOOL_VERSION="2.3.0", NATIVE_FFMPEG_MAJOR=8)
+        p.start(); self.addCleanup(p.stop)
+        self.answers = {"hdr_analyzer_mvp": (0, "Usage: hdr_analyzer_mvp [OPTIONS] [INPUT]\n"),
+                        "dovi_tool": (0, "dovi_tool 2.3.0\n"),
+                        "ffmpeg": (0, "ffmpeg version 8.0 Copyright (c) 2000-2025\n")}
+        self.probed = []
+
+        def probe(argv, timeout=10):
+            self.probed.append(list(argv))
+            return self.answers[os.path.basename(argv[0])]
+        p = mock.patch.object(preflight, "_probe", side_effect=probe)
+        p.start(); self.addCleanup(p.stop)
+        preflight._SHA_CACHE.clear()
+        self.addCleanup(preflight._SHA_CACHE.clear)
+
+    def ran(self, name):
+        return [a for a in self.probed if os.path.basename(a[0]) == name]
+
+
+class NativeDvCheck(_NativeToolchain, unittest.TestCase):
+    """check_native_dv: analyzer exists + sha256 + EXECUTES, LUT sha256, dovi_tool's exact
+    version, ffmpeg's major. One row; every failing sub-check is named in it."""
+
+    def test_a_pinned_working_toolchain_passes(self):
+        c = preflight.check_native_dv()
+        self.assertTrue(c["ok"], c["detail"])
+        self.assertEqual((c["id"], c["severity"]), ("native_dv", "fail"))
+        self.assertIn("383b0ad", c["detail"])
+        self.assertTrue(c["fix"])                        # fix is kept even on a pass
+        self.assertEqual(self.ran("hdr_analyzer_mvp"), [[self.an, "--help"]])
+
+    def test_a_missing_analyzer_fails_and_is_not_run(self):
+        os.remove(self.an)
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        self.assertIn("hdr_analyzer_mvp missing", c["detail"])
+        self.assertIn("383b0ad", c["fix"])               # says which commit to build
+        self.assertEqual(self.ran("hdr_analyzer_mvp"), [])
+
+    def test_a_different_analyzer_build_fails_and_is_never_executed(self):
+        with open(self.an, "ab") as f:
+            f.write(b" patched")
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        self.assertIn("not the pinned build", c["detail"])
+        self.assertEqual(self.ran("hdr_analyzer_mvp"), [])   # only the PINNED build runs
+
+    def test_a_pinned_analyzer_that_will_not_load_fails(self):
+        # the brew-upgrade case: the file is byte-identical, its libav*.62 links are gone
+        self.answers["hdr_analyzer_mvp"] = (
+            -6, "dyld[1]: Library not loaded: /opt/homebrew/opt/ffmpeg/lib/libavformat.62.dylib\n")
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        self.assertIn("does not run", c["detail"])
+        self.assertIn("libavformat.62", c["detail"])
+        self.assertIn("brew upgrade ffmpeg", c["fix"])
+
+    def test_an_analyzer_that_hangs_fails(self):
+        self.answers["hdr_analyzer_mvp"] = (None, "no answer within 10 s")
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        self.assertIn("no answer within 10 s", c["detail"])
+
+    def test_a_missing_or_changed_lut_fails(self):
+        with open(self.lut, "ab") as f:
+            f.write(b"# edited\n")
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        self.assertIn("LUT is not the pinned file", c["detail"])
+        os.remove(self.lut)
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        self.assertIn("LUT missing", c["detail"])
+
+    def test_dovi_tool_must_be_the_exact_version(self):
+        for answer, shown in (((0, "dovi_tool 2.2.0\n"), "2.2.0"),
+                              ((0, "dovi_tool 2.3.1\n"), "2.3.1"),
+                              ((None, "No such file or directory"), "not runnable"),
+                              ((1, "error: unexpected argument\n"), "unreadable")):
+            self.answers["dovi_tool"] = answer
+            c = preflight.check_native_dv()
+            self.assertFalse(c["ok"], answer)
+            self.assertIn("dovi_tool is " + shown, c["detail"])
+            self.assertIn("2.3.0", c["fix"])
+
+    def test_ffmpeg_must_be_the_pinned_major(self):
+        self.answers["ffmpeg"] = (0, "ffmpeg version 8.0.1 Copyright\n")
+        self.assertTrue(preflight.check_native_dv()["ok"])         # a point release is fine
+        for answer, shown in (((0, "ffmpeg version 7.1.1 Copyright\n"), "7"),
+                              ((0, "ffmpeg version 9.0 Copyright\n"), "9"),
+                              ((0, "ffmpeg version N-120000-gabc Copyright\n"), "unreadable"),
+                              ((None, "No such file or directory"), "not runnable")):
+            self.answers["ffmpeg"] = answer
+            c = preflight.check_native_dv()
+            self.assertFalse(c["ok"], answer)
+            self.assertIn("ffmpeg major is " + shown, c["detail"])
+
+    def test_every_failure_is_named_in_one_row(self):
+        os.remove(self.an)
+        os.remove(self.lut)
+        self.answers["dovi_tool"] = (0, "dovi_tool 2.2.0\n")
+        self.answers["ffmpeg"] = (0, "ffmpeg version 7.1 Copyright\n")
+        c = preflight.check_native_dv()
+        self.assertFalse(c["ok"])
+        for part in ("hdr_analyzer_mvp missing", "LUT missing", "dovi_tool is 2.2.0",
+                     "ffmpeg major is 7"):
+            self.assertIn(part, c["detail"])
+
+    def test_not_required_is_a_warn_that_says_items_fall_back(self):
+        os.remove(self.lut)
+        c = preflight.check_native_dv(required=False)
+        self.assertEqual(c["severity"], "warn")
+        self.assertFalse(c["ok"])                        # it still reports the real state
+        self.assertTrue(c["detail"].startswith(
+            "native items fall back to Resolve until this is fixed: "), c["detail"])
+        self.assertIn("LUT missing", c["detail"])
+        self.assertIn("Restore the pinned LUT", c["fix"])
+
+    def test_a_passing_warn_row_reads_as_a_plain_pass(self):
+        c = preflight.check_native_dv(required=False)
+        self.assertTrue(c["ok"], c["detail"])
+        self.assertEqual(c["severity"], "warn")
+        self.assertNotIn("fall back", c["detail"])
+
+    def test_the_lut_hash_is_cached_by_size_and_mtime(self):
+        import hashlib
+        real = hashlib.sha256
+        with mock.patch.object(preflight.hashlib, "sha256", side_effect=real) as h:
+            first = preflight._sha256_cached(self.lut)
+            self.assertEqual(preflight._sha256_cached(self.lut), first)
+            self.assertEqual(h.call_count, 1)            # unchanged file -> not re-hashed
+            st = os.stat(self.lut)
+            with open(self.lut, "r+b") as f:            # same SIZE, different bytes...
+                f.write(b"X")
+            os.utime(self.lut, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))   # ...new mtime
+            self.assertNotEqual(preflight._sha256_cached(self.lut), first)
+            self.assertEqual(h.call_count, 2)
+
+
+class NativeDvProbe(unittest.TestCase):
+    def test_probes_carry_a_10_second_timeout(self):
+        import subprocess
+        done = subprocess.CompletedProcess(["x"], 0, stdout="out", stderr="err")
+        with mock.patch.object(preflight.subprocess, "run", return_value=done) as run:
+            self.assertEqual(preflight._probe(["x", "--help"]), (0, "outerr"))
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+
+    def test_a_hung_tool_cannot_hang_the_check(self):
+        rc, text = preflight._probe(["/bin/sleep", "5"], timeout=0.2)
+        self.assertIsNone(rc)
+        self.assertIn("no answer", text)
+
+    def test_a_missing_tool_is_reported_not_raised(self):
+        rc, text = preflight._probe(["/nonexistent/hdr_analyzer_mvp", "--help"])
+        self.assertIsNone(rc)
+        self.assertTrue(text)
+
+
+class NativeDvGating(unittest.TestCase):
+    """dv_engine 'resolve' (the default): the native row does not exist — run_checks, --json,
+    the text output and the arm gate are exactly the old ones, and nothing native is probed.
+    'native': a "warn" row that never gates hard_ok, and NEVER an arm-gate row (a broken
+    toolchain sends items through Resolve; only the switch to 'native' is refused, by
+    POST /api/settings)."""
+
+    ROWS = ("resolve_version", "power_adapter", "brew_tools", "python_deps", "shim_templates",
+            "tcc_grants", "resolve_artifacts", "config")
+
+    def _row(self, cid, ok=True, sev="fail"):
+        return {"id": cid, "ok": ok, "severity": sev, "detail": "", "fix": ""}
+
+    def _patched(self, es, engine, native_ok=True, calls=None):
+        import settings
+
+        def ndv(required=True):
+            if calls is not None:
+                calls.append(required)
+            return self._row("native_dv", native_ok, "fail" if required else "warn")
+        es.enter_context(mock.patch.object(settings, "dv_engine", return_value=engine))
+        es.enter_context(mock.patch.object(preflight, "run_cheap",
+                                           return_value=[self._row("resolve_version")]))
+        for name in ("check_power_adapter", "check_brew_tools", "check_python_deps",
+                     "check_shim_templates", "check_tcc_grants",
+                     "check_resolve_artifacts", "check_config"):
+            es.enter_context(mock.patch.object(preflight, name,
+                                               return_value=self._row(name[6:])))
+        es.enter_context(mock.patch.object(preflight, "check_shim_smoke",
+                                           return_value=self._row("shim_smoke", sev="warn")))
+        es.enter_context(mock.patch.object(preflight, "check_native_dv", side_effect=ndv))
+
+    def _run_checks(self, engine, native_ok=True, smoke=False):
+        import contextlib
+        calls = []
+        with contextlib.ExitStack() as es:
+            self._patched(es, engine, native_ok, calls)
+            return preflight.run_checks(smoke=smoke), calls
+
+    def test_resolve_mode_has_no_native_row_and_probes_nothing(self):
+        import contextlib
+        trap = mock.Mock(side_effect=AssertionError("the native toolchain was looked at"))
+        with contextlib.ExitStack() as es:
+            self._patched(es, "resolve", native_ok=False)
+            for name in ("check_native_dv", "_native_dv_problems", "_probe", "_sha256_cached"):
+                es.enter_context(mock.patch.object(preflight, name, trap))
+            r = preflight.run_checks()
+            rs = preflight.run_checks(smoke=True)
+        self.assertEqual([c["id"] for c in r["checks"]], list(self.ROWS))
+        self.assertEqual([c["id"] for c in rs["checks"]], list(self.ROWS) + ["shim_smoke"])
+        # ...and the verdicts are computed over exactly those rows, the way they always were
+        self.assertEqual(r, {"ok": True, "hard_ok": True, "checks": r["checks"]})
+        trap.assert_not_called()
+
+    def test_resolve_mode_cli_output_has_no_native_row(self):
+        import contextlib, io, json
+        for argv in (["--json"], []):
+            with self.subTest(argv=argv), contextlib.ExitStack() as es:
+                self._patched(es, "resolve", native_ok=False)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = preflight.main(argv)
+                self.assertEqual(code, 0)                 # all pass, as before the lane
+                self.assertNotIn("native", out.getvalue())
+        with contextlib.ExitStack() as es:
+            self._patched(es, "resolve")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                preflight.main(["--json"])
+        self.assertEqual([c["id"] for c in json.loads(out.getvalue())["checks"]], list(self.ROWS))
+
+    def test_native_mode_lists_a_warn_row_that_never_gates_hard_ok(self):
+        r, calls = self._run_checks("native", native_ok=False)
+        self.assertEqual(calls, [False])                  # asked as the warn row
+        self.assertEqual([c["id"] for c in r["checks"]], list(self.ROWS) + ["native_dv"])
+        self.assertEqual(r["checks"][-1]["severity"], "warn")
+        self.assertTrue(r["hard_ok"])                     # never refuses to arm
+        self.assertTrue(r["ok"])                          # nor raises "Finish setup": Setup has
+                                                          # no row that could fix it (API-only)
+        r, _ = self._run_checks("native", native_ok=True)
+        self.assertTrue(r["hard_ok"])
+        self.assertTrue(r["ok"])
+        r, _ = self._run_checks("native", smoke=True)
+        self.assertEqual([c["id"] for c in r["checks"]][-2:], ["native_dv", "shim_smoke"])
+
+    def test_native_mode_cli_exit_is_warnings_only(self):
+        import contextlib, io
+        with contextlib.ExitStack() as es:
+            self._patched(es, "native", native_ok=False)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = preflight.main([])
+        self.assertEqual(code, 0)                         # ok stays true (see above)...
+        self.assertIn("[WARN] native_dv", out.getvalue())   # ...but the row is still reported
+
+    def _arm_gate(self, engine, native_ok=True):
+        import settings
+        with mock.patch.object(preflight, "run_cheap", return_value=[self._row("resolve_version"),
+                                                                     self._row("topaz_version"),
+                                                                     self._row("display")]), \
+             mock.patch.object(preflight, "check_brew_tools", return_value=self._row("brew_tools")), \
+             mock.patch.object(preflight, "check_python_deps",
+                               return_value=self._row("python_deps")), \
+             mock.patch.object(settings, "dv_engine", return_value=engine), \
+             mock.patch.object(preflight, "check_native_dv",
+                               return_value=self._row("native_dv", native_ok)) as ndv:
+            return preflight.run_arm_gate(), ndv
+
+    def test_the_arm_gate_never_holds_the_native_toolchain(self):
+        for engine in ("resolve", "native"):
+            with self.subTest(engine=engine):
+                gate, ndv = self._arm_gate(engine, native_ok=False)
+                self.assertEqual([c["id"] for c in gate],
+                                 ["resolve_version", "topaz_version", "display", "brew_tools",
+                                  "python_deps"])
+                ndv.assert_not_called()
+                self.assertTrue(all(c["ok"] for c in gate))   # a broken toolchain still arms
+
+    def test_the_switch_to_native_still_gets_a_hard_row(self):
+        # POST /api/settings {"dv_engine": "native"} calls check_native_dv() and refuses (409)
+        # on a failing row — that row is severity "fail", without the fall-back wording.
+        with mock.patch.object(preflight, "_native_dv_problems",
+                               return_value=[("dovi_tool is 2.2.0", "Install dovi_tool 2.3.0")]):
+            c = preflight.check_native_dv()
+        self.assertEqual((c["ok"], c["severity"]), (False, "fail"))
+        self.assertEqual(c["detail"], "dovi_tool is 2.2.0")
+
+    def test_an_unreadable_setting_fails_safe_to_resolve(self):
+        import settings
+        with mock.patch.object(settings, "dv_engine", side_effect=TypeError("bad file")):
+            self.assertEqual(preflight._dv_engine(), "resolve")
+        with mock.patch.object(settings, "get_settings", return_value={"dv_engine": "Native"}):
+            self.assertEqual(preflight._dv_engine(), "resolve")
+        with mock.patch.object(settings, "get_settings", return_value={"dv_engine": "native"}):
+            self.assertEqual(preflight._dv_engine(), "native")
+
+
+class NativeDvLiveOnReferenceMachine(unittest.TestCase):
+    """On the reference machine the real native toolchain must match its pins — skipped
+    anywhere the pinned analyzer isn't installed. Read-only: hashes two files and runs
+    `--help` / `--version` / `-version`."""
+
+    def test_reference_toolchain_matches_the_pins(self):
+        if not os.path.isfile(versions.HDR_ANALYZER_PATH):
+            self.skipTest("hdr_analyzer_mvp not installed — not the reference machine")
+        c = preflight.check_native_dv()
         self.assertTrue(c["ok"], c["detail"])

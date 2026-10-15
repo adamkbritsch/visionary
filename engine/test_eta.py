@@ -221,3 +221,179 @@ class TwoLaneContention(unittest.TestCase):
 
     def test_the_default_keeps_every_existing_caller_unchanged(self):
         self.assertEqual(eta.regime_of(run_stage="resolve", run_active=True), eta.SOLO)
+
+
+class NativeAnalysisRegime(unittest.TestCase):
+    """The native DV analysis ('dvnative') runs on the CPU at nice 10 beside a remux's x265 —
+    where Topaz sits — and then the run thread parks at the native gate until that remux ends."""
+
+    def test_a_live_analysis_is_contention(self):
+        self.assertEqual(eta.regime_of(run_stage="dvnative", run_active=True), eta.CONTENDED)
+
+    def test_a_STALE_dvnative_stage_is_not(self):
+        self.assertEqual(eta.regime_of(run_stage="dvnative", run_active=False), eta.SOLO)
+
+    def test_it_never_preempts_the_lane_so_the_correction_applies(self):
+        self.assertTrue(eta.correction_applies(run_stage="dvnative", run_active=True))
+
+    def test_every_existing_stage_keeps_its_regime(self):
+        # dv_engine = 'resolve' must be byte-identical: the stage list as it was before the
+        # native lane, run against the live function for every input it can see.
+        def before(run_stage, run_active, other_lane_live):
+            if other_lane_live:
+                return eta.CONTENDED
+            if run_active and run_stage in ("download", "extend", "topaz"):
+                return eta.CONTENDED
+            return eta.SOLO
+        for st in (None, "", "download", "extend", "topaz", "resolve", "remux", "upload",
+                   "cleanup", "idle"):
+            for active in (True, False):
+                for other in (True, False):
+                    self.assertEqual(eta.regime_of(run_stage=st, run_active=active,
+                                                   other_lane_live=other),
+                                     before(st, active, other), (st, active, other))
+                self.assertEqual(eta.correction_applies(run_stage=st, run_active=active),
+                                 not (active and st == "resolve"), (st, active))
+
+
+class ChunkReplay(unittest.TestCase):
+    """A resume re-fires one boundary per chunk already measured, about a second apart."""
+
+    def test_a_replayed_chunk_is_recognised(self):
+        self.assertTrue(eta.chunk_is_replay(1 / 6, 0.2))       # a sidecar reloaded
+        self.assertTrue(eta.chunk_is_replay(0.01, 3.0))        # under CHUNK_REPLAY_SECS
+        self.assertTrue(eta.chunk_is_replay(0.5, 20.0))        # the whole item in 40 s
+
+    def test_real_analysis_is_not(self):
+        self.assertFalse(eta.chunk_is_replay(1 / 6, 240.0))    # a 7,058-frame chunk in 4 min
+        self.assertFalse(eta.chunk_is_replay(0.005, 10.0))     # a tiny last chunk, genuinely run
+
+    def test_junk_is_never_banked(self):
+        for w, t in ((0, 100), (-0.1, 100), (0.1, 0), (0.1, -5), (None, 100), ("x", 100),
+                     (0.1, None)):
+            self.assertTrue(eta.chunk_is_replay(w, t), (w, t))
+
+
+class NativeChunkClock(unittest.TestCase):
+    """The 'dvnative' ETA, from chunk boundaries — the only progress that stage publishes."""
+
+    QUARTERS = [0.25, 0.5, 0.75, 1.0]
+
+    def test_nothing_until_a_live_chunk_lands(self):
+        c = eta.ChunkClock()
+        self.assertFalse(c.observe(0, self.QUARTERS, 0.0))
+        self.assertEqual(c.estimate(100.0), {})
+
+    def test_eta_from_measured_chunks(self):
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        self.assertTrue(c.observe(1, self.QUARTERS, 300.0))   # one chunk = 300 s
+        e = c.estimate(300.0)
+        self.assertAlmostEqual(e["eta_secs"], 900.0, delta=0.1)       # three chunks left
+        self.assertAlmostEqual(e["seg_secs"], 300.0, delta=0.1)
+        self.assertAlmostEqual(e["seg_eta_secs"], 300.0, delta=0.1)
+
+    def test_it_counts_down_between_boundaries(self):
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        c.observe(1, self.QUARTERS, 300.0)
+        e = c.estimate(400.0)
+        self.assertAlmostEqual(e["eta_secs"], 800.0, delta=0.1)
+        self.assertAlmostEqual(e["seg_eta_secs"], 200.0, delta=0.1)
+        self.assertAlmostEqual(e["seg_secs"], 300.0, delta=0.1)        # the projection holds
+
+    def test_the_rate_is_frames_weighted(self):
+        # A 10% chunk in 100 s, then a 40% one in 200 s: 50% in 300 s, so the last 50% takes
+        # 300 s. Averaging the two chunks' rates instead says 333 s.
+        c = eta.ChunkClock()
+        n = [0.1, 0.5, 1.0]
+        c.observe(0, n, 0.0)
+        c.observe(1, n, 100.0)
+        c.observe(2, n, 300.0)
+        self.assertAlmostEqual(c.estimate(300.0)["eta_secs"], 300.0, delta=0.1)
+
+    def test_the_resume_replay_is_not_banked(self):
+        # Three chunks were measured before a relaunch; the resume replays them in ~0.3 s.
+        # Banking that would say the last three take ~0.3 s x 1 — the stage ETA would collapse.
+        c = eta.ChunkClock()
+        n = [i / 6 for i in range(1, 7)]
+        c.observe(0, n, 0.0)
+        for k, t in ((1, 0.1), (2, 0.2), (3, 0.3)):
+            self.assertFalse(c.observe(k, n, t))
+        self.assertEqual(c.estimate(0.3), {})                  # nothing measured yet
+        self.assertTrue(c.observe(4, n, 240.3))                # the first live chunk: 240 s
+        self.assertAlmostEqual(c.estimate(240.3)["eta_secs"], 480.0, delta=0.5)
+
+    def test_a_new_attempt_keeps_what_was_measured(self):
+        # A pause (or a relaunch) restarts the stage at seg_done 0; the chunks and the machine
+        # are the same, so the rate is still the best evidence there is.
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        c.observe(1, self.QUARTERS, 300.0)
+        self.assertFalse(c.observe(0, self.QUARTERS, 5000.0))  # the next attempt starts
+        self.assertFalse(c.observe(1, self.QUARTERS, 5000.2))  # chunk 1 replayed
+        e = c.estimate(5000.2)
+        self.assertAlmostEqual(e["eta_secs"], 900.0, delta=0.5)
+
+    def test_a_different_item_starts_over(self):
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        c.observe(1, self.QUARTERS, 300.0)
+        c.observe(0, [0.5, 1.0], 400.0)
+        self.assertEqual(c.estimate(400.0), {})
+
+    def test_a_republished_boundary_changes_nothing(self):
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        c.observe(1, self.QUARTERS, 300.0)
+        self.assertFalse(c.observe(1, self.QUARTERS, 350.0))
+        self.assertAlmostEqual(c.estimate(350.0)["seg_eta_secs"], 250.0, delta=0.1)
+
+    def test_after_the_last_chunk_there_is_nothing_to_count(self):
+        # Merging and the RPU take seconds; no countdown is better than a wrong one.
+        c = eta.ChunkClock()
+        n = [0.5, 1.0]
+        c.observe(0, n, 0.0)
+        c.observe(1, n, 300.0)
+        c.observe(2, n, 600.0)
+        self.assertEqual(c.estimate(600.0), {})
+
+    def test_an_overrunning_chunk_never_reads_zero(self):
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        c.observe(1, self.QUARTERS, 300.0)
+        e = c.estimate(5000.0)
+        self.assertEqual(e["seg_eta_secs"], eta.TAIL_MIN_SECS)
+        self.assertAlmostEqual(e["eta_secs"], eta.TAIL_MIN_SECS + 600.0, delta=0.1)
+
+    def test_junk_progress_is_ignored(self):
+        c = eta.ChunkClock()
+        c.observe(0, self.QUARTERS, 0.0)
+        c.observe(1, self.QUARTERS, 300.0)
+        before = c.estimate(300.0)
+        for args in ((None, self.QUARTERS, 400.0), ("x", self.QUARTERS, 400.0),
+                     (2, None, 400.0), (2, [], 400.0), (5, self.QUARTERS, 400.0),
+                     (-1, self.QUARTERS, 400.0), (2, [0.5, 0.25, 1.0], 400.0),
+                     (2, self.QUARTERS, None)):
+            self.assertFalse(c.observe(*args), args)
+        self.assertEqual(c.estimate(300.0), before)
+
+    def test_a_live_episode_end_to_end(self):
+        # S06E05-shaped: six ~7,058-frame chunks at ~4 min each, a relaunch after chunk 3.
+        n = [round(k * 7058 / 42348, 4) for k in range(1, 7)]
+        c, t = eta.ChunkClock(), 0.0
+        c.observe(0, n, t)
+        for k in (1, 2, 3):
+            t += 240.0
+            c.observe(k, n, t)
+            self.assertAlmostEqual(c.estimate(t)["eta_secs"], (6 - k) * 240.0, delta=2.0)
+        t += 3600.0                                            # relaunched an hour later
+        c.observe(0, n, t)
+        for k in (1, 2, 3):
+            t += 0.15
+            c.observe(k, n, t)
+        self.assertAlmostEqual(c.estimate(t)["eta_secs"], 3 * 240.0, delta=2.0)
+        for k in (4, 5):
+            t += 240.0
+            c.observe(k, n, t)
+            self.assertAlmostEqual(c.estimate(t)["eta_secs"], (6 - k) * 240.0, delta=2.0)

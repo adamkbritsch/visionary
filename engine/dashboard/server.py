@@ -1010,6 +1010,33 @@ def api_preflight(fresh=False):
     return r
 
 
+def api_save_settings(body) -> tuple:
+    """POST /api/settings -> (payload, http code).
+
+    Switching dv_engine to 'native' is GATED here, server-side — the only gate: the arm gate
+    never checks the native toolchain (a broken one just sends items through Resolve), so
+    without this nothing would check that the pinned analyzer, LUT and dovi_tool exist.
+    A failing check_native_dv refuses the WHOLE update with a 409 and its row, and saves
+    nothing. Every other write (including back to 'resolve') is today's path unchanged."""
+    body = body or {}
+    if isinstance(body, dict) and body.get("dv_engine") == "native":
+        row = preflight.check_native_dv()
+        if not row["ok"]:
+            return {"error": "native DV toolchain check failed — dv_engine not changed",
+                    "checks": [row]}, 409
+    new = settings.set_settings(body)
+    if "max_youtube_minutes" in body:
+        # The popular sets bake this cap in at refresh time — invalidate so the
+        # next _refresh_youtube tick rebuilds them with the new value (otherwise
+        # raising the cap does nothing until the next re-arm). Best-effort, like
+        # the configure_youtarr call on queue edits.
+        try: orchestrator.ORCH.refresh_youtube_meta()
+        except Exception: pass
+    if "dv_engine" in body:
+        _invalidate_preflight()         # the native_dv row's PRESENCE follows the setting
+    return {"settings": new}, 200
+
+
 def _discover_plex(hosts):
     """Tokenless: :32400/identity answers without auth; version parsed off the
     MediaContainer tag (a bare version= match grabs the XML declaration's 1.0)."""
@@ -1459,6 +1486,9 @@ def current_state():
     state["up_next"] = up_next(current=orch.get("current"), inflight=orchestrator.ORCH.finisher_views())
     state["orchestrator"] = orch
     state["settings"] = settings.get_settings()
+    # READ-ONLY for the app: the engine's validated view, so a hand-edited value is shown as
+    # what the engine will actually use (it has no Settings control — POST /api/settings).
+    state["settings"]["dv_engine"] = settings.dv_engine()
     state["show_profile"] = show_profile_info()
     state["log"] = logbook.tail(6)            # recent failures/errors for the UI
     return state
@@ -1834,15 +1864,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/request-screen-recording":
             self._json(request_screen_recording())
         elif path == "/api/settings":
-            new = settings.set_settings(body or {})
-            if "max_youtube_minutes" in (body or {}):
-                # The popular sets bake this cap in at refresh time — invalidate so the
-                # next _refresh_youtube tick rebuilds them with the new value (otherwise
-                # raising the cap does nothing until the next re-arm). Best-effort, like
-                # the configure_youtarr call on queue edits.
-                try: orchestrator.ORCH.refresh_youtube_meta()
-                except Exception: pass
-            self._json({"settings": new})
+            out, code = api_save_settings(body)
+            self._json(out, code=code)
         elif path == "/api/displays":
             # Reorder the priority list / flip the master switch. The priority list is
             # validated in settings (VALIDATORS) rather than here, so a hand-edited
