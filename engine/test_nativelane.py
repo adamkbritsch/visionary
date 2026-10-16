@@ -408,9 +408,9 @@ class Disk(Fixture):
         self.assertEqual(nativelane.held_native_bytes(self.root, exclude=self.segdir), 100 + 101 + 102)
 
     def test_mid_analysis_floor(self):
-        frames = 7058                                          # ~28.9 GiB of intermediate
-        self.assertIsNone(nativelane.floor_reason(180 * GiB, frames))
-        why = nativelane.floor_reason(170 * GiB, frames, k=3)
+        frames = 7058                                          # ~44.8 GiB of intermediate
+        self.assertIsNone(nativelane.floor_reason(196 * GiB, frames))
+        why = nativelane.floor_reason(193 * GiB, frames, k=3)
         self.assertTrue(why.startswith("paused: low disk"))
         self.assertIn("chunk 4", why)
         hook = nativelane.disk_floor_hook(self.root, free_fn=lambda: 100 * GiB)

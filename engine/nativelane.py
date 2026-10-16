@@ -93,9 +93,10 @@ ITEM_TAIL_GB = 120              # = orchestrator.ITEM_TAIL_GB (test-pinned): the
 NEXT_ITEM_MIN_GB = 150          # the hard minimum of that need
 DISK_MARGIN_GB = 20             # held back from the projection (remux transients, rounding)
 MID_ANALYSIS_FLOOR_GB = 150     # before each analysis intermediate: free - its size >= this
-INTERMEDIATE_BYTES_PER_FRAME = int(4.2 * 1024 ** 2)
-                                # FFV1 1080p 4:4:4 10-bit: measured ~4.1 MB/frame (26-28 GiB for
-                                # S06E05's 7,058-frame chunk); rounded up to 4.2 MiB
+INTERMEDIATE_BYTES_PER_FRAME = int(6.5 * 1024 ** 2)
+                                # FFVHuff 1080p 4:4:4 10-bit: 2.3 MB/frame on S06E06, ~1.5x the
+                                # FFV1 it replaced; FFV1 measured ~4.1 MB/frame on S06E05's grainy
+                                # 7,058-frame chunk, so ~6.3 there — rounded up to 6.5 MiB
 
 _PIN_DEFAULTS = {
     "DOVI_TOOL_VERSION": "2.3.0",

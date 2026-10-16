@@ -193,10 +193,13 @@ def x265_max_cll(sc: dict):
 # hdr_analyzer_mvp drops frames on a piped input (measured: a 72-frame y4m pipe read as 1
 # frame, NUT as 21), so each Topaz chunk is rendered to a lossless FILE first: the PQ
 # picture after the LUT, area-downscaled IN RGB to 1080p, then 4:4:4 (no chroma-subsampling
-# overshoot in max-RGB), FFV1. ~4 MB/frame, and a chunk has no upper length: Topaz closes it
-# at the first strong cut at least ~90 s in, so a quiet stretch runs long (S06E05's 7,058-frame
-# chunk made a 26-28 GiB intermediate, not the ~9 GB once written here). One at a time,
-# deleted as soon as it is measured, and never started without room for it: the caller's
+# overshoot in max-RGB), FFVHuff: lossless like the FFV1 it replaced (pixel-identical output,
+# identical analyzer and L4 results), but ~5x cheaper to encode and to decode — FFV1's own
+# coding was ~240 of the ~500 ms of CPU each frame cost, and it was decoded twice (analyzer, L4).
+# ~2.3 MB/frame on S06E06 (FFV1: 1.5); grain costs it more than FFV1, and a chunk has no upper
+# length: Topaz closes it at the first strong cut at least ~90 s in, so a quiet stretch runs
+# long (S06E05's 7,058-frame chunk made a 26-28 GiB FFV1 intermediate). At most two exist,
+# deleted as soon as they are measured, and never started without room: the caller's
 # before_chunk hook checks free space against the chunk's frames first (the native lane's
 # 150 GiB floor). Topaz cuts its chunks at strong scene changes, so every chunk start is a
 # scene start and per-chunk results join without a seam.
@@ -333,7 +336,7 @@ def build_analysis_intermediate_command(ffmpeg: str, chunk: str, out_mkv: str, c
         head += ["-hwaccel", "videotoolbox"]
     return head + ["-i", chunk, "-map", "0:v:0", "-vf", analysis_vf(cube),
                    "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
-                   "-color_range", "tv", "-c:v", "ffv1", "-level", "3", "-slices", "16", out_mkv]
+                   "-color_range", "tv", "-c:v", "ffvhuff", "-pix_fmt", "yuv444p10le", out_mkv]
 
 
 def build_raw444_decode_command(ffmpeg: str, src: str, size: tuple | None = None) -> list:
@@ -489,7 +492,7 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     OVERLAPPED (2026-10-15, to match Resolve's stage time): while hdr-analyze and the L4 pass
     run side by side on chunk k's intermediate, chunk k+1's intermediate is already being
     built — a chunk costs its slowest step instead of the sum of three. At most two
-    intermediates (~1.5 MB/frame at 1080p FFV1) exist at once.
+    intermediates (~2.3 MB/frame at 1080p FFVHuff) exist at once.
 
     A finished chunk's sidecar (and its L4 list) is kept in `workdir` and reused on resume;
     intermediates are always deleted. Before a chunk that still needs work is STARTED:

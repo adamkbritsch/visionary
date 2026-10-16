@@ -183,7 +183,7 @@ class ChunkMerge(unittest.TestCase):
 
 
 class AnalysisIntermediate(unittest.TestCase):
-    def test_area_downscale_then_lut_then_444_ffv1_tagged_pq(self):
+    def test_area_downscale_then_lut_then_444_ffvhuff_tagged_pq(self):
         c = dvnative.build_analysis_intermediate_command("/ff", "/seg_0001.mov", "/c.mkv", "/l/rcm.cube")
         vf = c[c.index("-vf") + 1]
         self.assertTrue(vf.startswith("scale=1920:1080:flags=area,"))   # the LUT runs at 1080p
@@ -192,7 +192,8 @@ class AnalysisIntermediate(unittest.TestCase):
         self.assertTrue(vf.endswith("format=yuv444p10le"))
         self.assertNotIn("yuv420", vf)                       # never through 4:2:0 on the way
         self.assertEqual(c[c.index("-color_trc") + 1], "smpte2084")
-        self.assertEqual(c[c.index("-c:v") + 1], "ffv1")
+        self.assertEqual(c[c.index("-c:v") + 1], "ffvhuff")              # lossless, cheap to decode
+        self.assertEqual(c[c.index("-pix_fmt") + 1], "yuv444p10le")
         self.assertEqual(c[-1], "/c.mkv")
 
     def test_already_pq_input_needs_no_lut(self):
@@ -716,6 +717,42 @@ def _have_numpy() -> bool:
         return True
     except ImportError:
         return False
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG), "ffmpeg not installed")
+class IntermediateIsLossless(unittest.TestCase):
+    """The analysis intermediate's codec must give back exactly the 10-bit 4:4:4 PQ frames it
+    was handed (FFVHuff replaced FFV1 for speed; a codec that silently dropped to 8-bit, as
+    Ut Video does with yuv444p10le, would shift every measurement)."""
+
+    def test_round_trip_is_bit_exact(self):
+        d = tempfile.mkdtemp()
+        try:
+            src = ["-f", "lavfi", "-i", "testsrc2=size=96x54:rate=24", "-frames:v", "4",
+                   "-vf", "format=yuv444p10le"]
+            c = dvnative.build_analysis_intermediate_command(dvnative.FFMPEG, "IN", os.path.join(d, "x.mkv"),
+                                                             None, hwaccel=False)
+            enc = c[:c.index("-i")] + src + c[c.index("-color_primaries"):]
+            r = subprocess.run(enc, capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            # the reference: the SAME command with the codec swapped for FFV1 (lossless)
+            ref = enc[:enc.index("-c:v")] + ["-c:v", "ffv1", "-level", "3", os.path.join(d, "ref.mkv")]
+            r = subprocess.run(ref, capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            def md5(path):
+                return subprocess.run([dvnative.FFMPEG, "-hide_banner", "-loglevel", "error", "-i", path,
+                                       "-pix_fmt", "yuv444p10le", "-f", "md5", "-"],
+                                      capture_output=True, text=True).stdout.strip()
+            self.assertTrue(md5(os.path.join(d, "ref.mkv")).startswith("MD5="))
+            self.assertEqual(md5(os.path.join(d, "x.mkv")), md5(os.path.join(d, "ref.mkv")))
+            probe = subprocess.run([dvnative.FFMPEG.replace("ffmpeg", "ffprobe"), "-v", "error",
+                                    "-select_streams", "v:0", "-show_entries", "stream=pix_fmt",
+                                    "-of", "csv=p=0", os.path.join(d, "x.mkv")], capture_output=True, text=True)
+            self.assertEqual(probe.stdout.strip(), "yuv444p10le")     # 10-bit 4:4:4 kept (the analyzer
+            #                                       is told --transfer pq, so the tags are not load-bearing)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 @unittest.skipUnless(os.path.exists(dvnative.FFMPEG) and _have_numpy(), "ffmpeg/numpy not installed")
