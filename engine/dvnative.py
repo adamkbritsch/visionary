@@ -38,6 +38,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import versions as _versions
@@ -310,24 +311,36 @@ def run_step(cmd: list, *, timeout: float, abort=None, should_pause=None, cwd: s
 
 
 def analysis_vf(cube: str | None) -> str:
-    """Chain for the analysis intermediate. With a LUT: SDR -> PQ RGB -> 1080p (area, in RGB)
-    -> 4:4:4. Without (an already-PQ source): area-downscale and 4:4:4."""
+    """Chain for the analysis intermediate: area-downscale to 1080p FIRST, then (with a LUT)
+    SDR -> PQ RGB -> 4:4:4; without one (an already-PQ source) straight to 4:4:4. Scaling
+    before the LUT does the LUT's per-pixel float work at a quarter of the pixels: the
+    intermediate builds ~2x faster, and on a real Topaz chunk the L1 it measures moved by a
+    median 0 codes (peak, worst 9-10), at most 1 code (average), scene cuts identical, L4 at
+    most 1 code (measured 2026-10-15 against the LUT-first chain)."""
     scale = f"scale={ANALYSIS_WIDTH}:{ANALYSIS_HEIGHT}:flags=area"
     if cube:
-        return lut_rgb_chain(cube) + "," + scale + "," + pq_rgb_to_yuv("yuv444p10le")
+        return scale + "," + lut_rgb_chain(cube) + "," + pq_rgb_to_yuv("yuv444p10le")
     return scale + ",format=yuv444p10le"
 
 
-def build_analysis_intermediate_command(ffmpeg: str, chunk: str, out_mkv: str, cube: str | None) -> list:
-    return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", chunk,
-            "-map", "0:v:0", "-vf", analysis_vf(cube),
-            "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
-            "-color_range", "tv", "-c:v", "ffv1", "-level", "3", "-slices", "16", out_mkv]
+def build_analysis_intermediate_command(ffmpeg: str, chunk: str, out_mkv: str, cube: str | None,
+                                        hwaccel: bool = True) -> list:
+    """`hwaccel`: decode the 4K ProRes on Apple's media engine (VideoToolbox) — the decode is
+    what bounds this step once the LUT runs at 1080p; analyze_chunks retries once in software
+    if the hardware decode refuses a chunk."""
+    head = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
+    if hwaccel:
+        head += ["-hwaccel", "videotoolbox"]
+    return head + ["-i", chunk, "-map", "0:v:0", "-vf", analysis_vf(cube),
+                   "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                   "-color_range", "tv", "-c:v", "ffv1", "-level", "3", "-slices", "16", out_mkv]
 
 
-def build_raw444_decode_command(ffmpeg: str, src: str) -> list:
+def build_raw444_decode_command(ffmpeg: str, src: str, size: tuple | None = None) -> list:
+    """Raw yuv444p10le frames of `src` on stdout; `size` (w, h) area-scales them in the decode."""
+    vf = ["-vf", f"scale={int(size[0])}:{int(size[1])}:flags=area"] if size else []
     return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", src,
-            "-map", "0:v:0", "-pix_fmt", "yuv444p10le", "-f", "rawvideo", "-"]
+            "-map", "0:v:0", *vf, "-pix_fmt", "yuv444p10le", "-f", "rawvideo", "-"]
 
 
 def maxrgb_pq12_stats(frame, width: int, height: int):
@@ -347,12 +360,16 @@ def maxrgb_pq12_stats(frame, width: int, height: int):
 
 
 def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
-             height: int = ANALYSIS_HEIGHT) -> list:
+             height: int = ANALYSIS_HEIGHT, scale: bool = False) -> list:
     """Per-frame [anchor_pq, anchor_power] (rounded mean, std of PQ max-RGB) of a yuv444p10le
     PQ file — the analysis intermediate, so it costs one more decode of a file we already made.
-    analyze_chunks runs this in a child (build_l4_command), never in the engine process."""
+    `scale`: decode it area-scaled to width x height (analyze_chunks measures L4 at 960x540:
+    ~2x faster than 1080p, within a median 1-2 codes of it, worst 6 — far inside the native
+    vs Resolve L4 difference of ~6-8). analyze_chunks runs this in a child
+    (build_l4_command), never in the engine process."""
     size = width * height * 3 * 2
-    p = subprocess.Popen(build_raw444_decode_command(ffmpeg, src), stdout=subprocess.PIPE)
+    p = subprocess.Popen(build_raw444_decode_command(ffmpeg, src, (width, height) if scale else None),
+                         stdout=subprocess.PIPE)
     out = []
     try:
         while True:
@@ -369,11 +386,15 @@ def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
     return out
 
 
+L4_WIDTH, L4_HEIGHT = 960, 540         # analyze_chunks' L4 resolution (scaled in the decode)
+
+
 def build_l4_command(python: str, src: str, out_json: str, *, ffmpeg: str = FFMPEG,
-                     width: int = ANALYSIS_WIDTH, height: int = ANALYSIS_HEIGHT) -> list:
+                     width: int = ANALYSIS_WIDTH, height: int = ANALYSIS_HEIGHT,
+                     scale: bool = False) -> list:
     """`python3 -m dvnative l4 ...` (run with cwd = ENGINE_DIR): frame_l4 of `src` as JSON."""
     return [python, "-m", "dvnative", "l4", src, out_json, "--ffmpeg", ffmpeg,
-            "--size", f"{int(width)}x{int(height)}"]
+            "--size", f"{int(width)}x{int(height)}"] + (["--scale"] if scale else [])
 
 
 def merge_sidecars(parts: list, total: int | None = None) -> dict:
@@ -437,6 +458,26 @@ def _load_chunk(side: str, l4_path: str | None, frames: int) -> tuple:
         return None, f"unreadable result: {e}"
 
 
+class _EitherSet:
+    """run_step's `abort` while chunks overlap: set when the caller's abort is set OR a sibling
+    step failed (so a failure in one step kills the others instead of letting them run on)."""
+
+    def __init__(self, outer, inner):
+        self.outer, self.inner = outer, inner
+
+    def is_set(self) -> bool:
+        return bool(self.inner.is_set() or (self.outer is not None and self.outer.is_set()))
+
+    def wait(self, timeout=None) -> bool:
+        end = time.monotonic() + (timeout or 0)
+        while not self.is_set():
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            self.inner.wait(min(left, 0.25))
+        return True
+
+
 def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: str = HDR_ANALYZER,
                    ffmpeg: str = FFMPEG, peak_estimator: str = "max", with_l4: bool = True,
                    threads: int | None = None, abort=None, on_chunk=None, should_pause=None,
@@ -445,17 +486,26 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     """Measure every chunk ([[first_frame, path], ..., [total, None]] — the end sentinel is
     required: it gives each chunk its frame count) and return the merged sidecar.
 
+    OVERLAPPED (2026-10-15, to match Resolve's stage time): while hdr-analyze and the L4 pass
+    run side by side on chunk k's intermediate, chunk k+1's intermediate is already being
+    built — a chunk costs its slowest step instead of the sum of three. At most two
+    intermediates (~1.5 MB/frame at 1080p FFV1) exist at once.
+
     A finished chunk's sidecar (and its L4 list) is kept in `workdir` and reused on resume;
-    the intermediate is always deleted. Before a chunk that still needs work:
+    intermediates are always deleted. Before a chunk that still needs work is STARTED:
       abort set                   -> Aborted
       should_pause()              -> Paused (also polled while each step runs; the step dies)
       before_chunk(k, frames)     -> a non-empty string pauses with that reason (the caller's
                                      disk floor); it may also raise Paused itself
-    Each step (intermediate, analyzer, L4) runs through run_step at `nice`, bounded by
-    step_timeout(frames). on_chunk(done, of) after every chunk, resumed ones included;
-    on_cpu(k, cpu_seconds, frames) after each chunk measured in THIS call (os.wait4 user+sys
-    over its three steps). A chunk whose results do not cover exactly its frames (sidecar or
-    L4) is deleted and fails the call, so a retry measures it again instead of reusing it."""
+    A pause or abort found while starting chunk k+1 lets chunk k finish and publish first.
+    Each step runs through run_step at `nice`, bounded by step_timeout(frames); a failing
+    step kills its siblings and its own error is what the call raises. on_chunk(done, of)
+    after every published chunk (resumed ones counted first); on_cpu(k, cpu_seconds, frames)
+    for each chunk worked on in THIS call (os.wait4 user+sys over its steps): when it
+    publishes, or on the way out for one that failed or was cut short. A chunk whose
+    results do not cover exactly its frames (sidecar or L4) is deleted and fails the call,
+    so a retry measures it again instead of reusing it."""
+    import concurrent.futures as cf
     if not chunks or chunks[-1][1] is not None:
         raise ValueError("the chunk list must end with its [total, None] sentinel")
     os.makedirs(workdir, exist_ok=True)
@@ -463,62 +513,148 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     python = python or sys.executable
     real = [(a, p) for a, p in chunks if p]
     ends = [int(a) for a, _p in chunks[1:]]
-    parts = []
-    for k, (first, path) in enumerate(real):
-        frames = ends[k] - int(first)
+    n_chunks = len(real)
+
+    def frames_of(k):
+        return ends[k] - int(real[k][0])
+
+    def names(k):
         out_bin = os.path.join(workdir, f"chunk_{k:04d}.bin")
-        side = sidecar_path(out_bin)
-        l4_path = os.path.join(workdir, f"chunk_{k:04d}.l4.json")
-        if not os.path.exists(side) or (with_l4 and not os.path.exists(l4_path)):
-            if abort is not None and abort.is_set():
-                raise Aborted("aborted (run stopped)")
-            if should_pause is not None and should_pause():
-                raise Paused(f"paused: yielded before analysis chunk {k + 1} of {len(real)}")
-            if before_chunk is not None:
-                why = before_chunk(k, frames)
-                if why:
-                    why = str(why)
-                    raise Paused(why if why.startswith("paused:") else "paused: " + why)
-            mkv = os.path.join(workdir, f"chunk_{k:04d}.mkv")
-            tmo = step_timeout(frames)
-            cpu = 0.0
+        return (out_bin, sidecar_path(out_bin), os.path.join(workdir, f"chunk_{k:04d}.l4.json"),
+                os.path.join(workdir, f"chunk_{k:04d}.mkv"))
 
-            def step(cmd, what, cwd=None):
-                nonlocal cpu
-                rc, tail, used = run_step(niced(cmd, nice), timeout=tmo, abort=abort,
-                                          should_pause=should_pause, cwd=cwd,
-                                          what=f"chunk {k + 1} {what}")
-                cpu += used or 0.0
-                return rc, tail
+    def published(k):
+        _b, side, l4_path, _m = names(k)
+        return os.path.exists(side) and (not with_l4 or os.path.exists(l4_path))
 
-            try:
-                rc, tail = step(build_analysis_intermediate_command(ffmpeg, path, mkv, cube), "intermediate")
-                if rc != 0:
-                    raise RuntimeError(f"chunk {k}: intermediate failed: {tail[-300:]}")
-                rc, tail = step(build_analyzer_command(analyzer, mkv, out_bin + ".part",
-                                                       peak_estimator=peak_estimator, threads=threads),
-                                "analyzer")
-                if rc != 0 or not os.path.exists(sidecar_path(out_bin + ".part")):
-                    raise RuntimeError(f"chunk {k}: analyzer failed: {tail[-300:]}")
-                if with_l4:
-                    rc, tail = step(build_l4_command(python, mkv, l4_path + ".part", ffmpeg=ffmpeg),
-                                    "L4", cwd=ENGINE_DIR)
-                    if rc != 0 or not os.path.exists(l4_path + ".part"):
-                        raise RuntimeError(f"chunk {k}: L4 failed: {tail[-300:]}")
-                    os.replace(l4_path + ".part", l4_path)
-                load_sidecar(sidecar_path(out_bin + ".part"))       # never publish an invalid one
-                os.replace(sidecar_path(out_bin + ".part"), side)   # publish last: resume trusts it
-            finally:
-                _rm_quiet(mkv, out_bin + ".part", sidecar_path(out_bin + ".part"), l4_path + ".part")
+    def gate(k):
+        if abort is not None and abort.is_set():
+            raise Aborted("aborted (run stopped)")
+        if should_pause is not None and should_pause():
+            raise Paused(f"paused: yielded before analysis chunk {k + 1} of {n_chunks}")
+        if before_chunk is not None:
+            why = before_chunk(k, frames_of(k))
+            if why:
+                why = str(why)
+                raise Paused(why if why.startswith("paused:") else "paused: " + why)
+
+    stop = threading.Event()
+    guard = _EitherSet(abort, stop)
+    cpu, lock, reported = {}, threading.Lock(), set()
+
+    def step(k, cmd, what, cwd=None):
+        rc, tail, used = run_step(niced(cmd, nice), timeout=step_timeout(frames_of(k)), abort=guard,
+                                  should_pause=should_pause, cwd=cwd, what=f"chunk {k + 1} {what}")
+        with lock:
+            cpu[k] = cpu.get(k, 0.0) + (used or 0.0)
+        return rc, tail
+
+    def run_build(k):
+        mkv = names(k)[3]
+        rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube), "intermediate")
+        if rc != 0:                     # the hardware decode refused it: once more in software
+            _rm_quiet(mkv)
+            rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube,
+                                                                   hwaccel=False),
+                            "intermediate (software decode)")
+        if rc != 0:
+            raise RuntimeError(f"chunk {k}: intermediate failed: {tail[-300:]}")
+
+    def run_analyzer(k):
+        out_bin, _s, _l, mkv = names(k)
+        rc, tail = step(k, build_analyzer_command(analyzer, mkv, out_bin + ".part",
+                                                  peak_estimator=peak_estimator, threads=threads),
+                        "analyzer")
+        if rc != 0 or not os.path.exists(sidecar_path(out_bin + ".part")):
+            raise RuntimeError(f"chunk {k}: analyzer failed: {tail[-300:]}")
+
+    def run_l4(k):
+        _b, _s, l4_path, mkv = names(k)
+        rc, tail = step(k, build_l4_command(python, mkv, l4_path + ".part", ffmpeg=ffmpeg,
+                                            width=L4_WIDTH, height=L4_HEIGHT, scale=True),
+                        "L4", cwd=ENGINE_DIR)
+        if rc != 0 or not os.path.exists(l4_path + ".part"):
+            raise RuntimeError(f"chunk {k}: L4 failed: {tail[-300:]}")
+
+    def publish(k):
+        out_bin, side, l4_path, mkv = names(k)
+        if with_l4:
+            os.replace(l4_path + ".part", l4_path)
+        load_sidecar(sidecar_path(out_bin + ".part"))       # never publish an invalid one
+        os.replace(sidecar_path(out_bin + ".part"), side)   # publish last: resume trusts it
+        _rm_quiet(mkv, out_bin + ".part")
+
+    def first_error(futures):
+        """Wait for all of them; the first REAL error (a sibling killed by the stop event
+        only raises Aborted because of it)."""
+        cf.wait(futures)
+        errs = [f.exception() for f in futures if f.exception() is not None]
+        real_errs = [e for e in errs if not (isinstance(e, Aborted) and stop.is_set()
+                                             and not (abort is not None and abort.is_set()))]
+        return (real_errs or errs or [None])[0]
+
+    todo = [k for k in range(n_chunks) if not published(k)]
+    done_count = n_chunks - len(todo)
+    if on_chunk:
+        for i in range(done_count):
+            on_chunk(i + 1, n_chunks)
+    pool = cf.ThreadPoolExecutor(max_workers=3)
+    try:
+        queue = iter(todo)
+        pending = None
+        k0 = next(queue, None)
+        if k0 is not None:
+            gate(k0)
+            pending = (k0, pool.submit(run_build, k0))
+        while pending is not None:
+            k, fut = pending
+            pending = None
+            err = first_error([fut])
+            if err is not None:
+                raise err
+            deferred = None
+            nk = next(queue, None)
+            if nk is not None:
+                try:
+                    gate(nk)
+                    pending = (nk, pool.submit(run_build, nk))
+                except (Paused, Aborted) as e:
+                    deferred = e        # chunk k still finishes and publishes first
+            measure = [pool.submit(run_analyzer, k)] + ([pool.submit(run_l4, k)] if with_l4 else [])
+            done, _ = cf.wait(measure, return_when=cf.FIRST_EXCEPTION)
+            if any(f.exception() is not None for f in done):
+                stop.set()              # kill the other measuring step and the prefetched build
+                err = first_error(measure + ([pending[1]] if pending else []))
+                raise err
+            publish(k)
+            done_count += 1
+            reported.add(k)
             if on_cpu:
-                on_cpu(k, cpu, frames)
-        sc, bad = _load_chunk(side, l4_path if with_l4 else None, frames)
+                on_cpu(k, cpu.get(k, 0.0), frames_of(k))
+            if on_chunk:
+                on_chunk(done_count, n_chunks)
+            if deferred is not None:
+                raise deferred
+    except BaseException:
+        stop.set()                      # nothing keeps running behind a failure or a pause
+        raise
+    finally:
+        pool.shutdown(wait=True)
+        if on_cpu:                      # a chunk that failed or was cut short still used CPU
+            for k in sorted(set(cpu) - reported):
+                on_cpu(k, cpu[k], frames_of(k))
+        for k in todo:
+            if not published(k):
+                out_bin, _side, l4_path, mkv = names(k)
+                _rm_quiet(mkv, out_bin + ".part", sidecar_path(out_bin + ".part"), l4_path + ".part")
+    parts = []
+    for k, (first, _path) in enumerate(real):
+        _b, side, l4_path, _m = names(k)
+        sc, bad = _load_chunk(side, l4_path if with_l4 else None, frames_of(k))
         if bad:
             _rm_quiet(side, l4_path)            # never reuse it: the retry measures it again
             raise RuntimeError(f"chunk {k}: {bad}")
         parts.append((first, sc))
-        if on_chunk:
-            on_chunk(k + 1, len(real))
     return merge_sidecars(parts, total=total)
 
 
@@ -648,6 +784,7 @@ def main(argv=None) -> int:
     l4.add_argument("out")
     l4.add_argument("--ffmpeg", default=FFMPEG)
     l4.add_argument("--size", default=f"{ANALYSIS_WIDTH}x{ANALYSIS_HEIGHT}")
+    l4.add_argument("--scale", action="store_true", help="area-scale the decode to --size")
     a = ap.parse_args(argv)
     if a.cmd != "l4":
         ap.print_usage(sys.stderr)
@@ -657,7 +794,7 @@ def main(argv=None) -> int:
     except ValueError:
         print(f"--size must be WxH, got {a.size!r}", file=sys.stderr)
         return 2
-    data = frame_l4(a.src, ffmpeg=a.ffmpeg, width=width, height=height)
+    data = frame_l4(a.src, ffmpeg=a.ffmpeg, width=width, height=height, scale=a.scale)
     with open(a.out, "w") as f:
         json.dump(data, f)
     return 0

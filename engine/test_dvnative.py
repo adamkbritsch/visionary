@@ -183,11 +183,12 @@ class ChunkMerge(unittest.TestCase):
 
 
 class AnalysisIntermediate(unittest.TestCase):
-    def test_lut_then_rgb_area_downscale_then_444_ffv1_tagged_pq(self):
+    def test_area_downscale_then_lut_then_444_ffv1_tagged_pq(self):
         c = dvnative.build_analysis_intermediate_command("/ff", "/seg_0001.mov", "/c.mkv", "/l/rcm.cube")
         vf = c[c.index("-vf") + 1]
-        self.assertLess(vf.index("lut3d"), vf.index("scale=1920:1080:flags=area"))
-        self.assertLess(vf.index("scale=1920:1080"), vf.index("matrix=2020_ncl"))   # downscale in RGB
+        self.assertTrue(vf.startswith("scale=1920:1080:flags=area,"))   # the LUT runs at 1080p
+        self.assertLess(vf.index("scale=1920:1080"), vf.index("lut3d"))
+        self.assertLess(vf.index("lut3d"), vf.index("matrix=2020_ncl"))
         self.assertTrue(vf.endswith("format=yuv444p10le"))
         self.assertNotIn("yuv420", vf)                       # never through 4:2:0 on the way
         self.assertEqual(c[c.index("-color_trc") + 1], "smpte2084")
@@ -197,6 +198,24 @@ class AnalysisIntermediate(unittest.TestCase):
     def test_already_pq_input_needs_no_lut(self):
         c = dvnative.build_analysis_intermediate_command("/ff", "/x.mov", "/c.mkv", None)
         self.assertEqual(c[c.index("-vf") + 1], "scale=1920:1080:flags=area,format=yuv444p10le")
+
+    def test_hardware_decode_by_default_software_on_request(self):
+        hw = dvnative.build_analysis_intermediate_command("/ff", "/x.mov", "/c.mkv", None)
+        self.assertEqual(hw[hw.index("-hwaccel") + 1], "videotoolbox")
+        self.assertLess(hw.index("-hwaccel"), hw.index("-i"))           # an input option
+        sw = dvnative.build_analysis_intermediate_command("/ff", "/x.mov", "/c.mkv", None, hwaccel=False)
+        self.assertNotIn("-hwaccel", sw)
+        self.assertEqual([a for a in hw if a not in ("-hwaccel", "videotoolbox")], sw)
+
+
+class RawDecode(unittest.TestCase):
+    def test_full_size_unless_a_size_is_given(self):
+        full = dvnative.build_raw444_decode_command("/ff", "/c.mkv")
+        self.assertNotIn("-vf", full)
+        small = dvnative.build_raw444_decode_command("/ff", "/c.mkv", (960, 540))
+        self.assertEqual(small[small.index("-vf") + 1], "scale=960:540:flags=area")
+        self.assertLess(small.index("-vf"), small.index("-pix_fmt"))
+        self.assertEqual(small[-5:], ["-pix_fmt", "yuv444p10le", "-f", "rawvideo", "-"])
 
 
 class ColourChain(unittest.TestCase):
@@ -444,6 +463,7 @@ class AnalyzeChunks(unittest.TestCase):
         self.l4_short = set()            # chunk indices whose L4 child writes one frame too few
         self.analyzer_frames = {}        # chunk index -> frames the analyzer claims
         self.fail = {}                   # (k, step) -> rc
+        self.hooks = {}                  # (k, step) -> called inside that step, before it ends
 
     def tearDown(self):
         shutil.rmtree(self.d, ignore_errors=True)
@@ -454,8 +474,15 @@ class AnalyzeChunks(unittest.TestCase):
     def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, cwd=None, what="step", poll=0.5):
         self.assertEqual(cmd[:3], ["/usr/bin/nice", "-n", "10"])
         cmd = cmd[3:]
+        if should_pause is not None and should_pause():     # run_step's poll, at the first tick
+            raise dvnative.Paused(f"paused: yielded during {what}")
         if cmd[0] == "/ff":
             step, k = "intermediate", self._k(cmd[-1])
+            if "-hwaccel" not in cmd:
+                step = "intermediate-sw"
+            if (k, "hw-refuses") in self.fail and step == "intermediate":
+                self.calls.append((k, step))
+                return 1, "hardware decode refused", 0.25
             open(cmd[-1], "wb").close()
         elif cmd[0] == "/an":
             step, k = "analyzer", self._k(cmd[2])
@@ -465,14 +492,29 @@ class AnalyzeChunks(unittest.TestCase):
         else:
             step, k = "l4", self._k(cmd[4])
             self.assertEqual(cmd[1:4], ["-m", "dvnative", "l4"])
+            self.assertEqual(cmd[cmd.index("--size") + 1], "960x540")      # L4 at 540p...
+            self.assertEqual(cmd[-1], "--scale")                           # ...scaled in the decode
             self.assertEqual(cwd, dvnative.ENGINE_DIR)
             n = self.FRAMES[k] - (1 if k in self.l4_short else 0)
             with open(cmd[5], "w") as f:
                 json.dump([[k, 1]] * n, f)
         self.assertEqual(timeout, dvnative.step_timeout(self.FRAMES[k]))
+        hook = self.hooks.get((k, step))
+        if hook:
+            hook()
         self.calls.append((k, step))
         rc = self.fail.get((k, step), 0)
         return rc, f"{step} said no" if rc else "", 0.25
+
+    def assert_chunk_order(self, chunks, measure=("analyzer", "l4")):
+        """Every chunk ran its intermediate, then (in either order: they run side by side) its
+        measuring steps; nothing else ran."""
+        want = [(k, s) for k in chunks for s in ("intermediate",) + tuple(measure)]
+        self.assertEqual(sorted(self.calls), sorted(want))
+        for k in chunks:
+            first = self.calls.index((k, "intermediate"))
+            for s in measure:
+                self.assertLess(first, self.calls.index((k, s)))
 
     def analyze(self, **kw):
         kw.setdefault("cube", None)
@@ -489,7 +531,7 @@ class AnalyzeChunks(unittest.TestCase):
         self.assertEqual(dvnative.stream_frames(sc), self.total)
         self.assertEqual(len(sc["l4"]), self.total)
         self.assertEqual([s["start"] for s in sc["scenes"]], [0, 24, 54])
-        self.assertEqual(self.calls, [(k, s) for k in range(3) for s in ("intermediate", "analyzer", "l4")])
+        self.assert_chunk_order(range(3))
         self.assertEqual(cpu, [(0, 0.75, 24), (1, 0.75, 30), (2, 0.75, 18)])   # 3 steps x 0.25 s
         self.assertEqual(self._leftovers(), [])
 
@@ -499,19 +541,23 @@ class AnalyzeChunks(unittest.TestCase):
         os.remove(os.path.join(self.work, "chunk_0001.bin.l1.json"))      # only chunk 1 is unfinished
         progress = []
         sc = self.analyze(on_chunk=lambda done, of: progress.append((done, of)))
-        self.assertEqual(self.calls, [(1, "intermediate"), (1, "analyzer"), (1, "l4")])
+        self.assert_chunk_order([1])
         self.assertEqual(progress, [(1, 3), (2, 3), (3, 3)])                 # resumed ones report too
         self.assertEqual(dvnative.stream_frames(sc), self.total)
 
     def test_should_pause_between_chunks_gives_paused_and_resumes_there(self):
+        asked = threading.Event()
         with self.assertRaises(dvnative.Paused) as cm:
-            self.analyze(should_pause=lambda: any(k == 0 and s == "l4" for k, s in self.calls))
+            self.analyze(should_pause=asked.is_set,
+                         on_chunk=lambda done, of: asked.set() if done == 1 else None)
         self.assertTrue(str(cm.exception).startswith("paused:"))
-        self.assertEqual({k for k, _s in self.calls}, {0})
+        self.assertNotIn(2, {k for k, _s in self.calls})                   # never started
         self.assertTrue(os.path.exists(os.path.join(self.work, "chunk_0000.bin.l1.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.work, "chunk_0001.bin.l1.json")))
+        self.assertEqual(self._leftovers(), [])
         self.calls.clear()
         self.analyze()
-        self.assertEqual({k for k, _s in self.calls}, {1, 2})
+        self.assert_chunk_order([1, 2])
 
     def test_before_chunk_hook_pauses_with_its_reason_before_any_step(self):
         seen = []
@@ -550,6 +596,77 @@ class AnalyzeChunks(unittest.TestCase):
         self.assertEqual(self._leftovers(), [])
         self.assertFalse(os.path.exists(os.path.join(self.work, "chunk_0001.bin.l1.json")))
 
+    def test_next_intermediate_builds_while_this_chunk_is_measured(self):
+        built_1 = threading.Event()
+        overlapped = []
+        self.hooks[(1, "intermediate")] = built_1.set
+        self.hooks[(0, "analyzer")] = lambda: overlapped.append(built_1.wait(5))
+        sc = self.analyze()
+        self.assertEqual(overlapped, [True])           # chunk 1's build ran inside chunk 0's analysis
+        self.assertEqual(dvnative.stream_frames(sc), self.total)
+
+    def test_analyzer_and_l4_run_side_by_side(self):
+        l4_started = threading.Event()
+        together = []
+        self.hooks[(0, "l4")] = l4_started.set
+        self.hooks[(0, "analyzer")] = lambda: together.append(l4_started.wait(5))
+        self.analyze()
+        self.assertEqual(together, [True])
+
+    def test_hardware_decode_refusal_retries_once_in_software(self):
+        self.fail[(1, "hw-refuses")] = 1
+        sc = self.analyze()
+        self.assertEqual(dvnative.stream_frames(sc), self.total)
+        self.assertIn((1, "intermediate"), self.calls)
+        self.assertIn((1, "intermediate-sw"), self.calls)
+        self.assertLess(self.calls.index((1, "intermediate")), self.calls.index((1, "intermediate-sw")))
+        self.assertNotIn((0, "intermediate-sw"), self.calls)
+        self.assertEqual(self._leftovers(), [])
+
+    def test_software_decode_failure_fails_the_chunk(self):
+        self.fail[(1, "hw-refuses")] = 1
+        self.fail[(1, "intermediate-sw")] = 1
+        with self.assertRaisesRegex(RuntimeError, "chunk 1: intermediate failed: intermediate-sw said no"):
+            self.analyze()
+        self.assertEqual(self._leftovers(), [])
+        self.assertTrue(os.path.exists(os.path.join(self.work, "chunk_0000.bin.l1.json")))  # kept
+
+    def test_a_failed_step_kills_its_sibling_and_reports_its_own_error(self):
+        sibling = []
+
+        def slow_l4():                                  # stands in for a long L4 run_step
+            seen = guard_holder[0]
+            for _ in range(100):
+                if seen.is_set():
+                    sibling.append("killed")
+                    raise dvnative.Aborted("aborted (run stopped) during chunk 2 L4")
+                time.sleep(0.02)
+            sibling.append("ran on")
+        guard_holder = []
+        real_step = self.fake_step
+
+        def step(cmd, **kw):
+            if "chunk 2 L4" in kw.get("what", ""):
+                guard_holder.append(kw["abort"])
+                slow_l4()
+            return real_step(cmd, **kw)
+        self.fail[(1, "analyzer")] = 1
+        with mock.patch.object(dvnative, "run_step", side_effect=step):
+            with self.assertRaisesRegex(RuntimeError, "chunk 1: analyzer failed"):
+                dvnative.analyze_chunks(self.chunks, self.work, cube=None, analyzer="/an",
+                                        ffmpeg="/ff", python="/py")
+        self.assertEqual(sibling, ["killed"])
+        self.assertEqual(self._leftovers(), [])
+
+    def test_cpu_is_reported_for_a_chunk_that_failed(self):
+        self.fail[(1, "analyzer")] = 1
+        cpu = []
+        with self.assertRaises(RuntimeError):
+            self.analyze(on_cpu=lambda k, s, n: cpu.append((k, n)))
+        self.assertEqual(cpu[0], (0, 24))
+        self.assertIn((1, 30), cpu)
+        self.assertEqual(len(cpu), len(set(cpu)))      # once each
+
     def test_a_failed_step_raises_and_cleans_up(self):
         self.fail[(1, "analyzer")] = 1
         with self.assertRaisesRegex(RuntimeError, "chunk 1: analyzer failed: analyzer said no"):
@@ -582,6 +699,10 @@ class L4Command(unittest.TestCase):
         self.assertEqual(dvnative.build_l4_command("/py", "/w/c.mkv", "/w/c.l4.json.part", ffmpeg="/ff"),
                          ["/py", "-m", "dvnative", "l4", "/w/c.mkv", "/w/c.l4.json.part",
                           "--ffmpeg", "/ff", "--size", "1920x1080"])
+
+    def test_scaled_entry(self):
+        c = dvnative.build_l4_command("/py", "/w/c.mkv", "/o", ffmpeg="/ff", width=960, height=540, scale=True)
+        self.assertEqual(c[-3:], ["--size", "960x540", "--scale"])
 
     def test_bad_size_is_a_usage_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -624,6 +745,19 @@ class L4SubprocessMatchesInProcess(unittest.TestCase):
             self.assertEqual(child, here)
             self.assertTrue(any(v[0] > 0 for v in here))     # a real picture, not all black
             self.assertGreater(cpu, 0.0)
+            # scaled in the decode (as analyze_chunks runs it): child == in-process, and close
+            # to the full-size values on this smooth test pattern
+            out2 = os.path.join(d, "tiny.small.l4.json")
+            rc, tail, _cpu = dvnative.run_step(
+                dvnative.niced(dvnative.build_l4_command(PY, mkv, out2, width=32, height=18, scale=True)),
+                timeout=dvnative.step_timeout(6), cwd=dvnative.ENGINE_DIR, poll=0.05)
+            self.assertEqual(rc, 0, tail)
+            with open(out2) as f:
+                child_small = json.load(f)
+            small = dvnative.frame_l4(mkv, width=32, height=18, scale=True)
+            self.assertEqual(child_small, small)
+            self.assertEqual(len(small), 6)
+            self.assertTrue(all(abs(a[0] - b[0]) <= 40 for a, b in zip(small, here)))
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
