@@ -448,6 +448,7 @@ class AnalyzeChunks(unittest.TestCase):
     """analyze_chunks with run_step faked: each step writes what the real tool would."""
 
     FRAMES = (24, 30, 18)
+    STREAMS = 1                          # one pipeline: these tests pin its exact order
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -519,6 +520,7 @@ class AnalyzeChunks(unittest.TestCase):
 
     def analyze(self, **kw):
         kw.setdefault("cube", None)
+        kw.setdefault("streams", self.STREAMS)
         with mock.patch.object(dvnative, "run_step", side_effect=self.fake_step):
             return dvnative.analyze_chunks(self.chunks, self.work, analyzer="/an", ffmpeg="/ff",
                                            python="/py", **kw)
@@ -593,7 +595,7 @@ class AnalyzeChunks(unittest.TestCase):
         with mock.patch.object(dvnative, "run_step", side_effect=step):
             with self.assertRaises(dvnative.Paused):
                 dvnative.analyze_chunks(self.chunks, self.work, cube=None, analyzer="/an",
-                                        ffmpeg="/ff", python="/py")
+                                        ffmpeg="/ff", python="/py", streams=1)
         self.assertEqual(self._leftovers(), [])
         self.assertFalse(os.path.exists(os.path.join(self.work, "chunk_0001.bin.l1.json")))
 
@@ -655,7 +657,7 @@ class AnalyzeChunks(unittest.TestCase):
         with mock.patch.object(dvnative, "run_step", side_effect=step):
             with self.assertRaisesRegex(RuntimeError, "chunk 1: analyzer failed"):
                 dvnative.analyze_chunks(self.chunks, self.work, cube=None, analyzer="/an",
-                                        ffmpeg="/ff", python="/py")
+                                        ffmpeg="/ff", python="/py", streams=1)
         self.assertEqual(sibling, ["killed"])
         self.assertEqual(self._leftovers(), [])
 
@@ -693,6 +695,121 @@ class AnalyzeChunks(unittest.TestCase):
     def test_the_end_sentinel_is_required(self):
         with self.assertRaises(ValueError):
             dvnative.analyze_chunks(self.chunks[:-1], self.work, cube=None)
+
+
+class AnalyzeChunksTwoStreams(AnalyzeChunks):
+    """The same fakes, two pipelines (the default): chunks 0, 2, 4 ... and 1, 3, 5 ..."""
+
+    FRAMES = (24, 30, 18, 21, 27)
+    STREAMS = 2
+
+    # the single-stream ordering tests do not apply to two streams
+    test_every_chunk_measured_and_merged = None
+    test_resume_skips_published_sidecars = None
+    test_should_pause_between_chunks_gives_paused_and_resumes_there = None
+    test_before_chunk_hook_pauses_with_its_reason_before_any_step = None
+    test_next_intermediate_builds_while_this_chunk_is_measured = None
+    test_cpu_is_reported_for_a_chunk_that_failed = None
+    test_a_failed_step_kills_its_sibling_and_reports_its_own_error = None
+
+    def test_default_stays_one_stream_until_two_measure_faster(self):
+        self.assertEqual(dvnative.STREAMS, 1)
+
+    def test_same_result_as_one_stream_and_every_chunk_once(self):
+        two = self.analyze()
+        self.assert_chunk_order(range(5))                       # each step exactly once
+        shutil.rmtree(self.work)
+        self.calls.clear()
+        one = self.analyze(streams=1)
+        self.assertEqual(two, one)
+        self.assertEqual(dvnative.stream_frames(two), self.total)
+        self.assertEqual(self._leftovers(), [])
+
+    def test_both_streams_build_at_once(self):
+        other_started = threading.Event()
+        together = []
+        self.hooks[(1, "intermediate")] = other_started.set
+        self.hooks[(0, "intermediate")] = lambda: together.append(other_started.wait(5))
+        self.analyze()
+        self.assertEqual(together, [True])
+
+    def test_disk_floor_counts_the_other_streams_unwritten_intermediate(self):
+        release, building_1 = threading.Event(), threading.Event()
+        asked = {}
+
+        def chunk_1_build():                                          # chunk 1 still being written
+            building_1.set()
+            release.wait(5)
+        self.hooks[(1, "intermediate")] = chunk_1_build
+        self.hooks[(0, "intermediate")] = lambda: building_1.wait(5)  # chunk 2 is gated after this
+
+        def floor(k, frames):
+            asked[k] = frames
+            if k == 2:
+                release.set()
+            return None
+        self.analyze(before_chunk=floor)
+        self.assertEqual(asked[2], self.FRAMES[2] + self.FRAMES[1])
+        self.assertEqual(asked[0], self.FRAMES[0])
+
+    def test_a_refusal_lets_the_other_stream_finish_its_chunk_and_starts_nothing_new(self):
+        release, building_1 = threading.Event(), threading.Event()
+
+        def chunk_1_build():                                          # stream 1 mid-chunk
+            building_1.set()
+            release.wait(5)
+        self.hooks[(1, "intermediate")] = chunk_1_build
+        self.hooks[(0, "intermediate")] = lambda: building_1.wait(5)  # chunk 2 is gated after this
+
+        def floor(k, frames):
+            if k == 2:
+                release.set()
+                return "low disk"
+            return None
+        with self.assertRaises(dvnative.Paused) as cm:
+            self.analyze(before_chunk=floor)
+        self.assertEqual(str(cm.exception), "paused: low disk")
+        for k in (0, 1):                                              # both in-flight chunks published
+            self.assertTrue(os.path.exists(os.path.join(self.work, f"chunk_{k:04d}.bin.l1.json")))
+        self.assertFalse({2, 3, 4} & {k for k, _s in self.calls})     # nothing new started
+        self.assertEqual(self._leftovers(), [])
+        self.calls.clear()
+        self.analyze()
+        self.assert_chunk_order([2, 3, 4])
+
+    def test_a_failure_in_one_stream_kills_the_other_and_reports_its_own_error(self):
+        killed = []
+        real_step = self.fake_step
+
+        def step(cmd, **kw):
+            if "chunk 1 analyzer" in kw.get("what", ""):          # stream 1: a long analyzer
+                guard = kw["abort"]
+                for _ in range(250):
+                    if guard.is_set():
+                        killed.append(True)
+                        raise dvnative.Aborted("aborted (run stopped) during chunk 1 analyzer")
+                    time.sleep(0.02)
+            return real_step(cmd, **kw)
+        self.fail[(0, "l4")] = 1                                   # stream 0 fails
+        with mock.patch.object(dvnative, "run_step", side_effect=step):
+            with self.assertRaisesRegex(RuntimeError, "chunk 0: L4 failed"):
+                dvnative.analyze_chunks(self.chunks, self.work, cube=None, analyzer="/an",
+                                        ffmpeg="/ff", python="/py", streams=2)
+        self.assertEqual(killed, [True])
+        self.assertEqual(self._leftovers(), [])
+
+    def test_should_pause_stops_both_streams_and_resume_finishes_the_rest_once(self):
+        asked = threading.Event()
+        with self.assertRaises(dvnative.Paused):
+            self.analyze(should_pause=asked.is_set,
+                         on_chunk=lambda done, of: asked.set())
+        self.assertEqual(self._leftovers(), [])
+        done = {k for k in range(5) if os.path.exists(os.path.join(self.work, f"chunk_{k:04d}.bin.l1.json"))}
+        self.assertTrue(done)
+        self.calls.clear()
+        sc = self.analyze()
+        self.assert_chunk_order(sorted(set(range(5)) - done))
+        self.assertEqual(dvnative.stream_frames(sc), self.total)
 
 
 class L4Command(unittest.TestCase):

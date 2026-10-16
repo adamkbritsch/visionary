@@ -389,7 +389,11 @@ def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
     return out
 
 
-L4_WIDTH, L4_HEIGHT = 960, 540         # analyze_chunks' L4 resolution (scaled in the decode)
+L4_WIDTH, L4_HEIGHT = 960, 540
+STREAMS = 1                     # analyze_chunks' parallel pipelines. Two ran 33% faster on 600-frame
+                                # clips but SLOWER on full chunks beside an x265 remux (24 vs 27 fps on
+                                # S06E06's chunks 11-14, 2026-10-15): x265 takes the cores either way.
+                                # Raise it only on a measured gain (e.g. with the machine to itself).         # analyze_chunks' L4 resolution (scaled in the decode)
 
 
 def build_l4_command(python: str, src: str, out_json: str, *, ffmpeg: str = FFMPEG,
@@ -485,13 +489,15 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                    ffmpeg: str = FFMPEG, peak_estimator: str = "max", with_l4: bool = True,
                    threads: int | None = None, abort=None, on_chunk=None, should_pause=None,
                    before_chunk=None, on_cpu=None, python: str | None = None,
-                   nice: int = NICE) -> dict:
+                   nice: int = NICE, streams: int = STREAMS) -> dict:
     """Measure every chunk ([[first_frame, path], ..., [total, None]] — the end sentinel is
     required: it gives each chunk its frame count) and return the merged sidecar.
 
     OVERLAPPED (2026-10-15, to match Resolve's stage time): while hdr-analyze and the L4 pass
     run side by side on chunk k's intermediate, chunk k+1's intermediate is already being
-    built — a chunk costs its slowest step instead of the sum of three. At most two
+    built — a chunk costs its slowest step instead of the sum of three. `streams` such
+    pipelines run side by side, each taking every streams-th chunk (0, 2, 4 ... and 1, 3, 5
+    ... at 2), because one pipeline leaves most of the machine idle; at most 2 x streams
     intermediates (~2.3 MB/frame at 1080p FFVHuff) exist at once.
 
     A finished chunk's sidecar (and its L4 list) is kept in `workdir` and reused on resume;
@@ -499,10 +505,13 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
       abort set                   -> Aborted
       should_pause()              -> Paused (also polled while each step runs; the step dies)
       before_chunk(k, frames)     -> a non-empty string pauses with that reason (the caller's
-                                     disk floor); it may also raise Paused itself
-    A pause or abort found while starting chunk k+1 lets chunk k finish and publish first.
-    Each step runs through run_step at `nice`, bounded by step_timeout(frames); a failing
-    step kills its siblings and its own error is what the call raises. on_chunk(done, of)
+                                     disk floor); it may also raise Paused itself. `frames`
+                                     also counts every chunk whose intermediate another
+                                     stream is still writing, so the floor sees that too
+    A pause or abort found while starting a chunk lets the chunks already in flight (in every
+    stream) finish and publish first, and no stream starts another. Each step runs through
+    run_step at `nice`, bounded by step_timeout(frames); a failing step kills every other
+    step in every stream, and its own error is what the call raises. on_chunk(done, of)
     after every published chunk (resumed ones counted first); on_cpu(k, cpu_seconds, frames)
     for each chunk worked on in THIS call (os.wait4 user+sys over its steps): when it
     publishes, or on the way out for one that failed or was cut short. A chunk whose
@@ -530,20 +539,24 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
         _b, side, l4_path, _m = names(k)
         return os.path.exists(side) and (not with_l4 or os.path.exists(l4_path))
 
-    def gate(k):
+    def gate(k, extra=0):
         if abort is not None and abort.is_set():
             raise Aborted("aborted (run stopped)")
         if should_pause is not None and should_pause():
             raise Paused(f"paused: yielded before analysis chunk {k + 1} of {n_chunks}")
         if before_chunk is not None:
-            why = before_chunk(k, frames_of(k))
+            why = before_chunk(k, frames_of(k) + extra)
             if why:
                 why = str(why)
                 raise Paused(why if why.startswith("paused:") else "paused: " + why)
 
-    stop = threading.Event()
+    stop = threading.Event()            # a step failed: every other step dies
+    no_new = threading.Event()          # a gate refused: no stream starts another chunk
     guard = _EitherSet(abort, stop)
     cpu, lock, reported = {}, threading.Lock(), set()
+    building = set()                    # chunks whose intermediate is still being written
+    errors = []                         # what each stream ended on
+    counts = {"done": 0}
 
     def step(k, cmd, what, cwd=None):
         rc, tail, used = run_step(niced(cmd, nice), timeout=step_timeout(frames_of(k)), abort=guard,
@@ -554,14 +567,19 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
 
     def run_build(k):
         mkv = names(k)[3]
-        rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube), "intermediate")
-        if rc != 0:                     # the hardware decode refused it: once more in software
-            _rm_quiet(mkv)
-            rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube,
-                                                                   hwaccel=False),
-                            "intermediate (software decode)")
-        if rc != 0:
-            raise RuntimeError(f"chunk {k}: intermediate failed: {tail[-300:]}")
+        try:
+            rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube),
+                            "intermediate")
+            if rc != 0:                 # the hardware decode refused it: once more in software
+                _rm_quiet(mkv)
+                rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube,
+                                                                       hwaccel=False),
+                                "intermediate (software decode)")
+            if rc != 0:
+                raise RuntimeError(f"chunk {k}: intermediate failed: {tail[-300:]}")
+        finally:
+            with lock:                  # written (or abandoned): the disk floor sees it now
+                building.discard(k)
 
     def run_analyzer(k):
         out_bin, _s, _l, mkv = names(k)
@@ -597,51 +615,85 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
         return (real_errs or errs or [None])[0]
 
     todo = [k for k in range(n_chunks) if not published(k)]
-    done_count = n_chunks - len(todo)
+    counts["done"] = n_chunks - len(todo)
     if on_chunk:
-        for i in range(done_count):
+        for i in range(counts["done"]):
             on_chunk(i + 1, n_chunks)
-    pool = cf.ThreadPoolExecutor(max_workers=3)
+
+    def start(k):
+        """Gate chunk k and start its intermediate -> (k, future), or None when a gate
+        elsewhere already refused (this stream just stops)."""
+        if no_new.is_set():
+            return None
+        with lock:
+            extra = sum(frames_of(j) for j in building)
+        gate(k, extra)
+        with lock:
+            building.add(k)
+        return k, pool.submit(run_build, k)
+
+    def run_stream(ks):
+        """One overlapped pipeline over chunks `ks`: build k+1 while k is measured."""
+        try:
+            queue = iter(ks)
+            pending, deferred = None, None
+            k0 = next(queue, None)
+            if k0 is not None:
+                pending = start(k0)
+            while pending is not None:
+                k, fut = pending
+                pending = None
+                err = first_error([fut])
+                if err is not None:
+                    raise err
+                nk = next(queue, None)
+                if nk is not None:
+                    try:
+                        pending = start(nk)
+                    except (Paused, Aborted) as e:
+                        deferred = e    # chunk k (and the other streams' chunks) finish first
+                        no_new.set()
+                measure = [pool.submit(run_analyzer, k)] + ([pool.submit(run_l4, k)] if with_l4 else [])
+                done, _ = cf.wait(measure, return_when=cf.FIRST_EXCEPTION)
+                if any(f.exception() is not None for f in done):
+                    stop.set()          # kill every other step, in every stream
+                    raise first_error(measure + ([pending[1]] if pending else []))
+                publish(k)
+                with lock:
+                    counts["done"] += 1
+                    reported.add(k)
+                    if on_cpu:
+                        on_cpu(k, cpu.get(k, 0.0), frames_of(k))
+                    if on_chunk:
+                        on_chunk(counts["done"], n_chunks)
+                if deferred is not None:
+                    raise deferred
+        except BaseException as e:
+            with lock:
+                errors.append(e)
+            no_new.set()
+            if not isinstance(e, (Paused, Aborted)):
+                stop.set()
+
+    width = max(1, int(streams or 1))
+    lanes = [ks for ks in (todo[i::width] for i in range(width)) if ks]
+    pool = cf.ThreadPoolExecutor(max_workers=3 * max(1, len(lanes)))
     try:
-        queue = iter(todo)
-        pending = None
-        k0 = next(queue, None)
-        if k0 is not None:
-            gate(k0)
-            pending = (k0, pool.submit(run_build, k0))
-        while pending is not None:
-            k, fut = pending
-            pending = None
-            err = first_error([fut])
-            if err is not None:
-                raise err
-            deferred = None
-            nk = next(queue, None)
-            if nk is not None:
-                try:
-                    gate(nk)
-                    pending = (nk, pool.submit(run_build, nk))
-                except (Paused, Aborted) as e:
-                    deferred = e        # chunk k still finishes and publishes first
-            measure = [pool.submit(run_analyzer, k)] + ([pool.submit(run_l4, k)] if with_l4 else [])
-            done, _ = cf.wait(measure, return_when=cf.FIRST_EXCEPTION)
-            if any(f.exception() is not None for f in done):
-                stop.set()              # kill the other measuring step and the prefetched build
-                err = first_error(measure + ([pending[1]] if pending else []))
-                raise err
-            publish(k)
-            done_count += 1
-            reported.add(k)
-            if on_cpu:
-                on_cpu(k, cpu.get(k, 0.0), frames_of(k))
-            if on_chunk:
-                on_chunk(done_count, n_chunks)
-            if deferred is not None:
-                raise deferred
-    except BaseException:
-        stop.set()                      # nothing keeps running behind a failure or a pause
-        raise
+        workers = [threading.Thread(target=run_stream, args=(ks,), daemon=True) for ks in lanes]
+        for t in workers:
+            t.start()
+        for t in workers:
+            t.join()
+        if errors:
+            stop.set()                  # nothing keeps running behind a failure or a pause
+
+            def caused_by_stop(e):      # a sibling killed because another step failed
+                return isinstance(e, Aborted) and not (abort is not None and abort.is_set())
+            real_errs = [e for e in errors if not isinstance(e, (Paused, Aborted))]
+            raise (real_errs or [e for e in errors if isinstance(e, Aborted) and not caused_by_stop(e)]
+                   or [e for e in errors if isinstance(e, Paused)] or errors)[0]
     finally:
+        stop.set()
         pool.shutdown(wait=True)
         if on_cpu:                      # a chunk that failed or was cut short still used CPU
             for k in sorted(set(cpu) - reported):
