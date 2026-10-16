@@ -1148,18 +1148,12 @@ def start_resolve_display_watch() -> bool:
     return True
 
 
-def _refocus_app():
-    if not _UNDER_TEST:
-        subprocess.run(["open", "-a", "Visionary"], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def _quit_resolve_focus_app():
+def _quit_resolve():
     """After the resolve stage: force-quit Resolve to free its RAM/GPU and guarantee a
     FRESH, responsive Resolve next episode (stale Resolve is what caused the original
-    hang), then bring the dashboard app back to the front."""
+    hang). Visionary is NOT raised afterwards: no step brings the app to the front any
+    more (user, 2026-10-15) — focus goes back to whatever was in use before Resolve."""
     _kill_resolve()
-    _refocus_app()
 
 
 # ---- A YOUTUBE RUN KEEPS RESOLVE OPEN ------------------------------------------------
@@ -1191,7 +1185,6 @@ def _keep_resolve_open(mode) -> bool:
         if n >= RESOLVE_REUSE_MAX:
             return False
         _RESOLVE_KEPT.update(open=True, mode=mode, passes=n, pids=_resolve_pids())
-    _refocus_app()
     return True
 
 
@@ -1202,8 +1195,7 @@ def resolve_kept_open() -> bool:
 
 def close_kept_resolve(why: str) -> bool:
     """Close a Resolve a YouTube run left open. No-op (False) when none was kept — this never
-    touches a Resolve the pipeline did not leave running. No refocus: Visionary was already
-    brought back to the front when the last pass ended."""
+    touches a Resolve the pipeline did not leave running. It never raises Visionary."""
     with _RESOLVE_KEPT_LOCK:
         if not _RESOLVE_KEPT.get("open"):
             return False
@@ -1399,7 +1391,7 @@ def _resolve(p, abort, progress=None):
     The OUTPUT MODE picks the Resolve project. Automatically that is ALWAYS the
     1000-nit Dolby Vision project (user-dictated 2026-08-09); the 2000-nit DV project
     and the non-DV SDR project are reachable ONLY through explicit per-item overrides.
-    When the stage finishes Resolve is quit and the app refocused — except after a
+    When the stage finishes Resolve is quit (the app is never raised) — except after a
     successful YouTube pass, which leaves it running for the next video (_keep_resolve_open).
     FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
     nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""
@@ -1660,7 +1652,7 @@ def _resolve(p, abort, progress=None):
         # _keep_resolve_open); everything else ends the way it always did.
         aborted = abort is not None and abort.is_set()
         if not (ok and yt and not aborted and _keep_resolve_open(mode)):
-            _quit_resolve_focus_app()
+            _quit_resolve()
 
 
 def _dvnative(p, abort, progress=None, should_pause=None):

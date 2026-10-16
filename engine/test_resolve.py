@@ -72,15 +72,30 @@ class SuperScaleThreading(unittest.TestCase):
         self.assertIn("setup_single(video, mode, superscale", src)
 
 
-class RefocusAfterPlacement(unittest.TestCase):
-    def test_place_now_hands_the_main_display_back(self):
-        # After Resolve moves to the PINNED display, the main display refocuses on the
-        # app (user-dictated 2026-08-06) — and only in the pinned case: with Resolve on
-        # the main display, raising Visionary would cover the automation's own window.
-        import inspect, resolve_pipeline
-        src = inspect.getsource(resolve_pipeline._place_now)
-        self.assertIn('tell application "Visionary" to activate', src)
-        self.assertIn("if not host:", src)          # the unpinned early-return guards it
+class NoStepRaisesTheApp(unittest.TestCase):
+    """User, 2026-10-15: "don't bring the app to the front at the beginning of any step
+    anymore". Nothing in the engine may raise Visionary (Resolve itself is still activated
+    before every click by the DV automation)."""
+
+    def test_no_engine_source_raises_visionary(self):
+        import glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in glob.glob(os.path.join(here, "*.py")):
+            if os.path.basename(path).startswith("test_"):
+                continue
+            with open(path) as f:
+                src = f.read()
+            for needle in ('tell application "Visionary" to activate', '"open", "-a", "Visionary"',
+                           "open -a Visionary", "_refocus_app"):
+                self.assertNotIn(needle, src, f"{os.path.basename(path)} raises the app ({needle})")
+
+    def test_quitting_resolve_does_not_raise_the_app(self):
+        import stages
+        with mock.patch.object(stages, "_kill_resolve") as kill, \
+             mock.patch.object(stages.subprocess, "run") as run:
+            stages._quit_resolve()
+        kill.assert_called_once()
+        run.assert_not_called()
 
 
 class _FakeClip:

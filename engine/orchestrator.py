@@ -1828,8 +1828,7 @@ class Orchestrator:
 
     def reclaim_screen(self) -> bool:
         """QUIET MODE just turned ON: if an item is MID-RESOLVE (Resolve has the screen), abort it so the
-        display frees immediately — the resolve subprocess dies within ~5s, quits Resolve, and refocuses
-        the app. The item's Topaz output survives; it re-runs Resolve once Quiet Mode is off. Returns True
+        display frees immediately — the resolve subprocess dies within ~5s and quits Resolve. The item's Topaz output survives; it re-runs Resolve once Quiet Mode is off. Returns True
         if an abort was issued. No-op if we're not currently in the resolve stage."""
         if self._stage_active and self.state.get("stage") == "resolve":
             self._abort.set()

@@ -530,7 +530,7 @@ class FastPathDispatch(unittest.TestCase):
              mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             ok, msg = stages.run_stage("resolve", p)
         self.assertFalse(ok)                              # launch failed on purpose — we only
@@ -563,7 +563,7 @@ class FastPathDispatch(unittest.TestCase):
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
              mock.patch.object(stages, "_source_video_kbps", return_value=90000), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
         cmd = seen["cmd"]
@@ -801,7 +801,7 @@ class ResolveRenderWatchdog(unittest.TestCase):
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_resolve_budget", return_value=budget), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.time, "monotonic", side_effect=lambda: clock["t"]), \
              mock.patch.object(stages.time, "sleep", side_effect=sleep), \
              mock.patch.object(stages, "_vstream", return_value=None), \
@@ -895,7 +895,7 @@ class MezzanineFallback(unittest.TestCase):
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_resolve_budget",
                                return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
              mock.patch.object(stages, "_vstream", return_value=None), \
@@ -965,7 +965,7 @@ class MezzanineFallback(unittest.TestCase):
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_resolve_budget",
                                return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
              mock.patch.object(stages, "_vstream", return_value=None), \
@@ -1011,7 +1011,7 @@ class OutputModeOverride(unittest.TestCase):
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_resolve_budget",
                                return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
              mock.patch.object(stages, "_vstream", return_value=None), \
@@ -1086,7 +1086,7 @@ class HostDisplayFailSafe(unittest.TestCase):
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_resolve_budget",
                                return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
              mock.patch.object(stages, "_vstream", return_value=None), \
@@ -1251,7 +1251,7 @@ class ResolveHostPreSpawnGuard(unittest.TestCase):
              mock.patch.object(settings, "get_settings", return_value=s), \
              mock.patch.object(settings, "get_display_priority", return_value=list(priority)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
             ok, msg = stages.run_stage("resolve", p)
         return ok, msg, calls
@@ -1386,7 +1386,7 @@ class YouTubeSkipsTopaz(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
         return seen["cmd"], p
@@ -1423,7 +1423,7 @@ class YouTubeSkipsTopaz(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
         cmd = seen["cmd"]
@@ -1512,7 +1512,7 @@ class YouTubeFastRemux(unittest.TestCase):
              mock.patch.object(settings, "get_settings",
                                return_value=dict(settings.DEFAULT_SETTINGS)), \
              mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", p)
         self.assertEqual(seen["cmd"][6], str(stages.YOUTUBE_RENDER_KBPS))   # the YT target, not the 60000 floor
@@ -1648,7 +1648,7 @@ class RenderPhaseFlag(unittest.TestCase):
              mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
              mock.patch.object(stages, "_resolve_budget",
                                return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.threading, "Thread", _InlineThread), \
              mock.patch.object(stages.time, "sleep"), \
              mock.patch.object(stages, "_vstream", return_value=None), \
@@ -2487,7 +2487,7 @@ class TheCleanupFlagReachesResolve(unittest.TestCase):
              mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
              mock.patch.object(st, "get_settings", return_value=conf), \
              mock.patch.object(S, "resolve_pipeline_cleanup_drx", return_value=drx_path), \
-             mock.patch.object(S, "_quit_resolve_focus_app"), \
+             mock.patch.object(S, "_quit_resolve"), \
              mock.patch.object(S.subprocess, "Popen", side_effect=boom):
             S.run_stage("resolve", p)
         return seen["cmd"]
@@ -2860,7 +2860,7 @@ class YouTubeReexport(unittest.TestCase):
              mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
              mock.patch.object(settings, "get_settings", return_value=st), \
              mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve_focus_app"), \
+             mock.patch.object(stages, "_quit_resolve"), \
              mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
             stages.run_stage("resolve", youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T",
                                                       scratch_dir=tempfile.mkdtemp()))

@@ -265,8 +265,7 @@ class StageHooks(unittest.TestCase):
         stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
         try:
             with mock.patch.object(stages, "_UNDER_TEST", False), \
-                 mock.patch.object(stages, "_resolve_pids", return_value=(111,)), \
-                 mock.patch.object(stages, "_refocus_app"):
+                 mock.patch.object(stages, "_resolve_pids", return_value=(111,)):
                 self.assertTrue(stages._keep_resolve_open("dv1000"))
             self.assertEqual(stages._RESOLVE_KEPT["pids"], (111,))
         finally:
