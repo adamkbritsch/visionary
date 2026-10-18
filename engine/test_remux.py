@@ -1,4 +1,8 @@
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -885,6 +889,107 @@ class MastersMustBeInterleaved(unittest.TestCase):
         # 8.4 MB was already stalling; 0.03 MB is the fixed mux. The gate has to split them.
         self.assertGreater(remux.MAX_INTERLEAVE_GAP_MB, 0.03)
         self.assertLessEqual(remux.MAX_INTERLEAVE_GAP_MB, 8.4)
+
+
+class SubtitlesSitWithTheirPicture(unittest.TestCase):
+    """2026-10-18: MP4Box wrote every subtitle of an episode into the first ~150 MB while the
+    picture ran to 2.5 GB; the SHIELD stuttered seeking back for each one. The audio gate never
+    looked at subtitles. Now they are measured on the shipped file and re-interleaved."""
+
+    def test_distance_is_measured_against_the_picture_at_the_same_instant(self):
+        video = [(t / 24, int(t / 24 * 1_412_000)) for t in range(0, 24 * 1001)]   # ~11 Mbps
+        subs = [(1.0, 998_338, 37), (500.2, 42_000_000, 20), (999.0, 120_000_000, 54)]
+        worst, p99 = remux.subtitle_gaps(video, subs)
+        self.assertAlmostEqual(worst, 1290.6, delta=1.0)     # the 999 s line ~1.29 GB early
+        self.assertGreater(p99, remux.MAX_SUBTITLE_GAP_MB)
+
+    def test_an_interleaved_track_measures_small(self):
+        video = [(float(t), t * 1_460_000) for t in range(0, 1500, 2)]
+        subs = [(float(t) + 0.3, t * 1_460_000 + 400_000, 30) for t in range(5, 1500, 7)]
+        worst, p99 = remux.subtitle_gaps(video, subs)
+        self.assertLess(worst, 4.0)
+        self.assertLess(p99, remux.MAX_SUBTITLE_GAP_MB)
+
+    def test_ffmpegs_empty_end_sample_at_the_end_of_the_file_does_not_count(self):
+        video = [(1400 + t / 24, 1_750_000_000 + int(t / 24 * 375_000)) for t in range(0, 24 * 75)]
+        subs = [(1424.4, 1_759_150_000, 40), (1427.3, 1_778_037_298, 2)]   # S06E03's end marker at EOF-2
+        worst, _p99 = remux.subtitle_gaps(video, subs)
+        self.assertLess(worst, 2.0)
+
+    def test_no_subtitles_is_zero_and_no_video_is_unmeasurable(self):
+        self.assertEqual(remux.subtitle_gaps([(0.0, 1)], []), (0.0, 0.0))
+        self.assertEqual(remux.subtitle_gaps([], [(1.0, 5, 10)]), (-1.0, -1.0))
+
+    def test_the_reinterleave_keeps_dolby_vision_and_hvc1(self):
+        c = remux.build_reinterleave_command("/ff", "/in.mp4", "/out.mp4")
+        self.assertEqual(c[c.index("-strict") + 1], "unofficial")      # else the DV box is dropped
+        self.assertEqual(c[c.index("-tag:v") + 1], "hvc1")
+        self.assertEqual(c[c.index("-c") + 1], "copy")
+        self.assertEqual(c[c.index("-map") + 1], "0")
+        self.assertEqual(c[-1], "/out.mp4")
+        self.assertNotIn("-tag:v", remux.build_reinterleave_command("/ff", "/i", "/o", hevc=False))
+
+    def test_the_gate_fixes_misplaced_subtitles_and_says_so(self):
+        res = remux.RemuxResult(True, "/o.mp4", reason="DV 8.1 · 1 audio · 1 sub")
+        with mock.patch.object(remux, "interleave_gap_mb", return_value=0.1), \
+             mock.patch.object(remux, "fix_subtitle_interleave",
+                               return_value=(True, "subtitles re-interleaved (2314 -> 1 MB)")), \
+             mock.patch.object(remux, "_rm") as rm:
+            out = remux._gate_interleave(res, "/o.mp4")
+        self.assertTrue(out.ok)
+        self.assertIn("re-interleaved", out.reason)
+        rm.assert_not_called()
+
+    def test_the_gate_refuses_subtitles_it_could_not_fix_and_removes_the_master(self):
+        res = remux.RemuxResult(True, "/o.mp4")
+        with mock.patch.object(remux, "interleave_gap_mb", return_value=0.1), \
+             mock.patch.object(remux, "fix_subtitle_interleave",
+                               return_value=(False, "subtitles sit 2314 MB from their picture")), \
+             mock.patch.object(remux, "_rm") as rm:
+            out = remux._gate_interleave(res, "/o.mp4")
+        self.assertFalse(out.ok)
+        self.assertIn("2314 MB", out.reason)
+        rm.assert_called_once_with("/o.mp4")
+
+    def test_a_tight_master_is_left_alone(self):
+        with mock.patch.object(remux, "subtitle_gap_mb", return_value=(1.0, 0.7)), \
+             mock.patch.object(remux.subprocess, "run") as run:
+            self.assertEqual(remux.fix_subtitle_interleave("/o.mp4"), (True, ""))
+        run.assert_not_called()
+
+
+@unittest.skipUnless(os.path.exists(remux.FFMPEG) and os.path.exists(remux.MP4BOX)
+                     and os.path.exists(remux.FFPROBE), "ffmpeg/MP4Box not installed")
+class SubtitleReinterleaveForReal(unittest.TestCase):
+    """A real MP4 with its subtitles stored AFTER all the picture (MP4Box -flat), fixed for real."""
+
+    def test_a_flat_master_is_reinterleaved_losslessly(self):
+        d = tempfile.mkdtemp()
+        try:
+            v, srt, flat = (os.path.join(d, n) for n in ("v.mp4", "s.srt", "flat.mp4"))
+            r = subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                "-i", "testsrc2=size=320x180:rate=24", "-t", "40", "-c:v", "libx264",
+                                "-b:v", "4M", "-g", "48", v], capture_output=True)
+            if r.returncode:
+                self.skipTest("no libx264 here")
+            with open(srt, "w") as f:
+                for i in range(1, 19):
+                    f.write(f"{i}\n00:00:{i * 2:02d},000 --> 00:00:{i * 2 + 1:02d},000\nline {i}\n\n")
+            r = subprocess.run([remux.MP4BOX, "-add", v, "-add", srt + ":lang=en", "-flat", "-new", flat],
+                               capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            worst0, _ = remux.subtitle_gap_mb(flat)
+            self.assertGreater(worst0, 4.0)                          # subtitles parked after the picture
+            with mock.patch.object(remux, "MAX_SUBTITLE_GAP_MB", 1.0), \
+                 mock.patch.object(remux, "MAX_SUBTITLE_WORST_MB", 2.0):   # a 20 MB clip, scaled limits
+                ok, note = remux.fix_subtitle_interleave(flat)
+            self.assertTrue(ok, note)
+            self.assertIn("re-interleaved", note)
+            worst1, p991 = remux.subtitle_gap_mb(flat)
+            self.assertLess(worst1, 2.0)
+            self.assertFalse(os.path.exists(flat + ".reinterleave.mp4"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class NormalizeAudioHasToActuallyNormalize(unittest.TestCase):

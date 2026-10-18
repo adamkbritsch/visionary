@@ -338,16 +338,176 @@ def interleave_gap_mb(path: str, ffprobe=FFPROBE, at=(60, 300, 1200, 3600)) -> f
     return worst
 
 
-def _gate_interleave(res, output: str, ffprobe=FFPROBE):
+# SUBTITLES MUST SIT WITH THEIR PICTURE TOO (live-caught 2026-10-18). MP4Box's -inter 100 kept
+# audio beside its video, but wrote every mov_text sample of a 28-minute episode inside the first
+# ~150 MB: the subtitle for 8:20 sat at byte 42 MB while its picture sat at 706 MB. The SHIELD's
+# player reads tracks in file order, so it jumped back for every subtitle, opening a new range
+# request that streamed megabytes each time, and the picture stuttered (Community S06E08, every
+# S06 WEB-DL master and It's Always Sunny S01-S02). interleave_gap_mb above only compares AUDIO
+# with video, so it passed them all. Measured on the shipped files: worst 1.2-2.9 GB, p99 the
+# same; after an ffmpeg -c copy re-interleave: p99 0.5-1.0 MB, worst ~20-24 MB.
+MAX_SUBTITLE_GAP_MB = 8.0       # p99 of subtitle-to-picture distance (the audio gate's own limit)
+MAX_SUBTITLE_WORST_MB = 32.0    # no single subtitle further (~20 s of picture; the SHIELD buffers 50 MB)
+
+
+def subtitle_gaps(video: list, subs: list) -> tuple:
+    """PURE. (worst, p99) distance in MB between each subtitle sample and the video sample at its
+    instant. `video` = [(pts, pos)], `subs` = [(pts, pos, size)]. A trailing EMPTY sample (<= 2
+    bytes, the end marker ffmpeg writes at the very end of the file — never displayed) does not
+    count. (0.0, 0.0) with no subtitles; (-1.0, -1.0) with no video to compare against."""
+    import bisect
+    if not subs:
+        return 0.0, 0.0
+    v = sorted(video)
+    if not v:
+        return -1.0, -1.0
+    last = max(subs, key=lambda x: x[1])
+    if last[2] <= 2:
+        subs = [x for x in subs if x is not last]
+    if not subs:
+        return 0.0, 0.0
+    times = [t for t, _p in v]
+    gaps = []
+    for t, pos, _size in subs:
+        k = min(bisect.bisect_left(times, t), len(v) - 1)
+        gaps.append(abs(pos - v[k][1]) / 1e6)
+    gaps.sort()
+    return round(gaps[-1], 1), round(gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))], 1)
+
+
+def _packets(path: str, sel: str, ffprobe=FFPROBE, size=False) -> list:
+    """[(pts, pos[, size])] of the stream(s) `sel` selects; [] when none or unreadable."""
+    # KEYED output: ffprobe prints packet fields in ITS order (pts_time, size, pos), not the order
+    # asked for, so positional csv read size as pos the moment size was added.
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", sel, "-show_entries",
+                              "packet=pts_time,pos,size", "-of", "compact=p=0", path],
+                             capture_output=True, text=True, errors="replace", timeout=600).stdout
+    except Exception:
+        return []
+    rows = []
+    for ln in out.splitlines():
+        kv = dict(f.split("=", 1) for f in ln.split("|") if "=" in f)
+        try:
+            row = (float(kv["pts_time"]), int(kv["pos"])) + ((int(kv["size"]),) if size else ())
+        except (KeyError, ValueError):
+            continue
+        rows.append(row)
+    return rows
+
+
+def subtitle_gap_mb(path: str, ffprobe=FFPROBE) -> tuple:
+    """(worst, p99) MB between each subtitle and its picture in the file at `path`."""
+    subs = _packets(path, "s", ffprobe, size=True)
+    if not subs:
+        return 0.0, 0.0
+    return subtitle_gaps(_packets(path, "v:0", ffprobe), subs)
+
+
+def build_reinterleave_command(ffmpeg: str, src: str, out: str, hevc: bool = True) -> list:
+    """Lossless re-interleave: every stream copied, written in time order. `-strict unofficial`
+    is what makes ffmpeg write the Dolby Vision configuration box (without it the master loses
+    DV); hvc1 keeps SHIELD direct play (see build_capped_mux_command) — HEVC only, so `hevc`
+    False (any other codec) leaves the tag alone."""
+    return ([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", src, "-map", "0",
+             "-c", "copy", "-map_metadata", "0", "-strict", "unofficial"]
+            + (["-tag:v", "hvc1"] if hevc else [])
+            + ["-movflags", "+faststart", "-max_interleave_delta", "0", "-f", "mp4", out])
+
+
+def _stream_signature(path: str, ffprobe=FFPROBE) -> tuple:
+    """(codec list, packet count per stream, Dolby Vision config) — what a re-interleave must keep."""
+    try:
+        js = json.loads(subprocess.run(
+            [ffprobe, "-v", "error", "-count_packets", "-show_entries",
+             "stream=index,codec_type,codec_name,nb_read_packets:stream_side_data", "-of", "json", path],
+            capture_output=True, text=True, errors="replace", timeout=600).stdout or "{}")
+    except Exception:
+        return None
+    sts = js.get("streams", [])
+    dv = None
+    for st in sts:
+        for sd in st.get("side_data_list") or []:
+            if "dv_profile" in sd:
+                dv = tuple(sd.get(k) for k in ("dv_profile", "dv_level", "rpu_present_flag",
+                                               "bl_present_flag", "el_present_flag",
+                                               "dv_bl_signal_compatibility_id"))
+    return ([(st.get("codec_type"), st.get("codec_name")) for st in sts],
+            [int(st.get("nb_read_packets") or 0) for st in sts], dv)
+
+
+def fix_subtitle_interleave(output: str, ffmpeg=FFMPEG, ffprobe=FFPROBE) -> tuple:
+    """(ok, note). Measure the shipped master's subtitles; if they sit too far from their
+    picture, re-interleave it losslessly and replace it — only after the rewrite keeps every
+    stream, every video/audio packet, every subtitle line (ffmpeg may add EMPTY gap samples) and the Dolby
+    Vision configuration, and its subtitles measure within the limits. ok=False when the
+    subtitles are misplaced and could not be fixed (the caller fails the master)."""
+    worst, p99 = subtitle_gap_mb(output, ffprobe)
+    if worst < 0 or (p99 <= MAX_SUBTITLE_GAP_MB and worst <= MAX_SUBTITLE_WORST_MB):
+        return True, ""
+    tmp = output + ".reinterleave.mp4"
+    a = _stream_signature(output, ffprobe)
+    hevc = not a or ("video", "hevc") in a[0]
+    try:
+        r = subprocess.run(build_reinterleave_command(ffmpeg, output, tmp, hevc=hevc), capture_output=True,
+                           text=True, errors="replace", timeout=3600)
+    except Exception as e:
+        _rm(tmp)
+        return False, f"subtitles sit {worst:.0f} MB from their picture and the re-interleave failed: {e}"
+    if r.returncode or not os.path.exists(tmp):
+        _rm(tmp)
+        return False, (f"subtitles sit {worst:.0f} MB from their picture and the re-interleave "
+                       f"failed: {_tail(r.stderr)}")
+    b = _stream_signature(tmp, ffprobe)
+    w2, p2 = subtitle_gap_mb(tmp, ffprobe)
+    why = None
+    if not a or not b or a[0] != b[0]:
+        why = "streams differ"
+    elif a[2] != b[2]:
+        why = f"Dolby Vision config {a[2]} -> {b[2]}"
+    else:
+        for (kind, _c), n0, n1 in zip(a[0], a[1], b[1]):
+            if kind != "subtitle" and n1 != n0:
+                why = f"{kind} packets {n0} -> {n1}"
+                break
+    if why is None:
+        # Subtitles: ffmpeg fills the gaps between lines with EMPTY samples (it may add more than
+        # MP4Box wrote), so the raw count is not the content. Every line that SHOWS — every
+        # non-empty sample — must come through at the same instant with the same bytes.
+        def lines(path):
+            return [(round(t, 3), sz) for t, _p, sz in _packets(path, "s", ffprobe, size=True) if sz > 2]
+        l0, l1 = lines(output), lines(tmp)
+        if l0 != l1:
+            why = f"subtitle lines differ ({len(l0)} -> {len(l1)})"
+    if why is None and (p2 > MAX_SUBTITLE_GAP_MB or w2 > MAX_SUBTITLE_WORST_MB):
+        why = f"subtitles still {w2:.0f} MB (p99 {p2:.1f}) away"
+    if why:
+        _rm(tmp)
+        return False, f"subtitles sit {worst:.0f} MB from their picture; the re-interleave was refused: {why}"
+    os.replace(tmp, output)
+    return True, f"subtitles re-interleaved ({worst:.0f} -> {w2:.0f} MB)"
+
+
+def _gate_interleave(res, output: str, ffprobe=FFPROBE, ffmpeg=FFMPEG):
     """Refuse a master whose audio sits too far from its own video. Verified the same way the
     hvc1 check is — on the SHIPPED file, not on what we meant to write — because this is a
-    property of the mux, and the one that shipped was measured at 115 MB by 20 minutes in."""
+    property of the mux, and the one that shipped was measured at 115 MB by 20 minutes in.
+    Its SUBTITLES are checked the same way and re-interleaved losslessly when misplaced
+    (fix_subtitle_interleave); a master whose subtitles cannot be fixed is refused too."""
     gap = interleave_gap_mb(output, ffprobe)
     if gap > MAX_INTERLEAVE_GAP_MB:
         res.ok = False
         res.reason = (f"badly interleaved: audio sits {gap:.1f} MB from its own video "
                       f"(max {MAX_INTERLEAVE_GAP_MB:.0f}) — players stall on this")
         _rm(output)
+        return res
+    ok, note = fix_subtitle_interleave(output, ffmpeg, ffprobe)
+    if not ok:
+        res.ok = False
+        res.reason = "badly interleaved: " + note + " — players stall on this"
+        _rm(output)
+    elif note:
+        res.reason += " · " + note
     return res
 
 
