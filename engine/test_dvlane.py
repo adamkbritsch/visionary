@@ -69,7 +69,12 @@ class _Lane(unittest.TestCase):
                         mock.patch.object(dvlane.logbook, "event"),
                         mock.patch.object(dvlane.logbook, "failure"),
                         mock.patch.object(nas_ftp, "discard_stage"),   # a test patches it to look
-                        mock.patch.object(dvlane.plex, "heavy_activities", return_value=[])]  # never the live Plex
+                        mock.patch.object(dvlane.plex, "heavy_activities", return_value=[]),  # never the live Plex
+                        # never the live disk either: these tests failed whenever the real scratch
+                        # disk sat under the floor (2026-10-18, 368 GB free). Tests about room patch
+                        # their own values on top of these.
+                        mock.patch.object(dvlane.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 15)),
+                        mock.patch.object(dvlane, "_floor_bytes", return_value=400 * 1024 ** 3)]
         for p in self.patches:
             p.start()
         dvbook.seed([{"nas_path": HOST, "size_bytes": 100, "enhancement_layer": "FEL",
@@ -79,7 +84,7 @@ class _Lane(unittest.TestCase):
         self.ev = threading.Event()
 
     def tearDown(self):
-        for p in self.patches:
+        for p in reversed(self.patches):   # undo stacked patches innermost-first
             p.stop()
 
     def e(self):
