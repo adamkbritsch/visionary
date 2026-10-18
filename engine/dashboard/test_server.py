@@ -5,6 +5,26 @@ from unittest import mock
 import server
 from power import PowerReading
 
+_LIVE_SETTINGS = None
+
+
+def setUpModule():
+    """No test reads the user's LIVE settings.json. The Up Next tests silently depended on it and
+    started failing the day the live YouTube burst was set to 0 (2026-10-18). Every test now sees
+    the shipped defaults unless it patches settings itself."""
+    global _LIVE_SETTINGS
+    import os
+    import tempfile
+    import settings
+    _LIVE_SETTINGS = mock.patch.object(settings, "SETTINGS_FILE",
+                                       os.path.join(tempfile.mkdtemp(), "settings.json"))
+    _LIVE_SETTINGS.start()
+
+
+def tearDownModule():
+    if _LIVE_SETTINGS is not None:
+        _LIVE_SETTINGS.stop()
+
 
 def t(h, m=0):
     return datetime.time(h, m)
@@ -1275,6 +1295,17 @@ class SettingsDvEngine(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(out["settings"]["dv_engine"], "native")
         self.assertEqual(self.settings.dv_engine(), "native")
+
+    def test_a_route_switched_to_native_is_gated_the_same_way(self):
+        with self._ndv(False) as ndv:
+            out, code = server.api_save_settings({"dv_routes": {"yt_native4k": "native"}})
+        ndv.assert_called_once_with()
+        self.assertEqual(code, 409)
+        self.assertIn("dv_routes", out["error"])
+        self.assertEqual(self.settings.get_settings().get("dv_routes", {}), {})
+        with self._ndv(True):
+            out, code = server.api_save_settings({"dv_routes": {"yt_native4k": "native"}})
+        self.assertEqual(code, 200)
 
     def test_resolve_is_always_accepted_without_the_check(self):
         with self._ndv(True):

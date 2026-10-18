@@ -22,6 +22,10 @@ HOW:
      on every frame) and L1 clamped to the declared 1000-nit source range.
   4. `dovi_tool generate` writes the binary RPU, which dvcap's x265 path interleaves exactly
      like an RPU extracted from a Resolve render.
+  The TV lane measures Topaz's chunks (`analyze_chunks`); nativerender measures one file in
+  scene ranges (`analyze_ranges`), optionally behind a geometry/matrix front end (`pre_vf`)
+  and with another mastering (`MasterSpec`). Both run the same overlapped loop and default to
+  exactly the chain and RPU above.
 
 WHAT IT DOES NOT DO: Dolby's CM v4 analysis. Resolve's L1 average is Dolby's "anchored"
 value (not a mean), and its L2 trims and L3 offsets come from Dolby's licensed analyzer;
@@ -40,7 +44,9 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 
+import dvcap
 import versions as _versions
 
 DOVI_TOOL = "/opt/homebrew/bin/dovi_tool"
@@ -80,6 +86,75 @@ SOURCE_MAX_PQ = nits_to_pq12(MASTER_MAX_NITS)      # 3079
 SOURCE_MIN_PQ = nits_to_pq12(MASTER_MIN_NITS)      # 7
 
 
+# ---- mastering: what one RPU declares ---------------------------------------------------
+# The constants above are Resolve's 1000-nit DV project, and every SDR route renders through
+# it. A route whose master is something else (an HDR source keeping its own mastering, a
+# 2000-nit project) passes a MasterSpec instead; the DEFAULT is exactly those constants, so a
+# caller that passes nothing generates the same RPU byte for byte (test_dvnative pins that on
+# the stored E2E sidecar).
+
+_MDCV_RE = re.compile(r"^G\(\d+,\d+\)B\(\d+,\d+\)R\(\d+,\d+\)WP\(\d+,\d+\)L\((\d+),(\d+)\)$")
+
+
+@dataclass(frozen=True)
+class MasterSpec:
+    """The mastering an RPU declares: L6 mastering range, the source range L1/L4 are clamped
+    to (source_min_pq / source_max_pq), MaxCLL's ceiling and the L2 trim targets. `mdcv` is
+    the matching HDR10 mastering-display string in x265's units (dvcap.probe_video's
+    "master_display"), carried for the routes that pass a source's own mastering through;
+    when given, its L(max,min) must say the same nits as max_nits/min_nits, so the HDR10 SEI
+    and the RPU can never disagree. Nothing in the RPU reads it; the native render writes it
+    as the HDR10 mastering-display SEI (hdr10sei; None -> dvcap.FALLBACK_MASTER_DISPLAY, the
+    1000-nit P3 D65 display the x265 path writes)."""
+    max_nits: int = MASTER_MAX_NITS
+    min_nits: float = MASTER_MIN_NITS
+    trim_targets: tuple = TRIM_TARGETS_NITS
+    mdcv: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "trim_targets", tuple(int(t) for t in self.trim_targets))
+        if not 0 < float(self.min_nits) < int(self.max_nits) <= 10000:
+            raise ValueError(f"mastering range must be 0 < min < max <= 10000 nits, got "
+                             f"{self.min_nits}..{self.max_nits}")
+        t = self.trim_targets
+        if not t or list(t) != sorted(set(t)) or t[0] <= 0 or t[-1] > 10000:
+            raise ValueError(f"trim targets must be ascending nits in (0, 10000], got {t}")
+        if self.mdcv is not None:
+            m = _MDCV_RE.match(self.mdcv)
+            if not m:
+                raise ValueError(f"mdcv is not an x265 master-display string: {self.mdcv!r}")
+            if (int(m.group(1)), int(m.group(2))) != (int(self.max_nits) * 10000, self.l6_min):
+                raise ValueError(f"mdcv says L({m.group(1)},{m.group(2)}), the spec "
+                                 f"{self.max_nits}/{self.min_nits} nits")
+
+    @property
+    def source_max_pq(self) -> int:
+        return nits_to_pq12(self.max_nits)
+
+    @property
+    def source_min_pq(self) -> int:
+        return nits_to_pq12(self.min_nits)
+
+    @property
+    def l6_min(self) -> int:
+        """L6's min_display_mastering_luminance, in 0.0001-nit units (0.0001 nits -> 1)."""
+        return int(round(float(self.min_nits) * 10000))
+
+    @property
+    def hdr10_mdcv(self) -> str:
+        """The HDR10 mastering-display string a render of this master carries: `mdcv`, or the
+        x265 path's own fallback (the 1000-nit P3 D65 display) for the default 1000-nit
+        master. A non-default master must name its display — there is no fallback for it."""
+        if self.mdcv:
+            return self.mdcv
+        if (int(self.max_nits), self.l6_min) == (MASTER_MAX_NITS, int(round(MASTER_MIN_NITS * 10000))):
+            return dvcap.FALLBACK_MASTER_DISPLAY
+        raise ValueError(f"a {self.max_nits}-nit master needs its own mdcv string")
+
+
+DEFAULT_MASTER = MasterSpec()      # Resolve's 1000-nit project: today's RPU, unchanged
+
+
 # ---- colour: the captured Resolve conversion ---------------------------------------------
 # Topaz's ProRes is BT.709 limited 4:2:2. The LUT maps BT.709 R'G'B' to BT.2020 PQ R'G'B'
 # (Resolve's SDR->PQ, fitted to its own renders). zscale does ONLY matrix/range work around
@@ -112,6 +187,35 @@ def pq_rgb_to_yuv(pix_fmt: str) -> str:
 def lut_vf(cube: str, pix_fmt: str = "yuv420p10le") -> str:
     """The full SDR->PQ chain for an encode: Topaz ProRes -> BT.2020 PQ YUV."""
     return lut_rgb_chain(cube) + "," + pq_rgb_to_yuv(pix_fmt)
+
+
+# ---- front ends (pre_vf) -----------------------------------------------------------------
+# A `pre_vf` is a plain, linear filter chain run BEFORE the chains above (analysis and encode
+# alike, so the RPU measures the picture that ships). Its contract is the LUT chain's input:
+# BT.709 limited-range Y'CbCr (with no LUT: BT.2020 PQ Y'CbCr), because lut_rgb_chain's first
+# zscale reads its input as matrix 709, limited range, whatever the frame says. So a front end
+# does geometry and standard matrix/range conversions only, and the one captured LUT (Resolve's
+# BT.709 DV1000 conversion) stays the only colour transform. It must hand on Y'CbCr, never RGB:
+# that zscale would read RGB planes as Y'CbCr. Designed, not wired yet (the routes that use
+# them ship later; user decision 2026-10-15: no further Resolve captures, standard front ends):
+#   BT.601 SD (smpte170m)   zscale=matrixin=170m:rangein=limited:matrix=709:range=limited,
+#                           format=yuv444p16le   (matrix only; 16-bit so 8-bit SD is not
+#                           rounded twice; converting the SMPTE-C primaries is the route's call)
+#   full-range BT.709       zscale=matrixin=709:rangein=full:matrix=709:range=limited,
+#                           format=yuv444p16le
+#   fit + pad to UHD        zscale=w=W:h=H:filter=spline36,pad=3840:2160:(ow-iw)/2:(oh-ih)/2
+#                           (pad's black is limited-range black, which the LUT maps to PQ black)
+_PRE_VF_BAD = re.compile(r"[;\[\]\n]")
+
+
+def front_end(pre_vf: str | None) -> str:
+    """'' for no front end, else `pre_vf` + "," ready to prefix a chain. Refuses a filtergraph
+    (';', '[label]'): a front end must be one linear chain, or the chain after it breaks."""
+    if not pre_vf:
+        return ""
+    if _PRE_VF_BAD.search(pre_vf) or pre_vf.strip(", ") != pre_vf:
+        raise ValueError(f"pre_vf must be one plain filter chain: {pre_vf!r}")
+    return pre_vf + ","
 
 
 # ---- hdr-analyze ------------------------------------------------------------------------
@@ -171,21 +275,22 @@ def leading_frames(sc: dict) -> int:
     return int((sc.get("source") or {}).get("leading_skipped_frames") or 0)
 
 
-def light_levels(sc: dict):
-    """(MaxCLL, MaxFALL) in nits, clamped to the declared mastering range: MaxCLL <= 1000,
-    MaxFALL <= MaxCLL. (None, None) when unmeasured. A measured 8498 on a 1000-nit master
-    (the pilot) would tell HDR10 players to tone-map 1000-nit content as 8500-nit."""
+def light_levels(sc: dict, master: MasterSpec = DEFAULT_MASTER):
+    """(MaxCLL, MaxFALL) in nits, clamped to the declared mastering range: MaxCLL <= the
+    master's peak (1000 by default), MaxFALL <= MaxCLL. (None, None) when unmeasured. A
+    measured 8498 on a 1000-nit master (the pilot) would tell HDR10 players to tone-map
+    1000-nit content as 8500-nit."""
     ll = sc.get("light_level") or {}
     cll, fall = ll.get("max_cll_nits"), ll.get("max_fall_nits")
     if not cll or not fall or cll < 1 or fall < 1:
         return (None, None)
-    cll = min(int(cll), MASTER_MAX_NITS)
+    cll = min(int(cll), int(master.max_nits))
     return (cll, min(int(fall), cll))
 
 
-def x265_max_cll(sc: dict):
+def x265_max_cll(sc: dict, master: MasterSpec = DEFAULT_MASTER):
     """The x265 --max-cll string for the HDR10 SEI, from the same clamped values as L6."""
-    cll, fall = light_levels(sc)
+    cll, fall = light_levels(sc, master)
     return f"{cll},{fall}" if cll else None
 
 
@@ -280,14 +385,15 @@ def _tail(f) -> str:
 
 
 def run_step(cmd: list, *, timeout: float, abort=None, should_pause=None, cwd: str | None = None,
-             what: str = "step", poll: float = POLL_SECONDS) -> tuple:
+             what: str = "step", poll: float = POLL_SECONDS, on_poll=None) -> tuple:
     """Run one analysis child to completion -> (returncode, output tail, CPU seconds).
 
     The child gets its own session (so a kill takes its children too), stdin closed, and its
     stdout+stderr in an anonymous temp file (a full pipe can never stall it). While it runs,
     every `poll` seconds: abort set -> kill, raise Aborted; should_pause() -> kill, raise
-    Paused; past `timeout` -> kill, raise RuntimeError. Whatever ends the wait, a child still
-    running on the way out is killed and reaped."""
+    Paused; past `timeout` -> kill, raise RuntimeError; then on_poll() (a progress reader —
+    its errors are swallowed: a progress bug must never kill the work). Whatever ends the
+    wait, a child still running on the way out is killed and reaped."""
     with tempfile.TemporaryFile() as log:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                 cwd=cwd, start_new_session=True)
@@ -303,6 +409,11 @@ def run_step(cmd: list, *, timeout: float, abort=None, should_pause=None, cwd: s
                     raise Paused(f"paused: yielded during {what} — it restarts on resume")
                 if time.monotonic() - t0 > timeout:
                     raise RuntimeError(f"{what} timed out after {int(timeout)} s")
+                if on_poll is not None:
+                    try:
+                        on_poll()
+                    except Exception:
+                        pass
                 if abort is not None:
                     abort.wait(poll)
                 else:
@@ -313,30 +424,63 @@ def run_step(cmd: list, *, timeout: float, abort=None, should_pause=None, cwd: s
         return proc.returncode, _tail(log), cpu
 
 
-def analysis_vf(cube: str | None) -> str:
+def analysis_vf(cube: str | None, pre_vf: str | None = None) -> str:
     """Chain for the analysis intermediate: area-downscale to 1080p FIRST, then (with a LUT)
     SDR -> PQ RGB -> 4:4:4; without one (an already-PQ source) straight to 4:4:4. Scaling
     before the LUT does the LUT's per-pixel float work at a quarter of the pixels: the
     intermediate builds ~2x faster, and on a real Topaz chunk the L1 it measures moved by a
     median 0 codes (peak, worst 9-10), at most 1 code (average), scene cuts identical, L4 at
-    most 1 code (measured 2026-10-15 against the LUT-first chain)."""
+    most 1 code (measured 2026-10-15 against the LUT-first chain). A `pre_vf` front end (see
+    front_end) runs before all of it, so the analysis measures the picture the encode ships."""
     scale = f"scale={ANALYSIS_WIDTH}:{ANALYSIS_HEIGHT}:flags=area"
     if cube:
-        return scale + "," + lut_rgb_chain(cube) + "," + pq_rgb_to_yuv("yuv444p10le")
-    return scale + ",format=yuv444p10le"
+        return front_end(pre_vf) + scale + "," + lut_rgb_chain(cube) + "," + pq_rgb_to_yuv("yuv444p10le")
+    return front_end(pre_vf) + scale + ",format=yuv444p10le"
+
+
+def uniform_pts(fps: str) -> str:
+    """PURE. A setpts that stamps frame N at exactly N / fps from 0 ("24000/1001" ->
+    setpts=N*1001/24000/TB). For a passthrough copy: the frames stay exactly the decoded ones,
+    and their timestamps become regular whatever the source's were."""
+    from fractions import Fraction
+    f = Fraction(str(fps))
+    return f"setpts=N*{f.denominator}/{f.numerator}/TB"
 
 
 def build_analysis_intermediate_command(ffmpeg: str, chunk: str, out_mkv: str, cube: str | None,
-                                        hwaccel: bool = True) -> list:
-    """`hwaccel`: decode the 4K ProRes on Apple's media engine (VideoToolbox) — the decode is
-    what bounds this step once the LUT runs at 1080p; analyze_chunks retries once in software
-    if the hardware decode refuses a chunk."""
-    head = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
+                                        hwaccel: bool = True, *, start: int | None = None,
+                                        frames: int | None = None, fps: str | None = None,
+                                        pre_vf: str | None = None) -> list:
+    """The lossless analysis intermediate of `chunk`: the whole file, or with `frames` (and
+    `fps`) only frames [start, start+frames) of it — dvcap.build_seg_decode_command's seek:
+    input `-ss` at the midpoint timestamp (frame-exact; frame 0 needs none), `-frames:v` to
+    bound the count and `-fps_mode passthrough` so no frame is padded in or dropped.
+
+    `hwaccel`: decode on Apple's media engine (VideoToolbox) — the decode is what bounds this
+    step once the LUT runs at 1080p; the analysis loop retries once in software if the
+    hardware decode refuses a unit.
+
+    A range is also re-stamped from 0 (uniform_pts), so it is laid out like a chunk's
+    intermediate. A passthrough copy of an MKV source's millisecond timestamps (reordered by
+    B-frames, offset by the seek) can repeat one, and the L4 child's decode (rawvideo, which
+    pads to a constant rate) then emitted 6 frames for a 5-frame range — measured 2026-10-15;
+    the count gate would have failed that range on every retry."""
+    ranged = frames is not None
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
     if hwaccel:
-        head += ["-hwaccel", "videotoolbox"]
-    return head + ["-i", chunk, "-map", "0:v:0", "-vf", analysis_vf(cube),
-                   "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
-                   "-color_range", "tv", "-c:v", "ffvhuff", "-pix_fmt", "yuv444p10le", out_mkv]
+        cmd += ["-hwaccel", "videotoolbox"]
+    if ranged:
+        ss = dvcap.seg_seek_seconds(int(start or 0), fps)
+        if ss is not None:
+            cmd += ["-ss", f"{ss:.6f}"]
+    cmd += ["-i", chunk, "-map", "0:v:0"]
+    if ranged:
+        cmd += ["-frames:v", str(int(frames)), "-vf", uniform_pts(fps) + "," + analysis_vf(cube, pre_vf),
+                "-fps_mode", "passthrough"]
+    else:
+        cmd += ["-vf", analysis_vf(cube, pre_vf)]
+    return cmd + ["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                  "-color_range", "tv", "-c:v", "ffvhuff", "-pix_fmt", "yuv444p10le", out_mkv]
 
 
 def build_raw444_decode_command(ffmpeg: str, src: str, size: tuple | None = None) -> list:
@@ -346,9 +490,9 @@ def build_raw444_decode_command(ffmpeg: str, src: str, size: tuple | None = None
             "-map", "0:v:0", *vf, "-pix_fmt", "yuv444p10le", "-f", "rawvideo", "-"]
 
 
-def maxrgb_pq12_stats(frame, width: int, height: int):
+def maxrgb_pq12_stats(frame, width: int, height: int, max_pq: int = SOURCE_MAX_PQ):
     """PURE (numpy). One yuv444p10le BT.2020nc limited frame -> (mean, std) of PQ max(R,G,B)
-    in 12-bit codes, clamped to the declared source range."""
+    in 12-bit codes, clamped to the declared source range (`max_pq`, the master's peak)."""
     import numpy as np
     a = np.frombuffer(frame, dtype="<u2").astype(np.float32)
     n = width * height
@@ -358,12 +502,13 @@ def maxrgb_pq12_stats(frame, width: int, height: int):
     r = y + 1.4746 * cr
     b = y + 1.8814 * cb
     g = (y - 0.2627 * r - 0.0593 * b) / 0.6780
-    m = np.clip(np.maximum(np.maximum(r, g), b), 0.0, SOURCE_MAX_PQ / PQ12_MAX) * PQ12_MAX
+    m = np.clip(np.maximum(np.maximum(r, g), b), 0.0, max_pq / PQ12_MAX) * PQ12_MAX
     return float(m.mean()), float(m.std())
 
 
 def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
-             height: int = ANALYSIS_HEIGHT, scale: bool = False) -> list:
+             height: int = ANALYSIS_HEIGHT, scale: bool = False,
+             max_pq: int = SOURCE_MAX_PQ) -> list:
     """Per-frame [anchor_pq, anchor_power] (rounded mean, std of PQ max-RGB) of a yuv444p10le
     PQ file — the analysis intermediate, so it costs one more decode of a file we already made.
     `scale`: decode it area-scaled to width x height (analyze_chunks measures L4 at 960x540:
@@ -379,7 +524,7 @@ def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
             buf = p.stdout.read(size)
             if len(buf) < size:
                 break
-            mean, std = maxrgb_pq12_stats(buf, width, height)
+            mean, std = maxrgb_pq12_stats(buf, width, height, max_pq)
             out.append([int(round(mean)), int(round(std))])
     finally:
         p.stdout.close()
@@ -389,27 +534,60 @@ def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
     return out
 
 
-L4_WIDTH, L4_HEIGHT = 960, 540
+L4_WIDTH, L4_HEIGHT = 960, 540  # the analysis loop's L4 resolution (scaled in the decode)
 STREAMS = 1                     # analyze_chunks' parallel pipelines. Two ran 33% faster on 600-frame
                                 # clips but SLOWER on full chunks beside an x265 remux (24 vs 27 fps on
                                 # S06E06's chunks 11-14, 2026-10-15): x265 takes the cores either way.
-                                # Raise it only on a measured gain (e.g. with the machine to itself).         # analyze_chunks' L4 resolution (scaled in the decode)
+                                # Raise it only on a measured gain (e.g. with the machine to itself).
 
 
 def build_l4_command(python: str, src: str, out_json: str, *, ffmpeg: str = FFMPEG,
                      width: int = ANALYSIS_WIDTH, height: int = ANALYSIS_HEIGHT,
-                     scale: bool = False) -> list:
-    """`python3 -m dvnative l4 ...` (run with cwd = ENGINE_DIR): frame_l4 of `src` as JSON."""
-    return [python, "-m", "dvnative", "l4", src, out_json, "--ffmpeg", ffmpeg,
-            "--size", f"{int(width)}x{int(height)}"] + (["--scale"] if scale else [])
+                     scale: bool = False, max_pq: int | None = None) -> list:
+    """`python3 -m dvnative l4 ...` (run with cwd = ENGINE_DIR): frame_l4 of `src` as JSON.
+    `--max-pq` only for a master other than the 1000-nit default, so today's argv is unchanged."""
+    cmd = [python, "-m", "dvnative", "l4", src, out_json, "--ffmpeg", ffmpeg,
+           "--size", f"{int(width)}x{int(height)}"] + (["--scale"] if scale else [])
+    if max_pq is not None and int(max_pq) != SOURCE_MAX_PQ:
+        cmd += ["--max-pq", str(int(max_pq))]
+    return cmd
 
 
-def merge_sidecars(parts: list, total: int | None = None) -> dict:
+SCENE_MIN_KEYS = ("min_pq_12bit",)                      # a joined shot keeps the lowest of these,
+SCENE_MAX_KEYS = ("max_pq_12bit",)                      # the highest of these, and a frame-weighted
+SCENE_AVG_KEYS = ("avg_max_rgb_pq_12bit", "avg_luma_pq_12bit")   # mean of these
+
+
+def join_scenes(a: dict, b: dict) -> dict:
+    """PURE. Two adjacent scenes (a ends where b starts) as ONE: min of the minimums and max of
+    the maximums (exactly what one pass over the joined frames gives), and the frame-weighted
+    mean of the averages (the analyzer's averages are per-frame means over its scene)."""
+    na, nb = a["end"] - a["start"] + 1, b["end"] - b["start"] + 1
+    out = dict(a, end=b["end"])
+    for k in SCENE_MIN_KEYS:
+        if isinstance(a.get(k), int) and isinstance(b.get(k), int):
+            out[k] = min(a[k], b[k])
+    for k in SCENE_MAX_KEYS:
+        if isinstance(a.get(k), int) and isinstance(b.get(k), int):
+            out[k] = max(a[k], b[k])
+    for k in SCENE_AVG_KEYS:
+        if isinstance(a.get(k), int) and isinstance(b.get(k), int):
+            out[k] = int(round((a[k] * na + b[k] * nb) / (na + nb)))
+    return out
+
+
+def merge_sidecars(parts: list, total: int | None = None, joins=()) -> dict:
     """PURE. [(first_frame, sidecar), ...] in order -> one sidecar over the whole stream.
     Scenes are offset by their chunk's first frame; light level is the max over chunks; a
     per-frame "l4" list is concatenated when every chunk has one. Refuses a gap or overlap
     between chunks, and a merged length that differs from `total` (the RPU must cover every
-    frame exactly once)."""
+    frame exactly once).
+
+    `joins`: first frames of parts that do NOT start on a scene cut (a range split only to bound
+    the intermediate's size — analyze_ranges). There the previous part's last scene and this
+    part's first are one shot (join_scenes), so a DV display never steps its tone mapping in
+    the middle of a continuous shot. Topaz's chunks start on strong cuts: they pass none."""
+    joins = {int(j) for j in joins or ()}
     scenes, expect, cll, fall, l4 = [], 0, 0, 0, []
     for first, sc in parts:
         n = stream_frames(sc)
@@ -417,8 +595,12 @@ def merge_sidecars(parts: list, total: int | None = None) -> dict:
             raise ValueError(f"chunk starts at {first}, expected {expect}")
         if leading_frames(sc):
             raise ValueError("a chunk intermediate must not have undecodable leading pictures")
-        for s in sc["scenes"]:
-            scenes.append(dict(s, start=s["start"] + first, end=s["end"] + first))
+        for i, s in enumerate(sc["scenes"]):
+            s = dict(s, start=s["start"] + first, end=s["end"] + first)
+            if i == 0 and first in joins and scenes and scenes[-1]["end"] + 1 == s["start"]:
+                scenes[-1] = join_scenes(scenes[-1], s)
+            else:
+                scenes.append(s)
         ll = sc.get("light_level") or {}
         cll, fall = max(cll, ll.get("max_cll_nits") or 0), max(fall, ll.get("max_fall_nits") or 0)
         if l4 is not None:
@@ -447,19 +629,19 @@ def _rm_quiet(*paths) -> None:
             pass
 
 
-def _load_chunk(side: str, l4_path: str | None, frames: int) -> tuple:
-    """(sidecar with its "l4" list attached, None) for a published chunk that covers exactly
-    `frames` frames; (None, why) for one that cannot be used."""
+def _load_chunk(side: str, l4_path: str | None, frames: int, unit: str = "chunk") -> tuple:
+    """(sidecar with its "l4" list attached, None) for a published chunk (or range) that covers
+    exactly `frames` frames; (None, why) for one that cannot be used."""
     try:
         sc = load_sidecar(side)
         if stream_frames(sc) != frames:
-            return None, f"analysis covers {stream_frames(sc)} frames, the chunk has {frames}"
+            return None, f"analysis covers {stream_frames(sc)} frames, the {unit} has {frames}"
         if l4_path:
             with open(l4_path) as f:
                 sc["l4"] = json.load(f)
             got = len(sc["l4"]) if isinstance(sc["l4"], list) else None
             if got != frames:
-                return None, f"L4 has {got} frames, the chunk has {frames}"
+                return None, f"L4 has {got} frames, the {unit} has {frames}"
         return sc, None
     except (OSError, ValueError) as e:
         return None, f"unreadable result: {e}"
@@ -489,7 +671,8 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                    ffmpeg: str = FFMPEG, peak_estimator: str = "max", with_l4: bool = True,
                    threads: int | None = None, abort=None, on_chunk=None, should_pause=None,
                    before_chunk=None, on_cpu=None, python: str | None = None,
-                   nice: int = NICE, streams: int = STREAMS) -> dict:
+                   nice: int = NICE, streams: int = STREAMS, pre_vf: str | None = None,
+                   master: MasterSpec = DEFAULT_MASTER) -> dict:
     """Measure every chunk ([[first_frame, path], ..., [total, None]] — the end sentinel is
     required: it gives each chunk its frame count) and return the merged sidecar.
 
@@ -516,24 +699,102 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     for each chunk worked on in THIS call (os.wait4 user+sys over its steps): when it
     publishes, or on the way out for one that failed or was cut short. A chunk whose
     results do not cover exactly its frames (sidecar or L4) is deleted and fails the call,
-    so a retry measures it again instead of reusing it."""
-    import concurrent.futures as cf
+    so a retry measures it again instead of reusing it. `pre_vf` (a front end) and `master`
+    (its peak clamps L4) default to today's chain."""
     if not chunks or chunks[-1][1] is not None:
         raise ValueError("the chunk list must end with its [total, None] sentinel")
-    os.makedirs(workdir, exist_ok=True)
-    total = int(chunks[-1][0])
-    python = python or sys.executable
     real = [(a, p) for a, p in chunks if p]
     ends = [int(a) for a, _p in chunks[1:]]
-    n_chunks = len(real)
+    units = [(int(first), ends[k] - int(first), f"chunk_{k:04d}") for k, (first, _p) in enumerate(real)]
+    return _analyze_units(
+        units, int(chunks[-1][0]), workdir, unit="chunk",
+        build_intermediate=lambda k, mkv, hw: build_analysis_intermediate_command(
+            ffmpeg, real[k][1], mkv, cube, hwaccel=hw, pre_vf=pre_vf),
+        analyzer=analyzer, ffmpeg=ffmpeg, peak_estimator=peak_estimator, with_l4=with_l4,
+        threads=threads, abort=abort, on_done=on_chunk, should_pause=should_pause,
+        before_unit=before_chunk, on_cpu=on_cpu, python=python, nice=nice, streams=streams,
+        max_pq=master.source_max_pq)
+
+
+def validate_ranges(ranges) -> list:
+    """PURE. [(a, b), ...] half-open frame ranges as ints (dvcap.plan_segments' shape), refusing
+    an empty plan, one not starting at frame 0, an empty range, and a gap or overlap."""
+    out, expect = [], 0
+    for i, r in enumerate(ranges or []):
+        a, b = int(r[0]), int(r[1])
+        if a != expect or b <= a:
+            raise ValueError(f"range {i} is [{a}, {b}), expected one starting at {expect}")
+        out.append((a, b))
+        expect = b
+    if not out:
+        raise ValueError("no analysis ranges")
+    return out
+
+
+def analyze_ranges(path: str, ranges: list, workdir: str, *, fps: str, cube: str | None,
+                   pre_vf: str | None = None, master: MasterSpec = DEFAULT_MASTER,
+                   analyzer: str = HDR_ANALYZER, ffmpeg: str = FFMPEG, peak_estimator: str = "max",
+                   with_l4: bool = True, threads: int | None = None, abort=None, on_range=None,
+                   should_pause=None, before_range=None, on_cpu=None, python: str | None = None,
+                   nice: int = NICE, streams: int = STREAMS, joins=()) -> dict:
+    """analyze_chunks for ONE file measured in frame ranges ([(a, b), ...] from frame 0;
+    validate_ranges) -> the merged sidecar over [0, last b).
+
+    WHY RANGES: the intermediate is several MiB a frame (nativelane.INTERMEDIATE_BYTES_PER_FRAME),
+    so a whole file cannot be one unit — a 231k-frame livestream would need well over 1 TiB.
+    Each range is decoded with dvcap's frame-exact seek (build_analysis_intermediate_command's
+    range form, in hardware like a chunk's, retried once in software), measured, published and
+    its intermediate deleted — the same overlapped loop as analyze_chunks, so at most two
+    ranges' intermediates exist per stream. The caller bounds each range's length (nativerender
+    caps them); pass the item's scene plan as the ranges, so a range that starts on a scene cut
+    joins its neighbour without a seam, exactly as Topaz's chunks do. `joins` names the range
+    starts that are NOT scene cuts (a range split only for its size): merge_sidecars makes the
+    shot either side of them one shot again.
+
+    Resume, pause, abort, the per-step timeout, the before_range(k, frames) disk hook,
+    on_range(done, of), on_cpu(k, cpu_s, frames) and the refusal of a result that does not
+    cover exactly its range all follow analyze_chunks. A range's files are named by its index,
+    first frame and length, so a different plan never reuses one."""
+    from fractions import Fraction
+    rs = validate_ranges(ranges)
+    try:
+        if Fraction(str(fps)) <= 0:
+            raise ValueError
+    except (ValueError, ZeroDivisionError):
+        raise ValueError(f"analyze_ranges needs the file's frame rate, got {fps!r}")
+    units = [(a, b - a, f"range_{k:04d}_{a}_{b - a}") for k, (a, b) in enumerate(rs)]
+    return _analyze_units(
+        units, rs[-1][1], workdir, unit="range",
+        build_intermediate=lambda k, mkv, hw: build_analysis_intermediate_command(
+            ffmpeg, path, mkv, cube, hwaccel=hw, start=units[k][0], frames=units[k][1], fps=fps,
+            pre_vf=pre_vf),
+        analyzer=analyzer, ffmpeg=ffmpeg, peak_estimator=peak_estimator, with_l4=with_l4,
+        threads=threads, abort=abort, on_done=on_range, should_pause=should_pause,
+        before_unit=before_range, on_cpu=on_cpu, python=python, nice=nice, streams=streams,
+        max_pq=master.source_max_pq, joins=joins)
+
+
+def _analyze_units(units: list, total: int, workdir: str, *, unit: str, build_intermediate,
+                   analyzer: str, ffmpeg: str, peak_estimator: str, with_l4: bool,
+                   threads: int | None, abort, on_done, should_pause, before_unit, on_cpu,
+                   python: str | None, nice: int, streams: int, max_pq: int, joins=()) -> dict:
+    """The overlapped measuring loop analyze_chunks and analyze_ranges share. `units` is
+    [(first_frame, frames, file_stem), ...] in order; build_intermediate(k, mkv, hwaccel) gives
+    unit k's intermediate argv. Every rule in analyze_chunks' docstring is this loop's; `unit`
+    ("chunk" / "range") only words its messages."""
+    import concurrent.futures as cf
+    os.makedirs(workdir, exist_ok=True)
+    python = python or sys.executable
+    n_units = len(units)
 
     def frames_of(k):
-        return ends[k] - int(real[k][0])
+        return int(units[k][1])
 
     def names(k):
-        out_bin = os.path.join(workdir, f"chunk_{k:04d}.bin")
-        return (out_bin, sidecar_path(out_bin), os.path.join(workdir, f"chunk_{k:04d}.l4.json"),
-                os.path.join(workdir, f"chunk_{k:04d}.mkv"))
+        stem = units[k][2]
+        out_bin = os.path.join(workdir, stem + ".bin")
+        return (out_bin, sidecar_path(out_bin), os.path.join(workdir, stem + ".l4.json"),
+                os.path.join(workdir, stem + ".mkv"))
 
     def published(k):
         _b, side, l4_path, _m = names(k)
@@ -543,24 +804,24 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
         if abort is not None and abort.is_set():
             raise Aborted("aborted (run stopped)")
         if should_pause is not None and should_pause():
-            raise Paused(f"paused: yielded before analysis chunk {k + 1} of {n_chunks}")
-        if before_chunk is not None:
-            why = before_chunk(k, frames_of(k) + extra)
+            raise Paused(f"paused: yielded before analysis {unit} {k + 1} of {n_units}")
+        if before_unit is not None:
+            why = before_unit(k, frames_of(k) + extra)
             if why:
                 why = str(why)
                 raise Paused(why if why.startswith("paused:") else "paused: " + why)
 
     stop = threading.Event()            # a step failed: every other step dies
-    no_new = threading.Event()          # a gate refused: no stream starts another chunk
+    no_new = threading.Event()          # a gate refused: no stream starts another unit
     guard = _EitherSet(abort, stop)
     cpu, lock, reported = {}, threading.Lock(), set()
-    building = set()                    # chunks whose intermediate is still being written
+    building = set()                    # units whose intermediate is still being written
     errors = []                         # what each stream ended on
     counts = {"done": 0}
 
     def step(k, cmd, what, cwd=None):
         rc, tail, used = run_step(niced(cmd, nice), timeout=step_timeout(frames_of(k)), abort=guard,
-                                  should_pause=should_pause, cwd=cwd, what=f"chunk {k + 1} {what}")
+                                  should_pause=should_pause, cwd=cwd, what=f"{unit} {k + 1} {what}")
         with lock:
             cpu[k] = cpu.get(k, 0.0) + (used or 0.0)
         return rc, tail
@@ -568,15 +829,12 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     def run_build(k):
         mkv = names(k)[3]
         try:
-            rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube),
-                            "intermediate")
+            rc, tail = step(k, build_intermediate(k, mkv, True), "intermediate")
             if rc != 0:                 # the hardware decode refused it: once more in software
                 _rm_quiet(mkv)
-                rc, tail = step(k, build_analysis_intermediate_command(ffmpeg, real[k][1], mkv, cube,
-                                                                       hwaccel=False),
-                                "intermediate (software decode)")
+                rc, tail = step(k, build_intermediate(k, mkv, False), "intermediate (software decode)")
             if rc != 0:
-                raise RuntimeError(f"chunk {k}: intermediate failed: {tail[-300:]}")
+                raise RuntimeError(f"{unit} {k}: intermediate failed: {tail[-300:]}")
         finally:
             with lock:                  # written (or abandoned): the disk floor sees it now
                 building.discard(k)
@@ -587,15 +845,16 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                                                   peak_estimator=peak_estimator, threads=threads),
                         "analyzer")
         if rc != 0 or not os.path.exists(sidecar_path(out_bin + ".part")):
-            raise RuntimeError(f"chunk {k}: analyzer failed: {tail[-300:]}")
+            raise RuntimeError(f"{unit} {k}: analyzer failed: {tail[-300:]}")
 
     def run_l4(k):
         _b, _s, l4_path, mkv = names(k)
         rc, tail = step(k, build_l4_command(python, mkv, l4_path + ".part", ffmpeg=ffmpeg,
-                                            width=L4_WIDTH, height=L4_HEIGHT, scale=True),
+                                            width=L4_WIDTH, height=L4_HEIGHT, scale=True,
+                                            max_pq=max_pq),
                         "L4", cwd=ENGINE_DIR)
         if rc != 0 or not os.path.exists(l4_path + ".part"):
-            raise RuntimeError(f"chunk {k}: L4 failed: {tail[-300:]}")
+            raise RuntimeError(f"{unit} {k}: L4 failed: {tail[-300:]}")
 
     def publish(k):
         out_bin, side, l4_path, mkv = names(k)
@@ -614,14 +873,14 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                                              and not (abort is not None and abort.is_set()))]
         return (real_errs or errs or [None])[0]
 
-    todo = [k for k in range(n_chunks) if not published(k)]
-    counts["done"] = n_chunks - len(todo)
-    if on_chunk:
+    todo = [k for k in range(n_units) if not published(k)]
+    counts["done"] = n_units - len(todo)
+    if on_done:
         for i in range(counts["done"]):
-            on_chunk(i + 1, n_chunks)
+            on_done(i + 1, n_units)
 
     def start(k):
-        """Gate chunk k and start its intermediate -> (k, future), or None when a gate
+        """Gate unit k and start its intermediate -> (k, future), or None when a gate
         elsewhere already refused (this stream just stops)."""
         if no_new.is_set():
             return None
@@ -633,7 +892,7 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
         return k, pool.submit(run_build, k)
 
     def run_stream(ks):
-        """One overlapped pipeline over chunks `ks`: build k+1 while k is measured."""
+        """One overlapped pipeline over units `ks`: build k+1 while k is measured."""
         try:
             queue = iter(ks)
             pending, deferred = None, None
@@ -651,7 +910,7 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                     try:
                         pending = start(nk)
                     except (Paused, Aborted) as e:
-                        deferred = e    # chunk k (and the other streams' chunks) finish first
+                        deferred = e    # unit k (and the other streams' units) finish first
                         no_new.set()
                 measure = [pool.submit(run_analyzer, k)] + ([pool.submit(run_l4, k)] if with_l4 else [])
                 done, _ = cf.wait(measure, return_when=cf.FIRST_EXCEPTION)
@@ -664,8 +923,8 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                     reported.add(k)
                     if on_cpu:
                         on_cpu(k, cpu.get(k, 0.0), frames_of(k))
-                    if on_chunk:
-                        on_chunk(counts["done"], n_chunks)
+                    if on_done:
+                        on_done(counts["done"], n_units)
                 if deferred is not None:
                     raise deferred
         except BaseException as e:
@@ -695,7 +954,7 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     finally:
         stop.set()
         pool.shutdown(wait=True)
-        if on_cpu:                      # a chunk that failed or was cut short still used CPU
+        if on_cpu:                      # a unit that failed or was cut short still used CPU
             for k in sorted(set(cpu) - reported):
                 on_cpu(k, cpu[k], frames_of(k))
         for k in todo:
@@ -703,14 +962,14 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
                 out_bin, _side, l4_path, mkv = names(k)
                 _rm_quiet(mkv, out_bin + ".part", sidecar_path(out_bin + ".part"), l4_path + ".part")
     parts = []
-    for k, (first, _path) in enumerate(real):
+    for k, (first, frames, _stem) in enumerate(units):
         _b, side, l4_path, _m = names(k)
-        sc, bad = _load_chunk(side, l4_path if with_l4 else None, frames_of(k))
+        sc, bad = _load_chunk(side, l4_path if with_l4 else None, frames, unit)
         if bad:
             _rm_quiet(side, l4_path)            # never reuse it: the retry measures it again
-            raise RuntimeError(f"chunk {k}: {bad}")
+            raise RuntimeError(f"{unit} {k}: {bad}")
         parts.append((first, sc))
-    return merge_sidecars(parts, total=total)
+    return merge_sidecars(parts, total=total, joins=joins)
 
 
 # ---- dovi_tool generate config ----------------------------------------------------------
@@ -722,11 +981,12 @@ def neutral_l2(target_nits: int) -> dict:
                        "ms_weight": NEUTRAL}}
 
 
-def clamp_l1(mn: int, mx: int, avg: int):
-    """PURE. L1 inside the declared source range: max <= 3079, avg <= max, min <= avg. The
-    pilot measured scene peaks up to 4025 (~8500 nits) on a 1000-nit master; dovi_tool passes
-    those straight through (it only floors max at 2081 and avg at the CM floor)."""
-    mx = min(int(mx), SOURCE_MAX_PQ)
+def clamp_l1(mn: int, mx: int, avg: int, master: MasterSpec = DEFAULT_MASTER):
+    """PURE. L1 inside the declared source range: max <= the master's peak code (3079 for the
+    default 1000 nits), avg <= max, min <= avg. The pilot measured scene peaks up to 4025
+    (~8500 nits) on a 1000-nit master; dovi_tool passes those straight through (it only floors
+    max at 2081 and avg at the CM floor)."""
+    mx = min(int(mx), master.source_max_pq)
     avg = min(int(avg), mx)
     return min(int(mn), avg), mx, avg
 
@@ -736,7 +996,7 @@ AVG_FLOORS = ("V40", "V29")      # CM v4.0 floor 1229 (Resolve's own minimum; th
 
 
 def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = None,
-               l4: bool = True, avg_floor: str = "V40") -> dict:
+               l4: bool = True, avg_floor: str = "V40", master: MasterSpec = DEFAULT_MASTER) -> dict:
     """PURE. Sidecar -> `dovi_tool generate` JSON for Profile 8.1, CM v4.0.
 
     Shots follow the analyzer's scenes. Undecodable leading pictures come first in
@@ -745,14 +1005,16 @@ def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = N
     generator's default and Resolve's own minimum) rather than hdr-analyze's v2.9 choice of
     819 (`avg_floor="V29"` selects that instead, for the blind A/B). `long_play_mode` flags
     a scene refresh on every frame, as Resolve does. With a per-frame "l4" list, every frame
-    carries Level4 through a frame edit."""
+    carries Level4 through a frame edit. `master` sets the mastering range, the source range
+    L1 is clamped to and the L2 targets; its default is Resolve's 1000-nit project."""
     if avg_floor not in AVG_FLOORS:
         raise ValueError(f"avg_floor must be one of {AVG_FLOORS}")
+    peak = int(master.max_nits)
     if max_cll is None or max_fall is None:
-        m_cll, m_fall = light_levels(sc)
-        max_cll = max_cll if max_cll is not None else (m_cll or MASTER_MAX_NITS)
-        max_fall = max_fall if max_fall is not None else (m_fall or MASTER_MAX_NITS)
-    max_cll = min(int(max_cll), MASTER_MAX_NITS)
+        m_cll, m_fall = light_levels(sc, master)
+        max_cll = max_cll if max_cll is not None else (m_cll or peak)
+        max_fall = max_fall if max_fall is not None else (m_fall or peak)
+    max_cll = min(int(max_cll), peak)
     max_fall = min(int(max_fall), max_cll)
     lead = leading_frames(sc)
     frames_l4 = sc.get("l4") if l4 else None
@@ -763,7 +1025,7 @@ def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = N
     for i, s in enumerate(sc["scenes"]):
         start = 0 if i == 0 else s["start"] + lead
         duration = s["end"] + lead - start + 1
-        mn, mx, avg = clamp_l1(s["min_pq_12bit"], s["max_pq_12bit"], s["avg_max_rgb_pq_12bit"])
+        mn, mx, avg = clamp_l1(s["min_pq_12bit"], s["max_pq_12bit"], s["avg_max_rgb_pq_12bit"], master)
         shot = {"start": start, "duration": duration,
                 "metadata_blocks": [{"Level1": {"min_pq": mn, "max_pq": mx, "avg_pq": avg}}]}
         if frames_l4 is not None:
@@ -773,7 +1035,7 @@ def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = N
                     "anchor_power": min(int(frames_l4[start + k][1]), PQ12_MAX)}}]}
                 for k in range(duration)]
         shots.append(shot)
-    blocks = [neutral_l2(t) for t in TRIM_TARGETS_NITS]
+    blocks = [neutral_l2(t) for t in master.trim_targets]
     blocks.append({"Level9": {"length": 1, "source_primary_index": SOURCE_PRIMARY_BT2020}})
     blocks.append({"Level11": {"content_type": L11_CONTENT_TYPE, "whitepoint": 0,
                                "reference_mode_flag": False}})
@@ -782,12 +1044,12 @@ def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = N
         "cm_version": "V40",
         "long_play_mode": True,
         "length": length,
-        "source_min_pq": SOURCE_MIN_PQ,
-        "source_max_pq": SOURCE_MAX_PQ,
+        "source_min_pq": master.source_min_pq,
+        "source_max_pq": master.source_max_pq,
         "level5": {"active_area_left_offset": 0, "active_area_right_offset": 0,
                    "active_area_top_offset": 0, "active_area_bottom_offset": 0},
-        "level6": {"max_display_mastering_luminance": MASTER_MAX_NITS,
-                   "min_display_mastering_luminance": int(round(MASTER_MIN_NITS * 10000)),
+        "level6": {"max_display_mastering_luminance": peak,
+                   "min_display_mastering_luminance": master.l6_min,
                    "max_content_light_level": max_cll,
                    "max_frame_average_light_level": max_fall},
         "default_metadata_blocks": blocks,
@@ -804,13 +1066,14 @@ def build_generate_command(dovi_tool: str, config_json: str, rpu_out: str) -> li
 
 def generate_rpu(sidecar, rpu_out: str, *, dovi_tool: str = DOVI_TOOL, l4: bool = True,
                  avg_floor: str = "V40", max_cll: int | None = None, max_fall: int | None = None,
-                 timeout: int = 600) -> dict:
+                 timeout: int = 600, master: MasterSpec = DEFAULT_MASTER) -> dict:
     """Sidecar (file path, or an already-merged dict) -> binary RPU at `rpu_out` (atomic:
     written to .part, then renamed). Returns the config used. Raises RuntimeError when
-    dovi_tool refuses it."""
+    dovi_tool refuses it. `master` as in rpu_config (default: today's RPU, byte for byte)."""
     sc = load_sidecar(sidecar) if isinstance(sidecar, str) else sidecar
     validate_sidecar(sc)
-    cfg = rpu_config(sc, max_cll=max_cll, max_fall=max_fall, l4=l4, avg_floor=avg_floor)
+    cfg = rpu_config(sc, max_cll=max_cll, max_fall=max_fall, l4=l4, avg_floor=avg_floor,
+                     master=master)
     cfg_path = rpu_out + ".generate.json"
     with open(cfg_path, "w") as f:
         json.dump(cfg, f)
@@ -828,9 +1091,10 @@ def generate_rpu(sidecar, rpu_out: str, *, dovi_tool: str = DOVI_TOOL, l4: bool 
 # ---- child entry point ------------------------------------------------------------------
 
 def main(argv=None) -> int:
-    """`python3 -m dvnative l4 <intermediate.mkv> <out.json> [--ffmpeg PATH] [--size WxH]`:
-    frame_l4 of the intermediate written as JSON. analyze_chunks runs this as a child (nice 10,
-    killable, its numpy memory gone when it exits) and publishes `out` only on exit status 0."""
+    """`python3 -m dvnative l4 <intermediate.mkv> <out.json> [--ffmpeg PATH] [--size WxH]
+    [--scale] [--max-pq N]`: frame_l4 of the intermediate written as JSON. The analysis loop
+    runs this as a child (nice 10, killable, its numpy memory gone when it exits) and
+    publishes `out` only on exit status 0."""
     import argparse
     ap = argparse.ArgumentParser(prog="dvnative")
     sub = ap.add_subparsers(dest="cmd")
@@ -840,6 +1104,7 @@ def main(argv=None) -> int:
     l4.add_argument("--ffmpeg", default=FFMPEG)
     l4.add_argument("--size", default=f"{ANALYSIS_WIDTH}x{ANALYSIS_HEIGHT}")
     l4.add_argument("--scale", action="store_true", help="area-scale the decode to --size")
+    l4.add_argument("--max-pq", type=int, default=SOURCE_MAX_PQ)
     a = ap.parse_args(argv)
     if a.cmd != "l4":
         ap.print_usage(sys.stderr)
@@ -849,7 +1114,11 @@ def main(argv=None) -> int:
     except ValueError:
         print(f"--size must be WxH, got {a.size!r}", file=sys.stderr)
         return 2
-    data = frame_l4(a.src, ffmpeg=a.ffmpeg, width=width, height=height, scale=a.scale)
+    if not 0 < a.max_pq <= PQ12_MAX:
+        print(f"--max-pq must be a 12-bit PQ code, got {a.max_pq}", file=sys.stderr)
+        return 2
+    data = frame_l4(a.src, ffmpeg=a.ffmpeg, width=width, height=height, scale=a.scale,
+                    max_pq=a.max_pq)
     with open(a.out, "w") as f:
         json.dump(data, f)
     return 0

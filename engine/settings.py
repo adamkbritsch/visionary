@@ -184,6 +184,15 @@ DEFAULT_SETTINGS = {
                                 # refuses 'native' with a 409 while preflight.check_native_dv fails).
                                 # Read at USE time via dv_engine(); an item that has started native
                                 # stays native whatever this says later (its segdir marker decides).
+    "dv_routes": {},            # {route id: 'resolve' | 'native'} (routes.py ids). A route set 'native'
+                                # has its render — p.dv_render, the very file Resolve writes — made by
+                                # the 'dvrender' stage instead (nativerender.py: analysis + VideoToolbox,
+                                # no screen), whenever that stage can make the item (stages.native_route;
+                                # today one 3840x2160 BT.709 SDR file straight through the pinned LUT:
+                                # yt_native4k, sdr4k). Anything it cannot make still goes to Resolve.
+                                # {} = EVERY route 'resolve', exactly as before. tv_sdr_topaz is not set
+                                # here (the key is dropped): it keeps following dv_engine, the chunk
+                                # lane. POST /api/settings only; read at USE time via dv_routes().
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -395,11 +404,43 @@ def dv_engine() -> str:
     return _valid_dv_engine(get_settings().get("dv_engine", "resolve"))
 
 
+_ROUTE_ID = re.compile(r"[a-z][a-z0-9_]{0,39}")   # a routes.py id's shape (settings cannot import
+                                                   # the table; a name no route produces never matches)
+TV_LANE_ROUTE = "tv_sdr_topaz"    # the route dv_engine owns (the chunk lane): never a dv_routes key
+
+
+def _valid_dv_routes(v):
+    """{route id: 'resolve' | 'native'}, and nothing else. A key need only be route-id SHAPED
+    (routes.py owns the table; a name no route produces never matches), an engine must be one of
+    the exact DV_ENGINES, and TV_LANE_ROUTE is dropped — dv_engine decides that route. Anything
+    that is not a dict is {}: every route on Resolve, the old behaviour."""
+    if not isinstance(v, dict):
+        return {}
+    return {k: e for k, e in v.items()
+            if isinstance(k, str) and _ROUTE_ID.fullmatch(k) and k != TV_LANE_ROUTE
+            and isinstance(e, str) and e in DV_ENGINES}
+
+
+def dv_routes() -> dict:
+    """The live per-route engine choice, validated on READ (like dv_engine()). A route that is
+    absent is 'resolve'; {} — the default — sends every item through Resolve as it always has."""
+    return _valid_dv_routes(get_settings().get("dv_routes", {}))
+
+
+def dv_route(route) -> str:
+    """'native' | 'resolve' for one route id: its dv_routes entry, 'resolve' when it has none.
+    TV_LANE_ROUTE answers dv_engine() — that setting, not this table, picks the chunk lane."""
+    if route == TV_LANE_ROUTE:
+        return dv_engine()
+    return dv_routes().get(route, "resolve")
+
+
 VALIDATORS = {"resolve_host_displays": _valid_display_list,
               "quiet_until": _valid_quiet_until,
               "nas_network": _valid_nas_network,
               "plex_throttle": _valid_plex_throttle,
-              "dv_engine": _valid_dv_engine}
+              "dv_engine": _valid_dv_engine,
+              "dv_routes": _valid_dv_routes}
 
 
 def set_settings(updates: dict) -> dict:

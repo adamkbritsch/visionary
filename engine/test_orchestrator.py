@@ -69,13 +69,30 @@ def setUpModule():
     import settings as _settings
     _DV_ENGINE_PATCH = mock.patch.object(_settings, "dv_engine", return_value="resolve")
     _DV_ENGINE_PATCH.start()
+    # ...and dv_routes the same way (the shipped default: every route on Resolve). The native
+    # render tests below patch it back per test.
+    global _DV_ROUTES_PATCH
+    _DV_ROUTES_PATCH = mock.patch.object(_settings, "dv_routes", return_value={})
+    _DV_ROUTES_PATCH.start()
+    # The per-(item, stage) elapsed book too: every _process test that fails or pauses a stage
+    # wrote its fixture's key into the REAL ~/.topaz-pipeline/elapsed.json — the live app's own
+    # stage clocks. Tests that time stages patch it again themselves (nested, so unaffected).
+    global _ELAPSED_PATCH
+    _ELAPSED_PATCH = mock.patch.object(orch, "ELAPSED_FILE", _os.path.join(d, "elapsed.json"))
+    _ELAPSED_PATCH.start()
 
 
 _NAS_PATCH = None
 _DV_ENGINE_PATCH = None
+_DV_ROUTES_PATCH = None
+_ELAPSED_PATCH = None
 
 
 def tearDownModule():
+    if _ELAPSED_PATCH is not None:
+        _ELAPSED_PATCH.stop()
+    if _DV_ROUTES_PATCH is not None:
+        _DV_ROUTES_PATCH.stop()
     if _DV_ENGINE_PATCH is not None:
         _DV_ENGINE_PATCH.stop()
     if _NAS_PATCH is not None:
@@ -3742,6 +3759,26 @@ class CombinePaths(unittest.TestCase):
             orch.discard_workfiles(stem + ".mkv")
         self.assertFalse(os.path.exists(comp))
 
+    def test_discard_workfiles_sweeps_a_native_renders_books_and_transients(self):
+        import nativerender
+        d = tempfile.mkdtemp()
+        stem = "Chan - A video [aaaaaaaaaa1]"
+        render = os.path.join(d, stem + orch.DV_TAG + ".mov")
+        books = render + nativerender.BOOKS_SUFFIX
+        os.makedirs(os.path.join(books, nativerender.ANALYSIS_DIR))
+        open(os.path.join(books, nativerender.ENCODE), "w").write("x")
+        for f in nativerender.transient_paths(render):
+            open(f, "w").write("x")
+        keep = os.path.join(d, "Other - B [bbbbbbbbbb2]" + orch.DV_TAG + ".mov.dvrender")
+        os.makedirs(keep)                                          # someone else's books stay
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=d), \
+             mock.patch.object(orch.scratch, "prefetch_dir", return_value=d), \
+             mock.patch.dict(orch.ORCH.state, {"current": None}):
+            orch.discard_workfiles(stem + ".mp4")
+        self.assertFalse(os.path.exists(books))
+        self.assertEqual([f for f in nativerender.transient_paths(render) if os.path.exists(f)], [])
+        self.assertTrue(os.path.isdir(keep))
+
 
 class RotationWiring(unittest.TestCase):
     """The round-robin pointer is series.advance_rotation's PERSISTED one (it was an
@@ -4146,6 +4183,10 @@ class BurstActuallyGetsATurn(unittest.TestCase):
         o._tv_since_yt = since
         es = contextlib.ExitStack(); self.addCleanup(es.close)
         es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
+        # the SHIPPED burst, not the live settings file's (a live 0 — the cadence switched off —
+        # failed these on any machine that had it set; hermetic since 2026-10-15)
+        es.enter_context(mock.patch.object(o, "_yt_burst",
+                                           return_value=orch.settings.DEFAULT_SETTINGS["youtube_videos_per_burst"]))
         es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=holding))
         es.enter_context(mock.patch.object(o, "_in_finisher_keys", return_value=set()))
         es.enter_context(mock.patch.object(orch.youtube, "next_due",
@@ -4279,6 +4320,10 @@ class BurstRunsToItsSetSize(unittest.TestCase):
         o._tv_since_yt = since
         es = contextlib.ExitStack(); self.addCleanup(es.close)
         es.enter_context(mock.patch.object(o, "_yt_every_tv", return_value=every))
+        # the SHIPPED burst, not the live settings file's (a live 0 — the cadence switched off —
+        # failed these on any machine that had it set; hermetic since 2026-10-15)
+        es.enter_context(mock.patch.object(o, "_yt_burst",
+                                           return_value=orch.settings.DEFAULT_SETTINGS["youtube_videos_per_burst"]))
         es.enter_context(mock.patch.object(o, "_resolve_should_hold", return_value=holding))
         es.enter_context(mock.patch.object(o, "_in_finisher_keys", return_value=set()))
         es.enter_context(mock.patch.object(orch.youtube, "next_due",
@@ -4456,6 +4501,8 @@ class TVIsNotAPrerequisite(unittest.TestCase):
         o = orch.Orchestrator()
         o._parked, o._refused = set(), set()
         with mock.patch.object(_series, "get_active_series", return_value=[]), \
+             mock.patch.object(o, "_yt_burst",            # the shipped burst, not the live file's
+                               return_value=orch.settings.DEFAULT_SETTINGS["youtube_videos_per_burst"]), \
              mock.patch.object(o, "_participants", return_value=[]), \
              mock.patch.object(_movies, "next_due", return_value=movie), \
              mock.patch.object(_yt, "next_due", return_value=video), \
@@ -6206,3 +6253,571 @@ class NativeProgressHeartbeat(_NativeRun):
         self.assertFalse([t for t in __import__("threading").enumerate()
                           if t.name == "dvnative-progress"])
         self.assertTrue(self._handed_off())
+
+
+class RouteLoggedOnceAfterTheDownload(unittest.TestCase):
+    """P2b: _process logs the item's route (routes.item_route) once, the first time it gets past
+    the download (the source and CFR are local), and nothing else changes — the same stages
+    run in the same order with the same state, whatever the route log does or fails to do."""
+
+    def setUp(self):
+        import plan
+        self.td = tempfile.mkdtemp()
+        self.p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        # A local source makes the doorstep's own plan_for record its probe: keep it off the
+        # user's real probe cache.
+        cache = mock.patch.object(plan, "PROBE_CACHE", os.path.join(self.td, "probe_cache.json"))
+        cache.start()
+        self.addCleanup(cache.stop)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _process(self, o, *, done=("download", "extend"), download=(True, "ok"), extra=()):
+        """One _process pass with run_stage faked; returns (stage, state stage, resolve_active)
+        per stage run, the download included, plus every logbook line."""
+        seen, lines = [], []
+
+        def run(st, *_a, **_k):
+            seen.append((st, o.state.get("stage"), o._resolve_active.is_set()))
+            return True, "ok"
+
+        def dl(_p, **_k):
+            seen.append(("download", o.state.get("stage"), o._resolve_active.is_set()))
+            return download
+        with contextlib.ExitStack() as es:
+            for cm in [mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in done),
+                       mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+                       mock.patch.object(o, "_claim_prefetched"),
+                       mock.patch.object(o, "_reclaim_for_pipeline"),
+                       mock.patch.object(o, "_advance_cadence_at_handoff"),
+                       mock.patch.object(o, "_quiet_mode", return_value=False),
+                       mock.patch.object(o, "_display_missing", return_value=None),
+                       mock.patch.object(o, "_drain_backlog", return_value=0),
+                       mock.patch.object(o, "_suspend_remuxes"),
+                       mock.patch.object(o, "_resume_remuxes"),
+                       mock.patch.object(o, "_sleep"),
+                       mock.patch.object(o, "_download_once", side_effect=dl),
+                       mock.patch.object(o, "_hand_to_finisher",
+                                         side_effect=lambda _p: seen.append(("handoff",))),
+                       mock.patch.object(orch.logbook, "event", side_effect=lines.append),
+                       mock.patch("stages.run_stage", side_effect=run)] + list(extra):
+                es.enter_context(cm)
+            o._process(self.p)
+        return seen, [ln for ln in lines if " route " in ln]
+
+    def _orch(self):
+        o = orch.Orchestrator(); o._enabled = True
+        return o
+
+    def test_logged_once_per_item(self):
+        import routes
+        o = self._orch()
+        with mock.patch.object(routes, "item_route", return_value="tv_sdr_topaz") as ir:
+            _seen, first = self._process(o)
+            _seen, second = self._process(o)
+        self.assertEqual(first, ["S01E01: route tv_sdr_topaz — TV, 720p+ SDR, Topaz upscale, "
+                                 "dv1000"])
+        self.assertEqual(second, [])
+        ir.assert_called_once_with(self.p)
+
+    def test_the_stages_are_exactly_todays(self):
+        # The same sequence with the route log as without it (_log_route a no-op), whether it
+        # names a route, names none, or blows up — and with a fresh download in the pass too.
+        import routes
+        for done in (("download", "extend"), ()):
+            base, _ = self._process(self._orch(), done=done,
+                                    extra=[mock.patch.object(orch.Orchestrator, "_log_route")])
+            self.assertEqual(base[-1], ("handoff",))
+            for cm in (mock.patch.object(routes, "item_route", return_value="tv_sdr_topaz"),
+                       mock.patch.object(routes, "item_route", return_value=None),
+                       mock.patch.object(routes, "item_route", side_effect=RuntimeError("bug")),
+                       mock.patch.object(routes, "describe", side_effect=RuntimeError("bug"))):
+                seen, _ = self._process(self._orch(), done=done, extra=[cm])
+                self.assertEqual(seen, base)
+
+    def test_a_failing_log_line_never_costs_the_item(self):
+        import routes
+        o = self._orch()
+        with mock.patch.object(routes, "item_route", return_value="yt_plain"), \
+             mock.patch.object(orch.logbook, "event", side_effect=OSError("disk full")):
+            o._log_route(self.p, "S01E01")                     # swallowed
+        self.assertIn(o._skip_key(self.p), o._route_said)       # ...and not retried every pass
+
+    def test_never_before_the_download_is_done(self):
+        import routes
+        o = self._orch()
+        order = []
+        with mock.patch.object(routes, "item_route",
+                               side_effect=lambda _p: order.append("route") or "tv_sdr_topaz"):
+            seen, lines = self._process(o, done=(), download=(False, "boom"))
+            self.assertEqual([s[0] for s in seen], ["download"])
+            self.assertEqual((order, lines), ([], []))          # a failed download logs nothing
+            seen, lines = self._process(o, done=())
+        self.assertEqual(order, ["route"])
+        self.assertEqual(len(lines), 1)
+        self.assertEqual([s[0] for s in seen], ["download", "extend", "topaz", "resolve",
+                                                "handoff"])
+
+    def test_the_real_facts(self):
+        # routes.item_route end to end: the local source's probe and plan, the output-mode pin.
+        import plan, settings
+        with open(self.p.source, "w") as f:
+            f.write("x")
+        probe = {"width": 1920, "height": 1080, "sar": "", "is_4k": False, "is_hdr": False,
+                 "is_dv": False, "codec": "h264", "transfer": "bt709", "pix_fmt": "yuv420p",
+                 "is_cfr": True, "video_kbps": 8000}
+        for mode, want in (("auto", "tv_sdr_topaz"), ("dv2000", "dv2000")):
+            with mock.patch.object(plan, "probe_input", return_value=probe), \
+                 mock.patch.object(settings, "get_show_output_mode", return_value=mode):
+                _seen, lines = self._process(self._orch())
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith(f"S01E01: route {want} — "), lines[0])
+        self.assertEqual(plan.PROBE_CACHE, os.path.join(self.td, "probe_cache.json"))
+        self.assertTrue(os.path.exists(plan.PROBE_CACHE))       # the doorstep's write landed here
+
+    def test_no_local_source_logs_nothing(self):
+        import plan
+        with mock.patch.object(plan, "probe_input", side_effect=AssertionError("probed")):
+            seen, lines = self._process(self._orch())
+        self.assertEqual(lines, [])
+        self.assertEqual(seen[-1], ("handoff",))
+
+
+# ---- the native render ('dvrender'): settings dv_routes --------------------------------------
+
+def _yt_item(td, vid="aaaaaaaaaa9"):
+    """A YouTube video whose download is done: its scene plan's segdir (scenes.json) on disk."""
+    p = youtube_paths("Chan", f"/s/Chan/x/v [{vid}].mp4", "V", scratch_dir=td)
+    os.makedirs(p.segdir, exist_ok=True)
+    with open(os.path.join(p.segdir, "scenes.json"), "w") as f:
+        f.write("[]")
+    return p
+
+
+class _FakeRenderSpec:
+    total = 1000
+
+
+class DvRoutesOffChangesNothing(unittest.TestCase):
+    """dv_routes {} (the shipped default) — or every route set 'resolve' explicitly — leaves the
+    run loop's CALL SEQUENCE exactly as it was: the one new call is the decision itself, which
+    reads one setting and returns. Every orchestrator function and every collaborator the
+    Resolve slot touches is recorded in order and compared with a run where the decision is
+    bypassed outright; the native render's classifier, spec, stage and engine are booby-trapped."""
+
+    SCENARIOS = ("tv episode", "video renders", "video deferred", "resolve fails", "quiet mode")
+
+    def setUp(self):
+        import plan
+        self.td = tempfile.mkdtemp()
+        cm = mock.patch.object(plan, "PROBE_CACHE", os.path.join(self.td, "probe_cache.json"))
+        cm.start(); self.addCleanup(cm.stop)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _trace(self, scenario, mode):
+        import sys, nativerender, plan, routes, settings, stages
+        d = tempfile.mkdtemp(dir=self.td)
+        with mock.patch.object(orch, "FINISHER_FILE", os.path.join(d, "finisher_queue.json")):
+            o = orch.Orchestrator(); o._enabled = True          # an empty work-list of its own
+        if scenario == "tv episode" or scenario == "resolve fails" or scenario == "quiet mode":
+            p = episode_paths("A", "S01E01", SRC, scratch_dir=d)
+            _chunk(p)
+        else:
+            p = _yt_item(d)
+        calls = []
+
+        def rec(name, ret=None):
+            def f(*_a, **_k):
+                calls.append(name)
+                return ret
+            return f
+
+        def run(st, *_a, **kw):
+            calls.append(("run_stage", st, o.state.get("stage"), o._resolve_active.is_set()))
+            return (False, "resolve failed (rc=1): x") if scenario == "resolve fails" else (True, "ok")
+        every = {r: "resolve" for r in routes.ROUTES if r != settings.TV_LANE_ROUTE}
+        cms = [mock.patch.object(orch, "FINISHER_FILE", os.path.join(d, "finisher_queue.json")),
+               mock.patch.object(orch, "ELAPSED_FILE", os.path.join(d, "elapsed.json")),
+               mock.patch.object(orch, "stage_done", side_effect=lambda st, _p: st in ("download", "extend", "topaz")),
+               mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+               mock.patch.object(plan, "plan_for", side_effect=lambda _s: calls.append("plan_for") or {"topaz": "resolve-only" if p.youtube else "upscale"}),
+               mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")),
+               mock.patch.object(stages, "dvrender_spec", side_effect=AssertionError("spec")),
+               mock.patch.object(stages, "_dvrender", side_effect=AssertionError("dvrender")),
+               mock.patch.object(nativerender, "render", side_effect=AssertionError("rendered")),
+               mock.patch("stages.run_stage", side_effect=run),
+               mock.patch.object(o, "_render_set_progress", side_effect=AssertionError("render card"))]
+        for name in ("event", "failure", "exception"):      # every log line, in order, verbatim
+            cms.append(mock.patch.object(orch.logbook, name,
+                                         side_effect=lambda *a, _n=name, **k: calls.append((_n,) + a)))
+        for name, ret in (("_claim_prefetched", None), ("_reclaim_for_pipeline", None),
+                          ("_advance_cadence_at_handoff", None), ("_display_missing", None),
+                          ("_drain_backlog", 0), ("_suspend_remuxes", None), ("_resume_remuxes", None),
+                          ("_sleep", None), ("_on_resolve_failure", None), ("_defer_resolve", None),
+                          ("_quiet_mode", scenario == "quiet mode"),
+                          ("_resolve_should_hold", scenario == "video deferred"),
+                          ("_lease_hold", None)):
+            cms.append(mock.patch.object(o, name, side_effect=rec(name, ret)))
+        if mode == "bypassed":
+            cms.append(mock.patch.object(o, "_dvrender_route", return_value=None))
+        else:
+            cms.append(mock.patch.object(settings, "dv_routes", return_value={} if mode == "default" else every))
+
+        def prof(frame, event, _arg):
+            if event == "call" and os.path.basename(frame.f_code.co_filename) == "orchestrator.py":
+                calls.append(frame.f_code.co_name)
+        with contextlib.ExitStack() as es:
+            for cm in cms:
+                es.enter_context(cm)
+            sys.setprofile(prof)
+            try:
+                o._process(p)
+            finally:
+                sys.setprofile(None)
+        return calls, o
+
+    def test_the_call_sequence_is_identical_for_every_scenario(self):
+        for scenario in self.SCENARIOS:
+            base, _o = self._trace(scenario, "bypassed")
+            for mode in ("default", "every route resolve"):
+                got, o = self._trace(scenario, mode)
+                self.assertEqual(got.count("_dvrender_route"), 1, (scenario, mode))
+                self.assertEqual([c for c in got if c != "_dvrender_route"], base, (scenario, mode))
+                self.assertEqual(o._dvrender_said, {}, (scenario, mode))     # nothing logged
+
+    def test_the_resolve_slot_still_runs_resolve_with_the_whole_machine(self):
+        got, o = self._trace("tv episode", "default")
+        self.assertIn(("run_stage", "resolve", "resolve", True), got)
+        self.assertIn("_suspend_remuxes", got)
+        self.assertGreater(o._last_resolve_at, 0)
+        got, _o = self._trace("resolve fails", "default")
+        self.assertIn("_on_resolve_failure", got)
+        got, _o = self._trace("quiet mode", "default")
+        self.assertIn("_defer_resolve", got)
+        self.assertNotIn("run_stage", [c[0] if isinstance(c, tuple) else c for c in got])
+
+    def test_the_progress_card_and_the_park_sweep_are_unchanged(self):
+        o = orch.Orchestrator()
+        with mock.patch.object(o, "_render_set_progress", side_effect=AssertionError("render card")):
+            o._set_progress({"stage": "topaz", "ep": "S01E01", "pct": 10})
+            o._set_progress({"stage": "resolve", "ep": "S01E01", "pct": 50})
+        self.assertEqual(o.state["progress"]["stage"], "resolve")
+
+
+class _DvRenderRun(unittest.TestCase):
+    """_process for a native-4K YouTube video whose route is decided native (stages.native_route
+    faked); run_stage is faked and records what it ran and with what."""
+
+    def setUp(self):
+        import plan
+        self.td = tempfile.mkdtemp()
+        cm = mock.patch.object(plan, "PROBE_CACHE", os.path.join(self.td, "probe_cache.json"))
+        cm.start(); self.addCleanup(cm.stop)
+        self.o = orch.Orchestrator(); self.o._enabled = True
+        self.p = _yt_item(self.td)
+        self.key = self.o._skip_key(self.p)
+        self.ran, self.slept, self.at_run = [], [], {}
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _process(self, results=None, *, decision=("yt_native4k", _FakeRenderSpec(), ""),
+                 hold=False, extra=()):
+        import plan, stages
+        o, results = self.o, results or {}
+
+        def run(st, *_a, **kw):
+            self.ran.append(st)
+            self.at_run[st] = {"stage": o.state.get("stage"), "sp": kw.get("should_pause"),
+                               "resolve_active": o._resolve_active.is_set(),
+                               "stage_active": o.state.get("stage_active")}
+            r = results.get(st, (True, "ok"))
+            return r(st) if callable(r) else r
+        with contextlib.ExitStack() as es:
+            cms = [mock.patch.object(orch, "stage_done",
+                                     side_effect=lambda st, _p: st in ("download", "extend", "topaz")),
+                   mock.patch.object(orch, "apply_container", side_effect=lambda x: x),
+                   mock.patch.object(plan, "plan_for", return_value={"topaz": "resolve-only"}),
+                   mock.patch.object(stages, "native_route", return_value=decision),
+                   mock.patch.object(o, "_claim_prefetched"),
+                   mock.patch.object(o, "_reclaim_for_pipeline"),
+                   mock.patch.object(o, "_advance_cadence_at_handoff"),
+                   mock.patch.object(o, "_quiet_mode", return_value=False),
+                   mock.patch.object(o, "_display_missing", return_value=None),
+                   mock.patch.object(o, "_drain_backlog", return_value=0),
+                   mock.patch.object(o, "_resolve_should_hold", return_value=hold),
+                   mock.patch.object(o, "_suspend_remuxes"),
+                   mock.patch.object(o, "_resume_remuxes"),
+                   mock.patch.object(o, "_sleep", side_effect=self.slept.append),
+                   mock.patch("stages.run_stage", side_effect=run)]
+            for cm in cms + list(extra):
+                es.enter_context(cm)
+            o._process(self.p)
+
+    def _handed_off(self):
+        return self.key in self.o._in_finisher_keys()
+
+    RESOLVE_TRAPS = ("_on_resolve_failure", "_resolve_recovered", "_defer_resolve",
+                     "_hold_for_display", "_hold_before_stalled_resolve", "_suspend_remuxes")
+
+
+class DvRenderSlot(_DvRenderRun):
+    """A route set 'native' fills Resolve's slot with 'dvrender': the screen's rules skip it, the
+    doorstep's pacing does not, Resolve's state is never touched, failures take the ordinary
+    ladder, and the hand-off treats it exactly like a Resolve item."""
+
+    def test_it_runs_dvrender_and_never_touches_resolves_state(self):
+        o = self.o
+        o._last_resolve_at, o._resolve_fails[self.key] = 123.0, 2
+        o._stall_probe = "someone"
+        traps = [mock.patch.object(o, n, side_effect=AssertionError(n)) for n in self.RESOLVE_TRAPS]
+        with mock.patch.object(orch.logbook, "event") as ev:
+            self._process(extra=traps)
+        self.assertEqual(self.ran, ["dvrender"])
+        at = self.at_run["dvrender"]
+        self.assertEqual((at["stage"], at["resolve_active"], at["stage_active"]),
+                         ("dvrender", False, True))                  # no SIGSTOP of the remuxes
+        self.assertTrue(callable(at["sp"]))
+        self.assertEqual((o._last_resolve_at, o._resolve_fails, o._stall_probe),
+                         (123.0, {self.key: 2}, "someone"))
+        self.assertTrue(self._handed_off())
+        self.assertFalse(os.path.exists(self.p.segdir))         # dropped at hand-off, as Resolve's
+        self.assertIn("v [aaaaaaaaaa9]: DV via the native render — route yt_native4k",
+                      [c.args[0] for c in ev.call_args_list])
+
+    def test_quiet_mode_a_missing_display_and_a_stall_hold_nothing(self):
+        o = self.o
+        o._stall_active = True
+        extra = [mock.patch.object(o, "_quiet_mode", return_value=True),
+                 mock.patch.object(o, "_display_missing", return_value="not attached")] + \
+                [mock.patch.object(o, n, side_effect=AssertionError(n))
+                 for n in ("_defer_resolve", "_hold_for_display", "_hold_before_stalled_resolve")]
+        self._process(extra=extra)
+        self.assertEqual(self.ran, ["dvrender"])
+        self.assertTrue(self._handed_off())
+
+    def test_it_defers_at_the_doorstep_while_a_remux_runs(self):
+        self._process(hold=True)
+        self.assertEqual(self.ran, [])
+        self.assertIn(self.key, self.o._gate_deferred)
+        self.assertEqual(self.o.state["hold"]["code"], "resolve-gate")
+        self.assertIn("its DV render preempts it when the remux ends", self.o.state["message"])
+        self.assertFalse(self._handed_off())
+
+    def test_it_holds_at_the_doorstep_and_quiet_mode_never_defers_it_there(self):
+        import plan
+        o = self.o
+        holds = iter([True, True, False])
+        msgs = []
+        real_hold = o._hold
+        extra = [mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}),
+                 mock.patch.object(o, "_yt_parked", return_value=True),     # no defer: it holds
+                 mock.patch.object(o, "_resolve_should_hold", side_effect=lambda *_a: next(holds)),
+                 mock.patch.object(o, "_gate_release_pending", return_value=False),
+                 mock.patch.object(o, "_quiet_mode", return_value=True),
+                 mock.patch.object(o, "_defer_resolve", side_effect=AssertionError("deferred")),
+                 mock.patch.object(o, "_hold", side_effect=lambda c, m, **k: (msgs.append(m),
+                                                                               real_hold(c, m, **k))),
+                 mock.patch.object(orch.time, "sleep")]
+        self._process(extra=extra)
+        self.assertEqual(self.ran, ["dvrender"])
+        self.assertIn("v [aaaaaaaaaa9]: holding before its DV render — finishing the previous "
+                      "item's remux first", msgs)
+
+    def test_the_starvation_guard_steps_back_for_a_deferred_item(self):
+        o = self.o
+        o._gate_deferred.add("someone else")
+        self._process(extra=[mock.patch.object(o, "_gate_release_pending", return_value=True)])
+        self.assertEqual(self.ran, [])
+        self.assertEqual(o.state["message"],
+                         "v [aaaaaaaaaa9]: yielding its DV render to the item deferred ahead of it")
+
+    def test_a_sent_video_is_never_held_at_the_doorstep(self):
+        self._process(hold=True, extra=[mock.patch.object(orch.youtube, "is_priority_video",
+                                                          return_value=True)])
+        self.assertEqual(self.ran, ["dvrender"])
+
+    def test_a_route_it_cannot_make_goes_to_resolve_and_says_why_once(self):
+        decision = ("yt_plain", None, "route yt_plain has no native render yet")
+        with mock.patch.object(orch.logbook, "event") as ev:
+            self._process(decision=decision)
+            self.o._finish_q.get_nowait()
+            self._process(decision=decision)
+        self.assertEqual(self.ran, ["resolve", "resolve"])
+        self.assertTrue(self.at_run["resolve"]["resolve_active"])     # the ordinary Resolve
+        said = [c.args[0] for c in ev.call_args_list if "DV via" in c.args[0]]
+        self.assertEqual(said, ["v [aaaaaaaaaa9]: DV via Resolve — route yt_plain is set 'native', "
+                                "but route yt_plain has no native render yet"])
+
+    def test_a_decision_that_raises_costs_resolve_never_the_item(self):
+        import stages
+        with mock.patch.object(orch.logbook, "exception") as exc:
+            self._process(extra=[mock.patch.object(stages, "native_route",
+                                                   side_effect=RuntimeError("boom"))])
+        self.assertEqual(self.ran, ["resolve"])
+        exc.assert_called_once()
+
+    def test_a_failure_takes_the_ordinary_ladder_then_parks_at_dvrender(self):
+        o = self.o
+        traps = [mock.patch.object(o, n, side_effect=AssertionError(n))
+                 for n in ("_on_resolve_failure", "_resolve_recovered")]
+        self._process({"dvrender": (False, "native render failed: rc=1")}, extra=traps)
+        self.assertEqual(o._fail_counts, {self.key: 1})
+        self.assertEqual(o._resolve_fails, {})
+        self.assertIn(60, self.slept)
+        self.assertFalse(self._handed_off())
+        o._fail_counts[self.key] = orch._max_episode_fails() - 1
+        with mock.patch.object(o, "_sweep_parked_files"):
+            self._process({"dvrender": (False, "native render failed: rc=1")}, extra=traps)
+        self.assertIn(self.key, o._parked)
+        self.assertEqual(o.state["hold"]["at"], "dvrender")
+
+    def test_a_stop_mid_render_is_not_a_failure(self):
+        def stopped(_st):
+            self.o._abort.set()
+            return False, "interrupted: native DV render stopped — the next pass resumes its analysis"
+        self._process({"dvrender": stopped})
+        self.assertEqual(self.o._fail_counts, {})
+        self.assertNotIn(60, self.slept)
+
+    def test_a_low_disk_pause_holds_on_disk_and_is_not_a_yield(self):
+        self._process({"dvrender": (False, "paused: low disk — analysis range 3 needs ~27 GiB")})
+        self.assertEqual(self.o.state["hold"]["code"], "disk")
+        self.assertIn(orch.DRAIN_POLL_SECONDS, self.slept)
+        self.assertEqual(self.o._yield_streak, {})
+
+    def test_repeated_yields_feed_the_livelock_guard(self):
+        for _ in range(orch.YIELD_LIVELOCK_LIMIT):
+            self._process({"dvrender": (False, "paused: yielded before analysis range 2 of 9")})
+        self.assertIn(self.key, self.o._yield_block)
+        self.assertEqual(self.o.state["hold"]["code"], "native")
+        with mock.patch.object(self.o, "_yt_priority_waiting", return_value=True):
+            self._process({"dvrender": (False, "paused: yielded before analysis range 2 of 9")})
+        self.assertEqual(self.o.state["hold"]["code"], "yt-priority")
+
+    def test_a_lease_holds_it_before_it_starts(self):
+        o = self.o
+        asked = []
+        self._process(extra=[mock.patch.object(o, "_lease_hold", side_effect=lambda st: asked.append(st)
+                                               or "Expurgate has the machine for another 30s")])
+        self.assertEqual(self.ran, [])
+        self.assertEqual(asked, ["dvrender"])                    # its own name, not "resolve"
+        self.assertEqual(o.state["hold"]["code"], "yield-lease")
+        self.assertIn("dvrender waits", o.state["message"])
+
+    def test_the_card_runs_a_heartbeat_only_while_it_renders(self):
+        started = []
+
+        class T:
+            def __init__(self, target=None, args=(), **kw):
+                started.append(args[1:])
+                self.stop = args[0]
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                started.append(("joined", self.stop.is_set()))
+        self._process(extra=[mock.patch.object(orch.threading, "Thread", T)])
+        self.assertEqual(started, [("dvrender",), ("joined", True)])
+
+
+class DvRenderPausePredicate(_DvRenderRun):
+    """It yields to a sibling's lease or a sent video — never to the topaz reasons — and is
+    re-asked at most every NATIVE_PAUSE_POLL_SECONDS."""
+
+    def test_only_a_lease_or_a_send_pauses_it(self):
+        o = self.o
+        clock = [1000.0]
+        send = [False]
+        with mock.patch.object(orch.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(orch.youtube, "is_priority_video", return_value=False), \
+             mock.patch.object(o, "_dual_remux_live", return_value=True), \
+             mock.patch.object(o, "_gate_release_pending", return_value=True), \
+             mock.patch.object(o, "_yt_cadence_due", return_value=True), \
+             mock.patch.object(o._yield_lease, "blocks", return_value=False), \
+             mock.patch.object(o, "_yt_priority_waiting", side_effect=lambda: send[0]):
+            sp = o._dvrender_pause_predicate(self.p)
+            self.assertFalse(sp())                     # remuxes, a gate release, a cadence: no
+            send[0] = True
+            self.assertFalse(sp())                     # re-asked only every few seconds...
+            clock[0] += orch.NATIVE_PAUSE_POLL_SECONDS
+            self.assertTrue(sp())                      # ...then the sent video is seen
+            o._yield_block.add(self.key)
+            clock[0] += orch.NATIVE_PAUSE_POLL_SECONDS
+            self.assertFalse(sp())                     # the livelock guard silences it
+        with mock.patch.object(orch.time, "monotonic", return_value=5000.0), \
+             mock.patch.object(orch.youtube, "is_priority_video", return_value=False), \
+             mock.patch.object(o._yield_lease, "blocks", side_effect=lambda st: st == "dvrender"):
+            self.assertTrue(o._dvrender_pause_predicate(self.p)())   # a lease, by its own name
+
+    def test_a_send_never_yields_to_another_send(self):
+        o = self.o
+        with mock.patch.object(orch.youtube, "is_priority_video", return_value=True), \
+             mock.patch.object(o._yield_lease, "blocks", return_value=False), \
+             mock.patch.object(o, "_yt_priority_waiting", return_value=True):
+            self.assertFalse(o._dvrender_pause_predicate(self.p)())
+
+
+class DvRenderProgressCard(unittest.TestCase):
+    """The 'dvrender' card: timed by phase (eta.RenderClock), pct a whole number (the app decodes
+    it as an Int — nativerender reports tenths), and re-published by the heartbeat."""
+
+    def test_pct_is_whole_and_the_eta_comes_from_the_phase_clock(self):
+        o = orch.Orchestrator()
+        base = {"stage": "dvrender", "ep": "V", "frames": 6000}
+        with mock.patch.object(orch.time, "time", return_value=1000.0):
+            o._set_progress(dict(base, phase="analysis", pct=0.0, seg_done=0, seg_total=4))
+        self.assertEqual(o.state["progress"]["pct"], 0)
+        self.assertNotIn("eta_secs", o.state["progress"])
+        with mock.patch.object(orch.time, "time", return_value=1300.0):
+            o._set_progress(dict(base, phase="analysis", pct=12.5, seg_done=1, seg_total=4))
+        pr = o.state["progress"]
+        self.assertIsInstance(pr["pct"], int)
+        self.assertEqual((pr["pct"], pr["seg_done"], pr["phase"]), (12, 1, "analysis"))
+        want = 900.0 + 6000 / eta_math.RENDER_ENCODE_PRIOR_FPS + eta_math.render_finish_secs(6000)
+        self.assertAlmostEqual(pr["eta_secs"], want, delta=0.5)
+        with mock.patch.object(orch.time, "time", return_value=1400.0):
+            o._render_set_progress(o.state["progress"], tick=True)       # the heartbeat
+        self.assertAlmostEqual(o.state["progress"]["eta_secs"], want - 100.0, delta=0.5)
+
+    def test_the_heartbeat_only_republishes_a_dvrender_card(self):
+        import threading
+        o = orch.Orchestrator()
+        o.state["progress"] = {"stage": "topaz", "pct": 3}
+        stop = threading.Event()
+        calls = []
+        with mock.patch.object(o, "_render_set_progress", side_effect=lambda *a, **k: calls.append(1)), \
+             mock.patch.object(orch, "NATIVE_PROGRESS_TICK_SECONDS", 0.01):
+            t = threading.Thread(target=o._native_progress_ticker, args=(stop, "dvrender"))
+            t.start()
+            time.sleep(0.1)
+            self.assertEqual(calls, [])
+            o.state["progress"] = {"stage": "dvrender", "pct": 3}
+            time.sleep(0.1)
+            stop.set(); t.join(2)
+        self.assertTrue(calls)
+
+
+class DvRenderParkSweep(unittest.TestCase):
+    """A parked item's native render books (sidecars, RPU, encodes) are swept with its working set."""
+
+    def test_the_books_go_with_the_park(self):
+        import nativerender
+        td = tempfile.mkdtemp()
+        o = orch.Orchestrator()
+        p = _yt_item(td)
+        books = nativerender.books_dir(p)
+        self.assertEqual(books, str(p.dv_render) + ".dvrender")      # the suffix the sweep names
+        os.makedirs(os.path.join(books, nativerender.ANALYSIS_DIR))
+        with open(os.path.join(books, nativerender.ENCODE), "wb") as f:
+            f.write(b"x" * 1024)
+        with mock.patch.object(orch, "stage_done", return_value=False):
+            o._sweep_parked_files(p, "V")
+        self.assertFalse(os.path.exists(books))

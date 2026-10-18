@@ -206,10 +206,14 @@ def regime_of(*, run_stage: str | None, run_active: bool,
     normal-priority x265, exactly where Topaz sits, and when it ends the run thread parks at the
     native gate until this remux finishes: contended now, solo after, the same shape again.
     Banking it as solo would drag this item's own k toward 1. The stage never runs while
-    dv_engine is 'resolve', so every existing stage keeps the regime it always had."""
+    dv_engine is 'resolve', so every existing stage keeps the regime it always had.
+
+    THE NATIVE RENDER ('dvrender') IS THE SAME CASE: its analysis and LUT encode run at nice 10
+    beside this lane and never suspend it. It never runs while every dv_routes entry is
+    'resolve'."""
     if other_lane_live:
         return CONTENDED
-    if run_active and run_stage in ("download", "extend", "topaz", "dvnative"):
+    if run_active and run_stage in ("download", "extend", "topaz", "dvnative", "dvrender"):
         return CONTENDED
     return SOLO
 
@@ -222,7 +226,7 @@ def correction_applies(*, run_stage: str | None, run_active: bool) -> bool:
     speed-up. Predicting a speed-up there would be wrong in the dangerous direction, so the
     estimate falls back to today's conservative formula.
 
-    'dvnative' is NOT that case: the native analysis never suspends a lane, so it is ordinary
+    'dvnative' and 'dvrender' are NOT that case: neither suspends a lane, so they are ordinary
     contention and the correction applies."""
     return not (run_active and run_stage == "resolve")
 
@@ -321,3 +325,123 @@ class ChunkClock:
         seg_left = max(TAIL_MIN_SECS, seg - spent)
         return {"eta_secs": round(seg_left + max(0.0, ends[-1] - ends[done]) / r, 1),
                 "seg_eta_secs": round(seg_left, 1), "seg_secs": round(seg, 1)}
+
+
+# ---- the 'dvrender' stage: a native Dolby Vision render, timed by PHASE ---------------------
+# nativerender.render reports three phases on one 0-100 bar, and they run at unrelated speeds:
+#   analysis   one callback per finished analysis RANGE, minutes apart; a resume re-fires one
+#              per range measured before, within about a second (the 'dvnative' replay again)
+#   encode     ffmpeg's own -progress, every poll: a steady stream. A re-encode (the peak loop)
+#              starts again from the phase's start
+#   finish     four short steps (ES copy, RPU inject, mux, self-check), all I/O over the encode
+# A plain pct extrapolation would time the analysis' rate against the encode's half of the bar,
+# so each phase is timed on its own (live work only) and the ETA adds up what is left of each.
+RENDER_SPANS = {"analysis": (0.0, 50.0), "encode": (50.0, 95.0),    # = nativerender.PHASE_SPAN
+                "finish": (95.0, 100.0)}                             # (test-pinned)
+# The encode's rate before this item's own encode has been timed: a deliberately modest guess
+# for a VideoToolbox 4K Main10 encode behind the software LUT, unmeasured on real sources (the
+# route_cpu tool's encode probe will measure it). It only shapes the analysis-phase ETA, and the
+# item's own encode rate replaces it once MIN_RENDER_ENCODE_SECONDS of it have been seen.
+RENDER_ENCODE_PRIOR_FPS = 30.0
+MIN_RENDER_ENCODE_SECONDS = 10.0
+RENDER_FINISH_SECS_PER_KFRAME = 1.0   # the finish steps read and write the encode a few times
+
+
+def render_finish_secs(frames) -> float:
+    """Seconds the finish phase takes for `frames` (never under TAIL_MIN_SECS)."""
+    try:
+        f = max(0.0, float(frames or 0))
+    except (TypeError, ValueError):
+        f = 0.0
+    return max(TAIL_MIN_SECS, f / 1000.0 * RENDER_FINISH_SECS_PER_KFRAME)
+
+
+class RenderClock:
+    """The ETA of ONE item's 'dvrender' stage. observe() every progress dict (its phase, pct,
+    attempt and the item's `frames`); estimate(now) returns {"eta_secs"} — or {} while there is
+    nothing honest to say: before the first LIVE analysis range lands.
+
+    Rates are kept per phase as banked (fraction of the phase, seconds), the frames-weighted form
+    RateBook uses. An analysis boundary is banked only when it is not a resume replay
+    (chunk_is_replay, measured against the analysis phase's width); an encode tick only when it is
+    not a hold (MAX_IDLE_TICK). A new attempt — the phase's fraction going back, or a new encode
+    attempt — re-anchors and keeps what was measured: same item, same machine. A different
+    `frames` means a different item, and starts over."""
+
+    def __init__(self):
+        self._reset(None)
+
+    def _reset(self, frames):
+        self._frames = frames     # the item's frame count (its identity here)
+        self._phase = None        # the last observation: phase, its 0..1 fraction, attempt, time
+        self._frac = 0.0
+        self._attempt = None
+        self._at = None
+        self._af = self._as = 0.0   # banked LIVE analysis: fraction of the phase, seconds
+        self._ef = self._es = 0.0   # banked encode
+
+    def observe(self, info, now) -> bool:
+        """Note one progress dict. True when it banked live work as rate evidence."""
+        try:
+            phase = info.get("phase")
+            lo, hi = RENDER_SPANS[phase]
+            frac = min(1.0, max(0.0, (float(info.get("pct")) - lo) / (hi - lo)))
+            t = float(now)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        frames = info.get("frames")
+        if frames != self._frames:
+            self._reset(frames)
+        attempt = info.get("attempt")
+        if (phase != self._phase or self._at is None or frac < self._frac
+                or (phase == "encode" and attempt != self._attempt)):
+            self._phase, self._frac, self._attempt, self._at = phase, frac, attempt, t
+            return False
+        df, dt = frac - self._frac, t - self._at
+        self._frac, self._at = frac, t
+        if df <= 0 or dt <= 0:
+            return False
+        if phase == "analysis":
+            if chunk_is_replay(df, dt):
+                return False
+            self._af += df
+            self._as += dt
+            return True
+        if phase == "encode" and dt <= MAX_IDLE_TICK:
+            self._ef += df
+            self._es += dt
+            return True
+        return False
+
+    def _encode_rate(self):
+        """Fraction of one encode per second: this item's own once timed, else the prior."""
+        if self._ef > 0 and self._es >= MIN_RENDER_ENCODE_SECONDS:
+            return self._ef / self._es
+        try:
+            frames = float(self._frames)
+        except (TypeError, ValueError):
+            return None
+        return RENDER_ENCODE_PRIOR_FPS / frames if frames > 0 else None
+
+    def estimate(self, now) -> dict:
+        ph = self._phase
+        if ph is None or self._at is None:
+            return {}
+        try:
+            spent = max(0.0, float(now) - self._at)
+        except (TypeError, ValueError):
+            spent = 0.0
+        finish = render_finish_secs(self._frames)
+        if ph == "finish":
+            return {"eta_secs": round(max(TAIL_MIN_SECS, finish * (1.0 - self._frac) - spent), 1)}
+        enc = self._encode_rate()
+        if enc is None:
+            return {}
+        if ph == "encode":
+            left = max(TAIL_MIN_SECS, (1.0 - self._frac) / enc - spent)
+            return {"eta_secs": round(left + finish, 1)}
+        if not (self._af > 0 and self._as > 0):
+            return {}
+        # An overrunning range holds at the floor rather than reading 0 while it still runs.
+        left = max(TAIL_MIN_SECS, (1.0 - self._frac) / (self._af / self._as) - spent)
+        return {"eta_secs": round(left + 1.0 / enc + finish, 1)}

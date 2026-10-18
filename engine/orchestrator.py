@@ -58,6 +58,10 @@ FINISH_STAGES = ["remux", "upload", "cleanup"]
 # no Resolve-keyed rule (Quiet Mode, the pinned display, the stall ladder, SIGSTOP, the
 # doorstep gate, deploy-now's wait) ever applies to it. It is not in STAGES: stage_done
 # ("resolve") is what reports it done (nativelane.ready), and the lists above are unchanged.
+# NATIVE RENDER (settings `dv_routes`): an item whose route is set 'native' fills the slot with
+# the run-only stage 'dvrender' (_dvrender_route), which writes p.dv_render itself — so
+# stage_done("resolve") reports it done unchanged. The screen's rules skip it; the doorstep's
+# pacing does not.
 NATIVE_PAUSE_POLL_SECONDS = 5   # the analysis polls should_pause every 0.5 s; the reasons behind it
                                 # (gate release, sends, cadence) are re-asked at most this often
 NATIVE_PROGRESS_TICK_SECONDS = 5   # the analysis reports only at chunk boundaries (minutes apart); the
@@ -566,6 +570,21 @@ def discard_workfiles(source_basename: str) -> None:
             except OSError:
                 pass
     shutil.rmtree(os.path.join(main, stem + "_prob4_upscaled.segments"), ignore_errors=True)
+    # A NATIVE render's books (<render>.dvrender/: analysis ranges, encode, RPU) and its finish
+    # transients (<render>.part, .dv.hevc) beside the render — a withdrawn item's are as orphaned
+    # as its segdir (review-caught 2026-10-15; a 4K YouTube encode is gigabytes).
+    try:
+        import nativerender
+        for m in {stem, master_stem(source_basename)}:
+            render = os.path.join(main, m + DV_TAG + ".mov")
+            for f in nativerender.transient_paths(render):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            shutil.rmtree(render + nativerender.BOOKS_SUFFIX, ignore_errors=True)
+    except ImportError:
+        pass
 
 
 # A YouTube working file is named after youtarr's source stem, `<uploader> - <title> [<id>]`,
@@ -1234,6 +1253,10 @@ class Orchestrator:
         self._dvn_clock = None                 # eta.ChunkClock of the item analysed last (kept across its
         self._dvn_ep = None                    # attempts: a resume keeps the measured rate)
         self._dvn_last = None                  # its last REAL progress dict (the heartbeat re-publishes it)
+        self._dvr_lock = threading.Lock()      # the same three for the 'dvrender' card (_render_set_progress),
+        self._dvr_clock = None                 # timed by PHASE (eta.RenderClock) and kept across the
+        self._dvr_ep = None                    # item's attempts
+        self._dvr_last = None
         # per-(item, stage) elapsed accumulator (survives stop / turn / pause / restart — see _elapsed_*)
         self._elapsed_key = None               # f"{source_basename}|{stage}" of the running stage, or None
         self._elapsed_base = 0.0               # accumulated seconds BEFORE the current interval
@@ -1282,6 +1305,9 @@ class Orchestrator:
                                                # has been 'native'.
         self._native_said = {}                 # skip-key -> the last "DV via Resolve" reason logged for a
                                                # TV item the native lane declined (one line per change)
+        self._route_said = set()               # skip-keys whose route (routes.py) is already logged
+        self._dvrender_said = {}               # skip-key -> the last native-render decision logged for it
+                                               # (dv_routes; one line per change, never while all 'resolve')
         self._cadence_advanced = set()         # items whose HAND-OFF already advanced the cadence —
                                                # loaded below with the counters (survives restarts)
         self._lane_books = {}                  # lane -> eta.RateBook: per-REGIME (frames, seconds)
@@ -1463,6 +1489,9 @@ class Orchestrator:
         if info.get("stage") == "dvnative":
             self._native_set_progress(info)     # timed by CHUNK (eta.ChunkClock), not by pct
             return
+        if info.get("stage") == "dvrender":
+            self._render_set_progress(info)     # timed by PHASE (eta.RenderClock), not by pct
+            return
         now = time.time()
         key = (info.get("stage"), info.get("ep"))
         pct = info.get("pct") or 0
@@ -1585,18 +1614,50 @@ class Orchestrator:
             self._publish_elapsed(out)
             self.state["progress"] = out
 
-    def _native_progress_ticker(self, stop):
+    def _native_progress_ticker(self, stop, stage="dvnative"):
         """Heartbeat thread for the 'dvnative' stage (started and joined by _native_slot around
         run_stage): re-publishes its card every NATIVE_PROGRESS_TICK_SECONDS so the countdown,
         stopwatch and pct move inside a chunk. Only while the run thread's progress is still a
-        'dvnative' one; it never raises."""
+        'dvnative' one; it never raises. stage='dvrender' does the same for the native render's
+        card (_process runs it), whose analysis also reports only at range boundaries."""
+        setter = self._render_set_progress if stage == "dvrender" else self._native_set_progress
         while not stop.wait(NATIVE_PROGRESS_TICK_SECONDS):
             try:
                 cur = self.state.get("progress")
-                if isinstance(cur, dict) and cur.get("stage") == "dvnative":
-                    self._native_set_progress(cur, tick=True)
+                if isinstance(cur, dict) and cur.get("stage") == stage:
+                    setter(cur, tick=True)
             except Exception:  # noqa: BLE001 — a display refresh must never cost the stage
                 pass
+
+    # ---- the native render: the 'dvrender' card's progress, timed by phase --------------------
+
+    def _render_set_progress(self, info, *, tick=False):
+        """The 'dvrender' stage's progress (nativerender.render via stages._dvrender ->
+        _set_progress): an analysis that reports once per finished range (and replays the ranges
+        measured before on a resume), then an encode that reports every poll and may start over
+        (the peak loop), then a short finish. eta.RenderClock — per item, kept across attempts —
+        times each phase on its own and gives eta_secs. `tick` = the heartbeat between analysis
+        boundaries (_native_progress_ticker): the last real dict re-published with the countdown
+        and stopwatch moved on. The app decodes pct as an INTEGER (nativerender reports tenths),
+        so the published pct is a whole number."""
+        with self._dvr_lock:
+            now = time.time()
+            if not tick:
+                ep = info.get("ep")
+                if self._dvr_clock is None or self._dvr_ep != ep:
+                    self._dvr_ep, self._dvr_clock = ep, eta_math.RenderClock()
+                self._dvr_clock.observe(info, now)
+                self._dvr_last = dict(info)
+            elif self._dvr_last is None or self._dvr_clock is None:
+                return
+            out = dict(self._dvr_last)
+            out.update(self._dvr_clock.estimate(now))
+            try:
+                out["pct"] = int(float(out.get("pct") or 0))
+            except (TypeError, ValueError):
+                out["pct"] = 0
+            self._publish_elapsed(out)
+            self.state["progress"] = out
 
     def _show_slot_wait(self, info):
         """A pipeline transfer waiting for the shared NAS transfer slot says so on the run line
@@ -2543,8 +2604,11 @@ class Orchestrator:
         # only the 'encoded' marker that proves the kept master is this item's Topaz + DV work
         # (without it a re-pick would re-run Topaz for a master already on disk).
         stamp = p.segdir if _native_encoded(p) else None
+        # ...and a native render's books (<dv_render>.dvrender/: its sidecars, RPU and encodes —
+        # nativerender.BOOKS_SUFFIX; absent for every item that never rendered natively).
         for d in (p.segdir, str(p.final) + ".remuxsegs",
-                  (str(p.source_wide) + ".segments") if getattr(p, "source_wide", "") else ""):
+                  (str(p.source_wide) + ".segments") if getattr(p, "source_wide", "") else "",
+                  str(p.dv_render) + ".dvrender"):
             if d and d != stamp and os.path.isdir(d):
                 freed += self._dir_gb(d)
                 _shutil.rmtree(d, ignore_errors=True)
@@ -3578,6 +3642,8 @@ class Orchestrator:
         for st in RUN_STAGES:
             if not self._enabled or self._abort.is_set():
                 return
+            if st == "extend":                 # past the download: the source and CFR are local
+                self._log_route(p, ep_disp)
             if stage_done(st, p):
                 continue
             if st == "topaz" and (dmsg := self._native_overlap_hold(p)) is not None:
@@ -3588,6 +3654,7 @@ class Orchestrator:
                 self._hold("disk", dmsg)
                 self._sleep(DRAIN_POLL_SECONDS)
                 return
+            native = None          # the route the native render makes in Resolve's slot, or None
             if st == "resolve":
                 # NATIVE DV SLOT (settings dv_engine 'native'): an eligible TV episode is analysed
                 # headless here instead — BEFORE every Resolve-keyed rule below (Quiet Mode, the
@@ -3600,14 +3667,25 @@ class Orchestrator:
                     continue
                 if slot == "stop":
                     return
-            if st == "resolve" and self._quiet_mode():     # SCREEN CONTROL OFF: hold before the screen-
-                self._defer_resolve(p, ep_disp); return    # invasive Resolve stage; process other items
-            if st == "resolve":                            # its PINNED DISPLAY is gone (dummy unplugged):
+                # NATIVE RENDER (settings dv_routes): a route set 'native' that the 'dvrender'
+                # stage can make gets the file Resolve writes made without it. It skips the
+                # screen's rules (Quiet Mode, the pinned display, the stall ladder) but KEEPS the
+                # doorstep defer/hold below — that is remux pacing, not Resolve — and never
+                # touches Resolve's state (_resolve_active, SIGSTOP, _last_resolve_at, the stall
+                # ladder); its failures take the ordinary fail ladder. None -> Resolve, exactly as
+                # below (always while every route is 'resolve': one settings read).
+                native = self._dvrender_route(p, ep_disp)
+            run_st = "dvrender" if native else st          # the stage that actually runs here
+            if st == "resolve" and not native and self._quiet_mode():   # SCREEN CONTROL OFF: hold
+                self._defer_resolve(p, ep_disp); return    # before the screen-invasive Resolve stage;
+                                                           # process other items
+            if st == "resolve" and not native:             # its PINNED DISPLAY is gone (dummy unplugged):
                 why = self._display_missing()              # hold, never count it — other work goes on
                 if why:
                     self._hold_for_display(p, ep_disp, why); return
-            if st == "resolve" and self._stall_active:     # Resolve known-stalled (update prompt): don't
-                if self._skip_key(p) != self._stall_probe: # attempt it (a blocked attempt hangs to
+            if st == "resolve" and not native and self._stall_active:   # Resolve known-stalled
+                if self._skip_key(p) != self._stall_probe: # (update prompt): don't attempt it (a
+                                                           # blocked attempt hangs to
                     self._hold_before_stalled_resolve(p, ep_disp); return   # RESOLVE_TIMEOUT) — hold & buffer
                 self._stall_probe = None                   # this IS the probe → fall through and re-test Resolve
             fast_resolve = False
@@ -3654,7 +3732,8 @@ class Orchestrator:
                 self.state["current"] = None
                 self._hold("resolve-gate",
                     f"{ep_disp}: waiting for the remux to finish — the next episode "
-                    f"upscales meanwhile; Resolve preempts it when the remux ends")
+                    f"upscales meanwhile; {'its DV render' if native else 'Resolve'} "
+                    f"preempts it when the remux ends")
                 return
             while st == "resolve" and not is_send and self._resolve_should_hold(fast_resolve):
                 # RESOLVE GATE (user-dictated): hold this item at the Resolve doorstep until the
@@ -3663,12 +3742,12 @@ class Orchestrator:
                 # here; a fast-path item deferred above instead.)
                 if not self._enabled or self._abort.is_set():
                     return
-                if self._quiet_mode():                     # Screen Control turned OFF mid-hold (this gate
+                if not native and self._quiet_mode():      # Screen Control turned OFF mid-hold (this gate
                     self._defer_resolve(p, ep_disp); return   # can span the whole previous remux) → defer
                 fin = self.state.get("finishing") or {}
                 self._hold("resolve-gate",
-                    f"{ep_disp}: holding before Resolve — finishing "
-                    f"{fin.get('ep') or 'the previous item'}'s remux first")
+                    f"{ep_disp}: holding before {'its DV render' if native else 'Resolve'} — "
+                    f"finishing {fin.get('ep') or 'the previous item'}'s remux first")
                 time.sleep(10)
             # ...but ONLY when that deferred item can actually enter now, and never for a
             # SENT video. Live 2026-09-06: a send bypassed the pacing hold (as designed),
@@ -3692,28 +3771,30 @@ class Orchestrator:
                 # disk, so it re-enters exactly here at first_incomplete_stage=resolve.
                 self.state["current"] = None
                 self._hold("resolve-gate",
-                    f"{ep_disp}: yielding Resolve to the item deferred ahead of it")
+                    f"{ep_disp}: yielding {'its DV render' if native else 'Resolve'} to the "
+                    f"item deferred ahead of it")
                 return
-            if st == "resolve" and self._quiet_mode():     # flipped OFF in the instant the gate cleared —
-                self._defer_resolve(p, ep_disp); return    # never launch Resolve with Screen Control off
+            if st == "resolve" and not native and self._quiet_mode():   # flipped OFF in the instant
+                self._defer_resolve(p, ep_disp); return    # the gate cleared — never launch Resolve
+                                                           # with Screen Control off
             # A SIBLING HOLDS THE MACHINE: do not start a stage at all. Checking only inside the
             # stage means it starts, yields at its first boundary, is re-selected and starts again
             # (see _lease_hold). Nothing has begun at this point — no flags set, no elapsed clock
             # started, nothing to unwind — so a plain hold-and-poll is the whole of it.
-            held = self._lease_hold(st)
+            held = self._lease_hold(run_st)
             if held:
                 self.state["current"] = None
-                self._hold("yield-lease", f"{ep_disp}: {st} waits — {held}")
+                self._hold("yield-lease", f"{ep_disp}: {run_st} waits — {held}")
                 self._sleep(LEASE_POLL_SECONDS)
                 return
-            self.state.update(stage=st, message=f"{ep_disp}: {st}", progress=None, hold=None)
+            self.state.update(stage=run_st, message=f"{ep_disp}: {run_st}", progress=None, hold=None)
             self._reclaim_for_pipeline()   # pipeline > queue: purge the prefetch buffer if raw free is
                                            # low, so this stage's write can't be starved/truncated
-            ekey = p.source_basename + "|" + st      # per-(item, stage) elapsed key
+            ekey = p.source_basename + "|" + run_st  # per-(item, stage) elapsed key
             self._elapsed_begin(ekey)                # RESUMES this stage's clock if it ran before
             self._stage_active = True
             self.state["stage_active"] = True      # published: `stage` alone is stale (never cleared)
-            if st == "resolve" and self._quiet_mode():
+            if st == "resolve" and not native and self._quiet_mode():
                 # FINAL doorstep re-check, now that both of reclaim_screen's gates
                 # (_stage_active + stage) are set. A pause POSTed between the check above
                 # and this line used to slip through: reclaim_screen saw the gates unset and
@@ -3724,7 +3805,7 @@ class Orchestrator:
                 self.state["stage_active"] = False
                 self._defer_resolve(p, ep_disp)
                 return
-            if st == "resolve":
+            if st == "resolve" and not native:
                 # A NON-fast Resolve gets the WHOLE machine (user-dictated: it must finish
                 # ASAP — it holds the screen and can't be paced).
                 #
@@ -3785,15 +3866,29 @@ class Orchestrator:
             sp_download = lambda: ((not cur_is_send)
                                    and (self._skip_key(p) not in self._yield_block)
                                    and self._yt_priority_waiting())
+            # The native render runs at nice 10 beside the remuxes (no SIGSTOP, no _resolve_active)
+            # and yields only to a sibling's lease or a sent video, inside its analysis
+            # (_dvrender_pause_predicate); the heartbeat keeps its card moving between ranges.
+            stop_tick = ticker = None
+            if native:
+                stop_tick = threading.Event()
+                ticker = threading.Thread(target=self._native_progress_ticker,
+                                          args=(stop_tick, "dvrender"), daemon=True,
+                                          name="dvrender-progress")
+                ticker.start()
             try:
                 if st == "download":          # per-source lock: the prefetcher may already be pulling
                     ok, msg = self._download_once(p, on_progress=self._set_progress,   # this exact source
                                                   should_pause=sp_download)
                 else:
-                    ok, msg = run_stage(st, p, abort=self._abort, progress=self._set_progress,
-                                        should_pause=sp_full)
+                    ok, msg = run_stage(run_st, p, abort=self._abort, progress=self._set_progress,
+                                        should_pause=(self._dvrender_pause_predicate(p) if native
+                                                      else sp_full))
             finally:
-                if st == "resolve":
+                if native:
+                    stop_tick.set()
+                    ticker.join(timeout=5)      # before the card is cleared below: no late re-publish
+                if st == "resolve" and not native:
                     self._resolve_active.clear()
                     self._resolve_fast = False
                     self._last_resolve_at = time.time()   # the grace window starts HERE
@@ -3809,12 +3904,12 @@ class Orchestrator:
             else:   self._elapsed_pause()            # interrupted/failed → persist so it RESUMES from here
             # one-line message — a stage's msg can carry an ffmpeg stderr tail with newlines,
             # which would otherwise put multi-line junk in the UI status.
-            self.state.update(message=" ".join(f"{ep_disp}: {st} — {msg}".split()), progress=None)
+            self.state.update(message=" ".join(f"{ep_disp}: {run_st} — {msg}".split()), progress=None)
             if ok:
                 self._fail_counts.pop(self._skip_key(p), None)   # any forward progress clears the fail streak
                 self._yield_streak.pop(self._skip_key(p), None)  # ...and the livelock guard
                 self._yield_block.discard(self._skip_key(p))
-                if st == "resolve":
+                if st == "resolve" and not native:
                     self._resolve_fails.pop(self._skip_key(p), None)
                     if self._stall_active:          # Resolve works again → release the whole buffer to drain
                         self._resolve_recovered()
@@ -3827,12 +3922,19 @@ class Orchestrator:
                     # not this item ever runs, so the livelock guard below must not count it —
                     # there is nothing for this item to win by "keeping the machine", and the
                     # lease is not one of the reasons that guard can suppress anyway.
-                    held = self._lease_hold(st)
+                    held = self._lease_hold(run_st)
                     if held:
                         self.state["current"] = None
                         self._hold("yield-lease",
-                                   f"{ep_disp}: {st} paused at a segment boundary — {held}")
+                                   f"{ep_disp}: {run_st} paused at a segment boundary — {held}")
                         self._sleep(LEASE_POLL_SECONDS)
+                        return
+                    if native and str(msg).startswith("paused: low disk"):
+                        # The native render's analysis floor (150 GiB, as the native lane's): room
+                        # comes back when a remux passes. Not a yield — never counted below.
+                        self.state["current"] = None
+                        self._hold("disk", f"{ep_disp}: DV render analysis {msg}")
+                        self._sleep(DRAIN_POLL_SECONDS)
                         return
                     # LIVELOCK GUARD. A yield is only worth anything if something else then
                     # runs. If this same item keeps being re-selected and re-yielding with no
@@ -3846,6 +3948,15 @@ class Orchestrator:
                         logbook.event(f"{ep_disp}: yielded {self._yield_streak[k]} times with "
                                       f"nothing else able to run — keeping the machine")
                     self.state["current"] = None
+                    if native:                  # it yields to a sent video only (or a stale answer)
+                        if self._yt_priority_waiting():
+                            self._hold("yt-priority",
+                                f"{ep_disp}: DV render paused at an analysis range — running the "
+                                f"YouTube video you sent (this resumes after)")
+                        else:
+                            self._hold("native", f"{ep_disp}: DV render paused — it resumes on the "
+                                                 f"next pass")
+                        return
                     if self._yt_priority_waiting():
                         self._hold("yt-priority",
                             f"{ep_disp}: {st} paused at a safe boundary — running the "
@@ -3870,9 +3981,9 @@ class Orchestrator:
                 # park once, durably — before the resolve-fluke ladder too, because the
                 # resolve stage's own DV guard uses the same tag.
                 if str(msg).startswith("permanent:"):
-                    self._park_permanent(p, ep_disp, st, msg)
+                    self._park_permanent(p, ep_disp, run_st, msg)
                     return
-                if st == "resolve" and str(msg).startswith("host-display:"):
+                if st == "resolve" and not native and str(msg).startswith("host-display:"):
                     # The display went away during the attempt. Verified by looking for it, never by
                     # the message alone: one that IS attached and still refused Resolve's window is
                     # a genuine failure, and that one goes on to the ladder below.
@@ -3880,9 +3991,10 @@ class Orchestrator:
                     if why:
                         self._hold_for_display(p, ep_disp, why)
                         return
-                if st == "resolve":
+                if st == "resolve" and not native:
                     # Resolve failed. Retry the same item a few times (fluke window); once confirmed a real
                     # stall, hold it and buffer the next upscales (down to STALL_FLOOR_GB) instead of parking.
+                    # (A failed NATIVE render is not a Resolve stall: it takes the ordinary ladder below.)
                     self._on_resolve_failure(p, ep_disp, msg)
                     return
                 # AN OUTAGE IS NOT THE ITEM'S FAULT — the run thread's twin of the finisher's
@@ -3904,7 +4016,7 @@ class Orchestrator:
                 n = self._fail_counts.get(self._skip_key(p), 0) + 1
                 self._fail_counts[self._skip_key(p)] = n
                 if n >= _max_episode_fails():
-                    self._park_item(p, ep_disp, n, st, msg)   # movies key on basename (see _skip_key)
+                    self._park_item(p, ep_disp, n, run_st, msg)   # movies key on basename (see _skip_key)
                     self._sleep(5)
                     return
                 # otherwise leave it; next pass resumes this stage from its start
@@ -3916,6 +4028,73 @@ class Orchestrator:
             return                              # item passes straight through — no marker)
         self._hand_to_finisher(p)   # GPU/screen stages done → remux/upload/cleanup run in the
                                     # background while the loop moves on to the next item
+
+    def _log_route(self, p: EpisodePaths, ep_disp: str) -> None:
+        """Log the item's route (routes.item_route) ONCE per item per engine run, the first time
+        _process gets past its download — plan_for needs the local source. A log line and nothing else: no
+        engine choice reads it, and it never raises (a probe or book that fails logs nothing)."""
+        key = self._skip_key(p)
+        if key in self._route_said:
+            return
+        self._route_said.add(key)
+        try:
+            import routes
+            route = routes.item_route(p)
+            if route:
+                logbook.event(f"{ep_disp}: route {route} — {routes.describe(route)}")
+        except Exception:  # noqa: BLE001 — a log line must never cost the item
+            pass
+
+    # ---- the native render: 'dvrender' in Resolve's slot (settings dv_routes) -------------------
+
+    def _dvrender_route(self, p: EpisodePaths, ep_disp: str):
+        """The route whose native render ('dvrender') makes this item's p.dv_render in Resolve's
+        slot, or None -> Resolve, exactly as today. stages.native_route decides: the item's route
+        (routes.item_route) is set 'native' in dv_routes AND the stage can make it (its spec);
+        a route set 'native' that it cannot make goes to Resolve with the reason logged — once per
+        reason, like the native lane's "DV via Resolve" line. While every route is 'resolve' this
+        is one settings read and nothing else: no probe, no classifier, no log line. Never raises
+        (a decision bug costs Resolve, never the item)."""
+        try:
+            import stages as _stages
+            route, spec, why = _stages.native_route(p)
+        except Exception as e:  # noqa: BLE001
+            logbook.exception(f"native render decision for {ep_disp}", e)
+            return None
+        if spec is None and not why:
+            return None                              # its route is on Resolve (the default)
+        key = self._skip_key(p)
+        say = (f"DV via the native render — route {route}" if spec is not None else
+               f"DV via Resolve — route {route} is set 'native', but {why}")
+        if self._dvrender_said.get(key) != say:
+            self._dvrender_said[key] = say
+            logbook.event(f"{ep_disp}: {say}")
+        return route if spec is not None else None
+
+    def _dvrender_pause_predicate(self, p: EpisodePaths):
+        """`should_pause` for the 'dvrender' stage (stages._dvrender honours it inside the analysis
+        only): a sibling's lease, or a SENT video waiting (user-dictated: a send runs after the
+        current segment — here, the analysis range in hand; never for a send itself, which never
+        yields to another send). Not the topaz reasons — two live remuxes, a gate release, a due
+        cadence video — which a Resolve render never yielded to either: this item has passed the
+        doorstep already, and a YouTube video yielding to the next one would only churn. Re-asked
+        at most every NATIVE_PAUSE_POLL_SECONDS, as the 'dvnative' predicate is."""
+        key = self._skip_key(p)
+        is_send = bool(getattr(p, "youtube", False)
+                       and youtube.is_priority_video(p.source_basename))
+
+        def reasons():
+            return (self._yield_lease.blocks("dvrender")
+                    or (not is_send and key not in self._yield_block
+                        and self._yt_priority_waiting()))
+        last = {"at": None, "answer": False}
+
+        def should_pause():
+            now = time.monotonic()
+            if last["at"] is None or now - last["at"] >= NATIVE_PAUSE_POLL_SECONDS:
+                last["at"], last["answer"] = now, bool(reasons())
+            return last["answer"]
+        return should_pause
 
     # ---- native DV: the 'dvnative' slot and the gate before its hand-off -----------------------
 

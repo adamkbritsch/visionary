@@ -886,3 +886,167 @@ class CombineAppliesToEveryMovie(unittest.TestCase):
         probed = self._sweep([{"name": "z [2160p].mkv", "title": "Z", "dir": "/m",
                                "has_dv": True}], [[]])
         self.assertEqual(probed, ["z [2160p].mkv"])
+
+
+class NonPqWinnerRefusal(unittest.TestCase):
+    """The winner's OWN pixels ship, and an RPU describes a PQ base — so when the better video
+    is SDR/HLG and carries no DV of its own, neither a graft from the DV loser nor Resolve's
+    analysis may be chosen (plan P2d). Every verdict with a PQ winner, or a winner with its own
+    DV, is unchanged."""
+
+    RPU_KEYS = ("rpu_from", "rpu_profile", "rpu_inline", "rpu_why")
+
+    def test_sdr_winner_without_dv_is_refused_not_resolve(self):
+        v = companion.build_verdict(_probe(transfer="bt709"), _probe(kbps=30000),
+                                    "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
+        self.assertEqual(v["video_from"], "nas")
+        self.assertIsNone(v["rpu_from"])
+        self.assertIsNone(v["rpu_profile"])
+        self.assertFalse(v["rpu_inline"])
+        self.assertIn("SDR (bt709)", v["refused"])
+        self.assertIn("Resolve", v["refused"])
+        self.assertEqual(v["rpu_why"], v["refused"])
+
+    def test_sdr_winner_refuses_a_graft_from_the_dv_loser(self):
+        # IMAX puts a 1080p SDR WEB-DL above a real-DV REMUX: the P7 RPU cannot ride SDR pixels
+        v = companion.build_verdict(
+            _probe(dv="7.x", kbps=60000),
+            _probe(width=1920, height=1080, kbps=15000, transfer="bt709"),
+            "a 2160p BluRay REMUX.mkv", "b {edition-IMAX} 1080p WEB-DL.mkv")
+        self.assertEqual(v["video_from"], "remote")
+        self.assertIsNone(v["rpu_from"])
+        self.assertFalse(v["rpu_inline"])
+        self.assertIn("P7.x", v["refused"])
+        self.assertIn("nas copy", v["refused"])
+        self.assertNotIn("grafted", v["rpu_why"])
+
+    def test_hlg_winner_is_refused_too(self):
+        v = companion.build_verdict(_probe(transfer="arib-std-b67", kbps=60000),
+                                    _probe(dv="8.1", kbps=30000),
+                                    "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
+        self.assertIsNone(v["rpu_from"])
+        self.assertIn("HLG", v["refused"])
+
+    def test_untagged_winner_counts_as_not_pq(self):
+        v = companion.build_verdict(_probe(transfer=""), _probe(kbps=30000), "a.mkv", "b.mkv")
+        self.assertIn("untagged", v["refused"])
+
+    def test_refusal_changes_only_the_rpu_choice(self):
+        args = ("a 2160p REMUX.mkv", "b 2160p WEB-DL.mkv")
+        ok = companion.build_verdict(_probe(audio=[AC3]),
+                                     _probe(kbps=30000, audio=[TRUEHD_ATMOS]), *args)
+        bad = companion.build_verdict(_probe(audio=[AC3], transfer="bt709"),
+                                      _probe(kbps=30000, audio=[TRUEHD_ATMOS]), *args)
+        for k in ("video_from", "video_why", "audio_from", "audio_why", "audio_primary",
+                  "subs_from", "reencode", "container"):
+            self.assertEqual(ok[k], bad[k], k)
+
+    def test_pq_winner_without_dv_still_goes_to_resolve_exactly(self):
+        # the whole verdict, not just the rpu fields — byte-identical to before the fix
+        v = companion.build_verdict(_probe(), _probe(kbps=30000),
+                                    "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
+        self.assertEqual(v, {
+            "video_from": "nas", "video_why": "higher video bitrate",
+            "rpu_from": "resolve", "rpu_profile": "resolve", "rpu_inline": False,
+            "rpu_why": "neither copy has real DV — Resolve analyzes the winner",
+            "audio_from": "nas",
+            "audio_why": "AC-3 5.1 — all of this copy's audio ships (compat tracks included)",
+            "audio_primary": {"codec": "ac3", "atmos": False},
+            "subs_from": "nas",
+            "reencode": {"predicted": True, "basis": "estimate", "mbps": 50.0},
+            "container": ".mkv",
+            "specs": {"nas": "2160p · REMUX · HEVC · 50 Mbps · HDR10 · AC-3 5.1",
+                      "remote": "2160p · REMUX · HEVC · 30 Mbps · HDR10 · AC-3 5.1"},
+        })
+
+    def test_an_sdr_loser_never_matters(self):
+        # the 1080p-SDR library copy with a 2160p HDR10 seedbox copy: the PQ winner decides
+        v = companion.build_verdict(_probe(width=1920, height=1080, transfer="bt709"),
+                                    _probe(kbps=30000), "a 1080p BluRay.mkv", "b 2160p WEB.mkv")
+        self.assertEqual(v["video_from"], "remote")
+        self.assertEqual(v["rpu_from"], "resolve")
+        self.assertNotIn("refused", v)
+
+    def test_unchanged_matrix(self):
+        # (nas, remote) -> the rpu fields the engine chose before the fix
+        cases = [
+            ((_probe(dv="8.1", kbps=60000), _probe(kbps=30000)),
+             ("nas", "8.1", True)),
+            ((_probe(kbps=60000), _probe(dv="7.x", kbps=30000)),
+             ("remote", "7.x", False)),
+            ((_probe(dv="8.1", kbps=30000), _probe(kbps=60000)),
+             ("nas", "8.1", False)),
+            ((_probe(), _probe(kbps=30000)),
+             ("resolve", "resolve", False)),
+            # a winner carrying its OWN DV is out of scope: kept inline whatever the transfer
+            ((_probe(dv="8.4", kbps=60000, transfer="arib-std-b67"), _probe(kbps=30000)),
+             ("nas", "8.4", True)),
+            ((_probe(kbps=30000), _probe(dv="5", kbps=60000, transfer="")),
+             ("remote", "5", True)),
+        ]
+        for (nas, remote), (rfrom, rprof, rinline) in cases:
+            v = companion.build_verdict(nas, remote, "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
+            self.assertEqual((v["rpu_from"], v["rpu_profile"], v["rpu_inline"]),
+                             (rfrom, rprof, rinline))
+            self.assertNotIn("refused", v)
+
+
+class RefusedVerdictIsNeverConfirmable(unittest.TestCase):
+    """pair() turns a refused verdict into an error (no card, no Confirm); confirm() also
+    refuses one outright, so no combine stage can ever see an rpu_from of None."""
+
+    NAS = "a 2160p REMUX.mkv"      # same pedigree as the companion: bitrate decides (NAS)
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        p = mock.patch.object(companion, "BOOK_FILE", os.path.join(self.d, "companions.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def _pair(self, nas_probe, remote_probe):
+        import scratch
+        import transfer
+
+        class T:
+            def __init__(self, target=None, **kw): self.t = target
+            def start(self): self.t()
+        comp = {"path": "/seedbox/b.mkv", "name": "b 2160p REMUX.mkv", "size": 9}
+        companion.mark(self.NAS, "found", title="A", dir="/movies")
+        probes = {self.NAS: nas_probe, comp["name"]: remote_probe}
+        with mock.patch.object(companion.threading, "Thread", T), \
+             mock.patch.object(companion, "resolve_candidate", return_value=comp), \
+             mock.patch.object(companion, "fetch_head", return_value=""), \
+             mock.patch.object(companion, "probe_media",
+                               side_effect=lambda path, name="": probes[name]), \
+             mock.patch.object(companion, "_known_peak", return_value=None), \
+             mock.patch.object(transfer, "download_head", return_value=(True, "")), \
+             mock.patch.object(scratch, "default_scratch", return_value=self.d):
+            self.assertEqual(companion.pair(self.NAS, comp["path"])["status"], "probing")
+        return companion.entry(self.NAS)
+
+    def test_a_refused_verdict_pairs_to_an_error(self):
+        e = self._pair(_probe(transfer="bt709"), _probe(kbps=30000))
+        self.assertEqual(e["status"], "error")
+        self.assertTrue(e["error"].startswith("cannot combine: "))
+        self.assertIn("Resolve", e["error"])
+        self.assertIsNone(e["verdict"]["rpu_from"])
+        self.assertEqual(e["companion"]["name"], "b 2160p REMUX.mkv")   # kept for the record
+        self.assertEqual(companion.confirm(self.NAS)["status"], "error")
+        self.assertIsNone(companion.confirmed_verdict(self.NAS))
+
+    def test_a_pq_verdict_still_pairs_to_ready(self):
+        e = self._pair(_probe(), _probe(kbps=30000))
+        self.assertEqual(e["status"], "ready")
+        self.assertIsNone(e["error"])
+        self.assertEqual(e["verdict"]["rpu_from"], "resolve")
+        self.assertNotIn("refused", e["verdict"])
+        self.assertEqual(companion.confirm(self.NAS)["status"], "confirmed")
+
+    def test_confirm_refuses_a_ready_entry_holding_a_refused_verdict(self):
+        companion.mark("m.mkv", "ready",
+                       verdict={"video_from": "nas", "rpu_from": None,
+                                "audio_from": "nas", "refused": "SDR winner"},
+                       companion={"path": "/seedbox/x.mkv", "name": "x.mkv", "size": 9})
+        out = companion.confirm("m.mkv")
+        self.assertEqual(out, {"status": "error", "error": "cannot combine: SDR winner"})
+        self.assertEqual(companion.entry("m.mkv")["status"], "ready")
+        self.assertIsNone(companion.confirmed_verdict("m.mkv"))

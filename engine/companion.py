@@ -534,9 +534,22 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
     # ---- RPU source: real DV beats Resolve; graft follows the better base -----
     w_dv = winner_probe.get("dv_profile")
     l_dv = loser_probe.get("dv_profile")
+    w_transfer = winner_probe.get("transfer") or ""
+    refused = None
     if w_dv:
         rpu_from, rpu_inline, rpu_profile = video_from, True, w_dv
         rpu_why = f"the {video_from} copy carries real Dolby Vision (P{w_dv})"
+    elif w_transfer != "smpte2084":
+        # The winner's OWN pixels ship (stream-copied, or x265'd from the winner), and an
+        # RPU describes a PQ base: on SDR/HLG pixels a grafted RPU or Resolve's analysis
+        # would ship a mislabeled picture. REFUSED, never guessed — pair() turns this into
+        # an error, so the card never offers Confirm and no stage ever sees it.
+        kind = "HLG" if w_transfer == "arib-std-b67" else f"SDR ({w_transfer or 'untagged'})"
+        what = (f"the real Dolby Vision (P{l_dv}) of the {loser_side} copy" if l_dv
+                else "Resolve's Dolby Vision analysis")
+        rpu_from, rpu_inline, rpu_profile = None, False, None
+        rpu_why = refused = (f"the better video ({video_from} copy) is {kind}, not PQ HDR "
+                             f"— it cannot carry {what}")
     elif l_dv:
         rpu_from, rpu_inline, rpu_profile = loser_side, False, l_dv
         rpu_why = (f"real Dolby Vision (P{l_dv}) grafted from the {loser_side} copy "
@@ -569,7 +582,7 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
         reencode = {"predicted": bool(avg and avg * PEAK_ESTIMATE_FACTOR > gate),
                     "basis": "estimate", "mbps": round(avg, 1)}
 
-    return {
+    verdict = {
         "video_from": video_from, "video_why": video_why,
         "rpu_from": rpu_from, "rpu_profile": rpu_profile, "rpu_inline": rpu_inline,
         "rpu_why": rpu_why,
@@ -582,6 +595,9 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
         "specs": {"nas": _side_spec(nas_probe, nas_name),
                   "remote": _side_spec(remote_probe, remote_name)},
     }
+    if refused:                 # only a refused verdict carries the key — all others unchanged
+        verdict["refused"] = refused
+    return verdict
 
 
 # ---------------------------------------------------------------------- book
@@ -681,6 +697,8 @@ def confirm(basename: str) -> dict:
     e = entry(basename)
     if e.get("status") != "ready":
         return {"status": "error", "error": f"not ready (status={e.get('status') or 'none'})"}
+    if (e.get("verdict") or {}).get("refused"):     # pair() never marks one ready; belt and braces
+        return {"status": "error", "error": f"cannot combine: {e['verdict']['refused']}"}
     mark(basename, "confirmed", confirmed_at=time.time())
     logbook.event(f"companion {basename}: combine confirmed — "
                   f"video={e['verdict']['video_from']} rpu={e['verdict']['rpu_from']} "
@@ -905,8 +923,12 @@ def pair(basename: str, candidate_path: str) -> dict:
                                     nas_peak_mbps=_known_peak(basename))
             if cut_note:
                 verdict["cut_warning"] = cut_note
-            mark(basename, "ready", companion=comp, verdict=verdict,
-                 local_probe=nas_probe, remote_probe=remote_probe, error=None)
+            # A refused verdict (non-PQ winner, no real DV of its own) is an error, not a
+            # card: the pairing and both probes are kept for the record, Confirm is not offered.
+            refused = verdict.get("refused")
+            mark(basename, "error" if refused else "ready", companion=comp, verdict=verdict,
+                 local_probe=nas_probe, remote_probe=remote_probe,
+                 error=f"cannot combine: {refused}" if refused else None)
         except RelayError as e:
             mark(basename, "error", error=str(e))
         except Exception as e:

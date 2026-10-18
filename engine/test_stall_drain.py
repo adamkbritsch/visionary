@@ -141,6 +141,30 @@ class DrainBacklog(unittest.TestCase):
         self.assertEqual(self._count(d), 1)
 
 
+class NativeRenderIsNeverAResolveBacklog(unittest.TestCase):
+    """A native render ('dvrender', settings dv_routes) never waits on Resolve: its item keeps only
+    the scene plan's segdir (scenes.json, dropped at hand-off like any Resolve item's) and its
+    books beside the render (<dv_render>.dvrender/, analysis ranges and encodes). Neither may read
+    as Topaz output buffered behind a stalled Resolve — that would hold fresh Topaz and stand the
+    remux lanes down for a stall that does not exist."""
+
+    _with_segdirs = DrainBacklog._with_segdirs
+    _count = DrainBacklog._count
+
+    def test_its_books_and_its_plan_only_segdir_never_count(self):
+        import nativerender
+        d = self._with_segdirs(1)
+        stem = "Chan - Video [aaaaaaaaaa9]"
+        os.makedirs(os.path.join(d, stem + "_prob4_upscaled.segments"))
+        open(os.path.join(d, stem + "_prob4_upscaled.segments", "scenes.json"), "w").close()
+        books = os.path.join(d, stem + " HDR10 DV upscaled.mov" + nativerender.BOOKS_SUFFIX)
+        os.makedirs(os.path.join(books, nativerender.ANALYSIS_DIR))
+        for name in ("range_0000_0_300.mkv", "seg_0000.mov"):     # even a seg_-named stray
+            open(os.path.join(books, nativerender.ANALYSIS_DIR, name), "w").close()
+        open(os.path.join(books, nativerender.ENCODE), "w").close()
+        self.assertEqual(self._count(d), 1)                        # the Topaz item's alone
+
+
 class DiskGateDuringDrain(unittest.TestCase):
     def _pause(self, *, phys, backlog, fin_movie=False, in_finisher=True):
         o = orch.Orchestrator.__new__(orch.Orchestrator)
@@ -614,7 +638,8 @@ class ALeaseStopsWorkStarting(unittest.TestCase):
         import inspect
         src = inspect.getsource(orch.Orchestrator._process)
         self.assertIn("_lease_hold", src)
-        self.assertLess(src.index("_lease_hold"), src.index("run_stage(st, p"),
+        # run_st: the stage that runs in the slot ('dvrender' for a native route, else st)
+        self.assertLess(src.index("_lease_hold"), src.index("run_stage(run_st, p"),
                         "checked after the stage starts = the stage starts and then yields")
 
     def test_a_lease_yield_does_not_feed_the_livelock_guard(self):
@@ -906,3 +931,77 @@ class FastPathResolveStartsBesideARemux(unittest.TestCase):
     def test_non_fast_incoming_unchanged(self):
         self.assertTrue(orch.resolve_must_wait({"stage": "remux"}, 0, None))
         self.assertFalse(orch.resolve_must_wait({"stage": "upload"}, 0, None))
+
+
+class DeployWaitsOutTheNativeRender(unittest.TestCase):
+    """deploy-now.sh's patterns for the native render's children, matched against the argv the
+    REAL command builders produce for a render in ~/topaz-scratch: RANGE_PAT is every analysis
+    step (the range-boundary watch), RENDER_PAT every child at all (the wait-for-exit and the
+    orphan sweep) — and never a remux, a Resolve pass or the native lane's chunk analysis."""
+
+    def setUp(self):
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(orch.__file__)))
+        with open(os.path.join(root, "deploy-now.sh")) as f:
+            self.sh = f.read()
+        self.pat = {k: re.compile(re.search(r"^%s='([^']+)'" % k, self.sh, re.M).group(1))
+                    for k in ("RANGE_PAT", "RENDER_PAT", "ANALYSIS_PAT")}
+
+    def _argv(self):
+        import dvcap, dvnative, nativerender, remux, sys
+        scratch = "/Users/someone/topaz-scratch"
+        p = orch.youtube_paths("A, B + C #1", "/s/x/Vid, a+b #2 [aaaaaaaaaa9].mp4", "V",
+                               scratch_dir=scratch)
+        books = nativerender.books_dir(p)
+        mkv = os.path.join(books, nativerender.ANALYSIS_DIR, "range_0003_900_300.mkv")
+        bin_ = mkv[:-4] + ".bin"
+        spec = nativerender.RenderSpec(inputs=[[0, p.source_cfr], [1200, None]], fps="30000/1001",
+                                       kbps=14000, lut="/x/rcm.cube")
+        enc, es_dv = os.path.join(books, nativerender.ENCODE), p.dv_render + nativerender.ES_DV
+        mine = {
+            "intermediate": dvnative.build_analysis_intermediate_command(
+                "ffmpeg", p.source_cfr, mkv, "/x/rcm.cube", start=900, frames=300, fps="30000/1001"),
+            "analyzer": dvnative.build_analyzer_command("hdr_analyzer_mvp", mkv, bin_ + ".part"),
+            "l4": dvnative.build_l4_command(sys.executable, mkv, bin_ + ".l4.json.part"),
+            "encode": nativerender.build_encode_command("ffmpeg", spec, os.path.join(
+                books, nativerender.ENCODE), 14000, progress=os.path.join(books, nativerender.PROGRESS)),
+            "hdr10": nativerender.build_sei_command(sys.executable, enc, os.path.join(books, nativerender.SEI_TMP),
+                                                    "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)",
+                                                    "1000,400"),
+            "inject": dvcap.build_inject_command("dovi_tool", enc, os.path.join(books, nativerender.RPU), es_dv),
+            "mux": remux.build_capped_video_mux_command("MP4Box", es_dv, "30000/1001",
+                                                        p.dv_render + nativerender.PART),
+        }
+        others = {
+            "ship remux": remux.build_capped_video_mux_command("MP4Box", p.final + ".ship.hevc",
+                                                               "30000/1001", p.final + ".dv.mp4"),
+            "render read": ["ffmpeg", "-i", p.dv_render, "-c", "copy", p.final + ".ship.hevc"],
+            "resolve": [sys.executable, "resolve_pipeline.py", "single", p.source_cfr, p.dv_render,
+                        "dv1000", "14000"],
+            "chunk analysis": dvnative.build_analysis_intermediate_command(
+                "ffmpeg", p.segdir + "/seg_0001.mov", p.segdir + "/native/work/chunk_0001.mkv",
+                "/x/rcm.cube"),
+        }
+        return mine, others
+
+    def test_every_render_child_matches_and_nothing_else_does(self):
+        mine, others = self._argv()
+        for name, argv in mine.items():
+            line = " ".join(argv)
+            self.assertRegex(line, self.pat["RENDER_PAT"], name)
+            if name in ("intermediate", "analyzer", "l4"):
+                self.assertRegex(line, self.pat["RANGE_PAT"], name)
+            else:
+                self.assertNotRegex(line, self.pat["RANGE_PAT"], name)
+            self.assertNotRegex(line, self.pat["ANALYSIS_PAT"], name)
+        for name, argv in others.items():
+            self.assertNotRegex(" ".join(argv), self.pat["RENDER_PAT"], name)
+
+    def test_it_waits_for_them_sweeps_them_and_waits_out_the_encode(self):
+        sh = self.sh
+        self.assertIn('[ "$(pgrep -f "$RENDER_PAT" | wc -l | tr -d \' \')" = "0" ]', sh)
+        self.assertIn('pkill -f "$RENDER_PAT"', sh)
+        self.assertLess(sh.index("pkill -CONT -x x265"), sh.index('pkill -f "$RENDER_PAT"'))
+        self.assertIn("dvrender:encode|dvrender:finish)", sh)          # the wait and the give-up
+        self.assertEqual(sh.count("dvrender:encode|dvrender:finish)"), 2)
+        self.assertIn("p.get('phase')", sh)

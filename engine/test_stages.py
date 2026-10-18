@@ -18,6 +18,9 @@ def _paths(scratch):
 
 _BOOK_PATCH = None
 _HIST_PATCH = None
+_DV_ROUTES_PATCH = None
+import settings as _settings_mod
+_REAL_DV_ROUTES = _settings_mod.dv_routes       # the native render tests read the real accessor
 
 
 def setUpModule():
@@ -34,9 +37,17 @@ def setUpModule():
     global _HIST_PATCH
     _HIST_PATCH = mock.patch.object(history, "BOOK_FILE", _os.path.join(d, "history.json"))
     _HIST_PATCH.start()
+    # dv_routes is read from the REAL settings file at use time (the skip messages ask it): pin it
+    # to the shipped default, every route on Resolve. The native render tests restore the real
+    # accessor over their own temp settings file.
+    global _DV_ROUTES_PATCH
+    _DV_ROUTES_PATCH = mock.patch.object(_settings_mod, "dv_routes", return_value={})
+    _DV_ROUTES_PATCH.start()
 
 
 def tearDownModule():
+    if _DV_ROUTES_PATCH is not None:
+        _DV_ROUTES_PATCH.stop()
     if _BOOK_PATCH is not None:
         _BOOK_PATCH.stop()
     if _HIST_PATCH is not None:
@@ -3405,3 +3416,308 @@ class NativeRemuxClock(unittest.TestCase):
         self._at(30, 20)
         self.assertEqual(stages.native_wall_line(self.p),
                          "remux wall 30 s over 20 frames (2 segments, 1500.0 ms/frame)")
+
+
+class _DvRenderItem(unittest.TestCase):
+    """A native-4K YouTube item on disk (its CFR), a LUT, a bounds book and a settings file in a
+    temp dir; the native toolchain check and the CFR probes faked as a 3840x2160 BT.709 source."""
+
+    INFO = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p", "r_frame_rate": "30000/1001",
+            "color_primaries": "bt709", "color_space": "bt709", "color_transfer": "bt709",
+            "color_range": "tv"}
+
+    def setUp(self):
+        import nativelane, settings
+        self.d = tempfile.mkdtemp()
+        self.p = orch_youtube_paths("Chan", "/s/Chan/x/v [aaaaaaaaaa7].mp4", "V", scratch_dir=self.d)
+        for f in (self.p.source, self.p.source_cfr):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 64)
+        self.cube = os.path.join(self.d, "rcm.cube")
+        with open(self.cube, "w") as fh:
+            fh.write("LUT_3D_SIZE 2\n")
+        self.info = dict(self.INFO)
+        self.cfr = {"path": self.p.source_cfr, "frames": 1000, "fps": "30000/1001"}
+        self.toolchain = (True, "toolchain matches the pins")
+        for cm in (mock.patch.multiple(settings, CONFIG_DIR=self.d,
+                                       SETTINGS_FILE=os.path.join(self.d, "settings.json"),
+                                       PROFILES_FILE=os.path.join(self.d, "show_profiles.json")),
+                   mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(self.d, "bounds.json")),
+                   mock.patch.object(nativelane, "toolchain_ok", side_effect=lambda **kw: self.toolchain),
+                   mock.patch.object(nativelane, "probe_stream", side_effect=lambda _p: dict(self.info)),
+                   mock.patch.object(nativelane, "cfr_info", side_effect=lambda _p: dict(self.cfr)),
+                   mock.patch.object(nativelane, "lut_path", side_effect=lambda: self.cube),
+                   mock.patch.object(settings, "dv_routes", _REAL_DV_ROUTES)):
+            cm.start()
+            self.addCleanup(cm.stop)
+
+
+class NativeRenderSpec(_DvRenderItem):
+    """dvrender_spec is Resolve's render settings for the route — or a refusal, and then Resolve
+    renders the item as before."""
+
+    def test_native_4k_youtube_gets_resolves_export_settings(self):
+        stages._write_topaz_bounds(self.p.source_basename, [300, 700, 1000])
+        spec, why = stages.dvrender_spec(self.p, "yt_native4k")
+        self.assertEqual(why, "")
+        self.assertEqual(spec.inputs, ((0, self.p.source_cfr), (1000, None)))   # resolve_input
+        self.assertEqual((spec.fps, spec.lut, spec.pre_vf), ("30000/1001", self.cube, None))
+        self.assertEqual(spec.kbps, stages.youtube_render_kbps(2160))
+        self.assertEqual(spec.kbps, stages.YOUTUBE_RENDER_KBPS_4K)
+        self.assertEqual(spec.cap_mbps, 50)                       # _resolve's cap_arg default
+        self.assertEqual(spec.bounds, (300, 700, 1000))           # the scene plan's ranges
+        self.assertEqual(spec.analysis_ranges(), [(0, 300), (300, 700), (700, 1000)])
+        import settings
+        settings.set_settings({"max_peak_mbps": 40})
+        self.assertEqual(stages.dvrender_spec(self.p, "yt_native4k")[0].cap_mbps, 40)
+
+    def test_4k_sdr_exports_at_the_intakes_bitrate_with_no_gate(self):
+        with mock.patch.object(stages, "_source_video_kbps", return_value=80000) as kb:
+            spec, why = stages.dvrender_spec(self.p, "sdr4k")
+        kb.assert_called_once_with(self.p.source)                 # the ORIGINAL, as _resolve reads
+        self.assertEqual((spec.kbps, spec.cap_mbps, spec.bounds), (80000, 0, None))
+        with mock.patch.object(stages, "_source_video_kbps", return_value=20000):
+            self.assertEqual(stages.dvrender_spec(self.p, "sdr4k")[0].kbps,
+                             stages.EXPORT_BITRATE_FLOOR_KBPS)
+
+    def test_every_refusal_says_why(self):
+        def refused(route="yt_native4k"):
+            spec, why = stages.dvrender_spec(self.p, route)
+            self.assertIsNone(spec)
+            return why
+        for route in ("yt_1080", "yt_plain", "tv_sdr_topaz", "rpu_only", "unknown", None):
+            self.assertIn("has no native render yet", refused(route), route)
+        self.toolchain = (False, "dovi_tool is 2.2.0, pinned 2.3.0")
+        self.assertEqual(refused(), "the native toolchain is not ready: dovi_tool is 2.2.0, pinned 2.3.0")
+        self.toolchain = (True, "ok")
+        for key, value, words in (("color_space", "smpte170m", "the source matrix are smpte170m"),
+                                  ("color_range", "pc", "the source is full range"),
+                                  ("color_transfer", "smpte2084", "the source is already HDR")):
+            self.info = dict(self.INFO, **{key: value})
+            self.assertIn(words, refused())
+        for w, h in ((1920, 1080), (4096, 2160), (3840, 1600), (2160, 3840)):
+            self.info = dict(self.INFO, width=w, height=h)
+            self.assertIn(f"the source is {w}x{h}, not 3840x2160", refused())
+        self.info = dict(self.INFO)
+        self.cfr = dict(self.cfr, frames=None)
+        self.assertIn("frame count or frame rate is unknown", refused())
+        self.cfr = dict(self.cfr, frames=1000)
+        os.remove(self.cube)
+        self.assertIn("the LUT is missing", refused())
+        os.remove(self.p.source_cfr)
+        self.assertEqual(refused(), "its CFR source is not on disk")
+
+    def test_it_writes_nothing(self):
+        before = sorted(os.listdir(self.d))
+        stages.dvrender_spec(self.p, "yt_native4k")
+        self.assertEqual(sorted(os.listdir(self.d)), before)
+
+
+class NativeRouteDecision(_DvRenderItem):
+    """native_route: one settings read while no route is 'native', else the item's route and
+    whether the stage can make it."""
+
+    def test_nothing_is_probed_or_classified_while_every_route_is_resolve(self):
+        import routes, settings
+        every = {r: "resolve" for r in routes.ROUTES}
+        for table in ({}, every):
+            settings.set_settings({"dv_routes": table})
+            with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")), \
+                 mock.patch.object(stages, "dvrender_spec", side_effect=AssertionError("spec")):
+                self.assertEqual(stages.native_route(self.p), (None, None, ""))
+
+    def test_a_native_route_gets_its_spec(self):
+        import routes, settings
+        settings.set_settings({"dv_routes": {"yt_native4k": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="yt_native4k"):
+            route, spec, why = stages.native_route(self.p)
+        self.assertEqual((route, why), ("yt_native4k", ""))
+        self.assertEqual(spec.kbps, stages.YOUTUBE_RENDER_KBPS_4K)
+
+    def test_another_route_is_left_on_resolve_unasked(self):
+        import routes, settings
+        settings.set_settings({"dv_routes": {"yt_native4k": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="yt_1080"), \
+             mock.patch.object(stages, "dvrender_spec", side_effect=AssertionError("spec")):
+            self.assertEqual(stages.native_route(self.p), ("yt_1080", None, ""))
+
+    def test_a_route_the_stage_cannot_make_says_why(self):
+        import routes, settings
+        settings.set_settings({"dv_routes": {"yt_plain": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="yt_plain"):
+            route, spec, why = stages.native_route(self.p)
+        self.assertEqual((route, spec), ("yt_plain", None))
+        self.assertIn("has no native render yet", why)
+
+
+class _FakeSpec:
+    total = 1000
+
+
+class NativeRenderStage(_DvRenderItem):
+    """The run-only 'dvrender' stage: nativerender.render with the route's spec; should_pause
+    counts only inside the analysis; a stop is 'interrupted:', a failure a plain reason."""
+
+    def _run(self, render, *, should_pause=None, abort=None, route="yt_native4k", spec=_FakeSpec()):
+        import nativerender, routes
+        seen = []
+        with mock.patch.object(routes, "item_route", return_value=route), \
+             mock.patch.object(stages, "dvrender_spec", return_value=(spec, "") if spec else (None, "nope")), \
+             mock.patch.object(nativerender, "render", side_effect=render) as r:
+            out = stages.run_stage("dvrender", self.p, abort=abort, progress=seen.append,
+                                   should_pause=should_pause)
+        return out, seen, r
+
+    def test_run_stage_dispatches_it_with_should_pause(self):
+        sp = lambda: False
+        with mock.patch.object(stages, "_dvrender", return_value=(True, "ok")) as fn:
+            self.assertEqual(stages.run_stage("dvrender", self.p, should_pause=sp), (True, "ok"))
+        self.assertIs(fn.call_args.args[3], sp)
+
+    def test_it_renders_the_routes_spec_and_labels_its_progress(self):
+        spec = _FakeSpec()
+
+        def render(p, sp, abort=None, progress=None, should_pause=None):
+            self.assertIs(sp, spec)
+            progress({"stage": "dvrender", "ep": p.ep, "phase": "analysis", "pct": 12.5,
+                      "seg_done": 1, "seg_total": 4})
+            return True, "native DV render: 1000 frames"
+        (ok, msg), seen, _r = self._run(render, spec=spec)
+        self.assertEqual((ok, msg), (True, "native DV render: 1000 frames"))
+        self.assertEqual(seen, [{"stage": "dvrender", "ep": self.p.ep, "phase": "analysis",
+                                 "pct": 12.5, "seg_done": 1, "seg_total": 4, "frames": 1000,
+                                 "route": "yt_native4k"}])
+
+    def test_should_pause_counts_only_inside_the_analysis(self):
+        asked = []
+
+        def render(p, spec, abort=None, progress=None, should_pause=None):
+            asked.append(should_pause())                           # before anything: setup
+            for phase in ("analysis", "encode", "finish"):
+                progress({"stage": "dvrender", "phase": phase, "pct": 1.0})
+                asked.append(should_pause())
+            return True, "ok"
+        self._run(render, should_pause=lambda: True)
+        self.assertEqual(asked, [True, True, False, False])
+
+    def test_without_should_pause_render_gets_none(self):
+        (ok, _m), _s, r = self._run(lambda *a, **k: (True, "ok"))
+        self.assertIsNone(r.call_args.kwargs["should_pause"])
+
+    def test_a_refused_spec_is_a_plain_failure_and_renders_nothing(self):
+        (ok, msg), _s, r = self._run(lambda *a, **k: (True, "x"), spec=None)
+        self.assertEqual((ok, msg), (False, "native render refused (route yt_native4k): nope"))
+        r.assert_not_called()
+
+    def test_a_stop_is_interrupted_a_pause_and_a_failure_pass_through(self):
+        import threading
+        with mock.patch.object(stages.logbook, "failure") as fail:
+            (ok, msg), _s, _r = self._run(lambda *a, **k: (False, "aborted (run stopped)"))
+            self.assertEqual((ok, msg), (False, "interrupted: native DV render stopped — the next "
+                                                "pass resumes its analysis range by range"))
+            ab = threading.Event(); ab.set()
+            (ok, msg), _s, _r = self._run(lambda *a, **k: (False, "native render failed: x"), abort=ab)
+            self.assertTrue(msg.startswith("interrupted:"))
+            self.assertEqual(self._run(lambda *a, **k: (False, "paused: yielded before analysis range 2"))[0],
+                             (False, "paused: yielded before analysis range 2"))
+            fail.assert_not_called()                               # none of those is a red failure
+            (ok, msg), _s, _r = self._run(lambda *a, **k: (False, "native render failed: rc=1"))
+        self.assertEqual((ok, msg), (False, "native render failed: rc=1"))
+        fail.assert_called_once()
+
+
+class NativeRenderMessages(_DvRenderItem):
+    """The skip messages name who makes the item's DV: byte-identical while every route is on
+    Resolve; the native render when the item's route is set 'native' and the stage can make it."""
+
+    YT = "YouTube → Resolve scales it (SuperScale for 1080p) — skipping Topaz (scene plan cached)"
+    FAST = "4K SDR (av1) @ ~20 Mbps — no upscale, Resolve adds HDR + DV"
+
+    def _topaz(self, plan_topaz, native=None):
+        import plan
+        pl = {"topaz": plan_topaz, "reason": self.FAST}
+        cms = [mock.patch.object(plan, "plan_for", return_value=pl),
+               mock.patch.object(stages, "_plan_fast_path_bounds", return_value=" (scene plan cached)")]
+        if native is not None:
+            cms.append(mock.patch.object(stages, "native_route", return_value=native))
+        with contextlib_exit(cms):
+            return stages._topaz(self.p, None)
+
+    def test_the_default_texts_are_unchanged_and_nothing_is_asked(self):
+        import routes
+        with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")):
+            self.assertEqual(self._topaz("upscale"), (True, self.YT))
+            self.assertEqual(self._topaz("resolve-only"),
+                             (True, self.FAST + " — skipping upscale (scene plan cached)"))
+
+    def test_a_native_route_names_the_native_render(self):
+        self.assertEqual(self._topaz("upscale", ("yt_native4k", _FakeSpec(), "")),
+                         (True, "YouTube → the native DV render (yt_native4k) — skipping Topaz"
+                                " (scene plan cached)"))
+        self.assertEqual(self._topaz("resolve-only", ("yt_native4k", _FakeSpec(), "")),
+                         (True, "4K SDR (av1) @ ~20 Mbps — no upscale, the native DV render adds "
+                                "HDR + DV — skipping upscale (scene plan cached)"))
+
+    def test_a_refused_or_broken_decision_keeps_the_resolve_text(self):
+        self.assertEqual(self._topaz("upscale", ("yt_plain", None, "no native render yet")),
+                         (True, self.YT))
+        with mock.patch.object(stages, "native_route", side_effect=RuntimeError("boom")):
+            self.assertEqual(self._topaz("upscale"), (True, self.YT))
+
+
+def contextlib_exit(cms):
+    import contextlib
+    es = contextlib.ExitStack()
+    for cm in cms:
+        es.enter_context(cm)
+    return es
+
+
+class NativeRenderCleanup(unittest.TestCase):
+    """Cleanup deletes a native render's books and finish-step strays (never needed after the
+    upload)."""
+
+    def test_the_books_and_strays_go_and_the_message_is_the_same(self):
+        import nativerender
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        for f in p.working_files():
+            with open(f, "w") as fh:
+                fh.write("x")
+        os.makedirs(os.path.join(nativerender.books_dir(p), nativerender.ANALYSIS_DIR))
+        for f in (os.path.join(nativerender.books_dir(p), nativerender.RPU),
+                  p.dv_render + nativerender.PART, p.dv_render + nativerender.ES_DV):
+            with open(f, "w") as fh:
+                fh.write("x")
+        ok, msg = stages.run_stage("cleanup", p)
+        self.assertTrue(ok)
+        self.assertEqual(msg, f"permanently deleted 6 local working files + chunks for {p.ep}")
+        self.assertEqual(os.listdir(d), [])
+
+
+class RouteE2ETool(unittest.TestCase):
+    """tools/route_e2e.py builds a render for exactly the routes the stage can make, as the item
+    kind each route is (a YouTube video, a movie), and refuses the live pipeline's directories."""
+
+    def _tool(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(stages.__file__)), "..", "tools",
+                            "route_e2e.py")
+        spec = importlib.util.spec_from_file_location("route_e2e_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_it_covers_exactly_the_stages_routes(self):
+        t = self._tool()
+        self.assertEqual(sorted(t.KINDS), sorted(stages.DVRENDER_ROUTES))
+        self.assertEqual(t.KINDS, {"yt_native4k": "youtube", "sdr4k": "movie"})
+
+    def test_it_refuses_the_live_directories(self):
+        t = self._tool()
+        src = tempfile.mkstemp()[1]
+        for work in (os.path.expanduser("~/topaz-scratch/e2e"), os.path.expanduser("~/.topaz-pipeline/x"),
+                     "/private/tmp/x/topaz-scratch"):
+            with mock.patch("sys.stderr"):
+                self.assertEqual(t.main(["--source", src, "--work", work, "--route", "sdr4k"]), 2, work)
+        self.assertFalse(os.path.exists(os.path.expanduser("~/topaz-scratch/e2e")))

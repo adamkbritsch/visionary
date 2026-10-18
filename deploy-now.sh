@@ -11,12 +11,19 @@
 #   - stage = dvnative -> watch progress.seg_done (= CHUNKS analysed) ; a boundary there → deploy.
 #     The native DV analysis (dv_engine 'native') resumes from its last finished chunk, so a stop
 #     mid-chunk throws that chunk's minutes away. Never seen while dv_engine is 'resolve'.
+#   - stage = dvrender, phase analysis -> watch progress.seg_done (= analysis RANGES done) ; a
+#     boundary there → deploy. The native render (a route set 'native' in dv_routes) resumes its
+#     analysis range by range.
+#   - stage = dvrender, phase encode/finish -> wait it out like resolve: the VideoToolbox encode,
+#     the RPU inject and the mux are one pass each with no boundary inside, and a stop restarts the
+#     encode from scratch. Never seen while every dv_routes entry is 'resolve'.
 #   - stage = resolve -> wait it out (screen-capture render, NOT segmented/resumable).
 #   - finisher = upload/cleanup -> wait (a mid-STOR upload leaves a partial on the NAS; both are quick).
 #   - nothing encoding (download/idle, no remux) -> nothing precious, deploy immediately.
 # The stop waits for BOTH encoders (topaz tvai + remux x265) to exit before relaunching, so a resumed
 # stage can never collide with a still-dying old one on the same segdir. The native DV analysis's
-# children count too: they write into that same segdir.
+# children count too: they write into that same segdir — and so do the native render's, into its
+# books beside the render.
 ROOT="${VISIONARY_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 # ONE WAITER AT A TIME. A deploy can wait a long time for a safe boundary, so it is easy to
 # queue several by accident — and they would then all stop and relaunch the app on top of
@@ -59,20 +66,30 @@ API=http://127.0.0.1:8765
 # ~/topaz-scratch/<stem>_prob4_upscaled.segments/native/work/chunk_NNNN.mkv, so this matches them
 # all and nothing else: not a Topaz chunk, and not an analysis run outside the pipeline's scratch.
 ANALYSIS_PAT='/topaz-scratch/[^/]*_upscaled[.]segments/native/work/chunk_[0-9]+[.]mkv'
+# The native render's children (nativerender.render). Its analysis steps name their range's
+# intermediate, ~/topaz-scratch/<stem> HDR10 DV upscaled.mov.dvrender/analysis/range_K_A_N.mkv
+# (RANGE_PAT: the boundary watch); the encode writes .dvrender/encode.hevc, the HDR10 SEI pass
+# rewrites it via .dvrender/encode.sei.hevc, dovi_tool reads it and writes <render>.dv.hevc, and
+# MP4Box writes <render>.part.
+# RENDER_PAT matches every one of them (and no remux: its transients are named after the master).
+RANGE_PAT='/topaz-scratch/[^/]*[.]dvrender/analysis/range_[0-9]+_[0-9]+_[0-9]+[.]mkv'
+RENDER_PAT='/topaz-scratch/[^/]*[.]mov([.]dvrender/(analysis/range_[0-9]+_[0-9]+_[0-9]+[.]mkv|encode([.]sei)?[.]hevc)|[.]dv[.]hevc|[.]part)'
 : > "$LOG"
 say(){ echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
 is_num(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
-# "stage|topaz_seg|running|finisher|remux_seg" in one line. `finisher` = the FINISHER thread's
-# stage (remux/upload run OVERLAPPED with topaz — state.stage alone can NOT see them); both topaz
-# and the remux now report seg_done, so we can deploy at whichever hits a segment boundary FIRST.
+# "stage|topaz_seg|running|finisher|remux_seg|finisher2|remux_seg2|phase" in one line. `finisher` =
+# the FINISHER thread's stage (remux/upload run OVERLAPPED with topaz — state.stage alone can NOT see
+# them); both topaz and the remux now report seg_done, so we can deploy at whichever hits a segment
+# boundary FIRST. `phase` = the native render's (analysis/encode/finish; 'none' for every other stage).
 snap(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
 try:
  d=json.load(sys.stdin);o=d.get('orchestrator') or {};p=o.get('progress') or {}
  fi=o.get('finishing') or {};f2=o.get('finishing2') or {}
- print('%s|%s|%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'),
-       fi.get('stage') or 'none', fi.get('seg_done'), f2.get('stage') or 'none', f2.get('seg_done')))
+ print('%s|%s|%s|%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'),
+       fi.get('stage') or 'none', fi.get('seg_done'), f2.get('stage') or 'none', f2.get('seg_done'),
+       p.get('phase') or 'none'))
 except Exception:
- print('down|None|down|none|None|none|None')" 2>/dev/null; }
+ print('down|None|down|none|None|none|None|none')" 2>/dev/null; }
 running_now(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
 try: print((json.load(sys.stdin).get('orchestrator') or {}).get('running'))
 except Exception: print('down')" 2>/dev/null; }
@@ -87,12 +104,13 @@ except Exception: print('down')" 2>/dev/null; }
 say "deploy requested — holding for the first segment boundary (topaz OR remux; the other resumes; never resolve/upload)"
 deadline=$(( $(date +%s) + 10800 ))  # 3 h ceiling. Rarely bites now — only outlasts a resolve/upload
                                      # the deploy is briefly waiting out.
-tseg0=""; rseg0=""; rseg20=""; aseg0=""
+tseg0=""; rseg0=""; rseg20=""; aseg0=""; gseg0=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 <<< "$s"
+  s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase <<< "$s"
   # The chunk baseline belongs to ONE analysis pass: a later pass (another item, or this one
-  # resumed after a resolve) counts from its own start.
+  # resumed after a resolve) counts from its own start. The native render's range baseline too.
   [ "$stage" = "dvnative" ] || aseg0=""
+  [ "$stage" = "dvrender" ] && [ "$phase" = "analysis" ] || gseg0=""
   # Non-resumable / partial-risk stages → wait them out; reset the segment baselines.
   case "$fin$fin2" in
     *upload*|*cleanup*) say "waiting: finisher=$fin/$fin2 (short, not cleanly resumable)"
@@ -101,11 +119,17 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   case "$stage" in
     resolve|upload) say "waiting: stage=$stage (never interrupt — not resumable)"; tseg0=""; rseg0=""; sleep 5; continue ;;
   esac
+  # The native render past its analysis: one encode/inject/mux pass, restarted from scratch by a stop.
+  case "$stage:$phase" in
+    dvrender:encode|dvrender:finish) say "waiting: stage=dvrender phase=$phase (never interrupt — the encode is not resumable)"
+                                     tseg0=""; rseg0=""; sleep 5; continue ;;
+  esac
   # Run thread is topaz/download/idle; finisher is remux/none. Deploy at the FIRST segment boundary of
   # EITHER encoder that's actually running — the other stage, if mid-segment, resumes from its own last.
   tenc=$(pgrep -f tvai_up | wc -l | tr -d ' ')      # topaz (Video AI)
   xenc=$(pgrep -x x265 | wc -l | tr -d ' ')          # remux (x265)
   aenc=$(pgrep -f "$ANALYSIS_PAT" | wc -l | tr -d ' ')  # native DV analysis (any of its steps)
+  genc=$(pgrep -f "$RANGE_PAT" | wc -l | tr -d ' ')     # native render's analysis (any of its steps)
   watching=0
   if [ "$stage" = "topaz" ] && [ "$tenc" != "0" ] && is_num "$tseg"; then
     watching=1
@@ -118,6 +142,13 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     watching=1
     if [ -z "$aseg0" ] || [ "$tseg" -lt "$aseg0" ]; then aseg0="$tseg"; say "watching DV analysis at chunks_done=$tseg"
     elif [ "$tseg" -gt "$aseg0" ]; then say "DV ANALYSIS chunk boundary ($aseg0 -> $tseg) — deploying (it resumes from its last chunk)"; break; fi
+  fi
+  # The native render's analysis holds the run thread the same way; progress.seg_done counts its
+  # finished RANGES, and a count that went DOWN is a resumed attempt replaying from 0.
+  if [ "$stage" = "dvrender" ] && [ "$phase" = "analysis" ] && [ "$genc" != "0" ] && is_num "$tseg"; then
+    watching=1
+    if [ -z "$gseg0" ] || [ "$tseg" -lt "$gseg0" ]; then gseg0="$tseg"; say "watching the DV render's analysis at ranges_done=$tseg"
+    elif [ "$tseg" -gt "$gseg0" ]; then say "DV RENDER analysis range boundary ($gseg0 -> $tseg) — deploying (it resumes from its last range)"; break; fi
   fi
   if [ "$fin" = "remux" ] && [ "$xenc" != "0" ] && is_num "$rseg"; then
     watching=1
@@ -138,9 +169,10 @@ done
 # deadline fall-through guard (review-caught): if we got here by TIMEOUT while the pipeline is
 # still in an un-interruptible stage, GIVE UP instead of deploying into it — the built app stays
 # on disk and deploys on the next natural relaunch or re-run of this script.
-s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 <<< "$s"
+s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase <<< "$s"
 case "$fin" in upload|cleanup) say "GAVE UP: deadline hit but finisher=$fin — NOT deploying"; exit 2 ;; esac
 case "$stage" in resolve|upload) say "GAVE UP: deadline hit but stage=$stage — NOT deploying"; exit 2 ;; esac
+case "$stage:$phase" in dvrender:encode|dvrender:finish) say "GAVE UP: deadline hit but stage=dvrender phase=$phase — NOT deploying"; exit 2 ;; esac
 
 # A remux SUSPENDED for Resolve (SIGSTOP) can never exit, so the wait below would sit out its
 # full 30 s and then relaunch on top of frozen encoders. SIGCONT is a no-op on a running
@@ -158,7 +190,8 @@ for i in $(seq 1 30); do
   [ "$(running_now)" = "False" ] \
     && [ "$(pgrep -f tvai_up | wc -l | tr -d ' ')" = "0" ] \
     && [ "$(pgrep -x x265 | wc -l | tr -d ' ')" = "0" ] \
-    && [ "$(pgrep -f "$ANALYSIS_PAT" | wc -l | tr -d ' ')" = "0" ] && break
+    && [ "$(pgrep -f "$ANALYSIS_PAT" | wc -l | tr -d ' ')" = "0" ] \
+    && [ "$(pgrep -f "$RENDER_PAT" | wc -l | tr -d ' ')" = "0" ] && break
   sleep 1
 done
 if [ "$WAS_ARMED" = "True" ]; then
@@ -172,7 +205,9 @@ fi
 SERVER_PAT='Visionary[.]app/Contents/Resources/engine/dashboard/server[.]py'
 # An analysis step runs in its OWN session (dvnative.run_step), so killing the server would orphan
 # it, still writing into the segdir the relaunched app resumes. Only a step that outlived the wait.
+# The native render's steps (analysis, encode, ES copy, inject, mux) run through the same run_step.
 pkill -f "$ANALYSIS_PAT" 2>/dev/null
+pkill -f "$RENDER_PAT" 2>/dev/null
 pkill -f tvai_up 2>/dev/null; pkill -f "$SERVER_PAT" 2>/dev/null; pkill -f "$BIN" 2>/dev/null
 # Refresh LaunchServices BEFORE the relaunch. The bundle is rebuilt in place, and the app takes its
 # icon (NSApp.applicationIconImage, which its progress Dock tile draws) from that cache at launch —

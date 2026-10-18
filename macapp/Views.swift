@@ -483,7 +483,8 @@ struct PowerPill: View {
     private var leadStage: (Int, String, Int, String?)? {
         guard let up = PipelineCard.unifiedProgress(store.state) else { return nil }
         // `cleanup` has no PIPELINE card; it is past upload, so it borrows the upload glyph.
-        // `dvnative` has the card in Resolve's slot (pipelineCards), so it reads as that one.
+        // `dvnative` / `dvrender` have the card in Resolve's slot (pipelineCards), so they read
+        // as that one.
         let cards = pipelineCards(for: up.stage)
         let idx = cards.firstIndex { $0.key == up.stage } ?? (up.stage == "cleanup" ? cards.count : -1)
         guard idx >= 0 else { return nil }
@@ -816,11 +817,23 @@ let DVNATIVE_STAGE = StageInfo(
         + "generate the Dolby Vision metadata — no screen, no render.",
     how: "hdr_analyzer · CM v4.0 · DV 8.1")
 
-/// PIPELINE as it reads while `stage` runs: 'dvnative' stands in Resolve's slot. Every other
-/// stage gets PIPELINE itself. The card row and the header readout both go through this.
+// The native Dolby Vision render (run stage 'dvrender': a route set 'native' in dv_routes, e.g.
+// a native-4K YouTube video). It writes the very file Resolve writes, so like 'dvnative' its card
+// takes Resolve's slot while it runs. Display only: dv_routes dictates the output bytes, so like
+// dv_engine it has no control here.
+let DVRENDER_STAGE = StageInfo(
+    key: "dvrender", name: "Dolby Vision", symbol: "wand.and.rays",
+    desc: "Measure every frame's light through the SDR→PQ LUT, encode the 4K picture on the media "
+        + "engine and fold the Dolby Vision metadata in — no screen, no Resolve.",
+    how: "hdr_analyzer · VideoToolbox · DV 8.1")
+
+/// PIPELINE as it reads while `stage` runs: 'dvnative' or 'dvrender' stands in Resolve's slot.
+/// Every other stage gets PIPELINE itself. The card row and the header readout both go through
+/// this.
 func pipelineCards(for stage: String?) -> [StageInfo] {
-    guard stage == DVNATIVE_STAGE.key else { return PIPELINE }
-    return PIPELINE.map { $0.key == "resolve" ? DVNATIVE_STAGE : $0 }
+    guard let swap = [DVNATIVE_STAGE, DVRENDER_STAGE].first(where: { $0.key == stage })
+    else { return PIPELINE }
+    return PIPELINE.map { $0.key == "resolve" ? swap : $0 }
 }
 
 let PIPELINE: [StageInfo] = [
@@ -908,7 +921,8 @@ struct PipelineCard: View {
                 else { return false }
                 return (s.extend_borders ?? false) && s.aspect == "4:3"
             }()
-            // The native DV analysis takes Resolve's card while it runs (DVNATIVE_STAGE).
+            // The native DV analysis / render takes Resolve's card while it runs
+            // (DVNATIVE_STAGE / DVRENDER_STAGE).
             let stages: [StageInfo] = {
                 guard showExtend else { return pipelineCards(for: runStage) }
                 var a = pipelineCards(for: runStage)

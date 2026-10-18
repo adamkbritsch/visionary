@@ -397,3 +397,117 @@ class NativeChunkClock(unittest.TestCase):
             t += 240.0
             c.observe(k, n, t)
             self.assertAlmostEqual(c.estimate(t)["eta_secs"], (6 - k) * 240.0, delta=2.0)
+
+
+class NativeRenderRegime(unittest.TestCase):
+    """The native render ('dvrender') runs its analysis and LUT encode at nice 10 beside a
+    remux's x265 and never suspends it: ordinary contention, like 'dvnative'."""
+
+    def test_a_live_render_is_contention_and_the_correction_applies(self):
+        self.assertEqual(eta.regime_of(run_stage="dvrender", run_active=True), eta.CONTENDED)
+        self.assertEqual(eta.regime_of(run_stage="dvrender", run_active=False), eta.SOLO)
+        self.assertTrue(eta.correction_applies(run_stage="dvrender", run_active=True))
+
+    def test_every_other_stage_keeps_its_regime(self):
+        def before(run_stage, run_active, other_lane_live):
+            if other_lane_live:
+                return eta.CONTENDED
+            if run_active and run_stage in ("download", "extend", "topaz", "dvnative"):
+                return eta.CONTENDED
+            return eta.SOLO
+        for st in (None, "", "download", "extend", "topaz", "dvnative", "resolve", "remux",
+                   "upload", "cleanup", "idle"):
+            for active in (True, False):
+                for other in (True, False):
+                    self.assertEqual(eta.regime_of(run_stage=st, run_active=active,
+                                                   other_lane_live=other),
+                                     before(st, active, other), (st, active, other))
+
+
+class NativeRenderClock(unittest.TestCase):
+    """The 'dvrender' ETA: three phases on one bar, each timed on its own."""
+
+    F = 6000                                    # the item's frames
+
+    def _a(self, frac, done=None):
+        return {"stage": "dvrender", "phase": "analysis", "pct": 50.0 * frac,
+                "seg_done": done, "frames": self.F}
+
+    def _e(self, frac, attempt=1):
+        return {"stage": "dvrender", "phase": "encode", "pct": 50.0 + 45.0 * frac,
+                "attempt": attempt, "frames": self.F}
+
+    def test_the_spans_are_nativerenders(self):
+        import nativerender
+        self.assertEqual({k: tuple(map(float, v)) for k, v in nativerender.PHASE_SPAN.items()},
+                         eta.RENDER_SPANS)
+
+    def test_nothing_until_a_live_range_lands(self):
+        c = eta.RenderClock()
+        self.assertEqual(c.estimate(0.0), {})
+        self.assertFalse(c.observe(self._a(0.0, 0), 0.0))
+        self.assertEqual(c.estimate(100.0), {})
+
+    def test_analysis_eta_adds_the_encode_prior_and_the_finish(self):
+        c = eta.RenderClock()
+        c.observe(self._a(0.0, 0), 0.0)
+        self.assertTrue(c.observe(self._a(0.25, 1), 300.0))      # a quarter in 300 s
+        enc = self.F / eta.RENDER_ENCODE_PRIOR_FPS                # 200 s at the prior
+        fin = eta.render_finish_secs(self.F)
+        self.assertAlmostEqual(c.estimate(300.0)["eta_secs"], 900.0 + enc + fin, delta=0.2)
+        self.assertAlmostEqual(c.estimate(400.0)["eta_secs"], 800.0 + enc + fin, delta=0.2)
+
+    def test_a_resume_replay_is_not_banked(self):
+        c = eta.RenderClock()
+        c.observe(self._a(0.0, 0), 0.0)
+        c.observe(self._a(0.25, 1), 300.0)                       # measured: 0.25 / 300 s
+        c.observe(self._a(0.0, 0), 5000.0)                       # a new attempt, then replays
+        self.assertFalse(c.observe(self._a(0.25, 1), 5000.3))
+        self.assertFalse(c.observe(self._a(0.5, 2), 5000.6))
+        self.assertTrue(c.observe(self._a(0.75, 3), 5300.6))     # a live range at the same rate
+        fin = eta.render_finish_secs(self.F)
+        enc = self.F / eta.RENDER_ENCODE_PRIOR_FPS
+        self.assertAlmostEqual(c.estimate(5300.6)["eta_secs"], 300.0 + enc + fin, delta=0.2)
+
+    def test_the_encode_uses_its_own_rate_once_timed(self):
+        c = eta.RenderClock()
+        c.observe(self._e(0.0), 0.0)
+        fin = eta.render_finish_secs(self.F)
+        # under MIN_RENDER_ENCODE_SECONDS: still the prior (6000 frames at 30 fps = 200 s)
+        c.observe(self._e(0.01), 2.0)
+        self.assertAlmostEqual(c.estimate(2.0)["eta_secs"], 0.99 * 200.0 + fin, delta=0.2)
+        c.observe(self._e(0.1), 20.0)                             # 10% in 20 s: 200 s per encode
+        c.observe(self._e(0.5), 100.0)
+        self.assertAlmostEqual(c.estimate(100.0)["eta_secs"], 100.0 + fin, delta=0.2)
+
+    def test_a_re_encode_restarts_the_phase_but_keeps_the_rate(self):
+        c = eta.RenderClock()
+        c.observe(self._e(0.0), 0.0)
+        c.observe(self._e(0.5), 100.0)                            # 200 s per encode
+        c.observe(self._e(1.0), 200.0)
+        self.assertFalse(c.observe(self._e(0.0, attempt=2), 260.0))   # the peak loop's 2nd throw
+        fin = eta.render_finish_secs(self.F)
+        self.assertAlmostEqual(c.estimate(260.0)["eta_secs"], 200.0 + fin, delta=0.2)
+
+    def test_a_hold_is_not_encoding(self):
+        c = eta.RenderClock()
+        c.observe(self._e(0.0), 0.0)
+        self.assertFalse(c.observe(self._e(0.1), eta.MAX_IDLE_TICK + 50.0))
+        self.assertTrue(c.observe(self._e(0.2), eta.MAX_IDLE_TICK + 70.0))
+
+    def test_the_finish_counts_down_to_the_floor(self):
+        c = eta.RenderClock()
+        c.observe({"phase": "finish", "pct": 95.0, "frames": 600000}, 0.0)
+        self.assertAlmostEqual(c.estimate(0.0)["eta_secs"], eta.render_finish_secs(600000), delta=0.2)
+        self.assertEqual(c.estimate(10 ** 6)["eta_secs"], eta.TAIL_MIN_SECS)
+
+    def test_another_item_starts_over_and_junk_is_ignored(self):
+        c = eta.RenderClock()
+        c.observe(self._a(0.0, 0), 0.0)
+        c.observe(self._a(0.25, 1), 300.0)
+        other = dict(self._a(0.0, 0), frames=999)
+        c.observe(other, 400.0)
+        self.assertEqual(c.estimate(400.0), {})                   # nothing measured for it yet
+        for junk in ({}, {"phase": "x", "pct": 1}, {"phase": "analysis", "pct": None},
+                     {"phase": "analysis", "pct": "x"}, None):
+            self.assertFalse(c.observe(junk, 500.0), repr(junk))

@@ -640,3 +640,69 @@ class DvEngine(unittest.TestCase):
         settings.set_settings({"dv_engine": "native"})
         settings.set_settings({"poll_minutes": 45})
         self.assertEqual(settings.dv_engine(), "native")
+
+
+class DvRoutes(unittest.TestCase):
+    """`dv_routes` {route: 'resolve' | 'native'} picks, per route, who makes the render Resolve
+    makes today. It is inert by default: {} — every route 'resolve' — so a fresh install renders
+    exactly as it always has. tv_sdr_topaz is not this table's: it keeps following dv_engine (the
+    chunk lane). A hand-edited file is validated on write (VALIDATORS) and on read (dv_routes())."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        p = mock.patch.multiple(settings, CONFIG_DIR=d,
+                                SETTINGS_FILE=os.path.join(d, "settings.json"),
+                                PROFILES_FILE=os.path.join(d, "show_profiles.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_every_route_is_resolve_by_default(self):
+        import routes
+        self.assertEqual(settings.DEFAULT_SETTINGS["dv_routes"], {})
+        self.assertEqual(settings.dv_routes(), {})                  # no settings file at all
+        self.assertEqual(settings.set_settings({})["dv_routes"], {})
+        self.assertEqual(settings.dv_routes(), {})                  # ...nor after a plain write
+        for route in list(routes.ROUTES) + [routes.UNKNOWN, None, "x"]:
+            self.assertEqual(settings.dv_route(route), "resolve", route)
+        self.assertIs(settings.VALIDATORS["dv_routes"], settings._valid_dv_routes)
+
+    def test_the_tv_lane_route_follows_dv_engine_and_is_never_a_key(self):
+        import routes
+        self.assertIn(settings.TV_LANE_ROUTE, routes.ROUTES)        # a real route id
+        self.assertEqual(settings._valid_dv_routes({"tv_sdr_topaz": "native"}), {})
+        settings._save(settings.SETTINGS_FILE, {"dv_routes": {"tv_sdr_topaz": "native"}})
+        self.assertEqual(settings.dv_routes(), {})
+        self.assertEqual(settings.dv_route("tv_sdr_topaz"), "resolve")
+        with mock.patch.object(settings, "dv_engine", return_value="native"):
+            self.assertEqual(settings.dv_route("tv_sdr_topaz"), "native")
+            self.assertEqual(settings.dv_route("yt_native4k"), "resolve")   # not dv_engine's
+
+    def test_only_route_shaped_keys_and_the_exact_engines_survive(self):
+        v = settings._valid_dv_routes
+        self.assertEqual(v({"yt_native4k": "native", "sdr4k": "resolve"}),
+                         {"yt_native4k": "native", "sdr4k": "resolve"})
+        for junk in ({"yt_native4k": "Native"}, {"yt_native4k": " native"}, {"yt_native4k": None},
+                     {"yt_native4k": True}, {"yt_native4k": 1}, {"yt_native4k": ["native"]},
+                     {"YT_native4k": "native"}, {"../etc": "native"}, {"yt native4k": "native"},
+                     {"": "native"}, {"9route": "native"}, {"r" * 41: "native"}, {3: "native"}):
+            self.assertEqual(v(junk), {}, repr(junk))
+        for not_a_dict in (None, "", "yt_native4k", ["yt_native4k"], 3, True):
+            self.assertEqual(v(not_a_dict), {}, repr(not_a_dict))
+        self.assertEqual(v({"yt_native4k": "native", "Bad Key": "native"}), {"yt_native4k": "native"})
+
+    def test_set_settings_round_trips_and_clears(self):
+        s = settings.set_settings({"dv_routes": {"yt_native4k": "native", "sdr4k": "x"}})
+        self.assertEqual(s["dv_routes"], {"yt_native4k": "native"})
+        self.assertEqual(settings.dv_route("yt_native4k"), "native")
+        self.assertEqual(settings.dv_route("sdr4k"), "resolve")
+        settings.set_settings({"poll_minutes": 45})                 # an unrelated write keeps it
+        self.assertEqual(settings.dv_routes(), {"yt_native4k": "native"})
+        self.assertEqual(settings.set_settings({"dv_routes": {}})["dv_routes"], {})
+        self.assertEqual(settings.dv_route("yt_native4k"), "resolve")
+
+    def test_a_hand_edited_value_is_validated_on_read(self):
+        for raw, want in (({"yt_native4k": "native"}, {"yt_native4k": "native"}),
+                          ({"yt_native4k": "NATIVE"}, {}), ("native", {}), (None, {}), ([1], {}),
+                          ({"tv_sdr_topaz": "native", "sdr4k": "native"}, {"sdr4k": "native"})):
+            settings._save(settings.SETTINGS_FILE, {"dv_routes": raw})
+            self.assertEqual(settings.get_settings()["dv_routes"], raw)   # unvalidated merge
+            self.assertEqual(settings.dv_routes(), want, repr(raw))       # validated accessor

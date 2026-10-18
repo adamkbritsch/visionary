@@ -362,6 +362,15 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 var RUN_STAGES = ["download","extend","topaz","resolve"];
 var FIN_STAGES = ["remux","upload","cleanup"];
 var ALL = RUN_STAGES.concat(FIN_STAGES);
+/* The native Dolby Vision render (a route set 'native' in dv_routes) writes the very file Resolve
+   writes, so while it runs it takes Resolve's chip rather than joining as another — the app's
+   pipelineCards does the same. */
+var STAGE_LABEL = {dvrender: "Dolby Vision"};
+function stagesFor(stage){
+  return stage === "dvrender"
+    ? ALL.map(function(s){ return s === "resolve" ? "dvrender" : s; }) : ALL;
+}
+function stageLabel(s){ return STAGE_LABEL[s] || s; }
 var busy = false, timer = null;
 
 function $(id){ return document.getElementById(id); }
@@ -394,7 +403,7 @@ function pipelineItems(o){
               notches: f.notches || [], raw: f});
   });
   out.forEach(function(c){
-    var i = ALL.indexOf(c.stage);
+    var i = stagesFor(c.stage).indexOf(c.stage);
     c.rank = i < 0 ? -1 : i + (c.pct === null ? 0 : Math.max(0, Math.min(100, c.pct)) / 100);
   });
   out.sort(function(a, b){ return b.rank - a.rank; });   /* nearest the finish first */
@@ -432,15 +441,15 @@ function render(d){
   var sub = (o.message || "").trim();
   if (hold) sub = ((o.hold || {}).msg || hold);
   /* the leader may be a finisher item, whose stage the run-thread message doesn't describe */
-  if (lead && lead.o !== cur) sub = itemName(lead.o) + ": " + (stage || "finishing");
-  txt($("nowSub"), sub || (lead ? (stage || "—") : "—"));
+  if (lead && lead.o !== cur) sub = itemName(lead.o) + ": " + (stageLabel(stage) || "finishing");
+  txt($("nowSub"), sub || (lead ? (stageLabel(stage) || "—") : "—"));
   txt($("nowPct"), "");   /* the percentage lives in the readout row, beside its timings */
   $("nowSec").classList.toggle("off", !lead);
 
   drawBar(lead);
   drawReadout(lead, d.settings);
 
-  var st = $("stages"), at = ALL.indexOf(stage);
+  var row = stagesFor(stage), st = $("stages"), at = row.indexOf(stage);
   var haveLead = !!lead;
   if (st.children.length !== ALL.length){
     st.innerHTML = "";
@@ -453,6 +462,7 @@ function render(d){
     var cls = "stage";
     if (haveLead && at >= 0){ if (i === at) cls += " on"; else if (i < at) cls += " done"; }
     st.children[i].className = cls;
+    txt(st.children[i], stageLabel(row[i]));
   }
 
   /* ---- everything else in flight, behind the leader -------------------- */
@@ -463,7 +473,7 @@ function render(d){
       var pc = (c.pct === null) ? "" : Math.round(c.pct) + "%";
       return '<div class="row"><svg class="ic"><use href="' + iconFor(c.o.kind) +
              '"/></svg><span class="t">' + esc(itemName(c.o)) + '</span>' +
-             '<span class="pill dim">' + esc(c.stage || "") + '</span>' +
+             '<span class="pill dim">' + esc(stageLabel(c.stage || "")) + '</span>' +
              '<span class="mono" style="color:var(--steel)">' + pc + '</span></div>';
     }).join("");
   }

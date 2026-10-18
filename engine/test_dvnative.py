@@ -916,5 +916,402 @@ class L4SubprocessMatchesInProcess(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixtures")
+E2E_SIDECAR = os.path.join(FIXTURES, "e2e_s06e05_sidecar.json.gz")
+# What the pre-MasterSpec code wrote from that sidecar in the S06E05 E2E run (native.json's
+# rpu_sha256, and the sha256 of the rpu.bin.generate.json beside it), with dovi_tool 2.3.0.
+E2E_RPU_SHA256 = "7fa6836940ae67787964c1509c29c80eaf076d76945b07ddfba514055faba3f1"
+E2E_CONFIG_SHA256 = "03ce22b9e4a49bd5aa6c6bbe0b007ccb8b1c2129bf75b02472dfc8fe877e62ac"
+
+
+def _e2e_sidecar() -> dict:
+    import gzip
+    with gzip.open(E2E_SIDECAR) as f:
+        return json.load(f)
+
+
+def _sha256(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+class MasterSpecDefaults(unittest.TestCase):
+    """The default MasterSpec IS today's constants: a caller that passes nothing gets the RPU
+    the TV lane has always generated."""
+
+    def test_defaults_are_resolves_1000_nit_project(self):
+        m = dvnative.DEFAULT_MASTER
+        self.assertEqual((m.max_nits, m.min_nits, m.trim_targets, m.mdcv), (1000, 0.0001, (100, 600, 1000), None))
+        self.assertEqual((m.source_max_pq, m.source_min_pq, m.l6_min), (3079, 7, 1))
+        self.assertEqual(dvnative.MasterSpec(), m)
+        self.assertEqual(m.source_max_pq, dvnative.SOURCE_MAX_PQ)
+
+    def test_refuses_what_an_rpu_cannot_declare(self):
+        for kw in ({"max_nits": 0}, {"min_nits": 0}, {"min_nits": 2000}, {"max_nits": 20000},
+                   {"trim_targets": ()}, {"trim_targets": (600, 100)}, {"trim_targets": (0, 100)},
+                   {"mdcv": "L(1,1)"}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                dvnative.MasterSpec(**kw)
+
+    def test_mdcv_must_say_the_same_nits(self):
+        import dvcap
+        self.assertEqual(dvnative.MasterSpec(mdcv=dvcap.FALLBACK_MASTER_DISPLAY).max_nits, 1000)
+        p3_4000 = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50)"
+        with self.assertRaises(ValueError):                 # a 4000-nit SEI on a 1000-nit RPU
+            dvnative.MasterSpec(mdcv=p3_4000)
+        m = dvnative.MasterSpec(max_nits=4000, min_nits=0.005, mdcv=p3_4000)
+        self.assertEqual((m.source_max_pq, m.l6_min), (dvnative.nits_to_pq12(4000), 50))
+
+    def test_trim_targets_become_a_tuple(self):
+        self.assertEqual(dvnative.MasterSpec(trim_targets=[100, 1000]).trim_targets, (100, 1000))
+
+
+class MasterSpecThreading(unittest.TestCase):
+    def setUp(self):
+        self.sc = _sidecar([_scene(0, 9, 1, 3200, 3600)], cll=1800, fall=1900)
+        self.m2000 = dvnative.MasterSpec(max_nits=2000, trim_targets=(100, 600, 1000, 2000))
+
+    def test_default_master_changes_nothing(self):
+        for sc in (self.sc, _e2e_sidecar()):
+            self.assertEqual(dvnative.rpu_config(sc), dvnative.rpu_config(sc, master=dvnative.MasterSpec()))
+        self.assertEqual(dvnative.light_levels(self.sc), dvnative.light_levels(self.sc, dvnative.MasterSpec()))
+        self.assertEqual(dvnative.clamp_l1(5, 4025, 3200), dvnative.clamp_l1(5, 4025, 3200, dvnative.DEFAULT_MASTER))
+
+    def test_a_2000_nit_master_moves_every_dependent_field(self):
+        cfg = dvnative.rpu_config(self.sc, master=self.m2000)
+        pq2000 = dvnative.nits_to_pq12(2000)
+        self.assertEqual(cfg["source_max_pq"], pq2000)
+        self.assertEqual(cfg["level6"]["max_display_mastering_luminance"], 2000)
+        self.assertEqual((cfg["level6"]["max_content_light_level"],
+                          cfg["level6"]["max_frame_average_light_level"]), (1800, 1800))
+        self.assertEqual(cfg["shots"][0]["metadata_blocks"][0]["Level1"]["max_pq"], min(3600, pq2000))
+        self.assertEqual([b["Level2"]["target_max_pq"] for b in cfg["default_metadata_blocks"] if "Level2" in b],
+                         [dvnative.nits_to_pq12(t) for t in (100, 600, 1000, 2000)])
+        self.assertEqual(dvnative.x265_max_cll(self.sc, self.m2000), "1800,1800")
+        self.assertEqual(dvnative.x265_max_cll(self.sc), "1000,1000")     # the default still clamps
+
+
+class E2ESidecarByteIdentical(unittest.TestCase):
+    """The stored S06E05 E2E sidecar, through today's code with the DEFAULT MasterSpec, must give
+    the exact config and RPU the pre-MasterSpec code shipped from it."""
+
+    def test_config_is_byte_identical(self):
+        cfg = dvnative.rpu_config(_e2e_sidecar(), l4=True, avg_floor="V40", master=dvnative.MasterSpec())
+        self.assertEqual(_sha256(json.dumps(cfg).encode()), E2E_CONFIG_SHA256)   # json.dump as generate_rpu writes it
+
+    @unittest.skipUnless(os.path.exists(dvnative.DOVI_TOOL), "dovi_tool not installed")
+    def test_rpu_is_byte_identical(self):
+        d = tempfile.mkdtemp()
+        try:
+            for name, kw in (("implicit", {}), ("explicit", {"master": dvnative.MasterSpec()})):
+                rpu = os.path.join(d, name + ".bin")
+                dvnative.generate_rpu(_e2e_sidecar(), rpu, avg_floor="V40", l4=True, **kw)
+                with open(rpu, "rb") as f:
+                    got = _sha256(f.read())
+                with open(rpu + ".generate.json", "rb") as f:
+                    self.assertEqual(_sha256(f.read()), E2E_CONFIG_SHA256)
+                ver = subprocess.run([dvnative.DOVI_TOOL, "--version"], capture_output=True, text=True).stdout
+                if "2.3.0" not in ver:
+                    self.skipTest(f"RPU bytes pinned for dovi_tool 2.3.0, found {ver.strip()!r}")
+                self.assertEqual(got, E2E_RPU_SHA256, name)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class FrontEnd(unittest.TestCase):
+    def test_pre_vf_prefixes_the_analysis_chain_and_none_changes_nothing(self):
+        self.assertEqual(dvnative.analysis_vf("/l/rcm.cube", None), dvnative.analysis_vf("/l/rcm.cube"))
+        self.assertEqual(dvnative.analysis_vf(None, "scale=3840:2160"),
+                         "scale=3840:2160,scale=1920:1080:flags=area,format=yuv444p10le")
+        vf = dvnative.analysis_vf("/l/rcm.cube", "zscale=rangein=full:range=limited")
+        # the front end first, then the target's scale-first chain (1080p, then the LUT)
+        self.assertTrue(vf.startswith("zscale=rangein=full:range=limited,scale=1920:1080:flags=area,"
+                                      "zscale=matrixin=709"))
+
+    def test_a_filtergraph_is_not_a_front_end(self):
+        for bad in ("[0:v]scale=1:1", "split;scale", "scale=1:1,", "a\nb"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                dvnative.front_end(bad)
+        self.assertEqual(dvnative.front_end(""), "")
+
+
+class RangeIntermediate(unittest.TestCase):
+    # The TV lane's whole-chunk argv (hardware decode, FFVHuff 4:4:4): the range keywords and
+    # pre_vf default to it exactly.
+    OLD = ["/ff", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-hwaccel", "videotoolbox",
+           "-i", "/seg.mov", "-map", "0:v:0", "-vf", None, "-color_primaries", "bt2020",
+           "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
+           "-c:v", "ffvhuff", "-pix_fmt", "yuv444p10le", "/c.mkv"]
+
+    def test_whole_chunk_argv_is_unchanged(self):
+        want = list(self.OLD)
+        want[want.index(None)] = dvnative.analysis_vf("/l/rcm.cube")
+        self.assertEqual(dvnative.build_analysis_intermediate_command("/ff", "/seg.mov", "/c.mkv", "/l/rcm.cube"),
+                         want)
+        self.assertEqual(dvnative.build_analysis_intermediate_command(
+            "/ff", "/seg.mov", "/c.mkv", "/l/rcm.cube", hwaccel=False),
+            [a for a in want if a not in ("-hwaccel", "videotoolbox")])
+
+    def test_a_range_decodes_in_hardware_before_its_seek(self):
+        c = dvnative.build_analysis_intermediate_command("/ff", "/src.mp4", "/c.mkv", None, start=240,
+                                                         frames=96, fps="24000/1001")
+        self.assertLess(c.index("-hwaccel"), c.index("-ss"))
+        self.assertEqual(c[c.index("-c:v") + 1], "ffvhuff")
+        self.assertNotIn("-hwaccel", dvnative.build_analysis_intermediate_command(
+            "/ff", "/src.mp4", "/c.mkv", None, False, start=240, frames=96, fps="24000/1001"))
+
+    def test_a_range_seeks_to_the_midpoint_bounds_the_count_and_passes_frames_through(self):
+        c = dvnative.build_analysis_intermediate_command("/ff", "/src.mp4", "/c.mkv", None, start=240,
+                                                         frames=96, fps="24000/1001", pre_vf="scale=3840:2160")
+        self.assertEqual(c[c.index("-ss") + 1], f"{(240 - 0.5) / (24000 / 1001):.6f}")
+        self.assertLess(c.index("-ss"), c.index("-i"))                      # input seek
+        self.assertEqual(c[c.index("-frames:v") + 1], "96")
+        self.assertEqual(c[c.index("-fps_mode") + 1], "passthrough")
+        self.assertTrue(c[c.index("-vf") + 1].startswith(
+            "setpts=N*1001/24000/TB,scale=3840:2160,scale=1920:1080:flags=area"))   # re-stamped from 0
+        self.assertEqual(c[-1], "/c.mkv")
+
+    def test_uniform_pts_from_the_rate(self):
+        self.assertEqual(dvnative.uniform_pts("24000/1001"), "setpts=N*1001/24000/TB")
+        self.assertEqual(dvnative.uniform_pts("25"), "setpts=N*1/25/TB")
+
+    def test_frame_zero_needs_no_seek(self):
+        c = dvnative.build_analysis_intermediate_command("/ff", "/src.mp4", "/c.mkv", None, start=0,
+                                                         frames=10, fps="24000/1001")
+        self.assertNotIn("-ss", c)
+        self.assertIn("-frames:v", c)
+
+
+class RangeValidation(unittest.TestCase):
+    def test_contiguous_from_zero(self):
+        self.assertEqual(dvnative.validate_ranges([[0, 5], (5, 9)]), [(0, 5), (5, 9)])
+        for bad in ([], [(1, 5)], [(0, 5), (6, 9)], [(0, 5), (4, 9)], [(0, 0)]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                dvnative.validate_ranges(bad)
+
+
+class L4Clamp(unittest.TestCase):
+    def test_default_argv_unchanged_and_max_pq_only_when_it_differs(self):
+        base = dvnative.build_l4_command("/py", "/c.mkv", "/o.json", ffmpeg="/ff")
+        self.assertEqual(dvnative.build_l4_command("/py", "/c.mkv", "/o.json", ffmpeg="/ff", max_pq=3079), base)
+        self.assertNotIn("--max-pq", base)
+        self.assertEqual(dvnative.build_l4_command("/py", "/c.mkv", "/o.json", ffmpeg="/ff", max_pq=3388)[-2:],
+                         ["--max-pq", "3388"])
+
+    def test_the_child_refuses_a_code_outside_12_bits(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(dvnative.main(["l4", "/x.mkv", "/o.json", "--max-pq", "5000"]), 2)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_white_clamps_to_the_masters_peak(self):
+        import struct
+        frame = struct.pack("<%dH" % 3, 940, 512, 512)              # one reference-white pixel
+        self.assertAlmostEqual(dvnative.maxrgb_pq12_stats(frame, 1, 1)[0], 3079, delta=1)
+        self.assertAlmostEqual(dvnative.maxrgb_pq12_stats(frame, 1, 1, max_pq=4095)[0], 4095, delta=1)
+
+
+class RunStepPoll(unittest.TestCase):
+    def test_on_poll_runs_while_the_child_does_and_its_errors_are_swallowed(self):
+        calls = []
+
+        def poll():
+            calls.append(1)
+            raise RuntimeError("a progress bug")
+        rc, _tail, _cpu = dvnative.run_step([PY, "-c", "import time; time.sleep(0.4)"], timeout=30,
+                                            poll=0.05, on_poll=poll)
+        self.assertEqual(rc, 0)
+        self.assertGreater(len(calls), 2)
+
+
+class AnalyzeRanges(unittest.TestCase):
+    """analyze_ranges with run_step faked, as AnalyzeChunks does."""
+
+    RANGES = [(0, 24), (24, 54), (54, 72)]
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.work = os.path.join(self.d, "work")
+        self.src = os.path.join(self.d, "src.mp4")
+        open(self.src, "wb").close()
+        self.calls, self.cmds = [], []
+        self.short = {}                          # range index -> frames the analyzer claims
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _k(self, path):
+        return int(os.path.basename(path).split("_")[1].split(".")[0])
+
+    def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, cwd=None, what="step", poll=0.5,
+                  on_poll=None):
+        cmd = cmd[3:]
+        if cmd[0] == "/ff":
+            step, k = "intermediate", self._k(cmd[-1])
+            self.cmds.append(cmd)
+            open(cmd[-1], "wb").close()
+        elif cmd[0] == "/an":
+            step, k = "analyzer", self._k(cmd[2])
+            a, b = self.RANGES[k]
+            with open(dvnative.sidecar_path(cmd[cmd.index("-o") + 1]), "w") as f:
+                json.dump(_fake_sidecar(self.short.get(k, b - a)), f)
+        else:
+            step, k = "l4", self._k(cmd[4])
+            a, b = self.RANGES[k]
+            with open(cmd[5], "w") as f:
+                json.dump([[k, 1]] * (b - a), f)
+        self.assertEqual(timeout, dvnative.step_timeout(self.RANGES[k][1] - self.RANGES[k][0]))
+        self.assertTrue(what.startswith(f"range {k + 1} "))
+        self.calls.append((k, step))
+        return 0, "", 0.5
+
+    def analyze(self, **kw):
+        kw.setdefault("cube", None)
+        with mock.patch.object(dvnative, "run_step", side_effect=self.fake_step):
+            return dvnative.analyze_ranges(self.src, self.RANGES, self.work, fps="24000/1001",
+                                           analyzer="/an", ffmpeg="/ff", python="/py", **kw)
+
+    def test_every_range_measured_seeked_and_merged(self):
+        sc = self.analyze(pre_vf="scale=3840:2160")
+        self.assertEqual(dvnative.stream_frames(sc), 72)
+        self.assertEqual([s["start"] for s in sc["scenes"]], [0, 24, 54])
+        self.assertEqual(len(sc["l4"]), 72)
+        self.assertNotIn("-ss", self.cmds[0])
+        for cmd, (a, b) in zip(self.cmds, self.RANGES):
+            self.assertEqual(cmd[cmd.index("-frames:v") + 1], str(b - a))
+            self.assertEqual(cmd[cmd.index("-i") + 1], self.src)
+            self.assertTrue(cmd[cmd.index("-vf") + 1].startswith("setpts=N*1001/24000/TB,scale=3840:2160,"))
+        self.assertEqual(self.cmds[1][self.cmds[1].index("-ss") + 1], dvcap_ss(24))
+        self.assertEqual(sorted(n for n in os.listdir(self.work) if n.endswith((".mkv", ".part"))), [])
+
+    def test_resume_measures_only_the_unfinished_range(self):
+        self.analyze()
+        self.calls.clear()
+        os.remove(os.path.join(self.work, "range_0001_24_30.bin.l1.json"))
+        done = []
+        self.analyze(on_range=lambda d, of: done.append((d, of)))
+        # the analyzer and the L4 pass run side by side on the intermediate (the overlapped loop)
+        self.assertEqual(self.calls[0], (1, "intermediate"))
+        self.assertEqual(sorted(self.calls[1:]), [(1, "analyzer"), (1, "l4")])
+        self.assertEqual(done, [(1, 3), (2, 3), (3, 3)])
+
+    def test_a_different_plan_never_reuses_a_range(self):
+        self.analyze()
+        self.calls.clear()
+        self.RANGES = [(0, 30), (30, 54), (54, 72)]
+        self.analyze()
+        self.assertEqual({k for k, _s in self.calls}, {0, 1})             # range 2 is the same range
+
+    def test_before_range_pauses_with_its_reason(self):
+        with self.assertRaises(dvnative.Paused) as cm:
+            self.analyze(before_range=lambda k, n: "low disk" if k == 2 else None)
+        self.assertEqual(str(cm.exception), "paused: low disk")
+        self.assertNotIn(2, {k for k, _s in self.calls})
+
+    def test_should_pause_names_the_range(self):
+        with self.assertRaises(dvnative.Paused) as cm:
+            self.analyze(should_pause=lambda: True)
+        self.assertEqual(str(cm.exception), "paused: yielded before analysis range 1 of 3")
+
+    def test_a_short_range_is_refused_and_never_reused(self):
+        self.short[1] = 29
+        with self.assertRaisesRegex(RuntimeError, "range 1: analysis covers 29 frames, the range has 30"):
+            self.analyze()
+        self.assertFalse(os.path.exists(os.path.join(self.work, "range_0001_24_30.bin.l1.json")))
+
+    def test_master_peak_reaches_the_l4_child(self):
+        seen = []
+        real = self.fake_step
+
+        def spy(cmd, **kw):
+            seen.append(cmd)
+            return real(cmd, **kw)
+        with mock.patch.object(dvnative, "run_step", side_effect=spy):
+            dvnative.analyze_ranges(self.src, self.RANGES, self.work, fps="24000/1001", cube=None,
+                                    analyzer="/an", ffmpeg="/ff", python="/py",
+                                    master=dvnative.MasterSpec(max_nits=4000))
+        l4 = [c for c in seen if "l4" in c]
+        self.assertTrue(l4 and all(c[-2:] == ["--max-pq", str(dvnative.nits_to_pq12(4000))] for c in l4))
+
+    def test_the_frame_rate_is_required(self):
+        for fps in (None, "0/1", "x"):
+            with self.subTest(fps=fps), self.assertRaises(ValueError):
+                dvnative.analyze_ranges(self.src, self.RANGES, self.work, fps=fps, cube=None)
+
+
+def dvcap_ss(a, fps="24000/1001"):
+    import dvcap
+    return f"{dvcap.seg_seek_seconds(a, fps):.6f}"
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG), "ffmpeg not installed")
+class RangeIntermediateKeepsExactlyItsFrames(unittest.TestCase):
+    """REAL ffmpeg: a range's intermediate must hold exactly frames [a, a+n) of the source —
+    not a, a, a+1 (the duplicated-first-frame bug dvcap and the mezzanine both had), not a
+    frame late. Every source frame has its own grey level; the range's frames are identified
+    against the WHOLE file's intermediate (same chain, so the levels compare like for like).
+    Checked on an MP4 (exact timebase) and an MKV (1 ms timebase)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = tempfile.mkdtemp()
+        ff = dvnative.FFMPEG
+        cls.mp4 = os.path.join(cls.d, "levels.mp4")
+        r = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                            "nullsrc=s=64x36:r=24000/1001:d=1,geq=lum='60+7*N':cb=128:cr=128",
+                            "-frames:v", "24", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p",
+                            cls.mp4], capture_output=True)
+        if r.returncode != 0:
+            raise unittest.SkipTest("libx264 unavailable")
+        cls.mkv = os.path.join(cls.d, "levels.mkv")
+        subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-i", cls.mp4, "-c", "copy", cls.mkv],
+                       check=True)
+        # 4:2:0 High profile: what VideoToolbox decodes IN HARDWARE (the 4:4:4 lossless files above
+        # fall back to software), so the hwaccel range read is checked frame-exact too.
+        cls.hw = os.path.join(cls.d, "levels420.mp4")
+        subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                        "nullsrc=s=64x36:r=24000/1001:d=1,geq=lum='60+7*N':cb=128:cr=128",
+                        "-frames:v", "24", "-c:v", "libx264", "-qp", "2", "-pix_fmt", "yuv420p",
+                        "-profile:v", "high", "-bf", "2", cls.hw], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.d, ignore_errors=True)
+
+    @staticmethod
+    def _levels(path):
+        # passthrough: rawvideo is a constant-rate muxer, and its default cfr would pad this
+        # decode itself (the very bug under test), hiding or faking a shift
+        out = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-loglevel", "error", "-i", path,
+                              "-fps_mode", "passthrough", "-vf", "scale=8:8", "-pix_fmt", "gray",
+                              "-f", "rawvideo", "-"], capture_output=True).stdout
+        return [sum(out[i * 64:(i + 1) * 64]) / 64 for i in range(len(out) // 64)]
+
+    def test_each_range_is_exactly_its_frames(self):
+        for src, hw in ((self.mp4, True), (self.mkv, True), (self.hw, True), (self.hw, False)):
+            whole = os.path.join(self.d, "whole.mkv")
+            subprocess.run(dvnative.build_analysis_intermediate_command(dvnative.FFMPEG, src, whole, None,
+                                                                        hwaccel=False),
+                           capture_output=True, check=True)
+            table = self._levels(whole)
+            self.assertEqual(len(table), 24)
+            self.assertEqual(len(set(round(v) for v in table)), 24)     # every frame tells apart
+            for a, n in ((0, 5), (7, 6), (19, 5)):       # no seek, a mid seek, the tail
+                with self.subTest(src=os.path.basename(src), hwaccel=hw, a=a):
+                    out = os.path.join(self.d, f"r_{a}.mkv")
+                    r = subprocess.run(dvnative.build_analysis_intermediate_command(
+                        dvnative.FFMPEG, src, out, None, hw, start=a, frames=n, fps="24000/1001"),
+                        capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    got = [min(range(len(table)), key=lambda k: abs(table[k] - m)) for m in self._levels(out)]
+                    self.assertEqual(got, list(range(a, a + n)))
+                    # ...and the L4 child's own decode (no -fps_mode) sees those frames, unpadded
+                    l4 = subprocess.run(dvnative.build_raw444_decode_command(dvnative.FFMPEG, out),
+                                        capture_output=True).stdout
+                    exact = subprocess.run(dvnative.build_raw444_decode_command(dvnative.FFMPEG, out)[:-1]
+                                           + ["-fps_mode", "passthrough", "-"], capture_output=True).stdout
+                    self.assertEqual(len(l4), n * 1920 * 1080 * 3 * 2)
+                    self.assertEqual(l4, exact)
+
+
 if __name__ == "__main__":
     unittest.main()

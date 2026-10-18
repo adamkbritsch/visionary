@@ -7,7 +7,9 @@ needs this process to have macOS Screen-Recording + Accessibility grants and
 `cliclick`. Missing grants surface in preflight/Setup (check_tcc_grants); if they
 are missing at run time the resolve stage returns not-ok and the episode stays
 parked at this stage (resumable). The 'dvnative' stage is the headless alternative
-for an eligible TV episode when settings `dv_engine` is 'native' (see _dvnative).
+for an eligible TV episode when settings `dv_engine` is 'native' (see _dvnative), and
+'dvrender' writes Resolve's render itself for a route set 'native' in `dv_routes` (see
+_dvrender).
 """
 from __future__ import annotations
 import json
@@ -337,7 +339,8 @@ def _source_video_kbps(path):
 def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pause=None):
     fn = {
         "download": _download, "extend": _extend, "topaz": _topaz, "resolve": _resolve,
-        "dvnative": _dvnative, "remux": _remux, "upload": _upload, "cleanup": _cleanup,
+        "dvnative": _dvnative, "dvrender": _dvrender, "remux": _remux, "upload": _upload,
+        "cleanup": _cleanup,
     }.get(stage, lambda *_a, **_k: (False, f"unknown stage {stage}"))
     ep = getattr(p, "ep", "?")
     try:
@@ -345,8 +348,9 @@ def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pau
         # remuxes; a remux yields to an active Resolve (Resolve gets the whole machine).
         # Both are segmented, so a pause costs nothing — the retry resumes in place. The
         # native DV analysis ('dvnative', run thread only) is per-chunk resumable too: a
-        # pause there loses at most the chunk in hand.
-        if stage in ("topaz", "remux", "dvnative"):
+        # pause there loses at most the chunk in hand; the native render ('dvrender') yields
+        # only inside its analysis, range by range (see _dvrender).
+        if stage in ("topaz", "remux", "dvnative", "dvrender"):
             ok, msg = fn(p, abort, progress, should_pause)
         elif stage == "download":
             # download yields too — to a sent video only (see _download); the orchestrator
@@ -974,14 +978,21 @@ def _topaz(p, abort, progress=None, should_pause=None):
         # at scene cuts (rpu-only plans LAZILY in the remux stage instead — it only needs
         # segments at all when the peak gate revokes its stream copy).
         note = _plan_fast_path_bounds(p, progress) if pl["topaz"] == "resolve-only" else ""
-        return True, pl["reason"] + " — skipping upscale" + note
+        reason = pl["reason"]
+        if _native_render_route(p):     # its route renders natively (dv_routes): say who does
+            reason = reason.replace("Resolve ", "the native DV render ", 1)
+        return True, reason + " — skipping upscale" + note
     if p.youtube:
         # YOUTUBE SKIPS TOPAZ (user-dictated 2026-08-06): Resolve does the scaling
         # (the scheduler reads this same fact via orchestrator.topaz_is_noop — keep in step)
         # instead — SuperScale 2x for 1080p sources (a scripting-API clip property, no
         # screen navigation), the 4K timeline's plain scaling otherwise. Scene-cut
-        # planning still runs so the capped remux segments at real cuts.
+        # planning still runs so the capped remux segments at real cuts. A route set
+        # 'native' that the native render can make says so instead (dv_routes).
         note = _plan_fast_path_bounds(p, progress)
+        route = _native_render_route(p)
+        if route:
+            return True, f"YouTube → the native DV render ({route}) — skipping Topaz" + note
         return True, "YouTube → Resolve scales it (SuperScale for 1080p) — skipping Topaz" + note
     # Per-resolution preset variant: the plan's bucket (from the source height) picks which
     # tuned param set to use; the source can be ANY of 480p/720p/1080p and still reach 4K.
@@ -1696,6 +1707,138 @@ def _dvnative(p, abort, progress=None, should_pause=None):
     return False, f"{msg} (native attempt {n} of {nativelane.MAX_FAILURES})"
 
 
+# ---- the native DV render ('dvrender'): a route set 'native' in settings dv_routes -----------
+# The routes the stage can make TODAY: one source already at the master's 3840x2160, BT.709
+# limited-range SDR, straight through the pinned LUT (the TV lane's validated chain) — so no
+# front end at all. A route that needs one (a fit and pad, a BT.601 or full-range conversion:
+# dvnative.front_end) ships with its own phase and renders through Resolve until then, as does
+# every source of these routes the LUT cannot take as it is.
+DVRENDER_ROUTES = ("yt_native4k", "sdr4k")
+DVRENDER_SIZE = (3840, 2160)
+
+
+def _int0(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def dvrender_spec(p, route) -> tuple:
+    """(nativerender.RenderSpec, "") for item `p`'s native render on `route`, or (None, why) when
+    the stage cannot make it — then Resolve does, exactly as before. The spec is Resolve's render
+    settings for the route: the CFR source (resolve_input), the pinned LUT, the export bitrate
+    _resolve would pass (youtube_render_kbps under the max_peak_mbps gate for a video; for 4K
+    SDR the intake's own bitrate floored at EXPORT_BITRATE_FLOOR_KBPS, no gate — its remux
+    re-encodes under the cap anyway), and the scene plan _plan_fast_path_bounds stashed as the
+    analysis ranges. Probes the CFR (stream tags, frame count) and asks the native toolchain
+    check (cached); never writes anything."""
+    if route not in DVRENDER_ROUTES:
+        return None, f"route {route or 'unknown'} has no native render yet"
+    import nativelane
+    import nativerender
+    import settings as _st
+    src = getattr(p, "source_cfr", None)
+    if not src or not os.path.exists(src):
+        return None, "its CFR source is not on disk"
+    ok, why = nativelane.toolchain_ok()
+    if not ok:
+        return None, f"the native toolchain is not ready: {why}"
+    info = nativelane.probe_stream(src)
+    ok, why = nativelane.source_ok(info)
+    if not ok:
+        return None, why.replace("chunk 0", "the source")
+    size = (_int0(info.get("width")), _int0(info.get("height")))
+    if size != DVRENDER_SIZE:
+        return None, (f"the source is {size[0]}x{size[1]}, not {DVRENDER_SIZE[0]}x"
+                      f"{DVRENDER_SIZE[1]} (the fit and pad front end comes later)")
+    cfr = nativelane.cfr_info(p)
+    if not cfr.get("frames") or not cfr.get("fps"):
+        return None, "the CFR's frame count or frame rate is unknown"
+    if route == "yt_native4k":
+        kbps, cap = youtube_render_kbps(size[1]), int(_st.get_settings().get("max_peak_mbps", 50))
+    else:
+        kbps, cap = max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS), 0
+    spec = nativerender.RenderSpec(inputs=[[0, src], [cfr["frames"], None]], fps=cfr["fps"],
+                                   kbps=kbps, cap_mbps=cap, lut=nativelane.lut_path(),
+                                   bounds=_read_topaz_bounds(p.source_basename) or None)
+    bad = spec.problems()
+    if bad:
+        return None, "; ".join(bad)
+    return spec, ""
+
+
+def native_route(p) -> tuple:
+    """(route, spec, why): is this item's Dolby Vision the native render's ('dvrender')? `spec`
+    is set when it is; otherwise `why` says what stopped a route that IS set 'native' ("" when
+    its route is not). With no route set 'native' in dv_routes — the default — the answer is
+    (None, None, "") after one settings read: nothing probed, nothing classified."""
+    import settings as _st
+    native = {r for r, engine in _st.dv_routes().items() if engine == "native"}
+    if not native:
+        return None, None, ""
+    import routes
+    route = routes.item_route(p)
+    if route not in native:
+        return route, None, ""
+    spec, why = dvrender_spec(p, route)
+    return route, spec, why
+
+
+def _native_render_route(p):
+    """The route the native render will make this item on, or None (Resolve will) — for a stage
+    MESSAGE, so it never raises; native_route's one settings read while nothing is native."""
+    try:
+        route, spec, _why = native_route(p)
+    except Exception:  # noqa: BLE001 — a message must never cost the stage
+        return None
+    return route if spec is not None else None
+
+
+def _dvrender(p, abort, progress=None, should_pause=None):
+    """NATIVE DOLBY VISION RENDER (settings `dv_routes`: the item's route set 'native'): write
+    p.dv_render — the very file Resolve writes, HEVC Main10 PQ with an in-band DV 8.1 RPU, the
+    whole source at its frame rate — without Resolve (nativerender.render: the analysis in scene
+    ranges through the pinned LUT, a VideoToolbox encode under the peak gate, the RPU inject, the
+    mux, the self-check, the atomic publish). Run thread only, and only for an item
+    orchestrator._process routed here — never the screen, never a SIGSTOP: it runs at nice 10
+    beside the previous item's x265 tail, and everything after it (stage_done("resolve"), the
+    remux, the hand-off, cleanup) reads p.dv_render exactly as it reads Resolve's.
+
+    should_pause is honoured during the ANALYSIS only, where a yield loses at most the range in
+    hand (it resumes range by range). From the first encode on the stage runs to its end, the
+    way Resolve's render does: a yield there would throw the whole encode away (it restarts from
+    scratch) — deploy-now.sh waits that phase out for the same reason. "paused: ..." and
+    "interrupted: ..." are not failures; anything else is a plain failure, counted by the
+    orchestrator's ordinary fail ladder."""
+    import nativerender
+    import routes
+    route = routes.item_route(p)
+    spec, why = dvrender_spec(p, route)
+    if spec is None:
+        return False, f"native render refused (route {route or 'unknown'}): {why}"
+    total = spec.total
+    phase = {"now": None}            # the last phase render() reported (None: not started yet)
+
+    def report(info):
+        phase["now"] = info.get("phase")
+        if progress:
+            progress(dict(info, frames=total, route=route))
+
+    def pause():
+        return phase["now"] in (None, "analysis") and bool(should_pause())
+
+    ok, msg = nativerender.render(p, spec, abort=abort, progress=report,
+                                  should_pause=pause if should_pause is not None else None)
+    msg = str(msg)
+    if ok or msg.startswith("paused:"):
+        return ok, msg
+    if msg.startswith("aborted") or (abort is not None and abort.is_set()):
+        return False, ("interrupted: native DV render stopped — the next pass resumes its "
+                       "analysis range by range")
+    return False, msg
+
+
 def _tree_gib(path) -> float:
     """GiB under a directory (0 when it is missing)."""
     total = 0
@@ -2202,6 +2345,11 @@ def _cleanup(p, abort, progress=None):
             try: os.remove(stray)
             except OSError: pass
     except OSError:
+        pass
+    try:                                                 # a native render's books (<dv_render>.dvrender/)
+        import nativerender                              # and its finish-step strays — never the render
+        nativerender.discard_books(p)                    # itself (nothing there for a Resolve item)
+    except Exception:  # noqa: BLE001 — best-effort, like the strays above
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)
     shutil.rmtree(p.final + ".remuxsegs", ignore_errors=True)   # the resumable REMUX segments + rpu

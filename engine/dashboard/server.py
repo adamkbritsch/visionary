@@ -1019,10 +1019,15 @@ def api_save_settings(body) -> tuple:
     A failing check_native_dv refuses the WHOLE update with a 409 and its row, and saves
     nothing. Every other write (including back to 'resolve') is today's path unchanged."""
     body = body or {}
-    if isinstance(body, dict) and body.get("dv_engine") == "native":
+    routes = body.get("dv_routes") if isinstance(body, dict) else None
+    route_native = isinstance(routes, dict) and "native" in routes.values()
+    if isinstance(body, dict) and (body.get("dv_engine") == "native" or route_native):
+        # A route switched to native through dv_routes needs the same toolchain as the TV lane
+        # (review-caught 2026-10-15: it skipped this check).
         row = preflight.check_native_dv()
         if not row["ok"]:
-            return {"error": "native DV toolchain check failed — dv_engine not changed",
+            what = "dv_engine" if body.get("dv_engine") == "native" else "dv_routes"
+            return {"error": f"native DV toolchain check failed — {what} not changed",
                     "checks": [row]}, 409
     new = settings.set_settings(body)
     if "max_youtube_minutes" in body:
