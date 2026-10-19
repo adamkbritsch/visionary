@@ -368,8 +368,28 @@ def run_arm_gate():
     return run_cheap() + [check_brew_tools(), check_python_deps(), check_native_dv()]
 
 
+def check_lid_awake():
+    """WARN, never an arm gate: can a closed lid be kept from sleeping the Mac while the pipeline
+    runs on mains power (lidsleep.py)? Only `pmset disablesleep` does that, and it needs the
+    one-time sudoers rule the fix installs. A Mac with no lid has nothing to set up."""
+    import lidsleep
+    if not lidsleep.has_lid():
+        return _check("lid_awake", True, "warn", "no lid — nothing to keep awake",
+                      lidsleep.install_command())
+    if lidsleep.allowed(fresh=True):
+        return _check("lid_awake", True, "warn",
+                      "the Mac stays awake with the lid closed while activated on mains power",
+                      lidsleep.install_command())
+    return _check("lid_awake", False, "warn",
+                  "closing the lid sleeps the Mac and stops the run — run this once in Terminal "
+                  "(it asks for your password) to let Visionary keep it awake while activated "
+                  "on mains power",
+                  lidsleep.install_command())
+
+
 def run_checks(network=False):
-    checks = run_arm_gate() + [check_power_adapter(), check_config(network=network)]
+    checks = run_arm_gate() + [check_power_adapter(), check_lid_awake(),
+                               check_config(network=network)]
     hard_ok = all(c["ok"] for c in checks if c["severity"] == "fail")
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "hard_ok": hard_ok, "checks": checks}

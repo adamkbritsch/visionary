@@ -638,6 +638,25 @@ private struct BorderExtenderGroup: View {
 private struct ApplicationsGroup: View {
     @EnvironmentObject var store: AppStore
 
+    /// Lid closed while activated on mains power: the one-time permission is a Terminal
+    /// command (it asks for the user's password), so it is shown copyable, not as prose.
+    private var lidRow: some View {
+        let c = store.preflight?[check: "lid_awake"]
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                CheckDot(ok: c?.ok)
+                Text("Lid closed").font(.system(size: 12, weight: .medium))
+                Spacer()
+            }
+            if let d = c?.detail, !d.isEmpty {
+                Text(d).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(3)
+            }
+            if c?.ok == false, let fix = c?.fix, !fix.isEmpty {
+                CopyValueRow(value: fix)
+            }
+        }
+    }
+
     private func row(_ title: String, _ id: String) -> some View {
         let c = store.preflight?[check: id]
         return VStack(alignment: .leading, spacing: 3) {
@@ -660,6 +679,7 @@ private struct ApplicationsGroup: View {
             SetupGroupLabel(text: "Applications & hardware")
             row("Topaz Video AI", "topaz_version")
             row("Power", "power_adapter")
+            lidRow
         }
     }
 }

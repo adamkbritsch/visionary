@@ -6225,3 +6225,37 @@ class VstreamFloor(unittest.TestCase):
             f.write("done")
         self.assertIsNone(orch._vstream(stub))
         self.assertIsNone(orch._vstream(os.path.join(d, "missing.mov")))
+
+
+class CaffeinateAndTheLid(unittest.TestCase):
+    """caffeinate dies with the engine (-w), and the lid-closed hold follows the run."""
+
+    def test_caffeinate_waits_on_the_engine_and_the_lid_follows(self):
+        import lidsleep
+        o = orch.Orchestrator()
+        wants = []
+        with mock.patch.object(orch.subprocess, "Popen") as popen, \
+             mock.patch.object(lidsleep, "reconcile",
+                               side_effect=lambda want: (wants.append(want) or (want, "held" if want else "off"))):
+            o._enabled = True
+            o._start_caffeinate()
+            argv = popen.call_args[0][0]
+            self.assertEqual(argv[:4], ["caffeinate", "-d", "-i", "-u"])
+            self.assertEqual(argv[4:], ["-w", str(os.getpid())])
+            self.assertTrue(o.state["lid_awake"])
+            o._enabled = False
+            o._stop_caffeinate()
+        self.assertEqual(wants[-1], False)
+        self.assertIn(True, wants)
+        self.assertFalse(o.state["lid_awake"])
+
+    def test_an_awake_hold_after_a_deactivate_never_holds_the_lid(self):
+        import lidsleep
+        o = orch.Orchestrator()
+        wants = []
+        with mock.patch.object(orch.subprocess, "Popen"), \
+             mock.patch.object(lidsleep, "reconcile",
+                               side_effect=lambda want: (wants.append(want) or (False, "off"))):
+            o._enabled = False
+            o._start_caffeinate()
+        self.assertEqual(set(wants), {False})

@@ -88,6 +88,7 @@ OVERLAP_MIN_PHYS_GB = 400    # while an item finishes in the background (remux/u
                              # replaces this flat figure (U2 — see _native_overlap_hold).
 DIM_IDLE_MINUTES_DEFAULT = 15   # fallback for the 'dim_after_minutes' setting (idle this long → backlight 0)
 DRAIN_POLL_SECONDS = 30      # how often to re-check while paused for power
+LID_SYNC_SECONDS = 10        # how often the power monitor re-checks the lid-closed hold (lidsleep)
 UNPLUG_GRACE_SECONDS = 60    # DEFAULT for the 'unplug_grace_seconds' setting (read via
                              # _unplug_grace()): unplugged mid-stage (ANY stage, incl. remux), wait this long for the
                              # adapter to return before pausing. The remux used to get a 30-min
@@ -1312,6 +1313,12 @@ class Orchestrator:
         self._lock = threading.Lock()
         self._abort = threading.Event()        # set on manual stop / power pause / quiet reclaim / item removal
         self._caffeinate = None                # held while running: display+system awake
+        self._lid_state = None                 # the lid-closed hold's last (held, why) — logged on change
+        try:
+            import lidsleep
+            lidsleep.recover()                 # a dead engine's lid hold is released at start
+        except Exception:  # noqa: BLE001
+            pass
         self._awake_until = 0.0                # unix time an AWAKE HOLD expires (see hold_awake)
         self._drain_baseline = None            # battery % the current drain episode began at
         self._power_paused = False             # published by _run (single-writer): the prefetcher reads it
@@ -1730,17 +1737,48 @@ class Orchestrator:
         equivalent of Amphetamine."""
         self._stop_caffeinate()
         try:
-            self._caffeinate = subprocess.Popen(["caffeinate", "-d", "-i", "-u"],
+            # -w: caffeinate exits with THIS process. A relaunch (deploy-now, a quit, a crash)
+            # never ran _stop_caffeinate, and each one left its caffeinate holding the Mac
+            # awake for good — 91 of them were found 2026-10-19, idle runs included.
+            self._caffeinate = subprocess.Popen(["caffeinate", "-d", "-i", "-u",
+                                                  "-w", str(os.getpid())],
                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             logbook.exception("caffeinate", e)
             self._caffeinate = None
+        self._lid_sync()
 
     def _stop_caffeinate(self):
         if self._caffeinate:
             try: self._caffeinate.terminate()
             except Exception: pass
             self._caffeinate = None
+        self._lid_sync()
+
+    def _lid_sync(self):
+        """LID CLOSED, STILL RUNNING (user-dictated 2026-10-19: "make it so it doesn't make the
+        mac sleep when the pipeline is activated with power"): while activated and holding the
+        Mac awake, a closed lid does not sleep it — on AC only, on a Mac with a lid, once the
+        one-time permission is in place (lidsleep.py; Setup shows the command). Released with
+        caffeinate, on battery (by lidsleep's own guard too) and when the engine dies. Logs
+        only a change. Never raises: keeping the lid awake must never cost the run."""
+        want = bool(self._enabled and self._caffeinate is not None)
+        try:
+            import lidsleep
+            held, why = lidsleep.reconcile(want)
+        except Exception as e:  # noqa: BLE001
+            held, why = False, f"failed ({e.__class__.__name__})"
+        state = (held, why)
+        if state != getattr(self, "_lid_state", None):
+            self._lid_state = state
+            msg = {"held": "lid closed: the Mac stays awake while activated on mains power",
+                   "released": "lid closed: the Mac sleeps again",
+                   "needs permission": "lid closed: the Mac would still sleep — Settings → "
+                                       "Setup → Applications & hardware has the one-time "
+                                       "permission"}.get(why)
+            if msg:
+                logbook.event(msg)
+        self.state["lid_awake"] = held
 
     def hold_awake(self, seconds: float, why: str = "") -> float:
         """Keep the Mac awake for `seconds` even though the run has stopped.
@@ -2364,8 +2402,12 @@ class Orchestrator:
         abort the stage so the run pauses (it never runs on battery). Reconnecting
         cancels the countdown and restores the stage's message."""
         unplug_since, held_msg, held_hold = None, None, None
+        lid_at = 0.0
         while self._enabled:
             time.sleep(2)
+            if time.monotonic() - lid_at >= LID_SYNC_SECONDS:
+                lid_at = time.monotonic()
+                self._lid_sync()            # the cable came back after the guard let go
             fin = self.state.get("finishing") or {}
             any_active = self._stage_active or bool(fin)   # the finisher's stage counts too
             if any_active:
