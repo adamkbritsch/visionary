@@ -713,6 +713,320 @@ def _on_youtube_staging(tag, uploaders, listings=None) -> bool:
             _SWEEP_NOT_YT.add((up, tag))
     return False
 
+# ---- the scratch reaper ------------------------------------------------------------------------
+# User, 2026-10-19: "the cached files are still having a hard time clearing out once they're no
+# longer needed". 130 GB was sitting on the scratch: twenty episodes of a show swapped out on
+# 2026-10-17 (each downloaded, planned and deferred at the Dolby Vision doorstep — abandon_series
+# only sweeps the item in flight and the finisher's), YouTube videos started weeks ago and then
+# rotated 40-80 places back, and finished videos the YouTube sweep keeps because their channel is
+# still queued. The reaper looks at every item on the scratch and asks what still needs it.
+STALE_RECENT_SECONDS = 3600       # a group written to within the hour is left alone (a stage may own it)
+STALE_KEEP_AHEAD = {"youtube": 6, "episode": 3, "movie": 2}   # this close to its turn, an item keeps
+                                  # even its cheap files; further back they go and come back when due
+STALE_SWEEP_SECONDS = 900         # how often the activated pipeline runs it
+STALE_FIRST_SWEEP_SECONDS = 120   # ...the first time after activation (the queue caches warm first)
+STALE_CONFIRM_SECONDS = 600       # "no longer queued" must hold in two sweeps this far apart before
+                                  # anything goes: a passing misread (a NAS blip, a file mid-write)
+                                  # never costs work
+_STALE_LOCK = threading.Lock()
+_ORPHAN_SEEN = {}                 # stem -> when a sweep first judged it no longer queued
+_SOURCE_EXTS = tuple(transfer._VIDEO_EXT) + (".webm", ".flv")
+_PLAN_ONLY = {"scenes.json", ".DS_Store"}
+
+
+def workfile_split(name: str):
+    """PURE. (stem, part) for a name a stage writes on the scratch, or None. part: "source" (the
+    download), "cfr" (its frame-rate copy, or an old mezzanine), "companion" (a combine's second
+    download), "segdir" (Topaz's segment folder: a plan or real chunks — see _plan_only) or
+    "work" (anything costly to redo: renders and their books, masters and their remux segments,
+    the old ProRes, the AI-widened source). A master's stem is the retagged master_stem."""
+    for suffix, part in (("_prob4_upscaled.segments", "segdir"), ("_prob4_upscaled.mov", "work"),
+                         ("_wide.mp4.segments", "work"), ("_wide.mp4", "work")):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)], part
+    m = re.match(r"^(.+)_(?:cfr|mezz)\.[A-Za-z0-9]+$", name)
+    if m:
+        return m.group(1), "cfr"
+    m = re.match(r"^(.+)_mezz\.[A-Za-z0-9]+\.segments$", name)   # the old mezzanine's plan
+    if m:
+        return m.group(1), "segdir"
+    for tag in (DV_TAG, SDR_TAG):
+        i = name.find(tag + ".")
+        if i > 0:
+            return name[:i], "work"
+    m = re.match(r"^(.+)\.companion\.(?:mkv|mp4)$", name)
+    if m:
+        return m.group(1), "companion"
+    m = re.match(r"^(.+)\.revised\.[A-Za-z0-9]+$", name)    # an audio revision's output
+    if m:
+        return m.group(1), "work"
+    stem, ext = os.path.splitext(name)
+    if stem and ext.lower() in _SOURCE_EXTS:
+        return stem, "source"
+    return None
+
+
+def _plan_only(path: str) -> bool:
+    """A segment folder holding only its scene plan — seconds to redo, nothing upscaled yet."""
+    try:
+        return set(os.listdir(path)) <= _PLAN_ONLY
+    except OSError:
+        return False
+
+
+def _queued_items():
+    """([(source_basename, kind, position, skip_key)], complete, paused_uploaders): every item a
+    queue still holds, with its place in its own queue. `complete` is False when any listing could
+    not be read (a cold channel cache, a TV queue not computed yet, any error) — then nothing may
+    be judged unqueued. A PAUSED channel keeps what it already has: its uploader names come back
+    so the reaper leaves those files alone."""
+    import movies
+    import series
+    import youtube
+    items, complete, paused = [], True, set()
+    try:
+        for e in youtube.get_queue():
+            folder = e.get("folder_name") or ""
+            if not folder:
+                continue
+            if e.get("paused"):
+                paused |= {folder, transfer.display_name(folder), transfer.to_wire(folder)}
+            elif youtube._VIDEO_CACHE.get(folder) is None:
+                complete = False
+        for i, v in enumerate(youtube.all_pending()):
+            sb = v.get("source_name") or ""
+            items.append((sb, "youtube", i, os.path.splitext(sb)[0]))
+        for e in youtube._priority():          # SENDS wait for the very next slot (imports are
+            if (e.get("path") and youtube._jumps(e)          # in all_pending at their own place)
+                    and e.get("vid") not in youtube.get_done()):
+                sb = os.path.basename(e["path"])
+                items.append((sb, "youtube", 0, os.path.splitext(sb)[0]))
+    except Exception:  # noqa: BLE001
+        complete = False
+    try:
+        # the order movies RUN in: due ones (pos <= 0) first, then by their slot, list order within
+        sel = list(movies.get_selected())
+        order = sorted(range(len(sel)), key=lambda k: (max(0, movies._pos(sel[k])), k))
+        for i, k in enumerate(order):
+            if sel[k].get("name"):
+                items.append((sel[k]["name"], "movie", i, sel[k]["name"]))
+    except Exception:  # noqa: BLE001
+        complete = False
+    try:
+        shows = list(series.get_active_series())
+        follow = [series.get_next_up(s) for s in shows if series.next_up_armed(s)]
+        for s in shows + [f for f in follow if f]:
+            q = series.cached_queue(s)
+            if q is None:
+                complete = False
+                continue
+            for i, it in enumerate(q.get("remaining_items") or []):
+                if it.get("source_name"):
+                    items.append((it["source_name"], "episode", i,
+                                  f"{s}{Orchestrator.TV_KEY_SEP}{it.get('ep')}"))
+    except Exception:  # noqa: BLE001
+        complete = False
+    return items, complete, paused
+
+
+def _live_stems() -> set:
+    """Stems of everything a stage, a lane or a revision is working on right now."""
+    names = set()
+    cur = ORCH.state.get("current") or {}
+    names |= {cur.get("name"), cur.get("source_name")}
+    cp = ORCH._current_paths
+    if cp is not None:
+        names.add(cp.source_basename)
+    with ORCH._finisher_lock:
+        descs = list(ORCH._finisher_persisted.values())
+    for d in descs:
+        names |= {os.path.basename(v) for v in d.values() if isinstance(v, str)}
+    for lane in ("finishing", "finishing2", "revising"):
+        names.add((ORCH.state.get(lane) or {}).get("source"))
+    try:
+        import history
+        names |= {os.path.basename(p) for p in list(getattr(history, "_revising", ()))}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import nativelane
+        for d in nativelane.held_native_segdirs():
+            names.add(os.path.basename(d)[:-len("_prob4_upscaled.segments")] + ".mkv")
+    except Exception:  # noqa: BLE001
+        pass
+    stems = set()
+    for n in names:
+        if n:
+            stems |= _stem_aliases(n)
+            sp = workfile_split(n)              # a revision's file IS a master: its group is keyed
+            if sp is not None:                  # by the stem before the tag
+                stems.add(sp[0])
+    return stems
+
+
+def _stem_aliases(source_basename: str) -> set:
+    """Every stem one item's files can carry: the source's, and its master's (retagged, DV or SDR)."""
+    stem = os.path.splitext(source_basename)[0]
+    out = {stem}
+    try:
+        out |= {master_stem(source_basename), master_stem(source_basename, sdr=True)}
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def sweep_stale_workfiles(*, dry_run=False, now=None) -> dict:
+    """Clear the scratch of what nothing needs any more. Per item (its files grouped by stem):
+      * LIVE — the item running, finisher-owned, parked or deferred, a native lane's held chunks,
+        an audio revision — or written to within STALE_RECENT_SECONDS: kept.
+      * QUEUED within STALE_KEEP_AHEAD of its turn: kept. Further back, its CHEAP files (the
+        download, its frame-rate copy, a plan-only segment folder) go — they are minutes to redo,
+        and the item downloads again when it comes due. Anything costly (Topaz chunks, a render,
+        a master, remux segments) keeps the whole item.
+      * Permanently REFUSED, or in NO queue at all (a show swapped out, a finished video, a
+        dropped import): every file goes — but only when every queue listing was read, and only
+        an item proven to be pipeline-made (a derived file beside the download, or a video the
+        YouTube books know). A paused channel's files and anything unrecognised are never touched.
+    Never two at once. -> {"removed": {stem: [names]}, "bytes": freed, "why": {stem: reason}}."""
+    if not _STALE_LOCK.acquire(blocking=False):
+        return {"removed": {}, "bytes": 0, "skipped": "a sweep is already running"}
+    try:
+        return _sweep_stale(dry_run, time.time() if now is None else now)
+    finally:
+        _STALE_LOCK.release()
+
+
+def _running_stems() -> set:
+    """The item the run thread holds THIS moment — re-read just before each group goes, since
+    the run thread can pick one up while a sweep is under way."""
+    names = set()
+    cur = ORCH.state.get("current") or {}
+    names |= {cur.get("name"), cur.get("source_name")}
+    cp = ORCH._current_paths
+    if cp is not None:
+        names.add(cp.source_basename)
+    out = set()
+    for n in names:
+        if n:
+            out |= _stem_aliases(n)
+    return out
+
+
+def _sweep_stale(dry_run, now):
+    import youtube
+    main = scratch.default_scratch()
+    try:
+        names = os.listdir(main)
+    except OSError:
+        return {"removed": {}, "bytes": 0}
+    groups = {}                                     # stem -> {name: part}
+    for n in names:
+        if n.startswith("."):
+            continue
+        sp = workfile_split(n)
+        if sp is not None:
+            groups.setdefault(sp[0], {})[n] = sp[1]
+    if not groups:
+        return {"removed": {}, "bytes": 0}
+    items, complete, paused = _queued_items()
+    live = _live_stems()
+    skip = ORCH._selection_skip()
+    refused = set(ORCH._refused)
+    index, by_vid = {}, {}
+    for sb, kind, pos, key in items:
+        for st in _stem_aliases(sb):
+            if st not in index or pos < index[st][1]:
+                index[st] = (kind, pos, key)
+        vid = _yt_workfile_vid(sb)
+        if kind == "youtube" and vid and (vid not in by_vid or pos < by_vid[vid][1]):
+            by_vid[vid] = (kind, pos, key)
+    done = youtube.get_done()
+    known_yt = done | set(youtube._durations()) | set(youtube._published())
+    in_book = {e.get("vid") for e in youtube._priority()}       # sends AND imports, paused or not
+    channels = set()
+    for e in youtube.get_queue():
+        f = e.get("folder_name") or ""
+        if f:
+            channels |= {f, transfer.display_name(f), transfer.to_wire(f)}
+    removed, why, freed, orphans = {}, {}, 0, set()
+    for stem, parts in groups.items():
+        if stem in live:
+            continue
+        paths = {n: os.path.join(main, n) for n in parts}
+        try:
+            newest = max(os.path.getmtime(p) for p in paths.values())
+        except OSError:
+            continue
+        if now - newest < STALE_RECENT_SECONDS:
+            continue
+        if any(n.startswith(f + " - ") for n in parts for f in paused):
+            continue                                # a paused channel keeps what it has
+        vid = next((v for v in (_yt_workfile_vid(n) for n in parts) if v), "")
+        keys = {stem} | {n for n, part in parts.items() if part == "source"}
+        if keys & skip:
+            continue                                # parked, deferred, or the finisher's
+        hit = index.get(stem) or (by_vid.get(vid) if vid else None)
+        cheap = all(part in ("source", "cfr")
+                    or (part == "segdir" and _plan_only(paths[n])) for n, part in parts.items())
+        if hit:
+            kind, pos, key = hit
+            if key in refused:
+                reason = "refused for good"
+            elif key in skip:
+                continue                            # parked, deferred, or the finisher's
+            elif pos < STALE_KEEP_AHEAD.get(kind, 3) or not cheap:
+                continue
+            else:
+                reason = f"#{pos + 1} in its queue — downloads again when it comes due"
+        else:
+            if not complete:
+                continue
+            is_yt = bool(vid) and (vid in known_yt or vid in in_book)
+            if is_yt and vid not in done:
+                # A YouTube video is judged by the BOOKS, never by a staging listing (a failed
+                # FTP listing reads as an empty folder): one still in the send/import book, or
+                # from a channel still queued, is kept until it is done.
+                if vid in in_book or any(n.startswith(c + " - ") for n in parts for c in channels):
+                    continue
+            derived = any(part != "source" for part in parts.values())
+            if not (derived or is_yt):
+                continue                            # a lone file nothing proves is ours
+            orphans.add(stem)
+            first = _ORPHAN_SEEN.setdefault(stem, now) if not dry_run else _ORPHAN_SEEN.get(stem, now)
+            if now - first < STALE_CONFIRM_SECONDS and not dry_run:
+                continue                            # confirmed by the next sweep, or not at all
+            reason = "no longer queued"
+        if stem in _running_stems():
+            continue                                # picked up while this sweep ran
+        for n, path in paths.items():
+            size = _tree_bytes(path)
+            if not dry_run:
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except OSError:
+                    continue
+            removed.setdefault(stem, []).append(n)
+            freed += size
+        if stem in removed:
+            why[stem] = reason
+    if not dry_run:
+        for st in list(_ORPHAN_SEEN):               # forget what is queued again (or gone)
+            if st not in orphans or st in removed:
+                _ORPHAN_SEEN.pop(st, None)
+    if removed and not dry_run:
+        logbook.event(f"scratch: cleared {freed / 1e9:.1f} GB — {len(removed)} item(s) nothing needs "
+                      f"now (" + "; ".join(f"{transfer.display_name(s)[:60]}: {why[s]}"
+                                           for s in list(removed)[:6])
+                      + (" …" if len(removed) > 6 else "") + ")")
+    out = {"removed": removed, "bytes": freed, "why": why, "complete": complete}
+    if dry_run:
+        out["dry_run"] = True
+    return out
+
+
 def apply_container(p: EpisodePaths) -> EpisodePaths:
     """Lock the CFR INTERMEDIATE's container to what the LOCAL source needs — MKV for lossless
     audio (TrueHD/DTS-HD MA/PCM/FLAC) or bitmap subtitles (PGS/VOBSUB), else MP4 — by probing
@@ -2253,7 +2567,8 @@ class Orchestrator:
                                  ("finisher2", self._finisher2),   # 2nd remux lane (backlog-drain only)
                                  ("power_monitor", self._power_monitor), ("dimmer", self._dimmer),
                                  ("prefetch", self._prefetch), ("plex_monitor", self._plex_monitor),
-                                 ("priority_locator", self._priority_locator)):
+                                 ("priority_locator", self._priority_locator),
+                                 ("scratch_reaper", self._scratch_reaper)):
                 self._ensure(name, target)
         # The Dolby Vision profile 7 -> 8.1 lane runs BESIDE the pipeline for as long as the run is
         # on: it needs no GPU and takes no turn from an episode, only transfers and a remux
@@ -4537,6 +4852,28 @@ class Orchestrator:
                 eta_model.add_k_sample(eta_math.clamp_k(k))
         except Exception:
             pass
+
+    def _scratch_reaper(self):
+        """While activated: sweep_stale_workfiles every STALE_SWEEP_SECONDS (the first one shortly
+        after activation, once the queue caches have warmed). Never raises."""
+        wait = STALE_FIRST_SWEEP_SECONDS
+        while self._enabled:
+            if self._sleep_while_enabled(wait):
+                break
+            wait = STALE_SWEEP_SECONDS
+            try:
+                sweep_stale_workfiles()
+            except Exception as e:  # noqa: BLE001 — housekeeping must never cost the run
+                logbook.exception("scratch reaper", e)
+
+    def _sleep_while_enabled(self, secs) -> bool:
+        """Sleep `secs` in short steps; True as soon as the run is deactivated."""
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if not self._enabled:
+                return True
+            time.sleep(min(5.0, max(0.0, end - time.monotonic())))
+        return not self._enabled
 
     def _set_finishing_progress(self, info):
         """The finisher's own progress surface (state['finishing']) — NEVER _set_progress, whose

@@ -527,9 +527,12 @@ def get_queue() -> list:
 
 
 def _save_queue(items) -> None:
+    # ATOMIC: several threads write this, and a reader mid-write must never see "no channels"
     os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
-    with open(QUEUE_FILE, "w") as f:
+    tmp = f"{QUEUE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(items, f)
+    os.replace(tmp, QUEUE_FILE)
 
 
 _QUEUE_LOCK = threading.Lock()

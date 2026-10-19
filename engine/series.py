@@ -544,9 +544,13 @@ def get_selection():
 
 
 def _write_selection_file(d: dict) -> dict:
+    # ATOMIC: a reader mid-write must never see an empty file — it would read as "no shows",
+    # and the scratch reaper treats what no queue holds as no longer needed (review 2026-10-19)
     os.makedirs(os.path.dirname(SELECTION_FILE), exist_ok=True)
-    with open(SELECTION_FILE, "w") as f:
+    tmp = f"{SELECTION_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(d, f)
+    os.replace(tmp, SELECTION_FILE)
     return d
 
 

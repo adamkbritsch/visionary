@@ -13,6 +13,7 @@ import ftplib
 import io
 import json
 import os
+import threading
 import re
 
 from transfer import (connect as ftp_connect, ftp_listdir, ftp_listdir_sized,
@@ -328,9 +329,13 @@ def get_selected() -> list:
 
 
 def _save_selected(items) -> None:
+    # ATOMIC: a reader mid-write must never see an empty queue (the scratch reaper would take
+    # every queued movie's working files for unneeded — review 2026-10-19)
     os.makedirs(os.path.dirname(SELECTED_FILE), exist_ok=True)
-    with open(SELECTED_FILE, "w") as f:
+    tmp = f"{SELECTED_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(items, f)
+    os.replace(tmp, SELECTED_FILE)
 
 
 def _pos(item) -> int:

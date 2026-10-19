@@ -1513,6 +1513,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_youtube_queue(body or {}))
         elif path == "/api/refresh-library":
             self._json(api_refresh_library())
+        elif path == "/api/scratch-sweep":
+            # The scratch reaper on demand (it also runs every 15 min while activated):
+            # dry_run reports what would go, and why, without deleting anything.
+            self._json(orchestrator.sweep_stale_workfiles(dry_run=bool(body.get("dry_run"))))
         elif path == "/api/detect-preset":
             self._json(api_detect_preset(
                 (body.get("kind") or "tv").strip(),

@@ -6259,3 +6259,278 @@ class CaffeinateAndTheLid(unittest.TestCase):
             o._enabled = False
             o._start_caffeinate()
         self.assertEqual(set(wants), {False})
+
+
+class StaleWorkfileReaper(unittest.TestCase):
+    """User, 2026-10-19: "the cached files are still having a hard time clearing out once
+    they're no longer needed" — 130 GB of a swapped-out show's deferred episodes, YouTube
+    videos started weeks ago and rotated far back, and finished videos. The reaper asks, per
+    item on the scratch, what still needs it."""
+
+    OLD = 2 * 3600
+
+    def setUp(self):
+        import youtube
+        self.dir = tempfile.mkdtemp()
+        self.items, self.complete, self.paused = [], True, set()
+        self.live, self.skip, self.refused = set(), set(), {}
+        ps = [mock.patch.object(orch.scratch, "default_scratch", return_value=self.dir),
+              mock.patch.object(orch, "_queued_items",
+                                side_effect=lambda: (self.items, self.complete, self.paused)),
+              mock.patch.object(orch, "_live_stems", side_effect=lambda: set(self.live)),
+              mock.patch.object(orch.ORCH, "_selection_skip", side_effect=lambda: set(self.skip)),
+              mock.patch.object(orch.ORCH, "_refused", self.refused),
+              mock.patch.object(youtube, "get_done", side_effect=lambda: set(self.done)),
+              mock.patch.object(youtube, "_durations", return_value={}),
+              mock.patch.object(youtube, "_published", return_value={}),
+              mock.patch.object(youtube, "_priority", side_effect=lambda: list(self.book)),
+              mock.patch.object(youtube, "get_queue", side_effect=lambda: list(self.channels)),
+              mock.patch.object(orch, "_running_stems", side_effect=lambda: set(self.running))]
+        self.done, self.book, self.channels, self.running = set(), [], [], set()
+        for p in ps:
+            p.start()
+            self.addCleanup(p.stop)
+        orch._ORPHAN_SEEN.clear()
+        self.addCleanup(orch._ORPHAN_SEEN.clear)
+
+    def _twice(self):
+        """Two sweeps STALE_CONFIRM_SECONDS apart: what "no longer queued" needs."""
+        t = time.time()
+        orch.sweep_stale_workfiles(now=t)
+        return orch.sweep_stale_workfiles(now=t + orch.STALE_CONFIRM_SECONDS + 1)
+
+    def _item(self, stem, *, ext=".mkv", chunks=False, age=None, extra=()):
+        made = []
+        for n in (stem + ext, stem + "_cfr.mp4") + tuple(extra):
+            with open(os.path.join(self.dir, n), "wb") as f:
+                f.write(b"x" * 100)
+            made.append(n)
+        seg = os.path.join(self.dir, stem + "_prob4_upscaled.segments")
+        os.makedirs(seg)
+        with open(os.path.join(seg, "scenes.json"), "w") as f:
+            f.write("{}")
+        if chunks:
+            with open(os.path.join(seg, "seg_0000.mov"), "wb") as f:
+                f.write(b"y" * 1000)
+        made.append(os.path.basename(seg))
+        t = time.time() - (self.OLD if age is None else age)
+        for n in made:
+            os.utime(os.path.join(self.dir, n), (t, t))
+        return made
+
+    def _left(self):
+        return set(os.listdir(self.dir))
+
+    def test_a_swapped_out_shows_episodes_go(self):
+        made = self._item("Rick and Morty - S02E10 - The Wedding Squanchers")
+        orch.sweep_stale_workfiles()
+        self.assertEqual(self._left(), set(made))       # one sweep only marks it
+        out = self._twice()
+        self.assertFalse(self._left() & set(made))
+        self.assertEqual(out["why"]["Rick and Morty - S02E10 - The Wedding Squanchers"], "no longer queued")
+        self.assertEqual(out["bytes"], 202)
+
+    def test_nothing_is_judged_unqueued_on_an_incomplete_listing(self):
+        made = self._item("Show - S01E01")
+        self.complete = False
+        self._twice()
+        self.assertEqual(self._left(), set(made))
+
+    def test_live_and_recent_items_are_never_touched(self):
+        a = self._item("Live - S01E01")
+        b = self._item("Fresh - S01E01", age=60)
+        self.live = {"Live - S01E01"}
+        orch.sweep_stale_workfiles()
+        self.assertEqual(self._left(), set(a) | set(b))
+
+    def test_near_the_front_keeps_far_back_releases_cheap_files_only(self):
+        near = self._item("Ch - near [aaaaaaaaaa1]", ext=".mp4")
+        far = self._item("Ch - far [aaaaaaaaaa2]", ext=".mp4")
+        costly = self._item("Ch - costly [aaaaaaaaaa3]", ext=".mp4", chunks=True)
+        self.items = [("Ch - near [aaaaaaaaaa1].mp4", "youtube", 2, "Ch - near [aaaaaaaaaa1]"),
+                      ("Ch - far [aaaaaaaaaa2].mp4", "youtube", 40, "Ch - far [aaaaaaaaaa2]"),
+                      ("Ch - costly [aaaaaaaaaa3].mp4", "youtube", 40, "Ch - costly [aaaaaaaaaa3]")]
+        out = orch.sweep_stale_workfiles()
+        self.assertEqual(self._left(), set(near) | set(costly))
+        self.assertTrue(out["why"]["Ch - far [aaaaaaaaaa2]"].startswith("#41 in its queue"))
+
+    def test_parked_or_deferred_items_are_kept_refused_ones_go(self):
+        parked = self._item("Show - S01E01")
+        gone = self._item("Show - S01E02")
+        sep = orch.Orchestrator.TV_KEY_SEP
+        self.items = [("Show - S01E01.mkv", "episode", 9, f"Show{sep}S01E01"),
+                      ("Show - S01E02.mkv", "episode", 0, f"Show{sep}S01E02")]
+        self.skip = {f"Show{sep}S01E01"}
+        self.refused[f"Show{sep}S01E02"] = "permanent: already Dolby Vision"
+        orch.sweep_stale_workfiles()
+        self.assertEqual(self._left(), set(parked))
+        self.assertTrue(gone)
+
+    def test_a_lone_file_needs_proof_it_is_ours(self):
+        import youtube
+        for n in ("holiday video.mp4", "Ch - done [bbbbbbbbbb1].mp4"):
+            p = os.path.join(self.dir, n)
+            with open(p, "wb") as f:
+                f.write(b"x")
+            os.utime(p, (time.time() - self.OLD,) * 2)
+        self.done = {"bbbbbbbbbb1"}
+        self._twice()
+        self.assertEqual(self._left(), {"holiday video.mp4"})
+
+    def test_a_paused_channel_keeps_what_it_has(self):
+        made = self._item("Paused Ch - video [cccccccccc1]", ext=".mp4")
+        self.paused = {"Paused Ch"}
+        orch.sweep_stale_workfiles()
+        self.assertEqual(self._left(), set(made))
+
+    def test_unrecognised_entries_are_never_touched(self):
+        os.makedirs(os.path.join(self.dir, "_repair"))
+        os.makedirs(os.path.join(self.dir, "prefetch"))
+        with open(os.path.join(self.dir, "notes.txt"), "w") as f:
+            f.write("x")
+        for n in ("_repair", "prefetch", "notes.txt"):
+            os.utime(os.path.join(self.dir, n), (time.time() - self.OLD,) * 2)
+        self._twice()
+        self.assertEqual(self._left(), {"_repair", "prefetch", "notes.txt"})
+
+    def test_a_retagged_master_belongs_to_its_queued_item(self):
+        src = "Show - S01E01 - Pilot 1080p x264.mkv"
+        master = orch.master_stem(src) + orch.DV_TAG + ".mkv.remuxsegs"
+        self.assertNotEqual(orch.master_stem(src), os.path.splitext(src)[0])
+        os.makedirs(os.path.join(self.dir, master))
+        os.utime(os.path.join(self.dir, master), (time.time() - self.OLD,) * 2)
+        sep = orch.Orchestrator.TV_KEY_SEP
+        self.items = [(src, "episode", 0, f"Show{sep}S01E01")]
+        orch.sweep_stale_workfiles()
+        self.assertIn(master, self._left())
+
+    def test_a_dry_run_deletes_nothing(self):
+        made = self._item("Gone - S01E01")
+        out = orch.sweep_stale_workfiles(dry_run=True)
+        self.assertEqual(self._left(), set(made))
+        self.assertTrue(out["dry_run"])
+        self.assertIn("Gone - S01E01", out["removed"])
+
+    def test_workfile_names(self):
+        ws = orch.workfile_split
+        self.assertEqual(ws("A - x [id00000000a].mp4"), ("A - x [id00000000a]", "source"))
+        self.assertEqual(ws("A_cfr.mkv"), ("A", "cfr"))
+        self.assertEqual(ws("A_prob4_upscaled.segments"), ("A", "segdir"))
+        self.assertEqual(ws("A" + orch.DV_TAG + ".mov.best"), ("A", "work"))
+        self.assertEqual(ws("A" + orch.SDR_TAG + ".mkv.remuxsegs"), ("A", "work"))
+        self.assertEqual(ws("A.companion.mkv"), ("A", "companion"))
+        self.assertEqual(ws("A_mezz.mp4.segments"), ("A", "segdir"))
+        self.assertEqual(ws("Ch - v [eeeeeeeeee1].revised.mkv"), ("Ch - v [eeeeeeeeee1]", "work"))
+        self.assertEqual(ws("A.vob"), ("A", "source"))
+        self.assertIsNone(ws("prefetch"))
+        self.assertIsNone(ws("notes.txt"))
+
+    # ---- review 2026-10-19 ---------------------------------------------------------------
+    def test_a_failed_listing_never_costs_a_queued_channels_video(self):
+        # the channel's FTP listing failed (cached as []), so the video is in no pending list
+        import youtube
+        made = self._item("Ch - pending [ffffffffff1]", ext=".mp4")
+        self.channels = [{"folder_name": "Ch"}]
+        with mock.patch.object(youtube, "_durations", return_value={"ffffffffff1": 900}):
+            self._twice()
+        self.assertEqual(self._left(), set(made))
+
+    def test_a_finished_video_of_a_queued_channel_goes(self):
+        made = self._item("Ch - finished [ffffffffff2]", ext=".mp4")
+        self.channels = [{"folder_name": "Ch"}]
+        self.done = {"ffffffffff2"}
+        self._twice()
+        self.assertFalse(self._left() & set(made))
+
+    def test_a_paused_import_keeps_what_it_has(self):
+        made = self._item("Uploader - imported [ffffffffff3]", ext=".mp4")
+        self.book = [{"vid": "ffffffffff3", "jump": False, "batch": "imp1"}]
+        self._twice()
+        self.assertEqual(self._left(), set(made))
+
+    def test_a_parked_item_nobody_queues_is_kept(self):
+        made = self._item("Ch2 - parked at upload [ffffffffff4]", ext=".mp4")
+        self.done = {"ffffffffff4"}
+        self.skip = {"Ch2 - parked at upload [ffffffffff4]"}
+        self._twice()
+        self.assertEqual(self._left(), set(made))
+
+    def test_a_channel_named_with_a_dash_stays_paused(self):
+        made = self._item("Ch - The Show - a video [ffffffffff5]", ext=".mp4")
+        self.paused = {"Ch - The Show"}
+        self.done = {"ffffffffff5"}
+        self._twice()
+        self.assertEqual(self._left(), set(made))
+
+    def test_an_item_picked_up_mid_sweep_is_kept(self):
+        made = self._item("Show - S09E09")
+        self.running = {"Show - S09E09"}
+        self._twice()
+        self.assertEqual(self._left(), set(made))
+
+    def test_a_companion_download_is_not_cheap(self):
+        made = self._item("Movie (2020)", extra=("Movie (2020).companion.mkv",))
+        self.items = [("Movie (2020).mkv", "movie", 5, "Movie (2020).mkv")]
+        orch.sweep_stale_workfiles()
+        self.assertEqual(self._left(), set(made))
+
+    def test_a_queued_again_item_is_forgotten(self):
+        self._item("Back - S01E01")
+        t = time.time()
+        orch.sweep_stale_workfiles(now=t)
+        self.items = [("Back - S01E01.mkv", "episode", 0, "Back" + orch.Orchestrator.TV_KEY_SEP + "S01E01")]
+        orch.sweep_stale_workfiles(now=t + 1)
+        self.assertNotIn("Back - S01E01", orch._ORPHAN_SEEN)
+
+
+class LiveStemsCoverEveryOwner(unittest.TestCase):
+    def test_running_finisher_and_revision_items_are_live(self):
+        import nativelane
+        o = orch.ORCH
+        with mock.patch.dict(o.state, {"current": {"source_name": "Run - S01E01.mkv"},
+                                       "finishing": {"source": "Fin - S01E02.mkv"},
+                                       "revising": {"source": "Rev HDR10 DV upscaled.mkv"}}), \
+             mock.patch.object(o, "_current_paths", None), \
+             mock.patch.object(o, "_finisher_persisted",
+                               {"x": {"kind": "youtube", "video_path": "/s/Ch/Ch - v [dddddddddd1].mp4"}}), \
+             mock.patch.object(nativelane, "held_native_segdirs",
+                               return_value=["/scr/Held - S01E03_prob4_upscaled.segments"]):
+            live = orch._live_stems()
+        for stem in ("Run - S01E01", "Fin - S01E02", "Rev",
+                     "Ch - v [dddddddddd1]", "Held - S01E03"):
+            self.assertIn(stem, live)
+
+
+class QueuedItemsKnowWhenTheyAreIncomplete(unittest.TestCase):
+    def _run(self, *, cache, tv, movies_patched=False):
+        import contextlib, movies, series, youtube
+        sel = (contextlib.nullcontext() if movies_patched
+               else mock.patch.object(movies, "get_selected", return_value=[{"name": "M.mkv"}]))
+        with mock.patch.object(youtube, "get_queue", return_value=[{"folder_name": "Ch"}]), \
+             mock.patch.dict(youtube._VIDEO_CACHE, cache, clear=True), \
+             mock.patch.object(youtube, "all_pending", return_value=[]), \
+             mock.patch.object(youtube, "_priority", return_value=[]), \
+             sel, \
+             mock.patch.object(series, "get_active_series", return_value=["Show"]), \
+             mock.patch.object(series, "next_up_armed", return_value=False), \
+             mock.patch.object(series, "cached_queue", return_value=tv):
+            return orch._queued_items()
+
+    def test_movies_count_in_the_order_they_run(self):
+        import movies
+        with mock.patch.object(movies, "get_selected",
+                               return_value=[{"name": "A.mkv", "pos": 3}, {"name": "B.mkv", "pos": 0}]):
+            items, _c, _p = self._run(cache={"Ch": []}, tv={"remaining_items": []}, movies_patched=True)
+        self.assertIn(("B.mkv", "movie", 0, "B.mkv"), items)
+        self.assertIn(("A.mkv", "movie", 1, "A.mkv"), items)
+
+    def test_all_read(self):
+        items, complete, _p = self._run(cache={"Ch": []},
+                                        tv={"remaining_items": [{"ep": "S01E02", "source_name": "e2.mkv"}]})
+        self.assertTrue(complete)
+        self.assertIn(("e2.mkv", "episode", 0, "Show" + orch.Orchestrator.TV_KEY_SEP + "S01E02"), items)
+        self.assertIn(("M.mkv", "movie", 0, "M.mkv"), items)
+
+    def test_a_cold_channel_or_tv_queue_is_incomplete(self):
+        self.assertFalse(self._run(cache={}, tv={"remaining_items": []})[1])
+        self.assertFalse(self._run(cache={"Ch": []}, tv=None)[1])
