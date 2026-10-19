@@ -13,7 +13,7 @@ BIN="$TMP/Visionary"
 BUNDLE_ID="${BUNDLE_ID:-com.visionary.upscaler}"
 # --release [version]: also produce a version-stamped distributable zip in dist/.
 RELEASE=0
-VERSION="${VISIONARY_VERSION:-0.6}"
+VERSION="${VISIONARY_VERSION:-0.7}"
 if [ "${1:-}" = "--release" ]; then
   RELEASE=1
   [ -n "${2:-}" ] && VERSION="$2"
@@ -85,6 +85,9 @@ rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' "$RO
 # in-app Setup section's "Upload to NAS" uses it):
 mkdir -p "$APP/Contents/Resources/nas"
 cp "$ROOT/nas/dv_probe.py" "$APP/Contents/Resources/nas/dv_probe.py"
+# The pinned Dolby Vision toolchain files (dv/README.md): the server installs a missing one at
+# launch (engine/dvinstall.py). Copied byte-exact — they are checked by sha256.
+rsync -a --delete "$ROOT/dv/" "$APP/Contents/Resources/dv/"
 cp "$BIN" "$APP/Contents/MacOS/Visionary"
 # Sign with the STABLE self-signed identity (see setup-signing-cert.sh) so TCC keys on
 # the cert-based designated requirement, not the binary hash — grants then survive

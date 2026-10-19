@@ -55,12 +55,12 @@ Watch `topaz_version`. It must report the exact pin (`7.0.1` — from `engine/ve
 ### Step 4 — Dolby Vision toolchain
 `native_dv` check (severity fail — part of the arm gate). It verifies hdr_analyzer_mvp by
 sha256 AND runs it, the LUT by sha256, dovi_tool's exact version and ffmpeg's major.
-- hdr_analyzer_mvp: build tinof/hdr-analyze at the pinned commit (README step 4 has the
-  commands) and copy it to `~/.topaz-pipeline/bin/hdr_analyzer_mvp`. A `does not run`
-  result after a `brew upgrade ffmpeg` means its libraries moved: reinstall ffmpeg 8 or
-  rebuild.
-- The LUT (`~/.topaz-pipeline/luts/rcm_sdr709_to_pq1000.cube`) is not in this repo. If it
-  is missing, say so plainly — do not substitute another file (it IS the colour conversion).
+- hdr_analyzer_mvp and the LUT ship in `dv/` (dv/README.md). The app installs a missing one at
+  launch; from a clone run `python3 engine/dvinstall.py` (`--repair` also replaces a file that
+  is not the pinned one, keeping it beside as `.replaced-<stamp>`). Never substitute another
+  LUT — it IS the colour conversion.
+- A `does not run` result after a `brew upgrade ffmpeg` means the analyzer's libraries moved
+  (it links Homebrew's ffmpeg 8 at /opt/homebrew/opt/ffmpeg): reinstall ffmpeg 8 and pin it.
 
 ### Step 5 — Python dependency
 `python_deps` probes `/usr/bin/python3` specifically (the app's engine interpreter; the

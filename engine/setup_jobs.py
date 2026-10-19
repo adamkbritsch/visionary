@@ -28,6 +28,9 @@ TARGETS = {
     "brew_tools": {"cmd": f'for f in ffmpeg x265 dovi_tool gpac; do {BREW} list --versions "$f" '
                           f'>/dev/null 2>&1 || {BREW} install "$f"; done',
                    "needs_brew": True},
+    # the bundled Dolby Vision toolchain files (dv/): argv computed by the caller (engine/
+    # dvinstall.py --repair with the bundle's Resources dir) — copies the pinned analyzer and LUT
+    "dv_toolchain": {"cmd": None},
     "python_deps": {"cmd": "/usr/bin/python3 -m pip install --user opencv-python || "
                            "(/usr/bin/python3 -m ensurepip --user && "
                            "/usr/bin/python3 -m pip install --user opencv-python)"},

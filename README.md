@@ -41,7 +41,7 @@ Arm it in the evening; wake up to finished episodes.
 > |---|---|
 > | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro (M1/M2) or a MacBook Air can't sustain the power draw and is refused; a laptop too new for the model lists is judged by its live charger reading instead (see below). |
 > | Topaz Video AI | **7.0.1** — this exact build |
-> | Dolby Vision™ toolchain | Homebrew **ffmpeg 8** and **dovi_tool 2.3.0** (both pinned), **hdr_analyzer_mvp** built from [tinof/hdr-analyze](https://github.com/tinof/hdr-analyze) at commit `383b0ad`, and the pinned SDR→PQ LUT — see [step 4](#4-dolby-vision-toolchain) |
+> | Dolby Vision™ toolchain | Homebrew **ffmpeg 8** and **dovi_tool 2.3.0** (both pinned). The other two pieces — the **hdr_analyzer_mvp** build and the **SDR→PQ LUT** — ship with Visionary in [`dv/`](dv/README.md) and install themselves — see [step 4](#4-dolby-vision-toolchain) |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
 > | AI border extension | **optional.** Requires the **[Comfy Desktop](https://www.comfy.org/) app** (run once so it builds its ComfyUI + venv — a hand-cloned ComfyUI is not detected), its **ComfyUI-VideoHelperSuite** node from Manager, and ~11.4 GB of WAN 2.1 models Visionary downloads for you from Settings → Setup. Without all of it, everything else works unchanged — the feature simply never appears. See [step 11](#11-ai-border-extension--optional-only-for-43-shows). |
@@ -65,13 +65,11 @@ The easy path — no clone, no Terminal for most of it:
    Translocation).
 3. **Right-click → Open** the first time (the app isn't notarized; macOS asks once).
 4. Install **Topaz Video AI 7.0.1**, the exact build (link in step 2 of the manual path
-   below). It is licensed software; the app detects it but can't install it for you. Then
-   set up the [Dolby Vision™ toolchain](#4-dolby-vision-toolchain).
+   below). It is licensed software; the app detects it but can't install it for you.
 5. Open the **gear → Settings → Setup** section. Everything else lives there, with a
    live check beside each item: your NAS connection (and the optional Plex / TMDb /
-   youtarr / Shuttle fields), **one-click installs** for the command-line dependencies, a
-   check of the Dolby Vision™ toolchain, and the optional NAS DV-probe helper with its cron
-   line. The
+   youtarr / Shuttle fields), **one-click installs** for the command-line dependencies and
+   the Dolby Vision™ toolchain, and the optional NAS DV-probe helper with its cron line. The
    section stays expanded until every check is green, then tucks itself away.
 6. *Optional* — want [4:3 shows widened to 16:9](#11-ai-border-extension--optional-only-for-43-shows)?
    Install the free **[Comfy Desktop](https://www.comfy.org/)** app, **launch it once**,
@@ -130,30 +128,34 @@ brew install ffmpeg x265 dovi_tool gpac
 brew pin ffmpeg dovi_tool     # the Dolby Vision step is pinned to ffmpeg 8 and dovi_tool 2.3.0
 ```
 
-The Dolby Vision step needs **ffmpeg 8** and **dovi_tool 2.3.0** exactly. If Homebrew has already
-moved past them, install those versions instead (ffmpeg 8 is the `ffmpeg@8` formula; dovi_tool
-2.3.0 is on its [releases page](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.0)) and pin
-them — an upgrade later fails the `native_dv` check, and the app will not arm.
+The Dolby Vision step needs **ffmpeg 8** and **dovi_tool 2.3.0** exactly, and pinning keeps a later
+`brew upgrade` from moving them — an upgrade fails the `native_dv` check, and the app will not
+arm. If Homebrew has already moved past them: dovi_tool 2.3.0 is on its
+[releases page](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.0); for ffmpeg, the bundled
+analyzer links Homebrew's `ffmpeg` at `/opt/homebrew/opt/ffmpeg`, so install the `ffmpeg@8`
+formula, `brew link --force ffmpeg@8`, and point that path at it
+(`ln -s ffmpeg@8 /opt/homebrew/opt/ffmpeg`).
 
 ### 4. Dolby Vision™ toolchain
 
-Two more pieces, both checked by preflight's `native_dv` row (by sha256, and the analyzer
-is actually run). Both pins name the maintainer's own files: a binary you build yourself hashes
-differently, and neither file is distributed with this repository yet.
+Two more pieces ship with Visionary in [`dv/`](dv/README.md), so there is nothing to build or
+download:
 
-- **hdr_analyzer_mvp** — build [tinof/hdr-analyze](https://github.com/tinof/hdr-analyze) at
-  commit `383b0ad` against Homebrew ffmpeg 8, and copy the binary to
-  `~/.topaz-pipeline/bin/hdr_analyzer_mvp`:
+- **hdr_analyzer_mvp** — a build of [tinof/hdr-analyze](https://github.com/tinof/hdr-analyze)
+  (MIT) at commit `383b0ad`, which measures every shot of the picture.
+- **The SDR→PQ LUT** — the one colour conversion every SDR source goes through (BT.709 SDR to
+  BT.2020 PQ at 1000 nits).
 
-  ```bash
-  git clone https://github.com/tinof/hdr-analyze.git && cd hdr-analyze
-  git checkout 383b0ad && cargo build --release -p hdr_analyzer_mvp
-  mkdir -p ~/.topaz-pipeline/bin && cp target/release/hdr_analyzer_mvp ~/.topaz-pipeline/bin/
-  ```
+The app copies a missing one to its place (`~/.topaz-pipeline/bin/`, `~/.topaz-pipeline/luts/`)
+when it launches; **Settings → Setup → Dolby Vision toolchain → Install** also replaces one that
+isn't the pinned file. From a clone:
 
-- **The SDR→PQ LUT** — `~/.topaz-pipeline/luts/rcm_sdr709_to_pq1000.cube`, the one colour
-  conversion every SDR source goes through (BT.709 SDR to BT.2020 PQ at 1000 nits), pinned
-  by sha256. It is not distributed in this repository.
+```bash
+python3 engine/dvinstall.py          # add --repair to replace a mismatched file
+```
+
+Preflight's `native_dv` row checks both by sha256 (and actually runs the analyzer), together
+with the ffmpeg and dovi_tool versions from step 3.
 
 ### 5. Python dependency (for the SYSTEM python)
 
@@ -662,6 +664,7 @@ everything, including Plex detection.
 |---|---|
 | `engine/` | the Python pipeline (orchestrator, stages, preflight, dashboard server) |
 | `macapp/` | the SwiftUI app + build/signing scripts |
+| `dv/` | the pinned Dolby Vision toolchain files: the hdr_analyzer_mvp build and the SDR→PQ LUT |
 | `bundle/` | Topaz presets (reference only) |
 | `nas/` | optional NAS-side helper (`dv_probe.py`) |
 | `tools/` | maintainer-only checks (end-to-end route runs, CPU measurements) |
@@ -716,7 +719,9 @@ everything, including Plex detection.
 ## Legal
 
 © 2026 Adam Britsch. Topaz Video AI, Plex, and Dolby Vision™ are trademarks of their
-respective owners; you must own a license for Topaz Video AI.
+respective owners; you must own a license for Topaz Video AI. `dv/hdr_analyzer_mvp` is a build of
+[hdr-analyze](https://github.com/tinof/hdr-analyze), © 2025 HDR-Analyze Contributors, MIT
+licensed ([`dv/LICENSE.hdr-analyze`](dv/LICENSE.hdr-analyze)).
 Use this only on content you legally own.
 
 ---

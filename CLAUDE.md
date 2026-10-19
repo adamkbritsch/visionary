@@ -29,9 +29,11 @@ installs — prefer it. The operating loop:
   `MODELS_BELOW_140W`, because a 140 W brick in a 96 W-max machine still REPORTS 140 W.
   Extend those lists for new Macs — never guess a model into MODELS_140W (an unknown
   laptop already falls back to the live reading).
-- **Never replace the LUT** (`~/.topaz-pipeline/luts/rcm_sdr709_to_pq1000.cube`, pinned by
-  sha256). It IS the SDR→PQ conversion; any other file changes the picture. Archived
-  copies with a sha256 manifest live in `~/.topaz-pipeline/archive/` and on the NAS.
+- **Never replace the LUT or the analyzer** with anything but the pinned files in `dv/`
+  (installed to `~/.topaz-pipeline/luts/` and `~/.topaz-pipeline/bin/` by
+  `engine/dvinstall.py`, pinned by sha256 in `versions.py`). The LUT IS the SDR→PQ
+  conversion; any other file changes the picture. Archived copies with a sha256 manifest
+  also live in `~/.topaz-pipeline/archive/` and on the NAS.
 - **Never commit or print secrets.** `~/.topaz-pipeline/config.json` and `.env` are
   gitignored for a reason. Ask the user to fill values in; never echo tokens/passwords
   back into chat, logs, or commits.

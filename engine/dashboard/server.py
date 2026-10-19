@@ -852,7 +852,7 @@ def selftest_full():
 
 # ---- in-app Setup (onboarding) ---------------------------------------------------
 # RESOURCES_DIR: Contents/Resources in the bundle, the repo root in a checkout — both
-# hold engine/ beside nas/ (build.sh ships both).
+# hold engine/ beside nas/ and dv/ (build.sh ships all three).
 RESOURCES_DIR = os.path.dirname(ENGINE_DIR)
 
 _FULL_PREFLIGHT = {"t": 0.0, "result": None}    # 5 s cache (a full offline pass ≈ 1.4 s)
@@ -1575,6 +1575,10 @@ class Handler(BaseHTTPRequestHandler):
             import setup_jobs
             what = (body or {}).get("what") or ""
             argv = None
+            if what == "dv_toolchain":
+                # the bundled analyzer + LUT (dv/) to their pinned paths: argv ENGINE-computed
+                argv = [sys.executable, os.path.join(ENGINE_DIR, "dvinstall.py"), "--repair",
+                        RESOURCES_DIR]
             if what.startswith("borders_"):
                 # Border-extender model downloads: argv is ENGINE-computed (nothing
                 # user-supplied reaches a shell)
@@ -1782,6 +1786,13 @@ def main(port=8765):
             signal.signal(_sig, lambda *_a: sys.exit(0))   # SystemExit unwinds → atexit runs _shutdown
         except (ValueError, OSError):
             pass
+    try:                                  # the bundled Dolby Vision toolchain files (dv/): a
+        import dvinstall                  # missing one is copied to its path — never replaced
+        for line in dvinstall.ensure(RESOURCES_DIR):
+            if "installed to" in line or "NOT installed" in line:
+                logbook.event(f"dv toolchain: {line}")
+    except Exception as e:                # noqa: BLE001 — never a reason not to start
+        logbook.exception("dv toolchain install", e)
     threading.Thread(target=_rearm_loop, daemon=True, name="rearm").start()
     print(f"Dashboard (automation_enabled={AUTOMATION_ENABLED}) on http://localhost:{port}")
     ThreadingHTTPServer((BIND_ADDR, port), Handler).serve_forever()

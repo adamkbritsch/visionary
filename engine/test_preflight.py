@@ -258,7 +258,7 @@ class NativeDvCheck(_NativeToolchain, unittest.TestCase):
         c = preflight.check_native_dv()
         self.assertFalse(c["ok"])
         self.assertIn("hdr_analyzer_mvp missing", c["detail"])
-        self.assertIn("383b0ad", c["fix"])               # says which commit to build
+        self.assertIn("dvinstall.py --repair", c["fix"])   # says how to install the bundled build
         self.assertEqual(self.ran("hdr_analyzer_mvp"), [])
 
     def test_a_different_analyzer_build_fails_and_is_never_executed(self):

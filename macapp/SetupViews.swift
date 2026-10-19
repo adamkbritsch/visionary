@@ -329,6 +329,7 @@ private struct DependenciesGroup: View {
                 }
             }
             row("Command-line tools", check: "brew_tools", install: "brew_tools")
+            row("Dolby Vision toolchain", check: "native_dv", install: "dv_toolchain")
             row("Python OpenCV", check: "python_deps", install: "python_deps")
         }
     }
@@ -658,7 +659,6 @@ private struct ApplicationsGroup: View {
         VStack(alignment: .leading, spacing: 8) {
             SetupGroupLabel(text: "Applications & hardware")
             row("Topaz Video AI", "topaz_version")
-            row("Dolby Vision toolchain", "native_dv")
             row("Power", "power_adapter")
         }
     }

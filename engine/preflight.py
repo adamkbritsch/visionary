@@ -179,8 +179,8 @@ def _native_dv_problems():
     out = []
     an = versions.HDR_ANALYZER_PATH
     major = versions.NATIVE_FFMPEG_MAJOR
-    build = (f"Build tinof/hdr-analyze at commit {versions.HDR_ANALYZER_COMMIT} (cargo build "
-             f"--release, against Homebrew ffmpeg {major}) and copy hdr_analyzer_mvp to {an}.")
+    build = ("Install the bundled build: Settings → Setup → Dolby Vision toolchain → Install, or "
+             f"python3 engine/dvinstall.py --repair (it copies dv/hdr_analyzer_mvp to {an}).")
     sha = _sha256_or_none(an)
     if sha is None:
         out.append((f"hdr_analyzer_mvp missing or unreadable at {an}", build))
@@ -196,11 +196,13 @@ def _native_dv_problems():
             tail = (text or "").strip().splitlines()[-1:] or ["no output"]
             out.append((f"hdr_analyzer_mvp does not run (--help: "
                         f"{'exit %s' % rc if rc is not None else 'failed'}: {tail[0][:160]})",
-                        f"Its Homebrew ffmpeg libraries probably moved (brew upgrade ffmpeg?): "
-                        f"reinstall ffmpeg {major}, or rebuild. {build}"))
+                        f"It links Homebrew's ffmpeg {major} at /opt/homebrew/opt/ffmpeg, so its "
+                        f"libraries probably moved (brew upgrade ffmpeg?): reinstall ffmpeg "
+                        f"{major} and `brew pin ffmpeg`."))
     lut = versions.NATIVE_LUT_PATH
-    lut_fix = (f"Restore the pinned LUT (sha256 {versions.NATIVE_LUT_SHA256[:12]}...) to {lut}: "
-               f"it IS the SDR->PQ conversion, so any other file changes the picture.")
+    lut_fix = ("Install the bundled LUT: Settings → Setup → Dolby Vision toolchain → Install, or "
+               f"python3 engine/dvinstall.py --repair (it copies dv/{os.path.basename(lut)} to "
+               f"{lut}). It IS the SDR->PQ conversion, so any other file changes the picture.")
     sha = _sha256_or_none(lut)
     if sha is None:
         out.append((f"LUT missing or unreadable at {lut}", lut_fix))
