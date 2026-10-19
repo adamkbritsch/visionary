@@ -400,19 +400,6 @@ struct MarqueeText: View {
     }
 }
 
-struct PulseDot: View {
-    var color: Color = DS.steelBright.opacity(DS.dotQuiet)   // matches the header puck's dot
-    @State private var on = false
-    var body: some View {
-        Circle().fill(color).frame(width: 8, height: 8)
-            .overlay(
-                Circle().stroke(color.opacity(0.55), lineWidth: 2)
-                    .scaleEffect(on ? 2.4 : 1).opacity(on ? 0 : 1)
-            )
-            .onAppear { withAnimation(.easeOut(duration: 1.5).repeatForever(autoreverses: false)) { on = true } }
-    }
-}
-
 func minutes(_ secs: Double?) -> Int? { secs.map { Int(($0 / 60).rounded()) } }
 
 // The Visionary mark — the V in its screen frame (user-supplied 2026-09-30, replacing the
@@ -1023,7 +1010,6 @@ struct StageView: View {
                     if isActive {
                         icon.frame(width: 30, height: 30)
                         title
-                        PulseDot()
                         Spacer(minLength: 4)
                         // top-right: this card's EPISODE while active. The step's ORDINAL
                         // used to sit here when it wasn't — the arrows between the cards
@@ -1155,14 +1141,12 @@ struct FinisherProgress: View {
 /// ONE remux lane. Extracted from FinisherProgress so the second lane can reuse it
 /// verbatim — the two lanes must not drift into two renderings of the same thing.
 ///
-/// Two asymmetries are deliberate, not oversights:
-///  * Lane 2 carries NO elapsed clock. _set_finishing2_progress does not publish
-///    elapsed_secs ("the elapsed bookkeeping stays single-slot on lane 1"), so finHMS would
-///    be nil anyway. Showing a true-but-partial row beats inventing a number to match.
-///    Rows are ordered by EPISODE (earliest on top), so the clockless row can be either
-///    position — the clock follows the engine lane, not the display slot.
-///  * Only the CARD pulses, never a row. Two PulseDots beat against each other — each
-///    starts its own repeatForever on its own onAppear with no phase lock.
+/// One asymmetry is deliberate, not an oversight: lane 2 carries NO elapsed clock.
+/// _set_finishing2_progress does not publish elapsed_secs ("the elapsed bookkeeping stays
+/// single-slot on lane 1"), so finHMS would be nil anyway. Showing a true-but-partial row
+/// beats inventing a number to match. Rows are ordered by EPISODE (earliest on top), so the
+/// clockless row can be either position — the clock follows the engine lane, not the display
+/// slot.
 private struct LaneProgress: View {
     let f: FinishingDTO
     let primary: Bool
