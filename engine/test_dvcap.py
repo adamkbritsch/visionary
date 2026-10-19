@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -1283,3 +1284,125 @@ class ResumeIdentitySurvivesTheSnap(unittest.TestCase):
     def test_nested_fields_snap_too(self):
         self.assertEqual(dvcap.snap_fps_fields({"cfr": {"fps": "19001/317"}, "x": [{"fps": "25"}]}),
                          {"cfr": {"fps": "60000/1001"}, "x": [{"fps": "25/1"}]})
+
+
+class ChunkFreeingBound(unittest.TestCase):
+    """The chunk lane frees a Topaz chunk once its segment provably cannot be flagged by the
+    peak gate (user, 2026-10-19): the largest run of window_frames() coded frames bounds every
+    1-second bucket those frames take part in."""
+
+    def test_the_window_covers_a_second_plus_reordering(self):
+        self.assertEqual(dvcap.window_frames("24000/1001"), 24 + 2 * dvcap.REORDER_SLACK + 2)
+        self.assertEqual(dvcap.window_frames("60"), 60 + 2 * dvcap.REORDER_SLACK + 2)
+
+    def test_the_bound_is_the_heaviest_run_touching_the_range(self):
+        w = dvcap.window_frames("25")
+        sizes = [1000] * 300
+        sizes[10] = 10_000_000                       # a burst far left of the range
+        self.assertAlmostEqual(dvcap.window_peak_mbps(sizes, "25", 200, 300), w * 1000 * 8 / 1e6)
+        self.assertGreater(dvcap.window_peak_mbps(sizes, "25", 0, 50), 80)    # the burst counts
+        # a window that only STARTS before the range still counts its frames inside it
+        self.assertGreater(dvcap.window_peak_mbps(sizes, "25", 10 + w - 1, 300), 80)
+        self.assertLess(dvcap.window_peak_mbps(sizes, "25", 10 + w, 300), 1)
+
+    def test_an_es_decode_carries_its_rate(self):
+        cmd = dvcap.build_es_decode_command("ffmpeg", "/s.hevc", "24000/1001")
+        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
+        self.assertLess(cmd.index("-r"), cmd.index("-i"))
+        self.assertIn("passthrough", cmd)
+
+
+class OnSegmentHook(unittest.TestCase):
+    def test_every_complete_segment_is_heard_in_order(self):
+        import tempfile
+        TOTAL, SS = 200, 4
+        plan = dvcap.plan_segments(TOTAL, "24000/1001", SS)
+        n_of = {i: b - a for i, (a, b) in enumerate(plan)}
+        idx = lambda p: int(os.path.basename(p).split("_")[1].split(".")[0])
+        heard = []
+        with tempfile.TemporaryDirectory() as td:
+            segdir = os.path.join(td, "segs"); os.makedirs(segdir)
+            with open(os.path.join(segdir, "seg_0000.hevc"), "wb") as f:
+                f.write(b"x")                                    # seg 0 done on an earlier pass
+            def fake_pipe(dec, enc, out, abort, on_frame):
+                with open(out, "wb") as f:
+                    f.write(b"y")
+                return n_of[idx(out)], "ok", []
+            with mock.patch.object(dvcap, "count_hevc_frames",
+                                   side_effect=lambda p, ffprobe=None: n_of[0] if "seg_0000" in p else 0), \
+                 mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe), \
+                 mock.patch.object(dvcap, "concat_segments", return_value=(True, "ok")):
+                ok, _f, why = dvcap.encode_capped_segmented(
+                    "/r.mov", "/rpu.bin", os.path.join(td, "out.hevc"), 50, segdir=segdir,
+                    total_frames=TOTAL, fps="24000/1001", seg_seconds=SS,
+                    on_segment=lambda i, p: heard.append((i, os.path.basename(p))))
+        self.assertTrue(ok, why)
+        self.assertEqual([i for i, _p in heard], list(range(len(plan))))
+        self.assertEqual(heard[0][1], "seg_0000.hevc")
+
+
+class RepairFromItsOwnEncode(unittest.TestCase):
+    """The rare miss: the gate flags a segment whose chunk was already freed. It is re-capped
+    from its own encode, and put back as it was if that fails."""
+
+    CHUNKS = None
+
+    def _run(self, td, pipe):
+        chunk = os.path.join(td, "seg_0000.mov")                  # never created: freed
+        decode = {"chunks": [[0, chunk], [100, None]], "vf": "lut3d=x", "freed": {chunk}}
+        with open(os.path.join(td, "seg_0000.hevc"), "wb") as f:
+            f.write(b"ORIGINAL")
+        seen = {}
+        def fake_pipe(dec, enc, out, abort, cb):
+            seen["dec"] = dec
+            return pipe(out)
+        with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+             mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe):
+            res = dvcap.reencode_segments_tighter("dv.mov", "rpu.bin", td, [0], 42,
+                                                  total_frames=100, fps="25", decode=decode)
+        return res, seen
+
+    def _new(self, out):
+        with open(out, "wb") as f:
+            f.write(b"NEW")
+        return 100, "ok", []
+
+    def test_it_decodes_its_own_encode_and_tidies_up(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, why), seen = self._run(td, self._new)
+            self.assertTrue(ok, why)
+            self.assertIn(os.path.join(td, "seg_0000.hevc.own.hevc"), seen["dec"])
+            self.assertNotIn("lut3d=x", " ".join(seen["dec"]))   # already PQ: no LUT again
+            with open(os.path.join(td, "seg_0000.hevc"), "rb") as f:
+                self.assertEqual(f.read(), b"NEW")
+            self.assertFalse(os.path.exists(os.path.join(td, "seg_0000.hevc.own.hevc")))
+
+    def test_a_failed_repair_puts_the_segment_back(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (ok, _why), _seen = self._run(td, lambda out: (None, "aborted", []))
+            self.assertFalse(ok)
+            with open(os.path.join(td, "seg_0000.hevc"), "rb") as f:
+                self.assertEqual(f.read(), b"ORIGINAL")
+
+    def test_a_present_chunk_is_still_the_source(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            chunk = os.path.join(td, "seg_0000.mov")
+            with open(chunk, "wb") as f:
+                f.write(b"prores")
+            with open(os.path.join(td, "seg_0000.hevc"), "wb") as f:
+                f.write(b"ORIGINAL")
+            seen = {}
+            def fake_pipe(dec, enc, out, abort, cb):
+                seen["dec"] = dec
+                return self._new(out)
+            with mock.patch.object(dvcap, "slice_rpu", return_value=(True, "ok")), \
+                 mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe):
+                ok, _why = dvcap.reencode_segments_tighter(
+                    "dv.mov", "rpu.bin", td, [0], 42, total_frames=100, fps="25",
+                    decode={"chunks": [[0, chunk], [100, None]], "vf": "lut3d=x"})
+            self.assertTrue(ok)
+            self.assertIn(chunk, seen["dec"])

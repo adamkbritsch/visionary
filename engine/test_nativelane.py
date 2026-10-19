@@ -1141,3 +1141,56 @@ class RunAnalysisSd(_RunAnalysisBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChunksFreedDuringTheRemux(_RunAnalysisBase):
+    """User, 2026-10-19: each Topaz chunk goes as soon as its segments are encoded and safely
+    under the peak gate. A remux resumed after a relaunch must still find the item READY."""
+
+    def _ready(self):
+        ok, msg = self.run_it()
+        self.assertTrue(ok, msg)
+        m = nativelane.read_marker(self.p)
+        chunk = nativelane.chunks(self.segdir)[1][1]
+        return m, chunk
+
+    def test_a_freed_chunk_keeps_the_analysis_ready(self):
+        m, chunk = self._ready()
+        size = os.path.getsize(chunk)
+        self.assertEqual(nativelane.free_chunk(self.p, chunk, m["id"]), size)
+        self.assertFalse(os.path.exists(chunk))
+        self.assertEqual(nativelane.check_ready(self.p), (True, "ready"))
+        b = nativelane.bundle(self.p)
+        self.assertIsNotNone(b)
+        self.assertIn(chunk, [path for _a, path in b["chunks"]])
+        self.assertEqual(b["freed"], [chunk])
+
+    def test_a_chunk_missing_without_a_record_is_still_caught(self):
+        _m, chunk = self._ready()
+        os.remove(chunk)
+        self.assertFalse(nativelane.check_ready(self.p)[0])
+        self.assertIsNone(nativelane.bundle(self.p))
+
+    def test_a_record_from_another_analysis_proves_nothing(self):
+        m, chunk = self._ready()
+        nativelane.free_chunk(self.p, chunk, m["id"])
+        self.assertEqual(nativelane.read_freed(self.p, "another-id"), {})
+        self.assertEqual(nativelane.read_freed(self.p, m["id"]).keys(), {os.path.basename(chunk)})
+
+    def test_a_record_that_disagrees_with_the_marker_is_drift(self):
+        m, chunk = self._ready()
+        nativelane.free_chunk(self.p, chunk, m["id"])
+        book = nativelane._read_json(nativelane.freed_path(self.p))
+        book["chunks"][os.path.basename(chunk)][0] += 1
+        nativelane._write_json(nativelane.freed_path(self.p), book)
+        ok, why = nativelane.check_ready(self.p)
+        self.assertFalse(ok)
+        self.assertIn("freed from another set", why)
+
+    def test_record_first_then_delete(self):
+        m, chunk = self._ready()
+        with mock.patch.object(nativelane.os, "remove", side_effect=OSError("killed")):
+            with self.assertRaises(OSError):
+                nativelane.free_chunk(self.p, chunk, m["id"])
+        self.assertTrue(os.path.exists(chunk))                 # still there, already recorded:
+        self.assertEqual(nativelane.check_ready(self.p), (True, "ready"))   # nothing breaks

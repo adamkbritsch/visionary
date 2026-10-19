@@ -22,6 +22,7 @@ default (50 Mbps) is ~2x the measured average, so only the pathological seconds 
 """
 from __future__ import annotations
 import json
+import math
 import os
 import re
 import shutil
@@ -369,6 +370,67 @@ def video_peak_buckets(path: str, ffprobe: str = FFPROBE) -> dict:
 def video_peak_1s_mbps(path: str, ffprobe: str = FFPROBE) -> float:
     b = video_peak_buckets(path, ffprobe)
     return max(b.values()) if b else 0.0
+
+
+# ---- freeing a chunk-lane item's Topaz chunks during its remux (user, 2026-10-19) -------------
+# The peak gate measures the SHIPPED master in 1-second buckets of PRESENTATION time. A segment's
+# own ES has no timestamps, only its coded frames in DECODE order; a frame's decode position is
+# at most REORDER_SLACK frames from its presentation position (x265's B-frame reordering is far
+# shallower), and the container rounds each timestamp to the millisecond (one frame either way).
+# So every frame of any 1-second bucket lies inside some run of ceil(fps) + 2*REORDER_SLACK + 2
+# consecutive coded frames, and the largest such run's bytes BOUND the largest bucket the
+# segment can take part in. Under the gate (with EARLY_FREE_MARGIN) the segment can never be
+# flagged for a peak repair — the only thing its Topaz chunk was still kept for.
+REORDER_SLACK = 16
+EARLY_FREE_MARGIN = 0.97
+
+
+def hevc_packet_sizes(path: str, ffprobe: str = FFPROBE) -> list:
+    """The coded-frame sizes (bytes, decode order) of a raw HEVC ES — no decode, a packet
+    scan. Raises RuntimeError when ffprobe reads nothing."""
+    r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "packet=size", "-of", "csv=p=0", path],
+                       capture_output=True, text=True, timeout=600)
+    out = []
+    for line in (r.stdout or "").splitlines():
+        try:
+            out.append(int(line.strip().strip(",")))
+        except ValueError:
+            continue
+    if r.returncode != 0 or not out:
+        raise RuntimeError(f"no packets read from {os.path.basename(path)}")
+    return out
+
+
+def window_frames(fps_str: str) -> int:
+    """PURE. The run length (coded frames) that bounds any 1-second presentation bucket."""
+    return int(math.ceil(float(Fraction(str(fps_str))))) + 2 * REORDER_SLACK + 2
+
+
+def window_peak_mbps(sizes: list, fps_str: str, lo: int = 0, hi: int | None = None) -> float:
+    """PURE. The largest byte sum (as Mb) over runs of window_frames(fps) consecutive entries of
+    `sizes` that include at least one index in [lo, hi) — an UPPER BOUND on every 1-second
+    bucket those frames take part in."""
+    w = window_frames(fps_str)
+    n = len(sizes)
+    hi = n if hi is None else hi
+    if n == 0 or lo >= hi:
+        return 0.0
+    first, last = max(0, lo - w + 1), min(hi - 1, n - 1)
+    best, acc = 0, sum(sizes[first:first + w])
+    for s in range(first, last + 1):
+        if s > first:
+            acc += (sizes[s + w - 1] if s + w - 1 < n else 0) - sizes[s - 1]
+        best = max(best, acc)
+    return best * 8 / 1e6
+
+
+def build_es_decode_command(ffmpeg: str, es: str, fps_str: str) -> list:
+    """A raw HEVC ES -> 10-bit y4m at `fps` (an ES carries no timing of its own: without the
+    rate the y4m header — and so x265's VUI — would say 25)."""
+    return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-r", str(fps_str),
+            "-i", es, "-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le",
+            "-strict", "-1", "-f", "yuv4mpegpipe", "-"]
 
 
 def peak_ok(measured_mbps: float, cap_mbps: int, tolerance: float = PEAK_TOLERANCE) -> bool:
@@ -814,9 +876,11 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
                             master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
                             boundaries: list | None = None,
                             abort=None, on_progress=None, on_plan=None, should_pause=None,
-                            decode: dict | None = None, dv: bool = True,
+                            decode: dict | None = None, dv: bool = True, on_segment=None,
                             ffmpeg=FFMPEG, x265=X265, ffprobe=FFPROBE, dovi_tool=DOVI_TOOL):
     """Resumable peak-cap encode: per-segment native-DV x265 (own RPU slice) → concat.
+    `on_segment(i, path)` hears each segment that is complete on disk — encoded now or found
+    complete on a resume — in plan order (the chunk lane frees its Topaz chunks from it).
     `dv=False` (2026-10-18, an item pinned to SDR output): the TRUE SDR x265 (build_x265_command's
     Rec.709 branch) with no RPU at all — `rpu` is unused and nothing is sliced; everything else
     (the plan, the VBV cap, resume, pause, the frame gates) is the same.
@@ -850,6 +914,8 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
             base += n
             if on_progress:
                 on_progress(base, total_frames)
+            if on_segment:
+                on_segment(i, sf)
             continue
         # built BEFORE any side effect: a segment that can't be decoded deletes and slices
         # nothing, and fails with the normal (ok, frames, reason) return, not an exception
@@ -886,6 +952,8 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         base += n
         if on_progress:
             on_progress(base, total_frames)
+        if on_segment:
+            on_segment(i, sf)
     ok, why = concat_segments(seg_files, out_hevc)
     if not ok:
         return False, base, why
@@ -917,16 +985,33 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
             return False, f"repair segment index {i} out of range (plan has {len(segs)})"
         a, b = segs[i]
         n = b - a
+        sf = os.path.join(segdir, f"seg_{i:04d}.hevc")
+        stmp = sf + ".part"
+        # A CHUNK-LANE segment whose Topaz chunk was already freed (the measured bound said it
+        # could never be flagged — this is the rare miss) is re-capped from ITS OWN encode: one
+        # more generation for this one segment instead of a fresh Topaz pass for the item.
+        own = sf + ".own.hevc"
+        from_own = False
+        if decode and decode.get("chunks"):
+            try:
+                chunk, _first = chunk_for(decode["chunks"], a, n)
+            except ValueError as e:
+                return False, f"repair segment {i}: {e}"
+            if chunk in (decode.get("freed") or ()) and not os.path.exists(chunk):
+                if not os.path.exists(sf) and not os.path.exists(own):
+                    return False, f"repair segment {i}: its Topaz chunk was freed and its encode is gone"
+                from_own = True
         # built BEFORE the tight-cap note and the delete: a segment that can't be decoded
         # keeps its encoded file and records nothing
         try:
-            dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps, decode)
+            dec = (build_es_decode_command(ffmpeg, own, fps) if from_own
+                   else build_seg_decode_command(ffmpeg, dv_video, a, n, fps, decode))
         except ValueError as e:
             return False, f"repair segment {i}: {e}"
-        sf = os.path.join(segdir, f"seg_{i:04d}.hevc")
-        stmp = sf + ".part"
         _remember_tight_cap(segdir, i, tight_cap_mbps)   # BEFORE the delete: a kill from here on
                                                          # resumes this segment at the tight cap
+        if from_own and not os.path.exists(own):
+            os.replace(sf, own)                          # the source of this repair, kept aside
         _rm(sf); _rm(stmp)                               # the over-peak segment is what we're replacing
         rslice = os.path.join(segdir, f"seg_{i:04d}.rpu")
         if dv:
@@ -949,14 +1034,15 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
             cb(0)                                        # segment start: cut-out shows empty
         got, why, _t = _encode_pipe(dec, enc, stmp, abort, cb)
         _rm(rslice)
-        if why == "aborted":
+        fail = ("aborted" if why == "aborted" else
+                f"repair segment {i}: {why}" if got is None else
+                f"repair segment {i} frame mismatch: {got} != {n}" if got != n else None)
+        if fail:
             _rm(stmp)
-            return False, "aborted"
-        if got is None:
-            _rm(stmp)
-            return False, f"repair segment {i}: {why}"
-        if got != n:                                     # same drift guard as the main encode
-            _rm(stmp)
-            return False, f"repair segment {i} frame mismatch: {got} != {n}"
+            if from_own and not os.path.exists(sf):
+                os.replace(own, sf)                      # the segment as it was: the item stays
+            return False, fail                           # whole for the next attempt
         os.replace(stmp, sf)                             # atomic publish, like the main encode
+        if from_own:
+            _rm(own)
     return True, "re-capped %d segment(s) @ %d Mbps" % (len(indices), tight_cap_mbps)

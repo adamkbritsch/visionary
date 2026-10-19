@@ -1936,6 +1936,10 @@ def _remux(p, abort, progress=None, should_pause=None):
             if native is None:
                 return False, (f"native DV metadata no longer matches the chunks "
                                f"({nativelane.check_ready(p)[1]}) — shipped nothing")
+            # each chunk goes the moment its segments are encoded and safely under the peak
+            # gate (remux._ChunkReleaser), recorded so a resumed remux still finds it ready
+            native["free_chunk"] = (lambda path, _p=p, _id=native["id"]:
+                                    nativelane.free_chunk(_p, path, _id))
     on_prog, on_plan, on_repair, wall = _prog, _on_plan, _on_repair, None
     if native is not None:
         # ...and only a native call is timed per segment (the trial's ledger, cpu.json): the

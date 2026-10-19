@@ -1518,8 +1518,9 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
             return True
         # NATIVE DV: no render, and the chunks went when the master passed the peak gate —
         # the 'encoded' marker naming that master is the proof (a rendered item has no marker:
-        # one stat, and the answer above stands).
-        return _native_encoded(p)
+        # one stat, and the answer above stands). Mid-remux, chunks already freed for segments
+        # under the gate (nativelane.read_freed) still leave the analysis READY: Topaz is done.
+        return _native_encoded(p) or _native_ready(p)
     if stage == "dv":
         if combine:
             # A REAL RPU (from either copy) makes the DV step unnecessary — real DV beats

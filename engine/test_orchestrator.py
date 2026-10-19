@@ -6534,3 +6534,23 @@ class QueuedItemsKnowWhenTheyAreIncomplete(unittest.TestCase):
     def test_a_cold_channel_or_tv_queue_is_incomplete(self):
         self.assertFalse(self._run(cache={}, tv={"remaining_items": []})[1])
         self.assertFalse(self._run(cache={"Ch": []}, tv=None)[1])
+
+
+class TopazIsDoneWhileItsChunksAreFreed(unittest.TestCase):
+    """Mid-remux, a chunk-lane item's chunks go one by one (remux._ChunkReleaser): a ready
+    analysis still means Topaz is done — a retry must not re-run it over the freed chunks."""
+
+    def test_a_ready_native_item_is_past_topaz(self):
+        import topaz
+        p = orch.episode_paths("Show", "S01E01", "ep.mkv", scratch_dir=tempfile.mkdtemp(),
+                               nas_tv_root="/Media/TV-Shows")
+        with mock.patch.object(topaz, "segments_complete", return_value=False), \
+             mock.patch.object(orch, "render_is_complete", return_value=False), \
+             mock.patch.object(orch, "_native_encoded", return_value=False), \
+             mock.patch.object(orch, "_native_ready", return_value=True):
+            self.assertTrue(orch.stage_done("topaz", p))
+        with mock.patch.object(topaz, "segments_complete", return_value=False), \
+             mock.patch.object(orch, "render_is_complete", return_value=False), \
+             mock.patch.object(orch, "_native_encoded", return_value=False), \
+             mock.patch.object(orch, "_native_ready", return_value=False):
+            self.assertFalse(orch.stage_done("topaz", p))

@@ -805,6 +805,60 @@ def _verify(path: str, ffprobe: str, require_dv: bool = True, frames=None,
     return res
 
 
+class _ChunkReleaser:
+    """THE CHUNK LANE, chunks freed AS THE REMUX GOES (user, 2026-10-19: "build the per-segment
+    chunk deletion"). A chunk-lane item's x265 reads Topaz's ProRes chunks, and they used to stay
+    — 150-190 GiB — until the finished master passed its peak gate, only because a segment the
+    gate flags is re-capped from its chunk. Here each finished segment's coded-frame sizes are
+    read (a packet scan), and once a segment's NEIGHBOURS are known too (a 1-second bucket can
+    straddle a cut) the window bound (dvcap.window_peak_mbps) says whether the gate could ever
+    flag it. A chunk goes when every segment inside it is that safe — usually one segment behind
+    the encode. `native["free_chunk"](path) -> bytes` does the freeing (and its bookkeeping,
+    nativelane.free_chunk). Never raises: a hiccup only keeps a chunk until the end, as before."""
+
+    def __init__(self, native: dict, segs: list, fps: str, cap_mbps: int,
+                 ffprobe: str = FFPROBE, freed=None):
+        self.free = native["free_chunk"]
+        self.gone = freed if freed is not None else set()   # shared with the repair's decode
+        self.segs, self.fps, self.ffprobe = segs, str(fps), ffprobe
+        self.limit = cap_mbps * dvcap.PEAK_TOLERANCE * dvcap.EARLY_FREE_MARGIN
+        self.sizes, self.safe, self.freed = {}, set(), {}
+        self.by_chunk = {}
+        for i, (a, b) in enumerate(segs):
+            path, _first = dvcap.chunk_for(native["chunks"], a, b - a)
+            self.by_chunk.setdefault(path, []).append(i)
+
+    def on_segment(self, i: int, path: str) -> None:
+        try:
+            self.sizes[i] = dvcap.hevc_packet_sizes(path, self.ffprobe)
+            for j in (i - 1, i):
+                if j >= 0 and j not in self.safe and self._known(j):
+                    if self._peak(j) <= self.limit:
+                        self.safe.add(j)
+            for chunk, idx in self.by_chunk.items():
+                if chunk not in self.freed and chunk not in self.gone and all(k in self.safe for k in idx):
+                    self.freed[chunk] = int(self.free(chunk) or 0)
+                    self.gone.add(chunk)
+        except Exception:  # noqa: BLE001 — the encode never pays for an early free
+            pass
+
+    def _known(self, j: int) -> bool:
+        last = len(self.segs) - 1
+        return (j in self.sizes and (j == 0 or j - 1 in self.sizes)
+                and (j == last or j + 1 in self.sizes))
+
+    def _peak(self, j: int) -> float:
+        w = dvcap.window_frames(self.fps)
+        tail = self.sizes.get(j - 1, [])[-(w - 1):] if j > 0 else []
+        head = self.sizes.get(j + 1, [])[:w - 1]
+        run = tail + self.sizes[j] + head
+        return dvcap.window_peak_mbps(run, self.fps, len(tail), len(tail) + len(self.sizes[j]))
+
+    @property
+    def freed_bytes(self) -> int:
+        return sum(self.freed.values())
+
+
 def _copy_native_rpu(src: str, rpu_out: str):
     """Native DV: the generated RPU -> segdir/rpu.bin, in place of dvcap.extract_rpu. ATOMIC
     like extract_rpu (.part, then os.replace): a kill mid-copy must never leave a truncated
@@ -1029,7 +1083,10 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 "max_cll": native.get("max_cll")}
         boundaries = [int(b) for b in native["bounds"]]
         nat_kw = {"native_id": native["id"]}
-        dec_kw = {"decode": {"chunks": chunks, "vf": native["vf"]}}
+        # `freed`: chunks the remux already let go (a resumed one) — and, shared with the
+        # _ChunkReleaser below, the ones it frees now; a repair of one decodes its own encode
+        dec_kw = {"decode": {"chunks": chunks, "vf": native["vf"],
+                             "freed": set(native.get("freed") or ())}}
     else:
         enc = encode_source or dv_video   # the video the x265 pass re-encodes (RPU: always dv_video)
         info = dvcap.probe_video(enc, ffprobe)
@@ -1090,12 +1147,21 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                                    reason=f"RPU/source frame mismatch: rpu {real_frames} != "
                                           f"source {n_enc} — the RPU donor is not frame-aligned "
                                           f"with the encoded video (shipped nothing)")
+        releaser = None
+        if native is not None and callable(native.get("free_chunk")):
+            try:
+                releaser = _ChunkReleaser(native, dvcap.plan_segments(
+                    real_frames, info["fps"], dvcap.SEG_SECONDS, boundaries=boundaries),
+                    info["fps"], cap_mbps, ffprobe, freed=dec_kw["decode"]["freed"])
+            except ValueError:
+                releaser = None                   # a plan off the chunks fails below, as before
         ok, frames, why = dvcap.encode_capped_segmented(
             enc, rpu, hevc, cap_mbps, segdir=segdir,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
             master_display=info["master_display"], max_cll=info["max_cll"],
             abort=abort, on_progress=on_progress, on_plan=on_plan,
-            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw, **sdr_kw)
+            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw, **sdr_kw,
+            **({"on_segment": releaser.on_segment} if releaser else {}))
         if not ok:
             if why.startswith("paused:"):
                 return RemuxResult(False, output, reason=why)   # benign hold, not a failure
@@ -1160,6 +1226,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             buckets = dvcap.video_peak_buckets(part, ffprobe)   # re-measure the file that SHIPS
             peak = max(buckets.values()) if buckets else 0.0
             if dvcap.peak_ok(peak, cap_mbps):
+                if releaser is not None and releaser.freed:
+                    repair_note += (f" · {len(releaser.freed)} Topaz chunk(s), "
+                                    f"{releaser.freed_bytes / 2**30:.0f} GiB, freed during the encode")
                 res.reason += f" · peak {peak:.1f} ≤ {cap_mbps} Mbps cap" + repair_note + audio_note
                 atomic_ship(part, output)
                 shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the segments won't be needed again

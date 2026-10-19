@@ -64,6 +64,7 @@ RPU = "rpu.bin"
 SIDECAR = "sidecar.json"
 FAILURES = "failures.json"
 FALLBACK = "fallback.json"
+FREED = "freed.json"            # chunks the remux freed early (free_chunk): name -> [size, mtime_ns]
 CPU_LEDGER = "cpu.json"
 
 MARKER_VERSION = 1
@@ -238,6 +239,10 @@ def failures_path(p) -> str:
     return os.path.join(native_dir(p), FAILURES)
 
 
+def freed_path(p) -> str:
+    return os.path.join(native_dir(p), FREED)
+
+
 def cpu_path(p) -> str:
     return os.path.join(native_dir(p), CPU_LEDGER)
 
@@ -341,13 +346,14 @@ def probe_stream(path: str, extra: tuple = ()) -> dict:
 
 # ---- chunks, CFR -------------------------------------------------------------------------
 
-def chunks(segdir: str, expected: int | None = None) -> list:
+def chunks(segdir: str, expected: int | None = None, freed=()) -> list:
     """Topaz's chunks as dvcap's decode list, from segments.json (ACTUAL frame counts, never
     topaz_segbounds' planned ones): [[first_frame, path], ..., [total, None]]. Raises
     ValueError on a missing manifest or chunk file, a gap or overlap between chunks, or a
     manifest total that disagrees with its chunks. With `expected` (the CFR's frame count,
     which Topaz planned against) the total may land LAST_CHUNK_SHORT_MAX short or
-    LAST_CHUNK_LONG_MAX long of it — Topaz's own acceptance for the EOF-bounded last chunk."""
+    LAST_CHUNK_LONG_MAX long of it — Topaz's own acceptance for the EOF-bounded last chunk.
+    `freed`: chunk names the remux freed early (read_freed) — listed as usual, file or not."""
     m = topaz.read_manifest(segdir)
     if not isinstance(m, dict) or not isinstance(m.get("segments"), list) or not m["segments"]:
         raise ValueError("no segments.json with chunks")
@@ -363,7 +369,7 @@ def chunks(segdir: str, expected: int | None = None) -> list:
         if frames <= 0:
             raise ValueError(f"chunk {i} has {frames} frames")
         path = os.path.join(segdir, name)
-        if not os.path.isfile(path):
+        if not os.path.isfile(path) and name not in freed:
             raise ValueError(f"chunk {i} ({name}) is missing")
         out.append([start, path])
         expect = start + frames
@@ -732,12 +738,21 @@ def publish_ready(p, sc: dict) -> dict:
 
 def _chunk_drift(p, m: dict):
     """Why the chunks on disk are not the set marker `m` recorded (segments.json's sha256, every
-    chunk's size+mtime), or None when they still are. Raises OSError when they can't be read."""
+    chunk's size+mtime), or None when they still are. A chunk the remux FREED (read_freed: its
+    segment encoded and under the peak gate) stands in by its record — the very size+mtime the
+    marker holds — so a remux resumed after a relaunch still finds its analysis ready. Raises
+    OSError when they can't be read."""
     seg = _segdir(p)
     if sha256_file(os.path.join(seg, topaz.MANIFEST)) != m.get("manifest_sha256"):
         return "segments.json changed"
+    freed = read_freed(p, m.get("id"))
     for name, size, mtime_ns in m.get("chunks") or []:
-        st = os.stat(os.path.join(seg, name))
+        path = os.path.join(seg, name)
+        if name in freed and not os.path.exists(path):
+            if tuple(freed[name]) != (size, mtime_ns):
+                return f"chunk {name} was freed from another set"
+            continue
+        st = os.stat(path)
         if (st.st_size, st.st_mtime_ns) != (size, mtime_ns):
             return f"chunk {name} changed"
     return None
@@ -788,19 +803,62 @@ def ready(p) -> bool:
 def bundle(p):
     """remux.remux(native=) input, or None when not ready(p):
     {chunks: [[first, path], ..., [total, None]], vf: the LUT chain, rpu: path, fps: "n/d",
-     max_cll: "cll,fall" | None, total, bounds: chunk END frames (the segment plan), id}."""
+     max_cll: "cll,fall" | None, total, bounds: chunk END frames (the segment plan), id,
+     freed: paths of the chunks the remux already freed (read_freed)}."""
     if not ready(p):
         return None
     m = read_marker(p)
+    freed = read_freed(p, m.get("id"))
     try:
-        chunk_list = chunks(_segdir(p))
+        chunk_list = chunks(_segdir(p), freed=freed)
     except ValueError:
         return None
     if chunk_list[-1][0] != m["total"]:
         return None
     return {"chunks": chunk_list, "vf": m["vf"], "rpu": rpu_path(p), "fps": m["fps"],
             "max_cll": m.get("max_cll"), "total": m["total"],
-            "bounds": [a for a, _p in chunk_list[1:]], "id": m["id"]}
+            "bounds": [a for a, _p in chunk_list[1:]], "id": m["id"],
+            "freed": [os.path.join(_segdir(p), n) for n in freed]}
+
+
+# ---- chunks freed during the remux (user, 2026-10-19) -----------------------------------------
+# A chunk-lane item's remux encodes straight from Topaz's chunks and used to keep every one of
+# them (~150-190 GiB) until the finished master passed its peak gate. remux._ChunkReleaser now
+# frees each chunk as soon as its segments are encoded and provably under the gate; this book
+# remembers what went, so check_ready and bundle (a remux resumed after a relaunch) still see
+# the analysis as ready. Tied to the ready marker's id: a re-analysed item starts a fresh book.
+
+def read_freed(p, ready_id) -> dict:
+    """{chunk name: [size, mtime_ns]} the remux freed for the ready marker `ready_id`, or {}."""
+    book = _read_json(freed_path(p))
+    if not isinstance(book, dict) or not ready_id or book.get("ready_id") != ready_id:
+        return {}
+    out = {}
+    for name, rec in (book.get("chunks") or {}).items():
+        try:
+            out[str(name)] = [int(rec[0]), int(rec[1])]
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def free_chunk(p, path: str, ready_id: str) -> int:
+    """Free one Topaz chunk of a ready item: RECORD it (its size+mtime, under `ready_id`) first,
+    then delete it — a kill in between leaves a recorded chunk still on disk, which every check
+    accepts as it always did. -> bytes freed (0 when it was already gone)."""
+    name = os.path.basename(path)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 0
+    with _LOCK:
+        book = _read_json(freed_path(p))
+        if not isinstance(book, dict) or book.get("ready_id") != ready_id:
+            book = {"ready_id": ready_id, "chunks": {}}
+        book.setdefault("chunks", {})[name] = [st.st_size, st.st_mtime_ns]
+        _write_json(freed_path(p), book)
+    os.remove(path)
+    return st.st_size
 
 
 # ---- failures and fallback ---------------------------------------------------------------

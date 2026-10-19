@@ -1569,7 +1569,7 @@ class NativeBundle(unittest.TestCase):
             res, seen = self._run(tmp, self._bundle(tmp), [{1: 58.6}, {1: 40.0}])   # over → repair
         self.assertTrue(res.ok, res.reason)
         self.assertIn("peak repair: 1 seg(s) re-capped @ 42", res.reason)
-        want_decode = {"chunks": self.CHUNKS, "vf": self.VF}
+        want_decode = {"chunks": self.CHUNKS, "vf": self.VF, "freed": set()}
         calls = [k for _s, k in seen["enc"]] + [r[3] for r in seen["repair"]]
         self.assertEqual(len(seen["enc"]), 2)            # main encode + the repair re-concat
         self.assertEqual(len(seen["repair"]), 1)         # the repair rung
@@ -1852,3 +1852,80 @@ class SdrMaster(unittest.TestCase):
         self.assertTrue(res.ok, res.reason)
         self.assertEqual([m["require_dv"] for m in verified], [False])
         self.assertIn("--colour-primaries 0:1", " ".join(verified[0]["colour"]))
+
+
+class ChunkReleaser(unittest.TestCase):
+    """THE CHUNK LANE frees each Topaz chunk once its segments are encoded and provably under
+    the peak gate (user, 2026-10-19) — one segment behind the encode, the last one at once."""
+
+    CHUNKS = NativeBundle.CHUNKS
+    SEGS = [(0, 2217), (2217, 4398), (4398, 6000)]
+    FPS = "24000/1001"
+
+    def _rel(self, sizes, freed=None, cap=50):
+        self.calls = []
+        def free(path):
+            self.calls.append(path)
+            return 1000
+        native = {"chunks": self.CHUNKS, "free_chunk": free}
+        rel = remux._ChunkReleaser(native, self.SEGS, self.FPS, cap, freed=freed)
+        self.sizes = sizes
+        return rel
+
+    def _feed(self, rel, *indices):
+        with mock.patch.object(remux.dvcap, "hevc_packet_sizes",
+                               side_effect=lambda p, ff=None: self.sizes[int(p)]):
+            for i in indices:
+                rel.on_segment(i, str(i))
+
+    def test_quiet_segments_free_their_chunks_one_behind(self):
+        quiet = [10_000] * 2300                  # ~0.5 Mb a frame: far under 50 Mbps
+        rel = self._rel({0: quiet[:2217], 1: quiet[:2181], 2: quiet[:1602]})
+        self._feed(rel, 0)
+        self.assertEqual(self.calls, [])         # its right neighbour is not known yet
+        self._feed(rel, 1)
+        self.assertEqual(self.calls, ["/scratch/ep/seg_0000.mov"])
+        self._feed(rel, 2)                       # the last segment has no right neighbour
+        self.assertEqual(self.calls, ["/scratch/ep/seg_0000.mov", "/scratch/ep/seg_0001.mov",
+                                      "/scratch/ep/seg_0002.mov"])
+        self.assertEqual(rel.freed_bytes, 3000)
+
+    def test_a_hot_segment_keeps_its_chunk_and_so_does_its_neighbours_edge(self):
+        quiet, hot = [10_000] * 2217, [10_000] * 2181
+        hot[5] = 30_000_000                      # a burst at the start of segment 1
+        rel = self._rel({0: quiet, 1: hot, 2: [10_000] * 1602})
+        self._feed(rel, 0, 1, 2)
+        # the burst sits within a window of segment 0's tail → chunk 0 stays too
+        self.assertEqual(self.calls, ["/scratch/ep/seg_0002.mov"])
+
+    def test_already_freed_chunks_are_not_freed_again(self):
+        gone = {"/scratch/ep/seg_0000.mov"}
+        rel = self._rel({0: [10_000] * 2217, 1: [10_000] * 2181, 2: [10_000] * 1602}, freed=gone)
+        self._feed(rel, 0, 1)
+        self.assertEqual(self.calls, [])
+        self.assertIn("/scratch/ep/seg_0000.mov", gone)
+
+    def test_a_scan_failure_only_keeps_the_chunk(self):
+        rel = self._rel({})
+        with mock.patch.object(remux.dvcap, "hevc_packet_sizes", side_effect=RuntimeError("no packets")):
+            rel.on_segment(0, "0")               # never raises into the encode
+        self.assertEqual(self.calls, [])
+
+    def test_the_native_remux_wires_it_in(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = NativeBundle()._bundle(tmp, free_chunk=lambda path: 1 << 30)
+            h = NativeBundle()
+            h.assertEqual = self.assertEqual
+            res, seen = h._run(tmp, b)
+        self.assertTrue(res.ok, res.reason)
+        main = seen["enc"][0][1]
+        self.assertTrue(callable(main.get("on_segment")))
+        self.assertIs(main["decode"]["freed"], seen["enc"][0][1]["decode"]["freed"])
+
+    def test_a_rendered_item_has_no_releaser(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            res, seen = NativeBundle()._run(tmp, NativeBundle()._bundle(tmp))   # no free_chunk
+        self.assertTrue(res.ok, res.reason)
+        self.assertNotIn("on_segment", seen["enc"][0][1])
