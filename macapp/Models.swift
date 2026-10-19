@@ -41,6 +41,14 @@ struct ProgressDTO: Codable {
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
     var waiting: String?      // download/upload: queued for the NAS transfer slot shared with
                               // Expurgate ("waiting for another app's NAS transfer to finish")
+    // The step's LETTERED STAGES (engine/stagebar.py) — display only. The fields above stay
+    // the whole step's numbers (the ETA, the header readout and the Dock read those).
+    var stages: [String]?       // every stage, in order: lettered A, B, C
+    var stage_idx: Int?         // the one running now (0-based)
+    var stage_pct: Double?      // its own 0...100; nil = no honest number (label alone, no bar)
+    var stage_notches: [Double]?  // its own segment boundaries, 0...1 of the stage
+    var stage_seg_done: Int?    // ...and how many of those segments are finished
+    var stage_sub: String?      // what it is doing right now ("attempt 2, under the peak cap")
 }
 
 struct HoldDTO: Codable {
@@ -98,6 +106,14 @@ struct FinishingDTO: Codable {
     var step: String?           // fast remux (inject/ship): the labeled step running now —
                                 // one bar at a time, pct = that step's own progress (nil =
                                 // a label-only phase with no watchable output)
+    // The step's LETTERED STAGES (engine/stagebar.py) — display only. The fields above stay
+    // the whole step's numbers (the ETA, the header readout and the Dock read those).
+    var stages: [String]?       // every stage, in order: lettered A, B, C
+    var stage_idx: Int?         // the one running now (0-based)
+    var stage_pct: Double?      // its own 0...100; nil = no honest number (label alone, no bar)
+    var stage_notches: [Double]?  // its own segment boundaries, 0...1 of the stage
+    var stage_seg_done: Int?    // ...and how many of those segments are finished
+    var stage_sub: String?      // what it is doing right now ("attempt 2, under the peak cap")
     // Identity — `abandon_series` matches lanes on exactly these, and the puck labels with them.
     var series: String?
     var movie: Bool?
@@ -122,6 +138,57 @@ enum EpisodeOrdinal {
 
 extension FinishingDTO {
     var episodeOrdinal: (season: Int, episode: Int)? { EpisodeOrdinal.parse(ep) }
+    var stagePlan: StagePlan? {
+        StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub)
+    }
+}
+
+extension ProgressDTO {
+    var stagePlan: StagePlan? {
+        StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub)
+    }
+}
+
+/// One step's lettered stages, as the engine published them (stagebar). nil unless the step
+/// runs as a sequence of jobs — a step with one job has no stages and draws as it always did.
+struct StagePlan: Equatable {
+    let labels: [String]
+    let idx: Int
+    let pct: Double?            // the current stage's own 0...100 (nil = label alone)
+    let notches: [Double]
+    let segDone: Int
+    let sub: String?
+
+    init?(_ stages: [String]?, _ idx: Int?, _ pct: Double?, _ notches: [Double]?,
+          _ segDone: Int?, _ sub: String?) {
+        guard let stages, let idx, stages.indices.contains(idx) else { return nil }
+        labels = stages
+        self.idx = idx
+        self.pct = pct
+        self.notches = notches ?? []
+        self.segDone = segDone ?? 0
+        self.sub = sub?.isEmpty == true ? nil : sub
+    }
+
+    /// "A", "B", … "Z", then "AA" — the stage's letter.
+    static func letter(_ i: Int) -> String {
+        let a = Int(UnicodeScalar("A").value)
+        let head = i >= 26 ? letter(i / 26 - 1) : ""
+        return head + String(UnicodeScalar(UInt8(a + i % 26)))
+    }
+
+    /// The label with its first letter capitalised ("copying the original video" → "Copying…").
+    static func label(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
+
+    var current: String { Self.label(labels[idx]) }
+    /// "Stage B · Encoding the picture"
+    var title: String { "Stage \(Self.letter(idx)) · \(current)" }
+    /// The current stage's finished part: the bar's bright fill (its last finished segment).
+    var completed: Double {
+        let live = min(1, max(0, (pct ?? 0) / 100))
+        if notches.isEmpty { return live }
+        return segDone >= notches.count ? 1.0 : (segDone > 0 ? notches[segDone - 1] : 0)
+    }
 }
 
 struct QueueNextDTO: Codable {

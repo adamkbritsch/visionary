@@ -3123,6 +3123,20 @@ class StepReachesTheLane(unittest.TestCase):
         o._set_finishing2_progress({"stage": "upload", "pct": None})
         self.assertIsNone(o.state["finishing2"]["step"])       # ordinary ticks clear it
 
+    def test_the_lettered_stages_pass_through_both_lanes_and_clear(self):
+        import stagebar
+        o = orch.Orchestrator()
+        d = dict({"stage": "remux", "pct": 12.0, "step": "copying the original video"},
+                 **stagebar.fields(["peaks", "copying the original video"], 1, 12.0))
+        for setter, key in ((o._set_finishing_progress, "finishing"),
+                            (o._set_finishing2_progress, "finishing2")):
+            setter(d)
+            self.assertEqual(o.state[key]["stage_idx"], 1)
+            self.assertEqual(o.state[key]["stages"], ["peaks", "copying the original video"])
+            self.assertEqual(o.state[key]["stage_pct"], 12.0)
+            setter({"stage": "upload", "pct": 3})
+            self.assertTrue(all(o.state[key][k] is None for k in stagebar.FIELDS))
+
 
 class CombinePaths(unittest.TestCase):
     """movie_paths(combine=True): companion coordinates from the book, container FORCED
@@ -5550,6 +5564,23 @@ class NativeProgressCard(unittest.TestCase):
         d = self._boundary(1, 5000.5)                           # replayed within a second
         self.assertEqual(d["seg_secs"], 600.0)                  # the rate is still the live one
         self.assertEqual(d["eta_secs"], 1800.0)
+
+    def test_stage_a_moves_with_the_heartbeat(self):
+        """The chunk lane's Stage A is the whole measured span, so its own bar moves with the
+        interpolated pct; the notches and the finished count stay the real ones."""
+        import stagebar
+        self.now[0] = 1000
+        self.o._set_progress(dict({"stage": "dvnative", "ep": "S01E01", "pct": 0,
+                                   "notches": self.NOTCHES, "seg_done": 0, "seg_total": 4},
+                                  **stagebar.fields(["A", "B"], 0, 0.0, notches=self.NOTCHES,
+                                                    seg_done=0)))
+        self.now[0] = 1600
+        self.o._set_progress(dict({"stage": "dvnative", "ep": "S01E01", "pct": 25,
+                                   "notches": self.NOTCHES, "seg_done": 1, "seg_total": 4},
+                                  **stagebar.fields(["A", "B"], 0, 25.0, notches=self.NOTCHES,
+                                                    seg_done=1)))
+        d = self._tick(1900)
+        self.assertEqual((d["pct"], d["stage_pct"], d["stage_seg_done"]), (37, 37.0, 1))
 
     def test_a_tick_after_the_card_moved_on_publishes_nothing(self):
         self.o.state["progress"] = None

@@ -16,6 +16,7 @@ import threading
 import time
 
 import logbook
+import stagebar
 import transfer
 from orchestrator import _is_dv81, _vstream, _has_audio, _first_video, _remote_size
 
@@ -23,6 +24,12 @@ ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 FFPROBE = "/opt/homebrew/bin/ffprobe"
+# The lettered stages (stagebar) of the steps that run as a sequence of jobs
+DOWNLOAD_STAGES = ("Copying the source from the NAS", "Making the constant-frame-rate copy")
+COMBINE_STAGES = ("Copying the NAS copy", "Fetching the companion from the seedbox")
+PEAKS_STAGE = "measuring source peaks"          # a fast remux's labelled steps (remux.inject_stages)
+PLAN_STAGE = "planning scene-cut segments"
+CAPPED_STAGE = "re-encoding under the peak cap"
 EXPORT_BITRATE_FLOOR_KBPS = 60000   # render preset's default; the export matches the intake above this
 YOUTUBE_NATIVE_4K_MIN_HEIGHT = 1700  # above this the source IS 4K, not a 1080p upscale
 YOUTUBE_RENDER_KBPS_4K = 14000       # ...and a NATIVE 4K source renders lower (user-dictated
@@ -374,10 +381,13 @@ def _download_body(p, abort, progress=None, low_prio=False):
         on_prog = None
         if progress:
             def on_prog(done, total):          # the pull is the first ~20% of the stage bar
-                progress({"stage": "download", "ep": p.ep, "pct": round(done / total * 20)})
+                progress(dict({"stage": "download", "ep": p.ep, "pct": round(done / total * 20)},
+                              **stagebar.fields(DOWNLOAD_STAGES, 0, done / total * 100)))
         ok, _local, reason = transfer.download(p.nas_source, os.path.dirname(p.source),
                                                on_progress=on_prog, abort=abort,
-                                               on_wait=_slot_note(progress, "download", p.ep),
+                                               on_wait=_slot_note(progress, "download", p.ep,
+                                                                  stagebar.fields(DOWNLOAD_STAGES,
+                                                                                  0, 0.0)),
                                                # the download-ahead steps aside for the pipeline
                                                prio=(transfer.BACKGROUND if low_prio
                                                      else transfer.FOREGROUND))
@@ -450,10 +460,13 @@ def _download_combine(p, abort, progress=None):
         on_prog = None
         if progress:
             def on_prog(done, total):          # NAS pull = the front half of the bar
-                progress({"stage": "download", "ep": p.ep, "pct": round(done / total * 50)})
+                progress(dict({"stage": "download", "ep": p.ep, "pct": round(done / total * 50)},
+                              **stagebar.fields(COMBINE_STAGES, 0, done / total * 100)))
         ok, _local, reason = transfer.download(p.nas_source, os.path.dirname(p.source),
                                                on_progress=on_prog, abort=abort,
-                                               on_wait=_slot_note(progress, "download", p.ep))
+                                               on_wait=_slot_note(progress, "download", p.ep,
+                                                                  stagebar.fields(COMBINE_STAGES,
+                                                                                  0, 0.0)))
         if not ok:
             if os.path.exists(p.source):
                 try: os.remove(p.source)
@@ -461,7 +474,8 @@ def _download_combine(p, abort, progress=None):
             return ok, _stopped_is_interrupted(reason)
     # -- companion (relay-streamed from the seedbox) --------------------------------
     if progress:
-        progress({"stage": "download", "ep": p.ep, "pct": 50, "step": "fetching companion"})
+        progress(dict({"stage": "download", "ep": p.ep, "pct": 50, "step": "fetching companion"},
+                      **stagebar.fields(COMBINE_STAGES, 1, 0.0)))
     try:
         m = companion_mod.manifest(p.companion_virtual)
         if not (m.get("files") or []):
@@ -472,8 +486,9 @@ def _download_combine(p, abort, progress=None):
     on_cprog = None
     if progress:
         def on_cprog(done, total):                   # companion = the back half
-            progress({"stage": "download", "ep": p.ep,
-                      "pct": 50 + round(done / total * 50), "step": "fetching companion"})
+            progress(dict({"stage": "download", "ep": p.ep,
+                           "pct": 50 + round(done / total * 50), "step": "fetching companion"},
+                          **stagebar.fields(COMBINE_STAGES, 1, done / total * 100)))
     ok, reason = companion_mod.fetch_to_file(p.companion_virtual, p.companion_src,
                                              p.companion_size,
                                              on_progress=on_cprog, abort=abort)
@@ -509,7 +524,9 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
         total = topaz.total_frames(p.source) or 0
         def on_prog(frames):
             pct = 20 + round(frames / total * 79) if total else None
-            progress({"stage": "download", "ep": p.ep, "pct": min(99, pct) if pct else None})
+            progress(dict({"stage": "download", "ep": p.ep, "pct": min(99, pct) if pct else None},
+                          **stagebar.fields(DOWNLOAD_STAGES, 1,
+                                            min(99.0, frames / total * 100) if total else None)))
     res = topaz.to_cfr(p.source, p.source_cfr, abort=abort, on_progress=on_prog,
                        low_prio=low_prio, copy_only=copy_only)
     if not res.ok:
@@ -531,14 +548,15 @@ def _stopped_is_interrupted(reason):
     return ("interrupted: " + r) if r.startswith("aborted") else reason
 
 
-def _slot_note(progress, stage, ep):
+def _slot_note(progress, stage, ep, extra=None):
     """`on_wait` for a pipeline transfer: put "waiting for another app's NAS transfer" on the
-    stage's own surface while the shared NAS transfer slot is taken, and take it off again."""
+    stage's own surface while the shared NAS transfer slot is taken, and take it off again.
+    `extra` rides along on each note (the download's stage fields)."""
     if not progress:
         return None
 
     def note(text):
-        info = {"stage": stage, "ep": ep, "pct": 0}
+        info = dict({"stage": stage, "ep": ep, "pct": 0}, **(extra or {}))
         if text:
             info["waiting"] = text
         progress(info)
@@ -1743,13 +1761,16 @@ def _remux(p, abort, progress=None, should_pause=None):
             else:
                 logbook.event(f"audio {p.series} {season}: reusing +{audio_gain:.1f} dB "
                               f"from the season's first episode")
+    steps = stagebar.Steps()   # the fast paths' lettered stages (remux announces its plan)
+
     def _on_step(label, pct):
         # LABELED STEP progress for the fast (stream-copy) remuxes (user-asked): one bar
         # at a time — the current step's own percentage where a phase has a watchable
-        # output file, label-only (pct None) where it doesn't.
+        # output file, label-only (pct None) where it doesn't — each a lettered stage.
         if progress:
-            progress({"stage": "remux", "ep": p.ep,
-                      "pct": (round(pct, 1) if pct is not None else None), "step": label})
+            progress(dict({"stage": "remux", "ep": p.ep,
+                           "pct": (round(pct, 1) if pct is not None else None), "step": label},
+                          **steps.at(label, pct)))
 
     encode_source = None   # set when rpu-only loses its stream-copy privilege (peak-gated)
     combine_call = None    # set when a COMBINE item needs the capped path (notched bar below)
@@ -1797,7 +1818,8 @@ def _remux(p, abort, progress=None, should_pause=None):
             "rpu_profile": (v.get("rpu_profile") or "") if real_rpu else "",
             "real_rpu": real_rpu,
         }
-        _on_step("measuring source peaks", None)
+        steps.plan([PEAKS_STAGE] + remux.inject_stages(True))   # remux_inject corrects the tail
+        _on_step(PEAKS_STAGE, None)
         peak = _peak_of(winner, os.path.basename(winner))
         if peak is None:
             return False, "could not measure source peaks — retrying (never ship unverified)"
@@ -1807,12 +1829,13 @@ def _remux(p, abort, progress=None, should_pause=None):
                                 rpu_inline=combine_call["rpu_inline"],
                                 rpu_profile=combine_call["rpu_profile"], capped=False,
                                 cap_mbps=cap, audio_target_lufs=lufs, abort=abort,
-                                on_step=_on_step)
+                                on_step=_on_step, on_stages=steps.plan)
             return _combine_result(res, combine_call["real_rpu"])
         logbook.event(f"remux {p.ep}: winner peaks {peak:.1f} Mbps — over the "
                       f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate; combine takes "
                       "the capped re-encode (real DV preserved)")
-        _on_step("planning scene-cut segments", None)
+        steps.plan([PLAN_STAGE, CAPPED_STAGE])
+        _on_step(PLAN_STAGE, None)
         _plan_fast_path_bounds(p, src=winner)   # cached in the bounds book — retries free
     elif plan.plan_for(p.source).get("topaz") == "rpu-only":
         # FAST PATH (HDR10 keep-the-source), PEAK-GATED (user-dictated 2026-08-06): the bare
@@ -1824,19 +1847,22 @@ def _remux(p, abort, progress=None, should_pause=None):
         # revoked and the SOURCE video takes the same enforced-VBV x265 native-DV capped
         # re-encode as everything else (the cap must bind — an uncapped CRF pass can't
         # promise the ceiling).
-        _on_step("measuring source peaks", None)
+        steps.plan([PEAKS_STAGE] + remux.inject_stages(True))   # remux_inject corrects the tail
+        _on_step(PEAKS_STAGE, None)
         peak = _source_peak_mbps(p)
         if peak is None:
             return False, "could not measure source peaks — retrying (never ship unverified)"
         if peak <= dvcap.RPU_SHIP_VIDEO_GATE_MBPS:
             res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
-                                     audio_target_lufs=lufs, abort=abort, on_step=_on_step)
+                                     audio_target_lufs=lufs, abort=abort, on_step=_on_step,
+                                     on_stages=steps.plan)
             return res.ok, res.reason
         logbook.event(f"remux {p.ep}: source peaks {peak:.1f} Mbps — over the "
                       f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate "
                       f"({dvcap.DV_STREAM_CEILING_MBPS} ceiling - TrueHD headroom); "
                       "stream copy revoked, capped re-encode of the source instead")
-        _on_step("planning scene-cut segments", None)
+        steps.plan([PLAN_STAGE, CAPPED_STAGE])
+        _on_step(PLAN_STAGE, None)
         _plan_fast_path_bounds(p)      # cached in the bounds book — retries are free
         encode_source = p.source_cfr   # RPU from the render; VIDEO re-encoded from the source
     elif p.youtube:
@@ -1845,10 +1871,11 @@ def _remux(p, abort, progress=None, should_pause=None):
         # "render-over-cap" (and only that) falls through to the normal capped re-encode.
         res = remux.remux_ship_render(p.dv_render, p.source_cfr, p.source, p.final,
                                       cap_mbps=cap, audio_target_lufs=lufs, abort=abort,
-                                      on_step=_on_step, **sdr_kw)
+                                      on_step=_on_step, on_stages=steps.plan, **sdr_kw)
         if res.ok or not str(res.reason).startswith("render-over-cap"):
             return res.ok, res.reason
         logbook.event(f"remux {p.ep}: {res.reason}")
+        steps.plan([CAPPED_STAGE])
     bounds = _read_topaz_bounds(p.source_basename) or None   # segment at this episode's topaz boundaries
 
     # Same notched segment bar as Topaz: on_plan gives the cumulative segment-end frames once,
@@ -1869,6 +1896,9 @@ def _remux(p, abort, progress=None, should_pause=None):
             d["notches"] = [round(e / t, 4) for e in ends]
             d["seg_done"] = sum(1 for e in ends if frames >= e)
             d["seg_total"] = len(ends)
+        if steps.active:       # a fast path that turned into the capped re-encode: its last stage
+            d.update(steps.at(CAPPED_STAGE, d["pct"], notches=d.get("notches"),
+                              seg_done=d.get("seg_done")))
         d.update(extra)
         progress(d)
 

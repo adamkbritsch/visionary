@@ -1179,6 +1179,23 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
 # background size-poller yields an honest per-step percentage (user-asked 2026-08-06: a
 # progress bar with labeled steps, one at a time). Label-only steps report pct=None.
 
+MUX_STAGES = ("preparing audio", "muxing the master", "verifying the master")
+SHIP_STAGES = ("measuring the render's peaks", "copying the render's video") + MUX_STAGES
+
+
+def inject_stages(extract: bool, skip_inject: bool = False, convert_es: bool = False) -> list:
+    """PURE. The labelled steps remux_inject runs, in order — what its `on_stages` announces
+    before the first one (the app letters them A, B, C: stagebar). `extract` = the RPU is not
+    already in the resume dir."""
+    out = ["extracting DV metadata"] if extract and not skip_inject else []
+    out.append("copying the original video")
+    if not skip_inject:
+        out.append("injecting DV metadata")
+    elif convert_es:
+        out.append("converting DV to profile 8.1")
+    return out + list(MUX_STAGES)
+
+
 class _StepWatch:
     """Context manager: poll `path`'s size toward `target` every 2 s and report
     on_step(label, pct) — capped at 99 (the phase's own exit reports completion)."""
@@ -1220,7 +1237,7 @@ def _fsize(path) -> int:
 
 
 def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
-                 audio_target_lufs=None, abort=None, on_step=None,
+                 audio_target_lufs=None, abort=None, on_step=None, on_stages=None,
                  rpu_mode=None, skip_inject=False, convert_es=False,
                  ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream
@@ -1236,7 +1253,10 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
     winner is itself the real-DV file) — no extraction, no inject, its own bits ship;
     `convert_es=True` (with skip_inject) runs dovi_tool `-m 2 convert --discard` on the
     copied ES first, single-layer-ifying an inline-P7 winner (through nalfix first: a P7
-    release's split access units would otherwise reach mkvmerge as picture-less frames)."""
+    release's split access units would otherwise reach mkvmerge as picture-less frames).
+
+    `on_stages(labels)` (optional) hears the steps this call will report through `on_step`,
+    in order, before the first of them (inject_stages)."""
     if not is_master_container(output):
         return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
@@ -1276,6 +1296,8 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 manifest["rpu_mode"] = int(rpu_mode)
             dvcap.ensure_segdir(segdir, manifest)
             rpu = os.path.join(segdir, "rpu.bin")
+            if on_stages:
+                on_stages(inject_stages(not (os.path.exists(rpu) and os.path.getsize(rpu) > 0)))
             if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):
                 if on_step:
                     on_step("extracting DV metadata", None)   # reads the whole donor; no
@@ -1291,6 +1313,8 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                                           f"the shipped video (shipped nothing)")
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
+        if skip_inject and on_stages:
+            on_stages(inject_stages(False, skip_inject=True, convert_es=convert_es))
         with _StepWatch(on_step, "copying the original video", src_es, _fsize(orig_source)):
             ex = subprocess.run(dvcap.build_annexb_file_command(ffmpeg, orig_source, src_es),
                                 capture_output=True, text=True, errors="replace", timeout=timeout)
@@ -1375,7 +1399,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
 def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
             rpu_inline=False, rpu_profile="", capped=False,
             cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, boundaries=None,
-            audio_target_lufs=None, abort=None, on_step=None, on_progress=None,
+            audio_target_lufs=None, abort=None, on_step=None, on_stages=None, on_progress=None,
             on_plan=None, should_pause=None, on_repair=None,
             ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """COMPANION COMBINE (user-dictated): one best-of master from two copies of a film.
@@ -1433,14 +1457,15 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
                      ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
     return remux_inject(rpu_source, audio_source, winner, output,
                         audio_target_lufs=audio_target_lufs, abort=abort, on_step=on_step,
-                        rpu_mode=mode, skip_inject=rpu_inline,
+                        on_stages=on_stages, rpu_mode=mode, skip_inject=rpu_inline,
                         convert_es=(rpu_inline and p7),
                         ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
 
 
 def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                       cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
-                      abort=None, on_step=None, ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE,
+                      abort=None, on_step=None, on_stages=None, ffmpeg=FFMPEG,
+                      mkvmerge=MKVMERGE, ffprobe=FFPROBE,
                       timeout=None, sdr: bool = False) -> RemuxResult:
     """YOUTUBE FAST REMUX (user-asked 2026-08-06: videos should move through fast). The
     native render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
@@ -1452,13 +1477,18 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
     remux_inject; the render↔CFR frame alignment was already gated when the DV step
     accepted the render (render_is_complete). No resume dir — a kill just redoes minutes.
     `sdr` (2026-10-18): a native SDR render (an item pinned to SDR output) — shipped the same
-    way, with no DV box in the mux and a verify that asks for no DOVI record."""
+    way, with no DV box in the mux and a verify that asks for no DOVI record. `on_stages` hears
+    SHIP_STAGES (the steps `on_step` will report) before the first of them."""
     if not is_master_container(output):
         return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     info = dvcap.probe_video(dv_video, ffprobe)
     if info["frames"] <= 0:
         return RemuxResult(False, output, reason="could not probe render frame count")
+    if on_stages:
+        on_stages(list(SHIP_STAGES))
+    if on_step:
+        on_step("measuring the render's peaks", None)
     mbps = dvcap.video_peak_1s_mbps(dv_video, ffprobe)
     if not dvcap.peak_ok(mbps, cap_mbps):
         return RemuxResult(False, output,

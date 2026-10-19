@@ -203,6 +203,83 @@ struct SteelBar: View {
     }
 }
 
+/// The current stage's line: "Stage B · Encoding the picture", then what it is doing now.
+struct StageTitle: View {
+    let plan: StagePlan
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text("Stage \(StagePlan.letter(plan.idx)) ·")
+                .font(.system(size: 11, weight: .semibold)).foregroundStyle(DS.steelBright)
+                .fixedSize()
+            Text(plan.current).font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
+                .lineLimit(1).truncationMode(.tail).layoutPriority(1)
+            if let sub = plan.sub {
+                Text("· " + sub).font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+        }
+        .help(plan.title + (plan.sub.map { " · " + $0 } ?? ""))
+    }
+}
+
+/// A staged step's bar. Collapsed: the CURRENT stage's own bar (it starts over at each stage),
+/// none at all for a stage with no number. Expanded (the card hovered): EVERY stage side by
+/// side, lettered — finished ones full, the current one filling with its own segments, the
+/// rest empty.
+struct StageBar: View {
+    let plan: StagePlan
+    var expanded: Bool = false
+    var repairLo: Double? = nil
+    var repairHi: Double? = nil
+    var repairFrac: Double = 0
+
+    var body: some View {
+        if expanded {
+            HStack(alignment: .top, spacing: 4) {
+                ForEach(Array(plan.labels.enumerated()), id: \.offset) { i, label in
+                    VStack(spacing: 3) {
+                        section(i)
+                        Text(StagePlan.letter(i))
+                            .font(.system(size: 9, weight: i == plan.idx ? .bold : .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(i == plan.idx ? DS.steelBright
+                                             : (i < plan.idx ? DS.steel : DS.steelDim))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .help("Stage \(StagePlan.letter(i)) · \(StagePlan.label(label))"
+                          + (i < plan.idx ? " · done" : (i == plan.idx ? " · running now" : "")))
+                }
+            }
+        } else if let p = plan.pct {
+            SteelBar(completed: plan.completed, live: p / 100, notches: plan.notches,
+                     flashKey: plan.segDone, repairLo: repairLo, repairHi: repairHi,
+                     repairFrac: repairFrac)
+        }
+    }
+
+    @ViewBuilder private func section(_ i: Int) -> some View {
+        if i < plan.idx {
+            SteelBar(completed: 1, live: 1)
+        } else if i == plan.idx, let p = plan.pct {
+            SteelBar(completed: plan.completed, live: p / 100, notches: plan.notches,
+                     flashKey: plan.segDone, repairLo: repairLo, repairHi: repairHi,
+                     repairFrac: repairFrac)
+        } else if i == plan.idx {
+            // running, with no number to give: the track is lit and outlined, never filled
+            Capsule().fill(Color.white.opacity(0.14))
+                .overlay(Capsule().strokeBorder(DS.steel.opacity(0.55), lineWidth: 1))
+                .frame(height: 6)
+        } else {
+            Capsule().fill(Color.white.opacity(0.08)).frame(height: 6)
+        }
+    }
+
+    /// The bar's own number: the stage's percentage, "—" for a stage with none.
+    static func pctText(_ plan: StagePlan) -> String {
+        plan.pct.map { "\(Int($0.rounded(.down)))%" } ?? "—"
+    }
+}
+
 // MARK: - shared building blocks
 
 struct Card<Content: View>: View {
@@ -992,11 +1069,13 @@ struct StageView: View {
                 if isActive {
                     VStack(alignment: .leading, spacing: 7) {
                         Text(info.how).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
-                        if role == .finisher { FinisherProgress(stageKey: info.key) }
+                        // HOVER also lays out every stage of a staged step side by side
+                        if role == .finisher { FinisherProgress(stageKey: info.key, expanded: hovering) }
                         // `alwaysSegEta` while the card is open: the segment countdown belongs
                         // in the SAME place it sits when the gate lets it through, not in a
                         // row of its own further down (user-dictated 2026-08-23).
-                        else { StageProgress(stageKey: info.key, alwaysSegEta: hovering) }
+                        else { StageProgress(stageKey: info.key, alwaysSegEta: hovering,
+                                             expanded: hovering) }
                         // HOVER: the card grows in place to say what it is working ON. Only
                         // while it is live — an idle step has no file to name.
                         if hovering { liveDetail }
@@ -1043,6 +1122,8 @@ struct FinisherProgress: View {
     /// remuxes — and drawing both in one card put a remux's progress, segment counter and all,
     /// under the Upload heading.
     let stageKey: String
+    /// The card is hovered: a staged lane lays out all its stages.
+    var expanded: Bool = false
 
     var body: some View {
         let o = store.state?.orchestrator
@@ -1058,7 +1139,7 @@ struct FinisherProgress: View {
         let dual = mine.count > 1
         VStack(alignment: .leading, spacing: 7) {
             ForEach(Array(mine.enumerated()), id: \.offset) { i, f in
-                LaneProgress(f: f, primary: i == 0, showEpisode: dual)
+                LaneProgress(f: f, primary: i == 0, showEpisode: dual, expanded: expanded)
             }
         }
         .padding(.top, 3)
@@ -1082,6 +1163,8 @@ private struct LaneProgress: View {
     /// Label the row with its episode. False for a lone lane, whose identity is already in
     /// the card's top-right; true whenever two rows are up and that slot reads "x2".
     var showEpisode: Bool = false
+    /// The card is hovered: a staged lane lays out all its stages (StageBar).
+    var expanded: Bool = false
 
     // Fixed slots, sized to their worst cases ("100%", "~12h 59m left"), so a changing
     // digit never moves the container edge and lane 2's eta sits directly under lane 1's —
@@ -1114,6 +1197,7 @@ private struct LaneProgress: View {
             guard repairing, let d = f.repair_done, let t = f.repair_total, t > 0 else { return 0 }
             return Double(d) / Double(t)
         }()
+        let plan = f.stagePlan
         VStack(alignment: .leading, spacing: 4) {
             if showEpisode, let ep = f.ep, !ep.isEmpty {
                 Text(ep).font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -1121,8 +1205,11 @@ private struct LaneProgress: View {
             }
             // FAST-REMUX STEPS (inject / ship): one labeled bar at a time — the bar is
             // the CURRENT step's own progress; a label-only phase (no watchable output)
-            // shows its label with an empty track, never a fake number.
-            if let step = f.step {
+            // shows its label with an empty track, never a fake number. Each step is a
+            // lettered stage ("Stage C · injecting DV metadata", user-dictated 2026-10-19).
+            if let plan {
+                StageTitle(plan: plan)
+            } else if let step = f.step {
                 Text(step).font(.system(size: 11, weight: .medium))
                     .foregroundStyle(DS.steel).lineLimit(1)
             }
@@ -1130,12 +1217,17 @@ private struct LaneProgress: View {
             // progress used to draw an empty track for as long as it ran, which reads as a
             // stalled encode rather than as "this step has no percentage" — the step label
             // already says what is happening, so the track just lies.
-            if !stepOnly {
+            if let plan {
+                // the repair cut-out belongs to the stage whose ticks are the remux's own
+                let own = plan.notches == notches
+                StageBar(plan: plan, expanded: expanded, repairLo: own ? rLo : nil,
+                         repairHi: own ? rHi : nil, repairFrac: rFrac)
+            } else if !stepOnly {
                 SteelBar(completed: completed, live: live, notches: notches, flashKey: done,
                          repairLo: rLo, repairHi: rHi, repairFrac: rFrac)
             }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(stepOnly ? "—" : String(format: "%.0f%%", pct))
+                Text(plan.map(StageBar.pctText) ?? (stepOnly ? "—" : String(format: "%.0f%%", pct)))
                     .font(.system(size: primary ? 17 : 13, weight: .semibold)).monospacedDigit()
                     .foregroundStyle(held == nil ? DS.steelBright : DS.steelDim)
                     .frame(width: primary ? nil : Self.pctSlot, alignment: .leading)
@@ -1166,7 +1258,14 @@ private struct LaneProgress: View {
                         .foregroundStyle(.secondary)
                         .frame(width: primary ? nil : Self.etaSlot, alignment: .leading)
                 }
-                if let d = f.seg_done, let t = f.seg_total, t > 0 {
+                if let plan {
+                    // a staged lane counts the CURRENT stage's segments, when it has any
+                    if !plan.notches.isEmpty {
+                        Spacer()
+                        Text("\(min(plan.segDone + 1, plan.notches.count))/\(plan.notches.count)")
+                            .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
+                    }
+                } else if let d = f.seg_done, let t = f.seg_total, t > 0 {
                     Spacer()
                     Text("\(min(d + 1, t))/\(t)")
                         .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
@@ -1183,31 +1282,53 @@ struct StageProgress: View {
     /// Show the CURRENT segment's countdown whatever 'seg_eta_after_minutes' says — set
     /// while the step's card is expanded.
     var alwaysSegEta: Bool = false
+    /// The card is hovered: a staged step lays out all its stages (StageBar).
+    var expanded: Bool = false
     @EnvironmentObject var store: AppStore
     var body: some View {
         let pr = store.state?.orchestrator?.progress
         if let pr, pr.stage == stageKey, let pct = pr.pct {
+            let plan = pr.stagePlan
             VStack(alignment: .leading, spacing: 5) {
-                // Two-layer topaz bar: bright = completed segments (snapped to the last finished
-                // boundary, quick sweep + flash when one lands); dark shadow = live progress
-                // through the current segment. No notch plan yet → plain single bar.
-                let live = Double(pct) / 100
-                let notches = pr.notches ?? []
-                let done = pr.seg_done ?? 0
-                let completed: Double = notches.isEmpty ? live
-                    : (done >= notches.count ? 1.0 : (done > 0 ? notches[done - 1] : 0))
-                SteelBar(completed: completed, live: live,
-                         notches: notches, flashKey: done)
+                // A STAGED step (the Dolby Vision step, a two-part download) names the stage
+                // it is in, and its bar is THAT stage's: it starts over at each one, and the
+                // hover view shows them all (user-dictated 2026-10-19).
+                if let plan {
+                    StageTitle(plan: plan)
+                    StageBar(plan: plan, expanded: expanded)
+                } else {
+                    // Two-layer topaz bar: bright = completed segments (snapped to the last
+                    // finished boundary, quick sweep + flash when one lands); dark shadow = live
+                    // progress through the current segment. No notch plan yet → plain bar.
+                    let live = Double(pct) / 100
+                    let notches = pr.notches ?? []
+                    let done = pr.seg_done ?? 0
+                    let completed: Double = notches.isEmpty ? live
+                        : (done >= notches.count ? 1.0 : (done > 0 ? notches[done - 1] : 0))
+                    SteelBar(completed: completed, live: live,
+                             notches: notches, flashKey: done)
+                }
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     // The hero number — prominent but solid steel (the gradient stays on the title).
-                    Text("\(pct)%")
+                    // A staged step's is its stage's, the number its bar shows; the eta beside it
+                    // stays the whole step's.
+                    Text(plan.map(StageBar.pctText) ?? "\(pct)%")
                         .font(.system(size: 17, weight: .semibold)).monospacedDigit()
                         .foregroundStyle(DS.steelBright)
                     Text(elapsedClock(pr.elapsed_secs))       // stopwatch: time spent so far (counts up)
                         .font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
                     Text(etaSuffix(pr.eta_secs))              // remaining (counts down): " · ~7 min left"
                         .font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
-                    if let d = pr.seg_done, let t = pr.seg_total, t > 0 {
+                    // a staged step counts its CURRENT stage's segments, when that stage has any
+                    let segs: (done: Int, total: Int)? = {
+                        if let plan {
+                            return plan.notches.isEmpty ? nil : (plan.segDone, plan.notches.count)
+                        }
+                        guard let d = pr.seg_done, let t = pr.seg_total, t > 0 else { return nil }
+                        return (d, t)
+                    }()
+                    if let segs {
+                        let d = segs.done, t = segs.total
                         Spacer()
                         // The stage eta alone reads as "hours away", so show the CURRENT segment's
                         // countdown for near-term motion. Gated on that segment's projected TOTAL

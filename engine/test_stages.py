@@ -89,6 +89,32 @@ class DownloadReuse(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("CFR", msg)
 
+    def test_the_pull_and_the_cfr_are_stages_a_and_b(self):
+        """The pull fills the first fifth of the step's bar and the CFR the rest, but each is
+        its own lettered stage with its own 0..100 (the bar starts over for Stage B)."""
+        p = _paths(tempfile.mkdtemp())
+        seen = []
+        import topaz
+        def dl(remote, local_dir, on_progress=None, **kw):
+            on_progress(50, 100)
+            with open(p.source, "w") as fh:
+                fh.write("x")
+            return True, p.source, ""
+        def cfr(src, dst, on_progress=None, **kw):
+            on_progress(25)
+            return topaz.CfrResult(ok=True, frames=100, rate="24000/1001", error_tail="")
+        with mock.patch.object(stages.transfer, "download", side_effect=dl), \
+             mock.patch("plan.probe_input", return_value={}), \
+             mock.patch("topaz.is_cfr_ready", return_value=False), \
+             mock.patch("topaz.total_frames", return_value=100), \
+             mock.patch("topaz.to_cfr", side_effect=cfr):
+            ok, _ = stages.run_stage("download", p, progress=seen.append)
+        self.assertTrue(ok)
+        pull, make = seen[0], seen[-1]
+        self.assertEqual((pull["pct"], pull["stage_idx"], pull["stage_pct"]), (10, 0, 50.0))
+        self.assertEqual((make["pct"], make["stage_idx"], make["stage_pct"]), (40, 1, 25.0))
+        self.assertEqual(make["stages"], list(stages.DOWNLOAD_STAGES))
+
 
 class RemuxProgress(unittest.TestCase):
     """The finishing lane shows the SAME notched segment bar as topaz — _remux surfaces
@@ -348,6 +374,11 @@ class SlotNotes(unittest.TestCase):
 
     def test_no_surface_no_hook(self):
         self.assertIsNone(stages._slot_note(None, "upload", "S01E01"))
+
+    def test_a_waiting_download_keeps_its_stage(self):
+        seen = []
+        stages._slot_note(seen.append, "download", "S04E07", {"stage_idx": 0})("waiting")
+        self.assertEqual(seen[0]["stage_idx"], 0)
 
     def test_a_download_we_stopped_is_interrupted_not_a_failure(self):
         self.assertEqual(stages._stopped_is_interrupted("aborted mid-download"),
@@ -886,7 +917,9 @@ class FastRemuxStepProgress(unittest.TestCase):
         import types, plan, remux, settings
         p = _paths(tempfile.mkdtemp())
         emitted = []
-        def fake_inject(dv, cfr, orig, out, *, audio_target_lufs, abort, on_step=None):
+        def fake_inject(dv, cfr, orig, out, *, audio_target_lufs, abort, on_step=None,
+                        on_stages=None):
+            on_stages(remux.inject_stages(True))
             on_step("extracting DV metadata", None)
             on_step("copying the original video", 41.5)
             return types.SimpleNamespace(ok=True, reason="ok")
@@ -904,6 +937,75 @@ class FastRemuxStepProgress(unittest.TestCase):
         self.assertIsNone(emitted[1]["pct"])
         self.assertEqual(emitted[2]["step"], "copying the original video")
         self.assertEqual(emitted[2]["pct"], 41.5)
+        # ...each a lettered stage of ONE plan: the peaks, then what remux_inject announced
+        self.assertEqual(emitted[2]["stages"], ["measuring source peaks"] + remux.inject_stages(True))
+        self.assertEqual([d["stage_idx"] for d in emitted], [0, 1, 2])
+        self.assertEqual(emitted[2]["stage_pct"], 41.5)
+        self.assertNotIn("stage_pct", emitted[1])          # label-only: no number, no bar
+
+    def test_a_resumed_inject_letters_from_its_real_plan(self):
+        # the RPU already extracted: remux_inject's plan has no extraction, so copying is B
+        import types, plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        def fake_inject(dv, cfr, orig, out, *, audio_target_lufs, abort, on_step=None,
+                        on_stages=None):
+            on_stages(remux.inject_stages(False))
+            on_step("copying the original video", 10.0)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "rpu-only"}), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=15.0), \
+             mock.patch.object(remux, "remux_inject", side_effect=fake_inject), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
+        self.assertEqual(emitted[0]["stages"][1], "extracting DV metadata")   # the provisional plan
+        self.assertEqual(emitted[1]["stages"][:2], ["measuring source peaks",
+                                                    "copying the original video"])
+        self.assertEqual(emitted[1]["stage_idx"], 1)
+
+    def test_a_revoked_fast_path_letters_the_capped_encode(self):
+        # over the DV ship gate: peaks (A), planning (B), the capped re-encode (C) with its
+        # segment ticks as Stage C's own
+        import types, plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        def fake_remux(*a, on_progress=None, on_plan=None, **k):
+            on_plan([100, 200, 300], 300)
+            on_progress(150, 300)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "rpu-only"}), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=95.0), \
+             mock.patch.object(stages, "_plan_fast_path_bounds"), \
+             mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
+        self.assertTrue(ok)
+        last = emitted[-1]
+        self.assertEqual(last["stages"], [stages.PEAKS_STAGE, stages.PLAN_STAGE,
+                                          stages.CAPPED_STAGE])
+        self.assertEqual(last["stage_idx"], 2)
+        self.assertEqual(last["stage_pct"], 50.0)
+        self.assertEqual(last["stage_notches"], [0.3333, 0.6667, 1.0])
+        self.assertEqual(last["stage_seg_done"], 1)
+        self.assertEqual(last["pct"], 50.0)                # the lane's own pct is unchanged
+
+    def test_a_plain_capped_remux_has_no_stages(self):
+        import types, plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        def fake_remux(*a, on_progress=None, on_plan=None, **k):
+            on_plan([100, 200, 300], 300)
+            on_progress(150, 300)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
+        self.assertTrue(emitted)
+        self.assertTrue(all("stages" not in d for d in emitted))
 
 
 class CombineStages(unittest.TestCase):

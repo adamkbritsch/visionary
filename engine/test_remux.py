@@ -597,6 +597,83 @@ class ShipRender(unittest.TestCase):
         self.assertFalse(res.reason.startswith("render-over-cap"))   # a real failure retries
 
 
+class StagePlans(unittest.TestCase):
+    """The fast remuxes announce their lettered stages (on_stages) before the first step, and
+    every step they then report is in that plan, in its order (the app letters them A, B, C)."""
+
+    def _inject(self, tmp, steps, plans, **kw):
+        import os
+        out = os.path.join(tmp, "master.mkv")
+        with mock.patch.object(remux.dvcap, "probe_video",
+                               side_effect=[InjectPath.R_INFO, InjectPath.S_INFO]), \
+             mock.patch.object(remux.dvcap, "count_hevc_frames", side_effect=[100, 100]), \
+             mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
+             mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+             mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
+             mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="DV 8.1")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
+             mock.patch.object(remux.subprocess, "run", side_effect=InjectPath()._fake_run):
+            return remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out,
+                                      on_step=lambda l, p: steps.append(l),
+                                      on_stages=lambda ls: plans.append(list(ls)), **kw)
+
+    def assertInPlanOrder(self, steps, plan):
+        at = [plan.index(s) for s in steps]
+        self.assertEqual(at, sorted(at), (steps, plan))
+
+    def test_inject_announces_its_steps_first(self):
+        import tempfile
+        steps, plans = [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(self._inject(tmp, steps, plans).ok)
+        self.assertEqual(plans, [remux.inject_stages(True)])
+        self.assertEqual(steps[0], "extracting DV metadata")
+        self.assertInPlanOrder(steps, plans[0])
+
+    def test_a_cached_rpu_is_not_a_stage(self):
+        import os, tempfile
+        steps, plans = [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            seg = os.path.join(tmp, "master.mkv.remuxsegs")
+            with mock.patch.object(remux.dvcap, "ensure_segdir"):
+                os.makedirs(seg)
+                with open(os.path.join(seg, "rpu.bin"), "wb") as f:
+                    f.write(b"RPU")
+                self.assertTrue(self._inject(tmp, steps, plans).ok)
+        self.assertEqual(plans, [remux.inject_stages(False)])
+        self.assertNotIn("extracting DV metadata", plans[0] + steps)
+        self.assertEqual(plans[0][0], "copying the original video")     # Stage A
+
+    def test_skip_and_convert_plans(self):
+        self.assertEqual(remux.inject_stages(False, skip_inject=True, convert_es=True)[:2],
+                         ["copying the original video", "converting DV to profile 8.1"])
+        self.assertEqual(remux.inject_stages(True, skip_inject=True)[:2],
+                         ["copying the original video", "preparing audio"])
+
+    def test_the_mux_steps_are_the_ones_mux_verified_reports(self):
+        import inspect
+        src = inspect.getsource(remux._mux_verified) + inspect.getsource(remux.remux_inject)
+        for label in remux.MUX_STAGES + ("copying the original video", "injecting DV metadata",
+                                          "extracting DV metadata", "converting DV to profile 8.1"):
+            self.assertIn(f'"{label}"', src)
+        ship = inspect.getsource(remux.remux_ship_render)
+        for label in remux.SHIP_STAGES[:2]:
+            self.assertIn(f'"{label}"', ship)
+
+    def test_ship_render_announces_then_measures(self):
+        import dvcap
+        steps, plans = [], []
+        with mock.patch.object(dvcap, "probe_video",
+                               return_value={"frames": 100, "fps": "24000/1001"}), \
+             mock.patch.object(dvcap, "video_peak_1s_mbps", return_value=81.2):
+            res = remux.remux_ship_render("/dv.mov", "/cfr.mp4", "/orig.mp4", "/tmp/out.mkv",
+                                          cap_mbps=50, on_step=lambda l, p: steps.append(l),
+                                          on_stages=lambda ls: plans.append(list(ls)))
+        self.assertFalse(res.ok)
+        self.assertEqual(plans, [list(remux.SHIP_STAGES)])
+        self.assertEqual(steps, ["measuring the render's peaks"])
+
+
 class StepWatch(unittest.TestCase):
     def test_reports_label_immediately_and_caps_at_99(self):
         seen = []

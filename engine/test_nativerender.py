@@ -454,9 +454,36 @@ class Render(_Base):
         phases = [e["phase"] for e in self.events]
         self.assertEqual(phases[0], "analysis")
         self.assertEqual(phases[-1], "finish")
+        stages = ["Measuring every shot", "Encoding the picture", "Finishing the render"]
         self.assertIn({"stage": "dvrender", "ep": "S01E01", "phase": "encode", "pct": 72.5, "attempt": 1,
-                       "kbps": 14000}, self.events)                       # frame 24 of 48, from -progress
+                       "kbps": 14000, "stages": stages, "stage_idx": 1, "stage_pct": 50.0},
+                      self.events)                       # frame 24 of 48, from -progress
         self.assertEqual(self.events[-1]["pct"], 100)
+
+    def test_each_phase_is_a_lettered_stage_with_its_own_bar(self):
+        """The card shows "Stage A · Measuring every shot" with the ranges as its ticks, then
+        B (the encode, its bar starting over), then C (the finish: a label and its sub-step,
+        no number — there is none to give)."""
+        self.peaks = [40.0]
+        self.render()
+        ana = [e for e in self.events if e["phase"] == "analysis"]
+        self.assertEqual({e["stage_idx"] for e in ana}, {0})
+        self.assertEqual([e["stage_seg_done"] for e in ana], [0, 2])
+        self.assertEqual(ana[-1]["stage_notches"][-1], 1.0)
+        self.assertEqual(ana[-1]["stage_pct"], 100.0)
+        enc = [e for e in self.events if e["phase"] == "encode"]
+        self.assertEqual(enc[0]["stage_pct"], 0.0)            # the bar resets for Stage B
+        self.assertNotIn("stage_sub", enc[0])                 # a first attempt says nothing more
+        fin = [e for e in self.events if e["phase"] == "finish"]
+        self.assertEqual({e["stage_idx"] for e in fin}, {2})
+        self.assertTrue(all("stage_pct" not in e for e in fin))
+        self.assertIn("injecting the Dolby Vision metadata", [e.get("stage_sub") for e in fin])
+
+    def test_render_stages_follow_the_spec(self):
+        sdr = mock.Mock(sdr=True, keep_video=False)
+        keep = mock.Mock(sdr=False, keep_video=True)
+        self.assertEqual(NR.render_stages(sdr), ["Encoding the picture", "Finishing the render"])
+        self.assertEqual(NR.render_stages(keep)[1], "Copying the source's picture")
 
     # ---- the peak loop (render_under_cap's rules) ----
     def test_a_first_encode_under_the_cap_is_the_only_one(self):

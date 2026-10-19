@@ -90,6 +90,7 @@ import dvcap
 import dvnative
 import logbook
 import nativelane
+import stagebar
 import peakplan
 import remux
 
@@ -133,6 +134,12 @@ FINISH_HEADROOM = 1.10          # the finish's transient need, x the encode: at 
 DISK_FLOOR_GB = nativelane.MID_ANALYSIS_FLOOR_GB    # the native lane's floor, for every big write
 NICE = dvnative.NICE
 PHASE_SPAN = {"analysis": (0, 50), "encode": (50, 95), "finish": (95, 100)}   # stage pct per phase
+# The card's lettered stages (stagebar): what each phase is called, and the finish's sub-steps
+STAGE_MEASURE, STAGE_ENCODE, STAGE_COPY, STAGE_FINISH = (
+    "Measuring every shot", "Encoding the picture", "Copying the source's picture",
+    "Finishing the render")
+FINISH_SUBSTEP = {"hdr10": "writing the HDR10 metadata", "inject": "injecting the Dolby Vision metadata",
+                  "mux": "muxing", "check": "checking the render"}
 _FRAME_RE = re.compile(rb"frame=\s*(\d+)")
 
 
@@ -647,11 +654,32 @@ def _run(cmd: list, timeout: float, abort, should_pause, what: str, on_poll=None
     return cpu or 0.0
 
 
-def _report(progress, ep, phase: str, frac: float, **extra) -> None:
+def render_stages(spec) -> list:
+    """PURE. The lettered stages a render of `spec` runs (stagebar): an SDR render has no
+    analysis, a keep_video one copies the source's picture instead of encoding one."""
+    middle = STAGE_COPY if spec.keep_video else STAGE_ENCODE
+    return ([] if spec.sdr else [STAGE_MEASURE]) + [middle, STAGE_FINISH]
+
+
+def _report(progress, ep, spec, phase: str, frac: float, *, sub=None, notches=None,
+            seg_done=None, **extra) -> None:
+    """Publish the 'dvrender' card: `pct` is the whole render's (PHASE_SPAN, what RenderClock
+    times), and the stagebar fields say which stage `phase` is and how far IT has got — the
+    finish has no honest fraction, so it shows its label and sub-step alone."""
     if progress:
         lo, hi = PHASE_SPAN[phase]
-        progress(dict({"stage": "dvrender", "ep": ep, "phase": phase,
-                       "pct": round(lo + (hi - lo) * max(0.0, min(1.0, frac)), 1)}, **extra))
+        frac = max(0.0, min(1.0, frac))
+        stages = render_stages(spec)
+        idx = {"analysis": 0, "encode": len(stages) - 2, "finish": len(stages) - 1}[phase]
+        own = None if phase == "finish" else frac * 100
+        if phase == "finish" and sub is None:
+            sub = FINISH_SUBSTEP.get(extra.get("step"))
+        info = {"stage": "dvrender", "ep": ep, "phase": phase,
+                "pct": round(lo + (hi - lo) * frac, 1)}
+        info.update(stagebar.fields(stages, idx, own, notches=notches, seg_done=seg_done, sub=sub))
+        if seg_done is not None:
+            info["seg_done"] = seg_done
+        progress(dict(info, **extra))
 
 
 def _rpu_ready(p, state: dict) -> bool:
@@ -675,13 +703,16 @@ def _analyse(p, spec: RenderSpec, state: dict, abort, progress, should_pause) ->
     ends = [b for _a, b in ranges] if ranges is not None else [a for a, _p in spec.inputs[1:]]
     unit = "range" if ranges is not None else "chunk"
 
+    ticks = [e / total for e in ends]
+
     def on_done(done, of):
-        _report(progress, ep, "analysis", ends[done - 1] / total, seg_done=done, seg_total=of)
+        _report(progress, ep, spec, "analysis", ends[done - 1] / total, seg_done=done,
+                seg_total=of, notches=ticks)
 
     def on_cpu(k, cpu_s, frames):
         record_cpu(p, "analysis", f"{unit}_{k:04d}", cpu_s, frames)
 
-    _report(progress, ep, "analysis", 0.0, seg_done=0, seg_total=len(ends))
+    _report(progress, ep, spec, "analysis", 0.0, seg_done=0, seg_total=len(ends), notches=ticks)
     common = dict(cube=spec.lut, pre_vf=spec.pre_vf, master=spec.master,
                   analyzer=nativelane.analyzer_path(), peak_estimator=spec.peak_estimator,
                   with_l4=spec.with_l4, abort=abort, should_pause=should_pause, on_cpu=on_cpu)
@@ -765,22 +796,22 @@ def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progre
     _need_room(p, int(os.path.getsize(enc) * FINISH_HEADROOM), "the DV render's finish")
     cpu = 0.0
     if spec.sdr:
-        _report(progress, ep, "finish", 0.6, step="mux", attempt=attempt)
+        _report(progress, ep, spec, "finish", 0.6, step="mux", attempt=attempt)
         cpu += _run(remux.build_master_mux_command(MKVMERGE, enc, str(spec.fps), part,
                                                    colour=remux.mkv_colour_args(sdr=True)),
                     tmo, abort, None, "SDR mux", ok_rcs=remux.MKVMERGE_OK)
         _rm(enc)
         return cpu
     if sei_step:
-        _report(progress, ep, "finish", 0.0, step="hdr10", attempt=attempt)
+        _report(progress, ep, spec, "finish", 0.0, step="hdr10", attempt=attempt)
         cpu += _run(build_sei_command(sys.executable, enc, sei, hdr[0], hdr[1]), tmo, abort, None,
                     "HDR10 metadata", cwd=dvnative.ENGINE_DIR)
         os.replace(sei, enc)
-    _report(progress, ep, "finish", 0.3, step="inject", attempt=attempt)
+    _report(progress, ep, spec, "finish", 0.3, step="inject", attempt=attempt)
     cpu += _run(dvcap.build_inject_command(DOVI_TOOL, enc, _book(p, RPU), es_dv), tmo, abort, None,
                 "RPU inject")
     _rm(enc)
-    _report(progress, ep, "finish", 0.6, step="mux", attempt=attempt)
+    _report(progress, ep, spec, "finish", 0.6, step="mux", attempt=attempt)
     # the container's HDR10 description = the SEI this very stream carries (the finish's own, or
     # a keep_video source's) — read off its first frame
     md, cll = dvcap.first_frame_hdr10(es_dv, FFPROBE)
@@ -816,6 +847,10 @@ def _encode(p, spec: RenderSpec, rpu: dict, abort, progress, should_pause) -> di
     kbps, prev, attempts = int(spec.kbps), None, []
     keep, verdict = part, "no-cap"       # the file that ships at the end (part, or best)
 
+    def again(n):
+        """A re-encode under the peak cap says so on its stage (the bar starts over)."""
+        return f"attempt {n}, under the peak cap" if n > 1 else None
+
     def keep_best():
         """The first render is the best source the fallback can have: back it goes."""
         nonlocal keep
@@ -833,9 +868,10 @@ def _encode(p, spec: RenderSpec, rpu: dict, abort, progress, should_pause) -> di
         def on_poll(n=n, k=kbps):
             got = progress_frames(prog)
             if got is not None:
-                _report(progress, ep, "encode", got / total, attempt=n, kbps=k)
+                _report(progress, ep, spec, "encode", got / total, attempt=n, kbps=k,
+                        sub=again(n))
 
-        _report(progress, ep, "encode", 0.0, attempt=n, kbps=kbps)
+        _report(progress, ep, spec, "encode", 0.0, attempt=n, kbps=kbps, sub=again(n))
         cpu = _run(build_encode_command(FFMPEG, spec, out, kbps, concat=concat, progress=prog),
                    encode_timeout(total), abort, should_pause, f"encode attempt {n}",
                    on_poll=on_poll)
@@ -934,9 +970,9 @@ def _copy_video(p, spec: RenderSpec, rpu: dict, abort, progress) -> dict:
     def on_poll():
         got = progress_frames(prog)
         if got is not None:
-            _report(progress, ep, "encode", got / total, step="copy")
+            _report(progress, ep, spec, "encode", got / total, step="copy")
 
-    _report(progress, ep, "encode", 0.0, step="copy")
+    _report(progress, ep, spec, "encode", 0.0, step="copy")
     cpu = _run(build_copy_command(FFMPEG, src, out, prog), dvnative.step_timeout(total), abort,
                None, "stream copy", on_poll=on_poll)
     frames = dvcap.count_hevc_frames(out, FFPROBE)
@@ -963,7 +999,7 @@ def _publish(p, spec: RenderSpec, rpu: dict, progress) -> str:
     """Phase 5: self-check the kept render, then rename it to p.dv_render. -> why."""
     ep = getattr(p, "ep", "?")
     kept = _book(p, KEPT)
-    _report(progress, ep, "finish", 0.9, step="check")
+    _report(progress, ep, spec, "finish", 0.9, step="check")
     if as_source(spec):      # the source's own HDR10 SEI, whatever it says (the finish wrote none)
         ok, why = self_check(p, kept, spec.total, as_source=True)
     elif spec.sdr:
@@ -977,7 +1013,7 @@ def _publish(p, spec: RenderSpec, rpu: dict, progress) -> str:
         _write_sdr_proof(p, kept)       # BEFORE the rename: the rename keeps size and mtime, so
                                         # a kill between the two leaves a proof of nothing at all
     os.replace(kept, p.dv_render)       # the publish: last, atomic
-    _report(progress, ep, "finish", 1.0, step="done")
+    _report(progress, ep, spec, "finish", 1.0, step="done")
     return why
 
 

@@ -51,6 +51,7 @@ import dvnative
 import logbook
 import scratch
 import settings
+import stagebar
 import topaz
 import versions
 
@@ -68,6 +69,8 @@ CPU_LEDGER = "cpu.json"
 MARKER_VERSION = 1
 AVG_FLOOR = "V40"               # CM v4.0 L1 floor: the blind-tested native clip's setting
 PEAK_ESTIMATOR = "max"          # dvnative.analyze_chunks' default, pinned into the marker
+LANE_STAGES = ("Measuring every shot", "Writing the Dolby Vision metadata")   # the card's
+                                # lettered stages (stagebar): the chunks, then the RPU
 WITH_L4 = True
 
 MAX_FAILURES = 2                # the 2nd failed native attempt sends the item to the render for good
@@ -1041,21 +1044,25 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
         with _SD_LOCK:
             _SD_CLAIMS.pop(os.path.abspath(p.segdir), None)
     ends = [a for a, _p in chunk_list[1:]]
+    ticks = [round(e / total, 4) for e in ends]
 
     def on_chunk(done, of):
         if progress:
             d = {"stage": "dvnative", "ep": ep, "pct": min(100, round(ends[done - 1] / total * 100)),
-                 "notches": [round(e / total, 4) for e in ends], "seg_done": done, "seg_total": of}
+                 "notches": ticks, "seg_done": done, "seg_total": of}
             if done < of:
                 d["seg_rem_pct"] = (ends[done] - ends[done - 1]) / total * 100
+            d.update(stagebar.fields(LANE_STAGES, 0, ends[done - 1] / total * 100, notches=ticks,
+                                     seg_done=done))
             progress(d)
 
     def on_cpu(k, cpu_s, frames):
         record_cpu(p, "analysis", f"chunk_{k:04d}", cpu_s, frames)
 
     if progress:
-        progress({"stage": "dvnative", "ep": ep, "pct": 0, "seg_done": 0, "seg_total": len(ends),
-                  "notches": [round(e / total, 4) for e in ends]})
+        progress(dict({"stage": "dvnative", "ep": ep, "pct": 0, "seg_done": 0,
+                       "seg_total": len(ends), "notches": ticks},
+                      **stagebar.fields(LANE_STAGES, 0, 0.0, notches=ticks, seg_done=0)))
     try:
         sc = dvnative.analyze_chunks(chunk_list, work_dir(p), cube=lut_path(), analyzer=analyzer_path(),
                                      peak_estimator=PEAK_ESTIMATOR, with_l4=WITH_L4, abort=abort,
@@ -1069,6 +1076,10 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
         return False, "aborted (run stopped)"
     except (RuntimeError, ValueError, OSError) as e:
         return False, f"native analysis failed: {e}"
+    if progress:     # Stage B has no honest fraction: its label alone (every chunk is measured)
+        progress(dict({"stage": "dvnative", "ep": ep, "pct": 100, "seg_done": len(ends),
+                       "seg_total": len(ends), "notches": ticks},
+                      **stagebar.fields(LANE_STAGES, 1)))
     try:
         dvnative.generate_rpu(sc, rpu_path(p), avg_floor=AVG_FLOOR, l4=WITH_L4)
         m = publish_ready(p, sc)

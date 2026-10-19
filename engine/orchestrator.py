@@ -38,6 +38,7 @@ import power
 import scratch
 import series
 import settings
+import stagebar
 import eta as eta_math
 import eta_model
 import transfer
@@ -1661,6 +1662,8 @@ class Orchestrator:
                     base = int(out.get("pct") or 0)
                     cap = int(round(hi * 100.0)) - 1          # never the next boundary's own pct
                     out["pct"] = max(base, min(cap, int((lo + frac * (hi - lo)) * 100.0)))
+                    if out.get("stage_idx") == 0 and "stage_pct" in out:
+                        out["stage_pct"] = float(out["pct"])    # Stage A IS the measured span
                 except (TypeError, ValueError, IndexError, ZeroDivisionError):
                     pass
             self._publish_elapsed(out)
@@ -4515,6 +4518,8 @@ class Orchestrator:
                   # fast-remux labeled step (inject/ship) — self-clears like the notches
                   "step": info.get("step"),
                   "elapsed_secs": round(self._fin_elapsed_value(), 1)})
+        # the lettered stages (stagebar) — explicit too, so a stage-less tick clears them
+        f.update({k: info.get(k) for k in stagebar.FIELDS})
         # ETA from THIS attempt's live rate. The elapsed stopwatch deliberately ACCUMULATES
         # across killed attempts (user-dictated), so elapsed×remaining/pct read ~38 h after a
         # remux restart; anchoring frames/time at attempt start gives the real number.
@@ -4548,6 +4553,7 @@ class Orchestrator:
                   "repair_of": info.get("repair_of"), "repair_done": info.get("repair_done"),
                   "repair_total": info.get("repair_total"),
                   "step": info.get("step")})
+        f.update({k: info.get(k) for k in stagebar.FIELDS})
         e = self._lane_eta(2, info, f.get("stage"))
         if e is None:
             f.pop("eta_secs", None)

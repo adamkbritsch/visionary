@@ -112,9 +112,22 @@ enum DVConvert {
         return min(1, max(0, Double(d) / Double(t)))
     }
 
-    /// "Downloading 42%" / "Converting 45%" / "Uploading 10% · throttled" / "Waiting: …"
+    /// The conversion's phases in order: each is a lettered stage, and the row's bar starts
+    /// over at each one (user-dictated 2026-10-19).
+    static let stages = ["checking", "download", "convert", "upload", "swap"]
+
+    /// "Stage B · " for a phase, "" for anything else.
+    static func stageTag(_ phase: String?) -> String {
+        guard let p = phase, let i = stages.firstIndex(of: p) else { return "" }
+        return "Stage \(StagePlan.letter(i)) · "
+    }
+
+    /// "Stage B · Downloading 42%" / "Stage C · Converting 45%" / "Stage D · Uploading 10% ·
+    /// throttled" / "Stage B · Waiting: …"
     static func stepLabel(_ s: DVLaneStepDTO) -> String {
-        if let note = s.note, !note.isEmpty { return note.prefix(1).uppercased() + note.dropFirst() }
+        if let note = s.note, !note.isEmpty {
+            return stageTag(s.phase) + note.prefix(1).uppercased() + note.dropFirst()
+        }
         let verb: String
         switch s.phase {
         case "checking": verb = "Checking the NAS copy"
@@ -124,7 +137,7 @@ enum DVConvert {
         case "swap":     verb = "Replacing the original"
         default:         verb = (s.phase ?? "Working").capitalized
         }
-        var out = verb
+        var out = stageTag(s.phase) + verb
         if let f = fraction(s) { out += " \(Int((f * 100).rounded(.down)))%" }
         if s.phase == "download" || s.phase == "upload" {
             if let r = s.rate, r > 0 { out += String(format: " · %.0f MB/s", Double(r) / 1e6) }
@@ -169,7 +182,7 @@ enum DVConvert {
             }
             switch e.phase {
             case "converted": return "Converted · waiting to upload"
-            case "upload":    return "Uploading"
+            case "upload":    return stageTag("upload") + "Uploading"
             case "swap":      return "Uploaded · waiting to replace the original"
             default:          return "In progress"
             }

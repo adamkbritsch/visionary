@@ -93,7 +93,11 @@ check(DVConvert.entry(for: lib[0], in: q) == nil, "a plain row has no entry")
 
 // the lines the pane shows
 let live = DVConvert.entryLabel(q[0], lane: dv)
-check(live.hasPrefix("Downloading 50%"), "live step -> \(live)")
+check(live.hasPrefix("Stage B · Downloading 50%"), "live step -> \(live)")
+// each phase is a lettered stage, in the lane's order
+check(DVConvert.stageTag("checking") == "Stage A · " && DVConvert.stageTag("swap") == "Stage E · ",
+      "stage letters")
+check(DVConvert.stageTag("converted") == "", "between stages: no letter")
 check(live.contains("MB/s") && live.contains("throttled"), "rate + throttle -> \(live)")
 var busyStep = dv.fetch!; busyStep.throttle_why = "plex-busy"
 check(DVConvert.stepLabel(busyStep).contains("eased off while Plex analyzes a movie"),

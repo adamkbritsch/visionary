@@ -130,6 +130,13 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
 .bar > b.cut{position:absolute;top:0;bottom:0;background:rgba(0,0,0,.6);display:none}
 .bar > b.refill{position:absolute;top:0;bottom:0;background:var(--steel);opacity:.55;display:none}
 
+/* a staged step (the Dolby Vision step, a fast remux): "Stage B · Encoding the picture", and the
+   bar below is that stage's own */
+.stageln{font-size:12px;color:var(--steel);margin-top:10px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.stageln b{font-weight:600;color:var(--steel-bright)}
+.stageln:empty{display:none}
+.stageln + .bar{margin-top:6px}
 .readout{display:flex;align-items:baseline;gap:8px;margin-top:10px;flex-wrap:wrap}
 .readout .big{font-size:17px;font-weight:600;color:var(--steel-bright)}
 .readout .m{font-size:12px;font-weight:500;color:var(--steel-dim)}
@@ -282,6 +289,7 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18p
       </div>
       <div class="pct" id="nowPct"></div>
     </div>
+    <div class="stageln" id="nowStage"></div>
     <div class="bar" id="nowBar"><i class="live"></i><i class="done"></i><u></u><b class="cut"></b><b class="refill"></b></div>
     <div class="readout" id="readout"></div>
     <div class="stages" id="stages"></div>
@@ -416,6 +424,7 @@ function render(d){
   txt($("nowPct"), "");   /* the percentage lives in the readout row, beside its timings */
   $("nowSec").classList.toggle("off", !lead);
 
+  drawStage(lead);
   drawBar(lead);
   drawReadout(lead, d.settings);
 
@@ -954,8 +963,30 @@ function elapsedClock(secs){
 /* The app's SteelBar: a bright fill to the last COMPLETED segment boundary, a shadow fill
    at live progress, and only the NEXT boundary marked. During a peak repair the segment
    being re-encoded is cut back out and refills with its real frame progress. */
+/* The lead's lettered stage (engine/stagebar.py), or null: {letter, label, sub, pct, notches,
+   segDone}. Its bar and number are the STAGE's own; the timings stay the whole step's. */
+function stageOf(lead){
+  var r = (lead && lead.raw) || {}, s = r.stages, i = r.stage_idx;
+  if (!s || i === null || i === undefined || i < 0 || i >= s.length) return null;
+  var label = String(s[i]);
+  return {letter: String.fromCharCode(65 + (i % 26)),
+          label: label.charAt(0).toUpperCase() + label.slice(1), sub: r.stage_sub || "",
+          pct: (r.stage_pct === null || r.stage_pct === undefined) ? null : r.stage_pct,
+          notches: r.stage_notches || [], segDone: r.stage_seg_done || 0};
+}
+function drawStage(lead){
+  var sg = stageOf(lead), el = $("nowStage");
+  el.innerHTML = sg ? "<b>Stage " + sg.letter + " ·</b> " + esc(sg.label) +
+    (sg.sub ? ' <span style="color:var(--steel-dim)">· ' + esc(sg.sub) + "</span>" : "") : "";
+}
+
 function drawBar(lead){
   var bar = $("nowBar");
+  var sg = stageOf(lead);
+  if (sg) lead = {pct: sg.pct, notches: sg.notches,
+                  raw: (sg.notches.join() === ((lead.raw || {}).notches || []).join())
+                       ? Object.assign({}, lead.raw, {seg_done: sg.segDone})
+                       : {seg_done: sg.segDone}};
   // NO BAR WITHOUT A NUMBER: a phase that can't report progress drew an empty track for as
   // long as it ran, which reads as a stall. The step label already says what is happening.
   var known = lead && lead.pct !== null && lead.pct !== undefined;
@@ -993,8 +1024,9 @@ function drawBar(lead){
 function drawReadout(lead, settings){
   var el = $("readout");
   if (!lead){ el.innerHTML = ""; return; }
-  var raw = lead.raw || {}, bits = [];
-  bits.push('<span class="big mono">' + (lead.pct === null ? "—" : Math.round(lead.pct) + "%") + '</span>');
+  var raw = lead.raw || {}, bits = [], sg = stageOf(lead);
+  var big = sg ? sg.pct : lead.pct;
+  bits.push('<span class="big mono">' + (big === null ? "—" : (sg ? Math.floor(big) : Math.round(big)) + "%") + '</span>');
   var e = elapsedClock(raw.elapsed_secs);
   if (e) bits.push('<span class="m mono">' + e + '</span>');
   var eta = etaSuffix(raw.eta_secs);
@@ -1007,6 +1039,7 @@ function drawReadout(lead, settings){
       at.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}) + '</span>');
   }
   var d = raw.seg_done, t = raw.seg_total;
+  if (sg){ d = sg.segDone; t = sg.notches.length; }    /* the current stage's segments, if any */
   if (t > 0){
     var gate = ((settings || {}).seg_eta_after_minutes || 15) * 60;
     var segEta = ((raw.seg_secs || 0) > gate && raw.seg_eta_secs > 0)
