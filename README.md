@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/visionary-lockup-v10.png" alt="Visionary" width="335">
+  <img src="docs/assets/visionary-lockup-v11.png" alt="Visionary" width="372">
 </p>
 
 **Upscale your Plex library to 4K Dolby Vision™, overnight and unattended.**
