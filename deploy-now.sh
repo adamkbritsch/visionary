@@ -48,7 +48,7 @@ if [ -d "$ROOT/engine" ] && [ -d "$APP/Contents/Resources/engine" ]; then
   stale=$(cd "$ROOT/engine" && for p in *.py dashboard/*.py; do
             b="$APP/Contents/Resources/engine/$p"
             [ -f "$p" ] || continue
-            case "$p" in test_*|dashboard/test_*) continue ;; esac   # build.sh leaves tests out
+            n="${p##*/}"; [ "${n#test_}" = "$n" ] || continue   # build.sh leaves tests out
             if [ ! -f "$b" ] || ! cmp -s "$p" "$b"; then echo "$p"; fi
           done)
   if [ -n "$stale" ]; then
