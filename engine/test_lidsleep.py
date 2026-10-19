@@ -112,9 +112,9 @@ class LidSleep(unittest.TestCase):
         self.assertEqual(line, "someone ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, "
                                "/usr/bin/pmset -a disablesleep 0")
         cmd = lidsleep.install_command("someone")
-        self.assertIn("visudo -cqf", cmd)                     # checked BEFORE it is installed
-        self.assertLess(cmd.index("visudo"), cmd.index("sudo install"))
-        self.assertIn(lidsleep.RULE_FILE, cmd)
+        self.assertTrue(cmd.endswith("lidsleep.py --install"))
+        self.assertNotIn("'", cmd)                            # nothing for a paste to mangle
+        self.assertNotIn("(", cmd)
 
 
 class TestsNeverTouchTheMac(unittest.TestCase):

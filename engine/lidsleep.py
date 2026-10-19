@@ -19,7 +19,7 @@ A Mac that cannot sleep, shut in a bag, cooks. So:
   * a release restores what was set before the hold (HOLD_FILE keeps it), so a user who turned
     sleep off themselves keeps it off.
 
-CLI:  python3 engine/lidsleep.py --status | --release | --guard
+CLI:  python3 engine/lidsleep.py --status | --install [--dry-run] | --release | --guard
 """
 from __future__ import annotations
 import fcntl
@@ -104,11 +104,42 @@ def rule_line(user: str | None = None) -> str:
 
 
 def install_command(user: str | None = None) -> str:
-    """The ONE command the user runs (it asks for their password once). The rule is checked
-    with visudo BEFORE it goes into place — a malformed sudoers file would lock sudo out."""
-    return (f"echo '{rule_line(user)}' > /tmp/visionary-lidsleep && "
-            f"visudo -cqf /tmp/visionary-lidsleep && "
-            f"sudo install -m 0440 -o root -g wheel /tmp/visionary-lidsleep {RULE_FILE}")
+    """The ONE command the user runs. No quotes or parentheses to survive a copy-paste (the
+    first version, an echo of the rule line, reached the user's shell as an empty file)."""
+    return f"python3 {os.path.abspath(__file__)} --install"
+
+
+def install(dry_run: bool = False) -> int:
+    """--install: write the rule to a private temp file, check it with visudo, and only then
+    `sudo install` it into RULE_FILE (that one step asks for the user's password — a malformed
+    sudoers file would lock sudo out, so nothing unchecked ever goes there). Then prove it: a
+    password-free no-op set. -> exit code."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix="visionary-lidsleep-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(rule_line() + "\n")
+        if subprocess.run(["/usr/sbin/visudo", "-cqf", tmp]).returncode != 0:
+            print("the rule did not pass visudo's check — nothing was installed")
+            return 1
+        cmd = [SUDO, "/usr/bin/install", "-m", "0440", "-o", "root", "-g", "wheel", tmp, RULE_FILE]
+        if dry_run:
+            print("checked:", rule_line())
+            print("would run:", " ".join(cmd))
+            return 0
+        print("Installing", RULE_FILE, "(sudo asks for your password once)")
+        if subprocess.run(cmd).returncode != 0:
+            print("not installed")
+            return 1
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    ok = allowed(fresh=True)
+    print("done — Visionary can now keep the Mac awake with the lid closed" if ok
+          else "installed, but sudo still asks for a password — tell Claude")
+    return 0 if ok else 1
 
 
 def _pid_alive(pid) -> bool:
@@ -238,6 +269,8 @@ if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else "--status"
     if arg == "--guard":
         sys.exit(guard())
+    if arg == "--install":
+        sys.exit(install(dry_run="--dry-run" in sys.argv))
     if arg == "--release":
         cur = _read_hold()
         print("released" if cur and release() else "nothing held")
