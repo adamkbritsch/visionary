@@ -61,8 +61,11 @@ extension View {
     /// as a panel. `tint` is a STEEL-BRIGHTNESS accent (never a hue). `inset: true`
     /// renders a recessed glass WELL instead (inputs, inner lists, segmented containers):
     /// darker fill, hairline, no shadow.
-    func panel(_ radius: CGFloat = DS.radiusControl, tint: Color? = nil, inset: Bool = false) -> some View {
-        modifier(GlassPanel(radius: radius, tint: tint, inset: inset))
+    /// `edge` scales a tinted panel's bevel (1 = the full lit edge; the live pipeline step's is
+    /// fainter).
+    func panel(_ radius: CGFloat = DS.radiusControl, tint: Color? = nil, inset: Bool = false,
+               edge: Double = 1) -> some View {
+        modifier(GlassPanel(radius: radius, tint: tint, inset: inset, edge: edge))
     }
 }
 
@@ -86,7 +89,7 @@ extension View {
 }
 
 private struct GlassPanel: ViewModifier {
-    let radius: CGFloat; let tint: Color?; let inset: Bool
+    let radius: CGFloat; let tint: Color?; let inset: Bool; var edge: Double = 1
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         content
@@ -107,7 +110,7 @@ private struct GlassPanel: ViewModifier {
                 }
             }
             .overlay(shape.strokeBorder(LinearGradient(               // bevel: BOTTOM edge catches the
-                colors: tint.map { [$0.opacity(0.10), $0.opacity(0.40)] } // warm light, top stays cool-dim
+                colors: tint.map { [$0.opacity(0.10 * edge), $0.opacity(0.40 * edge)] } // warm light, top stays cool-dim
                      ?? [Color.white.opacity(inset ? 0.02 : 0.03),
                          DS.warmWhite.opacity(inset ? 0.07 : 0.13)],
                 startPoint: .top, endPoint: .bottom), lineWidth: inset ? 0.7 : 1))
@@ -1088,7 +1091,9 @@ struct StageView: View {
             // somewhere to sit (user-dictated 2026-08-23).
             .frame(minWidth: isActive ? (hovering ? (twoUp ? 340 : 440) : (twoUp ? 220 : 280)) : 90,
                    maxWidth: .infinity, alignment: .topLeading)
-            .panel(DS.radiusControl, tint: isActive ? DS.steelBright : nil, inset: !isActive)
+            // a faint lit edge on the live card (user 2026-10-19: the outline read too white)
+            .panel(DS.radiusControl, tint: isActive ? DS.steelBright : nil, inset: !isActive,
+                   edge: 0.4)
             .onHover { inside in
                 // Only the LIVE card expands: the idle ones are a row of labels and would
                 // just jitter the layout under a passing pointer.
@@ -1098,8 +1103,9 @@ struct StageView: View {
             .animation(.easeOut(duration: 0.16), value: hovering)
             .overlay {
                 if isActive {                                   // a quiet steel edge marks the live stage
+                    // (kept faint: 0.35 read as a white outline, user 2026-10-19)
                     RoundedRectangle(cornerRadius: DS.radiusControl, style: .continuous)
-                        .strokeBorder(DS.steelBright.opacity(0.35), lineWidth: 1)
+                        .strokeBorder(DS.steelBright.opacity(0.12), lineWidth: 1)
                 }
             }
             // The LIVE card explains itself: hovering it opens the description and the
