@@ -79,7 +79,9 @@ PLIST
 # had been made from an old commit. The bundle is the thing that runs; it must be the repo.
 # --delete-excluded: an EXCLUDED path is otherwise protected from --delete, so bytecode some older
 # Python wrote into the bundle (cpython-312, June) rode along in every release zip since.
-rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' "$ROOT/engine/" "$APP/Contents/Resources/engine/"
+# The unit tests and their fixtures stay in the repo: nothing in the app imports them.
+rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' \
+    --exclude 'test_*.py' --exclude test_fixtures "$ROOT/engine/" "$APP/Contents/Resources/engine/"
 # Ship the SETUP-TIME artifact too, mirroring the repo layout (the server derives its path from
 # its own location, so Resources/nas beside engine/ makes a drop-in .app self-sufficient — the
 # in-app Setup section's "Upload to NAS" uses it):
