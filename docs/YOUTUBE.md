@@ -36,9 +36,8 @@ same way: an 88-minute 4K interview needs about 80 GB. A 4K fast-path movie meas
   credential is unavoidable) it configures youtarr itself. Several of youtarr's own settings
   are a contract Visionary depends on — where downloads land (the folder split that keeps raw 1080p out of your Plex
   library), the `.nfo`/poster/thumbnail/subtitle sidecars it copies beside each master, and
-  whether youtarr auto-downloads at all. They used to be set by hand with nothing checking
-  them, so a wrong one failed quietly. Setup now applies them the moment youtarr connects
-  and shows each one with a Recheck/Apply. That includes **where downloads land**: the same
+  whether youtarr auto-downloads at all. A wrong one would fail quietly, so Setup applies
+  them the moment youtarr connects and shows each one with a Recheck/Apply. That includes **where downloads land**: the same
   folder has three names (youtarr's host path, Visionary's FTP path, Plex's container path),
   so the prefix is *observed* from youtarr's own current value rather than guessed — a
   directory pointing at your Plex library gets retargeted to staging, the folder is created
@@ -71,11 +70,11 @@ same way: an 88-minute 4K interview needs about 80 GB. A 4K fast-path movie meas
   else) and keeps the answer; a Short is never requested, never upscaled, and a pasted or
   sent one says so. A video longer than three minutes is never asked about: no Short is.
 
-- **Fetch-ahead** keeps the NAS stocked: Visionary used to only *subscribe* youtarr and then
-  wait for its own schedule, so the upscale queue could run dry with the pipeline idle. It
-  now asks youtarr for whatever each channel is short of — newest first, respecting the
-  channel's scope and max-age — to keep `youtube_fetch_ahead` (default 12) undownloaded
-  videos staged per channel. Set it to 0 for the old wait-and-see behaviour.
+- **Fetch-ahead** keeps the NAS stocked. Left to its own schedule, youtarr can leave the
+  upscale queue empty while the pipeline sits idle, so Visionary asks it for whatever each
+  channel is short of — newest first, respecting the channel's scope and max-age — to keep
+  `youtube_fetch_ahead` (default 12) videos staged per channel. Set it to 0 to rely on
+  youtarr's own schedule.
 
 - **Links and Send to Visionary.** Paste a video, playlist or channel link into the YouTube
   tab; a confirm step shows real titles and counts first, and a `watch?v=…&list=…` link asks

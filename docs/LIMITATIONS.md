@@ -25,7 +25,7 @@
 
 - **Enormous working scratch.** The finished master is small (~1.4 GB), but *getting
   there* is not: Topaz's 4K ProRes intermediate is near-lossless and scales with runtime —
-  about **4.1 GiB (4.4 GB) per minute of content** (re-measured 2026-09-16), so a
+  about **4.1 GiB (4.4 GB) per minute of content**, so a
   43-minute episode holds roughly **180 GiB (~192 GB)** and a 2-hour film about
   **500 GiB**. That intermediate is **deleted the
   moment the Dolby Vision™ render is made** — the remux only needs the DV render plus the

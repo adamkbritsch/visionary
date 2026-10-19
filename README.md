@@ -2,76 +2,70 @@
   <img src="docs/assets/visionary-lockup-v10.png" alt="Visionary" width="335">
 </p>
 
-**An overnight appliance that upscales your Plex library to 4K Dolby Vision™ — unattended.**
+**Upscale your Plex library to 4K Dolby Vision™, overnight and unattended.**
 
-Point Visionary at your TV shows, movies and YouTube channels, arm it, and walk away. It
-takes each one through Topaz Video AI, makes a **real Dolby Vision™ 8.1 master** — the picture
-measured shot by shot into Dolby Vision metadata, not an HDR tone-map — encodes a peak-capped
-x265, and files it back into your library in place of the 1080p original (or beside it, your
-call). Then it starts the next one. It stays out of your way while you're watching Plex,
-refuses to run on a machine that can't sustain the power draw, and picks up mid-episode
-after a restart without redoing finished work.
+Visionary is a Mac app that works through your TV shows, movies and YouTube channels one item
+at a time. It upscales each one to 4K with Topaz Video AI, makes a **real Dolby Vision™ 8.1
+master** of it, and files it back into your library, either in place of the 1080p original or
+beside it (your choice). Then it starts the next one. It stays out of the way while someone is
+watching Plex, and after a restart it picks up where it left off without redoing finished work.
 
-The Dolby Vision™ step runs entirely headless: a pinned SDR→PQ conversion, then
-[hdr-analyze](https://github.com/tinof/hdr-analyze) measures every shot of the finished
-picture and [dovi_tool](https://github.com/quietvoid/dovi_tool) writes the Dolby Vision
-metadata from those measurements. No editing app and no screen involved. The toolchain is
-pinned to exact builds, because every master's colour and metadata were judged on those
-builds, and that is what separates the output from the usual "HDR-ish" upscale.
+**Real Dolby Vision, not an HDR filter.** Every shot of the upscaled picture is measured, and the
+Dolby Vision metadata is written from those measurements by
+[hdr-analyze](https://github.com/tinof/hdr-analyze) and
+[dovi_tool](https://github.com/quietvoid/dovi_tool), after one fixed SDR-to-HDR colour
+conversion. These tools are pinned to exact versions, because every master's colour and
+metadata were checked against those versions.
 
 **See it on real footage:** [download the sample stills](https://github.com/adamkbritsch/visionary/releases/download/samples-lost-s01e01/visionary-lost-s01e01-samples.zip)
 — six moments from the pilot of *Lost*, upscaled from 1080p to 4K Dolby Vision™ and set against the
 original as side-by-sides, zoomed crops and isolated frames. One 106 MB zip of the whole folder; the
 HDR images are AVIF and need an HDR screen to show their highlights. Or [browse them](docs/samples/lost-s01e01).
 
-Optionally, AI border extension fills 4:3 shows out to 16:9 before upscaling.
+Optional: AI border extension widens 4:3 shows to 16:9 before they are upscaled.
 
-Arm it in the evening; wake up to finished episodes.
+Turn it on in the evening and wake up to finished episodes.
 
 <p align="center">
-  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in flight at once — one upscaling in Topaz while the previous one's Dolby Vision™ remux runs beside it" width="820">
+  <img src="docs/assets/app-pipeline.png" alt="The Visionary dashboard: two episodes in progress at once — one upscaling in Topaz while the previous one is encoded beside it" width="820">
 </p>
-<p align="center"><sub><b>Two episodes in flight at once</b> — S03E10 upscaling in Topaz while S03E09's Dolby Vision™ remux runs beside it, each with its own segmented, resumable progress and its own estimate.</sub></p>
+<p align="center"><sub><b>Two episodes at once</b> — S03E10 upscaling in Topaz while S03E09 is encoded beside it, each with its own progress and time estimate.</sub></p>
 
 > [!IMPORTANT]
-> **Visionary runs the GPU flat out for hours.** It checks your setup at launch and won't
-> start if it can't work properly. What it needs:
+> **What you need.** Visionary runs the GPU flat out for hours, so it checks your setup when it
+> starts and won't run on one that can't keep up. It tells you exactly what's missing.
 >
 > | Requirement | What works |
 > |---|---|
-> | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro (M1/M2) or a MacBook Air can't sustain the power draw and is refused; a laptop too new for the model lists is judged by its live charger reading instead (see below). |
-> | Topaz Video AI | **7.0.1** — this exact build |
-> | Dolby Vision™ toolchain | Homebrew **ffmpeg 8** (Setup installs it — see [step 3](docs/SETUP.md#3-command-line-tools)). Everything else — **dovi_tool 2.3.0**, the **hdr_analyzer_mvp** build and the **SDR→PQ LUT** — ships with Visionary in [`dv/`](dv/README.md) and installs itself — see [step 4](docs/SETUP.md#4-dolby-vision-toolchain) |
-> | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](docs/LIMITATIONS.md)) |
-> | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](docs/CONFIGURATION.md)) |
-> | AI border extension | **optional.** Requires the **[Comfy Desktop](https://www.comfy.org/) app** (run once so it builds its ComfyUI + venv — a hand-cloned ComfyUI is not detected), its **ComfyUI-VideoHelperSuite** node from Manager, and ~11.4 GB of WAN 2.1 models Visionary downloads for you from Settings → Setup. Without all of it, everything else works unchanged — the feature simply never appears. See [step 11](docs/SETUP.md#11-ai-border-extension--optional-only-for-43-shows). |
+> | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro (M1/M2) or a MacBook Air can't sustain the power draw (see below). |
+> | Topaz Video AI | **7.0.1**, this exact version. It's commercial software, so you need your own licence. |
+> | Homebrew | Installed. Visionary's Setup uses it to install the command-line tools it needs (ffmpeg 8, x265, mkvtoolnix). The Dolby Vision™ tools come with the app. |
+> | Scratch space | A **fast SSD with about 1 TB free**. The working files are very large (see [Known limitations](docs/LIMITATIONS.md)). |
+> | Media | A **NAS reachable over FTP** that holds your library. Plex is **optional** (see [Configuration](docs/CONFIGURATION.md)). |
+> | AI border extension | **Optional.** The free [Comfy Desktop](https://www.comfy.org/) app plus about 11 GB of models that Visionary downloads for you (see [step 11](docs/SETUP.md#11-ai-border-extension--optional-only-for-43-shows)). Without it, everything else works the same. |
 >
 > **Why the power rule?** Topaz pushes the GPU for hours. A desktop Mac is plugged into the
 > wall, so it always qualifies. A laptop is judged by its model rather than by the charger
-> you plugged in — because a 140 W charger connected to a laptop that can only draw 96 W
-> still reports "140 W". A laptop too new to be on the list isn't blocked: Visionary falls
-> back to checking the charger, and warns. On a MacBook, a **closed lid** pauses the run
-> unless you allow it to stay awake — one optional command, see
-> [step 12](docs/SETUP.md#12-lid-closed--optional-macbook-only).
->
-> Topaz Video AI is a commercial product — bring your own license.
+> plugged into it, because a 140 W charger connected to a laptop that can only draw 96 W
+> still reports "140 W". A laptop too new to be on Visionary's list isn't blocked: it is
+> judged by its charger instead, with a warning. On a MacBook, closing the lid pauses the run
+> unless you let it stay awake, which takes one optional command (see
+> [step 12](docs/SETUP.md#12-lid-closed--optional-macbook-only)).
 
 ## Install
 
-The easy path — no clone, no Terminal for most of it:
+No cloning, and almost no Terminal:
 
 1. **Download** the latest `Visionary-vX.zip` from
    [Releases](https://github.com/adamkbritsch/visionary/releases) and unzip it.
-2. **Drag Visionary.app to /Applications.** This step is required, not cosmetic: macOS
-   runs a quarantined app opened elsewhere from a randomized read-only path (App
-   Translocation).
+2. **Drag Visionary.app to /Applications.** This matters: opened from anywhere else, macOS
+   runs a downloaded app from a temporary read-only copy, and its permissions don't stick.
 3. **Right-click → Open** the first time (the app isn't notarized; macOS asks once).
 4. Install **Topaz Video AI 7.0.1**, the exact build ([where to get it](docs/SETUP.md#2-install-topaz-video-ai--exact-version)). It is licensed software; the app detects it but can't install it for you.
 5. Open the **gear → Settings → Setup** section. Everything else lives there, with a
-   live check beside each item: your NAS connection (and the optional Plex / TMDb /
-   youtarr / Shuttle fields), **one-click installs** for the command-line dependencies and
-   the Dolby Vision™ toolchain, and the optional NAS DV-probe helper with its cron line. The
-   section stays expanded until every check is green, then tucks itself away.
+   live check beside each item: your NAS connection (plus optional extras such as Plex,
+   TMDb and youtarr) and **one-click installs** for everything Visionary needs. The section
+   stays open until every check is green, then tucks itself away.
 6. *Optional* — want [4:3 shows widened to 16:9](docs/SETUP.md#11-ai-border-extension--optional-only-for-43-shows)?
    Install the free **[Comfy Desktop](https://www.comfy.org/)** app, **launch it once**,
    add **ComfyUI-VideoHelperSuite** from its Manager, then back in Setup use the *Border
@@ -80,12 +74,12 @@ The easy path — no clone, no Terminal for most of it:
 7. *Optional, MacBook only* — want it to keep running with the **lid closed** and no
    screen attached? Run the one command Setup shows under *Applications & hardware → Lid
    closed* (see [step 12](docs/SETUP.md#12-lid-closed--optional-macbook-only)). It asks for your password
-   once. Skip it and a closed lid simply sleeps the Mac, as it always did.
+   once. Skip it and closing the lid puts the Mac to sleep, as usual.
 
-The pipeline won't arm until the exact Topaz build and the Dolby Vision™ toolchain are in
-place and the dependencies exist — and it names exactly what's missing rather than failing
-mid-run. The NAS side needs its **FTP service enabled** (System Settings on a UGREEN /
-your NAS's file-services panel elsewhere); everything else NAS-side is optional.
+Visionary won't start until the exact Topaz version and everything else it needs are in
+place, and it names exactly what's missing rather than failing partway through a run. On the
+NAS, only its **FTP service** needs to be on (System Settings on a UGREEN, or your NAS's
+file-services panel); everything else there is optional.
 
 ## Read more
 

@@ -10,7 +10,7 @@ NAS (FTP) ──download──▶ local scratch
                           ▼
                         Topaz Video AI (bundled ffmpeg, prob-4) — 1080p → 4K ProRes chunks
                           ▼
-                        Dolby Vision™ step (headless) — the pinned SDR→PQ LUT, then hdr-analyze
+                        Dolby Vision™ step — the pinned SDR→PQ LUT, then hdr-analyze
                           │  measures every shot → dovi_tool writes the DV 8.1 metadata (RPU)
                           ▼
                         remux — x265 re-encode under a hard peak-bitrate cap (native DV RPU),
@@ -108,7 +108,7 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   and resumable.
 
   **Everything else 4K** ships its HDR+DV conversion through the normal capped remux,
-  whatever its bitrate (there is no minimum any more). Nothing is excluded by provenance, so a
+  whatever its bitrate (there is no minimum). Nothing is excluded by provenance, so a
   4K YouTube VP9 takes it too. Either way a movie lands in **~2.5× its runtime** instead of ~5×.
 
   An HDR source that *cannot* carry an RPU — HLG, AV1, H.264 or 8-bit — has to be converted

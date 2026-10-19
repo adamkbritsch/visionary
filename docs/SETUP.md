@@ -147,8 +147,7 @@ python3 engine/preflight.py --network
 ```
 
 All green → open Visionary, pick a show, press **Activate**, and watch one episode flow
-through download → topaz → dolby vision → remux → upload. Nothing takes the screen: the
-Dolby Vision™ step runs headless beside everything else.
+through download → topaz → dolby vision → remux → upload.
 
 ## 11. AI border extension — OPTIONAL, only for 4:3 shows
 
