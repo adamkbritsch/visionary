@@ -1,13 +1,10 @@
-"""The 'dvrender' engine: write the file Resolve writes, without Resolve.
+"""The 'dvrender' engine: write the item's Dolby Vision render, `p.dv_render`.
 
-WHY: everything after the Resolve stage reads ONE file, `p.dv_render` — HEVC Main10 PQ with an
-in-band Dolby Vision 8.1 RPU and the HDR10 static metadata, the whole source, at the source's
-frame rate. stage_done('resolve'), remux(), remux_ship_render(), remux_inject(), combine(), the
-chunk drop at hand-off and the disk accounting all key on that file. So this module writes
-exactly that file, and nothing after it has to change. It is the foundation of the Resolve-free
-end state (user decision 2026-10-15: no DaVinci Resolve anywhere in the app); routes move onto it
-one at a time through settings `dv_routes`, every route 'resolve' by default — so nothing calls
-render() until a route is switched.
+WHY: everything after the DV step reads ONE file, `p.dv_render` — HEVC Main10 PQ with an in-band
+Dolby Vision 8.1 RPU and the HDR10 static metadata, the whole source, at the source's frame rate.
+stage_done('dv'), remux(), remux_ship_render(), remux_inject(), combine(), the chunk drop at
+hand-off and the disk accounting all key on that file, and this module writes it for every route
+the chunk lane (nativelane) does not take.
 
 HOW, render(p, spec):
   1. analyse  dvnative.analyze_ranges over the source in ranges (one file), or
@@ -27,9 +24,8 @@ HOW, render(p, spec):
               number remux_ship_render re-measures) against cap x 1.15 (dvcap.peak_ok). Over it,
               peakplan's loop encodes and finishes again at a fitted target, at most
               MAX_REEXPORTS more times, keeping the FIRST finished render as the best and
-              putting it back when the gamble is lost — resolve_pipeline.render_under_cap's
-              rules, so the remux's x265 fallback starts from the best render, never a
-              half-bitrate one
+              putting it back when the gamble is lost, so the remux's x265 fallback starts
+              from the best render, never a half-bitrate one
   5. publish  the kept render passes the orchestrator's own gates first (_is_dv81,
               render_is_complete, _fps_matches, an exact frame count, the HDR10 metadata), THEN
               it is renamed to p.dv_render — last and atomic, so a half-made render never sits
@@ -43,7 +39,8 @@ render is the source's own coded video, copied out as Annex B, with the RPU inje
 mux (step 3 without the SEI, which the source carries already) — exactly what the remux's inject
 path ships, so the original picture is never re-encoded. A source whose light level says 0,0
 ("unknown") gets light None from its route (stages.declared_light): the level is measured, as
-Resolve did, and step 3 writes it into the SEI too, so L6 and the HDR10 SEI always agree.
+the reference masters do, and step 3 writes it into the SEI too, so L6 and the HDR10 SEI always
+agree.
 
 Every child runs through dvnative.run_step at nice 10 in its own process group: abort and
 should_pause kill it within a second ("aborted (run stopped)" / "paused: ..."), a wedged one
@@ -53,8 +50,8 @@ analysis per range, each encode for its estimated size plus its finish, the fini
 transients — "paused: low disk ..." (a hold, never a failure), or a plain failure when even an
 empty volume could not hold it.
 
-SDR OUTPUT (2026-10-18, route sdr_out: an item PINNED to SDR): a `sdr` spec writes the file
-Resolve's SDR project wrote — HEVC Main10 BT.709 limited, NO RPU and no HDR10 SEI — so step 1 is
+SDR OUTPUT (2026-10-18, route sdr_out: an item PINNED to SDR): a `sdr` spec writes the SDR
+render — HEVC Main10 BT.709 limited, NO RPU and no HDR10 SEI — so step 1 is
 skipped (nothing to measure), step 2 tags BT.709, step 3 is the plain mux (no SEI, no inject, no
 DV box), and steps 4-5 are the same peak loop and publish against an SDR self-check. Its proof is
 books/sdr.json (the published render's size and mtime, written just before the rename): the
@@ -62,8 +59,8 @@ orchestrator's stage_done and the remux accept an SDR render ONLY when it vouche
 (sdr_render_ok), so nothing that was accepted before changes.
 
 THE BOOKS live in <dv_render>.dvrender/ — never in segdir/native/, so nativelane's marker logic
-(_native_claimed) stays false and the hand-off and backlog code treat the item exactly like a
-Resolve item:
+(_native_claimed) stays false and the hand-off code drops the item's chunks like any rendered
+item's:
   spec.json        what the analysis and the encode were made from (a change clears them)
   analysis/        per-range (or per-chunk) sidecars and L4: the analysis' resume state
   sidecar.json     the merged sidecar; rpu.bin (+ .generate.json) the RPU generated from it
@@ -580,7 +577,7 @@ def self_check(p, path: str, total: int | None = None, hdr: tuple | None = None,
                as_source: bool = False, sdr: bool = False) -> tuple:
     """(ok, why): would the orchestrator accept `path` as this item's render? The exact frame
     count first (when `total` is given: the RPU covers exactly that many), then the same gates
-    stage_done('resolve') applies — a DV 8.1 configuration record (_is_dv81), the whole source
+    stage_done('dv') applies — a DV 8.1 configuration record (_is_dv81), the whole source
     and no more (render_is_complete) and the source's frame rate (_fps_matches) — and last the
     HDR10 static metadata every master carries: a mastering display and a content light level
     (dvcap.probe_video's first-frame read). `hdr` = (master_display, "cll,fall") demands those
@@ -978,7 +975,7 @@ def _write_sdr_proof(p, path: str) -> None:
 def sdr_render_ok(p) -> bool:
     """Is p.dv_render an SDR render this module published (or blessed) for the SDR output — its
     proof (books/sdr.json) still naming exactly that file's size and mtime? Never raises; a DV
-    render, a Resolve render nobody blessed, or no render at all is False."""
+    render, an SDR render nobody blessed, or no render at all is False."""
     try:
         proof = _read_json(_book(p, SDR_PROOF))
         st = os.stat(p.dv_render)
@@ -1002,9 +999,8 @@ def render(p, spec: RenderSpec, abort=None, progress=None, should_pause=None) ->
     if bad:
         return False, "native render spec is unusable: " + "; ".join(bad)
     if spec.sdr and os.path.exists(p.dv_render) and self_check(p, p.dv_render, sdr=True)[0]:
-        # an SDR render of this whole source is already there — ours (its proof just re-written),
-        # or one Resolve's SDR project made before the route was switched: either is the picture
-        # the SDR master is made from
+        # an SDR render of this whole source is already there — ours (its proof just re-written)
+        # or an older one of the same picture: either is what the SDR master is made from
         try:
             _write_sdr_proof(p, p.dv_render)
         except OSError as e:

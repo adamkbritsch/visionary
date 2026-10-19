@@ -16,12 +16,12 @@ already running; the extra slots drain away as those shows finish.
 
 Six stages, split between a **run thread** and the **finisher lanes**, so item N's
 headless tail — chiefly its ~75-min x265 remux — runs while item N+1 **downloads and
-upscales**. It does NOT overlap N+1's screen work: `resolve` and `remux` are mutually
-exclusive, gated in both directions (see below).
+upscales**. Nothing needs the screen.
 
-- **run thread** — `RUN_STAGES = ["download", "topaz", "resolve"]`, taken in order for
-  one item at a time. Only `resolve` is genuinely exclusive: it drives the Resolve UI
-  on the screen, so while it runs both remux lanes hold. `topaz` needs the GPU but is
+- **run thread** — `RUN_STAGES = ["download", "extend", "topaz", "dv"]`, taken in order
+  for one item at a time. The `dv` slot runs as `dvnative` (the chunk lane: an eligible TV
+  episode's Dolby Vision analysed straight from Topaz's chunks) or `dvrender` (the native
+  render, which writes `p.dv_render` for every other route). `topaz` needs the GPU but is
   MEANT to overlap the finisher — that is the whole split — and yields at a segment
   boundary only when two remux lanes are live at once. `download` needs neither the
   GPU nor the screen; it sits here because it feeds them, and the **prefetch daemon**
@@ -30,8 +30,9 @@ exclusive, gated in both directions (see below).
   only). There is no lane pool: the `finisher` daemon takes exactly one item at a time,
   and a SECOND daemon, `finisher2`, opportunistically drains a backlog. Between them at
   most `finisher_lanes` remuxes run at once (default 2; set it to 1 and lane 2 never
-  fires). The exclusion is two-way — `resolve` holds at its doorstep while a remux is in
-  flight, and starting `resolve` makes an in-flight remux yield at its next segment.
+  fires). The DV doorstep paces the run thread one item at a time: a `dvrender` item holds
+  there while a remux is in flight (`dv_must_wait`), and a chunk-lane item waits at the
+  native gate before its hand-off.
 
 `enable()` actually spawns seven daemons — `run`, `finisher`, `finisher2`, `prefetch`,
 plus the `power_monitor`, `dimmer` and `plex_monitor` helpers — and `_ensure()` restarts
@@ -41,7 +42,7 @@ any that died, so a disable→enable can never leave the run armed without its w
 |---|----------|---------------------------------------|--------|
 | 1 | download | NAS source → `scratch/<src>`, then normalised to a CONSTANT frame rate → `<stem>_cfr.mp4` **or** `_cfr.mkv` | `transfer.download` (FTP) + `topaz.to_cfr` |
 | 2 | topaz    | CFR source → `<stem>_prob4_upscaled.segments/` (scene-cut ProRes chunks + manifest) | `topaz.upscale_resumable` |
-| 3 | resolve  | ProRes segments → `<stem> HDR10 DV upscaled.mov` (mute) | `resolve_pipeline` + dv_shim |
+| 3 | dv       | ProRes segments (or the CFR source) → `<stem> HDR10 DV upscaled.mov` (mute), or for a chunk-lane item the RPU alone (`segdir/native/`) | `nativerender.render` / `nativelane.run_analysis` |
 | 4 | remux    | mute DV video + audio from the CFR copy + subtitles from the original download → peak-capped `<mstem> HDR10 DV upscaled.mp4\|.mkv` | `remux.remux` (dvcap x265 + MP4Box) |
 | 5 | upload   | master → NAS library                  | `transfer.upload` (FTP STOR, owner 1000:10) |
 | 6 | cleanup  | delete **every** local working file   | `stages._cleanup` |
@@ -70,14 +71,14 @@ silently drop its lossless audio and bitmap subs.
   source carries lossless audio (TrueHD / DTS-HD MA / PCM / FLAC) or bitmap subtitles
   (PGS / VOBSUB), else `.mp4`; `apply_container` locks it in once the file is on disk.
   The `_cfr.mp4` in the path factories is only a pre-download default, never consumed.
-- **The remux is not a plain mux.** It re-encodes the Resolve render through x265
+- **The remux is not a plain mux.** It re-encodes the DV render through x265
   under a hard peak-bitrate ceiling (`dvcap`, `max_peak_mbps`) and puts the original
   audio + subtitles back. HARD GATE — no uncapped fallback.
 - **Cleanup frees the disk** every item, so it runs indefinitely.
 
 ## The prefetcher
 A pure accelerator: a daemon that runs the SAME download stage (`low_prio=True`) for
-upcoming queue items while the run thread is busy in topaz/resolve, so the GPU never
+upcoming queue items while the run thread is busy in topaz/dv, so the GPU never
 waits on a download. `low_prio` clamps the CFR **encode** to background QoS (E-cores on
 Apple silicon, `taskpolicy -c background`); the FTP transfer itself runs normally. Everything it makes, the foreground download stage also makes and
 detects via `stage_done`, so killing it just leaves partials the foreground re-pulls.
@@ -116,8 +117,7 @@ There is no time window and no stop-time — only power.
 
 ## Per-show profiles + settings (`settings.py`)
 `~/.topaz-pipeline/settings.json` holds the UNIVERSAL settings — power
-(`min_adapter_watts`, `unplug_grace_seconds`), the screen (`dim_after_minutes`,
-`quiet_mode`), output (`max_peak_mbps`, `audio_target_lufs`), eligibility
+(`min_adapter_watts`, `unplug_grace_seconds`), the screen (`dim_after_minutes`), output (`max_peak_mbps`, `audio_target_lufs`), eligibility
 (`passthrough_min_mbps`, `max_youtube_minutes`, `youtube_every_tv_episodes`) and
 scheduling/capacity (`max_active_shows`, `finisher_lanes`, `min_free_gb`,
 `prefetch_cap_gb`, `max_episode_fails`, `poll_minutes`). Every numeric key is clamped
@@ -129,7 +129,7 @@ plus booleans, never raw Topaz params:
 `{key: {preset, unwatched_first, normalize_audio, featurettes_last, replace_source,
 yt_scope}}` (`yt_scope` only applies to channels). A legacy bare-string entry, which
 was the preset key alone, still loads and migrates to a dict on the next write.
-The Topaz stage resolves params through `settings.show_topaz_params(p.series, res)`
+The Topaz stage looks params up through `settings.show_topaz_params(p.series, res)`
 (`stages.py:242`), which looks the preset up by content type AND source-resolution
 bucket; unconfigured items get the DIGITAL default.
 
@@ -149,16 +149,7 @@ A single `ftp_host` (or `TOPAZ_NAS_FTP_HOST`) forces one host.
 ## What unattended running depends on
 All in place:
 - **FTP password** — set in `~/.topaz-pipeline/config.json` (login verified over Tailscale). ✓
-- **`cliclick`** — installed (`/opt/homebrew/bin/cliclick`). ✓
-- **DV UI step** — codified in `dv_shim.run_dv_ui()`: opens the palette, verifies the
-  inherited 1000-nit target, Analyze All, waits for completion. Only "Analyze All"
-  is UI; color/DV-8.1/target all inherit (never uncheck HW accel). Templates captured. ✓
-- **`Overnight Upscaler` project** — exists, HDR-PQ + DV configured (renamed from
-  `Dolby Vision Test`). `setup()` loads it and STOPS if it's ever missing. ✓
+- **The Dolby Vision toolchain** — dovi_tool 2.3.0, hdr_analyzer_mvp at the pinned commit,
+  the pinned LUT and Homebrew ffmpeg 8; preflight's `native_dv` check is part of the arm gate. ✓
 
-**The one setup step that is user-only and can't be scripted:** grant the
-orchestrator's python process **Screen Recording** + **Accessibility** in System
-Settings → Privacy & Security. screencapture/cliclick run as that process, and
-Claude's computer-use grant does NOT transfer to it. Until granted, the resolve stage
-returns not-ok and the item parks there (resumable); download/Topaz/remux/upload/
-cleanup/gating all run hands-off regardless.
+No step needs the screen, the mouse or a macOS privacy grant.

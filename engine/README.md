@@ -1,7 +1,6 @@
 # Engine components (Mac-side)
 
-Runs on the Mac that hosts Topaz + DaVinci Resolve. Buildable/testable now;
-the actual Topaz/Resolve stage runners wait on hardware.
+Runs on the Mac that hosts Topaz and the Dolby Vision toolchain.
 
 ## scratch.py — scratch-volume manager
 Pre-flight storage setup for each run. The pipeline writes ~300 GB ProRes

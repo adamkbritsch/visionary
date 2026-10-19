@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""What the native (Resolve-free) YouTube routes would cost on this Mac — P2g of the
-Resolve-free plan. READ-ONLY on its inputs: every file it makes lives in a fresh work dir that
+"""What the native YouTube routes would cost on this Mac — P2g of the native-routes plan. READ-ONLY on its inputs: every file it makes lives in a fresh work dir that
 it removes at the end (--keep keeps it), and it never writes beside --source or --master.
 
 Each answer is one section of a JSON report (stdout, and --out):

@@ -1,10 +1,10 @@
 """Topaz stage: headless 1080p -> 4K upscale via Topaz Video AI's bundled ffmpeg.
 
 Matches the user's real Topaz preset exactly:
-"1080p to 4K SDR XQ - DIGITAL (Resolve HDR+DoVi)"
+"1080p to 4K SDR XQ - DIGITAL (HDR+DoVi)"
   - enhance: model prob-4 (Proteus), recoverOriginalDetail 45, compress 8,
-    dehalo 5, detail 2, denoise 0, sharpen 0; HDR off (Hyperion happens later
-    in Resolve).
+    dehalo 5, detail 2, denoise 0, sharpen 0; HDR off (HDR + Dolby Vision are
+    added afterward, by the native DV step).
   - encoder: prores-422-xq-osx  ->  exact ffmpegOpts from Topaz's
     video-encoders.json (ProRes 4444 XQ, p416le). PCM audio, .mov.
 
@@ -42,9 +42,9 @@ CFR_HW_MIN_HEIGHT = 1440
 CFR_HW_KBPS = 80000
 
 # ProRes 422 HQ, 10-bit 4:2:2 (p210le) — the upscale intermediate. Was ProRes XQ 16-bit (p416le), but
-# the DV master out of Resolve is 10-bit, so XQ's 12/16-bit precision is unused on an 8-bit-sourced
+# the DV master is 10-bit, so XQ's 12/16-bit precision is unused on an 8-bit-sourced
 # upscale; HQ 10-bit still exceeds the source's real information (banding-safe in the grade) at ~1/3 the
-# size (~76 vs ~229 GB/episode) → less scratch, faster Resolve read + cleanup, room to prefetch the queue.
+# size (~76 vs ~229 GB/episode) → less scratch, faster DV read + cleanup, room to prefetch the queue.
 XQ_ENCODER = ["-c:v", "prores_videotoolbox", "-profile:v", "hq",
               "-color_range", "tv", "-pix_fmt", "p210le", "-allow_sw", "1"]
 
@@ -213,10 +213,10 @@ def total_frames(path: str, ffprobe: str = FFPROBE) -> int:
 
 # ---- constant-frame-rate source pass -------------------------------------
 # A variable frame rate is what made the frame counts drift downstream: ffprobe's header
-# count, the actual decoded count, and Resolve's clip length disagreed by a few frames,
-# which broke the Topaz last-chunk count and the Resolve timeline-length guard. We convert
-# the verified download to CFR at its OWN rate (no cadence change) so every count is exact
-# end to end, and Topaz/Resolve/remux all read THAT file.
+# count and the actual decoded count disagreed by a few frames, which broke the Topaz
+# last-chunk count and the render's length check. We convert the verified download to CFR
+# at its OWN rate (no cadence change) so every count is exact end to end, and Topaz, the DV
+# step and the remux all read THAT file.
 
 @dataclass
 class CfrResult:
@@ -277,7 +277,7 @@ def _cfr_height(path, ffprobe=FFPROBE_HB) -> int:
 
 # How far the container may outrun the VIDEO before we cap the CFR's length, and the slack
 # left above the video when we do. Don't Look Up's source carries ~5 minutes of audio past
-# the end of its picture; Resolve took its TIMELINE length from the container, so it rendered
+# the end of its picture; a reader that took its length from the container rendered
 # 206,200 frames for a 199,144-frame movie — five minutes of nothing on the end, which then
 # could not align to the RPU and parked the movie at the remux (live-caught 2026-08-21).
 # The slack is deliberately a whole second: `-t` must never shave a real trailing frame, and
@@ -399,7 +399,7 @@ def build_cfr_command(ffmpeg, src, dst, *, rate, pix, color=None, low_prio=False
     threads = ["-threads", "4"] if low_prio else []
     # 4K → hardware HEVC on the media engine (see CFR_HW_MIN_HEIGHT). Same timing contract:
     # the -r/-fps_mode cfr flags and the colour tags below are shared by both paths, so what
-    # Resolve imports is identical apart from the codec. `-allow_sw 1` keeps it working if
+    # the DV step reads is identical apart from the codec. `-allow_sw 1` keeps it working if
     # the media engine is unavailable rather than failing the stage outright.
     # Hardware DECODE matters as much as the encode: the source is 4K AV1, and software
     # decoding that under the background QoS clamp is what actually stalls it (measured on a
@@ -576,92 +576,16 @@ def declared_rate_mismatch(path, ffprobe=FFPROBE_HB, *, frames=None):
     return (declared_s, f"{actual.numerator}/{actual.denominator}")
 
 
-# ---- what DaVinci Resolve can actually host ------------------------------------------------
-# Resolve puts a timeline on a fixed set of rates. Ask for one it does not know and the setting
-# is IGNORED — `proj.SetSetting("timelineFrameRate", "23")` leaves the project at 23.976 — so
-# resolve_pipeline's conform guard refuses to render, correctly, because a conform would drop or
-# duplicate frames behind our back. The CFR is the file Resolve imports, so the constraint
-# belongs here: a source at a rate Resolve cannot host is RE-TIMED on the way in. Live: Rhett &
-# Link's "Christmas Face" is a genuine 23.000 fps upload, and from 2026-09-14 to 2026-09-24 it
-# failed Resolve five times a day, every day, with nothing to show for it.
-RESOLVE_TIMELINE_RATES = ("16/1", "18/1", "24000/1001", "24/1", "25/1", "30000/1001", "30/1",
-                          "48000/1001", "48/1", "50/1", "60000/1001", "60/1", "72/1",
-                          "96000/1001", "96/1", "100/1", "120000/1001", "120/1")
-HOSTABLE_RATE_TOLERANCE = 1e-4   # 2997/125 IS Resolve's 23.976 — do not re-encode over a rounding
-
-
-def is_hostable_rate(rate) -> bool:
-    """PURE: is `rate` one of Resolve's timeline rates (however it is spelled)? An unreadable rate
-    counts as hostable: nothing here can do better with it than ffmpeg's own choice."""
-    from fractions import Fraction
-    try:
-        want = Fraction(rate)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return True
-    if want <= 0:
-        return True
-    return any(abs(float(want) / float(Fraction(r)) - 1) <= HOSTABLE_RATE_TOLERANCE
-               for r in RESOLVE_TIMELINE_RATES)
-
-
-_HOSTABLE_CACHE = {}
-
-
-def cfr_hostable(path) -> bool:
-    """Is an existing CFR file at a rate Resolve can host? A CFR made before the CFR had to be
-    one (a04f0eb) was reused as it was: Rhett & Link "Fireworks Song", 23/1 since 2026-09-08,
-    failed Resolve's conform on every attempt and stalled every item behind it (live
-    2026-10-01). Cached per file version — the stage gate asks often."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return True
-    key = (path, st.st_size, st.st_mtime_ns)
-    if key not in _HOSTABLE_CACHE:
-        rate = _fps_fraction(path)
-        if rate is None:
-            return True                  # unreadable now: ask again next time, never remember it
-        _HOSTABLE_CACHE[key] = is_hostable_rate(rate)
-    return _HOSTABLE_CACHE[key]
-
-
-def resolve_hostable_rate(rate):
-    """The rate to encode at so Resolve can host the result: `rate` itself when Resolve knows it,
-    otherwise the next one UP.
-
-    Up, never down: duplicating frames to reach a hostable rate keeps every picture in the source
-    and its running time, while rounding down would throw pictures away to shrink a file that is a
-    temporary intermediate anyway. Beyond the top of the list it clamps. An unreadable rate is
-    returned untouched — the caller's existing behaviour, which is to let ffmpeg decide."""
-    from fractions import Fraction
-    if not rate:
-        return rate
-    try:
-        want = Fraction(rate)
-    except (ValueError, ZeroDivisionError):
-        return rate
-    if want <= 0:
-        return rate
-    known = sorted(Fraction(r) for r in RESOLVE_TIMELINE_RATES)
-    if is_hostable_rate(want):
-        return rate                          # already one of Resolve's, however it is spelled
-    for r in known:
-        if r > want:
-            return "%d/%d" % (r.numerator, r.denominator)
-    top = known[-1]
-    return "%d/%d" % (top.numerator, top.denominator)
-
-
 def timestamp_holes(path, ffprobe=FFPROBE_HB) -> int:
     """How many frame slots `path`'s own video timestamps SKIP — the number of frames it is short
     of the running time it advertises. 0 for a sound CFR, -1 when it cannot be read.
 
     A constant-rate file is supposed to have one picture per slot. When it does not, every reader
-    that measures by DURATION (Resolve, sizing a timeline) disagrees with every reader that counts
-    FRAMES (our own gates), and the item can never satisfy both. Live 2026-09-24: hevc_videotoolbox
-    dropped 4 frames 39 minutes into a 2-hour interview and left the gap in the timestamps, so
-    Resolve built a 171,235-frame timeline for a 171,230-frame file and refused it on every
-    attempt, for two days. The same stretch re-encoded clean — a hiccup under load, not the file.
+    that measures by DURATION disagrees with every reader that counts FRAMES (our own gates), and
+    the item can never satisfy both. Live 2026-09-24: hevc_videotoolbox dropped 4 frames 39
+    minutes into a 2-hour interview and left the gap in the timestamps, so a duration-sized
+    reader saw 171,235 frames in a 171,230-frame file and refused it on every attempt, for two
+    days. The same stretch re-encoded clean — a hiccup under load, not the file.
     Reads the packet INDEX only, no decode: measured at ~0.2 s/GB on that 71 GB CFR."""
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
@@ -736,37 +660,6 @@ def build_cfr_copy_command(ffmpeg, src, dst, *, low_prio=False, duration_cap=Non
     ]
 
 
-def build_mezzanine_segment_command(ffmpeg, src, dst, *, start_frame, n, rate,
-                                    color=None, kbps=0):
-    """ONE segment of the Resolve-compat mezzanine (frames [start_frame, start_frame+n)):
-    same encode as build_mezzanine_command, but seekable + bounded so the build is
-    RESUMABLE (user-dictated 2026-08-06 — a killed pass keeps its finished chunks).
-    Input `-ss` = dvcap's proven seek (keyframe seek + decode-to-exact-frame); the
-    caller gates each chunk on an EXACT frame count, so a seek miss fails loudly
-    instead of shipping drift. Inputs are CFR by construction (the fast path requires
-    it; YouTube passes its true-CFR file), which is what makes frame->seconds exact.
-
-    `setpts=PTS-STARTPTS` puts the first kept frame at 0 before `-fps_mode cfr` sees it.
-    After the midpoint seek that frame sits half a frame in; cfr rounded it to slot 1 and
-    filled slot 0 by emitting it TWICE (frames a, a, a+1, ...) on every segment, and on a
-    1 ms-timebase (webm/mkv) input the jitter instead repeated the LAST frame and dropped
-    one — the exact count still matched, so nothing noticed (measured 2026-10-15). cfr
-    stays: it is what regenerates uniform PTS from a millisecond timebase."""
-    import dvcap
-    ss = dvcap.seg_seek_seconds(start_frame, rate)
-    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
-    if ss is not None:
-        cmd += ["-ss", f"{ss:.6f}"]
-    rate_flags = ["-r", rate] if rate else []
-    return [*cmd, "-i", src, "-map", "0:v:0", "-an", "-vf", "setpts=PTS-STARTPTS",
-            "-frames:v", str(n),
-            "-c:v", "hevc_videotoolbox", "-b:v", f"{int(kbps)}k",
-            "-pix_fmt", "p010le", "-tag:v", "hvc1", "-allow_sw", "1",
-            *rate_flags, "-fps_mode", "cfr",
-            *color_flags(color),
-            dst]
-
-
 def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
            copy_only=False) -> CfrResult:
     """Give `source` a CONSTANT frame rate in `dst`. If the source is ALREADY CFR (the common
@@ -775,30 +668,26 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     _run_ffmpeg so it's registered for kill-on-stop/shutdown and dies within ~0.5 s of an
     abort. A failed/aborted/partial output is removed (never left to be reused as 'ready').
 
-    `copy_only` (FAST-PATH items, rpu-only/resolve-only): ALWAYS stream-copy, even when the
+    `copy_only` (FAST-PATH items, rpu-only/dv-only): ALWAYS stream-copy, even when the
     timebase-exactness test would force a re-encode. The true-CFR re-encode exists to keep
     TOPAZ's frame counts stable — but the fast paths skip Topaz, ship the ORIGINAL video (or
-    Resolve's render of it), and read only this file's AUDIO (a bit-copy of the original's
+    the native render of it), and read only this file's AUDIO (a bit-copy of the original's
     either way) plus decoded frames for scene-cut planning. Hours of libx264 on a 4K movie
     whose video bytes nothing reads (live-caught 2026-08-06, a 60 GB REMUX).
 
     A container that DECLARES a rate its frames do not run at (declared_rate_mismatch) never
     passes that rate on. A re-encode is timed at the frames' own rate, since `-r 500/21` over
     24000/1001 frames drops 1 in 144 to hold the wrong clock. A copy keeps its packets and
-    declares the right rate over them, because Resolve imports this file for every item."""
+    declares the right rate over them, because every later stage reads this file's timing."""
     lie = declared_rate_mismatch(source)
-    true_rate = lie[1] if lie else _fps_fraction(source)
-    # Resolve can only host the rates it knows (resolve_hostable_rate), and re-timing is not
-    # something a stream copy can do — so a source at any other rate is re-encoded, fast path or not.
-    rate = resolve_hostable_rate(true_rate)
-    retime = bool(rate and true_rate and rate != true_rate)
+    rate = true_rate = lie[1] if lie else _fps_fraction(source)
     # Only a PROVEN rate (a container that lies about its own) overrides the stream's: passing
     # the plain r_frame_rate of a VARIABLE-rate source made video_duration take frames / r — short
     # of the real picture — and the cap then cut the re-timed CFR there (2026-09-30, a real 60 s
     # VFR MP4 came out 55 s).
     cap = cfr_duration_cap(source, rate=(true_rate if lie else None))   # see CFR_TAIL_SLOP_SECS — a container longer
-                                                     # than its own picture becomes Resolve's timeline
-    copied = (copy_only or (not lie and _is_already_cfr(source, check_rate=False))) and not retime
+                                                     # than its own picture would pad every later stage
+    copied = copy_only or (not lie and _is_already_cfr(source, check_rate=False))
     if copied:
         cmd = build_cfr_copy_command(FFMPEG_HB, source, dst, low_prio=low_prio,
                                      duration_cap=cap, rate=(rate if lie else None))
@@ -815,8 +704,8 @@ def to_cfr(source, dst, *, abort=None, on_progress=None, low_prio=False,
     aborted = aborted or (rc is not None and rc < 0)
     ok = (rc == 0 and not aborted and is_cfr_ready(dst))
     # A re-encode that SKIPPED slots is not a constant-rate file, whatever its frame count says
-    # (timestamp_holes): Resolve sizes a timeline by duration and refuses it against our own
-    # frame count, for as long as the item is in the queue. The drop is a hiccup under load, so
+    # (timestamp_holes): a reader that sizes by duration disagrees with our own frame count for
+    # as long as the item is in the queue. The drop is a hiccup under load, so
     # throwing the file away is enough — the next attempt redoes it. Only the RE-ENCODE is judged
     # this way: a copy's gaps come from the source, copying again would reproduce them, and it is
     # `-fps_mode cfr` that fills a gap in the first place.
@@ -1044,9 +933,9 @@ MANIFEST = "segments.json"
 
 
 def write_manifest(segdir, fps, entries) -> None:
-    """Record the ordered chunks (each with its ACTUAL frame count) so the Resolve stage
-    assembles them on its timeline instead of us concatenating a second ~238 GB file.
-    total_frames = the real assembled length (sum of actual counts) for Resolve's guard."""
+    """Record the ordered chunks (each with its ACTUAL frame count) so the DV step reads them
+    in order instead of us concatenating a second ~238 GB file. total_frames = the real
+    assembled length (sum of actual counts)."""
     data = {"fps": fps, "total_frames": sum(e["frames"] for e in entries), "segments": entries}
     with open(os.path.join(segdir, MANIFEST), "w") as f:
         json.dump(data, f, indent=1)
@@ -1079,9 +968,8 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
     cuts into ~SEGMENT_TARGET_SECONDS chunks, each encoded to its own ProRes file in
     `segdir`; finished chunks survive a kill, so a resume re-encodes only the interrupted
     chunk (from its scene-cut start — seamless) and skips the rest. We do NOT concatenate:
-    the chunks stay as separate files and a manifest records their order — the Resolve
-    stage assembles them on its timeline (frame-accurate), so we never write the ~238 GB
-    twice. `on_progress(total_frames_done)` reports cumulative progress across chunks.
+    the chunks stay as separate files and a manifest records their order — the DV step and
+    the remux read them in order (frame-accurate), so we never write the ~238 GB twice. `on_progress(total_frames_done)` reports cumulative progress across chunks.
     `on_plan(seg_end_frames, exact_total)` fires once after planning (progress-bar notches).
     `should_pause()` (optional callable) is polled BETWEEN segments: when it returns True the
     encode stops CLEANLY at that boundary — completed chunks stay, nothing partial is lost —
@@ -1164,7 +1052,7 @@ def upscale_resumable(source, *, segdir, profile=None, scale=2, device=-2, fit_h
             return UpscaleResult(False, rc, done + frames, segdir, why)
         entries.append({"file": os.path.basename(sf), "start": a, "frames": c})
         done += c
-    # All chunks present — record the order + ACTUAL frame counts for Resolve (no concat).
+    # All chunks present — record the order + ACTUAL frame counts (no concat).
     write_manifest(segdir, fps, entries)
     summary = probe(os.path.join(segdir, entries[0]["file"])) if entries else {}
     return UpscaleResult(is_valid_upscale(summary), 0, done, segdir, "", summary)

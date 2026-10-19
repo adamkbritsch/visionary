@@ -120,10 +120,10 @@ class ProtectedStageTests(unittest.TestCase):
         self.lease = yield_lease.YieldLease(gate=TRUST, now=Clock())
         self.lease.take("discretion", 3600)
 
-    def test_resolve_upload_and_extend_never_stand_down(self):
-        """Resolve holds the screen and cannot be paced; an upload half-written to the NAS is the one
-        thing worse than a slow one."""
-        for stage in ("resolve", "upload", "extend"):
+    def test_upload_and_extend_never_stand_down(self):
+        """AI outpainting loses its chunk if cut; an upload half-written to the NAS is the one thing
+        worse than a slow one."""
+        for stage in ("upload", "extend"):
             self.assertFalse(self.lease.blocks(stage), stage)
 
     def test_every_other_stage_does(self):

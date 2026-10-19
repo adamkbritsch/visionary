@@ -1088,7 +1088,7 @@ def channel_pending(entry, skip=()) -> list:
 
     NO LENGTH CAP (removed 2026-08-17, user-dictated). The cap existed because a long video
     used to cost the same hour-class Topaz + capped-x265 pass as a TV episode. It doesn't
-    any more: YouTube skips Topaz entirely (Resolve scales it) and ships Resolve's render
+    any more: YouTube skips Topaz entirely (the native render scales it) and ships that render
     stream-copied (YOUTUBE_RENDER_KBPS + remux_ship_render), so a long video is now cheap
     in proportion to its length instead of catastrophically expensive."""
     if entry.get("paused"):        # paused → no upscaling work at all (keeps what it already has)

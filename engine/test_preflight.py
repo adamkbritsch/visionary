@@ -7,30 +7,17 @@ import versions
 
 
 class Pins(unittest.TestCase):
-    """versions.py is the single source of truth — the shim's hardcoded geometry must agree
-    with it (a drifted edit to either would silently break clicks on the pinned hardware)."""
+    """versions.py is the single source of truth for the pinned builds."""
 
-    def test_shim_scale_matches_pin(self):
-        import dv_shim
-        self.assertEqual(dv_shim.retina_scale(), versions.RETINA_SCALE)
-
-    def test_every_supported_display_shares_the_invariant_scale(self):
-        # The templates only match when the UI renders at the same BACKING-PIXEL size —
-        # i.e. the same scale. Screen SIZE may differ (clicks are template-derived).
-        for cfg in versions.SUPPORTED_DISPLAYS:
-            self.assertEqual(cfg["scale"], versions.RETINA_SCALE, cfg["name"])
 
     def test_pin_values(self):
-        # the exact builds this repo ships templates/params for — bump ONLY with new templates
-        self.assertEqual(versions.RESOLVE_VERSION, "18.6.0")
+        # the exact Topaz build this repo ships params for
         self.assertEqual(versions.TOPAZ_VERSION, "7.0.1")
-        self.assertEqual(versions.DISPLAY_PIXELS, (3456, 2234))
-        # the verified allow-list: built-in + the 4K dummy plug used for clamshell
-        self.assertEqual([c["backing"] for c in versions.SUPPORTED_DISPLAYS],
-                         [(3456, 2234), (3840, 2160)])
+        for gone in ("RESOLVE_APP", "RESOLVE_VERSION", "SUPPORTED_DISPLAYS", "REQUIRED_BACKING_SCALE"):
+            self.assertFalse(hasattr(versions, gone), gone)        # no Resolve, no display rule
 
     def test_native_dv_pin_values(self):
-        # ADDITIVE pins for the native DV lane: the toolchain the blind A/B was judged on
+        # the Dolby Vision toolchain the blind A/B was judged on
         self.assertEqual(versions.DOVI_TOOL_VERSION, "2.3.0")
         self.assertEqual(versions.HDR_ANALYZER_COMMIT, "383b0ad")
         self.assertEqual(versions.HDR_ANALYZER_SHA256,
@@ -45,89 +32,12 @@ class Pins(unittest.TestCase):
 
 
 class VersionChecks(unittest.TestCase):
-    def test_missing_app_fails_with_install_fix(self):
-        with mock.patch.object(preflight, "_bundle_version", return_value=(None, None)):
-            c = preflight.check_resolve_version()
-        self.assertFalse(c["ok"]); self.assertEqual(c["severity"], "fail")
-        self.assertIn("STUDIO", c["fix"])
-
     def test_wrong_version_fails_exactly(self):
-        with mock.patch.object(preflight, "_bundle_version", return_value=("18.6.1", "x")):
-            self.assertFalse(preflight.check_resolve_version()["ok"])   # point builds refuse too
         with mock.patch.object(preflight, "_bundle_version", return_value=("7.0.2", "7.0.2")):
-            self.assertFalse(preflight.check_topaz_version()["ok"])
+            self.assertFalse(preflight.check_topaz_version()["ok"])   # point builds refuse too
 
-    def test_exact_version_passes(self):
-        with mock.patch.object(preflight, "_bundle_version",
-                               return_value=(versions.RESOLVE_VERSION, versions.RESOLVE_BUILD)):
-            self.assertTrue(preflight.check_resolve_version()["ok"])
-
-
-class DisplayCheck(unittest.TestCase):
-    """The display gate is the BACKING SCALE, not a geometry list: dv_shim derives every
-    click from a template match, so a template lands whenever the UI renders at the same
-    pixel size (proven — the 16-inch panel's templates matched the 3840x2160 dummy at
-    >=0.96 with no recalibration). Verified geometries just get a nicer name."""
-
-    def test_verified_builtin_passes_by_name(self):
-        w, h = versions.DISPLAY_PIXELS
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(w, h, versions.RETINA_SCALE, True)):
-            c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
-        self.assertTrue(c["ok"]); self.assertIn("built-in", c["detail"])
-
-    def test_clamshell_dummy_passes_by_name(self):
-        # LID-CLOSED: the 4K dummy plug is the main display and is NOT builtin
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(3840, 2160, 2.0, False)):
-            c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
-        self.assertTrue(c["ok"]); self.assertIn("clamshell", c["detail"])
-
-    def test_other_2x_displays_pass_generically(self):
-        # a 14-inch MBP panel, and a 5K external — neither smoke-tested, both valid 2x
-        for geom, builtin in (((3024, 1964), True), ((5120, 2880), False), ((2560, 1600), False)):
-            with mock.patch.object(preflight, "_display_via_coregraphics",
-                                   return_value=(geom[0], geom[1], 2.0, builtin)):
-                c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
-            self.assertTrue(c["ok"], geom)
-            self.assertIn("@2x", c["detail"])
-            self.assertIn("--smoke", c["detail"])      # says it is unverified, run the smoke test
-
-    def test_non_2x_scale_still_fails(self):
-        # 1x renders the UI at half the templates' pixel size -> nothing would match
-        for scale in (1.0, 1.5, 3.0):
-            with mock.patch.object(preflight, "_display_via_coregraphics",
-                                   return_value=(3840, 2160, scale, False)):
-                self.assertFalse(preflight.check_display(host=None)["ok"], scale)
-
-    def test_absurdly_small_2x_display_fails(self):
-        # 1920x1080 BACKING at 2x is 960x540 points — Resolve's Color page cannot lay out
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               return_value=(1920, 1080, 2.0, False)):
-            self.assertFalse(preflight.check_display(host=None)["ok"])
-
-    def test_match_display_is_pure(self):
-        self.assertIsNotNone(preflight.match_display(3456, 2234, 2.0, True))
-        self.assertIsNotNone(preflight.match_display(3840, 2160, 2.0, False))
-        self.assertIsNotNone(preflight.match_display(3024, 1964, 2.0, True))   # unverified but 2x
-        self.assertIsNone(preflight.match_display(3840, 2160, 1.0, False))     # 1x
-        self.assertIsNone(preflight.match_display(1920, 1080, 2.0, False))     # too small at 2x
-
-    def test_unreadable_scale_accepts_only_a_verified_geometry(self):
-        # system_profiler can't report the scale — the invariant is unverifiable, so only a
-        # known-good geometry is accepted (an unknown one must NOT be waved through).
-        w, h = versions.DISPLAY_PIXELS
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               side_effect=RuntimeError("no CG")), \
-             mock.patch.object(preflight, "_display_via_system_profiler",
-                               return_value=(w, h, None, True)):
-            c = preflight.check_display(host=None)   # judge MAIN, whatever is pinned
-        self.assertTrue(c["ok"]); self.assertIn("system_profiler", c["detail"])
-        with mock.patch.object(preflight, "_display_via_coregraphics",
-                               side_effect=RuntimeError("no CG")), \
-             mock.patch.object(preflight, "_display_via_system_profiler",
-                               return_value=(5120, 2880, None, False)):
-            self.assertFalse(preflight.check_display(host=None)["ok"])
+    def test_the_cheap_poll_is_the_topaz_pin_alone(self):
+        self.assertEqual([c["id"] for c in preflight.run_cheap()], ["topaz_version"])
 
 
 class PowerRule(unittest.TestCase):
@@ -171,21 +81,12 @@ class Semantics(unittest.TestCase):
              mock.patch.object(preflight, "check_power_adapter", return_value=warns[0]), \
              mock.patch.object(preflight, "check_brew_tools", return_value=fails[0]), \
              mock.patch.object(preflight, "check_python_deps", return_value=fails[0]), \
-             mock.patch.object(preflight, "check_shim_templates", return_value=fails[0]), \
-             mock.patch.object(preflight, "check_tcc_grants", return_value=warns[0]), \
-             mock.patch.object(preflight, "check_resolve_artifacts", return_value=warns[0]), \
              mock.patch.object(preflight, "check_config", return_value=warns[0]), \
-             mock.patch.object(preflight, "check_native_dv", return_value=fails[0]), \
-             mock.patch.object(preflight, "_dv_engine", return_value="native"):
+             mock.patch.object(preflight, "check_native_dv", return_value=fails[0]):
             r = preflight.run_checks()
         self.assertTrue(r["hard_ok"])            # warn failures don't gate arming
         self.assertFalse(r["ok"])                # but strict ok reflects them
 
-    def test_post_setup_promotes_artifacts_to_fail(self):
-        c = preflight.check_resolve_artifacts(post_setup=True)
-        self.assertEqual(c["severity"], "fail")
-        c = preflight.check_resolve_artifacts(post_setup=False)
-        self.assertEqual(c["severity"], "warn")
 
     def test_cli_exit_codes(self):
         allpass = {"ok": True, "hard_ok": True, "checks": []}
@@ -204,8 +105,8 @@ class LiveOnReferenceMachine(unittest.TestCase):
     skipped automatically anywhere the pinned apps aren't installed."""
 
     def test_reference_machine_hard_checks(self):
-        if preflight._bundle_version(versions.RESOLVE_APP)[0] != versions.RESOLVE_VERSION:
-            self.skipTest("pinned Resolve not installed — not the reference machine")
+        if preflight._bundle_version(versions.TOPAZ_APP)[0] != versions.TOPAZ_VERSION:
+            self.skipTest("pinned Topaz not installed — not the reference machine")
         r = preflight.run_cheap()
         self.assertTrue(all(c["ok"] for c in r), [c for c in r if not c["ok"]])
 
@@ -275,36 +176,6 @@ class ConfigCheck(unittest.TestCase):
         self.assertIn("Plex:", c["detail"])
 
 
-class ResolveProcessMatch(unittest.TestCase):
-    """`pgrep -x "DaVinci Resolve"` never matches: that is the APP name, while the
-    executable is "Resolve". Every guard built on it silently reported "not running" —
-    --smoke always skipped, and setup/import_resolve's never-merge-while-Resolve-is-open
-    rule never fired even though Resolve rewrites the preset file on exit."""
-
-    def test_the_pattern_matches_the_executable_not_the_app_name(self):
-        pat = preflight.RESOLVE_PGREP
-        self.assertEqual(pat[1], "-f", "-x matches the executable name, which is 'Resolve'")
-        self.assertTrue(pat[2].endswith("/Resolve"),
-                        "must match the real executable at the end of the bundle path")
-        self.assertIn("DaVinci Resolve.app", pat[2],
-                      "and stay anchored to the bundle so it can't match an unrelated 'Resolve'")
-
-    def test_no_caller_still_uses_the_broken_form(self):
-        import glob, os
-        root = os.path.dirname(os.path.dirname(os.path.abspath(preflight.__file__)))
-        bad = []
-        for f in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
-            # Source tree only — Visionary.app is build output and carries a copy of the
-            # engine that is stale until the next build.
-            if os.path.basename(f).startswith("test_") or ".app/" in f:
-                continue
-            with open(f) as fh:
-                body = fh.read()
-            if '"-x", "DaVinci Resolve"' in body:
-                bad.append(os.path.relpath(f, root))
-        self.assertEqual(bad, [], "these still use a pgrep pattern that can never match")
-
-
 class FixStringsAlwaysPresent(unittest.TestCase):
     def test_passing_check_keeps_its_fix(self):
         # the in-app Setup rows show each check's remediation/command regardless of state
@@ -317,42 +188,21 @@ class FixStringsAlwaysPresent(unittest.TestCase):
 
 
 class ArmGate(unittest.TestCase):
-    def test_arm_gate_is_cheap_plus_instant_deps(self):
-        # dv_engine 'resolve' (the default): EXACTLY the list it always was — and the
-        # native toolchain is not even looked at.
-        from unittest import mock
-        import settings
+    def test_arm_gate_is_the_pins_the_instant_deps_and_the_dv_toolchain(self):
         fake = lambda cid: {"id": cid, "ok": True, "severity": "fail", "detail": "", "fix": ""}
-        with mock.patch.object(preflight, "run_cheap",
-                               return_value=[fake("resolve_version"), fake("topaz_version"),
-                                             fake("display")]), \
-             mock.patch.object(preflight, "check_brew_tools",
-                               return_value=fake("brew_tools")), \
-             mock.patch.object(preflight, "check_python_deps",
-                               return_value=fake("python_deps")), \
-             mock.patch.object(settings, "dv_engine", return_value="resolve"), \
-             mock.patch.object(preflight, "check_native_dv") as ndv:
+        with mock.patch.object(preflight, "run_cheap", return_value=[fake("topaz_version")]), \
+             mock.patch.object(preflight, "check_brew_tools", return_value=fake("brew_tools")), \
+             mock.patch.object(preflight, "check_python_deps", return_value=fake("python_deps")), \
+             mock.patch.object(preflight, "check_native_dv", return_value=fake("native_dv")):
             ids = [c["id"] for c in preflight.run_arm_gate()]
-        self.assertEqual(ids, ["resolve_version", "topaz_version", "display",
-                               "brew_tools", "python_deps"])
-        ndv.assert_not_called()
+        self.assertEqual(ids, ["topaz_version", "brew_tools", "python_deps", "native_dv"])
 
-
-class ArtifactsAcceptNewProjectNames(unittest.TestCase):
-    def test_clean_import_names_pass_the_check(self):
-        # regression: preflight only knew legacy names, so a clean import of
-        # "Visionary DV1000 Output" failed the artifacts check
-        import os, tempfile
-        from unittest import mock
-        d = tempfile.mkdtemp()
-        for name in ("Visionary DV1000 Output", "Visionary DV2000 Output"):
-            os.makedirs(os.path.join(d, name))
-        presets = os.path.join(d, "DeliverPresetList.xml")
-        open(presets, "w").write("<x><DbKey>OvernightDV</DbKey></x>")
-        with mock.patch.object(preflight, "RESOLVE_PROJECT_DIR", d), \
-             mock.patch.object(preflight, "DELIVER_PRESETS", presets):
-            c = preflight.check_resolve_artifacts()
-        self.assertTrue(c["ok"], c["detail"])
+    def test_a_broken_dv_toolchain_refuses_to_arm(self):
+        with mock.patch.object(preflight, "_native_dv_problems",
+                               return_value=[("dovi_tool is 2.2.0", "install 2.3.0")]):
+            row = preflight.check_native_dv()
+        self.assertEqual((row["ok"], row["severity"]), (False, "fail"))
+        self.assertIn("dovi_tool is 2.2.0", row["detail"])
 
 
 class _NativeToolchain:
@@ -480,21 +330,6 @@ class NativeDvCheck(_NativeToolchain, unittest.TestCase):
                      "ffmpeg major is 7"):
             self.assertIn(part, c["detail"])
 
-    def test_not_required_is_a_warn_that_says_items_fall_back(self):
-        os.remove(self.lut)
-        c = preflight.check_native_dv(required=False)
-        self.assertEqual(c["severity"], "warn")
-        self.assertFalse(c["ok"])                        # it still reports the real state
-        self.assertTrue(c["detail"].startswith(
-            "native items fall back to Resolve until this is fixed: "), c["detail"])
-        self.assertIn("LUT missing", c["detail"])
-        self.assertIn("Restore the pinned LUT", c["fix"])
-
-    def test_a_passing_warn_row_reads_as_a_plain_pass(self):
-        c = preflight.check_native_dv(required=False)
-        self.assertTrue(c["ok"], c["detail"])
-        self.assertEqual(c["severity"], "warn")
-        self.assertNotIn("fall back", c["detail"])
 
     def test_the_lut_hash_is_cached_by_size_and_mtime(self):
         import hashlib
@@ -528,143 +363,6 @@ class NativeDvProbe(unittest.TestCase):
         rc, text = preflight._probe(["/nonexistent/hdr_analyzer_mvp", "--help"])
         self.assertIsNone(rc)
         self.assertTrue(text)
-
-
-class NativeDvGating(unittest.TestCase):
-    """dv_engine 'resolve' (the default): the native row does not exist — run_checks, --json,
-    the text output and the arm gate are exactly the old ones, and nothing native is probed.
-    'native': a "warn" row that never gates hard_ok, and NEVER an arm-gate row (a broken
-    toolchain sends items through Resolve; only the switch to 'native' is refused, by
-    POST /api/settings)."""
-
-    ROWS = ("resolve_version", "power_adapter", "brew_tools", "python_deps", "shim_templates",
-            "tcc_grants", "resolve_artifacts", "config")
-
-    def _row(self, cid, ok=True, sev="fail"):
-        return {"id": cid, "ok": ok, "severity": sev, "detail": "", "fix": ""}
-
-    def _patched(self, es, engine, native_ok=True, calls=None):
-        import settings
-
-        def ndv(required=True):
-            if calls is not None:
-                calls.append(required)
-            return self._row("native_dv", native_ok, "fail" if required else "warn")
-        es.enter_context(mock.patch.object(settings, "dv_engine", return_value=engine))
-        es.enter_context(mock.patch.object(preflight, "run_cheap",
-                                           return_value=[self._row("resolve_version")]))
-        for name in ("check_power_adapter", "check_brew_tools", "check_python_deps",
-                     "check_shim_templates", "check_tcc_grants",
-                     "check_resolve_artifacts", "check_config"):
-            es.enter_context(mock.patch.object(preflight, name,
-                                               return_value=self._row(name[6:])))
-        es.enter_context(mock.patch.object(preflight, "check_shim_smoke",
-                                           return_value=self._row("shim_smoke", sev="warn")))
-        es.enter_context(mock.patch.object(preflight, "check_native_dv", side_effect=ndv))
-
-    def _run_checks(self, engine, native_ok=True, smoke=False):
-        import contextlib
-        calls = []
-        with contextlib.ExitStack() as es:
-            self._patched(es, engine, native_ok, calls)
-            return preflight.run_checks(smoke=smoke), calls
-
-    def test_resolve_mode_has_no_native_row_and_probes_nothing(self):
-        import contextlib
-        trap = mock.Mock(side_effect=AssertionError("the native toolchain was looked at"))
-        with contextlib.ExitStack() as es:
-            self._patched(es, "resolve", native_ok=False)
-            for name in ("check_native_dv", "_native_dv_problems", "_probe", "_sha256_cached"):
-                es.enter_context(mock.patch.object(preflight, name, trap))
-            r = preflight.run_checks()
-            rs = preflight.run_checks(smoke=True)
-        self.assertEqual([c["id"] for c in r["checks"]], list(self.ROWS))
-        self.assertEqual([c["id"] for c in rs["checks"]], list(self.ROWS) + ["shim_smoke"])
-        # ...and the verdicts are computed over exactly those rows, the way they always were
-        self.assertEqual(r, {"ok": True, "hard_ok": True, "checks": r["checks"]})
-        trap.assert_not_called()
-
-    def test_resolve_mode_cli_output_has_no_native_row(self):
-        import contextlib, io, json
-        for argv in (["--json"], []):
-            with self.subTest(argv=argv), contextlib.ExitStack() as es:
-                self._patched(es, "resolve", native_ok=False)
-                out = io.StringIO()
-                with contextlib.redirect_stdout(out):
-                    code = preflight.main(argv)
-                self.assertEqual(code, 0)                 # all pass, as before the lane
-                self.assertNotIn("native", out.getvalue())
-        with contextlib.ExitStack() as es:
-            self._patched(es, "resolve")
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                preflight.main(["--json"])
-        self.assertEqual([c["id"] for c in json.loads(out.getvalue())["checks"]], list(self.ROWS))
-
-    def test_native_mode_lists_a_warn_row_that_never_gates_hard_ok(self):
-        r, calls = self._run_checks("native", native_ok=False)
-        self.assertEqual(calls, [False])                  # asked as the warn row
-        self.assertEqual([c["id"] for c in r["checks"]], list(self.ROWS) + ["native_dv"])
-        self.assertEqual(r["checks"][-1]["severity"], "warn")
-        self.assertTrue(r["hard_ok"])                     # never refuses to arm
-        self.assertTrue(r["ok"])                          # nor raises "Finish setup": Setup has
-                                                          # no row that could fix it (API-only)
-        r, _ = self._run_checks("native", native_ok=True)
-        self.assertTrue(r["hard_ok"])
-        self.assertTrue(r["ok"])
-        r, _ = self._run_checks("native", smoke=True)
-        self.assertEqual([c["id"] for c in r["checks"]][-2:], ["native_dv", "shim_smoke"])
-
-    def test_native_mode_cli_exit_is_warnings_only(self):
-        import contextlib, io
-        with contextlib.ExitStack() as es:
-            self._patched(es, "native", native_ok=False)
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                code = preflight.main([])
-        self.assertEqual(code, 0)                         # ok stays true (see above)...
-        self.assertIn("[WARN] native_dv", out.getvalue())   # ...but the row is still reported
-
-    def _arm_gate(self, engine, native_ok=True):
-        import settings
-        with mock.patch.object(preflight, "run_cheap", return_value=[self._row("resolve_version"),
-                                                                     self._row("topaz_version"),
-                                                                     self._row("display")]), \
-             mock.patch.object(preflight, "check_brew_tools", return_value=self._row("brew_tools")), \
-             mock.patch.object(preflight, "check_python_deps",
-                               return_value=self._row("python_deps")), \
-             mock.patch.object(settings, "dv_engine", return_value=engine), \
-             mock.patch.object(preflight, "check_native_dv",
-                               return_value=self._row("native_dv", native_ok)) as ndv:
-            return preflight.run_arm_gate(), ndv
-
-    def test_the_arm_gate_never_holds_the_native_toolchain(self):
-        for engine in ("resolve", "native"):
-            with self.subTest(engine=engine):
-                gate, ndv = self._arm_gate(engine, native_ok=False)
-                self.assertEqual([c["id"] for c in gate],
-                                 ["resolve_version", "topaz_version", "display", "brew_tools",
-                                  "python_deps"])
-                ndv.assert_not_called()
-                self.assertTrue(all(c["ok"] for c in gate))   # a broken toolchain still arms
-
-    def test_the_switch_to_native_still_gets_a_hard_row(self):
-        # POST /api/settings {"dv_engine": "native"} calls check_native_dv() and refuses (409)
-        # on a failing row — that row is severity "fail", without the fall-back wording.
-        with mock.patch.object(preflight, "_native_dv_problems",
-                               return_value=[("dovi_tool is 2.2.0", "Install dovi_tool 2.3.0")]):
-            c = preflight.check_native_dv()
-        self.assertEqual((c["ok"], c["severity"]), (False, "fail"))
-        self.assertEqual(c["detail"], "dovi_tool is 2.2.0")
-
-    def test_an_unreadable_setting_fails_safe_to_resolve(self):
-        import settings
-        with mock.patch.object(settings, "dv_engine", side_effect=TypeError("bad file")):
-            self.assertEqual(preflight._dv_engine(), "resolve")
-        with mock.patch.object(settings, "get_settings", return_value={"dv_engine": "Native"}):
-            self.assertEqual(preflight._dv_engine(), "resolve")
-        with mock.patch.object(settings, "get_settings", return_value={"dv_engine": "native"}):
-            self.assertEqual(preflight._dv_engine(), "native")
 
 
 class NativeDvLiveOnReferenceMachine(unittest.TestCase):

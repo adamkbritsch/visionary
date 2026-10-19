@@ -3,9 +3,9 @@ import AppKit
 
 // The in-app onboarding: every README setup step as a live row inside Settings —
 // connection fields (writing ~/.topaz-pipeline/config.json through the redacted
-// /api/config), one-click dependency installs with live output, version/display
-// checks, TCC grant buttons, the Resolve project import, and the optional NAS
-// helper. Auto-expanded until every preflight check passes, collapsed after.
+// /api/config), one-click dependency installs with live output, version and
+// toolchain checks, and the optional NAS helper. Auto-expanded until every preflight
+// check passes, collapsed after.
 
 private struct SetupGroupLabel: View {
     let text: String
@@ -60,8 +60,6 @@ struct SetupSection: View {
                     MediaFoldersGroup()
                     DependenciesGroup()
                     ApplicationsGroup()
-                    PermissionsGroup()
-                    ResolveProjectsGroup()
                     BorderExtenderGroup()
                     OptionalConnectionsGroup()
                     YoutarrSettingsGroup()
@@ -659,84 +657,9 @@ private struct ApplicationsGroup: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             SetupGroupLabel(text: "Applications & hardware")
-            row("DaVinci Resolve Studio", "resolve_version")
             row("Topaz Video AI", "topaz_version")
-            row("Display", "display")
+            row("Dolby Vision toolchain", "native_dv")
             row("Power", "power_adapter")
-        }
-    }
-}
-
-// MARK: - permissions (TCC)
-
-private struct PermissionsGroup: View {
-    @EnvironmentObject var store: AppStore
-    var body: some View {
-        let t = store.selftest
-        VStack(alignment: .leading, spacing: 8) {
-            SetupGroupLabel(text: "Permissions")
-            HStack(spacing: 8) {
-                CheckDot(ok: t?.screen_recording)
-                Text("Screen Recording").font(.system(size: 12, weight: .medium))
-                Spacer()
-                Button("Request") { Task { await store.requestScreenRecording() } }
-                    .buttonStyle(SteelButtonStyle(lit: t?.screen_recording != true))
-                Button("Open Settings") {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:"
-                        + "com.apple.preference.security?Privacy_ScreenCapture")!)
-                }.buttonStyle(SteelButtonStyle(lit: false))
-            }
-            HStack(spacing: 8) {
-                CheckDot(ok: t?.accessibility)
-                Text("Accessibility").font(.system(size: 12, weight: .medium))
-                Spacer()
-                Button("Request") { Task { await store.requestAccessibility() } }
-                    .buttonStyle(SteelButtonStyle(lit: t?.accessibility != true))
-            }
-            Text("macOS shows each prompt once; relaunch Visionary after granting.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-        }
-    }
-}
-
-// MARK: - resolve projects (the bundled import)
-
-private struct ResolveProjectsGroup: View {
-    @EnvironmentObject var store: AppStore
-    var body: some View {
-        let c = store.preflight?[check: "resolve_artifacts"]
-        let j = store.installStatus?.jobs?["import_resolve"]
-        let running = store.installStatus?.active == "import_resolve"
-        VStack(alignment: .leading, spacing: 6) {
-            SetupGroupLabel(text: "Resolve projects & DV preset")
-            HStack(spacing: 8) {
-                CheckDot(ok: c?.ok)
-                Text(c?.detail ?? "not checked yet").font(.system(size: 11))
-                    .foregroundStyle(.secondary).lineLimit(2)
-                Spacer()
-                Button {
-                    Task { await store.importResolve() }
-                } label: {
-                    if running { ProgressView().controlSize(.small) }
-                    else { Text("Import projects & preset") }
-                }.buttonStyle(SteelButtonStyle(lit: c?.ok != true))
-                    .disabled(store.installStatus?.active != nil && !running)
-            }
-            Text("Quit DaVinci Resolve first — it rewrites the preset file on exit.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-            if let steps = j?.steps {
-                ForEach(steps) { s in
-                    HStack(spacing: 6) {
-                        CheckDot(ok: s.ok)
-                        Text("\(s.step ?? "?"): \(s.detail ?? "")")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary).lineLimit(2)
-                    }
-                }
-            } else if j?.state == "failed" {
-                Text((j?.tail ?? []).suffix(3).joined(separator: " · "))
-                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(DS.fault)
-            }
         }
     }
 }

@@ -1,7 +1,7 @@
 """A TTL'd request from a sibling app for the machine, and the reason it has a TTL.
 
 Discretion (the content-filtering sibling) needs the whole machine for a scan or a masked render,
-the same way Visionary's own Resolve and outpainting stages do. It asks for it here rather than by
+the same way Visionary's own outpainting stage does. It asks for it here rather than by
 pausing automation, because pausing is a state a human has to undo and this is a state that must
 undo itself.
 
@@ -21,11 +21,10 @@ the kernel and Expurgate's own state on EVERY take and renewal, and re-checked e
 a lease is held. The request's `holder` string is a label, never a credential: until then anything on
 this Mac that said "discretion" held the machine, and an orphaned training script did so all day.
 
-WHAT A LEASE DOES NOT DO. It never interrupts `resolve` or `upload`. Resolve holds the screen and
-cannot be paced; an upload half-written to the NAS is the one thing worse than a slow one. Those
-stages are already uninterruptible in Visionary's own deploy discipline and a lease respects the
-same boundary — which also means a lease taken during one of them is HELD but not yet effective, and
-its caller has to expect that.
+WHAT A LEASE DOES NOT DO. It never interrupts `extend` or `upload`. AI outpainting holds the whole
+machine and loses its chunk if cut; an upload half-written to the NAS is the one thing worse than a
+slow one. So a lease taken during one of them is HELD but not yet effective, and its caller has to
+expect that.
 """
 
 import sys
@@ -43,7 +42,7 @@ DEFAULT_SECONDS = 900
 
 # Stages a lease must never cut into. Kept here rather than at the call site so the rule is stated
 # once, next to the reason.
-PROTECTED_STAGES = ("resolve", "extend", "upload")
+PROTECTED_STAGES = ("extend", "upload")
 
 GUARD_SECS = 10          # how often a held lease is re-checked against Expurgate's real state
 SOFT_MISSES = 2          # Expurgate not ANSWERING this many checks in a row revokes it too

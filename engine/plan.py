@@ -6,9 +6,9 @@ without the user thinking about the source resolution. Invariants the user set:
   * ProRes is the intermediate in EVERY scenario (it makes up for source data loss).
   * Topaz PRESERVES dynamic range — SDR→SDR, HDR→HDR, NEVER converts either way
     (no Hyperion/tone-map). It UPSCALES every sub-4K source to 4K; already-4K is CLEANED (1×).
-  * DaVinci Resolve adds HDR ONLY when the source is SDR; it always adds Dolby Vision.
+  * The DV step adds HDR ONLY when the source is SDR; it always adds Dolby Vision.
 
-           input                topaz (keeps range)        resolve
+           input                topaz (keeps range)        dv
   ----------------------------  ------------------------   ----------------------------
   480p  SDR/HDR                 upscale 4× → fit 2160      add (HDR+)DV
   720p  SDR/HDR                 upscale 4× → fit 2160      add (HDR+)DV
@@ -105,8 +105,8 @@ def _no_rpu_reason(info) -> str | None:
 
 def choose_plan(info: dict) -> dict:
     """Map input characteristics to the path (PURE — unit-tested). Topaz preserves range;
-    Resolve adds HDR only for SDR sources. Every sub-4K source upscales to 4K. Returns
-    {topaz, scale, res, fit_height, resolve, is_hdr, reason, source_cfr}: `scale` = the tvai AI
+    the DV step adds HDR only for SDR sources. Every sub-4K source upscales to 4K. Returns
+    {topaz, scale, res, fit_height, dv, is_hdr, reason, source_cfr}: `scale` = the tvai AI
     factor, `res` = the preset/resolution bucket (which variant's params to use), `fit_height` =
     the final lanczos-fit height (2160) or None when the AI scale already lands on 2160.
 
@@ -117,20 +117,20 @@ def choose_plan(info: dict) -> dict:
     (passthrough_min_mbps, 12 Mbps) and a Topaz "clean" 1x pass for 4K under it or at a variable
     frame rate. Neither exists now. The tier is technical:
       rpu-only      an HDR10/PQ HEVC Main10 4K source at a CONSTANT frame rate: the ORIGINAL
-                    stream is kept and Resolve's Dolby Vision RPU is injected — no re-encode, at
+                    stream is kept and a generated Dolby Vision RPU is injected — no re-encode, at
                     any bitrate or 4K geometry (user-dictated: 4K HDR10 is never re-encoded)
-      resolve-only  every other 4K source: Resolve's HDR+DV conversion ships through the normal
-                    capped remux. A VARIABLE frame rate source is only RE-TIMED first — the CFR
-                    pass re-encodes it to a constant rate (source_cfr=False) instead of
-                    stream-copying, since Resolve's timeline and the remux run at one rate. The
+      dv-only       every other 4K source: the native render's HDR+DV conversion ships through
+                    the normal capped remux. A VARIABLE frame rate source is only RE-TIMED first —
+                    the CFR pass re-encodes it to a constant rate (source_cfr=False) instead of
+                    stream-copying, since the render and the remux run at one rate. The
                     re-time is ffmpeg's, never Topaz's.
     `"skip"` stays reserved for already-DV (an abort, not a fast path)."""
     is_hdr = bool(info.get("is_hdr"))
-    resolve = "add_dv" if is_hdr else "add_hdr_dv"
+    dv = "add_dv" if is_hdr else "add_hdr_dv"
     rng = "HDR" if is_hdr else "SDR"
     if info.get("is_dv"):
         return {"topaz": "skip", "scale": 1, "res": None, "fit_height": None,
-                "resolve": "skip", "is_hdr": is_hdr, "reason": "already Dolby Vision — nothing to do"}
+                "dv": "skip", "is_hdr": is_hdr, "reason": "already Dolby Vision — nothing to do"}
     kbps = int(info.get("video_kbps") or 0)
     cfr = bool(info.get("is_cfr"))
     # Only the three properties Dolby Vision 8.1 physically requires of a base layer are tested,
@@ -141,9 +141,9 @@ def choose_plan(info: dict) -> dict:
             and info.get("codec") == "hevc"                   # ...an HEVC one
             and info.get("pix_fmt") == "yuv420p10le"):        # ...Main10
         return {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
-                "resolve": "add_dv", "is_hdr": True, "source_cfr": True,
+                "dv": "add_dv", "is_hdr": True, "source_cfr": True,
                 "reason": "4K HDR10 HEVC Main10 (%dx%d @ ~%d Mbps) — original stream kept "
-                          "untouched, Resolve adds the DV layer only"
+                          "untouched, the DV layer added only"
                           % (info.get("width") or 0, info.get("height") or 0, kbps // 1000)}
     if info.get("is_4k"):
         # 4K, but it cannot keep its own stream, so it is converted. Name the reason — a
@@ -151,22 +151,22 @@ def choose_plan(info: dict) -> dict:
         why = _no_rpu_reason(info) if is_hdr else None
         if is_hdr and not why and not cfr:
             why = "its frame rate varies"
-        return {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
-                "resolve": resolve, "is_hdr": is_hdr, "source_cfr": cfr,
-                "reason": "4K %s (%s) @ ~%d Mbps — no upscale, %sResolve %s%s"
+        return {"topaz": "dv-only", "scale": 1, "res": None, "fit_height": None,
+                "dv": dv, "is_hdr": is_hdr, "source_cfr": cfr,
+                "reason": "4K %s (%s) @ ~%d Mbps — no upscale, %s%s%s"
                           % (rng, info.get("codec") or "?", kbps // 1000,
                              "" if cfr else "re-timed to a constant frame rate, ",
-                             "adds DV" if is_hdr else "adds HDR + DV",
+                             "DV added" if is_hdr else "HDR + DV added",
                              ("; re-encoded because " + why) if why else "")}
     height = int(info.get("height") or 0)
     res = resolution_bucket(height)
     scale = _AI_SCALE[res]
     fit_height = TARGET_H if (height * scale != TARGET_H) else None   # land exactly on 4K
-    reason = ("%s %s → Topaz upscale %d×%s (keeps %s) → Resolve %s"
+    reason = ("%s %s → Topaz upscale %d×%s (keeps %s) → %s"
               % (res, rng, scale, " → fit 2160" if fit_height else " = 2160", rng,
-                 "adds DV" if is_hdr else "adds HDR + DV"))
+                 "DV added" if is_hdr else "HDR + DV added"))
     return {"topaz": "upscale", "scale": scale, "res": res, "fit_height": fit_height,
-            "resolve": resolve, "is_hdr": is_hdr, "reason": reason}
+            "dv": dv, "is_hdr": is_hdr, "reason": reason}
 
 
 # What ffprobe ACTUALLY found, remembered per source basename so the app can stop guessing.

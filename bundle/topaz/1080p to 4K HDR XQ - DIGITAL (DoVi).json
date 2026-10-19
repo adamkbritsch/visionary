@@ -1,8 +1,8 @@
 {
-    "date": "Sat Jun 13 14:00:00 2026 GMT-0600",
+    "date": "Sat Jun 13 12:00:00 2026 GMT-0600",
     "editable": true,
     "enabled": true,
-    "name": "1080p to 4K SDR XQ - DIGITAL (Resolve HDR+DoVi)",
+    "name": "1080p to 4K HDR XQ - DIGITAL (DoVi)",
     "outputSettings": {
         "active": true,
         "appendModelNameForIS": false,
@@ -21,22 +21,22 @@
         "startFrameNumber": 0,
         "videoBitrate": 40
     },
-    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K SDR XQ - DIGITAL (Resolve HDR+DoVi).json",
+    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K HDR XQ - DIGITAL (DoVi).json",
     "saveOutputSettings": true,
     "settings": {
         "enhance": {
             "active": true,
             "addNoise": 0,
             "auto": 2,
-            "compress": 8,
+            "compress": 20,
             "deblur": 0,
-            "dehalo": 5,
+            "dehalo": 10,
             "denoise": 0,
-            "detail": 2,
+            "detail": 8,
             "fieldOrder": 0,
             "focusFixLevel": "Off",
             "model": "prob-4",
-            "recoverOriginalDetailValue": 45,
+            "recoverOriginalDetailValue": 20,
             "sharpen": 0,
             "videoType": 1,
             "isSecondEnhancement": false
@@ -47,14 +47,14 @@
             "grainSize": 2
         },
         "hdr": {
-            "active": false,
+            "active": true,
             "auto": 0,
             "exposure": 0,
             "fieldOrder": 0,
             "hdrOutputTRC": 0,
             "model": "hyp-1",
             "saturation": 0,
-            "sdrInflectionPoint": 0.75,
+            "sdrInflectionPoint": 0.78,
             "videoType": 1
         },
         "motionblur": {

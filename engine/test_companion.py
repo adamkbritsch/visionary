@@ -102,11 +102,11 @@ class VerdictEngine(unittest.TestCase):
         self.assertEqual(v["rpu_from"], "nas")
         self.assertFalse(v["rpu_inline"])
 
-    def test_no_real_dv_falls_back_to_resolve(self):
+    def test_no_real_dv_falls_back_to_a_generated_rpu(self):
         v = companion.build_verdict(_probe(), _probe(kbps=30000),
                                     "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
-        self.assertEqual(v["rpu_from"], "resolve")
-        self.assertEqual(v["rpu_profile"], "resolve")
+        self.assertEqual(v["rpu_from"], "native")
+        self.assertEqual(v["rpu_profile"], "native")
 
     def test_audio_donor_is_the_best_single_track(self):
         v = companion.build_verdict(_probe(audio=[AC3]),
@@ -890,13 +890,13 @@ class CombineAppliesToEveryMovie(unittest.TestCase):
 
 class NonPqWinnerRefusal(unittest.TestCase):
     """The winner's OWN pixels ship, and an RPU describes a PQ base — so when the better video
-    is SDR/HLG and carries no DV of its own, neither a graft from the DV loser nor Resolve's
+    is SDR/HLG and carries no DV of its own, neither a graft from the DV loser nor a generated
     analysis may be chosen (plan P2d). Every verdict with a PQ winner, or a winner with its own
     DV, is unchanged."""
 
     RPU_KEYS = ("rpu_from", "rpu_profile", "rpu_inline", "rpu_why")
 
-    def test_sdr_winner_without_dv_is_refused_not_resolve(self):
+    def test_sdr_winner_without_dv_is_refused_not_generated(self):
         v = companion.build_verdict(_probe(transfer="bt709"), _probe(kbps=30000),
                                     "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
         self.assertEqual(v["video_from"], "nas")
@@ -904,7 +904,7 @@ class NonPqWinnerRefusal(unittest.TestCase):
         self.assertIsNone(v["rpu_profile"])
         self.assertFalse(v["rpu_inline"])
         self.assertIn("SDR (bt709)", v["refused"])
-        self.assertIn("Resolve", v["refused"])
+        self.assertIn("generated Dolby Vision", v["refused"])
         self.assertEqual(v["rpu_why"], v["refused"])
 
     def test_sdr_winner_refuses_a_graft_from_the_dv_loser(self):
@@ -941,14 +941,14 @@ class NonPqWinnerRefusal(unittest.TestCase):
                   "subs_from", "reencode", "container"):
             self.assertEqual(ok[k], bad[k], k)
 
-    def test_pq_winner_without_dv_still_goes_to_resolve_exactly(self):
+    def test_pq_winner_without_dv_still_goes_to_the_generated_rpu_exactly(self):
         # the whole verdict, not just the rpu fields — byte-identical to before the fix
         v = companion.build_verdict(_probe(), _probe(kbps=30000),
                                     "a 2160p REMUX.mkv", "b 2160p REMUX.mkv")
         self.assertEqual(v, {
             "video_from": "nas", "video_why": "higher video bitrate",
-            "rpu_from": "resolve", "rpu_profile": "resolve", "rpu_inline": False,
-            "rpu_why": "neither copy has real DV — Resolve analyzes the winner",
+            "rpu_from": "native", "rpu_profile": "native", "rpu_inline": False,
+            "rpu_why": "neither copy has real DV — the native DV render analyzes the winner",
             "audio_from": "nas",
             "audio_why": "AC-3 5.1 — all of this copy's audio ships (compat tracks included)",
             "audio_primary": {"codec": "ac3", "atmos": False},
@@ -964,7 +964,7 @@ class NonPqWinnerRefusal(unittest.TestCase):
         v = companion.build_verdict(_probe(width=1920, height=1080, transfer="bt709"),
                                     _probe(kbps=30000), "a 1080p BluRay.mkv", "b 2160p WEB.mkv")
         self.assertEqual(v["video_from"], "remote")
-        self.assertEqual(v["rpu_from"], "resolve")
+        self.assertEqual(v["rpu_from"], "native")
         self.assertNotIn("refused", v)
 
     def test_unchanged_matrix(self):
@@ -977,7 +977,7 @@ class NonPqWinnerRefusal(unittest.TestCase):
             ((_probe(dv="8.1", kbps=30000), _probe(kbps=60000)),
              ("nas", "8.1", False)),
             ((_probe(), _probe(kbps=30000)),
-             ("resolve", "resolve", False)),
+             ("native", "native", False)),
             # a winner carrying its OWN DV is out of scope: kept inline whatever the transfer
             ((_probe(dv="8.4", kbps=60000, transfer="arib-std-b67"), _probe(kbps=30000)),
              ("nas", "8.4", True)),
@@ -1027,7 +1027,7 @@ class RefusedVerdictIsNeverConfirmable(unittest.TestCase):
         e = self._pair(_probe(transfer="bt709"), _probe(kbps=30000))
         self.assertEqual(e["status"], "error")
         self.assertTrue(e["error"].startswith("cannot combine: "))
-        self.assertIn("Resolve", e["error"])
+        self.assertIn("generated Dolby Vision", e["error"])
         self.assertIsNone(e["verdict"]["rpu_from"])
         self.assertEqual(e["companion"]["name"], "b 2160p REMUX.mkv")   # kept for the record
         self.assertEqual(companion.confirm(self.NAS)["status"], "error")
@@ -1037,7 +1037,7 @@ class RefusedVerdictIsNeverConfirmable(unittest.TestCase):
         e = self._pair(_probe(), _probe(kbps=30000))
         self.assertEqual(e["status"], "ready")
         self.assertIsNone(e["error"])
-        self.assertEqual(e["verdict"]["rpu_from"], "resolve")
+        self.assertEqual(e["verdict"]["rpu_from"], "native")
         self.assertNotIn("refused", e["verdict"])
         self.assertEqual(companion.confirm(self.NAS)["status"], "confirmed")
 

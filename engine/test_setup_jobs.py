@@ -69,21 +69,6 @@ class Jobs(unittest.TestCase):
         self.assertEqual(out["error"], "homebrew-missing")
         self.assertIn("install.sh", out["hint"])           # the copyable command rides along
 
-    def test_import_resolve_parses_trailing_json_steps(self):
-        payload = ('{"ok": true, "steps": [{"step": "merge_preset", "ok": true, '
-                   '"detail": "merged"}]}')
-        setup_jobs.start("import_resolve",
-                         argv=["/bin/sh", "-c", f"echo Resolve chatter; echo '{payload}'"])
-        j = _wait("import_resolve")
-        self.assertEqual(j["state"], "ok")
-        self.assertEqual(j["steps"][0]["step"], "merge_preset")
-
-    def test_import_resolve_with_a_failed_step_reads_failed(self):
-        payload = '{"ok": false, "steps": [{"step": "merge_preset", "ok": false, "detail": "x"}]}'
-        setup_jobs.start("import_resolve", argv=["/bin/sh", "-c", f"echo '{payload}'"])
-        j = _wait("import_resolve")
-        self.assertEqual(j["state"], "failed")             # --json exits 0; steps decide
-
 
 if __name__ == "__main__":
     unittest.main()

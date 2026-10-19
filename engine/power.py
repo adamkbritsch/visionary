@@ -3,7 +3,7 @@
 macOS cannot read mains voltage (the adapter hides it behind low-voltage DC),
 so "only run on adequate wall power" is detected behaviorally instead: if the
 Mac is plugged in (ExternalConnected) yet the battery is still *draining* under
-load, the adapter can't keep up with Topaz+Resolve and the run quits for the
+load, the adapter can't keep up with Topaz and the encoders and the run quits for the
 night.
 
 Gotcha handled below: macOS reports a discharging current as an unsigned

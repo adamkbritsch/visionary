@@ -2,8 +2,8 @@
 #   /usr/bin/python3 -m pip install --user -r requirements.txt
 # (If pip is missing: /usr/bin/python3 -m ensurepip --user first.)
 #
-# opencv-python powers the DaVinci Resolve UI automation (template matching in
-# engine/dv_shim.py). numpy comes with it. Everything else in the engine is stdlib.
+# opencv-python is for the AI border-extension stage (engine/borders.py); numpy (which comes with
+# it) is also used by the Dolby Vision L4 pass. Everything else in the engine is stdlib.
 opencv-python
 numpy
 

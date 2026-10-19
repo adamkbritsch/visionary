@@ -1,50 +1,48 @@
 """Which ROUTE an item takes to its Dolby Vision master — a name for every outcome of plan.py
-and companion.py, so each kind of item can move off Resolve on its own switch. The end state
-has NO Resolve at all (user decision 2026-10-15: "absolutely zero resolve integration in the
-entire app"): every route gets a native engine, then the Resolve code is removed.
+and companion.py. The orchestrator logs that name once per item after the CFR stage, and
+stages.native_route reads it to plan the native render ('dvrender') of an item the chunk lane
+(nativelane) does not take.
 
-classify() picks no engine itself. It only NAMES what the engine choices made elsewhere
-(plan.choose_plan, companion.build_verdict, nativelane.eligible, stages._resolve's YouTube
-rules, the per-item output mode) already do. The orchestrator logs that name once per item
-after the CFR stage, and stages.native_route reads it to send a route set 'native' in settings
-`dv_routes` to the native render ('dvrender') — inert while dv_routes is {}, the default.
+classify() picks no engine itself. It only NAMES what the choices made elsewhere
+(plan.choose_plan, companion.build_verdict, nativelane.eligible, the per-item output mode)
+already do.
 
-  route              the item                                          today
+  route              the item                                          its Dolby Vision
   -----------------  ------------------------------------------------  ----------------------------
-  tv_sdr_topaz       TV, BT.709-era SDR (720p+ bucket), Topaz upscale  Resolve 'episode', or the
-                                                                       native lane (dv_engine)
-  tv_disk_fallback   ...one the native lane declined for disk          Resolve 'episode'
-  sd_sdr_topaz       TV, 480p/576p bucket (BT.601-era SD), Topaz       Resolve 'episode'
-  movie_sdr_topaz    a sub-4K SDR movie, Topaz upscale                 Resolve 'episode'
-  hdr_topaz          sub-4K PQ or HLG (TV or movie), Topaz upscale     Resolve 'episode' (add_dv)
-  rpu_only           4K HDR10 HEVC Main10 at a constant frame rate     Resolve analyses; its RPU
+  tv_sdr_topaz       TV, BT.709-era SDR (720p+ bucket), Topaz upscale  the chunk lane, else the
+                                                                       render from the chunks
+  tv_disk_fallback   ...one the chunk lane declined for disk           the render from the chunks
+  sd_sdr_topaz       TV, 480p/576p bucket (BT.601-era SD), Topaz       the chunk lane (601 front
+                                                                       end), else the render
+  movie_sdr_topaz    a sub-4K SDR movie, Topaz upscale                 the render from the chunks
+  hdr_topaz          sub-4K PQ or HLG (TV or movie), Topaz upscale     the render, no LUT
+  rpu_only           4K HDR10 HEVC Main10 at a constant frame rate     analysed as it is; the RPU
                                                                        rides the original bits
-  hdr_reencode       PQ that cannot carry an RPU (not HEVC, not        Resolve converts
+  hdr_reencode       PQ that cannot carry an RPU (not HEVC, not        the render, converted
                      10-bit, or a variable frame rate), and every
                      other YouTube PQ
-  hlg                4K HLG, and any YouTube HLG                       Resolve HLG -> PQ
-  sdr4k              4K SDR (not YouTube), no upscale                  Resolve 'single'
-  yt_native4k        YouTube SDR, landscape, >= 1700 lines             Resolve 'single' @ 14 Mbps
-  yt_1080            YouTube SDR, 900-1200 lines                       ...SuperScale 2x @ 20 Mbps
-  yt_plain           YouTube SDR, everything else (480p, 720p,         ...plain fit @ 20 or 14 Mbps
+  hlg                4K HLG, and any YouTube HLG                       the render, HLG -> PQ
+  sdr4k              4K SDR (not YouTube), no upscale                  the render through the LUT
+  yt_native4k        YouTube SDR, landscape, >= 1700 lines             ...at 14 Mbps
+  yt_1080            YouTube SDR, 900-1200 lines                       ...a 2x Lanczos fit, 20 Mbps
+  yt_plain           YouTube SDR, everything else (480p, 720p,         ...a plain fit, 20 or 14 Mbps
                      1440p, vertical, unprobed)
-  combine_rpu        companion combine, either copy has real DV        Resolve-free
-  combine_nodv       companion combine, neither copy has DV            Resolve analyses the winner
-  sdr_out            any Resolve-rendered item pinned to SDR           the SDR project
-  already_dv         the source is already Dolby Vision                refused; Resolve-free
-  dvp7               DV profile 7 (the dvlane conversion)              Resolve-free
+  combine_rpu        companion combine, either copy has real DV        no DV step (the real RPU)
+  combine_nodv       companion combine, neither copy has DV            the render analyses the winner
+  sdr_out            any item pinned to SDR                            the SDR render (no DV)
+  already_dv         the source is already Dolby Vision                refused; no DV step
+  dvp7               DV profile 7 (the dvlane conversion)              no DV step (its own lane)
 
 ORDER MATTERS, and it is the stages' own order: a combine's verdict outranks the plan's
-already-DV skip (stages._resolve checks it first); an output-mode PIN outranks the kind of
-item for every route that renders through Resolve (stages._resolve renders every one of them
-in the pinned project); rpu-only outranks YouTube (stages._remux tests it first); and HDR
-outranks the yt_* split, because every yt_* engine will run the BT.709 SDR LUT — a YouTube
-video in PQ or HLG (none so far) must never be named into one.
+already-DV skip; an output-mode PIN outranks the kind of item for every rendered route; rpu-only
+outranks YouTube (stages._remux tests it first); and HDR outranks the yt_* split, because every
+yt_* render runs the BT.709 SDR LUT — a YouTube video in PQ or HLG (none so far) must never be
+named into one.
 
 THE 2000-NIT MODE IS RETIRED (user decision 2026-10-15, built 2026-10-18): there is no dv2000
 route any more. settings reads a profile still pinned to "dv2000" as "dv1000", and
 normalize_mode does the same with anything it is handed — so such an item is named by its kind,
-exactly like an unpinned one, and takes that route's engine.
+exactly like an unpinned one.
 """
 from __future__ import annotations
 import os
@@ -61,24 +59,24 @@ ROUTES = {
     "hlg": "HLG, converted to PQ",
     "sdr4k": "4K SDR, no upscale (adds HDR + DV)",
     "yt_native4k": "YouTube, native 4K landscape (no scaling)",
-    "yt_1080": "YouTube, 900-1200 lines (Resolve SuperScale 2x)",
+    "yt_1080": "YouTube, 900-1200 lines (2x Lanczos)",
     "yt_plain": "YouTube, plain fit (480p/720p/1440p/vertical)",
-    "combine_rpu": "companion combine with a real DV RPU (Resolve-free)",
+    "combine_rpu": "companion combine with a real DV RPU (no DV step)",
     "combine_nodv": "companion combine, neither copy has DV",
     "sdr_out": "pinned to the SDR output",
-    "already_dv": "already Dolby Vision (refused, Resolve-free)",
-    "dvp7": "DV profile 7 -> 8.1 lane (Resolve-free)",
+    "already_dv": "already Dolby Vision (refused, no DV step)",
+    "dvp7": "DV profile 7 -> 8.1 lane (no DV step)",
 }
 UNKNOWN = "unknown"             # the facts do not name a route (no plan, no combine verdict)
-RESOLVE_FREE = frozenset(("combine_rpu", "already_dv", "dvp7"))   # no Resolve on any setting
+NO_DV_STEP = frozenset(("combine_rpu", "already_dv", "dvp7"))   # never rendered, on any setting
 
 MODES = ("sdr", "dv1000")             # = settings.OUTPUT_MODES without "auto" (test-pinned)
 HLG = "arib-std-b67"                  # plan.HDR_TRANSFERS' HLG member (test-pinned)
 TV_LANE_RES = ("720p", "1080p")       # = nativelane.ELIGIBLE_RES (test-pinned)
 SD_RES = "480p"                       # plan.resolution_bucket's SD bucket (480p and 576p)
 YT_NATIVE_4K_MIN_HEIGHT = 1700        # = stages.YOUTUBE_NATIVE_4K_MIN_HEIGHT (test-pinned)
-YT_SUPERSCALE_MIN_HEIGHT = 900        # stages._resolve's inline SuperScale rule,
-YT_SUPERSCALE_MAX_HEIGHT = 1200       # `if 900 <= h <= 1200` (test-pinned against its source)
+YT_1080_MIN_HEIGHT = 900              # the yt_1080 band: `if 900 <= h <= 1200`
+YT_1080_MAX_HEIGHT = 1200
 
 
 def describe(route) -> str:
@@ -89,7 +87,7 @@ def describe(route) -> str:
 
 
 def normalize_mode(mode) -> str:
-    """The output mode stages._resolve renders in: a real mode as given, anything else
+    """The output mode an item is made in: a real mode as given, anything else
     ("auto", None, junk, the retired "dv2000") dv1000 — the same rule as
     settings.effective_output_mode."""
     return mode if mode in MODES else "dv1000"
@@ -107,8 +105,7 @@ def _dv_major(profile):
 
 
 def _geometry(plan: dict, facts: dict) -> tuple:
-    """(width, height) of the source, read the way stages._resolve reads the height: the
-    plan's probe, 0 when absent or unreadable. facts may override either."""
+    """(width, height) of the source: the plan's probe, 0 when absent or unreadable. facts may override either."""
     info = plan.get("input") if isinstance(plan.get("input"), dict) else {}
     out = []
     for key in ("width", "height"):
@@ -125,13 +122,12 @@ def _transfer(plan: dict, facts: dict):
 
 
 def _youtube(plan: dict, facts: dict) -> str:
-    """The SDR YouTube split. yt_1080 is EXACTLY the set Resolve SuperScales today (any
-    orientation: the rule reads the height alone), since that is what a native 1080p route
-    must be checked against. yt_native4k is the landscape half of the 14 Mbps bucket — the
-    frames the LUT alone can master; a vertical video in that bucket needs a fit and a pad,
-    so it is plain. Everything else (480p, 720p, 1201-1699 lines, unprobed) is plain too."""
+    """The SDR YouTube split. yt_1080 is the 900-1200-line band (any orientation: the rule reads
+    the height alone), a plain 2x Lanczos. yt_native4k is the landscape half of the 14 Mbps
+    bucket — the frames the LUT alone can master; a vertical video in that bucket needs a fit and
+    a pad, so it is plain. Everything else (480p, 720p, 1201-1699 lines, unprobed) is plain too."""
     width, height = _geometry(plan, facts)
-    if YT_SUPERSCALE_MIN_HEIGHT <= height <= YT_SUPERSCALE_MAX_HEIGHT:
+    if YT_1080_MIN_HEIGHT <= height <= YT_1080_MAX_HEIGHT:
         return "yt_1080"
     if height >= YT_NATIVE_4K_MIN_HEIGHT and width >= height:
         return "yt_native4k"
@@ -163,13 +159,12 @@ def _classify(p, plan, mode, facts) -> str:
     movie = bool(getattr(p, "movie", False))
 
     # A COMBINE is decided by its verdict before anything else: a real RPU (either copy) skips
-    # Resolve whatever the plan or the mode says; the no-RPU fallback renders the winner in the
-    # pinned project. Without a confirmed verdict the stages refuse the item permanently.
+    # the DV step whatever the plan or the mode says; the no-RPU fallback renders the winner. Without a confirmed verdict the stages refuse the item permanently.
     if getattr(p, "combine", False):
         verdict = facts.get("verdict")
         if not isinstance(verdict, dict) or not verdict.get("rpu_from"):
             return UNKNOWN
-        if verdict.get("rpu_from") != "resolve":
+        if verdict.get("rpu_from") != "native":
             return "combine_rpu"
         return "sdr_out" if mode == "sdr" else "combine_nodv"
 
@@ -177,27 +172,27 @@ def _classify(p, plan, mode, facts) -> str:
     major = _dv_major(facts.get("dv_profile"))
     if major == 7:
         return "dvp7"
-    if major or "skip" in (plan.get("topaz"), plan.get("resolve")):
+    if major or "skip" in (plan.get("topaz"), plan.get("dv")):
         return "already_dv"
 
     topaz = plan.get("topaz")
-    if topaz not in ("upscale", "rpu-only", "resolve-only"):
+    if topaz not in ("upscale", "rpu-only", "dv-only"):
         return UNKNOWN                  # no plan (or one this table does not know)
 
-    # A PIN renders every remaining route in another Resolve project (SDR: the only pin left).
+    # A PIN makes every remaining route the SDR render (SDR: the only pin left).
     if mode == "sdr":
         return "sdr_out"
 
     if topaz == "rpu-only":             # ahead of YouTube, as in stages._remux
         return "rpu_only"
-    hdr = bool(plan.get("is_hdr")) or plan.get("resolve") == "add_dv"
+    hdr = bool(plan.get("is_hdr")) or plan.get("dv") == "add_dv"
     if hdr:
         if topaz == "upscale" and not youtube:   # YouTube never runs Topaz (stages._topaz)
             return "hdr_topaz"
         return "hlg" if _transfer(plan, facts) == HLG else "hdr_reencode"
     if youtube:
         return _youtube(plan, facts)
-    if topaz == "resolve-only":
+    if topaz == "dv-only":
         return "sdr4k"
     # The SDR Topaz upscale.
     if movie:
@@ -210,7 +205,7 @@ def _classify(p, plan, mode, facts) -> str:
 
 
 def output_mode(p) -> str:
-    """The output mode stages._resolve renders `p` in: its per-item override, read under the
+    """The output mode `p` is made in: its per-item override, read under the
     same key (stages._settings_scope — a YouTube import batch's own scope), normalized."""
     import settings
     import stages

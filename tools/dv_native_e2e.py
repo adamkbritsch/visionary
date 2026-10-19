@@ -29,6 +29,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +38,117 @@ REAL_HOME = os.path.expanduser("~")
 FF, FFPROBE = "/opt/homebrew/bin/ffmpeg", "/opt/homebrew/bin/ffprobe"
 SERIES, EP = "E2E Native Show", "S06E05"
 SOURCE = f"{SERIES} {EP} 1080p.mkv"
+
+
+# ---- the RPU reader (what a binary RPU carries per frame; dovi_tool export, streamed) ----------
+PQ12_MAX = 4095                                  # = dvnative.PQ12_MAX (12-bit PQ code ceiling)
+NEUTRAL_L3 = 2048                                 # an L3 offset of 2048 means "no offset"
+_WS = " \t\r\n"
+
+
+def _iter_json_array(f, chunk: int = 1 << 20):
+    """Yield the elements of a top-level JSON array of OBJECTS (dovi_tool export) one at a
+    time, so memory stays at ~2 chunks however long the array is. Not for arrays of bare
+    numbers: one cut at a chunk boundary would decode as two."""
+    dec = json.JSONDecoder()
+    buf, pos, eof = "", 0, False
+
+    def fill():
+        nonlocal buf, pos, eof
+        more = f.read(chunk)
+        eof = not more
+        buf, pos = buf[pos:] + more, 0
+
+    def skip(chars):
+        nonlocal pos
+        while True:
+            while pos < len(buf) and buf[pos] in chars:
+                pos += 1
+            if pos < len(buf) or eof:
+                return
+            fill()
+
+    skip(_WS)
+    if pos >= len(buf) or buf[pos] != "[":
+        raise ValueError("not a JSON array")
+    pos += 1
+    while True:
+        skip(_WS + ",")
+        if pos >= len(buf):
+            raise ValueError("JSON array is truncated")
+        if buf[pos] == "]":
+            return
+        try:
+            obj, end = dec.raw_decode(buf, pos)
+        except json.JSONDecodeError:
+            if eof:
+                raise
+            fill()                  # the element runs past the buffer: read more, retry
+            continue
+        pos = end
+        yield obj
+
+
+def _frame_fields(rpu: dict):
+    """PURE. (L1, L3, L4, L6, source_max_pq) of one exported RPU frame; a block it does not
+    carry is None. L1/L4/L6 live in the CM v2.9 block set, L3 in the CM v4 one."""
+    dm = rpu.get("vdr_dm_data") or {}
+    got = {}
+    for key in ("cmv29_metadata", "cmv40_metadata"):
+        for blk in (dm.get(key) or {}).get("ext_metadata_blocks") or []:
+            for name, v in blk.items():
+                got.setdefault(name, v)
+    l1, l3, l4, l6 = (got.get(k) for k in ("Level1", "Level3", "Level4", "Level6"))
+    return ((l1["min_pq"], l1["max_pq"], l1["avg_pq"]) if l1 else None,
+            (l3["min_pq_offset"], l3["max_pq_offset"], l3["avg_pq_offset"]) if l3 else None,
+            (l4["anchor_pq"], l4["anchor_power"]) if l4 else None,
+            (l6["max_display_mastering_luminance"], l6["min_display_mastering_luminance"],
+             l6["max_content_light_level"], l6["max_frame_average_light_level"]) if l6 else None,
+            dm.get("source_max_pq"))
+
+
+def v4_view(l1, l3):
+    """PURE. What a CM v4 display works from: L1 + (L3 offset - 2048) per field, clamped to
+    the 12-bit range. No L3 means neutral offsets, i.e. the L1 itself."""
+    if l1 is None or l3 is None:
+        return l1
+    return tuple(max(0, min(PQ12_MAX, v + o - NEUTRAL_L3)) for v, o in zip(l1, l3))
+
+
+def rpu_frames(rpu_bin: str, dovi_tool: str | None = None) -> dict:
+    """What a binary RPU carries per frame, from `dovi_tool export`: "l1" (min, max, avg) —
+    the CM v2.9 view; "l3" offsets (None where absent); "v4" = L1 + L3 (the same list when no
+    frame has L3); "l4" (anchor_pq, anchor_power) per frame, or None when no frame has L4;
+    the distinct "l6" tuples (mastering max, min, MaxCLL, MaxFALL) and "source_max_pq"
+    values. The export is ~3.5 KB of JSON per frame (139 MB for a 22-min episode, and a
+    plain json.load of it peaked at 787 MB RSS), so it goes to a temporary file that is
+    parsed one frame at a time, keeping only these fields."""
+    if dovi_tool is None:
+        import dvnative
+        dovi_tool = dvnative.DOVI_TOOL
+    l1, l3, l4, l6, src = [], [], [], set(), set()
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "all.json")
+        r = subprocess.run([dovi_tool, "export", "-i", rpu_bin, "-d", f"all={out}"],
+                           capture_output=True, text=True, errors="replace")
+        if r.returncode != 0 or not os.path.exists(out):
+            why = (r.stderr or r.stdout or "").strip()[-300:]
+            raise RuntimeError(f"dovi_tool export failed on {rpu_bin} (rc={r.returncode}): {why}")
+        with open(out) as f:
+            for rpu in _iter_json_array(f):
+                a, b, c, e, s = _frame_fields(rpu)
+                l1.append(a)
+                l3.append(b)
+                l4.append(c)
+                if e:
+                    l6.add(e)
+                if s is not None:
+                    src.add(s)
+    has_l3 = any(x is not None for x in l3)
+    return {"frames": len(l1), "l1": l1, "l3": l3,
+            "v4": [v4_view(a, b) for a, b in zip(l1, l3)] if has_l3 else l1,
+            "l4": l4 if any(x is not None for x in l4) else None,
+            "l6": sorted(l6), "source_max_pq": sorted(src)}
 
 
 def fake_home(work: str) -> str:
@@ -121,8 +233,6 @@ def main(argv=None) -> int:
 def run(work: str, chunks: str, cfr: str) -> int:
     import threading
     import nativelane, stages, remux, dvcap, dvnative
-    sys.path.insert(0, HERE)
-    import dv_compare as dc
     results = []
     t0 = time.time()
     print(f"HOME={os.environ['HOME']} (scratch) — the live pipeline and ~/.topaz-pipeline are untouched")
@@ -185,8 +295,8 @@ def run(work: str, chunks: str, cfr: str) -> int:
     print("4. embedded RPU vs generated", flush=True)
     emb = os.path.join(work, "embedded.rpu")
     dvcap.extract_rpu(final, emb)
-    gen = dc.rpu_frames(b["rpu"])
-    got = dc.rpu_frames(emb)
+    gen = rpu_frames(b["rpu"])
+    got = rpu_frames(emb)
     same = all(got[k] == gen[k] for k in ("l1", "l3", "l4")) and got["frames"] == gen["frames"]
     results.append(check("embedded RPU == generated, frame for frame", same, f"{got['frames']} frames"))
 

@@ -153,31 +153,31 @@ class Plan(unittest.TestCase):
 
     def test_1080p_sdr_upscales_and_adds_hdr(self):
         pl = self._plan()
-        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("upscale", 2, "add_hdr_dv"))
+        self.assertEqual((pl["topaz"], pl["scale"], pl["dv"]), ("upscale", 2, "add_hdr_dv"))
 
     def test_4k_sdr_skips_topaz_and_adds_hdr(self):
         pl = self._plan(is_4k=True, is_cfr=True)
-        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("resolve-only", 1, "add_hdr_dv"))
+        self.assertEqual((pl["topaz"], pl["scale"], pl["dv"]), ("dv-only", 1, "add_hdr_dv"))
 
     def test_4k_hdr_skips_topaz_keeps_hdr_adds_dv_only(self):
         pl = self._plan(is_4k=True, is_hdr=True, is_cfr=True)
-        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("resolve-only", 1, "add_dv"))
+        self.assertEqual((pl["topaz"], pl["scale"], pl["dv"]), ("dv-only", 1, "add_dv"))
 
     def test_4k_vfr_is_only_re_timed_never_sent_to_topaz(self):
         pl = self._plan(is_4k=True)                          # is_cfr absent = not proven CFR
-        self.assertEqual((pl["topaz"], pl["source_cfr"], pl["resolve"]),
-                         ("resolve-only", False, "add_hdr_dv"))
+        self.assertEqual((pl["topaz"], pl["source_cfr"], pl["dv"]),
+                         ("dv-only", False, "add_hdr_dv"))
         pl = self._plan(is_4k=True, is_hdr=True)
-        self.assertEqual((pl["topaz"], pl["source_cfr"], pl["resolve"]),
-                         ("resolve-only", False, "add_dv"))
+        self.assertEqual((pl["topaz"], pl["source_cfr"], pl["dv"]),
+                         ("dv-only", False, "add_dv"))
 
     def test_1080p_hdr_upscales_keeps_hdr(self):
         pl = self._plan(is_hdr=True)
-        self.assertEqual((pl["topaz"], pl["scale"], pl["resolve"]), ("upscale", 2, "add_dv"))
+        self.assertEqual((pl["topaz"], pl["scale"], pl["dv"]), ("upscale", 2, "add_dv"))
 
     def test_already_dv_skips_everything(self):
         pl = self._plan(is_4k=True, is_hdr=True, is_dv=True)
-        self.assertEqual((pl["topaz"], pl["resolve"]), ("skip", "skip"))
+        self.assertEqual((pl["topaz"], pl["dv"]), ("skip", "skip"))
 
     def test_480p_upscales_4x_then_fits_up_to_4k(self):
         pl = self._plan(height=480)
@@ -197,7 +197,7 @@ class Plan(unittest.TestCase):
         for cfr in (True, False):
             pl = self._plan(is_4k=True, is_cfr=cfr)
             self.assertEqual((pl["topaz"], pl["scale"], pl["res"], pl["fit_height"]),
-                             ("resolve-only", 1, None, None), cfr)
+                             ("dv-only", 1, None, None), cfr)
 
     def test_odd_height_fits_to_exact_4k(self):
         pl = self._plan(height=1088)                        # 1088×2 = 2176 ≠ 2160 → fit
@@ -245,7 +245,6 @@ class PlexThrottle(unittest.TestCase):
         self.assertIs(st.VALIDATORS["plex_throttle"], st._valid_plex_throttle)
 
 
-
 if __name__ == "__main__":
     unittest.main()
 
@@ -254,7 +253,7 @@ class FastPathGate(unittest.TestCase):
     """NO 4K SOURCE GOES THROUGH TOPAZ (user-dictated 2026-09-30: no 12 Mbps minimum, and no
     cleanup pass for a variable frame rate either — "that counts as upscaling even though it's
     the same size"). A 4K HDR10 (PQ/HEVC/Main10) CFR source is NEVER re-encoded — rpu-only at any
-    bitrate and 4K geometry. Every other 4K source takes resolve-only; a VFR one is re-timed."""
+    bitrate and 4K geometry. Every other 4K source takes dv-only; a VFR one is re-timed."""
 
     GOOD = dict(is_4k=True, is_hdr=False, is_dv=False, codec="hevc", pix_fmt="yuv420p10le",
                 width=3840, height=2160, is_cfr=True, video_kbps=15000, transfer=None)
@@ -264,21 +263,21 @@ class FastPathGate(unittest.TestCase):
 
     def test_hdr10_takes_rpu_only(self):
         pl = self._plan(transfer="smpte2084", is_hdr=True)
-        self.assertEqual((pl["topaz"], pl["resolve"], pl["is_hdr"], pl["source_cfr"]),
+        self.assertEqual((pl["topaz"], pl["dv"], pl["is_hdr"], pl["source_cfr"]),
                          ("rpu-only", "add_dv", True, True))
 
     def test_sdr_takes_resolve_only(self):
         pl = self._plan()                                    # WWDITS profile: SDR 4K ~15 Mbps
-        self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_hdr_dv"))
+        self.assertEqual((pl["topaz"], pl["dv"]), ("dv-only", "add_hdr_dv"))
 
     def test_hlg_takes_resolve_only_not_inject(self):
         pl = self._plan(transfer="arib-std-b67", is_hdr=True)  # HLG base can't carry an 8.1 RPU
-        self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
+        self.assertEqual((pl["topaz"], pl["dv"]), ("dv-only", "add_dv"))
 
     def test_no_bitrate_sends_a_4k_source_through_topaz(self):
         # The old 12 Mbps minimum is gone: a starved, an unknown and a huge bitrate all skip it.
         for kbps in (120000, 12000, 11999, 6000, 1, 0):
-            self.assertEqual(self._plan(video_kbps=kbps)["topaz"], "resolve-only", kbps)
+            self.assertEqual(self._plan(video_kbps=kbps)["topaz"], "dv-only", kbps)
             pl = self._plan(transfer="smpte2084", is_hdr=True, video_kbps=kbps)
             self.assertEqual(pl["topaz"], "rpu-only", kbps)
 
@@ -289,17 +288,17 @@ class FastPathGate(unittest.TestCase):
                 ("yuv420p10le", "yuv420p"), (True, False), (0, 4000, 40000)):
             pl = self._plan(is_hdr=hdr, transfer=transfer, codec=codec, pix_fmt=pix,
                             is_cfr=cfr, video_kbps=kbps)
-            self.assertIn(pl["topaz"], ("rpu-only", "resolve-only"),
+            self.assertIn(pl["topaz"], ("rpu-only", "dv-only"),
                           (hdr, transfer, codec, pix, cfr, kbps))
             self.assertEqual(pl["source_cfr"], cfr)          # VFR: the CFR pass must re-time it
 
     def test_a_variable_frame_rate_source_is_re_timed_not_sent_to_topaz(self):
         pl = self._plan(is_cfr=False)
-        self.assertEqual((pl["topaz"], pl["source_cfr"]), ("resolve-only", False))
+        self.assertEqual((pl["topaz"], pl["source_cfr"]), ("dv-only", False))
         self.assertIn("re-timed to a constant frame rate", pl["reason"])
         # an HDR10 VFR source cannot keep its stream (the RPU needs one frame rate) — and says so
         pl = self._plan(is_cfr=False, transfer="smpte2084", is_hdr=True)
-        self.assertEqual((pl["topaz"], pl["source_cfr"]), ("resolve-only", False))
+        self.assertEqual((pl["topaz"], pl["source_cfr"]), ("dv-only", False))
         self.assertIn("re-encoded because its frame rate varies", pl["reason"])
 
     def test_hdr10_takes_rpu_only_at_ANY_4k_geometry(self):
@@ -313,9 +312,9 @@ class FastPathGate(unittest.TestCase):
     def test_nothing_is_categorically_excluded(self):
         for kw in (dict(codec="av1"), dict(codec="h264"), dict(pix_fmt="yuv420p"),
                    dict(width=4096), dict(height=2072, width=3840)):
-            self.assertEqual(self._plan(**kw)["topaz"], "resolve-only", kw)
+            self.assertEqual(self._plan(**kw)["topaz"], "dv-only", kw)
         pl = self._plan(transfer="smpte2084", is_hdr=True, codec="av1")
-        self.assertEqual((pl["topaz"], pl["resolve"]), ("resolve-only", "add_dv"))
+        self.assertEqual((pl["topaz"], pl["dv"]), ("dv-only", "add_dv"))
 
     def test_a_re_encode_of_HDR_always_says_why(self):
         for kw, needle in ((dict(transfer="arib-std-b67"), "not PQ"),
@@ -323,13 +322,13 @@ class FastPathGate(unittest.TestCase):
                            (dict(transfer="smpte2084", pix_fmt="yuv420p"), "not 10-bit"),
                            (dict(transfer="smpte2084", is_cfr=False), "frame rate varies")):
             pl = self._plan(is_hdr=True, **kw)
-            self.assertEqual(pl["topaz"], "resolve-only", kw)
+            self.assertEqual(pl["topaz"], "dv-only", kw)
             self.assertIn("re-encoded because", pl["reason"], kw)
             self.assertIn(needle, pl["reason"], kw)
 
     def test_youtube_profile_qualifies_on_its_numbers(self):
         pl = self._plan(codec="vp9", pix_fmt="yuv420p", video_kbps=20000)   # typical 4K VP9
-        self.assertEqual(pl["topaz"], "resolve-only")
+        self.assertEqual(pl["topaz"], "dv-only")
 
     def test_already_dv_still_wins(self):
         self.assertEqual(self._plan(is_dv=True)["topaz"], "skip")
@@ -529,25 +528,6 @@ class ProbeBeatsTheFilename(unittest.TestCase):
         plan._remember_probe("/x/a.mkv", {"is_hdr": True, "transfer": "smpte2084"})  # no raise
 
 
-class QuietUntilValidator(unittest.TestCase):
-    """The 4-hour Screen Control cap, enforced at the PERSISTENCE layer — the app's
-    /api/quiet-mode path already clamps, but /api/settings and a hand-edited file must
-    be held to the same rule (a days-long pause fills the disk and stalls the run)."""
-
-    def test_cap_junk_and_in_range(self):
-        import time as t
-        with mock.patch.object(settings, "SETTINGS_FILE",
-                               os.path.join(tempfile.mkdtemp(), "s.json")):
-            far = int(t.time()) + 10 * 24 * 3600
-            got = settings.set_settings({"quiet_until": far})["quiet_until"]
-            self.assertLessEqual(got, int(t.time()) + settings.MAX_QUIET_SECONDS + 5)
-            self.assertGreater(got, int(t.time()))          # capped, not zeroed
-            self.assertEqual(settings.set_settings({"quiet_until": "junk"})["quiet_until"], 0)
-            self.assertEqual(settings.set_settings({"quiet_until": -5})["quiet_until"], 0)
-            ok = int(t.time()) + 600
-            self.assertEqual(settings.set_settings({"quiet_until": ok})["quiet_until"], ok)
-
-
 class ManualOnly2000Nits(unittest.TestCase):
     def test_auto_never_resolves_to_2000(self):
         # 2000-nit DV was MANUAL-ONLY (user-dictated 2026-08-09) and is now retired: auto = 1000
@@ -623,116 +603,3 @@ class DoFeaturettesReplacesFeaturettesLast(unittest.TestCase):
         self.assertTrue(settings.get_show_do_featurettes("B"))
 
 
-class DvEngine(unittest.TestCase):
-    """`dv_engine` decides who makes a TV episode's Dolby Vision. 'resolve' is the default
-    and the old, safe path, so EVERYTHING that is not exactly 'native' must read as
-    'resolve' — on write (VALIDATORS) and on read (dv_engine()), because get_settings()
-    merges a hand-edited file over the defaults without checking it."""
-
-    def setUp(self):
-        d = tempfile.mkdtemp()
-        p = mock.patch.multiple(settings, CONFIG_DIR=d,
-                                SETTINGS_FILE=os.path.join(d, "settings.json"),
-                                PROFILES_FILE=os.path.join(d, "show_profiles.json"))
-        p.start(); self.addCleanup(p.stop)
-
-    def test_defaults_to_resolve(self):
-        self.assertEqual(settings.DEFAULT_SETTINGS["dv_engine"], "resolve")
-        self.assertEqual(settings.dv_engine(), "resolve")          # no settings file at all
-        self.assertEqual(settings.get_settings()["dv_engine"], "resolve")
-
-    def test_only_the_two_exact_choices_survive(self):
-        for v in ("resolve", "native"):
-            self.assertEqual(settings._valid_dv_engine(v), v)
-        for junk in ("Native", "NATIVE", " native", "", None, 1, True, ["native"], {"x": 1}):
-            self.assertEqual(settings._valid_dv_engine(junk), "resolve", repr(junk))
-        self.assertIs(settings.VALIDATORS["dv_engine"], settings._valid_dv_engine)
-
-    def test_set_settings_accepts_and_round_trips_the_key(self):
-        self.assertEqual(settings.set_settings({"dv_engine": "native"})["dv_engine"], "native")
-        self.assertEqual(settings.dv_engine(), "native")
-        self.assertEqual(settings.set_settings({"dv_engine": "resolve"})["dv_engine"], "resolve")
-        self.assertEqual(settings.dv_engine(), "resolve")
-
-    def test_set_settings_turns_junk_into_resolve(self):
-        settings.set_settings({"dv_engine": "native"})
-        self.assertEqual(settings.set_settings({"dv_engine": "x"})["dv_engine"], "resolve")
-        self.assertEqual(settings.dv_engine(), "resolve")
-
-    def test_a_hand_edited_value_is_validated_on_read(self):
-        for raw, want in (("Native", "resolve"), ("x", "resolve"), (None, "resolve"),
-                          (7, "resolve"), ("native", "native"), ("resolve", "resolve")):
-            settings._save(settings.SETTINGS_FILE, {"dv_engine": raw})
-            self.assertEqual(settings.get_settings()["dv_engine"], raw)   # unvalidated merge
-            self.assertEqual(settings.dv_engine(), want, repr(raw))      # validated accessor
-
-    def test_an_unrelated_write_leaves_a_native_choice_alone(self):
-        settings.set_settings({"dv_engine": "native"})
-        settings.set_settings({"poll_minutes": 45})
-        self.assertEqual(settings.dv_engine(), "native")
-
-
-class DvRoutes(unittest.TestCase):
-    """`dv_routes` {route: 'resolve' | 'native'} picks, per route, who makes the render Resolve
-    makes today. It is inert by default: {} — every route 'resolve' — so a fresh install renders
-    exactly as it always has. tv_sdr_topaz is not this table's: it keeps following dv_engine (the
-    chunk lane). A hand-edited file is validated on write (VALIDATORS) and on read (dv_routes())."""
-
-    def setUp(self):
-        d = tempfile.mkdtemp()
-        p = mock.patch.multiple(settings, CONFIG_DIR=d,
-                                SETTINGS_FILE=os.path.join(d, "settings.json"),
-                                PROFILES_FILE=os.path.join(d, "show_profiles.json"))
-        p.start(); self.addCleanup(p.stop)
-
-    def test_every_route_is_resolve_by_default(self):
-        import routes
-        self.assertEqual(settings.DEFAULT_SETTINGS["dv_routes"], {})
-        self.assertEqual(settings.dv_routes(), {})                  # no settings file at all
-        self.assertEqual(settings.set_settings({})["dv_routes"], {})
-        self.assertEqual(settings.dv_routes(), {})                  # ...nor after a plain write
-        for route in list(routes.ROUTES) + [routes.UNKNOWN, None, "x"]:
-            self.assertEqual(settings.dv_route(route), "resolve", route)
-        self.assertIs(settings.VALIDATORS["dv_routes"], settings._valid_dv_routes)
-
-    def test_the_tv_lane_route_follows_dv_engine_and_is_never_a_key(self):
-        import routes
-        self.assertIn(settings.TV_LANE_ROUTE, routes.ROUTES)        # a real route id
-        self.assertEqual(settings._valid_dv_routes({"tv_sdr_topaz": "native"}), {})
-        settings._save(settings.SETTINGS_FILE, {"dv_routes": {"tv_sdr_topaz": "native"}})
-        self.assertEqual(settings.dv_routes(), {})
-        self.assertEqual(settings.dv_route("tv_sdr_topaz"), "resolve")
-        with mock.patch.object(settings, "dv_engine", return_value="native"):
-            self.assertEqual(settings.dv_route("tv_sdr_topaz"), "native")
-            self.assertEqual(settings.dv_route("yt_native4k"), "resolve")   # not dv_engine's
-
-    def test_only_route_shaped_keys_and_the_exact_engines_survive(self):
-        v = settings._valid_dv_routes
-        self.assertEqual(v({"yt_native4k": "native", "sdr4k": "resolve"}),
-                         {"yt_native4k": "native", "sdr4k": "resolve"})
-        for junk in ({"yt_native4k": "Native"}, {"yt_native4k": " native"}, {"yt_native4k": None},
-                     {"yt_native4k": True}, {"yt_native4k": 1}, {"yt_native4k": ["native"]},
-                     {"YT_native4k": "native"}, {"../etc": "native"}, {"yt native4k": "native"},
-                     {"": "native"}, {"9route": "native"}, {"r" * 41: "native"}, {3: "native"}):
-            self.assertEqual(v(junk), {}, repr(junk))
-        for not_a_dict in (None, "", "yt_native4k", ["yt_native4k"], 3, True):
-            self.assertEqual(v(not_a_dict), {}, repr(not_a_dict))
-        self.assertEqual(v({"yt_native4k": "native", "Bad Key": "native"}), {"yt_native4k": "native"})
-
-    def test_set_settings_round_trips_and_clears(self):
-        s = settings.set_settings({"dv_routes": {"yt_native4k": "native", "sdr4k": "x"}})
-        self.assertEqual(s["dv_routes"], {"yt_native4k": "native"})
-        self.assertEqual(settings.dv_route("yt_native4k"), "native")
-        self.assertEqual(settings.dv_route("sdr4k"), "resolve")
-        settings.set_settings({"poll_minutes": 45})                 # an unrelated write keeps it
-        self.assertEqual(settings.dv_routes(), {"yt_native4k": "native"})
-        self.assertEqual(settings.set_settings({"dv_routes": {}})["dv_routes"], {})
-        self.assertEqual(settings.dv_route("yt_native4k"), "resolve")
-
-    def test_a_hand_edited_value_is_validated_on_read(self):
-        for raw, want in (({"yt_native4k": "native"}, {"yt_native4k": "native"}),
-                          ({"yt_native4k": "NATIVE"}, {}), ("native", {}), (None, {}), ([1], {}),
-                          ({"tv_sdr_topaz": "native", "sdr4k": "native"}, {"sdr4k": "native"})):
-            settings._save(settings.SETTINGS_FILE, {"dv_routes": raw})
-            self.assertEqual(settings.get_settings()["dv_routes"], raw)   # unvalidated merge
-            self.assertEqual(settings.dv_routes(), want, repr(raw))       # validated accessor

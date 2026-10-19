@@ -2,7 +2,7 @@
     "date": "Sat Jun 13 13:00:00 2026 GMT-0600",
     "editable": true,
     "enabled": true,
-    "name": "1080p to 4K HDR XQ - COMPRESSED (Resolve DoVi)",
+    "name": "1080p to 4K HDR XQ - COMPRESSED (DoVi)",
     "outputSettings": {
         "active": true,
         "appendModelNameForIS": false,
@@ -21,7 +21,7 @@
         "startFrameNumber": 0,
         "videoBitrate": 40
     },
-    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K HDR XQ - COMPRESSED (Resolve DoVi).json",
+    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K HDR XQ - COMPRESSED (DoVi).json",
     "saveOutputSettings": true,
     "settings": {
         "enhance": {

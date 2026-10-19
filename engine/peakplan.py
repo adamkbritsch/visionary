@@ -1,9 +1,5 @@
 """The peak plan: what bitrate to render again at when a VideoToolbox render's 1-s peak is over
-the cap. Pure arithmetic, no Resolve.
-
-Moved here verbatim from resolve_pipeline.py (which imports it back, unchanged in behaviour)
-so the native render (nativerender.py) can use the same rules without importing a module
-that pins and launches Resolve at import time.
+the cap. Pure arithmetic — the native render (nativerender.py) imports it.
 
 THE YOUTUBE GAMBLE, WITH A SECOND THROW. A YouTube render targets a cap-safe bitrate so the
 remux can SHIP it stream-copied (stages.YOUTUBE_RENDER_KBPS). VideoToolbox has no peak

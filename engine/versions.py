@@ -1,74 +1,25 @@
 """The EXACT external-app + hardware pins Visionary is built for — single source of truth.
 
-Read by engine/preflight.py (the setup/runtime gate), the dashboard server, the artifact
-import tooling, and the tests. The pins are LOAD-BEARING, not advisory:
+Read by engine/preflight.py (the setup/runtime gate), the dashboard server and the tests. The
+pins are LOAD-BEARING, not advisory:
 
-- The Resolve stage drives the real DaVinci Resolve UI by screen-capture template matching
-  (engine/dv_shim.py) — the template PNGs were cropped from THIS Resolve build's Color page
-  at THIS display's native resolution, and the click coordinates assume THIS backing scale.
-  Any other Resolve version, or any other display, moves pixels and silently breaks clicks.
 - The Topaz stage invokes THIS Topaz build's bundled ffmpeg (`tvai_up` filter) with the
   parameter schema and `prob-4` model that build ships.
+- The Dolby Vision step runs THIS toolchain (dovi_tool, the hdr_analyzer_mvp build, the pinned
+  SDR->PQ LUT, Homebrew ffmpeg 8): it is what every master's metadata and colour was judged on.
 
 Do NOT edit these to make a mismatched machine pass preflight — install the exact builds
 instead (see README "Requirements").
 """
 import os
 
-# DaVinci Resolve — must be the STUDIO edition (the free edition lacks the needed features).
-RESOLVE_APP = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
-RESOLVE_VERSION = "18.6.0"     # CFBundleShortVersionString — the gate (exact match)
-RESOLVE_BUILD = "18.6.00009"   # CFBundleVersion — reported for diagnostics, not gated
-
 # Topaz Video AI — provides the bundled ffmpeg + models the pipeline invokes headlessly.
 TOPAZ_APP = "/Applications/Topaz Video AI.app"
 TOPAZ_VERSION = "7.0.1"        # CFBundleShortVersionString — the gate (exact match)
 
-# The three persistent Resolve projects, named for what they PRODUCE, with legacy names
-# as fallbacks (first existing one wins). SINGLE SOURCE OF TRUTH — consumed by
-# resolve_pipeline (which project to load), setup/import_resolve.py (what to import and
-# verify), and preflight.check_resolve_artifacts (what counts as imported). These three
-# drifted apart once already: preflight only knew the legacy names, so a CLEAN import of
-# "Visionary DV1000 Output" then failed the artifacts check.
-RESOLVE_PROJECTS_DV1000 = ("Visionary DV1000 Output",               # 1000-nit Dolby Vision
-                           "Visionary SDR", "Overnight Upscaler SDR", "Overnight Upscaler")
-RESOLVE_PROJECTS_DV2000 = ("Visionary DV2000 Output",               # 2000-nit Dolby Vision
-                           "Visionary HDR", "Overnight Upscaler HDR")
-RESOLVE_PROJECTS_SDR_OUT = ("Visionary SDR Output",                 # true Rec.709, NO DV
-                            "Overnight Upscaler SDR Output")
-
-# Hardware — TWO independent requirements, each with its own rule below:
-#  1) A MAIN DISPLAY at 2.0 backing scale (REQUIRED_BACKING_SCALE).
-#  2) Sustained 140 W: the Topaz stage runs the GPU flat-out for hours. A DESKTOP Mac is
-#     mains-powered by definition and always satisfies this; a LAPTOP needs a 140 W-class
-#     machine + brick, or the battery drains mid-encode and the power gate holds forever.
-
-# THE DISPLAY RULE. dv_shim locates every button by TEMPLATE MATCHING and derives every
-# click from the match — there is not one fixed coordinate in it. So a template matches
-# whenever the UI renders at the same BACKING-PIXEL SIZE, i.e. the same scale; the screen's
-# SIZE and shape are irrelevant. Proven 2026-07-17: with the 16-inch panel's templates
-# unchanged, all four matched the 3840x2160 dummy at >=0.96 (palette 1.000). So the gate is
-# the SCALE, not a geometry allow-list — that admits any Retina built-in, any 4K/5K display
-# at 2x, and a 4K dummy HDMI plug for lid-closed running.
-# A 1x display is still refused: the UI would render at half the template's pixel size.
-REQUIRED_BACKING_SCALE = 2.0
-# Sanity floor, NOT a calibration: at 2x a tiny panel is still "2x" but Resolve's Color
-# page cannot lay out in it (1920x1080 BACKING is only 960x540 points). Comfortably below
-# both verified configs (1728x1117 and 1920x1080 points), so it excludes only nonsense.
-MIN_LOGICAL_SIZE = (1280, 720)
-
-# Configurations actually SMOKE-TESTED end to end (preflight --smoke / GET /api/shim-smoke
-# matches every dv_shim template against the live screen). Purely for a precise message —
-# NOT the pass/fail list. Anything else at 2x passes too, described generically; run
-# --smoke on a new display the first time to confirm the templates land.
-SUPPORTED_DISPLAYS = (
-    {"name": "16-inch MacBook Pro built-in", "backing": (3456, 2234), "scale": 2.0, "builtin": True},
-    # Lid-CLOSED clamshell operation: a 4K dummy HDMI plug keeps a framebuffer alive for
-    # screencapture while the laptop is shut (verified 2026-07-17: HDP-V104, 1920x1080 pt).
-    {"name": "4K dummy HDMI (clamshell)", "backing": (3840, 2160), "scale": 2.0, "builtin": False},
-)
-DISPLAY_PIXELS = SUPPORTED_DISPLAYS[0]["backing"]   # the built-in (back-compat for importers)
-RETINA_SCALE = REQUIRED_BACKING_SCALE               # back-compat alias for importers
+# Hardware — sustained 140 W: the Topaz stage runs the GPU flat-out for hours. A DESKTOP Mac is
+# mains-powered by definition and always satisfies this; a LAPTOP needs a 140 W-class machine +
+# brick, or the battery drains mid-encode and the power gate holds forever.
 REQUIRED_ADAPTER_WATTS = 140   # the run-time power gate (settings min_adapter_watts) defaults to this
 
 # THE POWER RULE, for machines WITH a battery only (a desktop Mac has no battery and is
@@ -93,14 +44,11 @@ MODELS_BELOW_140W = frozenset({    # 14-inch M1/M2 MacBook Pro (96 W max) + ever
     "MacBookAir10,1", "Mac14,2", "Mac14,15", "Mac15,12", "Mac15,13",
 })
 
-# THE NATIVE DOLBY VISION LANE (settings `dv_engine` = 'native'; engine/dvnative.py). ADDITIVE
-# pins, checked ONLY while dv_engine is 'native' (preflight.check_native_dv: a warn row in
-# the full report, and the 409 when switching TO native; never the arm gate — a broken
-# toolchain only sends items through Resolve), so a default 'resolve' install is unchanged.
-# They pin the toolchain the blind A/B on the TV was judged on.
+# THE DOLBY VISION TOOLCHAIN (engine/dvnative.py, nativerender.py). Part of the arm gate
+# (preflight.check_native_dv): without it no item can get its Dolby Vision. They pin the
+# toolchain the blind A/B on the TV was judged on.
 DOVI_TOOL_VERSION = "2.3.0"         # `dovi_tool --version`. The `generate` config the lane writes
-                                    # (CM v4.0, l1_avg_pq_cm_version) is version-sensitive. NOT
-                                    # gated for the Resolve path, which only extracts/injects RPUs.
+                                    # (CM v4.0, l1_avg_pq_cm_version) is version-sensitive.
 HDR_ANALYZER_PATH = os.path.expanduser("~/.topaz-pipeline/bin/hdr_analyzer_mvp")
 HDR_ANALYZER_COMMIT = "383b0ad"     # tinof/hdr-analyze, built from source (cargo) at this commit
 HDR_ANALYZER_SHA256 = "41727312f4a960b27d59cb0c0f24c2922dc82768da3503f083e4842a87fc099e"
@@ -108,7 +56,7 @@ HDR_ANALYZER_SHA256 = "41727312f4a960b27d59cb0c0f24c2922dc82768da3503f083e4842a8
                                     # breaking its libav*.62 links, so preflight also RUNS it.
 NATIVE_LUT_PATH = os.path.expanduser("~/.topaz-pipeline/luts/rcm_sdr709_to_pq1000.cube")
 NATIVE_LUT_SHA256 = "e410e5b7b899a07096a77e2f65bdeb6a4ab3cc60126358a81c8050251d8c59b0"
-                                    # the SDR->PQ conversion fitted to Resolve's own renders; any
-                                    # other file changes the picture
+                                    # the captured SDR->PQ conversion (archived with its sha256
+                                    # manifest); any other file changes the picture
 NATIVE_FFMPEG_MAJOR = 8             # Homebrew ffmpeg: the LUT's colour was measured on 8.0, and
                                     # the analyzer links ffmpeg 8's major-versioned libraries

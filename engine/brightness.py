@@ -1,9 +1,8 @@
 """Display brightness (private DisplayServices API — works on Apple-Silicon built-in
 displays) + user-idle time, for the orchestrator's auto-dimmer.
 
-While a run is going and the display is caffeinated (kept logically ON so
-screencapture works), drop the backlight to 0 after the user has been idle a while
-— screencapture reads the framebuffer, so the resolve stage still works in the dark.
+While a run is going and the display is caffeinated (kept logically ON), drop the
+backlight to 0 after the user has been idle a while.
 We deliberately do NOT auto-restore on activity (that poll-based restore felt laggy):
 the screen stays dark and the user taps the brightness key to bring it back (native,
 instant). We only restore when the run stops, or step aside if the user raises it first.

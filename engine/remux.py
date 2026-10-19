@@ -1,13 +1,13 @@
 """Remux stage: peak-cap the DV video, then put the original audio + subtitles back onto it.
 
-Resolve renders a mute Dolby Vision .mov via VideoToolbox, whose VBR has NO peak control —
+The native render writes a mute Dolby Vision .mov via VideoToolbox, whose VBR has NO peak control —
 measured 139 Mbps single-second spikes on a 27.5 Mbps average, which underruns players
 (S05E23 SHIELD glitching). So the remux stage now ALWAYS re-encodes through dvcap.py:
-  0. dovi_tool extracts the per-frame RPU from Resolve's render; x265 re-encodes the video
+  0. dovi_tool extracts the per-frame RPU from the render; x265 re-encodes the video
      in its native Dolby Vision mode with a HARD VBV ceiling (settings `max_peak_mbps`,
      default 50) and interleaves the RPU itself. NO UNCAPPED FALLBACK (user-dictated):
      if capping fails in any way, the stage FAILS — an uncapped file IS the broken file.
-     Native DV (settings dv_engine 'native', `remux(native=)`) has no render: the RPU is
+     A chunk-lane item (`remux(native=)`) has no render: the RPU is
      dvnative's generated one and x265 reads Topaz's ProRes chunks through the SDR->PQ LUT.
   1. ffmpeg extracts every audio + subtitle track from the source (its `-map`
      is reliable; subs -> mov_text) into a temp track file.
@@ -317,7 +317,7 @@ def interleave_gap_mb(path: str, ffprobe=FFPROBE, at=(60, 300, 1200, 3600)) -> f
         # a time-exact audio one: the "gap" was the previous GOP's length in bytes. x265's
         # default keyint is 250 frames = 10.4 s at 23.976, and a talking-heads YouTube video
         # at ~8 Mbps measured exactly 10.4 MB, failed "badly interleaved" eight times, and
-        # held the resolve doorstep shut for 15 hours (live-caught 2026-09-05). What a
+        # held the DV doorstep shut for 15 hours (live-caught 2026-09-05). What a
         # player must have read by time t is the packet it decodes AT t, for both streams.
         for ln in out.splitlines():
             part = ln.split(",")
@@ -800,19 +800,19 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
           encode_source=None, rpu_mode=None, native=None, sdr=False,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
-    """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
+    """Peak-cap the DV render's video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
     failure (RPU, encode, frame mismatch, DV lost, measured peak over cap) fails the stage.
     Audio comes from the CFR file (same timing as the pipeline video); subs from the ORIGINAL.
     Dispatches on `output`'s extension, decided by `container_ext` upstream.
     `should_pause`: polled between x265 segments — yields a benign "paused:" result so the
-    finisher can hold this remux while the run thread's Resolve is active (Resolve gets the
-    whole machine, user-dictated); every finished segment is kept and the retry resumes here.
+    finisher can hold this remux while another stage has the whole machine (a sibling's lease,
+    AI outpainting); every finished segment is kept and the retry resumes here.
     `encode_source`: the peak-gated rpu-only fallback (SHIELD DV ceiling) — the RPU still
-    comes from `dv_video` (Resolve's analysis), but the video that gets the capped re-encode
-    is THIS file (the original HDR10 stream; frame-aligned because Resolve rendered from the
+    comes from `dv_video` (the render's analysis), but the video that gets the capped re-encode
+    is THIS file (the original HDR10 stream; frame-aligned because the render was made from the
     same CFR copy) instead of the render, whose floor-bitrate video was never meant to ship.
-    `native` (settings dv_engine 'native'; None = the Resolve path above, unchanged): the
+    `native` (a chunk-lane item; None = the render path above, unchanged): the
     nativelane bundle {chunks, vf, rpu, fps, max_cll, total, bounds, id}. There is NO render:
     every segment decodes its own Topaz ProRes chunk through the LUT (`decode`, at the main
     encode, the repair rung AND the re-concat — a missing one would encode the wrong file),
@@ -829,7 +829,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     audio and the resume rules are the DV path's; the resume manifest says "sdr" so the two
     never share segments. Without it every call below is exactly the DV path's."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-    nat_kw, dec_kw = {}, {}   # Resolve path: NO extra kwargs — every dvcap call is the pre-native call
+    nat_kw, dec_kw = {}, {}   # render path: NO extra kwargs — every dvcap call is the plain call
     sdr_kw, mux_kw = {}, {}   # ...and none for SDR unless asked: the DV calls stay byte-identical
     if sdr:
         if native is not None or encode_source is not None or rpu_mode is not None:
@@ -1360,14 +1360,14 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
     """COMPANION COMBINE (user-dictated): one best-of master from two copies of a film.
     `winner` = the video that ships (the genuinely better HDR10 base, or the real-DV file
     itself); `rpu_source` = where the Dolby Vision metadata comes from (the real-DV copy,
-    or the Resolve render when neither copy has an RPU); `audio_source` = the file whose
+    or the native render when neither copy has an RPU); `audio_source` = the file whose
     ENTIRE audio ships (best track wins the whole file — its compat AC-3 rides along).
     Subtitles ship from the winner. Output is always MKV (TrueHD-class audio).
 
     `capped=False` → stream path: the winner's own bits ship (RPU grafted/converted as
     needed) — the caller peak-gates first. `capped=True` → the enforced-VBV x265
     native-DV re-encode of the winner with the SAME RPU (real DV survives a re-encode —
-    prioritized over Resolve DV either way, user-dictated).
+    prioritized over generated DV either way, user-dictated).
 
     A thin dispatcher: both paths are the proven remux_inject / remux machinery — the
     frame-count and fps hard gates in there are exactly the different-cut gates a
@@ -1378,7 +1378,7 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
     carry that proof already (audio from the winner itself is trivial; audio from the
     real-RPU donor is transitively proven by the RPU-vs-winner frame gate). The
     remaining one — audio from the other copy while the RPU comes from elsewhere
-    (Resolve fallback, or an inline-DV winner borrowing audio) — is gated HERE: the
+    (the no-RPU render, or an inline-DV winner borrowing audio) — is gated HERE: the
     donor's video must match the winner frame-for-frame, else its audio would drift."""
     p7 = str(rpu_profile).startswith("7")
     mode = 2 if p7 else None
@@ -1422,13 +1422,13 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                       abort=None, on_step=None, ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE,
                       timeout=None, sdr: bool = False) -> RemuxResult:
     """YOUTUBE FAST REMUX (user-asked 2026-08-06: videos should move through fast). The
-    Resolve render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
+    native render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
     to force video under the SHIELD peak cap, and a render encoded at the YouTube target
     bitrate (stages caps it well under the cap) normally measures safe already. So: GATE
     the render's measured 1-s peak; under → ship its video STREAM-COPIED (ES copy + mux +
     audio — minutes), over → reason "render-over-cap: ..." and the caller falls back to
     the normal capped re-encode, ladder and all. Same mux/audio/verify tail as
-    remux_inject; the render↔CFR frame alignment was already gated when the resolve stage
+    remux_inject; the render↔CFR frame alignment was already gated when the DV step
     accepted the render (render_is_complete). No resume dir — a kill just redoes minutes.
     `sdr` (2026-10-18): a native SDR render (an item pinned to SDR output) — shipped the same
     way, with no DV box in the mux and a verify that asks for no DOVI record."""
@@ -1550,7 +1550,7 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
 def main(argv=None):
     import argparse, sys
     ap = argparse.ArgumentParser(description="Remux original audio+subs onto the mute DV video.")
-    ap.add_argument("dv_video", help="mute Dolby Vision video from Resolve")
+    ap.add_argument("dv_video", help="mute Dolby Vision video (the native render)")
     ap.add_argument("cfr_source", help="the CFR file (audio donor)")
     ap.add_argument("orig_source", help="the original download (subtitle donor)")
     ap.add_argument("output", help="master; .mkv or .mp4 decides the mux path")

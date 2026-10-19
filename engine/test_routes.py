@@ -45,15 +45,15 @@ SOURCES = {
     "1080p_hlg": (info(1920, 1080, HLG, "hevc", "yuv420p10le"), ("upscale", "add_dv")),
     "4k_hdr10": (info(3840, 2160, PQ, "hevc", "yuv420p10le"), ("rpu-only", "add_dv")),
     "4k_hdr10_vfr": (info(3840, 2160, PQ, "hevc", "yuv420p10le", cfr=False),
-                     ("resolve-only", "add_dv")),
-    "4k_pq_av1": (info(3840, 2160, PQ, "av1", "yuv420p10le"), ("resolve-only", "add_dv")),
-    "4k_pq_8bit": (info(3840, 2160, PQ, "hevc", "yuv420p"), ("resolve-only", "add_dv")),
-    "4k_hlg": (info(3840, 2160, HLG, "hevc", "yuv420p10le"), ("resolve-only", "add_dv")),
-    "4k_sdr": (info(3840, 2160, SDR, "av1"), ("resolve-only", "add_hdr_dv")),
-    "4k_sdr_vfr": (info(3840, 2160, SDR, "h264", cfr=False), ("resolve-only", "add_hdr_dv")),
-    "dci_4k_sdr": (info(4096, 2160, SDR, "vp9"), ("resolve-only", "add_hdr_dv")),
-    "scope_4k_sdr": (info(3840, 1600, SDR, "av1"), ("resolve-only", "add_hdr_dv")),
-    "vertical_4k": (info(2160, 3840, SDR, "vp9"), ("resolve-only", "add_hdr_dv")),
+                     ("dv-only", "add_dv")),
+    "4k_pq_av1": (info(3840, 2160, PQ, "av1", "yuv420p10le"), ("dv-only", "add_dv")),
+    "4k_pq_8bit": (info(3840, 2160, PQ, "hevc", "yuv420p"), ("dv-only", "add_dv")),
+    "4k_hlg": (info(3840, 2160, HLG, "hevc", "yuv420p10le"), ("dv-only", "add_dv")),
+    "4k_sdr": (info(3840, 2160, SDR, "av1"), ("dv-only", "add_hdr_dv")),
+    "4k_sdr_vfr": (info(3840, 2160, SDR, "h264", cfr=False), ("dv-only", "add_hdr_dv")),
+    "dci_4k_sdr": (info(4096, 2160, SDR, "vp9"), ("dv-only", "add_hdr_dv")),
+    "scope_4k_sdr": (info(3840, 1600, SDR, "av1"), ("dv-only", "add_hdr_dv")),
+    "vertical_4k": (info(2160, 3840, SDR, "vp9"), ("dv-only", "add_hdr_dv")),
     "dv": (info(3840, 2160, PQ, "hevc", "yuv420p10le", dv=True), ("skip", "skip")),
 }
 
@@ -104,7 +104,7 @@ def matrix():
         for kind, want in zip(KINDS, routes_by_kind):
             # "dv2000" is RETIRED (2026-10-18): a stale pin names the item exactly as "auto" does
             for mode in ("auto", "dv1000", None, "junk", "dv2000", "sdr"):
-                if mode == "sdr" and want not in routes.RESOLVE_FREE:
+                if mode == "sdr" and want not in routes.NO_DV_STEP:
                     want_m = "sdr_out"
                 else:
                     want_m = want
@@ -119,25 +119,27 @@ class GoldenMatrix(unittest.TestCase):
         self.assertEqual(set(SOURCES), set(GOLDEN))
         for name, (_probe, want) in SOURCES.items():
             pl = plan_of(name)
-            self.assertEqual((pl["topaz"], pl["resolve"]), want, name)
+            self.assertEqual((pl["topaz"], pl["dv"]), want, name)
 
     def test_every_row(self):
         for kind, name, mode, want in matrix():
             got = routes.classify(item(kind), plan_of(name), mode)
             self.assertEqual(got, want, f"{kind} {name} mode={mode}")
 
-    def test_the_native_lane_takes_exactly_the_tv_sdr_topaz_rows(self):
-        # nativelane.eligible is the one engine choice that exists for a route today; it must
-        # say yes to tv_sdr_topaz and to nothing else, in every output mode.
+    def test_the_chunk_lane_takes_exactly_the_tv_topaz_rows(self):
+        # nativelane.eligible is the one engine choice there is for a route: it must say yes to
+        # tv_sdr_topaz and sd_sdr_topaz (the 480p/576p episodes, with the 601 front end) and to
+        # nothing else, in every output mode.
         for kind, name, mode, want in matrix():
             p, pl = item(kind), plan_of(name)
             lane = nativelane.eligible(p, pl, routes.normalize_mode(mode))[0]
-            self.assertEqual(lane, want == "tv_sdr_topaz", f"{kind} {name} mode={mode}")
+            self.assertEqual(lane, want in ("tv_sdr_topaz", "sd_sdr_topaz"),
+                             f"{kind} {name} mode={mode}")
             if p.movie or p.youtube:
                 self.assertFalse(lane)
 
     def test_the_youtube_split_is_stages_own(self):
-        # yt_1080 is exactly the set stages._resolve SuperScales; yt_native4k always renders
+        # yt_1080 is exactly the 900-1200-line band; yt_native4k always renders
         # in the 14 Mbps bucket. (The rule and the constant are pinned to stages below.)
         for name, (probe, _plan) in SOURCES.items():
             route = GOLDEN[name][2]
@@ -159,7 +161,7 @@ class GoldenMatrix(unittest.TestCase):
     def test_every_route_in_the_table_is_reachable(self):
         seen = {want for _k, _n, _m, want in matrix()}
         seen |= {routes.classify(item("combine"), plan_of("4k_hdr10"), "auto",
-                                 {"verdict": {"rpu_from": rf}}) for rf in ("nas", "resolve")}
+                                 {"verdict": {"rpu_from": rf}}) for rf in ("nas", "native")}
         seen.add(routes.classify(item("movie"), None, "auto", {"dv_profile": 7}))
         seen.add(routes.classify(item("tv"), plan_of("1080p_sdr"), "auto", {"disk_fits": False}))
         self.assertEqual(seen, set(routes.ROUTES))
@@ -168,7 +170,7 @@ class GoldenMatrix(unittest.TestCase):
 
 
 class Combine(unittest.TestCase):
-    """The verdict outranks the plan: a real RPU from either copy is Resolve-free whatever the
+    """The verdict outranks the plan: a real RPU from either copy skips the DV step whatever the
     plan or the mode says (even a DV library copy, which the plan would 'skip')."""
 
     def test_a_real_rpu_is_resolve_free_in_any_mode(self):
@@ -181,7 +183,7 @@ class Combine(unittest.TestCase):
                         "combine_rpu")
 
     def test_no_rpu_follows_the_pin(self):
-        v = {"verdict": {"rpu_from": "resolve"}}
+        v = {"verdict": {"rpu_from": "native"}}
         for mode, want in (("auto", "combine_nodv"), ("dv1000", "combine_nodv"),
                            ("dv2000", "combine_nodv"), ("sdr", "sdr_out")):
             self.assertEqual(routes.classify(item("combine"), plan_of("4k_sdr"), mode, v), want)
@@ -253,11 +255,11 @@ class Facts(unittest.TestCase):
     def test_a_bare_plan_without_a_probe(self):
         # The tests elsewhere stub plan_for with bare dicts; a missing probe reads as 0 lines.
         self.assertEqual(routes.classify(item("youtube"), {"topaz": "upscale",
-                                                           "resolve": "add_hdr_dv"}, "auto"),
+                                                           "dv": "add_hdr_dv"}, "auto"),
                          "yt_plain")
         self.assertEqual(routes.classify(item("tv"), {"topaz": "rpu-only"}, "auto"), "rpu_only")
-        self.assertEqual(routes.classify(item("tv"), {"topaz": "resolve-only",
-                                                      "resolve": "add_dv"}, "auto"),
+        self.assertEqual(routes.classify(item("tv"), {"topaz": "dv-only",
+                                                      "dv": "add_dv"}, "auto"),
                          "hdr_reencode")
 
     def test_youtube_geometry_edges(self):
@@ -319,11 +321,7 @@ class PinnedToTheStages(unittest.TestCase):
 
     def test_youtube_rules(self):
         self.assertEqual(routes.YT_NATIVE_4K_MIN_HEIGHT, stages.YOUTUBE_NATIVE_4K_MIN_HEIGHT)
-        rule = (f"if {routes.YT_SUPERSCALE_MIN_HEIGHT} <= h <= "
-                f"{routes.YT_SUPERSCALE_MAX_HEIGHT}:\n")
-        src = inspect.getsource(stages._resolve)
-        self.assertIn(rule, src)
-        self.assertIn('ss = "2"', src.split(rule, 1)[1].splitlines()[0])
+        self.assertEqual((routes.YT_1080_MIN_HEIGHT, routes.YT_1080_MAX_HEIGHT), (900, 1200))
 
     def test_lane_and_plan(self):
         self.assertEqual(routes.TV_LANE_RES, nativelane.ELIGIBLE_RES)
@@ -390,7 +388,7 @@ class ItemRoute(unittest.TestCase):
     def test_a_combine_reads_its_confirmed_verdict(self):
         import companion
         p = self._p(movie=True, combine=True)
-        for cv, want in (({"verdict": {"rpu_from": "resolve"}, "companion": {}}, "combine_nodv"),
+        for cv, want in (({"verdict": {"rpu_from": "native"}, "companion": {}}, "combine_nodv"),
                          ({"verdict": {"rpu_from": "remote"}, "companion": {}}, "combine_rpu"),
                          (None, routes.UNKNOWN)):
             with mock.patch.object(plan, "probe_input", return_value=SOURCES["dv"][0]), \

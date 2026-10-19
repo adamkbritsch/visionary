@@ -11,32 +11,22 @@ def _gate(cap=50):
     return cap * dvcap.PEAK_TOLERANCE * peakplan.REEXPORT_MARGIN     # 51.75 for a 50 cap
 
 
-class MovedVerbatim(unittest.TestCase):
-    """peakplan.py is resolve_pipeline's YouTube-gamble arithmetic, moved so the native render
-    can use it without importing a module that pins Resolve. resolve_pipeline imports the same
-    objects back: one implementation, two names."""
+class PeakPlanStandsAlone(unittest.TestCase):
+    """peakplan.py is the YouTube-gamble arithmetic the native render uses: pure, importing
+    nothing heavy."""
 
-    def test_resolve_pipeline_uses_the_same_objects(self):
-        import resolve_pipeline as RP
-        for name in ("reexport_plan", "reexport_kbps", "REEXPORT_MARGIN", "REEXPORT_FLOOR_KBPS",
-                     "MAX_REEXPORTS"):
-            self.assertIs(getattr(RP, name), getattr(peakplan, name), name)
 
     def test_the_constants_kept_their_values(self):
         self.assertEqual((peakplan.REEXPORT_MARGIN, peakplan.REEXPORT_FLOOR_KBPS, peakplan.MAX_REEXPORTS),
                          (0.9, 8000, 2))
 
-    def test_render_under_cap_still_defaults_to_two_re_exports(self):
-        import inspect
-        import resolve_pipeline as RP
-        self.assertEqual(inspect.signature(RP.render_under_cap).parameters["max_reexports"].default, 2)
 
-    def test_importing_it_loads_nothing_of_resolve(self):
+    def test_importing_it_loads_nothing_heavy(self):
         engine = os.path.dirname(os.path.abspath(__file__))
         out = subprocess.run(
             [sys.executable, "-c",
              "import sys, peakplan; peakplan.reexport_plan(20000, 60, 50); "
-             "print(sorted(m for m in ('resolve', 'resolve_pipeline', 'versions', 'dv_shim') "
+             "print(sorted(m for m in ('versions', 'orchestrator', 'stages') "
              "if m in sys.modules))"],
             cwd=engine, capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)

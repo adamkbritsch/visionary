@@ -9,15 +9,13 @@
 #   - topaz encoding  -> watch progress.seg_done ; a boundary there → deploy.
 #   - finisher = remux -> watch finishing.seg_done ; a boundary there → deploy.
 #   - stage = dvnative -> watch progress.seg_done (= CHUNKS analysed) ; a boundary there → deploy.
-#     The native DV analysis (dv_engine 'native') resumes from its last finished chunk, so a stop
-#     mid-chunk throws that chunk's minutes away. Never seen while dv_engine is 'resolve'.
+#     The chunk lane's DV analysis resumes from its last finished chunk, so a stop mid-chunk throws
+#     that chunk's minutes away.
 #   - stage = dvrender, phase analysis -> watch progress.seg_done (= analysis RANGES done) ; a
-#     boundary there → deploy. The native render (a route set 'native' in dv_routes) resumes its
-#     analysis range by range.
-#   - stage = dvrender, phase encode/finish -> wait it out like resolve: the VideoToolbox encode,
-#     the RPU inject and the mux are one pass each with no boundary inside, and a stop restarts the
-#     encode from scratch. Never seen while every dv_routes entry is 'resolve'.
-#   - stage = resolve -> wait it out (screen-capture render, NOT segmented/resumable).
+#     boundary there → deploy. The native render resumes its analysis range by range.
+#   - stage = dvrender, phase encode/finish -> wait it out: the VideoToolbox encode, the RPU inject
+#     and the mux are one pass each with no boundary inside, and a stop restarts the encode from
+#     scratch.
 #   - finisher = upload/cleanup -> wait (a mid-STOR upload leaves a partial on the NAS; both are quick).
 #   - nothing encoding (download/idle, no remux) -> nothing precious, deploy immediately.
 # The stop waits for BOTH encoders (topaz tvai + remux x265) to exit before relaunching, so a resumed
@@ -101,14 +99,14 @@ armed_now(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
 try: print((json.load(sys.stdin).get('settings') or {}).get('activated'))
 except Exception: print('down')" 2>/dev/null; }
 
-say "deploy requested — holding for the first segment boundary (topaz OR remux; the other resumes; never resolve/upload)"
-deadline=$(( $(date +%s) + 10800 ))  # 3 h ceiling. Rarely bites now — only outlasts a resolve/upload
-                                     # the deploy is briefly waiting out.
+say "deploy requested — holding for the first segment boundary (topaz OR remux; the other resumes; never a render encode/upload)"
+deadline=$(( $(date +%s) + 10800 ))  # 3 h ceiling. Rarely bites now — only outlasts a render
+                                     # encode/upload the deploy is briefly waiting out.
 tseg0=""; rseg0=""; rseg20=""; aseg0=""; gseg0=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase <<< "$s"
   # The chunk baseline belongs to ONE analysis pass: a later pass (another item, or this one
-  # resumed after a resolve) counts from its own start. The native render's range baseline too.
+  # resumed) counts from its own start. The native render's range baseline too.
   [ "$stage" = "dvnative" ] || aseg0=""
   [ "$stage" = "dvrender" ] && [ "$phase" = "analysis" ] || gseg0=""
   # Non-resumable / partial-risk stages → wait them out; reset the segment baselines.
@@ -117,6 +115,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
                         tseg0=""; rseg0=""; rseg20=""; aseg0=""; sleep 5; continue ;;
   esac
   case "$stage" in
+    # `resolve` only ever comes from the engine this deploy REPLACES (the switch-over from a build
+    # that still had Resolve): its pass is not resumable, so it is waited out like an upload.
     resolve|upload) say "waiting: stage=$stage (never interrupt — not resumable)"; tseg0=""; rseg0=""; sleep 5; continue ;;
   esac
   # The native render past its analysis: one encode/inject/mux pass, restarted from scratch by a stop.
@@ -174,7 +174,7 @@ case "$fin" in upload|cleanup) say "GAVE UP: deadline hit but finisher=$fin — 
 case "$stage" in resolve|upload) say "GAVE UP: deadline hit but stage=$stage — NOT deploying"; exit 2 ;; esac
 case "$stage:$phase" in dvrender:encode|dvrender:finish) say "GAVE UP: deadline hit but stage=dvrender phase=$phase — NOT deploying"; exit 2 ;; esac
 
-# A remux SUSPENDED for Resolve (SIGSTOP) can never exit, so the wait below would sit out its
+# A remux SUSPENDED for AI outpainting (SIGSTOP) can never exit, so the wait below would sit out its
 # full 30 s and then relaunch on top of frozen encoders. SIGCONT is a no-op on a running
 # process, so this is unconditional and safe.
 pkill -CONT -x x265 2>/dev/null

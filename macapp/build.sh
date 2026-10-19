@@ -7,8 +7,8 @@ TMP="$(mktemp -d)"
 BIN="$TMP/Visionary"
 # Local overrides (gitignored): e.g. BUNDLE_ID for an existing install's TCC continuity.
 [ -f "$ROOT/.env" ] && . "$ROOT/.env"
-# Bundle id: env-overridable. TCC (Screen Recording + Accessibility) keys on the bundle id +
-# the signing cert, so KEEP whatever id you first granted with — changing it resets grants.
+# Bundle id: env-overridable. TCC keys on the bundle id + the signing cert, so KEEP whatever
+# id you first granted with — changing it resets grants.
 # (The maintainer exports BUNDLE_ID=com.adambritsch.overnightupscaler locally for that reason.)
 BUNDLE_ID="${BUNDLE_ID:-com.visionary.upscaler}"
 # --release [version]: also produce a version-stamped distributable zip in dist/.
@@ -32,9 +32,8 @@ swiftc \
   -o "$BIN" -framework AppKit -framework SwiftUI
 
 # 2. Assemble the bundle. The bundle id is UNCHANGED across the Overnight Upscaler ->
-#    Visionary rename ON PURPOSE: TCC (Screen Recording + Accessibility) keys on the
-#    bundle id + the cert-based designated requirement, so keeping it makes the existing
-#    grants survive the rename.
+#    Visionary rename ON PURPOSE: TCC keys on the bundle id + the cert-based designated
+#    requirement, so keeping it makes the existing grants survive the rename.
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/engine"
 
 # Icon: prefer the compiled Icon Composer .icon (Assets.car -> the live glass icon the
@@ -45,6 +44,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/engine"
 # place, so a file dropped from the repo would otherwise ship forever (the engine/ rsync below has
 # --delete for the same reason).
 rm -f "$APP/Contents/Resources/UpscalerDV.icns" "$APP/Contents/Resources/DolbyVision.svg"
+# retired payloads an in-place build would otherwise keep (and ship in a release zip)
+rm -rf "$APP/Contents/Resources/setup" "$APP/Contents/Resources/bundle"
 ICON_KEYS='  <key>CFBundleIconFile</key><string>Visionary</string>'
 if [ -f "$ROOT/macapp/Assets.car" ]; then
   cp "$ROOT/macapp/Assets.car" "$APP/Contents/Resources/Assets.car"
@@ -79,17 +80,15 @@ PLIST
 # --delete-excluded: an EXCLUDED path is otherwise protected from --delete, so bytecode some older
 # Python wrote into the bundle (cpython-312, June) rode along in every release zip since.
 rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' "$ROOT/engine/" "$APP/Contents/Resources/engine/"
-# Ship the SETUP-TIME artifacts too, mirroring the repo layout (import_resolve.py derives
-# its paths from its own location, so Resources/{setup,bundle,nas} beside engine/ makes a
-# drop-in .app fully self-sufficient — the in-app Setup section drives all three):
-rsync -a --delete --delete-excluded --exclude __pycache__ --exclude '*.pyc' "$ROOT/setup/" "$APP/Contents/Resources/setup/"
-rsync -a "$ROOT/bundle/resolve/" "$APP/Contents/Resources/bundle/resolve/"
+# Ship the SETUP-TIME artifact too, mirroring the repo layout (the server derives its path from
+# its own location, so Resources/nas beside engine/ makes a drop-in .app self-sufficient — the
+# in-app Setup section's "Upload to NAS" uses it):
 mkdir -p "$APP/Contents/Resources/nas"
 cp "$ROOT/nas/dv_probe.py" "$APP/Contents/Resources/nas/dv_probe.py"
 cp "$BIN" "$APP/Contents/MacOS/Visionary"
 # Sign with the STABLE self-signed identity (see setup-signing-cert.sh) so TCC keys on
-# the cert-based designated requirement, not the binary hash — Screen Recording +
-# Accessibility grants then survive rebuilds. Falls back to ad-hoc if the cert is gone.
+# the cert-based designated requirement, not the binary hash — grants then survive
+# rebuilds. Falls back to ad-hoc if the cert is gone.
 IDENTITY="Overnight Upscaler Local Signing"
 if codesign --force --deep -s "$IDENTITY" --timestamp=none "$APP" 2>/dev/null; then
   echo "signed with stable identity ($IDENTITY) — grants survive rebuilds"

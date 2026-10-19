@@ -318,7 +318,7 @@ class CfrFastPath(unittest.TestCase):
 
 
 class FastPathCfrCopy(unittest.TestCase):
-    """Fast-path items (rpu-only / resolve-only) skip Topaz, so the true-CFR re-encode —
+    """Fast-path items (rpu-only / dv-only) skip Topaz, so the true-CFR re-encode —
     which exists solely to keep Topaz's frame counts stable — is discarded work for them:
     the CFR file only carries their audio (a bit-copy either way) and decodable frames.
     `copy_only` forces the stream-copy even when the timebase test would re-encode."""
@@ -523,38 +523,6 @@ class TheCapIsReportedNotLogged(unittest.TestCase):
                                          capped_secs=8298.667).capped_secs, 8298.667)
 
 
-class ResolveHostableRate(unittest.TestCase):
-    """Resolve can only put a timeline on the rates it knows. A CFR at any other rate is dead on
-    arrival: `proj.SetSetting("timelineFrameRate", "23")` is ignored, the timeline stays 23.976,
-    and resolve_pipeline's conform guard refuses to render it — five times a day, for as long as
-    the video sits in the queue (live: Rhett & Link's "Christmas Face", a genuine 23.000 fps
-    upload, from 2026-09-14 to 2026-09-24). Frames are DUPLICATED up to the next rate Resolve
-    knows, never dropped down to it: duplication keeps every frame of the source and its running
-    time, and a drop would throw picture away to save a file we re-encode anyway."""
-
-    def test_a_rate_resolve_knows_is_left_exactly_as_it_is(self):
-        for rate in ("24000/1001", "24/1", "25/1", "30000/1001", "30/1", "60/1", "120000/1001"):
-            self.assertEqual(topaz.resolve_hostable_rate(rate), rate)
-
-    def test_the_christmas_face_rate_goes_up_to_the_next_one_resolve_knows(self):
-        self.assertEqual(topaz.resolve_hostable_rate("23/1"), "24000/1001")
-
-    def test_it_never_rounds_down_and_throws_frames_away(self):
-        self.assertEqual(topaz.resolve_hostable_rate("55/1"), "60000/1001")   # up to 59.94, not 50
-        self.assertEqual(topaz.resolve_hostable_rate("10/1"), "16/1")
-        self.assertEqual(topaz.resolve_hostable_rate("26/1"), "30000/1001")
-
-    def test_another_spelling_of_a_rate_resolve_knows_is_not_re_encoded_over(self):
-        self.assertEqual(topaz.resolve_hostable_rate("2997/125"), "2997/125")   # 23.976 to 6 places
-
-    def test_an_absurd_rate_clamps_to_the_highest_resolve_knows(self):
-        self.assertEqual(topaz.resolve_hostable_rate("240/1"), "120/1")
-
-    def test_an_unreadable_rate_is_left_alone(self):
-        self.assertIsNone(topaz.resolve_hostable_rate(None))
-        self.assertEqual(topaz.resolve_hostable_rate("0/0"), "0/0")
-
-
 class TimestampHoles(unittest.TestCase):
     """A CFR that SKIPS frame slots advertises more running time than it has pictures, so every
     reader that measures by duration (Resolve, sizing its timeline) disagrees with every reader
@@ -589,110 +557,6 @@ class TimestampHoles(unittest.TestCase):
 
     def test_a_file_with_one_frame_cannot_have_a_hole(self):
         self.assertEqual(self._holes([0]), 0)
-
-
-class TheCfrMustBeSomethingResolveCanHost(unittest.TestCase):
-    """to_cfr's output is what Resolve imports, so both rules live here."""
-
-    def _run(self, *, already_cfr, rate, holes, copy_only=False):
-        captured = {}
-        def fake_run(cmd, env, *, abort=None, on_progress=None):
-            captured["cmd"] = cmd
-            return (0, 100, False, "")
-        removed = []
-        with mock.patch.object(topaz, "declared_rate_mismatch", return_value=None), \
-             mock.patch.object(topaz, "_fps_fraction", return_value=rate), \
-             mock.patch.object(topaz, "_is_already_cfr", return_value=already_cfr), \
-             mock.patch.object(topaz, "cfr_duration_cap", return_value=None), \
-             mock.patch.object(topaz, "_cfr_pix_fmt", return_value="yuv420p"), \
-             mock.patch.object(topaz, "_cfr_height", return_value=1080), \
-             mock.patch.object(topaz, "source_color", return_value=None), \
-             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
-             mock.patch.object(topaz, "_frame_count", return_value=100), \
-             mock.patch.object(topaz, "timestamp_holes", return_value=holes), \
-             mock.patch.object(topaz.os.path, "exists", return_value=True), \
-             mock.patch.object(topaz.os, "remove", side_effect=removed.append), \
-             mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run):
-            res = topaz.to_cfr("/in.mp4", "/out.mp4", copy_only=copy_only)
-        return captured.get("cmd", []), res, removed
-
-    def test_which_rates_resolve_can_host(self):
-        for r in ("24000/1001", "2997/125", "24/1", "25", "30000/1001", "60/1", None, "junk", "0/1"):
-            self.assertTrue(topaz.is_hostable_rate(r), r)
-        for r in ("23/1", "29/1", "15/1", "12/1", "20/1"):
-            self.assertFalse(topaz.is_hostable_rate(r), r)
-
-    def test_an_existing_cfrs_rate_is_checked_once_per_file_version(self):
-        import os, tempfile
-        f = os.path.join(tempfile.mkdtemp(), "x_cfr.mp4")
-        open(f, "wb").close()
-        with mock.patch.object(topaz, "_fps_fraction", return_value="23/1") as fr:
-            self.assertFalse(topaz.cfr_hostable(f))
-            self.assertFalse(topaz.cfr_hostable(f))
-        self.assertEqual(fr.call_count, 1)
-        with open(f, "wb") as fh:
-            fh.write(b"remade")                                    # a new version is asked again
-        with mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"):
-            self.assertTrue(topaz.cfr_hostable(f))
-        self.assertTrue(topaz.cfr_hostable("/no/such/file.mp4"))  # absent: is_cfr_ready decides
-
-    def test_ffprobe_8s_trailing_comma_is_read_past(self):
-        # a stream with side data (HDR metadata, a rotation, a DV record) prints "23/1," and "46,"
-        self.assertEqual(topaz.first_field("23/1,\n"), "23/1")
-        self.assertEqual(topaz.first_field("46\n"), "46")
-        self.assertEqual(topaz.first_field(""), "")
-        run = lambda out: mock.patch.object(topaz.subprocess, "run",
-                                            return_value=mock.Mock(stdout=out))
-        with run("23/1,\n"):
-            self.assertEqual(topaz._fps_fraction("/x.mkv"), "23/1")
-        with run("46,\n"):
-            self.assertEqual(topaz._frame_count("/x.mkv", decode=False), 46)
-        with run("1080,\n"):
-            self.assertEqual(topaz._cfr_height("/x.mkv"), 1080)
-
-    def test_an_unreadable_rate_is_never_remembered(self):
-        import os, tempfile
-        f = os.path.join(tempfile.mkdtemp(), "y_cfr.mp4")
-        open(f, "wb").close()
-        with mock.patch.object(topaz, "_fps_fraction", return_value=None):
-            self.assertTrue(topaz.cfr_hostable(f))
-        with mock.patch.object(topaz, "_fps_fraction", return_value="29/1"):
-            self.assertFalse(topaz.cfr_hostable(f))                # asked again, and answered
-
-    def test_a_rate_resolve_cannot_host_is_re_encoded_at_one_it_can(self):
-        cmd, res, _ = self._run(already_cfr=True, rate="23/1", holes=0)
-        self.assertIn("libx264", cmd)                       # a COPY could not change the rate
-        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
-        self.assertEqual(res.rate, "24000/1001")
-
-    def test_even_a_fast_path_copy_gives_way_to_a_hostable_rate(self):
-        cmd, _res, _ = self._run(already_cfr=False, rate="23/1", holes=0, copy_only=True)
-        self.assertIn("libx264", cmd)
-        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")
-
-    def test_a_hostable_rate_still_copies(self):
-        cmd, res, _ = self._run(already_cfr=True, rate="24000/1001", holes=0)
-        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
-        self.assertEqual(res.rate, "24000/1001")
-
-    def test_a_holed_cfr_is_thrown_away_so_the_next_attempt_redoes_it(self):
-        _cmd, res, removed = self._run(already_cfr=False, rate="24000/1001", holes=4)
-        self.assertFalse(res.ok)
-        self.assertIn("4", res.error_tail)
-        self.assertIn("short", res.error_tail)
-        self.assertEqual(removed, ["/out.mp4"])             # never left to be reused as ready
-
-    def test_a_copy_is_not_judged_on_holes(self):
-        """Deliberate boundary: a copy's gaps come from the source, so copying again would only
-        reproduce them. Filling a gap is what the re-encode's `-fps_mode cfr` does."""
-        _cmd, res, removed = self._run(already_cfr=True, rate="24000/1001", holes=4)
-        self.assertTrue(res.ok)
-        self.assertEqual(removed, [])
-
-    def test_an_unreadable_hole_count_is_not_treated_as_a_fault(self):
-        _cmd, res, removed = self._run(already_cfr=False, rate="24000/1001", holes=-1)
-        self.assertTrue(res.ok)
-        self.assertEqual(removed, [])
 
 
 class DeclaredRateMismatch(unittest.TestCase):
@@ -839,12 +703,12 @@ class NoWrongDeclaredRateReachesTheCfr(unittest.TestCase):
         self.assertNotIn("-r", cmd)
         self.assertEqual(r.rate, "24000/1001")
 
-    def test_an_honest_but_unhostable_rate_is_re_timed_rather_than_copied(self):
-        """500/21 is what the Sharkboy release DECLARED, and Resolve cannot host it either. A
-        source whose frames genuinely run at it has to be re-timed, copy or no copy."""
+    def test_an_honest_odd_rate_is_kept_as_it_is(self):
+        """A source whose frames genuinely run at an unusual rate keeps it: nothing downstream
+        needs a standard one (only Resolve's timeline did), so an already-CFR source is copied."""
         cmd, r, _ = self._to_cfr(lie=None, already=True, declared="500/21")
-        self.assertIn("libx264", cmd)
-        self.assertEqual(r.rate, "24000/1001")
+        self.assertNotIn("libx264", cmd)
+        self.assertIn("copy", cmd)
 
 
 class ResumableRefusesAWrongClock(unittest.TestCase):
@@ -940,56 +804,3 @@ class WrongDeclaredRateOnRealMedia(unittest.TestCase):
                     self.assertIsNone(topaz.declared_rate_mismatch(dst))
 
 
-@unittest.skipUnless(__import__("os").path.exists(topaz.FFMPEG_HB), "needs ffmpeg")
-class MezzanineSegmentsKeepEveryFrame(unittest.TestCase):
-    """The mezzanine's midpoint seek + `-fps_mode cfr` emitted each segment's first frame
-    twice (a, a, a+1, ...), and on a 1 ms-timebase input repeated the last frame instead and
-    dropped one — with the exact frame count intact. Every frame here has its own level;
-    hevc_videotoolbox is lossy, so frames are identified against the same encoder's output
-    for the whole clip (no seek), not by their nominal level."""
-
-    @classmethod
-    def setUpClass(cls):
-        import os, subprocess, tempfile, stages
-        cls.td = tempfile.mkdtemp()
-        ff = topaz.FFMPEG_HB
-        cls.mov = os.path.join(cls.td, "n.mov")
-        subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                        "nullsrc=s=128x128:r=24000/1001:d=1,geq=lum='16+9*N':cb=128:cr=128",
-                        "-c:v", "libx265", "-x265-params", "log-level=none:bframes=0:lossless=1",
-                        "-video_track_timescale", "24000", "-pix_fmt", "yuv420p", cls.mov], check=True)
-        cls.mkv = os.path.join(cls.td, "n.mkv")          # millisecond timebase: jittered PTS
-        subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-i", cls.mov, "-c", "copy", cls.mkv],
-                       check=True)
-        full = os.path.join(cls.td, "full.mp4")
-        r = subprocess.run(stages.build_mezzanine_command(ff, cls.mov, full, rate="24000/1001", kbps=20000),
-                           capture_output=True)
-        if r.returncode != 0:
-            raise unittest.SkipTest("hevc_videotoolbox unavailable")
-        cls.table = cls._means(full)
-
-    @classmethod
-    def tearDownClass(cls):
-        import shutil
-        shutil.rmtree(cls.td, ignore_errors=True)
-
-    @staticmethod
-    def _means(path, w=128, h=128):
-        import subprocess
-        out = subprocess.run([topaz.FFMPEG_HB, "-hide_banner", "-loglevel", "error", "-i", path,
-                              "-pix_fmt", "gray", "-f", "rawvideo", "-"], capture_output=True).stdout
-        sz = w * h
-        return [sum(out[i * sz:(i + 1) * sz]) / sz for i in range(len(out) // sz)]
-
-    def test_every_segment_is_exactly_frames_a_to_a_plus_n(self):
-        import os, subprocess
-        for src in (self.mov, self.mkv):
-            for a in (4, 7, 10, 13, 16):
-                with self.subTest(src=os.path.basename(src), a=a):
-                    dst = os.path.join(self.td, f"seg_{a}.mp4")
-                    subprocess.run(topaz.build_mezzanine_segment_command(
-                        topaz.FFMPEG_HB, src, dst, start_frame=a, n=4, rate="24000/1001", kbps=20000),
-                        capture_output=True, check=True)
-                    got = [min(range(len(self.table)), key=lambda k: abs(self.table[k] - m))
-                           for m in self._means(dst)]
-                    self.assertEqual(got, [a, a + 1, a + 2, a + 3])

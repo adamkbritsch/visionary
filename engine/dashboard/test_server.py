@@ -167,22 +167,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class PreviewVariants(unittest.TestCase):
-    def test_big_and_small_are_served_from_one_capture(self):
-        # The enlarged view gets the 1080p-class encode; the card keeps the 420w tile.
-        # Both come from the same screenshot and share one freshness clock.
-        import time as _t
-        old = dict(server._PREVIEW)
-        try:
-            server._PREVIEW.update(jpg=b"small", big=b"large", at=_t.time(), busy=False)
-            self.assertEqual(server._preview_frame(), b"small")
-            self.assertEqual(server._preview_frame(big=True), b"large")
-            server._PREVIEW["at"] = _t.time() - 999          # stale → neither is served
-            self.assertIsNone(server._preview_frame(big=True))
-        finally:
-            server._PREVIEW.update(old)
-
-
 class CompanionEndpoint(unittest.TestCase):
     """POST /api/companion action routing + the DV combine-only add rejection."""
 
@@ -317,7 +301,7 @@ class DvQueue(unittest.TestCase):
 
 class SetupEndpoints(unittest.TestCase):
     """The in-app onboarding surface: full preflight with fix strings, redacted config,
-    connectivity tests, guarded Resolve import, dv_probe upload."""
+    connectivity tests, dv_probe upload."""
 
     def test_preflight_payload_carries_fixes_and_summary(self):
         from unittest import mock
@@ -328,7 +312,7 @@ class SetupEndpoints(unittest.TestCase):
         server._FULL_PREFLIGHT["result"] = None
         with mock.patch.object(preflight, "run_checks", return_value=dict(fake)) as rc:
             out = server.api_preflight(fresh=True)
-        rc.assert_called_once_with(in_app=True)
+        rc.assert_called_once_with()
         self.assertFalse(out["setup_complete"])
         self.assertIn("brew_present", out)
         self.assertEqual(out["checks"][0]["fix"], "brew install x265")
@@ -376,31 +360,6 @@ class SetupEndpoints(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("530", out["detail"])
 
-    def test_import_resolve_refuses_while_resolve_runs(self):
-        from unittest import mock
-        r = mock.Mock(returncode=0)                       # pgrep found Resolve
-        with mock.patch.object(server.subprocess, "run", return_value=r), \
-             mock.patch.object(server.os.path, "exists", return_value=True):
-            out = server.api_import_resolve()
-        self.assertEqual(out["error"], "resolve-running")
-        self.assertIn("Quit DaVinci Resolve", out["detail"])
-
-    def test_import_resolve_starts_the_bundled_script(self):
-        from unittest import mock
-        import setup_jobs
-        r = mock.Mock(returncode=1)                       # pgrep: not running
-        seen = {}
-        def fake_start(what, argv=None):
-            seen["what"], seen["argv"] = what, argv
-            return {"what": what, "state": "running"}
-        with mock.patch.object(server.subprocess, "run", return_value=r), \
-             mock.patch.object(server.os.path, "exists", return_value=True), \
-             mock.patch.object(setup_jobs, "start", side_effect=fake_start):
-            out = server.api_import_resolve()
-        self.assertEqual(out["state"], "running")
-        self.assertEqual(seen["what"], "import_resolve")
-        self.assertTrue(seen["argv"][1].endswith("setup/import_resolve.py"))
-        self.assertIn("--json", seen["argv"])
 
     def test_dv_probe_upload_returns_the_cron_line(self):
         from unittest import mock
@@ -1244,129 +1203,11 @@ class YieldEndpoint(unittest.TestCase):
             self.assertFalse(out["created"])
 
     def test_a_lease_granted_during_a_protected_stage_says_it_is_not_in_force_yet(self):
-        pl, ps = self._lease(stage="resolve")
+        pl, ps = self._lease(stage="extend")
         with pl, ps:
             out = server.api_yield({"holder": "discretion", "seconds": 600})
             self.assertTrue(out["ok"])
             self.assertFalse(out["effective_now"])
-            self.assertEqual(out["current_stage"], "resolve")
+            self.assertEqual(out["current_stage"], "extend")
 
 
-class SettingsDvEngine(unittest.TestCase):
-    """POST /api/settings is the ONLY way to flip dv_engine (no app control). Switching to
-    'native' is gated server-side like arming: a failing check_native_dv is a 409 carrying
-    the failing row, and nothing is saved. Every other write is today's path unchanged."""
-
-    def setUp(self):
-        import os, tempfile
-        import settings
-        d = tempfile.mkdtemp()
-        p = mock.patch.multiple(settings, CONFIG_DIR=d,
-                                SETTINGS_FILE=os.path.join(d, "settings.json"),
-                                PROFILES_FILE=os.path.join(d, "show_profiles.json"))
-        p.start(); self.addCleanup(p.stop)
-        self.settings = settings
-        server._FULL_PREFLIGHT["result"] = None
-        self.addCleanup(lambda: server._FULL_PREFLIGHT.__setitem__("result", None))
-
-    @staticmethod
-    def _row(ok):
-        return {"id": "native_dv", "ok": ok, "severity": "fail",
-                "detail": "fine" if ok else "dovi_tool is 2.2.0; the native lane needs exactly 2.3.0",
-                "fix": "Install dovi_tool 2.3.0"}
-
-    def _ndv(self, ok):
-        import preflight
-        return mock.patch.object(preflight, "check_native_dv", return_value=self._row(ok))
-
-    def test_native_with_a_failing_toolchain_is_a_409_that_saves_nothing(self):
-        with self._ndv(False) as ndv:
-            out, code = server.api_save_settings({"dv_engine": "native", "poll_minutes": 45})
-        ndv.assert_called_once_with()                      # required -> severity fail
-        self.assertEqual(code, 409)
-        self.assertIn("error", out)
-        self.assertEqual(out["checks"], [self._row(False)])
-        self.assertEqual(self.settings.dv_engine(), "resolve")
-        self.assertEqual(self.settings.get_settings()["poll_minutes"], 30)   # whole body refused
-
-    def test_native_with_a_passing_toolchain_is_saved(self):
-        with self._ndv(True):
-            out, code = server.api_save_settings({"dv_engine": "native"})
-        self.assertEqual(code, 200)
-        self.assertEqual(out["settings"]["dv_engine"], "native")
-        self.assertEqual(self.settings.dv_engine(), "native")
-
-    def test_a_route_switched_to_native_is_gated_the_same_way(self):
-        with self._ndv(False) as ndv:
-            out, code = server.api_save_settings({"dv_routes": {"yt_native4k": "native"}})
-        ndv.assert_called_once_with()
-        self.assertEqual(code, 409)
-        self.assertIn("dv_routes", out["error"])
-        self.assertEqual(self.settings.get_settings().get("dv_routes", {}), {})
-        with self._ndv(True):
-            out, code = server.api_save_settings({"dv_routes": {"yt_native4k": "native"}})
-        self.assertEqual(code, 200)
-
-    def test_resolve_is_always_accepted_without_the_check(self):
-        with self._ndv(True):
-            server.api_save_settings({"dv_engine": "native"})
-        with self._ndv(False) as ndv:
-            out, code = server.api_save_settings({"dv_engine": "resolve"})
-        ndv.assert_not_called()
-        self.assertEqual(code, 200)
-        self.assertEqual(self.settings.dv_engine(), "resolve")
-
-    def test_other_writes_are_untouched(self):
-        with self._ndv(False) as ndv:
-            out, code = server.api_save_settings({"poll_minutes": 45})
-            self.assertEqual(server.api_save_settings({})[1], 200)
-            self.assertEqual(server.api_save_settings(None)[1], 200)
-        ndv.assert_not_called()
-        self.assertEqual(code, 200)
-        self.assertEqual(list(out), ["settings"])          # same response shape as before
-        self.assertEqual(out["settings"]["poll_minutes"], 45)
-        self.assertEqual(out["settings"]["dv_engine"], "resolve")
-
-    def test_junk_is_saved_as_resolve_without_the_check(self):
-        with self._ndv(False) as ndv:
-            out, code = server.api_save_settings({"dv_engine": "Native"})
-        ndv.assert_not_called()
-        self.assertEqual((code, out["settings"]["dv_engine"]), (200, "resolve"))
-
-    def test_the_youtube_cap_still_refreshes_the_popular_sets(self):
-        import orchestrator
-        with mock.patch.object(orchestrator.ORCH, "refresh_youtube_meta") as ref:
-            server.api_save_settings({"max_youtube_minutes": 30})
-        ref.assert_called_once_with()
-
-    def test_the_http_handler_returns_the_409(self):
-        import io, json
-        body = json.dumps({"dv_engine": "native"}).encode()
-        h = _req("127.0.0.1", path="/api/settings", **{"Content-Length": str(len(body))})
-        h.rfile = io.BytesIO(body)
-        sent = []
-        h._json = lambda obj, code=200: sent.append((code, obj))
-        with self._ndv(False):
-            h.do_POST()
-        self.assertEqual(sent[0][0], 409)
-        self.assertEqual(sent[0][1]["checks"][0]["id"], "native_dv")
-
-    def test_state_exposes_the_validated_engine(self):
-        import contextlib, orchestrator, scratch, series, logbook, power
-        self.settings._save(self.settings.SETTINGS_FILE, {"dv_engine": "Native"})   # hand-edited
-        with contextlib.ExitStack() as es:
-            for target, name, value in (
-                    (orchestrator.ORCH, "snapshot", {"enabled": False, "current": None}),
-                    (orchestrator.ORCH, "finisher_views", []),
-                    (server, "build_state", {}), (power, "read_power", None),
-                    (server, "collect_scratch", None), (server, "read_adapter_watts", None),
-                    (scratch, "folder_preview", []), (series, "get_mode", "tv"),
-                    (server, "series_info", None), (server, "movies_info", None),
-                    (server, "dv_convert_info", None), (server, "youtube_info", None),
-                    (server, "up_next", []), (server, "show_profile_info", None),
-                    (logbook, "tail", [])):
-                es.enter_context(mock.patch.object(target, name, return_value=value))
-            st = server.current_state()
-            self.assertEqual(st["settings"]["dv_engine"], "resolve")   # what the engine uses
-            self.settings._save(self.settings.SETTINGS_FILE, {"dv_engine": "native"})
-            self.assertEqual(server.current_state()["settings"]["dv_engine"], "native")

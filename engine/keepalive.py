@@ -1,8 +1,8 @@
 """Keep the flaky external scratch SSD's connection fresh.
 
 The external "2TB SSD" connection degrades when left idle, which then makes the
-next big read/write crawl (Resolve renders go ~1%/min vs finishing in ~10 min
-when the drive is freshly mounted). So during idle periods the engine
+next big read/write crawl (a render went ~1%/min vs finishing in ~10 min when the
+drive was freshly mounted). So during idle periods the engine
 force-reconnects the drive (the same unmount->mount cycle scratch.py uses) once
 it has been idle past an interval (default 1 hour).
 

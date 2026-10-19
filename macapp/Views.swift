@@ -44,11 +44,8 @@ enum DS {
     // Text drawn ON a silver plate (the lit Stop button, the active stage's icon well).
     static let graphiteText = Color(.displayP3, red: 0.10, green: 0.11, blue: 0.12)
 
-    // The one hue exception — genuine fault surfaces + the "not controlling the screen" indicator.
+    // The one hue exception — genuine fault surfaces.
     static let fault = Color(.displayP3, red: 0.92, green: 0.30, blue: 0.27)
-    // Screen-Control "off" rim — a MUTED red (desaturated toward the steel theme, still clearly reddish).
-    static let quietRedLight = Color(.displayP3, red: 0.78, green: 0.44, blue: 0.42)
-    static let quietRedDark  = Color(.displayP3, red: 0.44, green: 0.19, blue: 0.18)
 
     static let radiusCard: CGFloat = 16
     static let radiusControl: CGFloat = 10
@@ -417,13 +414,10 @@ struct HeaderBar: View {
             }
             Button(action: { store.showSettings.toggle() }) {
                 // A bare glyph, no plate: the gear is a way IN, never the action on this bar —
-                // giving it a button chrome made it compete with Activate. Screen Control lives
-                // inside the popup now, so the gear carries its one at-a-glance signal: it goes
-                // red while the pipeline is holding off the screen, since that state pauses
-                // Resolve and is easy to forget about.
+                // giving it a button chrome made it compete with Activate.
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(store.quietMode ? DS.quietRedLight : DS.steel)
+                    .foregroundStyle(DS.steel)
                     .contentShape(Rectangle())           // keep the whole glyph box clickable
             }
             .buttonStyle(.plain)
@@ -463,8 +457,8 @@ struct HeaderBar: View {
 
 /// The header's ONE readout: power, battery, and how far along the item nearest to shipping is.
 ///
-/// "Nearest to shipping" = the highest-index LIVE stage in PIPELINE (download → topaz → resolve
-/// → remux → upload). Two stages run at once — the run thread owns download/topaz/resolve, the
+/// "Nearest to shipping" = the highest-index LIVE stage in PIPELINE (download → topaz → dv
+/// → remux → upload). Two stages run at once — the run thread owns download/topaz/dv, the
 /// finisher owns remux/upload/cleanup — so with Topaz at 41% and Remux at 17% this shows the
 /// REMUX's 17%: that item is the one about to leave the machine.
 struct PowerPill: View {
@@ -483,8 +477,8 @@ struct PowerPill: View {
     private var leadStage: (Int, String, Int, String?)? {
         guard let up = PipelineCard.unifiedProgress(store.state) else { return nil }
         // `cleanup` has no PIPELINE card; it is past upload, so it borrows the upload glyph.
-        // `dvnative` / `dvrender` have the card in Resolve's slot (pipelineCards), so they read
-        // as that one.
+        // `dvnative` / `dvrender` have the card in the Dolby Vision slot (pipelineCards), so
+        // they read as that one.
         let cards = pipelineCards(for: up.stage)
         let idx = cards.firstIndex { $0.key == up.stage } ?? (up.stage == "cleanup" ? cards.count : -1)
         guard idx >= 0 else { return nil }
@@ -566,233 +560,6 @@ struct PowerPill: View {
     }
 }
 
-/// WHICH SCREEN RESOLVE RUNS ON.
-///
-/// Sits with Screen Control because it is the same subject: what the pipeline does to the
-/// machine you are sitting at. Off by default — Resolve opens wherever it opens (the main
-/// display), exactly as it always has.
-///
-/// A display has to be PROVEN before it can be chosen. Driving a screen nobody is looking
-/// at turns a bad template match from a loud failure into silent wrong clicks, so "Test"
-/// scores every template against that screen and the result is remembered.
-///
-/// Honest about what this does NOT fix, in the copy as well as here: the mouse pointer is
-/// one object shared by every display. Hosting Resolve elsewhere stops it covering your
-/// work; it cannot give the pipeline a cursor of its own.
-struct ResolveHostSection: View {
-    @EnvironmentObject var store: AppStore
-
-    private var d: DisplaysDTO? { store.displays }
-    private var hostable: [DisplayDTO] { (d?.displays ?? []).filter { !($0.main ?? false) } }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle(isOn: Binding(get: { d?.enabled ?? false },
-                                 set: { v in Task { await store.setDisplayPinning(v) } })) {
-                Text("Run Resolve on another screen").font(.system(size: 12))
-            }
-            .help("Off: Resolve opens on the main display, as it always has. On: it is moved "
-                  + "to the highest-priority screen below that is eligible and proven.")
-
-            if hostable.isEmpty {
-                Text("No second screen attached.")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
-            } else {
-                ForEach(hostable) { disp in row(disp) }
-                if (d?.enabled ?? false) {
-                    Text(hostLine).font(.system(size: 11)).foregroundStyle(.tertiary)
-                }
-            }
-
-            Divider().padding(.vertical, 2)
-            warningRow
-        }
-        .task { await store.fetchDisplays() }
-    }
-
-    private var hostLine: String {
-        if let h = d?.host, let n = h.name { return "Resolve will run on \(n)." }
-        return "Resolve will run on the main display — \(d?.host_reason ?? "no screen chosen")."
-    }
-
-    @ViewBuilder private func row(_ disp: DisplayDTO) -> some View {
-        let key = disp.key ?? ""
-        let chosen = (d?.priority ?? []).contains(key)
-        HStack(spacing: 8) {
-            Image(systemName: "display").font(.system(size: 12)).foregroundStyle(DS.steelDim)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(disp.name ?? key).font(.system(size: 12)).foregroundStyle(DS.steel)
-                Text(subtitle(disp)).font(.system(size: 10)).foregroundStyle(.tertiary)
-            }
-            Spacer()
-            if disp.eligible == true {
-                if store.smokeRunning == key {
-                    ProgressView().controlSize(.small)
-                } else if disp.smoke_pass == true {
-                    Button(chosen ? "Chosen" : "Choose") {
-                        Task { await store.setDisplayPriority(chosen ? [] : [key]) }
-                    }
-                    .buttonStyle(.plain).font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(chosen ? DS.steel : Color.brand)
-                } else {
-                    Button("Test") { Task { await store.runDisplaySmoke(key) } }
-                        .buttonStyle(.plain).font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Color.brand)
-                        .help("Open Resolve full-screen on that display first, then Test — it "
-                              + "scores every template against it.")
-                }
-            }
-        }
-    }
-
-    private func subtitle(_ disp: DisplayDTO) -> String {
-        if disp.eligible != true { return disp.why_not ?? "can't host Resolve" }
-        if disp.smoke_pass == true {
-            let best = disp.smoke_best.map { String(format: "%.2f", $0) } ?? "-"
-            return "proven (best template \(best))"
-        }
-        return "not tested yet — Resolve's templates haven't been checked on this screen"
-    }
-
-    @ViewBuilder private var warningRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Toggle(isOn: Binding(get: { d?.warn_takeover ?? true },
-                                 set: { v in Task { await store.setTakeoverWarning(v) } })) {
-                Text("Warn before taking the screen").font(.system(size: 12))
-            }
-            Text("A notice appears here just before the pipeline takes the screen and mouse "
-                 + "— roughly ten seconds of Resolve setup still runs after it, so it costs "
-                 + "no time. Not a countdown: the exact moment isn't predictable.")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
-            Text("The mouse pointer is shared by every screen — moving Resolve stops it "
-                 + "covering your work, but the pipeline still borrows the pointer to click.")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
-        }
-    }
-}
-
-/// SCREEN CONTROL, now a Settings row rather than a header button.
-///
-/// It can only be switched off for a WHILE — a duration or a clock time, never indefinitely.
-/// Holding items before Resolve buffers their ~190 GiB Topaz intermediates against the disk
-/// floor, so a forgotten "off" doesn't keep the Mac free, it quietly stalls the run. The
-/// engine owns the deadline (`quiet_until`), so the pause still lifts if the app is closed.
-struct ScreenControlSection: View {
-    @EnvironmentObject var store: AppStore
-    @State private var untilTime = Date().addingTimeInterval(3600)
-    @State private var now = Date()
-
-    // Mirrors settings.MAX_QUIET_SECONDS — the UI can't offer a pause the engine would clamp.
-    private static let maxSeconds = 4 * 3600
-    private static let presets: [(String, Int)] = [
-        ("30m", 1800), ("1h", 3600), ("2h", 7200), ("4h", 14400),
-    ]
-
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    private func remaining(_ until: Date) -> String {
-        let s = max(0, Int(until.timeIntervalSince(now)))
-        return s >= 3600 ? "\(s / 3600)h \((s % 3600) / 60)m" : "\(max(1, s / 60))m"
-    }
-
-    private static let clock: DateFormatter = {
-        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none; return f
-    }()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Screen control").font(.system(size: 13, weight: .medium))
-                    Text(store.quietMode
-                         ? "Paused — the pipeline is leaving the screen alone."
-                         : "The pipeline may take the screen to run Dolby Vision.")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 10)
-                Text(store.quietMode ? "Paused" : "On")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(store.quietMode ? DS.quietRedLight : DS.steel)
-            }
-
-            if let until = store.quietUntil {
-                // PAUSED: say exactly when it comes back, and offer the way out.
-                HStack(spacing: 8) {
-                    Text("Back on at \(Self.clock.string(from: until)) · \(remaining(until)) left")
-                        .font(.system(size: 11)).foregroundStyle(DS.steel).monospacedDigit()
-                    Spacer()
-                    Button("Resume now") { Task { await store.resumeScreenControl() } }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(DS.steelBright)
-                        .padding(.horizontal, 9).padding(.vertical, 4)
-                        .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
-                        .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
-                }
-            } else {
-                // ON: the only way to switch it off is to say for how long.
-                HStack(spacing: 6) {
-                    Text("Pause for").font(.system(size: 11)).foregroundStyle(.secondary)
-                    ForEach(Self.presets, id: \.0) { label, secs in
-                        Button(label) { Task { await store.pauseScreenControl(seconds: secs) } }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(DS.steelBright)
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
-                            .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
-                    }
-                }
-                HStack(spacing: 6) {
-                    Text("or until").font(.system(size: 11)).foregroundStyle(.secondary)
-                    DatePicker("", selection: $untilTime, displayedComponents: .hourAndMinute)
-                        .labelsHidden().datePickerStyle(.field).fixedSize()
-                    // Show what the picked time actually BUYS, so the 4 h clamp is visible
-                    // rather than silent — picking a time already gone today would otherwise
-                    // look like it did nothing in particular.
-                    Text(durationLabel(secondsUntilChosenTime()))
-                        .font(.system(size: 11)).monospacedDigit()
-                        .foregroundStyle(secondsUntilChosenTime() >= Self.maxSeconds
-                                         ? DS.quietRedLight : DS.steel)
-                    Button("Set") {
-                        Task { await store.pauseScreenControl(seconds: secondsUntilChosenTime()) }
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(DS.steelBright)
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
-                    .overlay(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
-                    Spacer()
-                }
-                Text("Longest pause is 4 hours — beyond that, held items fill the disk and the run stalls.")
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .onReceive(tick) { now = $0 }
-    }
-
-    /// "→ 1h 30m", or "→ 4h (max)" when the pick was long enough to be clamped.
-    private func durationLabel(_ secs: Int) -> String {
-        let h = secs / 3600, m = (secs % 3600) / 60
-        let body = h > 0 ? (m > 0 ? "\(h)h \(m)m" : "\(h)h") : "\(m)m"
-        return secs >= Self.maxSeconds ? "→ \(body) (max)" : "→ \(body)"
-    }
-
-    /// The picker gives an hour+minute; resolve it to the NEXT time that clock reads (so
-    /// 1 AM chosen at 11 PM means tonight's 1 AM, not this morning's) and cap at 4 h out.
-    private func secondsUntilChosenTime() -> Int {
-        let cal = Calendar.current
-        let c = cal.dateComponents([.hour, .minute], from: untilTime)
-        let n = Date()
-        var target = cal.date(bySettingHour: c.hour ?? 0, minute: c.minute ?? 0, second: 0, of: n) ?? n
-        if target <= n { target = cal.date(byAdding: .day, value: 1, to: target) ?? target }
-        return min(Int(target.timeIntervalSince(n)), Self.maxSeconds)
-    }
-}
-
 // MARK: - pipeline
 
 // Monochrome steel: stages carry no per-stage hue — they differ by symbol, name, and
@@ -807,33 +574,32 @@ let EXTEND_STAGE = StageInfo(
         + "are generated; the original picture ships untouched.",
     how: "WAN VACE \u{00B7} chunked")
 
-// The native Dolby Vision lane's analysis (run stage 'dvnative': dv_engine 'native', TV only).
-// It is the step Resolve fills on every other path, so while it runs its card takes Resolve's
-// slot rather than joining as a sixth beside an idle Resolve. Display only: dv_engine dictates
-// the output bytes, so like the cap and the loudness target it has no control here.
+// The Dolby Vision step's analysis phase (run stage 'dvnative': the chunk lane, TV only). While it
+// runs, its card takes the Dolby Vision slot in place of the idle PIPELINE card. Display only:
+// the route dictates the output bytes, so like the cap and the loudness target it has no control
+// here.
 let DVNATIVE_STAGE = StageInfo(
-    key: "dvnative", name: "DV analysis", symbol: "wand.and.rays",
+    key: "dvnative", name: "Dolby Vision", symbol: "wand.and.rays",
     desc: "Measure every frame's light straight from the Topaz chunks, through the SDR→PQ LUT, and "
-        + "generate the Dolby Vision metadata — no screen, no render.",
+        + "generate the Dolby Vision metadata — no separate render pass.",
     how: "hdr_analyzer · CM v4.0 · DV 8.1")
 
-// The native Dolby Vision render (run stage 'dvrender': a route set 'native' in dv_routes, e.g.
-// a native-4K YouTube video). It writes the very file Resolve writes, so like 'dvnative' its card
-// takes Resolve's slot while it runs. Display only: dv_routes dictates the output bytes, so like
-// dv_engine it has no control here.
+// The Dolby Vision step's render phase (run stage 'dvrender': every item the chunk lane does not
+// take, e.g. a native-4K YouTube video). Like 'dvnative' its card takes the Dolby Vision slot while
+// it runs. Display only: the route dictates the output bytes.
 let DVRENDER_STAGE = StageInfo(
     key: "dvrender", name: "Dolby Vision", symbol: "wand.and.rays",
     desc: "Measure every frame's light through the SDR→PQ LUT, encode the 4K picture on the media "
-        + "engine and fold the Dolby Vision metadata in — no screen, no Resolve.",
+        + "engine and fold the Dolby Vision metadata in.",
     how: "hdr_analyzer · VideoToolbox · DV 8.1")
 
-/// PIPELINE as it reads while `stage` runs: 'dvnative' or 'dvrender' stands in Resolve's slot.
-/// Every other stage gets PIPELINE itself. The card row and the header readout both go through
-/// this.
+/// PIPELINE as it reads while `stage` runs: 'dvnative' or 'dvrender' stands in the Dolby Vision
+/// slot. Every other stage gets PIPELINE itself. The card row and the header readout both go
+/// through this.
 func pipelineCards(for stage: String?) -> [StageInfo] {
     guard let swap = [DVNATIVE_STAGE, DVRENDER_STAGE].first(where: { $0.key == stage })
     else { return PIPELINE }
-    return PIPELINE.map { $0.key == "resolve" ? swap : $0 }
+    return PIPELINE.map { $0.key == "dv" ? swap : $0 }
 }
 
 let PIPELINE: [StageInfo] = [
@@ -841,8 +607,8 @@ let PIPELINE: [StageInfo] = [
           desc: "Pull the 1080p source from the NAS to local scratch.", how: "FTP RETR · size-verified"),
     .init(key: "topaz", name: "Topaz", symbol: "cpu",
           desc: "Upscale sub-4K sources to 4K. ProRes HQ 10-bit, range preserved — never SDR↔HDR. 4K sources skip it.", how: "per-show preset"),
-    .init(key: "resolve", name: "Resolve", symbol: "wand.and.stars",
-          desc: "Scene-cut, Dolby Vision analyze, render mute master — HDR inherited from the project.", how: "H.265 Main10 · DV 8.1"),
+    .init(key: "dv", name: "Dolby Vision", symbol: "wand.and.rays",
+          desc: "Measure every frame's light, generate the Dolby Vision metadata and, where the item needs it, render the 4K picture — HDR added only to SDR sources.", how: "hdr_analyzer · DV 8.1"),
     .init(key: "remux", name: "Remux", symbol: "square.stack.3d.up",
           desc: "Re-encode the DV video under a hard peak-bitrate cap, fold the original audio + subtitles back on, smart loudness boost.", how: "x265 peak-cap · DV 8.1"),
     .init(key: "upload", name: "Upload", symbol: "arrow.up.circle",
@@ -874,13 +640,13 @@ struct PipelineCard: View {
         let cur = o?.current
         let skippable = running && cur?.kind == "youtube"
         // The two independently-active stages under the topaz/remux overlap: the RUN thread's
-        // stage (download/topaz/resolve) and the FINISHER thread's stage (remux/upload/cleanup).
+        // stage (download/topaz/dv) and the FINISHER thread's stage (remux/upload/cleanup).
         let runStage = running ? o?.stage : nil
         // A lane counts as LIVE only when it is actually working. `finishing` is set the
         // moment the finisher CLAIMS an item — before any encoding — and it keeps its
-        // last-known percentage while suspended for Resolve. Keying the card on its mere
-        // presence opened Remux the instant you hit Activate, looking exactly like work in
-        // progress, and left it open beside an active Resolve that had just frozen it.
+        // last-known percentage while suspended for AI outpainting or a sibling app. Keying the
+        // card on its mere presence opened Remux the instant you hit Activate, looking exactly
+        // like work in progress, and left it open beside the job that had just frozen it.
         // EVERY live lane's stage, not just the first one's. The two lanes are independent and
         // routinely sit in DIFFERENT stages — lane 1 uploading while lane 2 is still remuxing.
         // Collapsing them to one stage put both lanes' rows inside whichever card happened to
@@ -921,7 +687,7 @@ struct PipelineCard: View {
                 else { return false }
                 return (s.extend_borders ?? false) && s.aspect == "4:3"
             }()
-            // The native DV analysis / render takes Resolve's card while it runs
+            // The DV analysis / render phase takes the Dolby Vision card while it runs
             // (DVNATIVE_STAGE / DVRENDER_STAGE).
             let stages: [StageInfo] = {
                 guard showExtend else { return pipelineCards(for: runStage) }
@@ -945,7 +711,7 @@ struct PipelineCard: View {
     }
 
     /// Is this lane doing work right now? Not merely claimed, and not frozen.
-    ///  * `holding` set  -> suspended for Resolve; Resolve is the live stage, not this.
+    ///  * `holding` set  -> suspended while AI outpainting or a sibling app has the machine.
     ///  * `pct` nil      -> claimed but nothing encoded yet (the state at Activate).
     static func laneLive(_ f: FinishingDTO?) -> Bool {
         guard let f, f.stage?.isEmpty == false else { return false }
@@ -964,7 +730,7 @@ struct PipelineCard: View {
     /// 2026-08-06) — one computation, so the two can never disagree. ONE pick among
     /// everything actively carrying a number: the EARLIEST episode processing anywhere
     /// (user-dictated) — whichever step it is on, finisher lane or run thread, a lane
-    /// suspended for Resolve included (its frozen %, exactly what the bar shows).
+    /// suspended by another job included (its frozen %, exactly what the bar shows).
     /// Non-episodes (movies, YouTube — no SxxEyy ordinal) sort after episodes; among
     /// themselves, finisher-before-run keeps the old precedence. nil = idle → plain
     /// icon, no header number.
@@ -1226,18 +992,6 @@ struct StageView: View {
                 if isActive {
                     VStack(alignment: .leading, spacing: 7) {
                         Text(info.how).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
-                        // Resolve is the one stage whose work is INVISIBLE from here — it is
-                        // driving a real UI, possibly on a screen you are not looking at. A
-                        // live frame of that screen is the only honest progress indicator it
-                        // has, and it is how you see a wrong-screen or stuck-dialog failure
-                        // without going to look.
-                        // The preview ENDS once the render starts (user-dictated):
-                        // analysis is over, and each frame is a 4K screencapture
-                        // taken while the machine renders.
-                        if info.key == "resolve"
-                            && store.state?.orchestrator?.progress?.rendering != true {
-                            ResolvePreview()
-                        }
                         if role == .finisher { FinisherProgress(stageKey: info.key) }
                         // `alwaysSegEta` while the card is open: the segment countdown belongs
                         // in the SAME place it sits when the gate lets it through, not in a
@@ -1275,159 +1029,6 @@ struct StageView: View {
             // same idiom Pill uses. An idle card still gets one — it shows neither.
             .help(isActive ? "" : "\(info.desc)  (\(info.how))")
             .animation(.easeInOut(duration: 0.22), value: isActive)
-        }
-    }
-}
-
-/// A live frame of the screen the Resolve stage is driving, inside its pipeline card.
-///
-/// Polled rather than streamed: each frame is a real `screencapture` of a 3840x2160 panel,
-/// so the cadence is deliberately slow — this is a "what is it doing" window, not a video
-/// feed, and the machine is busy rendering. The server downscales and JPEG-encodes so the
-/// loopback isn't carrying full frames.
-struct ResolvePreview: View {
-    @EnvironmentObject var store: AppStore
-    @State private var frame: NSImage?
-    @State private var failed = false
-
-
-    var body: some View {
-        Group {
-            if let img = frame {
-                Image(nsImage: img)
-                    .resizable().aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
-                    // Click-to-expand affordance: quiet corner glyph, always there — a
-                    // hover-only hint is invisible on a machine nobody is sitting at.
-                    .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .padding(4)
-                            .background(Circle().fill(Color.black.opacity(0.45)))
-                            .foregroundStyle(.secondary)
-                            .padding(5)
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.22)) {
-                            store.resolvePreviewExpanded = true
-                        }
-                    }
-                    .help("Live view of the screen Resolve is running on — click to expand")
-            } else if !failed {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.05))
-                    .frame(height: 96)
-                    .overlay(ProgressView().controlSize(.small))
-            }
-        }
-        // THE FREEZE. This used to drive itself off a stored
-        // `Timer.publish(...).autoconnect()`. A stored property is rebuilt every time the
-        // view is re-initialised, and the pipeline card re-renders on every 1.5 s state
-        // poll — so the 2 s timer was reset before it could ever fire, `load()` ran exactly
-        // once from `.task`, and the preview sat on that first frame forever. It showed the
-        // desktop because that is what the screen looked like before Resolve had opened.
-        //
-        // A `.task` loop is tied to the view's IDENTITY, not to its re-initialisation, so it
-        // survives the re-renders and keeps running.
-        .task {
-            while !Task.isCancelled {
-                // While the full-width overlay is up, ITS loop owns the polling — two
-                // pollers would double the 4K screencapture load for the same pixels.
-                if !store.resolvePreviewExpanded {
-                    await load()
-                }
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
-        }
-    }
-
-    private func load() async {
-        // Sequential by construction now — the loop awaits each load before sleeping — so no
-        // in-flight guard is needed and requests cannot pile up.
-        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg") else { return }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 8
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            // 204 = the server has no frame yet; keep whatever is on screen and keep asking.
-            guard code == 200, !data.isEmpty, let img = NSImage(data: data) else { return }
-            frame = img
-            failed = false
-        } catch {
-            if frame == nil { failed = true }    // only give up the placeholder if never loaded
-        }
-    }
-}
-
-/// The Resolve preview blown up to the FULL window width (click the card's preview to
-/// open, click anywhere to close). Same polled source as the card — its loop pauses
-/// while this one runs, so the server still captures the 4K panel once per tick.
-/// Auto-collapses when the Resolve stage stops being the active run stage: the frames
-/// go stale the moment the pass ends, and a dead fullscreen frame reads as a hang.
-struct ExpandedResolvePreview: View {
-    @EnvironmentObject var store: AppStore
-    @State private var frame: NSImage?
-
-    private var resolveActive: Bool {
-        let o = store.state?.orchestrator
-        return (o?.stage_active ?? false) && ((o?.progress?.stage ?? o?.stage) == "resolve")
-            && o?.progress?.rendering != true      // the render phase closes the preview too
-    }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.72)          // scrim: the app recedes, the screen is the subject
-            VStack(spacing: 10) {
-                if let img = frame {
-                    Image(nsImage: img)
-                        .resizable().aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity)          // the full window width
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
-                } else {
-                    ProgressView().controlSize(.large)
-                }
-                Text("Live view of the screen Resolve is driving — click anywhere to close")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 12)
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.easeInOut(duration: 0.22)) { store.resolvePreviewExpanded = false }
-        }
-        .task {
-            while !Task.isCancelled {
-                await load()
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
-        }
-        .onChange(of: resolveActive) { _, active in
-            if !active {
-                withAnimation(.easeInOut(duration: 0.22)) { store.resolvePreviewExpanded = false }
-            }
-        }
-        .transition(.opacity.combined(with: .scale(scale: 0.98)))
-    }
-
-    private func load() async {
-        // The 1080p-class variant — the card's 420w tile stretched to the full window
-        // was mush. Same server-side capture; only the encode differs.
-        guard let url = URL(string: "http://127.0.0.1:8765/api/resolve-preview.jpg?size=big") else { return }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 8
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        if let (data, resp) = try? await URLSession.shared.data(for: req),
-           (resp as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty,
-           let img = NSImage(data: data) {
-            frame = img
         }
     }
 }
@@ -1542,8 +1143,9 @@ private struct LaneProgress: View {
                     Text(c).font(.system(size: 12, weight: .medium)).monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
-                // HELD, not stalled. A lane paused because Resolve took the machine keeps its
-                // last-known percentage on purpose; without saying so it reads as a hung encode.
+                // HELD, not stalled. A lane paused because AI outpainting or a sibling app took
+                // the machine keeps its last-known percentage on purpose; without saying so it
+                // reads as a hung encode.
                 if let h = held {
                     Text("held").font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary).help(h)
@@ -2049,12 +1651,12 @@ private struct TVMode: View {
 // The four per-show settings on ONE line, for a show the run has locked. Nothing here is
 // actionable while the pipeline is armed (every Change button is hidden), so four stacked
 // rows are four lines of dead weight — this says the same thing in one, in pipeline order:
-// what Topaz does, what Resolve masters, what the remux does to audio, what the upload does
+// what Topaz does, what the Dolby Vision step masters, what the remux does to audio, what the upload does
 // to the source. Same glyphs as the expanded rows, so it reads as the same information.
 private struct LockedSettingsLine: View {
     let preset: String
     let isDefaultPreset: Bool
-    let output: String            // the RESOLVED range (dv1000 / sdr)
+    let output: String            // the effective range (dv1000 / sdr)
     let normalized: Bool
     let replaces: Bool
     var extending: Bool = false   // 4:3 show with border extension ON (hidden otherwise)
@@ -2067,7 +1669,7 @@ private struct LockedSettingsLine: View {
         HStack(spacing: 7) {
             item("cpu", preset + (isDefaultPreset ? " (default)" : ""))
             dot
-            item("wand.and.stars", outputLabel)
+            item("wand.and.rays", outputLabel)
             dot
             item("square.stack.3d.up", normalized ? "Normalized audio" : "Original audio")
             dot
@@ -2079,7 +1681,7 @@ private struct LockedSettingsLine: View {
             Spacer(minLength: 0)
         }
         .lineLimit(1)
-        .help("Locked while the run is armed — Topaz preset, what Resolve masters, the remux's "
+        .help("Locked while the run is armed — Topaz preset, what it masters as, the remux's "
               + "audio, and the upload's source policy. Stop the run to change any of them.")
     }
 
@@ -2504,9 +2106,9 @@ private struct OutputModeRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            // The same glyph the RESOLVE stage carries in the timeline — this is a Resolve
-            // setting, and the row sits in pipeline order between Topaz and the remux.
-            Image(systemName: "wand.and.stars").font(.system(size: 12)).foregroundStyle(DS.steelDim)
+            // The same glyph the Dolby Vision stage carries in the timeline — this is a Dolby
+            // Vision setting, and the row sits in pipeline order between Topaz and the remux.
+            Image(systemName: "wand.and.rays").font(.system(size: 12)).foregroundStyle(DS.steelDim)
             Text(Self.label(current))
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
@@ -2920,7 +2522,7 @@ private struct MovieRow: View {
                             .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
                             .padding(.horizontal, 7).padding(.vertical, 2)
                             .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
-                            .help("Already 4K: it skips Topaz and goes straight to Resolve for Dolby Vision")
+                            .help("Already 4K: it skips Topaz and goes straight to Dolby Vision")
                     } else {
                         Text(catalog.first { $0.key == m.preset }?.label ?? (m.preset ?? "—"))
                             .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.steel)
@@ -2950,7 +2552,7 @@ private struct MovieRow: View {
                     }
                     Button("Keep processing", role: .cancel) {}
                 } message: {
-                    Text("Its unfinished download, Resolve and remux work is thrown away. "
+                    Text("Its unfinished download, Dolby Vision and remux work is thrown away. "
                          + "Anything already uploaded to the NAS stays.")
                 }
             }
@@ -2962,7 +2564,7 @@ private struct MovieRow: View {
             // OUTSIDE the tappable HStack — the row tap opens the preset chooser, and the
             // Change buttons must not trigger it. Keyed by TITLE (the movie's settings key).
             // COMBINE rows hide the inert controls (user rule): a combine has no
-            // Topaz/Resolve encode to range-pin, so only the source's fate is still a real
+            // Topaz/Dolby Vision encode to range-pin, so only the source's fate is still a real
             // choice.
             if m.combine != true {
                 OutputModeRow(key: m.title ?? m.name ?? "", effective: m.output_mode_effective ?? "dv1000")
@@ -3111,7 +2713,7 @@ private struct VerdictCard: View {
             Divider()
             row("film", "Video", sideLabel(v?.video_from), v?.video_why)
             row("sparkles.tv", "Dolby Vision",
-                (v?.rpu_from == "resolve") ? "Resolve analysis"
+                (v?.rpu_from == "native") ? "generated (native analysis)"
                     : "real (P\(v?.rpu_profile ?? "?")) from the \(sideLabel(v?.rpu_from))",
                 v?.rpu_why)
             row("speaker.wave.3", "Audio", sideLabel(v?.audio_from), v?.audio_why)
@@ -3960,11 +3562,11 @@ private struct UpNextView: View {
                              ? "Imported individually — one you asked for by hand. It runs in its normal "
                                + "cadence turn; it does not preempt what is running."
                              : "Queued to jump the queue — starts at the next safe boundary: after the "
-                               + "current Topaz segment or download. A running Resolve always finishes first."))
+                               + "current Topaz segment or download. A running Dolby Vision render always finishes first."))
             } else {
                 iconButton("arrow.up.to.line", enabled: true,
                            help: "Run this video now — the current segment finishes first, "
-                               + "then this starts (Resolve is never cut off) and whatever "
+                               + "then this starts (a running Dolby Vision render is never cut off) and whatever "
                                + "was running resumes afterwards") {
                     await store.runYoutubeNow(name: it.name ?? "")
                 }
@@ -4251,12 +3853,8 @@ struct SettingsPopover: View {
             Divider()
             Text("Settings").font(.system(size: 15, weight: .semibold))
 
-                ScreenControlSection()
-                ResolveHostSection()
-                Divider()
-
                 // The basics are the ones you actually reach for: what the run is chewing
-                // through, how much of the machine it takes, and the screen. Everything that is
+                // through and how much of the machine it takes. Everything that is
                 // set once and forgotten — the hardware pins, the disk floors, the failure
                 // thresholds — sits under Advanced.
                 SettingRow(title: "Shows at once",
@@ -4325,14 +3923,6 @@ struct SettingsPopover: View {
                                 .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-
-                        // Every 4K source skips Topaz now — there is no bitrate to qualify by
-                        // (user-dictated 2026-09-30), so the old "4K fast path" Mbps row is gone.
-                        SettingsGroupLabel(text: "4K fast path").padding(.top, 4)
-                        SettingRow(title: "Remuxes beside a fast-path Resolve",
-                                   blurb: "Never (the default) gives every Resolve the whole machine. Raising it lets a fast-path title's Resolve share with this many running remuxes.",
-                                   key: "resolve_share_remuxes", fallback: 0,
-                                   range: 0...2, zeroLabel: "Never")
                     }
                 } label: {
                     Text("Advanced settings").font(.system(size: 13, weight: .medium))
@@ -4517,7 +4107,7 @@ struct ScratchContentsCard: View {
         if n.hasSuffix(".tracks.mp4") { return "Audio tracks · temp" }
         if n.hasSuffix(".dv.mp4") { return "DV wrap · temp" }
         if n.contains("_mezz.mp4.segments") { return "Compat copy segments" }
-        if n.hasSuffix("_mezz.mp4") { return "Resolve compat copy" }
+        if n.hasSuffix("_mezz.mp4") { return "Compat copy" }
         if n.contains("_prob4_upscaled.segments") { return "Topaz segments" }
         if n.contains("_prob4_upscaled") { return "Topaz ProRes" }
         if n.contains(" hdr10 dv upscaled") { return n.hasSuffix(".mov") ? "DV render" : "4K DV master" }
@@ -4539,13 +4129,12 @@ struct ScratchContentsCard: View {
     }
 }
 
-// MARK: - grants + footer
+// MARK: - notices + footer
 
-struct GrantsCard: View {
+struct NoticesCard: View {
     @EnvironmentObject var store: AppStore
     var body: some View {
         let t = store.selftest
-        let grantsOK = (t?.screen_recording ?? false) && (t?.accessibility ?? false)
         // the arm-gate 409's face: the server named exactly what refused — show it
         if let err = store.lastError {
             Card(title: "Can't start", systemImage: "exclamationmark.octagon") {
@@ -4553,14 +4142,14 @@ struct GrantsCard: View {
                     .textSelection(.enabled)
             }
         }
-        // HARD requirements (exact Resolve/Topaz builds + a 2.0-backing-scale display —
-        // engine/versions.py). hard_ok false → the server refuses to arm; explain why here.
+        // HARD requirement (the exact Topaz build — engine/versions.py). hard_ok false → the
+        // server refuses to arm; explain why here.
         if let t, t.hard_ok == false {
             Card(title: "Unsupported setup", systemImage: "xmark.octagon") {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 12) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DS.steelBright)
-                        Text("Visionary requires DaVinci Resolve Studio 18.6.0, Topaz Video AI 7.0.1, and a main display rendering at 2.0x (Retina/HiDPI — a built-in panel, a 4K/5K monitor in its default scaled mode, or a 4K dummy plug). It will not arm until they match.")
+                        Text("Visionary requires Topaz Video AI 7.0.1. It will not arm until it matches.")
                             .font(.system(size: 13, weight: .medium))
                     }
                     ForEach((t.found ?? [:]).sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
@@ -4570,13 +4159,13 @@ struct GrantsCard: View {
             }
         }
         // FIRST-RUN: everything else healthy but setup incomplete (no config yet, tools
-        // missing, projects not imported) — point at the one place that finishes it.
+        // missing) — point at the one place that finishes it.
         if let t, t.hard_ok != false, t.setup_complete == false {
             Card(title: "Finish setup", systemImage: "wrench.and.screwdriver") {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("A few setup steps are still open").font(.system(size: 13, weight: .medium))
-                        Text("Connections, dependencies, permissions and the Resolve import all live in one place.")
+                        Text("Connections and dependencies all live in one place.")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -4585,23 +4174,7 @@ struct GrantsCard: View {
                 }
             }
         }
-        if t != nil && !grantsOK {
-            Card(title: "Permissions", systemImage: "lock.shield") {
-                HStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DS.steelBright)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("The Resolve stage needs Screen Recording + Accessibility").font(.system(size: 13, weight: .medium))
-                        Text("Screen Recording: \(yn(t?.screen_recording))   ·   Accessibility: \(yn(t?.accessibility))")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Request Accessibility") { Task { await store.requestAccessibility() } }
-                        .buttonStyle(SteelButtonStyle(lit: false))
-                }
-            }
-        }
     }
-    func yn(_ b: Bool?) -> String { (b ?? false) ? "granted" : "not granted" }
 }
 
 struct FooterBar: View {
@@ -4671,7 +4244,7 @@ struct RootView: View {
             HeaderBar()
             ScrollView {
                 VStack(spacing: 16) {
-                    GrantsCard()
+                    NoticesCard()
                     PipelineCard()
                     SeriesCard()
                     // (Settings moved to the header gear — see HeaderBar / SettingsPopover.)
@@ -4692,14 +4265,6 @@ struct RootView: View {
         .frame(width: 1080, height: 620)     // fixed: fold lands at the Current-series card's end
                                              // with the pipeline stage expanded (settings live below the fold)
         .background(TheatreStage(scrollY: scrollY))
-        .overlay {
-            // The Resolve preview at the FULL window width (click the card's preview to
-            // open). Mounted HERE — the one place that spans the whole window — so the
-            // card's tile can hand off to something genuinely edge to edge.
-            if store.resolvePreviewExpanded {
-                ExpandedResolvePreview()
-            }
-        }
         .tint(Color.brand)   // steel-blue accent app-wide, echoing the Visionary icon
     }
 }

@@ -1,38 +1,34 @@
-"""Native Dolby Vision metadata: measure the picture ourselves, no Resolve Analyze.
+"""Native Dolby Vision metadata: measure the picture ourselves.
 
-WHY: Resolve's DV pass is the slowest and most fragile stage (full-screen UI automation,
-template matching, ~2 min scene cuts + ~7 min Analyze + 4-14 min render), and its HEVC
-render is thrown away anyway — dvcap re-encodes it with x265 under the peak cap. What Resolve
-really contributes is (1) the SDR->PQ conversion, (2) shot detection, (3) DV analysis. This
-module replaces (2) and (3); (1) is a LUT fitted to Resolve's own output, applied by ffmpeg
-(`lut_vf`).
+WHAT IT DOES: (1) the SDR->PQ conversion, (2) shot detection, (3) Dolby Vision analysis. (1) is
+the one captured LUT (the reference 1000-nit conversion, archived with its sha256 manifest),
+applied by ffmpeg (`lut_vf`); (2) and (3) are below.
 
 HOW:
   1. hdr-analyze's `hdr_analyzer_mvp` (MIT, github.com/tinof/hdr-analyze, built from source at
      a pinned commit — HDR_ANALYZER_COMMIT) measures the PQ picture: scene cuts plus per-scene
      L1 (min / max-RGB average / max, 12-bit PQ codes) into a JSON sidecar.
   2. `frame_l4()` measures, per frame, the mean and standard deviation of PQ max(R,G,B) —
-     the two values Resolve's L4 (anchor_pq / anchor_power) track on our own masters
+     the two values the reference masters' L4 (anchor_pq / anchor_power) track
      (black-box: r = 0.999 and 0.97 against pixel truth on S06E01). Plain measurement; the
      meaning of L4 comes from a public Dolby patent (US 12573352), so patent risk is noted.
   3. `rpu_config()` turns both into a `dovi_tool generate` config. It started as a port of
      hdr-analyze's mkvdovi/src/metadata/rpu_config.rs::generate_extra_json (MIT, Copyright
-     (c) 2025 HDR-Analyze Contributors), with the static blocks set to what Resolve writes
+     (c) 2025 HDR-Analyze Contributors), with the static blocks set to what the reference
+     masters carry
      (CM v4.0, source range 7..3079, L9 BT.2020, L11 content type 0, L5 zero, a scene refresh
      on every frame) and L1 clamped to the declared 1000-nit source range.
   4. `dovi_tool generate` writes the binary RPU, which dvcap's x265 path interleaves exactly
-     like an RPU extracted from a Resolve render.
+     like an RPU extracted from a render.
   The TV lane measures Topaz's chunks (`analyze_chunks`); nativerender measures one file in
   scene ranges (`analyze_ranges`), optionally behind a geometry/matrix front end (`pre_vf`)
   and with another mastering (`MasterSpec`). Both run the same overlapped loop and default to
   exactly the chain and RPU above.
 
-WHAT IT DOES NOT DO: Dolby's CM v4 analysis. Resolve's L1 average is Dolby's "anchored"
-value (not a mean), and its L2 trims and L3 offsets come from Dolby's licensed analyzer;
+WHAT IT DOES NOT DO: Dolby's CM v4 analysis. A licensed analyzer's L1 average is Dolby's
+"anchored" value (not a mean), and its L2 trims and L3 offsets come from Dolby's algorithm;
 none of that is reproduced. L1 here is a true measurement (average floored at the CM v4
-minimum 1229, which is also Resolve's own minimum) and L2 is neutral (2048). Whether that
-looks as good on a real TV is decided by eye — the blind A/B — before any native master
-ships (settings `dv_engine`).
+minimum 1229, the reference masters' own minimum) and L2 is neutral (2048).
 """
 from __future__ import annotations
 import json
@@ -61,7 +57,7 @@ HDR_ANALYZER_COMMIT = getattr(_versions, "HDR_ANALYZER_COMMIT", "383b0ad")
                                     # tinof/hdr-analyze, built from source (cargo, Homebrew ffmpeg 8)
 ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# What Resolve's 1000-nit DV project writes (read from Resolve masters' RPUs with
+# What the reference 1000-nit DV masters carry (read from their RPUs with
 # `dovi_tool export`): mastering 0.0001..1000 nits, BT.2020 source primaries (L9 index 2),
 # L11 content type 0 / whitepoint 0 / reference mode off, L5 all zero, CM v4.0, and a scene
 # refresh flagged on EVERY frame (L1 held constant within a shot).
@@ -76,7 +72,7 @@ PQ12_MAX = 4095
 
 def nits_to_pq12(nits: float) -> int:
     """PURE. Absolute luminance -> 12-bit PQ code (SMPTE ST 2084), rounded. 1000 nits -> 3079,
-    100 -> 2081, 600 -> 2851, 0.0001 -> 7 (the codes Resolve's RPUs carry)."""
+    100 -> 2081, 600 -> 2851, 0.0001 -> 7 (the codes the reference RPUs carry)."""
     m1, m2 = 2610.0 / 16384.0, 2523.0 / 32.0
     c1, c2, c3 = 3424.0 / 4096.0, 2413.0 / 128.0, 2392.0 / 128.0
     y = max(0.0, min(float(nits), 10000.0)) / 10000.0
@@ -89,7 +85,7 @@ SOURCE_MIN_PQ = nits_to_pq12(MASTER_MIN_NITS)      # 7
 
 
 # ---- mastering: what one RPU declares ---------------------------------------------------
-# The constants above are Resolve's 1000-nit DV project, and every SDR route renders through
+# The constants above are the reference 1000-nit DV master, and every SDR route renders through
 # it. A route whose master is something else (an HDR source keeping its own mastering, a
 # 2000-nit project) passes a MasterSpec instead; the DEFAULT is exactly those constants, so a
 # caller that passes nothing generates the same RPU byte for byte (test_dvnative pins that on
@@ -157,15 +153,15 @@ class MasterSpec:
         raise ValueError(f"a {self.max_nits}-nit master needs its own mdcv string")
 
 
-DEFAULT_MASTER = MasterSpec()      # Resolve's 1000-nit project: today's RPU, unchanged
+DEFAULT_MASTER = MasterSpec()      # the reference 1000-nit master: today's RPU, unchanged
 
 # An HDR10 source KEEPS its own mastering (2026-10-18, the HDR intake routes rpu_only /
 # hdr_reencode): its mastering-display SEI becomes the RPU's L6 mastering range and the clamp for
 # L1/L4, and its content-light-level SEI is L6's MaxCLL/MaxFALL as it stands — never measured,
 # never clamped — so the RPU and the HDR10 metadata in the same stream can never disagree. That
 # is Dolby's rule for L6, and it is the rpu_only route's whole contract: the original stream ships
-# with its own SEI, so only the RPU can be made to match. (Resolve wrote its own project's L6
-# instead: the Hamilton render's RPU says MaxCLL 620 / MaxFALL 41 over a source whose SEI says 0,0.)
+# with its own SEI, so only the RPU can be made to match. (A source whose SEI says 0,0 —
+# "unknown" — is measured instead, in L6 and the SEI alike: stages.declared_light.)
 SOURCE_TRIM_TARGETS = TRIM_TARGETS_NITS     # the L2 targets a source's master keeps, minus any above its peak
 SOURCE_MIN_PEAK_NITS = 100                  # a mastering display under this is not an HDR one (bad SEI)
 
@@ -176,7 +172,7 @@ def source_mastering(master_display, max_cll) -> tuple:
     `max_cll` ("MaxCLL,MaxFALL", or None) — -> (MasterSpec, (MaxCLL, MaxFALL)): the master
     that keeps the source's own mastering (its display as the mdcv, its peak and minimum as the
     range, the L2 targets at or under its peak) and the light levels L6 must declare as given.
-    No mastering display -> DEFAULT_MASTER (the 1000-nit master every Resolve route writes); no
+    No mastering display -> DEFAULT_MASTER (the 1000-nit master every SDR route writes); no
     content light level -> (0, 0), HDR10's own "unknown", which is what such a stream says.
     Raises ValueError (the reason) for a mastering display no RPU can carry exactly: a peak that
     is not a whole number of nits, under SOURCE_MIN_PEAK_NITS or over 10000, or a minimum that
@@ -210,9 +206,9 @@ def source_mastering(master_display, max_cll) -> tuple:
         raise ValueError(f"the source's mastering display {master_display!r}: {e}")
 
 
-# ---- colour: the captured Resolve conversion ---------------------------------------------
+# ---- colour: the captured SDR->PQ conversion ---------------------------------------------
 # Topaz's ProRes is BT.709 limited 4:2:2. The LUT maps BT.709 R'G'B' to BT.2020 PQ R'G'B'
-# (Resolve's SDR->PQ, fitted to its own renders). zscale does ONLY matrix/range work around
+# (the captured 1000-nit SDR->PQ conversion). zscale does ONLY matrix/range work around
 # it: the first instance turns YUV into RGB with transfer and primaries left alone; the
 # second declares its input as already PQ/BT.2020, so it converts the matrix and range and
 # nothing else. (Leaving the second zscale to read the frame's stale BT.709 tags made it
@@ -249,13 +245,13 @@ def lut_vf(cube: str, pix_fmt: str = "yuv420p10le") -> str:
 # alike, so the RPU measures the picture that ships). Its contract is the LUT chain's input:
 # BT.709 limited-range Y'CbCr (with no LUT: BT.2020 PQ Y'CbCr), because lut_rgb_chain's first
 # zscale reads its input as matrix 709, limited range, whatever the frame says. So a front end
-# does geometry and standard matrix/range conversions only, and the one captured LUT (Resolve's
+# does geometry and standard matrix/range conversions only, and the one captured LUT (the
 # BT.709 DV1000 conversion) stays the only colour transform. It must hand on Y'CbCr, never RGB:
 # that zscale would read RGB planes as Y'CbCr.
 #
 # THE FIT FRONT END (fit_front_end; 2026-10-18, the single-file SDR routes whose source is not
 # already the master's 3840x2160 BT.709 frame: yt_plain and yt_1080, stages.dvrender_spec).
-# Standard zscale conversions only (user decision: no further Resolve captures), 16-bit 4:4:4
+# Standard zscale conversions only (user decision: no further LUT captures), 16-bit 4:4:4
 # throughout so an 8-bit source is rounded once, at the very end:
 #   1. colour  (colour_vf, only when needed) BT.601 or full-range Y'CbCr -> BT.709 limited, at
 #              the SOURCE's size. SMPTE-C / EBU primaries are converted to BT.709 through linear
@@ -273,7 +269,7 @@ def lut_vf(cube: str, pix_fmt: str = "yuv420p10le") -> str:
 # then runs on the 4K picture — so the validated chain (lut_vf) runs byte for byte on the kind of
 # frame it was made for; the analysis keeps its measured scale-first form (front end, area to
 # 1080p, LUT); and the pad, laid in Y'CbCr before the LUT, leaves it as EXACTLY the code source
-# black does. Measured 2026-10-18 against Resolve's own 4K render of a 1080p60 YouTube video (5
+# black does. Measured 2026-10-18 against a reference 4K render of a 1080p60 YouTube video (5
 # frames): the opposite order (LUT at 1080p, Lanczos in PQ R'G'B') moved the median dE2000 by at
 # most 0.02 and the p95 by at most 0.4 — so the order is chosen for exactness, not for a look.
 # THE PAD'S BLACK: pad writes FULL-range black (Y 0, neutral chroma — exact at any bit depth)
@@ -463,7 +459,7 @@ def fit_front_end(info: dict, frame=FIT_FRAME) -> str:
 # diagonal of 0.99-1.04 and cross terms of at most 0.03 over five frames — Topaz kept the BT.601
 # matrix both ways (a 601/709 mix-up shows cross terms near 0.1). The LUT takes BT.709, so:
 #   1. colour  colour_vf from the CHUNK's tags, the same standard conversion the fit front end
-#              uses (user decision: no further Resolve captures). An UNTAGGED chunk is judged by the
+#              uses (user decision: no further LUT captures). An UNTAGGED chunk is judged by the
 #              SOURCE's frame (colour_front's SD rule) — by its own 4K frame every untagged SD
 #              source would read as BT.709
 #   2. square  a chunk with non-square pixels (an anamorphic DVD: Topaz keeps the sample aspect,
@@ -506,7 +502,7 @@ def chunk_front_end(chunk: dict, source: dict | None = None) -> str:
     if _int0(source.get("width")) > 0 and _int0(source.get("height")) > 0:
         judged.update(width=source["width"], height=source["height"])
     m, p, full = colour_front(judged)
-    # PILLARBOX LIKE RESOLVE (2026-10-18): Resolve's SD masters are a full 3840x2160 frame with the
+    # PILLARBOX (2026-10-18): the reference SD masters are a full 3840x2160 frame with the
     # 4:3 picture centred (It's Always Sunny 2x06's render, measured). A Topaz chunk of an SD
     # source is 2880x2160, and shipping that bare would be a size no master has ever had on the
     # SHIELD's Dolby Vision decoder. So a chunk whose picture does not fill the frame gets the
@@ -532,7 +528,7 @@ def chunk_front_end(chunk: dict, source: dict | None = None) -> str:
 # An HDR source is already the master's colour: BT.2020 primaries, the BT.2020 non-constant-
 # luminance matrix, limited range. PQ needs no front end at all — the picture is measured and
 # encoded as it is. HLG is converted to PQ by the standard BT.2100 conversion (user decision
-# 2026-10-15: standard conversions, no new Resolve captures): zimg's HLG inverse OETF, then
+# 2026-10-15: standard conversions, no new LUT captures): zimg's HLG inverse OETF, then
 # BT.2100's display-referred OOTF for a HLG_NPL-nit display (system gamma 1.2 at 1000 nits),
 # then the PQ inverse EOTF — BT.2408's "HLG to PQ at 1000 cd/m2", which puts HLG's 75% reference
 # white at 203 nits. zimg FIXES that display at 1000 nits: zscale's `npl` scales only SDR transfers
@@ -559,7 +555,7 @@ def hdr_front_end(info: dict):
     """PURE. An HDR source's ffprobe stream tags -> its front end: None for PQ (nothing to do),
     hlg_to_pq_vf() for HLG. Untagged primaries or matrix are read as BT.2020 (BT.2100 has no
     other); full range, another primaries / matrix tag, or a transfer that is neither PQ nor HLG
-    raises ValueError (the reason), and the route stays on Resolve."""
+    raises ValueError (the reason), and the route refuses the item."""
     info = info if isinstance(info, dict) else {}
     trc = info.get("color_transfer")
     if trc not in (PQ, HLG):
@@ -582,7 +578,7 @@ def build_analyzer_command(analyzer: str, src: str, out_bin: str, *, peak_estima
                            downscale: int = 1, threads: int | None = None,
                            frame_stats: str | None = None) -> list:
     """`src` must be PQ. --transfer pq because a raw/re-wrapped input can lose its colour
-    tags; --no-crop because Resolve writes L5 = 0 (full frame) and Topaz output is full frame."""
+    tags; --no-crop because the reference masters carry L5 = 0 (full frame) and Topaz output is full frame."""
     cmd = [analyzer, "-i", src, "-o", out_bin, "--transfer", "pq", "--no-crop",
            "--peak-estimator", peak_estimator, "--downscale", str(int(downscale))]
     if peak_estimator != "max":
@@ -871,7 +867,7 @@ def frame_l4(src: str, *, ffmpeg: str = FFMPEG, width: int = ANALYSIS_WIDTH,
     PQ file — the analysis intermediate, so it costs one more decode of a file we already made.
     `scale`: decode it area-scaled to width x height (analyze_chunks measures L4 at 960x540:
     ~2x faster than 1080p, within a median 1-2 codes of it, worst 6 — far inside the native
-    vs Resolve L4 difference of ~6-8). analyze_chunks runs this in a child
+    vs reference L4 difference of ~6-8). analyze_chunks runs this in a child
     (build_l4_command), never in the engine process."""
     size = width * height * 3 * 2
     p = subprocess.Popen(build_raw444_decode_command(ffmpeg, src, (width, height) if scale else None),
@@ -1034,7 +1030,7 @@ def analyze_chunks(chunks: list, workdir: str, *, cube: str | None, analyzer: st
     """Measure every chunk ([[first_frame, path], ..., [total, None]] — the end sentinel is
     required: it gives each chunk its frame count) and return the merged sidecar.
 
-    OVERLAPPED (2026-10-15, to match Resolve's stage time): while hdr-analyze and the L4 pass
+    OVERLAPPED (2026-10-15, to match the old DV stage's time): while hdr-analyze and the L4 pass
     run side by side on chunk k's intermediate, chunk k+1's intermediate is already being
     built — a chunk costs its slowest step instead of the sum of three. `streams` such
     pipelines run side by side, each taking every streams-th chunk (0, 2, 4 ... and 1, 3, 5
@@ -1349,7 +1345,7 @@ def clamp_l1(mn: int, mx: int, avg: int, master: MasterSpec = DEFAULT_MASTER):
     return min(int(mn), avg), mx, avg
 
 
-AVG_FLOORS = ("V40", "V29")      # CM v4.0 floor 1229 (Resolve's own minimum; the default) or
+AVG_FLOORS = ("V40", "V29")      # CM v4.0 floor 1229 (the reference minimum; the default) or
                                  # hdr-analyze's v2.9 floor 819 (keeps the measured average)
 
 
@@ -1361,11 +1357,11 @@ def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = N
     Shots follow the analyzer's scenes. Undecodable leading pictures come first in
     presentation order, so every scene but the first moves back by their count and the first
     also covers them (hdr-analyze's rule). The L1 average uses the CM v4.0 floor (1229, the
-    generator's default and Resolve's own minimum) rather than hdr-analyze's v2.9 choice of
+    generator's default and the reference masters' minimum) rather than hdr-analyze's v2.9 choice of
     819 (`avg_floor="V29"` selects that instead, for the blind A/B). `long_play_mode` flags
-    a scene refresh on every frame, as Resolve does. With a per-frame "l4" list, every frame
+    a scene refresh on every frame, as the reference masters do. With a per-frame "l4" list, every frame
     carries Level4 through a frame edit. `master` sets the mastering range, the source range
-    L1 is clamped to and the L2 targets; its default is Resolve's 1000-nit project. `light`
+    L1 is clamped to and the L2 targets; its default is the reference 1000-nit master. `light`
     (MaxCLL, MaxFALL) is declared in L6 EXACTLY as given — an HDR source's own content light
     level (source_mastering), which the stream's HDR10 SEI says too — and then max_cll /
     max_fall and the measurement are not used; None (the default) keeps the rule above."""

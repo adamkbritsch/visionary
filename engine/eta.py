@@ -4,8 +4,8 @@ The problem this solves: the remux's remaining time spans TWO regimes, and the o
 extrapolated the whole remainder at the rate of whichever one it happened to be in.
 
     Phase 1  the next item's Topaz runs alongside  -> the remux encodes SLOW (contended)
-    Phase 2  the run thread parks at the Resolve gate (`resolve_must_wait` holds the next
-             Resolve until THIS remux finishes) -> the remux has the machine (solo)
+    Phase 2  the run thread parks at the DV gate (`dv_must_wait` holds the next item's
+             DV step until THIS remux finishes) -> the remux has the machine (solo)
 
 Measured on the 16" M3 Max: contended 3.12 fps with ~55k frames left, i.e. a displayed 4h46m —
 a correct extrapolation of the wrong regime, since roughly 70% of that work actually runs solo.
@@ -40,7 +40,7 @@ import math
 R_MAX_FPS = 30.0
 
 # A tick with no frames is only evidence of a slow encode if it is SHORT. A long one is a hold
-# (Resolve preemption, power pause) and must not be banked as rate evidence.
+# (an outpainting preemption, a power pause) and must not be banked as rate evidence.
 MAX_IDLE_TICK = 120.0
 
 # Enough of a regime before its rate is trustworthy. Deliberately stricter than the display gate
@@ -86,12 +86,12 @@ def accept_sample(df, dt, max_fps: float = R_MAX_FPS) -> bool:
     impossible rate (the resume replay burst), and a long stall (a hold, not slow encoding).
 
     THE LONG-INTERVAL RULE APPLIES WHATEVER df IS. It used to only fire when df was exactly
-    zero, which missed the case that matters most: a lane SUSPENDED for Resolve stops
+    zero, which missed the case that matters most: a SUSPENDED lane stops
     reporting progress entirely, and the first callback after it resumes carries a handful of
     frames against the whole suspension — twenty minutes of wall clock for twelve frames.
     That is not slow encoding, it is a hold with an encoding sample stapled to the end of it,
     and one such tick measured a healthy 2.50 fps lane at 1.04 (a 2.4x ETA inflation). Several
-    Resolve passes compounded it to the 5x seen live. Any interval this long contains a hold;
+    suspensions compounded it to the 5x seen live. Any interval this long contains a hold;
     drop it and re-anchor rather than averaging it in."""
     if dt is None or df is None:
         return False
@@ -143,7 +143,7 @@ class RateBook:
         """This item's OWN solo/contended ratio, once both regimes are established.
 
         Preferring this over the persisted value is the highest-value detail in the design: the
-        Resolve gate means every remux enters a solo phase before it ends, so an item measures
+        DV gate means every remux enters a solo phase before it ends, so an item measures
         its own k before it finishes -- and a same-item ratio cancels the content-complexity
         confound that makes cross-item comparisons noisy."""
         rs = self.rate(SOLO)
@@ -205,12 +205,10 @@ def regime_of(*, run_stage: str | None, run_active: bool,
     THE NATIVE DV ANALYSIS ('dvnative') COUNTS TOO. It is CPU work at nice 10 beside this lane's
     normal-priority x265, exactly where Topaz sits, and when it ends the run thread parks at the
     native gate until this remux finishes: contended now, solo after, the same shape again.
-    Banking it as solo would drag this item's own k toward 1. The stage never runs while
-    dv_engine is 'resolve', so every existing stage keeps the regime it always had.
+    Banking it as solo would drag this item's own k toward 1.
 
     THE NATIVE RENDER ('dvrender') IS THE SAME CASE: its analysis and LUT encode run at nice 10
-    beside this lane and never suspend it. It never runs while every dv_routes entry is
-    'resolve'."""
+    beside this lane and never suspend it."""
     if other_lane_live:
         return CONTENDED
     if run_active and run_stage in ("download", "extend", "topaz", "dvnative", "dvrender"):
@@ -221,14 +219,14 @@ def regime_of(*, run_stage: str | None, run_active: bool,
 def correction_applies(*, run_stage: str | None, run_active: bool) -> bool:
     """Should the two-phase speed-up be applied at all?
 
-    NO while the run thread is in `resolve`: that stage PREEMPTS the lane entirely
-    (`_resolve_active` -> `should_pause`), so the remux's next regime is rate ZERO, not a
-    speed-up. Predicting a speed-up there would be wrong in the dangerous direction, so the
-    estimate falls back to today's conservative formula.
+    NO while the run thread is in `extend`: AI outpainting PREEMPTS the lane entirely
+    (SIGSTOP), so the remux's next regime is rate ZERO, not a speed-up. Predicting a speed-up
+    there would be wrong in the dangerous direction, so the estimate falls back to the
+    conservative formula.
 
     'dvnative' and 'dvrender' are NOT that case: neither suspends a lane, so they are ordinary
     contention and the correction applies."""
-    return not (run_active and run_stage == "resolve")
+    return not (run_active and run_stage == "extend")
 
 
 # ---- the 'dvnative' stage: native Dolby Vision analysis, timed by CHUNK ----------------------

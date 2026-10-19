@@ -2,7 +2,7 @@
 
 Read-only and inert: AUTOMATION_ENABLED is False, so the dashboard only
 observes (power, scratch, window). Nothing auto-starts, no apps are closed, the
-drive is never cycled from here, and no Topaz/Resolve work is launched. The UI
+drive is never cycled from here, and no Topaz/DV work is launched. The UI
 reflects truth from the actual components; the automation stays off until the
 app is finished.
 """
@@ -38,8 +38,7 @@ import orchestrator
 import yield_lease     # noqa: E402
 
 # The app launches us with a minimal PATH (no /opt/homebrew/bin) — augment it so the
-# selftest and every spawned subprocess (notably the resolve stage's cliclick) can
-# find Homebrew-installed tools. Inherited by child processes.
+# selftest and every spawned subprocess can find Homebrew-installed tools. Inherited by child processes.
 os.environ["PATH"] = (os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")
 
 # Automation is controlled by the orchestrator's enable toggle (POST /api/automation).
@@ -123,7 +122,7 @@ def read_adapter_watts():
 def collect_scratch():
     # The pipeline now works on the always-mounted internal SSD (~/topaz-scratch);
     # the external 2TB SSD is cold storage. Report the internal scratch as the
-    # active working volume — it is the location Topaz/Resolve actually read+write.
+    # active working volume — it is the location Topaz and the DV step actually read+write.
     path = scratch.default_scratch()
     # Space left for the project = physical free + topaz-scratch's own usage (its recyclable
     # working files), so a partially-filled scratch isn't counted against the pipeline.
@@ -562,7 +561,7 @@ def api_youtube_queue(body):
         # "Run this video now": promote it to the priority book (cadence-exempt, ahead of
         # due movies) and ask the in-flight item to YIELD at its next safe boundary — a
         # Topaz segment boundary, so at most one ~90 s segment is redone. A download is
-        # left to finish (aborting throws away GB) and Resolve is never interrupted, so
+        # left to finish (aborting throws away GB) and a DV render runs on to its end, so
         # the response says when it will actually start.
         vid = (body.get("vid") or body.get("id") or "").strip()
         if not vid:
@@ -576,7 +575,8 @@ def api_youtube_queue(body):
             stage = (o.get("stage") or "") if o.get("running") else ""
             out["current_stage"] = stage
             out["starts"] = {"topaz": "at the current segment boundary (about a minute)",
-                             "resolve": "after the current Dolby Vision pass finishes",
+                             "dvrender": "after the current Dolby Vision render finishes",
+                             "dvnative": "at the current Dolby Vision analysis chunk",
                              # the download stage yields to a ready send: the pull
                              # stops and is redone afterwards (stages._download)
                              "download": "right away — the current download stops and restarts after",
@@ -624,7 +624,7 @@ def api_yield(body, peer=None):
     come from the lease's own engine too — see YieldLease.release.
 
     Discretion (the content filter) needs the whole machine for a scan or a masked render, the same
-    way Resolve and outpainting stages do. It asks here rather than by pausing automation, because
+    way the outpainting stage does. It asks here rather than by pausing automation, because
     pausing is a state a human has to undo and this is a state that undoes itself.
 
     The TTL is the safety property: a crashed or force-quit sibling can never wedge the overnight
@@ -703,83 +703,6 @@ def _hdr_hint(name) -> bool:
         return hdr * 2 > len(names)
     except Exception:
         return False
-
-
-# --- RESOLVE SCREEN PREVIEW ----------------------------------------------------------------
-# One capture at a time, shared by every request. A capture of the 4K host measured 1.9-9.9 s
-# under load, so the endpoint must never do it inline.
-_PREVIEW = {"jpg": None, "big": None, "at": 0.0, "busy": False}
-_PREVIEW_LOCK = threading.Lock()
-PREVIEW_MAX_AGE = 1.0        # refresh if the newest frame is older than this
-PREVIEW_STALE = 15.0         # ...and stop serving one this old entirely
-
-
-def _preview_capture():
-    """Capture + downscale + JPEG-encode one frame of the display the resolve stage drives."""
-    try:
-        import tempfile, cv2, dv_shim
-        png = os.path.join(tempfile.gettempdir(), "_api_preview.png")
-        host, _why = preflight.chosen_host()
-        prev = dv_shim.get_host()
-        try:
-            dv_shim.set_host(host)
-            dv_shim.screenshot(png, attempts=1)
-        finally:
-            dv_shim.set_host(prev)
-        img = cv2.imread(png)
-        if img is None:
-            return
-        h, w = img.shape[:2]
-        # TWO variants from the ONE capture (the screenshot is the expensive part): the
-        # card's 420w tile, and a 1080p-class frame for the full-width overlay — 420
-        # stretched across the window was mush (user-caught 2026-08-06).
-        out = {}
-        for key, want_w in (("jpg", 420), ("big", 1920)):
-            scale = want_w / float(w)
-            sized = img if scale >= 1.0 else cv2.resize(
-                img, (want_w, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
-            ok, buf = cv2.imencode(".jpg", sized, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-            if ok:
-                out[key] = buf.tobytes()
-        if out:
-            with _PREVIEW_LOCK:
-                _PREVIEW.update(out)
-                _PREVIEW["at"] = time.time()
-    except Exception:
-        pass
-    finally:
-        with _PREVIEW_LOCK:
-            _PREVIEW["busy"] = False
-
-
-def _preview_frame(big=False):
-    """The newest frame (420w tile, or the 1080p-class `big` for the enlarged view),
-    kicking off a refresh when it is getting old. Never blocks."""
-    now = time.time()
-    with _PREVIEW_LOCK:
-        jpg = _PREVIEW["big" if big else "jpg"]
-        at, busy = _PREVIEW["at"], _PREVIEW["busy"]
-        due = (now - at) > PREVIEW_MAX_AGE
-        if due and not busy:
-            _PREVIEW["busy"] = True
-            start = True
-        else:
-            start = False
-    if start:
-        threading.Thread(target=_preview_capture, daemon=True).start()
-    return jpg if (jpg is not None and (now - at) < PREVIEW_STALE) else None
-
-
-def displays_view() -> dict:
-    """Every attached screen, whether it can host Resolve, and the saved priority."""
-    import displays as _dsp        # noqa: F401  (imported for the side of a clear error)
-    host, why = preflight.chosen_host()
-    return {"displays": preflight.eligible_displays(),
-            "priority": settings.get_display_priority(),
-            "enabled": bool(settings.get_settings().get("resolve_host_pinning")),
-            "fallback_main": bool(settings.get_settings().get("resolve_host_fallback_main")),
-            "warn_takeover": bool(settings.get_settings().get("resolve_takeover_warn")),
-            "host": host, "host_reason": why}
 
 
 def show_settings_view(name) -> dict:
@@ -899,33 +822,24 @@ def api_detect_preset(kind, show, name=None, title=None):
     return {"preset": key if key in settings.TOPAZ_PRESETS else None}
 
 
-def selftest_grants():
-    """Moved to engine/preflight.py (one implementation for the CLI + the app); kept as a
-    thin alias for existing callers."""
-    return preflight.selftest_grants()
-
-
 _PREFLIGHT_CACHE = {"t": 0.0, "result": None}
 
 
 def selftest_full():
-    """The app's selftest: TCC grants (authoritative in THIS process's context) + the cheap
-    exact-version/display gates from preflight (plist reads + CoreGraphics — sub-ms; the
-    heavy --network/--smoke checks never run here). Cheap checks cached 60 s."""
+    """The app's selftest: the cheap exact-version gate from preflight (plist reads — sub-ms;
+    the heavy checks never run here), cached 60 s."""
     import time as _t
-    r = preflight.selftest_grants()
+    r = {}
     now = _t.monotonic()
     if _PREFLIGHT_CACHE["result"] is None or now - _PREFLIGHT_CACHE["t"] > 60:
         _PREFLIGHT_CACHE["result"] = preflight.run_cheap()
         _PREFLIGHT_CACHE["t"] = now
     cheap = _PREFLIGHT_CACHE["result"]
     by_id = {c["id"]: c for c in cheap}
-    r["resolve_version_ok"] = by_id["resolve_version"]["ok"]
     r["topaz_version_ok"] = by_id["topaz_version"]["ok"]
-    r["display_ok"] = by_id["display"]["ok"]
     r["hard_ok"] = all(c["ok"] for c in cheap)
     r["found"] = {c["id"]: c["detail"] for c in cheap if not c["ok"]}
-    r["ok"] = r["ok"] and r["hard_ok"]
+    r["ok"] = r["hard_ok"]
     # setup_complete drives the app's "Finish setup" card + the Setup section's
     # auto-expand. A FULL pass costs ~1.4 s, so it rides its own 300 s cache here
     # (the 5 s /api/preflight cache refreshes it whenever the Setup UI is open).
@@ -936,52 +850,9 @@ def selftest_full():
     return r
 
 
-
-def request_accessibility():
-    """Fire the macOS Accessibility approval POPUP for THIS process's responsible app
-    (the bundle), via AXIsProcessTrustedWithOptions(prompt=True). Manual list-adding
-    can mis-attribute the grant; the popup grants the exact responsible process. Returns
-    {prompted, trusted}; the popup appears when trusted is still False."""
-    try:
-        import ctypes, ctypes.util
-        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
-        ax = ctypes.CDLL(ctypes.util.find_library("ApplicationServices"))
-        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
-        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
-        key = cf.CFStringCreateWithCString(None, b"AXTrustedCheckOptionPrompt", 0x08000100)
-        true_val = ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue")
-        keys = (ctypes.c_void_p * 1)(key)
-        vals = (ctypes.c_void_p * 1)(true_val)
-        kcb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
-        vcb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
-        cf.CFDictionaryCreate.restype = ctypes.c_void_p
-        cf.CFDictionaryCreate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
-                                          ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
-                                          ctypes.c_void_p, ctypes.c_void_p]
-        opts = cf.CFDictionaryCreate(None, keys, vals, 1, ctypes.byref(kcb), ctypes.byref(vcb))
-        ax.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
-        ax.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
-        return {"prompted": True, "trusted": bool(ax.AXIsProcessTrustedWithOptions(opts))}
-    except Exception as e:
-        return {"prompted": False, "error": str(e)}
-
-
-def request_screen_recording():
-    """Fire the macOS Screen Recording approval prompt for this process's responsible
-    app, via CGRequestScreenCaptureAccess. macOS shows the dialog at most once per boot;
-    the grant takes effect after an app relaunch (the Setup row says both)."""
-    try:
-        import ctypes, ctypes.util
-        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
-        cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
-        return {"prompted": True, "granted": bool(cg.CGRequestScreenCaptureAccess())}
-    except Exception as e:
-        return {"prompted": False, "error": str(e)}
-
-
 # ---- in-app Setup (onboarding) ---------------------------------------------------
 # RESOURCES_DIR: Contents/Resources in the bundle, the repo root in a checkout — both
-# hold engine/ beside setup/, bundle/ and nas/ (build.sh ships all four).
+# hold engine/ beside nas/ (build.sh ships both).
 RESOURCES_DIR = os.path.dirname(ENGINE_DIR)
 
 _FULL_PREFLIGHT = {"t": 0.0, "result": None}    # 5 s cache (a full offline pass ≈ 1.4 s)
@@ -989,20 +860,19 @@ _FULL_PREFLIGHT_LOCK = threading.Lock()
 
 
 def _invalidate_preflight():
-    """Config saved / an install finished / grants changed — force fresh answers."""
+    """Config saved / an install finished — force fresh answers."""
     _FULL_PREFLIGHT["result"] = None
     _PREFLIGHT_CACHE["result"] = None
 
 
 def api_preflight(fresh=False):
-    """The FULL check list for the Setup section (12 checks, fix strings included) —
-    on demand only, never on the poll. run_checks(in_app=True): the server runs inside
-    the app's TCC context, so the grants check is authoritative and severity=fail."""
+    """The FULL check list for the Setup section (fix strings included) — on demand only,
+    never on the poll."""
     import time as _t
     with _FULL_PREFLIGHT_LOCK:
         now = _t.monotonic()
         if fresh or _FULL_PREFLIGHT["result"] is None or now - _FULL_PREFLIGHT["t"] > 5:
-            _FULL_PREFLIGHT["result"] = preflight.run_checks(in_app=True)
+            _FULL_PREFLIGHT["result"] = preflight.run_checks()
             _FULL_PREFLIGHT["t"] = now
         r = dict(_FULL_PREFLIGHT["result"])
     r["setup_complete"] = r["ok"]
@@ -1011,24 +881,8 @@ def api_preflight(fresh=False):
 
 
 def api_save_settings(body) -> tuple:
-    """POST /api/settings -> (payload, http code).
-
-    Switching dv_engine to 'native' is GATED here, server-side — the only gate: the arm gate
-    never checks the native toolchain (a broken one just sends items through Resolve), so
-    without this nothing would check that the pinned analyzer, LUT and dovi_tool exist.
-    A failing check_native_dv refuses the WHOLE update with a 409 and its row, and saves
-    nothing. Every other write (including back to 'resolve') is today's path unchanged."""
+    """POST /api/settings -> (payload, http code)."""
     body = body or {}
-    routes = body.get("dv_routes") if isinstance(body, dict) else None
-    route_native = isinstance(routes, dict) and "native" in routes.values()
-    if isinstance(body, dict) and (body.get("dv_engine") == "native" or route_native):
-        # A route switched to native through dv_routes needs the same toolchain as the TV lane
-        # (review-caught 2026-10-15: it skipped this check).
-        row = preflight.check_native_dv()
-        if not row["ok"]:
-            what = "dv_engine" if body.get("dv_engine") == "native" else "dv_routes"
-            return {"error": f"native DV toolchain check failed — {what} not changed",
-                    "checks": [row]}, 409
     new = settings.set_settings(body)
     if "max_youtube_minutes" in body:
         # The popular sets bake this cap in at refresh time — invalidate so the
@@ -1037,8 +891,6 @@ def api_save_settings(body) -> tuple:
         # the configure_youtarr call on queue edits.
         try: orchestrator.ORCH.refresh_youtube_meta()
         except Exception: pass
-    if "dv_engine" in body:
-        _invalidate_preflight()         # the native_dv row's PRESENCE follows the setting
     return {"settings": new}, 200
 
 
@@ -1199,27 +1051,6 @@ def api_config_test(what):
         # exception text can carry host names but never credentials (nothing here puts
         # a secret into a URL or an error string)
         return {"ok": False, "detail": f"{e.__class__.__name__}: {e}"}
-
-
-def api_import_resolve():
-    """Run the bundled setup/import_resolve.py as a SUBPROCESS job (fusionscript can
-    hang holding the GIL — it must never run inside the server). Hard guard first:
-    Resolve must be closed (it rewrites DeliverPresetList.xml on exit)."""
-    script = os.path.join(RESOURCES_DIR, "setup", "import_resolve.py")
-    if not os.path.exists(script):
-        return {"error": "missing", "detail": "setup/import_resolve.py not in this build"}
-    try:
-        r = subprocess.run(["pgrep", "-f", "DaVinci Resolve.app/Contents/MacOS/Resolve"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            return {"error": "resolve-running",
-                    "detail": "Quit DaVinci Resolve first — it rewrites the render-preset "
-                              "file on exit and would undo the import."}
-    except Exception:
-        pass
-    import setup_jobs
-    return setup_jobs.start("import_resolve",
-                            argv=[preflight.ENGINE_PYTHON, script, "--json"])
 
 
 DV_PROBE_CRON = "0 5 * * * /usr/bin/python3 {fs_path} all"
@@ -1491,9 +1322,6 @@ def current_state():
     state["up_next"] = up_next(current=orch.get("current"), inflight=orchestrator.ORCH.finisher_views())
     state["orchestrator"] = orch
     state["settings"] = settings.get_settings()
-    # READ-ONLY for the app: the engine's validated view, so a hand-edited value is shown as
-    # what the engine will actually use (it has no Settings control — POST /api/settings).
-    state["settings"]["dv_engine"] = settings.dv_engine()
     state["show_profile"] = show_profile_info()
     state["log"] = logbook.tail(6)            # recent failures/errors for the UI
     return state
@@ -1620,57 +1448,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(show_profile_info(show))
         elif path == "/api/selftest":
             self._json(selftest_full())
-        elif path == "/api/screen.png":
-            # SEE THE SCREEN WITH THE LID CLOSED. Only this process holds the Screen
-            # Recording grant (a plain shell's screencapture returns "could not create
-            # image from display"), so remote debugging of the DV automation has to come
-            # from here — and from a phone, which is the whole point of the web UI. It is
-            # the remote TOKEN that protects this now, not the old loopback bind.
-            # ?display=<key> captures a NON-main screen. Once Resolve can be hosted
-            # elsewhere, a debugger that always shows the built-in is worse than useless.
-            try:
-                import tempfile, dv_shim, displays
-                key = (parse_qs(urlparse(self.path).query).get("display") or [None])[0]
-                target = displays.find(key) if key else None
-                if key and not target:
-                    self._json({"error": "display not attached: %s" % key}, code=404); return
-                prev = dv_shim.get_host()
-                try:
-                    dv_shim.set_host(target)
-                    png = os.path.join(tempfile.gettempdir(), "_api_screen.png")
-                    dv_shim.screenshot(png)
-                finally:
-                    dv_shim.set_host(prev)
-                with open(png, "rb") as f:
-                    self._send(200, f.read(), "image/png")
-            except Exception as e:
-                self._json({"error": f"screenshot failed: {e.__class__.__name__}: {e}"}, code=500)
-        elif path == "/api/resolve-preview.jpg":
-            # Serve the LATEST captured frame immediately and refresh in the background.
-            #
-            # Capturing per request does not work: measured at 1.9 s, 9.9 s and 3.7 s for one
-            # frame of a 3840x2160 panel while Resolve has the machine. A 2 s client poll
-            # therefore queued requests faster than they completed — every frame arrived
-            # stale, and overlapping requests raced on one shared temp file. Decoupling the
-            # two means the client always gets the freshest frame that EXISTS, at whatever
-            # rate captures actually manage, and never waits on one.
-            big = (parse_qs(urlparse(self.path).query).get("size") or [""])[0] == "big"
-            frame = _preview_frame(big=big)
-            if frame is None:
-                self._send(204, b"", "image/jpeg")     # nothing captured yet — try again
-            else:
-                self._send(200, frame, "image/jpeg")
-        elif path == "/api/shim-smoke":
-            # Per-template match scores against the LIVE screen + display/lock context —
-            # the acceptance gate for a display config and the first thing to check when
-            # the Resolve stage misbehaves on a screen nobody can see.
-            key = (parse_qs(urlparse(self.path).query).get("display") or [None])[0]
-            self._json(preflight.shim_smoke_scores(key))
-        elif path == "/api/displays":
-            # Every attached screen + whether it could host Resolve + the saved priority.
-            # NOT folded into /api/state: that polls every 1.5 s and re-enumerating
-            # displays at that rate is pointless work.
-            self._json(displays_view())
         elif path == "/oauth/youtube":
             import ytdata
             code = (parse_qs(urlparse(self.path).query).get("code") or [""])[0]
@@ -1751,11 +1528,10 @@ class Handler(BaseHTTPRequestHandler):
             with _ARM_LOCK:
                 if body.get("enabled"):
                     # HARD GATE (server-side so the UI can't bypass it): never arm on a machine
-                    # that isn't the exact Resolve/Topaz/display Visionary is built for — the
-                    # screen automation would click the wrong pixels (see engine/versions.py).
-                    # run_arm_gate = the version/display pins PLUS the instant
-                    # dependency checks (brew tools, cv2) — a missing x265 used to
-                    # surface HOURS into a job; now it refuses to arm, named.
+                    # without the exact Topaz build and Dolby Vision toolchain Visionary is
+                    # built for (see engine/versions.py). run_arm_gate = the version pins PLUS
+                    # the instant dependency checks (brew tools, cv2, the DV toolchain) — a
+                    # missing x265 used to surface HOURS into a job; now it refuses to arm, named.
                     gate = preflight.run_arm_gate()
                     bad = [c for c in gate if not c["ok"]]
                     if bad:
@@ -1800,8 +1576,8 @@ class Handler(BaseHTTPRequestHandler):
             what = (body or {}).get("what") or ""
             argv = None
             if what.startswith("borders_"):
-                # Border-extender model downloads: argv is ENGINE-computed (the
-                # import_resolve escape hatch — nothing user-supplied reaches a shell)
+                # Border-extender model downloads: argv is ENGINE-computed (nothing
+                # user-supplied reaches a shell)
                 # and lands in Comfy Desktop's own models directory. curl -C - resumes
                 # a truncated file in place.
                 import borders
@@ -1858,41 +1634,11 @@ class Handler(BaseHTTPRequestHandler):
             # instead of letting the row silently reappear after a "successful" reset.
             self._json({"show": show, "removed": removed, "ok": ok},
                        code=(200 if ok else 500))
-        elif path == "/api/setup/import-resolve":
-            out = api_import_resolve()
-            self._json(out, code=(409 if out.get("error") == "resolve-running" else 200))
         elif path == "/api/setup/install-dv-probe":
             self._json(api_install_dv_probe())
-        elif path == "/api/request-accessibility":
-            # the app's button POSTs; this was GET-only and 404'd silently (live bug)
-            self._json(request_accessibility())
-        elif path == "/api/request-screen-recording":
-            self._json(request_screen_recording())
         elif path == "/api/settings":
             out, code = api_save_settings(body)
             self._json(out, code=code)
-        elif path == "/api/displays":
-            # Reorder the priority list / flip the master switch. The priority list is
-            # validated in settings (VALIDATORS) rather than here, so a hand-edited
-            # settings.json is held to the same rule as the UI.
-            upd = {}
-            for k in ("resolve_host_pinning", "resolve_host_fallback_main"):
-                if k in body:
-                    upd[k] = bool(body.get(k))
-            if "priority" in body:
-                upd["resolve_host_displays"] = body.get("priority")
-            if "warn_takeover" in body:
-                upd["resolve_takeover_warn"] = bool(body.get("warn_takeover"))
-            if upd:
-                settings.set_settings(upd)
-            self._json(displays_view())
-        elif path == "/api/display-smoke":
-            # Score every template against ONE display and remember the result. This is
-            # what a screen must pass before it is allowed to host Resolve.
-            key = body.get("display")
-            res = preflight.shim_smoke_scores(key)
-            preflight.record_display_smoke(key, res)
-            self._json({"result": res, "displays": displays_view()})
         elif path == "/api/history-scan":
             # Adopt masters the pipeline published BEFORE the history book existed. Detection
             # is the pipeline's own naming (series.is_master_name), so a source can never be
@@ -1930,29 +1676,6 @@ class Handler(BaseHTTPRequestHandler):
             until = orchestrator.ORCH.hold_awake(secs, "extended from the web UI")
             self._json({"held": bool(until), "awake_hold_secs":
                         orchestrator.ORCH.snapshot().get("awake_hold_secs", 0)})
-        elif path == "/api/quiet-mode":
-            # SCREEN CONTROL. `enabled` = quiet mode ON = the pipeline stops using the screen.
-            # That is only ever TEMPORARY: `seconds` (or an `until` epoch) sets when it comes
-            # back by itself, clamped to settings.MAX_QUIET_SECONDS — an indefinite pause would
-            # buffer items until the disk floor stalls the run. Turning it back ON clears both.
-            on = bool(body.get("enabled"))
-            if not on:
-                settings.set_settings({"quiet_mode": False, "quiet_until": 0})
-            else:
-                secs = body.get("seconds")
-                if secs is None and body.get("until") is not None:
-                    try:
-                        secs = int(body["until"]) - int(time.time())
-                    except (TypeError, ValueError):
-                        secs = None
-                secs = settings.clamp_quiet_seconds(3600 if secs is None else secs)
-                if secs <= 0:                      # a past/zero deadline means "don't pause at all"
-                    settings.set_settings({"quiet_mode": False, "quiet_until": 0})
-                else:
-                    settings.set_settings({"quiet_mode": True,
-                                           "quiet_until": int(time.time()) + secs})
-                    orchestrator.ORCH.reclaim_screen()   # abort any in-flight Resolve NOW
-            self._json(orchestrator.ORCH.snapshot())
         elif path == "/api/next-up":
             # Per-slot follow-up: the show that takes this slot the moment `show` finishes.
             # Empty `next` clears it. NOT arm-gated (unlike picking the slot's CURRENT show):
@@ -1987,7 +1710,7 @@ class Handler(BaseHTTPRequestHandler):
                 # verified master (default) vs keep both. No queue refresh needed.
                 settings.set_show_replace_source(show, bool(body.get("replace_source")))
             if "output_mode" in body:
-                # What Resolve should OUTPUT for this item: auto (the long-standing rule) or a
+                # What this item should OUTPUT: auto (the long-standing rule) or a
                 # pinned sdr / dv1000 (dv2000 is retired: settings stores it as dv1000).
                 # Changing it changes the DELIVERABLE'S NAME too
                 # (SDR masters carry a different done-mark), so it only affects items not yet
@@ -2060,11 +1783,6 @@ def main(port=8765):
         except (ValueError, OSError):
             pass
     threading.Thread(target=_rearm_loop, daemon=True, name="rearm").start()
-    try:                                  # keep the user's Resolve off the pinned display
-        import stages
-        stages.start_resolve_display_watch()
-    except Exception:
-        pass
     print(f"Dashboard (automation_enabled={AUTOMATION_ENABLED}) on http://localhost:{port}")
     ThreadingHTTPServer((BIND_ADDR, port), Handler).serve_forever()
 

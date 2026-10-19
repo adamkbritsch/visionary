@@ -1,7 +1,7 @@
 """The Dolby Vision profile 7 -> 8.1 lane: queued movies converted and replaced IN PLACE on the NAS.
 
 A profile 7 movie has already proven it can carry Dolby Vision — it IS Dolby Vision — so it never
-goes near Topaz, Resolve or the capped x265 re-encode (user-dictated 2026-09-29: "NONE of them
+goes near Topaz, the DV render or the capped x265 re-encode (user-dictated 2026-09-29: "NONE of them
 should have to re-encode their hdr video"). dvp7.py copies the HDR10 video bit for bit and rewrites
 only the RPU. That makes this a transfer job, not a GPU job, so it runs BESIDE the TV pipeline in
 its own two threads instead of taking the run thread's turn:

@@ -1,15 +1,9 @@
 """Heavy stage runners for the orchestrator. Each returns (ok, message).
 
-download / topaz / remux / upload / cleanup run fully unattended. The resolve
-stage runs setup + render via the scripting API; its two UI-only steps (DV Analyze
-All Shots @ 1000-nit, and the DV Profile 8.1 dropdown) go through dv_shim, which
-needs this process to have macOS Screen-Recording + Accessibility grants and
-`cliclick`. Missing grants surface in preflight/Setup (check_tcc_grants); if they
-are missing at run time the resolve stage returns not-ok and the episode stays
-parked at this stage (resumable). The 'dvnative' stage is the headless alternative
-for an eligible TV episode when settings `dv_engine` is 'native' (see _dvnative), and
-'dvrender' writes Resolve's render itself for a route set 'native' in `dv_routes` (see
-_dvrender).
+Every stage runs fully unattended, with no screen. The Dolby Vision step ("dv" in the
+orchestrator's stage list) is one of two: 'dvnative', the chunk lane's analysis for an eligible
+TV episode (see _dvnative), or 'dvrender', the native render that writes p.dv_render for every
+other route (see _dvrender).
 """
 from __future__ import annotations
 import json
@@ -26,85 +20,14 @@ import transfer
 from orchestrator import _is_dv81, _vstream, _has_audio, _first_video, _remote_size
 
 ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Whole resolve stage budget (setup + DV "Analyze All Shots" + render). MUST exceed the
-# DV analysis cap (dv_shim.wait_for_analysis max_seconds = 3600 = 60 min) PLUS render +
-# Resolve launch, or a long episode gets killed mid-analysis and fail-loops. Was 45 min
-# (< the 60-min analysis cap alone) — the exact recipe for a stuck resolve stage.
-RESOLVE_TIMEOUT = 120 * 60
-RESOLVE_CEILING_SECS = 8 * 3600   # no Resolve pass runs past this, however well it is moving
-RENDER_STALL_SECS = 15 * 60       # a render whose % has not moved for this long is wedged
 
 
-def resolve_deadline(now, start, deadline, watch, budget=RESOLVE_TIMEOUT) -> float:
-    """PURE. The Resolve pass's deadline once `now` is past its budget (`deadline`): unchanged (kill
-    it) unless a RENDER is visibly moving, which is not "Resolve unresponsive". Then the render gets
-    the time its own rate says it still needs, with a quarter and five minutes to spare. The caller
-    asks again on EVERY poll once past the budget, so a render that stops moving for
-    RENDER_STALL_SECS is killed then, not when a generous early estimate runs out (review).
-
-    The flat budget killed renders that were working: live 2026-10-01/02, "Let's Game It Out -
-    Astro Colony" (1080p60, SuperScale) finished its render at 1 h 47 m, peaked over the cap, and
-    was killed 12 minutes into the re-export the cap gate asked for — five times, ten hours, and
-    the resolve stall held the queue behind it. `watch`: t0 (this render's start), pct, moved (when
-    the % last changed), first (how long the previous render took), all time.monotonic().
-
-    Never past the ceiling, and no time at all for a render whose own pace — read optimistically,
-    one more percent than the truncated figure — says it cannot finish before the ceiling: holding
-    the queue for hours to kill it at 70% helps nobody (review)."""
-    ceiling = start + max(RESOLVE_CEILING_SECS, budget)
-    if now >= ceiling:
-        return deadline
-    t0, pct, moved, first = (watch.get(k) for k in ("t0", "pct", "moved", "first"))
-    if t0 is None or moved is None or now - moved > RENDER_STALL_SECS:
-        return deadline
-    if pct and 0 < pct < 100:
-        need = (100 - pct) * (now - t0) / pct
-        best = (100 - (pct + 1)) * (now - t0) / (pct + 1)
-        if now + best > ceiling:
-            return deadline
-    elif pct and pct >= 100:
-        need = 600                       # finishing: the file is closed and its peak measured
-    elif pct == 0:
-        need = first or RENDER_STALL_SECS   # just started: look again once it has a rate
-    elif first:
-        need = first                     # a re-export that has not reported yet
-    else:
-        return deadline
-    return max(deadline, min(ceiling, now + need * 1.25 + 300))
-
-
-def _resolve_budget(p) -> int:
-    """The resolve stage's wall-clock budget for THIS item. The flat RESOLVE_TIMEOUT is
-    sized for EPISODES (launch + <=60 min DV analysis + a sub-hour render); a feature
-    cannot fit — the Star Wars Ep III "Siege of Mandalore" FAN CUT (4 h 19 m, 372,831
-    frames) rendered for two hours at ~2x realtime and was killed at exactly the wall,
-    attempt after attempt (live 2026-08-16: the partial ~42 GB render's mtime matched
-    the kill second), each retry burning another two hours with no chance of finishing.
-    Content at/below 50 min keeps the proven flat budget (a wedged Resolve still clears
-    in 2 h); longer content scales: analysis cap + render at a conservative realtime
-    factor + launch slack, capped at 6 h so a bad probe can't produce an unbounded hang."""
-    try:
-        import topaz
-        # COMBINE items never create a source_cfr (the remux reads both originals), so
-        # probing it returned 0 and every combine silently fell back to the flat
-        # episode-sized budget — on movie-length content, the exact failure this function
-        # exists to prevent. Measure whatever Resolve will actually ingest.
-        from orchestrator import combine_winner_path as _winner
-        src = p.source_cfr if os.path.exists(getattr(p, "source_cfr", "") or "") else ""
-        if not src:
-            src = _winner(p) or getattr(p, "source", "") or ""
-        _fps, dur = topaz.media_timing(src) if src else (0, 0.0)
-    except Exception:
-        dur = 0.0
-    if not dur or dur <= 50 * 60:
-        return RESOLVE_TIMEOUT
-    return min(3600 + int(dur * 1.8) + 1200, 6 * 3600)
 FFPROBE = "/opt/homebrew/bin/ffprobe"
 EXPORT_BITRATE_FLOOR_KBPS = 60000   # render preset's default; the export matches the intake above this
 YOUTUBE_NATIVE_4K_MIN_HEIGHT = 1700  # above this the source IS 4K, not a 1080p upscale
 YOUTUBE_RENDER_KBPS_4K = 14000       # ...and a NATIVE 4K source renders lower (user-dictated
                                      # 2026-08-18). The 20 Mbps below is tuned for the normal
-                                     # case — a 1080p web source Resolve upscales. Real 4K
+                                     # case — a 1080p web source the render upscales. Real 4K
                                      # detail is far harder to encode, so at the same target
                                      # its peaks run much higher: measured live, an 18-minute
                                      # native-4K video rendered at 20 Mbps peaked at 59.9 and
@@ -118,15 +41,14 @@ YOUTUBE_RENDER_KBPS = 20000         # YouTube renders target THIS instead of the
                                     # IS the deliverable: its 1-s peaks land under the cap, which lets
                                     # the remux SHIP its video stream-copied (remux_ship_render) in
                                     # minutes instead of an hour-class x265 re-encode.
-                                    # WHY 20 and not 35 (lowered 2026-08-17, user-dictated "their
-                                    # resolve outputs should loosely be enough to function as the final
+                                    # WHY 20 and not 35 (lowered 2026-08-17, user-dictated: the
+                                    # renders "should loosely be enough to function as the final
                                     # thing"): the whole scheme only pays off if the peak gate actually
-                                    # PASSES, and Resolve's VideoToolbox export has no peak control at
-                                    # all — it was measured spiking to ~139 Mbps on a ~27 Mbps average,
-                                    # i.e. bursts of several times the target. At 35 the gate was a
-                                    # coin flip, and losing it costs the entire hour the fast path was
-                                    # meant to save. 20 Mbps of 4K HEVC is still generous for video
-                                    # UPSCALED FROM 1080p web sources (YouTube skips Topaz — Resolve
+                                    # PASSES, and a VideoToolbox export's peaks run several times its
+                                    # target (measured ~139 Mbps on a ~27 Mbps average). At 35 the gate
+                                    # was a coin flip, and losing it costs the entire hour the fast path
+                                    # was meant to save. 20 Mbps of 4K HEVC is still generous for video
+                                    # UPSCALED FROM 1080p web sources (YouTube skips Topaz — the render
                                     # does the scaling — so this is the only encode the picture ever
                                     # gets, and its input is already a lossy 1080p web file).
                                     # SHIELD context: single-layer DV stutters above ~60 Mbps.
@@ -263,32 +185,9 @@ def _settings_scope(p) -> str:
     return p.series
 
 
-def resolve_input(p):
-    """WHICH FILE RESOLVE PUTS ON THE TIMELINE — and it must be the file the gates measure.
-    This used to hand Resolve the ORIGINAL source for everything except YouTube, while
-    render_is_complete() and the remux's RPU alignment both measure p.source_cfr. Two
-    different files. Don't Look Up's original carries ~294s of audio past the end of its
-    picture, so Resolve took the clip length from the container: 8591.648s x 24 is exactly
-    the 206,200 frames it rendered for a 199,144-frame movie, and an RPU aligned
-    frame-by-frame could never land on it (live-caught 2026-08-21).
-
-    The CFR is the pipeline's canonical timing, and for an already-CFR source its video is a
-    stream COPY — so the fast path still puts the original's own pixels on the timeline,
-    just in a container that tells the truth about where the picture ends. Combine items
-    have no CFR (the remux reads both originals) and keep their verdict winner.
-
-    There is deliberately NO "fall back to the source if the CFR is missing": a silent
-    fallback is how the two files diverged in the first place. It cannot fire anyway —
-    stage_done("download") already gates on topaz.is_cfr_ready(p.source_cfr), so resolve
-    never starts without one."""
-    from orchestrator import combine_winner_path
-    if p.combine:
-        return combine_winner_path(p)
-    return p.source_cfr
-
-
 def _plan_fast_path_bounds(p, progress=None, src=None) -> str:
-    """RESOLVE-ONLY fast path: no upscale, but the capped remux still re-encodes — so run
+    """The DV-only fast path ("dv-only" in the plan): no upscale, but the capped remux still
+    re-encodes — so run
     topaz's PLANNING front half (scene detect + ~90 s grouping, the exact same utilities)
     and stash the cumulative end-frames, so the remux segments at scene cuts like the
     topaz path (user-dictated). Best-effort: any failure just leaves the remux on its
@@ -338,15 +237,13 @@ def _source_video_kbps(path):
 
 def run_stage(stage, p, *, abort=None, progress=None, low_prio=False, should_pause=None):
     fn = {
-        "download": _download, "extend": _extend, "topaz": _topaz, "resolve": _resolve,
-        "dvnative": _dvnative, "dvrender": _dvrender, "remux": _remux, "upload": _upload,
+        "download": _download, "extend": _extend, "topaz": _topaz, "dvnative": _dvnative, "dvrender": _dvrender, "remux": _remux, "upload": _upload,
         "cleanup": _cleanup,
     }.get(stage, lambda *_a, **_k: (False, f"unknown stage {stage}"))
     ep = getattr(p, "ep", "?")
     try:
         # `should_pause` = yield at the next segment boundary: topaz yields to two live
-        # remuxes; a remux yields to an active Resolve (Resolve gets the whole machine).
-        # Both are segmented, so a pause costs nothing — the retry resumes in place. The
+        # remuxes; a remux yields while AI outpainting has the machine. Both are segmented, so a pause costs nothing — the retry resumes in place. The
         # native DV analysis ('dvnative', run thread only) is per-chunk resumable too: a
         # pause there loses at most the chunk in hand; the native render ('dvrender') yields
         # only inside its analysis, range by range (see _dvrender).
@@ -447,9 +344,8 @@ def _download_body(p, abort, progress=None, low_prio=False):
 
     Then convert the verified source to CONSTANT frame rate at its own rate (topaz.to_cfr)
     into p.source_cfr — a variable frame rate is what made the downstream frame counts
-    drift (header vs decoder vs Resolve disagreeing), breaking the Topaz last-chunk count
-    and the Resolve timeline-length guard. p.source_cfr is what Topaz, Resolve and the
-    remux all read; the original stays so the size check still proves the download finished.
+    drift (header vs decoder disagreeing), breaking the Topaz last-chunk count and the
+    render's length check. p.source_cfr is what Topaz, the DV step and the remux all read; the original stays so the size check still proves the download finished.
     stage_done('download') requires BOTH, so an interrupted CFR pass just resumes here."""
     if p.combine:
         return _download_combine(p, abort, progress)
@@ -522,7 +418,7 @@ def _download_combine(p, abort, progress=None):
     Visionary's own FTP (same reuse/verify/partial rules as the classic path) and the
     seedbox companion streamed through the Shuttle relay (rclone-cat; nothing staged on
     the NAS). NO Dolby Vision refusal (a DV copy is the point here) and NO CFR pass
-    (combine never feeds Topaz; the remux and Resolve read the originals directly)."""
+    (combine never feeds Topaz; the remux and the DV render read the originals directly)."""
     import companion as companion_mod
     import scratch as scratch_mod
     if not p.companion_virtual or p.companion_size <= 0:
@@ -595,30 +491,17 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
     import plan
     orchestrator.apply_container(p)     # source is on disk now → lock the container (mkv vs mp4)
     if topaz.is_cfr_ready(p.source_cfr):
-        if topaz.cfr_hostable(p.source_cfr):
-            return True, "source + CFR already on disk (reused)"
-        # Made before the CFR had to be a rate Resolve can host: redo it, and forget the scene
-        # plan's frame bounds, which counted the old rate's frames (the cut TIMES in scenes.json
-        # stay good). Live 2026-10-01: a 23/1 "Fireworks Song" CFR from 2026-09-08 failed
-        # Resolve's conform every time and held every item queued behind it.
-        rate = topaz._fps_fraction(p.source_cfr)
-        try:
-            os.remove(p.source_cfr)
-        except OSError:
-            pass
-        _forget_topaz_bounds(p.source_basename)
-        logbook.event(f"download {p.ep}: the CFR on disk runs at {rate}, which Resolve cannot "
-                      f"host — making it again at a rate it can")
-    # FAST-PATH items (rpu-only / resolve-only) skip Topaz, so they don't need the true-CFR
+        return True, "source + CFR already on disk (reused)"
+    # FAST-PATH items (rpu-only / dv-only) skip Topaz, so they don't need the true-CFR
     # re-encode that keeps Topaz's frame counts stable — this file only carries their AUDIO
     # (a bit-copy of the original's either way) and decodable frames for scene-cut planning.
     # Stream-copy instead: minutes and disk-bound rather than hours of libx264 on a 4K
     # movie whose video bytes nothing downstream reads (live-caught: a 60 GB REMUX).
     pl = plan.plan_for(p.source)
-    fast = pl.get("topaz") in ("rpu-only", "resolve-only")
+    fast = pl.get("topaz") in ("rpu-only", "dv-only")
     # ...except a VARIABLE frame rate source, which takes the fast path too (no 4K source goes
-    # through Topaz, user-dictated 2026-09-30) and so must really be RE-TIMED here: Resolve
-    # imports this file (resolve_input) and its timeline runs at one rate. For 4K that is the
+    # through Topaz, user-dictated 2026-09-30) and so must really be RE-TIMED here: the DV render
+    # reads this file and counts its frames at one rate. For 4K that is the
     # hardware HEVC re-encode at CFR_HW_KBPS — the same one the old Topaz clean pass started from.
     copy_only = fast and pl.get("source_cfr", True)
     on_prog = None
@@ -633,8 +516,8 @@ def _ensure_cfr(p, abort, progress=None, low_prio=False):
         return False, cfr_failure_message(res.error_tail)
     if res.capped_secs:
         # Worth saying out loud: the source's container ran past its own picture, so the CFR
-        # was bounded to the picture. Unbounded, Resolve takes the CONTAINER's length as the
-        # timeline and renders minutes of nothing onto the end (see topaz.cfr_duration_cap).
+        # was bounded to the picture. Unbounded, every later stage would count the CONTAINER's
+        # length and minutes of nothing would land on the end (see topaz.cfr_duration_cap).
         logbook.event(f"download {p.ep}: container runs past the picture — "
                       f"CFR capped at {res.capped_secs:.1f}s")
     return True, f"downloaded + CFR @ {res.rate} ({res.frames} frames)"
@@ -802,7 +685,7 @@ def _extend(p, abort, progress=None):
     scene_hash: dict = {}       # scene -> the probe frame's dHash (for registration)
 
     def _scene_reference(sc, chunk_in, n):
-        """Resolve this scene's reference (cached). Never raises."""
+        """Look up this scene's reference (cached). Never raises."""
         if sc in scene_refs:
             return scene_refs[sc]
         ref_name = None
@@ -971,29 +854,22 @@ def _topaz(p, abort, progress=None, should_pause=None):
         # Reached when the download stage was already done (pre-fix scratch, reused source);
         # a fresh download refuses earlier, before the CFR pass.
         return False, "permanent: source is already Dolby Vision — nothing to upscale"
-    if pl["topaz"] in ("rpu-only", "resolve-only"):
+    if pl["topaz"] in ("rpu-only", "dv-only"):
         # HIGH-BITRATE 4K FAST PATH: the source picture IS the deliverable — no upscale.
-        # Succeed as a no-op so the run loop proceeds straight to the Resolve stage.
-        # resolve-only still runs topaz's scene-cut PLANNING so its capped remux segments
+        # Succeed as a no-op so the run loop proceeds straight to the DV step.
+        # dv-only still runs topaz's scene-cut PLANNING so its capped remux segments
         # at scene cuts (rpu-only plans LAZILY in the remux stage instead — it only needs
         # segments at all when the peak gate revokes its stream copy).
-        note = _plan_fast_path_bounds(p, progress) if pl["topaz"] == "resolve-only" else ""
-        reason = pl["reason"]
-        if _native_render_route(p):     # its route renders natively (dv_routes): say who does
-            reason = reason.replace("Resolve ", "the native DV render ", 1)
-        return True, reason + " — skipping upscale" + note
+        note = _plan_fast_path_bounds(p, progress) if pl["topaz"] == "dv-only" else ""
+        return True, pl["reason"] + " — skipping upscale" + note
     if p.youtube:
-        # YOUTUBE SKIPS TOPAZ (user-dictated 2026-08-06): Resolve does the scaling
-        # (the scheduler reads this same fact via orchestrator.topaz_is_noop — keep in step)
-        # instead — SuperScale 2x for 1080p sources (a scripting-API clip property, no
-        # screen navigation), the 4K timeline's plain scaling otherwise. Scene-cut
-        # planning still runs so the capped remux segments at real cuts. A route set
-        # 'native' that the native render can make says so instead (dv_routes).
+        # YOUTUBE SKIPS TOPAZ (user-dictated 2026-08-06): the native DV render does the scaling
+        # (the scheduler reads this same fact via orchestrator.topaz_is_noop — keep in step) —
+        # a Lanczos fit into 3840x2160 (user-chosen 2026-10-18 over MetalFX in a blind A/B).
+        # Scene-cut planning still runs so the capped remux segments at real cuts.
         note = _plan_fast_path_bounds(p, progress)
         route = _native_render_route(p)
-        if route:
-            return True, f"YouTube → the native DV render ({route}) — skipping Topaz" + note
-        return True, "YouTube → Resolve scales it (SuperScale for 1080p) — skipping Topaz" + note
+        return True, f"YouTube → the native DV render ({route or 'its route'}) — skipping Topaz" + note
     # Per-resolution preset variant: the plan's bucket (from the source height) picks which
     # tuned param set to use; the source can be ANY of 480p/720p/1080p and still reach 4K.
     params = settings.show_topaz_params(p.series, pl.get("res") or "1080p")
@@ -1036,8 +912,8 @@ def _topaz(p, abort, progress=None, should_pause=None):
     # segdir (+ a manifest). An interruption only loses the current chunk — a resume
     # re-encodes just that one (from its scene-cut start, frame-identical) and skips the
     # rest. We do NOT stitch the chunks into one giant file (that needed ~238 GB twice and
-    # is what got stuck); the chunks STAY as separate files and the Resolve stage assembles
-    # them on its timeline. The segdir is the topaz OUTPUT + the resume checkpoint — KEPT on
+    # is what got stuck); the chunks STAY as separate files and the DV step reads them in
+    # order. The segdir is the topaz OUTPUT + the resume checkpoint — KEPT on
     # interruption, removed only at cleanup. stage_done("topaz") checks the manifest.
     res = topaz.upscale_resumable(src_in, segdir=p.segdir, profile=params, scale=pl["scale"],
                                   fit_height=pl.get("fit_height"), on_progress=on_progress, abort=abort,
@@ -1067,610 +943,9 @@ def _err_tail(text, n=200):
     return (" ".join(picked.split()) or "(no error output)")[-n:]
 
 
-# UNDER TESTS these two never touch the real machine. Closing a kept Resolve is now reachable
-# from ordinary orchestrator paths (a TV item starting, disable(), an idle loop), so a test
-# that leaked kept-open state could otherwise pkill the LIVE Resolve mid-analysis or pull
-# Visionary to the front while the suite runs. Same detection as scratch/logbook.
-_UNDER_TEST = "unittest" in sys.modules
-
-
-def _kill_resolve():
-    """Force-quit Resolve (a graceful quit hangs on its 'cancel renders?' prompt) and forget
-    any kept-open state — then point the user's Resolve back at their own screen."""
-    if not _UNDER_TEST:
-        subprocess.run(["pkill", "-9", "-f", "DaVinci Resolve.app"], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    with _RESOLVE_KEPT_LOCK:
-        _RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
-    unpin_resolve_display(wait=5.0)
-
-
-def _resolve_pids() -> tuple:
-    """The running Resolve's PIDs; () under tests or when they cannot be read (never raises —
-    it runs at the end of a successful pass)."""
-    if _UNDER_TEST:
-        return ()
-    try:
-        r = subprocess.run(["pgrep", "-f", "DaVinci Resolve.app/Contents/MacOS/Resolve"],
-                           capture_output=True, text=True)
-        return tuple(sorted(int(x) for x in r.stdout.split() if x.isdigit()))
-    except Exception:  # noqa: BLE001
-        return ()
-
-
-def unpin_resolve_display(wait: float = 0.0) -> list:
-    """Once Resolve is not running: point any Resolve screen choice that names the pinned display
-    back at the main one (resolve_prefs) — every DV pass puts Resolve's window on the dummy, and
-    Resolve saves that as where it belongs, so the user's own Resolve opened there, invisible
-    (live 2026-10-04). Waits up to `wait` s for a just-killed Resolve to be gone. Never raises;
-    never touches anything under tests."""
-    if _UNDER_TEST:
-        return []
-    try:
-        import resolve_prefs
-        end = time.time() + wait
-        while resolve_prefs.resolve_running() and time.time() < end:
-            time.sleep(0.25)
-        changed = resolve_prefs.unpin()
-        if changed:
-            logbook.event("pointed DaVinci Resolve back at the main display (it had saved the "
-                          "pinned one): " + ", ".join(f"{lay} {key} {a}->{b}"
-                                                      for lay, key, a, b in changed))
-        return changed
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def _display_watch_tick(seen):
-    """One look: unpin when Resolve's preferences OR the attached screens changed since `seen`
-    and Resolve is not running. A save made while the dummy was unplugged or the lid closed (no
-    host to point away from then) is looked at again once the screens change. Returns the new
-    `seen` (unchanged while Resolve runs, so its saves are looked at once it has quit)."""
-    import resolve_prefs
-    key = (os.stat(resolve_prefs.PRESET).st_mtime_ns, resolve_prefs.screens_now())
-    if key == seen or resolve_prefs.resolve_running():
-        return seen
-    unpin_resolve_display()
-    return (os.stat(resolve_prefs.PRESET).st_mtime_ns, resolve_prefs.screens_now())
-
-
-_DISPLAY_WATCH = {"started": False}
-DISPLAY_WATCH_SECS = 15.0
-
-
-def start_resolve_display_watch() -> bool:
-    """A daemon that runs unpin_resolve_display whenever Resolve has saved UI.preset and is no
-    longer running — so a Resolve the user quits, or one a restart closed, never leaves its next
-    launch on the dummy, whether or not a run is armed. One stat per tick otherwise."""
-    if _UNDER_TEST or _DISPLAY_WATCH["started"]:
-        return False
-    _DISPLAY_WATCH["started"] = True
-
-    def loop():
-        seen = None
-        while True:
-            try:
-                seen = _display_watch_tick(seen)
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(DISPLAY_WATCH_SECS)
-
-    threading.Thread(target=loop, daemon=True, name="resolve-display-watch").start()
-    return True
-
-
-def _quit_resolve():
-    """After the resolve stage: force-quit Resolve to free its RAM/GPU and guarantee a
-    FRESH, responsive Resolve next episode (stale Resolve is what caused the original
-    hang). Visionary is NOT raised afterwards: no step brings the app to the front any
-    more (user, 2026-10-15) — focus goes back to whatever was in use before Resolve."""
-    _kill_resolve()
-
-
-# ---- A YOUTUBE RUN KEEPS RESOLVE OPEN ------------------------------------------------
-# Every resolve stage used to end by killing Resolve. For a TV episode that is right: an
-# hour of Topaz follows and wants the GPU and memory back, and the next episode's Resolve
-# is hours away. For a burst of YouTube videos it was pure overhead — each video spends
-# about three minutes in Resolve and paid a cold launch on top of that, then the next
-# video launched it again (user-caught 2026-09-16: "make it so resolve doesn't close at
-# the end of every video export, just at the end of the youtube queue").
-#
-# So a SUCCESSFUL YouTube pass leaves Resolve running, and the orchestrator closes it when
-# the YouTube run ends: the run thread starts an item that is not a video, finds nothing
-# to run, pauses for power, or stops (close_kept_resolve). Anything that went wrong still
-# kills it — a failed, aborted or timed-out pass must never leave a suspect Resolve for
-# the next video — and so does a change of output project (switching projects inside a
-# live session can raise a save prompt the automation cannot see) and a long run
-# (RESOLVE_REUSE_MAX passes: a fresh Resolve now and then costs one launch, a slowly
-# degrading one costs a hang).
-RESOLVE_REUSE_MAX = 20
-_RESOLVE_KEPT = {"open": False, "mode": None, "passes": 0, "pids": ()}
-_RESOLVE_KEPT_LOCK = threading.Lock()
-
-
-def _keep_resolve_open(mode) -> bool:
-    """Leave Resolve running after a successful YouTube pass. False when the reuse budget is
-    spent — the caller then kills it as it always did."""
-    with _RESOLVE_KEPT_LOCK:
-        n = int(_RESOLVE_KEPT.get("passes") or 0) + 1
-        if n >= RESOLVE_REUSE_MAX:
-            return False
-        _RESOLVE_KEPT.update(open=True, mode=mode, passes=n, pids=_resolve_pids())
-    return True
-
-
-def resolve_kept_open() -> bool:
-    with _RESOLVE_KEPT_LOCK:
-        return bool(_RESOLVE_KEPT.get("open"))
-
-
-def close_kept_resolve(why: str) -> bool:
-    """Close a Resolve a YouTube run left open. No-op (False) when none was kept — this never
-    touches a Resolve the pipeline did not leave running. It never raises Visionary."""
-    with _RESOLVE_KEPT_LOCK:
-        if not _RESOLVE_KEPT.get("open"):
-            return False
-        kept = set(_RESOLVE_KEPT.get("pids") or ())
-    if kept and not _UNDER_TEST and not (kept & set(_resolve_pids())):
-        # The Resolve this run kept is gone (the user quit it): whatever runs now is theirs, and
-        # a pkill here would take their unsaved work with it.
-        with _RESOLVE_KEPT_LOCK:
-            _RESOLVE_KEPT.update(open=False, mode=None, passes=0, pids=())
-        unpin_resolve_display()
-        return False
-    _kill_resolve()
-    logbook.event(f"closed DaVinci Resolve — {why}")
-    return True
-
-
-# ---- FAST-PATH RESOLVE-COMPAT MEZZANINE -----------------------------------------------
-# The fast path feeds the ORIGINAL source to Resolve, and the eligibility gate excludes
-# nothing by codec (user-dictated) — so a 4K VP9/AV1 source (typical 4K YouTube) can land
-# on a Resolve build that can't decode it. That fails at import ("IMPORT FAILED" /
-# "FPS UNREADABLE" from resolve_pipeline), NOT at render — so when that exact signature
-# appears, transcode a lightweight HEVC Main10 mezzanine (hardware videotoolbox — plain
-# ffmpeg, ~45 GB/hr vs ProRes' ~340) and retry ONCE. HEVC Main10 is what the fast path's
-# HDR10 sources already are, so Resolve ingests it by construction. Sources Resolve
-# decodes never take this path.
-MEZZ_MIN_KBPS = 80_000        # floor; else 4× the source bitrate — transparent for a 12-25 Mbps intake
-MEZZ_TIMEOUT = 7200           # hardware encode runs >100 fps; even a movie is well inside 2 h
-_MEZZ_MARKERS = ("IMPORT FAILED", "FPS UNREADABLE")   # resolve_pipeline's ingest-failure prints
-
-
-def mezzanine_path(source: str) -> str:
-    """The mezzanine sits next to the source in scratch (cleanup sweeps it by this name)."""
-    return os.path.splitext(source)[0] + "_mezz.mp4"
-
-
-def build_mezzanine_command(ffmpeg, src, dst, *, rate, color=None, kbps=MEZZ_MIN_KBPS):
-    """Resolve-compat mezzanine: video-only HEVC Main10 at ≥4× the source bitrate. CFR
-    flags regenerate uniform PTS (a webm/mkv ms-timebase must not reach a frame-counted
-    render); color tags carry the source's range (bt709 or PQ) so the persistent
-    project's color management reads the mezzanine exactly like the original. Audio
-    stays out — the remux ships it from the CFR file."""
-    import topaz
-    rate_flags = ["-r", rate] if rate else []
-    return [ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-            "-i", src, "-map", "0:v:0", "-an",
-            "-c:v", "hevc_videotoolbox", "-b:v", f"{int(kbps)}k",
-            "-pix_fmt", "p010le", "-tag:v", "hvc1", "-allow_sw", "1",
-            *rate_flags, "-fps_mode", "cfr",
-            *topaz.color_flags(color),
-            dst]
-
-
-def _build_mezzanine(p, abort, progress=None, src=None):
-    """Transcode the source -> the mezzanine via topaz's registered/killable ffmpeg runner
-    (the repo-standard wrapper — no Topaz processing involved). (ok, path_or_tail).
-    `src` overrides the input (YouTube passes its TRUE-CFR file so the mezzanine's frame
-    count matches what the render-completeness gate counts against)."""
-    import topaz
-    import dvcap
-    inp = src or p.source
-    dst = mezzanine_path(p.source)
-    # REUSE a complete mezzanine from an earlier attempt (frame-count-verified against
-    # the input): a lid-close/transient killed pass used to REBUILD the ~10-minute,
-    # ~50 GB encode on every retry (live-caught 2026-08-06). A partial never matches
-    # (unreadable moov / short count); cleanup still sweeps strays.
-    # EXACT count, not duration x fps. total_frames() estimates from the container
-    # duration, which overruns the real video whenever a track runs past the last frame
-    # (an Opus/AAC tail is routinely a few hundred ms long). The plan built from that
-    # estimate then asks the FINAL segment for frames that do not exist, it hits EOF
-    # short, the exact-count gate rejects it, and the item fails identically on every
-    # retry until it parks (review-caught 2026-08-17). _frame_count reads headers/tags
-    # and falls back to a packet scan — the same exact number the gate compares against.
-    want = topaz._frame_count(inp)
-    if want <= 0:
-        want = topaz.total_frames(inp) or 0
-    if want and os.path.exists(dst) and topaz.total_frames(dst) == want:
-        return True, dst
-    if not want:
-        return False, "could not count the input's frames"
-    # SEGMENTED, dvcap-style (user-dictated 2026-08-06): ~5-min chunks with atomic
-    # publish into a manifest-guarded segdir. A kill keeps every finished chunk; the
-    # retry encodes only what's missing, then a stream-copy concat assembles the
-    # mezzanine. ensure_segdir wipes the chunks whenever the INPUT changes.
-    rate = topaz._fps_fraction(inp)
-    color = topaz.source_color(inp)
-    kbps = max(4 * _source_video_kbps(p.source), MEZZ_MIN_KBPS)
-    segdir = dst + ".segments"
-    try:
-        st = os.stat(inp)
-        ident = f"{st.st_size}:{int(st.st_mtime)}"
-    except OSError:
-        ident = "missing"
-    dvcap.ensure_segdir(segdir, {"mode": "mezz", "src": ident,
-                                 "frames": want, "fps": str(rate), "kbps": int(kbps)})
-    segs = dvcap.plan_segments(want, rate, dvcap.SEG_SECONDS)
-    done = 0
-    seg_files = []
-    for i, (a, b) in enumerate(segs):
-        if abort is not None and abort.is_set():
-            return False, "aborted"
-        n = b - a
-        sf = os.path.join(segdir, f"seg_{i:04d}.mp4")
-        seg_files.append(sf)
-        if dvcap.count_hevc_frames(sf) == n:            # already encoded (resume) → skip
-            done += n
-            if progress:
-                progress({"stage": "resolve", "ep": p.ep, "pct": min(99, round(done / want * 100))})
-            continue
-        part = sf + ".part"
-        for f in (sf, part):                            # partial/stale → redo clean
-            try: os.remove(f)
-            except OSError: pass
-        cmd = topaz.build_mezzanine_segment_command(topaz.FFMPEG_HB, inp, part,
-                                                    start_frame=a, n=n, rate=rate,
-                                                    color=color, kbps=kbps)
-        on_prog = None
-        if progress:
-            base = done
-            def on_prog(frames, _b=base):
-                progress({"stage": "resolve", "ep": p.ep,
-                          "pct": min(99, round((_b + frames) / want * 100))})
-        rc, _frames, aborted, tail = topaz._run_ffmpeg(cmd, os.environ.copy(), abort=abort,
-                                                       on_progress=on_prog, timeout=MEZZ_TIMEOUT)
-        if aborted or rc != 0:
-            try: os.remove(part)
-            except OSError: pass
-            return False, ("aborted" if aborted else (tail or "")[-180:])
-        got = dvcap.count_hevc_frames(part)
-        if got != n:                                    # seek/decode drift → NEVER publish it
-            try: os.remove(part)
-            except OSError: pass
-            return False, f"mezz segment {i + 1}/{len(segs)} frame mismatch: {got} != {n}"
-        os.replace(part, sf)                            # atomic publish, like dvcap's encode
-        done += n
-    # Stream-copy concat of the finished chunks -> the ingest MP4. Identical encodes
-    # (same builder, same params) concat cleanly; the count gate below is the proof.
-    lst = os.path.join(segdir, "concat.txt")
-    with open(lst, "w") as f:
-        for sf in seg_files:
-            f.write("file '%s'\n" % sf.replace("'", "'\\''"))
-    cc = subprocess.run([topaz.FFMPEG_HB, "-hide_banner", "-nostdin", "-y",
-                         "-f", "concat", "-safe", "0", "-i", lst,
-                         "-c", "copy", "-tag:v", "hvc1", "-movflags", "+faststart", dst],
-                        capture_output=True, text=True, timeout=MEZZ_TIMEOUT)
-    if cc.returncode != 0 or topaz.total_frames(dst) != want:
-        try: os.remove(dst)
-        except OSError: pass
-        return False, "mezz concat failed: " + (cc.stderr or "")[-180:]
-    shutil.rmtree(segdir, ignore_errors=True)           # SUCCESS: chunks won't be needed again
-    return True, dst
-
-
-def _chosen_host():
-    try:
-        import preflight as _pf
-        return _pf.chosen_host()
-    except Exception as e:
-        return None, "%s: %s" % (e.__class__.__name__, e)
-
-
-def _host_problem(host, host_why):
-    """Why the Resolve stage may not run now for want of its display — the reason it reports as
-    "host-display: <why>" — or None when it may: a display was chosen, or none is pinned, or
-    pinning is off, or the user allowed the main display instead (resolve_host_fallback_main)."""
-    import settings as _st
-    s = _st.get_settings()
-    if host or not (s.get("resolve_host_pinning") and _st.get_display_priority()):
-        return None
-    if host_why == "chosen display is the main one" or s.get("resolve_host_fallback_main"):
-        return None
-    return host_why or "pinned display unavailable"
-
-
-def host_display_problem():
-    """The same verdict, read now: what the orchestrator asks before it lets an item reach Resolve,
-    and again before it counts a "host-display:" failure (a display that IS attached but refused
-    the window is a genuine failure). Never raises."""
-    if _UNDER_TEST:
-        return None             # the real screens must not steer a test; tests patch this
-    try:
-        return _host_problem(*_chosen_host())
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _resolve(p, abort, progress=None):
-    """ProRes -> mute Dolby Vision .mov, run in a KILLABLE SUBPROCESS (setup + DV
-    Analyze All + render, via resolve_pipeline.py episode). The Resolve scripting
-    API (fusionscript) can hang on a socket wait HOLDING THE GIL when Resolve is
-    unresponsive — in-process that wedges the entire orchestrator (the exact bug
-    that froze the app mid-run). As a child process it's killable on timeout/abort,
-    so a Resolve hang fails this stage cleanly and the orchestrator keeps breathing.
-    The OUTPUT MODE picks the Resolve project. Automatically that is ALWAYS the
-    1000-nit Dolby Vision project (user-dictated 2026-08-09); the non-DV SDR project is
-    reachable ONLY through an explicit per-item override. The 2000-nit DV project is retired
-    (user decision 2026-10-15): nothing selects it any more.
-    When the stage finishes Resolve is quit (the app is never raised) — except after a
-    successful YouTube pass, which leaves it running for the next video (_keep_resolve_open).
-    FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
-    nothing by codec), a lightweight HEVC mezzanine is built and the run retried once."""
-    import plan
-    if p.combine:
-        # COMPANION COMBINE: a REAL RPU (either copy) makes this whole stage unnecessary —
-        # real DV beats Resolve DV (user-dictated). Only the neither-copy-has-DV fallback
-        # renders, and it analyzes the verdict WINNER. Checked BEFORE the plan skip below:
-        # a DV library copy would otherwise "permanent:"-refuse the item it belongs to.
-        import companion as companion_mod
-        cv = companion_mod.confirmed_verdict(p.source_basename)
-        if not cv:
-            return False, "permanent: combine verdict lost — re-pair the companion"
-        if cv["verdict"].get("rpu_from") != "resolve":
-            return True, "combine: real Dolby Vision RPU present — Resolve not needed"
-    pl = plan.plan_for(p.source)   # ORIGINAL: CFR re-encode strips DV side data (skip-detection)
-    if not p.combine and pl.get("resolve") == "skip":
-        return False, "permanent: source is already Dolby Vision — nothing for Resolve to do"
-    # OUTPUT MODE. "auto" = the 1000-nit DV project, whatever the intake range
-    # (user-dictated 2026-08-09). A per-item override pins it regardless of the source;
-    # "sdr" is the only value that produces a non-DV master, and the only one whose Resolve
-    # stage needs no screen automation at all.
-    import settings as _st
-    override = _st.get_show_output_mode(_settings_scope(p))
-    # The setting's values ARE the Resolve modes ("sdr" / "dv1000"), so there is no translation
-    # table to get wrong. "auto" = ALWAYS 1000 nits (user-dictated 2026-08-09), HDR intake
-    # included. The 2000-nit mode is RETIRED (user decision 2026-10-15): settings reads a
-    # profile still pinned to it as "dv1000", and this never passes "dv2000" either.
-    mode = override if override in ("sdr", "dv1000") else "dv1000"
-    # WHICH SCREEN. Resolved ONCE here, before the subprocess spawns, so an unplugged or
-    # unproven display is a clean stage-level decision with a log line — not a surprise
-    # 200 seconds into a Resolve cold start.
-    host, host_why = _chosen_host()
-    if host:
-        print(f"resolve: hosting on {host.get('name')} ({host.get('key')})", flush=True)
-    elif (problem := _host_problem(host, host_why)) is not None:
-        # A PINNED display that is gone/unproven must not silently become "drive the main
-        # display" — the whole point of pinning is that the main screen belongs to the
-        # user. Same "host-display:" reason as the post-spawn HOST_UNAVAILABLE path; the
-        # orchestrator HOLDS the item before Resolve until the display is back (never counted
-        # toward parking), or set resolve_host_fallback_main to allow main instead.
-        return False, "host-display: %s" % problem
-    fast = pl.get("topaz") in ("rpu-only", "resolve-only")
-    # YouTube runs single-mode too (no Topaz segdir), but on the TRUE-CFR file — web
-    # sources are routinely VFR, and the render-completeness gate counts frames against
-    # source_cfr. SuperScale 2x only for ~1080p sources (user-dictated).
-    yt = bool(p.youtube)
-    # THE CLEANUP GRADE, for YouTube only. It is the one path with nothing between the source
-    # and the deliverable — it skips Topaz by design, so the source's banding and block noise
-    # scale up 2x and freeze into the master. Off unless the user has actually saved a grade.
-    cleanup = "1" if (yt and _st.get_settings().get("youtube_cleanup_grade", True)
-                      and os.path.exists(resolve_pipeline_cleanup_drx())) else "-"
-    # The SHIELD peak cap, for a YouTube render only: resolve_pipeline measures the
-    # render's 1-s peak while the timeline is still up and re-exports lower while it is
-    # over — the gamble's second throw, minutes instead of the hour-class capped re-encode
-    # (user-dictated 2026-09-14). "-" for everything else: TV/movie renders always take
-    # the x265 capped pass, so their render bitrate is not a gamble.
-    cap_arg = str(int(_st.get_settings().get("max_peak_mbps", 50))) if yt else "-"
-    single = fast or yt or p.combine
-    ss = "-"
-    h = 0
-    if yt:
-        try:
-            h = int((pl.get("input") or {}).get("height") or 0)
-        except (TypeError, ValueError):
-            h = 0
-        if 900 <= h <= 1200:
-            ss = "2"
-    # Match the ORIGINAL intake's bitrate (the real source quality), not the CFR re-encode's
-    # near-lossless crf bitrate, which would inflate the export for no quality gain. In
-    # rpu-only mode the render's VIDEO is discarded (only its RPU ships) — floor is plenty.
-    # (A mezzanine retry keeps this same value — the inflated mezz bitrate is not quality.)
-    bitrate = (EXPORT_BITRATE_FLOOR_KBPS if (pl.get("topaz") == "rpu-only" or p.combine)
-               else youtube_render_kbps(h) if yt
-               else max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS))
-
-    def _run(video_in):
-        """One resolve_pipeline subprocess pass. (ok, out, reason) — `out` is the FULL
-        output (the import-failure markers print mid-stream, not on the last line);
-        reason is None on a hard kill/abort/launch failure (no retry on those)."""
-        cmd = [sys.executable, os.path.join(ENGINE_DIR, "resolve_pipeline.py"),
-               ("single" if single else "episode"),
-               (video_in if single else p.segdir), p.dv_render, mode, str(bitrate),
-               # 6th arg: the display to drive. "-" = the main display (every older
-               # behaviour). 7th: SuperScale factor for single mode ("-" = none).
-               # 8th: apply the YouTube cleanup grade ("1"/"-"). APPENDED, never inserted —
-               # an older resolve_pipeline.py just ignores a trailing arg.
-               # Both files deploy together, so argv lockstep is fine.
-               (host.get("key") if host else "-"), ss, cleanup,
-               # 9th: the peak cap for the render gate ("-" = none). Appended, as above.
-               cap_arg]
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1)
-        except Exception as e:
-            logbook.exception(f"resolve {p.ep}: launch", e)
-            return False, "", f"resolve launch failed: {e}"
-        out_lines = []
-        watch = {"t0": None, "pct": None, "moved": None, "first": None}   # see resolve_deadline
-
-        def _reader():
-            # stream output live so the RENDER part's % surfaces as a progress bar;
-            # keep the lines around for the failure tail. (Reader thread so the abort/
-            # timeout poll below stays responsive even between sparse render updates.)
-            for line in proc.stdout:
-                out_lines.append(line)
-                m = re.match(r"RENDER_PCT (\d+)", line.strip())
-                if m:
-                    now, pct = time.monotonic(), int(m.group(1))
-                    if watch["t0"] is None:
-                        watch["t0"] = now
-                    if pct != watch["pct"]:
-                        watch["pct"], watch["moved"] = pct, now
-                elif line.startswith("RENDER_REEXPORT"):
-                    now = time.monotonic()              # the cap gate asked for another render
-                    watch.update(first=(now - watch["t0"]) if watch["t0"] else watch["first"],
-                                 t0=now, pct=None, moved=now)
-                if m and progress:
-                    # `rendering` gates the app's live screen preview OFF for the render
-                    # phase (user-dictated 2026-08-06): the analysis worth watching is
-                    # over, and each preview frame is a screencapture of the 4K panel
-                    # while the machine renders. Carried only by these events, so any
-                    # non-render event (a retry's setup) brings the preview back.
-                    progress({"stage": "resolve", "ep": p.ep, "pct": int(m.group(1)),
-                              "rendering": True})
-                    continue
-                # The screen/mouse takeover is about to happen. This marker is the ONLY
-                # lead time that exists — the stage flips to "resolve" seconds before
-                # Resolve launches, so the warning window is the deliberate hold the shim
-                # takes, and this is what tells the app to draw the notice.
-                # Three states, no timer. SOON = about to (roughly ten seconds of real
-                # setup work still to run), BEGIN = the first click has landed and the mouse
-                # is genuinely taken, END = handed back.
-                if progress and line.startswith("SCREEN_TAKEOVER_SOON"):
-                    progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_soon": True, "takeover_active": False})
-                elif progress and line.startswith("MOUSE_IN_USE"):
-                    # A timestamp, not a flag: the app shows the notice while this is fresh,
-                    # so it tracks real pointer use and expires by itself. The mouse is only
-                    # busy in short click bursts — the hour of wait_for_analysis that follows
-                    # is screenshots only.
-                    try:
-                        at = int(line.strip().split()[1])
-                    except (IndexError, ValueError):
-                        at = int(time.time())
-                    progress({"stage": "resolve", "ep": p.ep,
-                              "takeover_soon": False, "mouse_at": at})
-                elif progress and line.startswith("SCREEN_TAKEOVER_END"):
-                    progress({"stage": "resolve", "ep": p.ep, "takeover_soon": False})
-        threading.Thread(target=_reader, daemon=True).start()
-        # MONOTONIC: it pauses through a real sleep on macOS, so a laptop that slept
-        # mid-pass wakes with its budget intact instead of a falsely-expired deadline
-        # killing the subprocess ("starting over with resolve", user-caught 2026-08-06).
-        budget = _resolve_budget(p)
-        start = time.monotonic()
-        base = start + budget
-        extended = False
-        while proc.poll() is None:
-            aborted = abort is not None and abort.is_set()
-            now = time.monotonic()
-            deadline = base
-            if not aborted and now > base:
-                # Past the budget, asked EVERY poll: a render that stops moving dies within one
-                # poll of RENDER_STALL_SECS, however long an earlier estimate would have allowed.
-                deadline = resolve_deadline(now, start, base, watch, budget)
-                if deadline > now and not extended:
-                    extended = True
-                    logbook.event(f"resolve {p.ep}: past its {budget // 60}-minute budget but "
-                                  f"rendering ({watch['pct'] or 0}%) — letting it finish while "
-                                  f"it keeps moving")
-            if aborted or now > deadline:
-                proc.kill()
-                reason = "aborted (stop-time)" if aborted else "TIMED OUT — Resolve unresponsive"
-                logbook.failure(f"resolve {p.ep}: killed subprocess — {reason}")
-                return False, "", f"resolve killed — {reason}"
-            time.sleep(5)
-        out = "".join(out_lines)
-        tail = " ".join(out.strip().splitlines()[-1:])[:180]
-        dv = _is_dv81(_vstream(p.dv_render))
-        # LENGTH too. A render that died partway still carries a valid DOVI record, and
-        # accepting it drops the ~190 GiB ProRes that is the only way to redo the upscale.
-        from orchestrator import render_is_complete, _nb_frames
-        whole = render_is_complete(p) if dv else True
-        ok = dv and whole
-        if dv and not whole:
-            # WRONG-LENGTH, not merely short: a render can also come back LONGER than the
-            # source (a stale timeline, a container that outran its picture), and calling
-            # that "TRUNCATED" sent the diagnosis in exactly the wrong direction for a day.
-            got, want = _nb_frames(p.dv_render), _nb_frames(p.source_cfr)
-            how = ("LONG" if (got or 0) > (want or 0) else "SHORT")
-            logbook.failure(f"resolve {p.ep}: {how} render ({got} of {want} frames) — "
-                            f"the render is not this source")
-            # The subprocess's own diagnostics (timeline length, clip fps, OUTPUT line) are
-            # the only record of WHY, and they were dropped with the rest of stdout.
-            for ln in out.splitlines():
-                if any(k in ln for k in ("timeline = ", "CLIP FPS DISAGREES", "FRAME RATE",
-                                         "FRAME-RATE CONFORM", "TIMELINE LENGTH", "RESUME:")):
-                    logbook.event(f"resolve {p.ep}: {ln.strip()[:200]}")
-            return False, out, f"resolve produced a {how} render — not accepting it"
-        if not ok:
-            logbook.failure(f"resolve {p.ep}: rc={proc.returncode} :: {tail}")
-        # The gamble's outcome is worth a line of its own: which target the render ended
-        # up at, or that it stayed over the cap and the remux will re-encode it.
-        note = ""
-        for ln in out.splitlines():
-            # RENDER_PEAK rides along: it carries the peak a render LANDED at against the target
-            # it asked for, and without it there is no instrument on the one number this gamble
-            # turns — every review of it so far has had to infer the distribution from how often
-            # the slow path fired, weeks after the fact.
-            if ln.startswith(("RENDER_PEAK", "RENDER_REEXPORT", "RENDER_OVER_CAP")):
-                logbook.event(f"resolve {p.ep}: {ln.strip()[:200]}")
-                if ln.startswith("RENDER_REEXPORT"):
-                    note = " (re-exported under the cap)"
-        return ok, out, (("rendered DV 8.1" + note) if ok
-                         else f"resolve failed (rc={proc.returncode}): {tail}")
-
-    def _passes():
-        from orchestrator import combine_winner_path
-        video_in = resolve_input(p)
-        if p.combine and not video_in:
-            return False, "permanent: combine verdict lost — re-pair the companion"
-        ok, out, reason = _run(video_in)
-        # A PINNED display that is unplugged, asleep or unmovable must not silently become
-        # "drive the main display" — that is the one outcome hosting exists to prevent. The
-        # item defers instead, so a yanked cable stalls the run rather than surprising the
-        # user, and it does not burn one of max_episode_fails on a cable.
-        if not ok and "HOST_UNAVAILABLE" in out:
-            line = next((l.strip() for l in out.splitlines() if "HOST_UNAVAILABLE" in l), "")
-            return False, "host-display: %s" % (line.replace("HOST_UNAVAILABLE", "").strip()
-                                                or "pinned display unavailable")
-        if ok or not single or not any(mk in out for mk in _MEZZ_MARKERS):
-            return ok, reason
-        # Fast-path ingest failure — Resolve can't decode this source (VP9/AV1). Build the
-        # compat mezzanine and retry ONCE; either way the big temp is deleted before return.
-        logbook.failure(f"resolve {p.ep}: source not ingestible — building HEVC compat mezzanine")
-        if progress:
-            progress({"stage": "resolve", "ep": p.ep, "pct": 0})
-        mok, mezz = _build_mezzanine(p, abort, progress,
-                                     src=(video_in if (yt or p.combine) else None))
-        if not mok:
-            return False, f"compat mezzanine failed: {mezz}"
-        ok, _out, reason = _run(mezz)
-        if ok:                          # keep it on FAILURE — the retry reuses it instead of
-            try: os.remove(mezz)        # re-encoding 10 minutes; cleanup sweeps a stray
-            except OSError: pass
-        return ok, (reason + " (via compat mezzanine)" if ok else reason)
-
-    with _RESOLVE_KEPT_LOCK:
-        other_project = _RESOLVE_KEPT.get("open") and _RESOLVE_KEPT.get("mode") != mode
-    if other_project:
-        close_kept_resolve(f"this video renders to the {mode} project, not the open one")
-    ok = False
-    try:
-        ok, reason = _passes()
-        return ok, reason
-    finally:
-        # A successful YouTube pass leaves Resolve running for the next video (see
-        # _keep_resolve_open); everything else ends the way it always did.
-        aborted = abort is not None and abort.is_set()
-        if not (ok and yt and not aborted and _keep_resolve_open(mode)):
-            _quit_resolve()
-
-
 def _dvnative(p, abort, progress=None, should_pause=None):
-    """NATIVE DOLBY VISION (settings `dv_engine` 'native'): an eligible TV episode's DV analysis
-    WITHOUT Resolve — hdr_analyzer_mvp over Topaz's ProRes chunks through the pinned SDR->PQ
-    LUT, then dovi_tool's RPU (nativelane.run_analysis: chunk list -> 'analyzing' marker ->
+    """NATIVE DOLBY VISION — the chunk lane: an eligible TV episode's DV analysis, hdr_analyzer_mvp
+    over Topaz's ProRes chunks through the pinned SDR->PQ LUT, then dovi_tool's RPU (nativelane.run_analysis: chunk list -> 'analyzing' marker ->
     per-chunk analysis -> RPU -> 'ready' marker, published last). Run thread only, and only
     for an item orchestrator._native_slot routed here — never the screen, never a SIGSTOP:
     it runs at nice 10 beside the previous item's x265 tail.
@@ -1680,9 +955,10 @@ def _dvnative(p, abort, progress=None, should_pause=None):
     failure is booked in native/failures.json; the MAX_FAILURES-th, or one the lane says no
     retry can fix (on a first claim: chunks or CFR that do not fit; on a resume: a changed
     analyzer or LUT, or a changed chunk set), writes native/fallback.json and comes back as
-    "native-fallback: ..." — the orchestrator then runs the item through Resolve in the same
-    pass, on the chunks the lane never touched. A broken TOOLCHAIN is never sticky: it claims
-    nothing, and nativelane.decide() sends items to Resolve until it is fixed."""
+    "native-fallback: ..." — the orchestrator then sends the item to the native chunk render
+    (dvrender) in the same pass, on the chunks the lane never touched. A broken TOOLCHAIN is
+    never sticky: it claims nothing, and the item waits until it is fixed (the render needs the
+    same toolchain)."""
     import nativelane
     try:
         ok, msg = nativelane.run_analysis(p, abort=abort, progress=progress,
@@ -1701,66 +977,63 @@ def _dvnative(p, abort, progress=None, should_pause=None):
             nativelane.write_fallback(p, msg)
             why = msg[len(nativelane.FALLBACK_PREFIX):].strip() \
                 if msg.startswith(nativelane.FALLBACK_PREFIX) else msg
-            return False, f"{nativelane.FALLBACK_PREFIX} {why} — Resolve takes this item"
+            return False, f"{nativelane.FALLBACK_PREFIX} {why} — the native render takes this item"
     except Exception as e:      # the books are files on a disk that may be full: never a crash
         logbook.exception(f"dvnative {getattr(p, 'ep', '?')} bookkeeping", e)
         return False, f"{msg} (native attempt not booked: {e.__class__.__name__})"
     return False, f"{msg} (native attempt {n} of {nativelane.MAX_FAILURES})"
 
 
-# ---- the native DV render ('dvrender'): a route set 'native' in settings dv_routes -----------
-# The routes the stage can make. yt_native4k and sdr4k take one source already at the master's
+# ---- the native DV render ('dvrender'): every route the chunk lane does not take -------------
+# The routes the stage makes. yt_native4k and sdr4k take one source already at the master's
 # 3840x2160, BT.709 limited-range SDR, straight through the pinned LUT (the TV lane's validated
-# chain) — no front end at all; any other size or colour of theirs renders through Resolve.
-# DVRENDER_FIT_ROUTES (2026-10-18: yt_plain, yt_1080 — every SDR YouTube video under native 4K,
-# and every vertical one) put the fit front end before the LUT (dvnative.fit_front_end): BT.601
-# or full range to BT.709 limited when the tags (or, untagged, the frame size) say so, then a
-# Lanczos fit into 3840x2160 with a black pad — the picture Resolve's 4K timeline makes of
-# them. yt_1080 is a plain 2x Lanczos (user decision: no SuperScale stand-in; a blind A/B against
-# MetalFX showed no difference). Each route still renders only when dv_routes sets it 'native'.
-# HDR INTAKE (2026-10-18): DVRENDER_HDR_ROUTES take an HDR source with NO LUT (_hdr_render_spec).
+# chain) — no front end at all; any other size or colour of theirs is refused with the reason.
+# DVRENDER_FIT_ROUTES (yt_plain, yt_1080 — every SDR YouTube video under native 4K, and every
+# vertical one) put the fit front end before the LUT (dvnative.fit_front_end): BT.601 or full
+# range to BT.709 limited when the tags (or, untagged, the frame size) say so, then a Lanczos fit
+# into 3840x2160 with a black pad. yt_1080 is a plain 2x Lanczos (user decision 2026-10-18: a
+# blind A/B against MetalFX showed no difference).
+# HDR INTAKE: DVRENDER_HDR_ROUTES take an HDR source with NO LUT (_hdr_render_spec).
 #   rpu_only      4K HDR10 HEVC Main10 CFR: the source is measured as it is and keeps its own
 #                 mastering (its mastering-display and content-light-level SEI become L6), and the
 #                 render IS its own coded video with that RPU injected (keep_video: no encode) —
-#                 so the remux's untouched rpu-only branch ships exactly what it did with
-#                 Resolve's RPU: remux_inject onto the original bits under the 72 Mbps gate, the
-#                 capped x265 of the source (its own mastering display, encode_source) over it
+#                 so the remux's rpu-only branch ships remux_inject onto the original bits under
+#                 the 72 Mbps gate, the capped x265 of the source (its own mastering display,
+#                 encode_source) over it
 #   hdr_reencode  PQ that cannot carry an RPU as it is (AV1, H.264, 8-bit, VFR): measured and
-#                 VideoToolbox-encoded as it is, keeping its own mastering, at Resolve's export
-#                 bitrate; the remux's capped x265 then reads the render, as it read Resolve's
+#                 VideoToolbox-encoded as it is, keeping its own mastering, at the export floor;
+#                 the remux's capped x265 then reads the render
 #   hlg           HLG: dvnative.hlg_to_pq_vf (BT.2100 HLG -> PQ at 1000 nits) in front, then as
-#                 PQ, on the 1000-nit master every Resolve route writes
+#                 PQ, on the 1000-nit master
 #   hdr_topaz     sub-4K PQ or HLG upscaled by Topaz: the render is made from Topaz's chunks (the
 #                 native render's chunk input — per-chunk analysis, one concat encode), no LUT,
-#                 the HLG front end for HLG, the source's own mastering for PQ, at the export
-#                 bitrate Resolve's 'episode' render had; after it the item is a Resolve item in
-#                 every way (the chunks drop at hand-off, the remux's x265 reads the render). It is
-#                 NOT the dv_engine chunk lane (nativelane), which stays the SDR TV lane, untouched.
+#                 the HLG front end for HLG, the source's own mastering for PQ; after it the chunks
+#                 drop at hand-off and the remux's x265 reads the render. It is NOT the chunk lane
+#                 (nativelane), which stays the SDR TV lane.
 # The source keeps its own frame (any 4K geometry, as rpu_only's original stream always has) —
-# except a YouTube video, whose render is the 3840x2160 frame Resolve's timeline makes: one of
-# another size needs an HDR fit, which is not built, so Resolve keeps it.
-# SDR TOPAZ CHUNKS (2026-10-18): DVRENDER_SDR_CHUNK_ROUTES render from Topaz's chunks through
+# except a YouTube video, whose render is 3840x2160: one of another size needs an HDR fit, which
+# is not built, so it is refused with the reason.
+# SDR TOPAZ CHUNKS: DVRENDER_SDR_CHUNK_ROUTES render from Topaz's chunks through
 # dvnative.chunk_front_end (BT.601 -> BT.709 by the standard conversion when the chunk's tags — or,
-# untagged, the source's frame — say so; square pixels for an anamorphic chunk) and the pinned LUT,
-# at the export bitrate Resolve's 'episode' render had, no gate (_sdr_chunk_render_spec). After it
-# the item is a Resolve item in every way: the chunks drop at hand-off and the remux's x265 reads
-# the render — exactly the disk profile Resolve had, which is what movie_sdr_topaz must keep
-# (orchestrator: a movie's ~245 GB ProRes is never held through its remux).
-#   movie_sdr_topaz  a sub-4K SDR movie (any bucket: a 480p DVD film gets the 601 front end)
-#   sd_sdr_topaz     a 480p/576p TV episode the chunk lane (nativelane, its first choice) declined —
-#                    for disk, say; never one the lane fell back from (fallback.json: Resolve takes
-#                    it, as the lane promises) or claimed
-# COMBINE (2026-10-18): combine_nodv — neither copy has real DV, so the verdict's WINNER is analysed
+# untagged, the source's frame — say so; square pixels for an anamorphic chunk; a 4:3 SD picture
+# pillarboxed into 3840x2160) and the pinned LUT, at the intake's own bitrate floored at
+# EXPORT_BITRATE_FLOOR_KBPS, no gate (_sdr_chunk_render_spec). The chunks drop at hand-off and the
+# remux's x265 reads the render, which is what movie_sdr_topaz must keep (orchestrator: a movie's
+# ~245 GB ProRes is never held through its remux).
+#   movie_sdr_topaz   a sub-4K SDR movie (any bucket: a 480p DVD film gets the 601 front end)
+#   tv_sdr_topaz,     a TV episode the chunk lane (nativelane, its first choice) passed on — for
+#   tv_disk_fallback, disk, say, or fell back from (fallback.json) — never one it has claimed
+#   sd_sdr_topaz
+# COMBINE: combine_nodv — neither copy has real DV, so the verdict's WINNER is analysed
 # (_combine_render_spec), exactly as rpu_only analyses its one source; companion.build_verdict
 # already refuses a winner that is not PQ, so there is no SDR winner to route.
 DVRENDER_HDR_ROUTES = ("rpu_only", "hdr_reencode", "hlg", "hdr_topaz")
-DVRENDER_SDR_CHUNK_ROUTES = ("movie_sdr_topaz", "sd_sdr_topaz")
+DVRENDER_SDR_CHUNK_ROUTES = ("movie_sdr_topaz", "tv_sdr_topaz", "tv_disk_fallback", "sd_sdr_topaz")
+DVRENDER_TV_CHUNK_ROUTES = ("tv_sdr_topaz", "tv_disk_fallback", "sd_sdr_topaz")   # the chunk lane's first
 DVRENDER_CHUNK_ROUTES = ("hdr_topaz",) + DVRENDER_SDR_CHUNK_ROUTES   # from Topaz's chunks; the rest
                                                                      # from one file
-# SDR OUTPUT (2026-10-18): sdr_out — any item PINNED to SDR (user decision: the SDR output mode
-# stays, with no Resolve). Resolve's SDR project could never finish such an item (its render has no
-# RPU, which the remux and stage_done both demand); this makes the SDR master without it
-# (_sdr_out_spec): the item is named by the route it would have unpinned (routes.item_route(p,
+# SDR OUTPUT: sdr_out — any item PINNED to SDR (user decision 2026-10-18: the SDR output mode
+# stays). It makes the SDR master (_sdr_out_spec): the item is named by the route it would have unpinned (routes.item_route(p,
 # mode="dv1000")) and rendered as that route's picture with NO LUT — Topaz's chunks through the
 # chunk front end, a YouTube video through the fit front end, 4K SDR through the colour step
 # alone — into a BT.709 HEVC render with no RPU (nativerender's sdr spec, its proof books/sdr.json),
@@ -1775,8 +1048,9 @@ DVRENDER_ROUTES = (("yt_native4k", "sdr4k", "yt_plain", "yt_1080") + DVRENDER_HD
                    + DVRENDER_SDR_CHUNK_ROUTES + DVRENDER_COMBINE_ROUTES + DVRENDER_OUTPUT_ROUTES)
 DVRENDER_FIT_ROUTES = ("yt_plain", "yt_1080")
 DVRENDER_SIZE = (3840, 2160)
+TOOLCHAIN_REFUSAL = "the native toolchain is not ready"   # a refusal of the MACHINE, not the item
 DVRENDER_HDR_MAX = (4096, 2176)     # the largest frame an HDR re-encode makes: HEVC level 5.1's
-                                    # picture size (DV 8.1's UHD levels); larger goes to Resolve
+                                    # picture size (DV 8.1's UHD levels); larger is refused
 
 
 def _int0(v) -> int:
@@ -1788,9 +1062,8 @@ def _int0(v) -> int:
 
 def dvrender_spec(p, route) -> tuple:
     """(nativerender.RenderSpec, "") for item `p`'s native render on `route`, or (None, why) when
-    the stage cannot make it — then Resolve does, exactly as before. The spec is Resolve's render
-    settings for the route: the CFR source (resolve_input), the pinned LUT, the export bitrate
-    _resolve would pass (youtube_render_kbps of the source's height under the max_peak_mbps gate
+    the stage cannot make it (the item then fails with that reason). The spec for the route: the
+    CFR source, the pinned LUT, the export bitrate (youtube_render_kbps of the source's height under the max_peak_mbps gate
     for a video — 14 Mbps for a native-4K or a vertical >= 1700-line one, 20 otherwise; for 4K
     SDR the intake's own bitrate floored at EXPORT_BITRATE_FLOOR_KBPS, no gate — its remux
     re-encodes under the cap anyway), the scene plan _plan_fast_path_bounds stashed as the
@@ -1806,44 +1079,43 @@ def dvrender_spec(p, route) -> tuple:
     if route in DVRENDER_COMBINE_ROUTES:        # a combine has no CFR: it renders the winner
         ok, why = nativelane.toolchain_ok()
         if not ok:
-            return None, f"the native toolchain is not ready: {why}"
+            return None, f"{TOOLCHAIN_REFUSAL}: {why}"
         return _combine_render_spec(p)
     src = getattr(p, "source_cfr", None)
     if not src or not os.path.exists(src):
         return None, "its CFR source is not on disk"
     ok, why = nativelane.toolchain_ok()
     if not ok:
-        return None, f"the native toolchain is not ready: {why}"
+        return None, f"{TOOLCHAIN_REFUSAL}: {why}"
     if route in DVRENDER_HDR_ROUTES:
         return _hdr_render_spec(p, route, src)
     if route in DVRENDER_SDR_CHUNK_ROUTES:
         return _sdr_chunk_render_spec(p, route)
     if route in DVRENDER_OUTPUT_ROUTES:
         return _sdr_out_spec(p, src)
+    import dvnative
+    info = nativelane.probe_stream(src, extra=("sample_aspect_ratio",))
+    if not info:
+        return None, "the source could not be probed"
+    size = (_int0(info.get("width")), _int0(info.get("height")))
     pre_vf = None
-    if route in DVRENDER_FIT_ROUTES:
-        import dvnative
-        info = nativelane.probe_stream(src, extra=("sample_aspect_ratio",))
-        if not info:
-            return None, "the source could not be probed"
+    if route in DVRENDER_FIT_ROUTES or size != DVRENDER_SIZE:
+        # a fit route always takes the fit front end; a native-4K one (yt_native4k, sdr4k) only
+        # when its frame is not the master's — 2.39:1 scope, DCI 4K — and is then letterboxed
+        # into 3840x2160, as every 4K master is
         try:
             pre_vf = dvnative.fit_front_end(info, DVRENDER_SIZE)
         except ValueError as e:
             return None, str(e)
     else:
-        info = nativelane.probe_stream(src)
         ok, why = nativelane.source_ok(info)
         if not ok:
             return None, why.replace("chunk 0", "the source")
-    size = (_int0(info.get("width")), _int0(info.get("height")))
-    if pre_vf is None and size != DVRENDER_SIZE:
-        return None, (f"the source is {size[0]}x{size[1]}, not {DVRENDER_SIZE[0]}x"
-                      f"{DVRENDER_SIZE[1]} — route {route} renders its frame as it is")
     cfr = nativelane.cfr_info(p)
     if not cfr.get("frames") or not cfr.get("fps"):
         return None, "the CFR's frame count or frame rate is unknown"
     if route.startswith("yt_"):
-        # _resolve's YouTube export: youtube_render_kbps(h) for the height of plan_for(p.source)'s
+        # the YouTube export: youtube_render_kbps(h) for the height of plan_for(p.source)'s
         # probe — the same height as the CFR's, which never changes the geometry — and its
         # cap_arg, the max_peak_mbps render gate.
         kbps, cap = youtube_render_kbps(size[1]), int(_st.get_settings().get("max_peak_mbps", 50))
@@ -1862,8 +1134,8 @@ def dvrender_spec(p, route) -> tuple:
 def declared_light(light):
     """PURE. The content light level a native HDR route declares: the source's own (MaxCLL,
     MaxFALL), or None — measure it, in L6 and in the HDR10 SEI alike — when the source says 0,0
-    (HDR10's "unknown", or no level at all: dvnative.source_mastering). Resolve measured it then:
-    its Hamilton render (2026-10-18) declared 620,41 in both over a 0,0 WEB source."""
+    (HDR10's "unknown", or no level at all: dvnative.source_mastering). The reference masters
+    measure it then too: Hamilton's (2026-10-18) declared 620,41 in both over a 0,0 WEB source."""
     return None if light is None or tuple(light) == (0, 0) else light
 
 
@@ -1899,7 +1171,7 @@ def _hdr_render_spec(p, route, src) -> tuple:
     against the CFR they were made from, whose audio the remux takes). PQ routes keep the
     ORIGINAL's own mastering — read from p.source, whose stream the rpu_only master ships (a VFR
     source's CFR is a re-encode that need not carry the SEI) — and HLG takes the 1000-nit master
-    it is converted for. The bitrate and gate are _resolve's: the floor for rpu_only (its
+    it is converted for. The bitrate and gate: the floor for rpu_only (its
     render's picture is never re-encoded here at all — keep_video), youtube_render_kbps(h) under
     max_peak_mbps for a YouTube video, else the intake's own bitrate floored at
     EXPORT_BITRATE_FLOOR_KBPS with no gate (its remux re-encodes under the cap). Probes only;
@@ -1982,19 +1254,16 @@ def _sdr_chunk_render_spec(p, route, *, sdr: bool = False) -> tuple:
     Topaz's chunks (nativelane.chunks, checked against the CFR whose audio the remux takes, chunk
     0's rate exactly the CFR's) through dvnative.chunk_front_end — chunk 0's tags, an untagged one
     judged by the source's frame (the CFR's: it keeps the source's geometry) — and the pinned LUT,
-    at the export bitrate Resolve's 'episode' render had: the intake's own, floored at
-    EXPORT_BITRATE_FLOOR_KBPS, no gate (its remux re-encodes under the cap). sd_sdr_topaz refuses an
-    item the chunk lane claimed or fell back from. `sdr` (sdr_out over a chunk route): the same
+    at the intake's own bitrate, floored at EXPORT_BITRATE_FLOOR_KBPS, no gate (its remux
+    re-encodes under the cap). A TV route (DVRENDER_TV_CHUNK_ROUTES) refuses an item the chunk
+    lane has claimed — the lane makes it — unless the lane fell back from it. `sdr` (sdr_out over a chunk route): the same
     chunks and front end with no LUT, into the SDR render. Probes only; writes nothing."""
     import dvnative
     import nativelane
     import nativerender
-    if route == "sd_sdr_topaz":
-        if nativelane.has_fallback(p):
-            return None, ("the native lane fell back for this item (native/fallback.json) — "
-                          "Resolve takes it")
-        if nativelane.has_marker(p):
-            return None, "the native lane has claimed this item (native/native.json)"
+    if route in DVRENDER_TV_CHUNK_ROUTES and nativelane.has_marker(p) \
+            and not nativelane.has_fallback(p):
+        return None, "the native lane has claimed this item (native/native.json)"
     cfr = nativelane.cfr_info(p)
     if not cfr.get("frames") or not cfr.get("fps"):
         return None, "the CFR's frame count or frame rate is unknown"
@@ -2027,8 +1296,8 @@ def _sdr_out_spec(p, src) -> tuple:
     item's unpinned route says what its picture is, and it is rendered as that route's, minus the
     LUT, into the SDR render (nativerender sdr spec: BT.709 HEVC, no RPU):
       a Topaz chunk route   its chunks through the chunk front end (_sdr_chunk_render_spec)
-      a YouTube route       the CFR through the fit front end to 3840x2160 — Resolve's 4K
-                            timeline — at youtube_render_kbps(h) under the max_peak_mbps gate
+      a YouTube route       the CFR through the fit front end to 3840x2160 at
+                            youtube_render_kbps(h) under the max_peak_mbps gate
       sdr4k                 the CFR at its own frame, through the colour step alone, at the
                             intake's bitrate floored at EXPORT_BITRATE_FLOOR_KBPS, no gate
     Anything else refuses with the reason (HDR needs a tone map; a combine an RPU). Probes only."""
@@ -2080,10 +1349,10 @@ def _combine_render_spec(p) -> tuple:
     the copy that ships), exactly as rpu_only measures its one source: no LUT, the winner's own
     mastering (its HDR10 SEI -> L6 and the L1/L4 clamp, dvnative.source_mastering), and the
     render IS the winner's own coded video with the RPU injected (keep_video) when it is HEVC
-    Main10 — else a VideoToolbox encode of it, at the floor bitrate Resolve's combine export used.
+    Main10 — else a VideoToolbox encode of it, at the export floor bitrate.
     Its video never ships either way: remux.combine takes only the render's RPU (rpu_source =
     p.dv_render), injected onto the winner's bits or carried by the capped x265 of the winner —
-    the very calls it made with Resolve's render. companion.build_verdict refuses a winner that
+    the very calls it always made. companion.build_verdict refuses a winner that
     is not PQ, and so does this. No CFR exists for a combine: the frame count is the winner's
     own (a header read, else a packet count — never a decode) and so is the rate. Probes only."""
     import dvnative
@@ -2134,26 +1403,55 @@ def _combine_render_spec(p) -> tuple:
     return spec, ""
 
 
+def route_refusal(p) -> str:
+    """Why this item's Dolby Vision can never be made natively whatever Topaz produces — ""
+    when it can (or when that is not known yet: the source is not local). Asked at the Topaz
+    doorstep, so an item no route can make is refused BEFORE hours of upscaling, not after:
+      a route with no native render at all (unknown, or one this table has not got)
+      sdr_out over an HDR source (needs a tone map) or a combine (ships Dolby Vision)
+      an HDR YouTube video that is not 3840x2160 (needs an HDR fit, not built)
+    Every other refusal depends on the chunks, the toolchain or the disk, and stays the render's.
+    Never raises (a probe hiccup is "" — the render decides later)."""
+    try:
+        import routes
+        route = routes.item_route(p)
+        if route is None or route in routes.NO_DV_STEP:
+            return ""
+        if route not in DVRENDER_ROUTES:
+            return f"route {route} has no native render"
+        if route == "sdr_out" and not getattr(p, "combine", False):
+            base = routes.item_route(p, mode="dv1000")
+            if base in DVRENDER_HDR_ROUTES:
+                return (f"underneath the SDR pin it is route {base}: an HDR source mastered to SDR "
+                        "needs a tone map, which is not built")
+        if getattr(p, "youtube", False) and route in DVRENDER_HDR_ROUTES and route != "rpu_only":
+            import plan as _plan
+            info = _plan.probe_input(p.source)
+            size = (_int0(info.get("width")), _int0(info.get("height")))
+            if size[0] and size != DVRENDER_SIZE:
+                return (f"an HDR YouTube video at {size[0]}x{size[1]}: its render is 3840x2160 and "
+                        "there is no HDR fit front end yet")
+        return ""
+    except Exception:  # noqa: BLE001 — a doorstep question must never cost the item
+        return ""
+
+
 def native_route(p) -> tuple:
-    """(route, spec, why): is this item's Dolby Vision the native render's ('dvrender')? `spec`
-    is set when it is; otherwise `why` says what stopped a route that IS set 'native' ("" when
-    its route is not). With no route set 'native' in dv_routes — the default — the answer is
-    (None, None, "") after one settings read: nothing probed, nothing classified."""
-    import settings as _st
-    native = {r for r, engine in _st.dv_routes().items() if engine == "native"}
-    if not native:
-        return None, None, ""
+    """(route, spec, why): the native render's plan for this item's Dolby Vision ('dvrender').
+    `spec` is set when the stage can make it; otherwise `why` says what stops it."""
     import routes
     route = routes.item_route(p)
-    if route not in native:
-        return route, None, ""
+    if getattr(p, "combine", False):
+        import companion
+        if not companion.confirmed_verdict(p.source_basename):
+            return route, None, "permanent: combine verdict lost — re-pair the companion"
     spec, why = dvrender_spec(p, route)
     return route, spec, why
 
 
 def _native_render_route(p):
-    """The route the native render will make this item on, or None (Resolve will) — for a stage
-    MESSAGE, so it never raises; native_route's one settings read while nothing is native."""
+    """The route the native render will make this item on, or None — for a stage MESSAGE, so it
+    never raises."""
     try:
         route, spec, _why = native_route(p)
     except Exception:  # noqa: BLE001 — a message must never cost the stage
@@ -2162,18 +1460,18 @@ def _native_render_route(p):
 
 
 def _dvrender(p, abort, progress=None, should_pause=None):
-    """NATIVE DOLBY VISION RENDER (settings `dv_routes`: the item's route set 'native'): write
-    p.dv_render — the very file Resolve writes, HEVC Main10 PQ with an in-band DV 8.1 RPU, the
-    whole source at its frame rate — without Resolve (nativerender.render: the analysis in scene
+    """NATIVE DOLBY VISION RENDER (every route the chunk lane does not take): write p.dv_render —
+    HEVC Main10 PQ with an in-band DV 8.1 RPU, the whole source at its frame rate
+    (nativerender.render: the analysis in scene
     ranges through the pinned LUT, a VideoToolbox encode under the peak gate, the RPU inject, the
     mux, the self-check, the atomic publish). Run thread only, and only for an item
     orchestrator._process routed here — never the screen, never a SIGSTOP: it runs at nice 10
-    beside the previous item's x265 tail, and everything after it (stage_done("resolve"), the
-    remux, the hand-off, cleanup) reads p.dv_render exactly as it reads Resolve's.
+    beside the previous item's x265 tail, and everything after it (stage_done("dv"), the
+    remux, the hand-off, cleanup) reads p.dv_render.
 
     should_pause is honoured during the ANALYSIS only, where a yield loses at most the range in
     hand (it resumes range by range). From the first encode on the stage runs to its end, the
-    way Resolve's render does: a yield there would throw the whole encode away (it restarts from
+    way: a yield there would throw the whole encode away (it restarts from
     scratch) — deploy-now.sh waits that phase out for the same reason. "paused: ..." and
     "interrupted: ..." are not failures; anything else is a plain failure, counted by the
     orchestrator's ordinary fail ladder."""
@@ -2230,8 +1528,7 @@ def _never_raise(fn, *a, **k) -> None:
 
 class _NativeRemuxClock:
     """Wall time per LIVE-encoded segment of a native item's remux, booked into
-    segdir/native/cpu.json beside the analysis CPU (design §4 'Measure': the trial compares a
-    native episode's cost with a Resolve one's). Fed by the remux's own callbacks — nothing in
+    segdir/native/cpu.json beside the analysis CPU (design §4 'Measure'). Fed by the remux's own callbacks — nothing in
     dvcap or its processes changes:
       plan(ends, total)             on_plan: the segment ends; this attempt's clock starts
       progress(frames, total, **x)  on_progress: cumulative frames. A segment counts only when
@@ -2330,7 +1627,7 @@ def _native_master_passed(p, native: dict) -> None:
     files, ~130-190 GiB, the very thing the next item's disk gates wait on — and keep a proof
     that survives them. The marker turns NATIVE_ENCODED (written FIRST, so a kill in between
     leaves a proof, never a chunk-less 'ready' marker) and records the master's path, size and
-    mtime: orchestrator.stage_done("topaz"/"resolve") accept it while that master is unchanged,
+    mtime: orchestrator.stage_done("topaz"/"dv") accept it while that master is unchanged,
     so an item that parks at upload and is re-picked goes straight back to the upload instead
     of re-running Topaz and the analysis. The rest of the segdir (the marker, RPU, sidecar,
     cpu.json; a few MB) goes with cleanup's rmtree. If the stamp cannot be written, the whole
@@ -2375,8 +1672,8 @@ def _native_master_passed(p, native: dict) -> None:
 def _combine_result(res, real_rpu_donor):
     """Map a combine RemuxResult to the stage's (ok, reason). A frame/fps mismatch
     against a REAL companion donor means the two releases are different cuts — that can
-    never heal, so it parks permanently. The same mismatch against the Resolve render is
-    just a truncated render: retryable (the resolve stage redoes it). The AUDIO-donor
+    never heal, so it parks permanently. The same mismatch against the native render is
+    just a truncated render: retryable (the DV step redoes it). The AUDIO-donor
     sync gate compares two release files, so its mismatch is a different cut regardless
     of where the RPU came from."""
     if res.ok:
@@ -2389,18 +1686,11 @@ def _combine_result(res, real_rpu_donor):
     return False, r
 
 
-def resolve_pipeline_cleanup_drx() -> str:
-    """Where the YouTube cleanup grade lives. Imported lazily: resolve_pipeline pulls in the
-    Resolve scripting module at import time, and this runs inside the orchestrator."""
-    import resolve_pipeline
-    return resolve_pipeline.CLEANUP_DRX
-
-
 def youtube_render_kbps(height) -> int:
-    """What a YouTube item exports from Resolve at. A NATIVE 4K source gets a lower target
+    """What a YouTube item's render targets. A NATIVE 4K source gets a lower target
     than a 1080p one, because the point of the number is not picture quality in isolation —
     it is landing the render's PEAK under max_peak_mbps so the remux can stream-copy it.
-    Resolve's VideoToolbox export has no peak control whatsoever, so the only lever is the
+    A VideoToolbox export has no peak control whatsoever, so the only lever is the
     target, and a more detailed source bursts further above it."""
     return (YOUTUBE_RENDER_KBPS_4K if (height or 0) >= YOUTUBE_NATIVE_4K_MIN_HEIGHT
             else YOUTUBE_RENDER_KBPS)
@@ -2468,11 +1758,11 @@ def _remux(p, abort, progress=None, should_pause=None):
     # becomes the TRUE SDR master: remux_ship_render / remux with sdr=True (no RPU, Rec.709 x265
     # under the same cap, no DV box). Every other item makes exactly the calls it always made.
     # ONLY while the item still ships as SDR (orchestrator.ships_as_sdr — p.final's name; 2026-10-18
-    # review): the finisher runs the remux without asking stage_done("resolve"), so an item unpinned
+    # review): the finisher runs the remux without asking stage_done("dv"), so an item unpinned
     # after its SDR render and resumed under the DV name would otherwise have made an SDR master
     # named '... HDR10 DV upscaled' and uploaded it. That render cannot make a DV master either, so
     # the remux refuses at once (no hour of x265 first); the failed pick sends the item back
-    # through RUN_STAGES, where stage_done("resolve") no longer counts the SDR render
+    # through RUN_STAGES, where stage_done("dv") no longer counts the SDR render
     # (orchestrator._native_sdr_render asks the same question) and the item renders again as DV.
     sdr_out = False
     if not p.combine and os.path.isfile(str(p.dv_render) + ".dvrender/sdr.json"):   # one stat, else
@@ -2489,7 +1779,7 @@ def _remux(p, abort, progress=None, should_pause=None):
         # the path. Under the 72 Mbps gate the winner's own bits ship (RPU grafted or
         # converted as needed — remux_inject machinery); over it, the enforced-VBV capped
         # re-encode runs with the SAME RPU (real DV survives a re-encode and still beats
-        # Resolve DV, user-dictated).
+        # generated DV, user-dictated).
         import companion as companion_mod
         from orchestrator import combine_winner_path
         cv = companion_mod.confirmed_verdict(p.source_basename)
@@ -2498,7 +1788,7 @@ def _remux(p, abort, progress=None, should_pause=None):
             return False, "permanent: combine verdict lost — re-pair the companion"
         v = cv["verdict"]
         side = {"nas": p.source, "remote": p.companion_src}
-        real_rpu = v.get("rpu_from") != "resolve"
+        real_rpu = v.get("rpu_from") != companion_mod.GENERATED_RPU
         combine_call = {
             "winner": winner,
             "rpu_source": side[v["rpu_from"]] if real_rpu else p.dv_render,
@@ -2601,12 +1891,12 @@ def _remux(p, abort, progress=None, should_pause=None):
                             abort=abort, on_progress=_prog, on_plan=_on_plan,
                             should_pause=should_pause, on_repair=_on_repair)
         return _combine_result(res, combine_call["real_rpu"])
-    # NATIVE DV (settings dv_engine 'native'): this item never rendered. Its RPU is the
-    # native lane's, and x265 reads Topaz's ProRes chunks through the LUT (remux.remux(
+    # THE CHUNK LANE (the item carries a native marker and no fallback.json): this item never
+    # rendered. Its RPU is the lane's, and x265 reads Topaz's ProRes chunks through the LUT (remux.remux(
     # native=)) — for the peak repair as well, which is why the chunks were KEPT at hand-off.
     # They go the moment the master passes the peak gate, before the upload; the marker stays,
     # stamped 'encoded', as the proof of that work (_native_master_passed). An item without
-    # a native marker (every Resolve item: its segdir was dropped at hand-off) takes the
+    # a native marker (a rendered item: its segdir was dropped at hand-off) takes the
     # call below exactly as before — no extra keyword at all.
     native = None
     if not (p.movie or p.youtube) and encode_source is None:
@@ -2716,10 +2006,6 @@ def _cleanup(p, abort, progress=None):
             os.remove(p.final + ".src.hevc")
         if os.path.exists(p.final + ".inject.hevc"):    # inject temp: RPU-injected ES
             os.remove(p.final + ".inject.hevc")
-        if os.path.exists(mezzanine_path(p.source)):    # fast-path Resolve-compat mezzanine
-            os.remove(mezzanine_path(p.source))
-        if os.path.isdir(mezzanine_path(p.source) + ".segments"):   # its resumable chunk dir
-            shutil.rmtree(mezzanine_path(p.source) + ".segments", ignore_errors=True)
         if os.path.exists(p.final + ".ship.hevc"):      # ship-render temp: the render's ES
             os.remove(p.final + ".ship.hevc")
         if os.path.exists(p.dv_render + ".best"):       # the re-export gamble's kept first render
@@ -2735,7 +2021,7 @@ def _cleanup(p, abort, progress=None):
         pass
     try:                                                 # a native render's books (<dv_render>.dvrender/)
         import nativerender                              # and its finish-step strays — never the render
-        nativerender.discard_books(p)                    # itself (nothing there for a Resolve item)
+        nativerender.discard_books(p)                    # itself
     except Exception:  # noqa: BLE001 — best-effort, like the strays above
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)

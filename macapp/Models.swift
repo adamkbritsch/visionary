@@ -26,9 +26,6 @@ struct ScratchDTO: Codable {
 struct ProgressDTO: Codable {
     var stage: String?
     var ep: String?
-    var rendering: Bool?      // resolve: the RENDER phase is running — the live screen
-                              // preview hides (nothing left worth watching, and each
-                              // frame costs a 4K screencapture mid-render)
     var notches: [Double]?    // topaz: segment boundaries as 0..1 fractions (progress-bar ticks)
     var seg_done: Int?        // topaz: fully-encoded segment count (drives the tiny flash)
     var seg_total: Int?
@@ -44,22 +41,12 @@ struct ProgressDTO: Codable {
     var elapsed_secs: Double? // wall time spent in the current stage so far (live "elapsed" stopwatch)
     var waiting: String?      // download/upload: queued for the NAS transfer slot shared with
                               // Expurgate ("waiting for another app's NAS transfer to finish")
-    // No timer. A countdown has to start somewhere, and the only place with slack is the
-    // top of the stage — but the takeover lands whenever setup() finishes (Resolve's cold
-    // start plus a 20-chunk import), so the number hit zero and then sat at "now..." for
-    // minutes. Two plain states instead.
-    var takeover_soon: Bool?    // about to take the screen + mouse (~10 s of real work left)
-    var mouse_at: Int?          // epoch of the last CLICK. The notice shows while this is
-                                // fresh, so it tracks real pointer use and expires by
-                                // itself — the mouse is busy only in short click bursts,
-                                // and the hour of analysis that follows is screenshots only.
 }
 
 struct HoldDTO: Codable {
-    var code: String?           // "power"|"power-grace"|"disk"|"backlog"|"resolve-gate"|"dual-remux"
-                                // |"quiet"|"stall"|"retry"|"nas"|"empty"|"done"|"parked"|"display"
+    var code: String?           // "power"|"power-grace"|"disk"|"backlog"|"dv-gate"|"dual-remux"
+                                // |"retry"|"nas"|"empty"|"done"|"parked"
     var secs: Int?              // power-grace: seconds until the run pauses
-    var held: Int?              // stall: items waiting behind the stalled Resolve
     var attempt: Int?           // retry: which attempt this is...
     var of: Int?                // ...out of how many before it counts as a real stall
     var fails: Int?             // parked: consecutive failures that gave up on the item
@@ -101,7 +88,7 @@ struct FinishingDTO: Codable {
     var notches: [Double]?      // remux: segment boundaries as 0..1 fractions (same bar as topaz)
     var seg_done: Int?          // remux: fully-encoded segment count (drives the flash + counter)
     var seg_total: Int?
-    var holding: String?        // non-nil while this lane is preempted (Resolve has the machine)
+    var holding: String?        // non-nil while this lane is preempted (another job has the machine)
     var fast: Bool?             // the 4K fast path (no Topaz) — a much shorter remux
     var repair_seg: Int?        // peak-repair pass (post-100%): 1-based segment being re-capped
     var repair_k: Int?          // ...which of the flagged segments this is (1-based)
@@ -339,8 +326,8 @@ struct VerdictReencodeDTO: Codable {
 struct VerdictDTO: Codable {
     var video_from: String?    // "nas" | "remote"
     var video_why: String?
-    var rpu_from: String?      // "nas" | "remote" | "resolve"
-    var rpu_profile: String?   // "8.1" / "7.x" / "resolve"
+    var rpu_from: String?      // "nas" | "remote" | "native"
+    var rpu_profile: String?   // "8.1" / "7.x" / "native"
     var rpu_inline: Bool?
     var rpu_why: String?
     var audio_from: String?
@@ -475,8 +462,6 @@ struct YTConnectDTO: Codable {            // /api/youtube-connect
 
 struct SettingsDTO: Codable {
     var activated: Bool?        // appliance mode: persisted arm state (survives stops/relaunches)
-    var quiet_mode: Bool?       // QUIET MODE: defer the screen-invasive Resolve stage so the laptop stays usable
-    var quiet_until: Int?       // epoch second quiet_mode lifts by itself (0/absent = not paused)
     var poll_minutes: Int?
     var dim_after_minutes: Int?           // idle this long → backlight 0 (0 = Off); no auto-restore
     var max_peak_mbps: Int?               // hard 1-second peak-bitrate ceiling on every shipped master
@@ -642,33 +627,6 @@ struct YoutarrApplyDTO: Codable {
     var status: YoutarrConfigDTO?
 }
 
-struct DisplayDTO: Codable, Identifiable {
-    var key: String?
-    var name: String?
-    var main: Bool?
-    var builtin: Bool?
-    var eligible: Bool?          // passes the SAME rule preflight has always used
-    var why_not: String?         // plain-language reason when it can't host
-    var smoke_pass: Bool?        // templates PROVEN to match on this screen
-    var smoke_best: Double?
-    var smoke_when: String?
-    var scale: Double?
-    var backing: [Int]?
-    var size_pt: [Int]?
-    var origin: [Double]?
-    var id: String { key ?? "" }
-}
-
-struct DisplaysDTO: Codable {
-    var displays: [DisplayDTO]?
-    var priority: [String]?      // ordered keys, highest first
-    var enabled: Bool?           // the master switch (default off)
-    var fallback_main: Bool?
-    var warn_takeover: Bool?
-    var host: DisplayDTO?        // what would actually be driven right now
-    var host_reason: String?
-}
-
 struct DetectPresetDTO: Codable {   // /api/detect-preset → an auto-detected key, or nil = ask
     var preset: String?
 }
@@ -736,25 +694,20 @@ struct SeriesListDTO: Codable {
 }
 
 struct SelftestDTO: Codable {
-    var screen_recording: Bool?
-    var accessibility: Bool?
-    var cliclick_installed: Bool?
     var ok: Bool?
-    // exact-version / exact-hardware gates (engine/preflight.py; see engine/versions.py) —
-    // all optional so an older engine's selftest payload still decodes.
-    var resolve_version_ok: Bool?
+    // exact-version gate (engine/preflight.py; see engine/versions.py) — all optional so an
+    // older engine's selftest payload still decodes.
     var topaz_version_ok: Bool?
-    var display_ok: Bool?
     var hard_ok: Bool?                 // false → the server refuses to arm (409)
     var found: [String: String]?       // failing check id -> human detail ("found X; require Y")
-    var setup_complete: Bool?          // ALL 12 preflight checks pass → the Setup section
+    var setup_complete: Bool?          // ALL preflight checks pass → the Setup section
                                        // auto-collapses and the "Finish setup" card hides
 }
 
 // ---- in-app Setup (onboarding) ------------------------------------------------------
 
 struct PreflightCheckDTO: Codable, Identifiable {
-    var id: String?                    // check id ("brew_tools", "resolve_version", ...)
+    var id: String?                    // check id ("brew_tools", "topaz_version", ...)
     var ok: Bool?
     var severity: String?              // "fail" | "warn"
     var detail: String?
@@ -791,19 +744,11 @@ struct AutoConnectDTO: Codable, Equatable {           // one sweep: plex / youta
     var found: [String: ConfigTestDTO]?
 }
 
-struct ImportStepDTO: Codable, Identifiable {
-    var step: String?
-    var ok: Bool?
-    var detail: String?
-    var id: String { step ?? UUID().uuidString }
-}
-
 struct InstallJobDTO: Codable {
     var what: String?
     var state: String?                 // "running" | "ok" | "failed"
     var rc: Int?
     var tail: [String]?                // live output (bounded ring server-side)
-    var steps: [ImportStepDTO]?        // import_resolve only
 }
 
 struct InstallStatusDTO: Codable {

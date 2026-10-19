@@ -1,5 +1,6 @@
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -18,9 +19,6 @@ def _paths(scratch):
 
 _BOOK_PATCH = None
 _HIST_PATCH = None
-_DV_ROUTES_PATCH = None
-import settings as _settings_mod
-_REAL_DV_ROUTES = _settings_mod.dv_routes       # the native render tests read the real accessor
 
 
 def setUpModule():
@@ -37,17 +35,9 @@ def setUpModule():
     global _HIST_PATCH
     _HIST_PATCH = mock.patch.object(history, "BOOK_FILE", _os.path.join(d, "history.json"))
     _HIST_PATCH.start()
-    # dv_routes is read from the REAL settings file at use time (the skip messages ask it): pin it
-    # to the shipped default, every route on Resolve. The native render tests restore the real
-    # accessor over their own temp settings file.
-    global _DV_ROUTES_PATCH
-    _DV_ROUTES_PATCH = mock.patch.object(_settings_mod, "dv_routes", return_value={})
-    _DV_ROUTES_PATCH.start()
 
 
 def tearDownModule():
-    if _DV_ROUTES_PATCH is not None:
-        _DV_ROUTES_PATCH.stop()
     if _BOOK_PATCH is not None:
         _BOOK_PATCH.stop()
     if _HIST_PATCH is not None:
@@ -169,71 +159,6 @@ class TopazSegBounds(unittest.TestCase):
                                return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
             stages.run_stage("remux", p, progress=lambda d: None)
         self.assertIsNone(got["b"])                                     # [] → None → ~SEG_SECONDS plan
-
-
-class StaleCfrRate(unittest.TestCase):
-    """A CFR made before the CFR had to be a rate Resolve can host (a04f0eb) was reused as it
-    was: Rhett & Link "Fireworks Song" (23/1, made 2026-09-08) failed Resolve's conform on every
-    attempt and held every item queued behind it (live 2026-10-01)."""
-
-    def test_forgetting_bounds_drops_only_that_item(self):
-        d = tempfile.mkdtemp()
-        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")):
-            stages._write_topaz_bounds("a.mp4", [10, 20])
-            stages._write_topaz_bounds("b.mp4", [30])
-            stages._forget_topaz_bounds("a.mp4")
-            stages._forget_topaz_bounds("never.mp4")              # absent: fine
-            self.assertEqual(stages._read_topaz_bounds("a.mp4"), [])
-            self.assertEqual(stages._read_topaz_bounds("b.mp4"), [30])
-
-    def _ensure(self, hostable):
-        import topaz, plan, types
-        d = tempfile.mkdtemp()
-        p = _paths(d)
-        open(p.source_cfr, "wb").close()
-        made = []
-        def to_cfr(src, dst, **kw):
-            made.append(os.path.exists(dst))                         # was the stale one gone?
-            return types.SimpleNamespace(ok=True, rate="24000/1001", frames=4420, capped_secs=0,
-                                         error_tail="")
-        with mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(d, "sb.json")), \
-             mock.patch("orchestrator.apply_container"), \
-             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
-             mock.patch.object(topaz, "cfr_hostable", return_value=hostable), \
-             mock.patch.object(topaz, "_fps_fraction", return_value="23/1"), \
-             mock.patch.object(topaz, "to_cfr", side_effect=to_cfr), \
-             mock.patch.object(plan, "plan_for", return_value={"topaz": "resolve-only"}), \
-             mock.patch.object(stages.logbook, "event") as ev:
-            stages._write_topaz_bounds(p.source_basename, [2105, 4241])
-            ok, msg = stages._ensure_cfr(p, None)
-            bounds = stages._read_topaz_bounds(p.source_basename)
-        return ok, msg, made, bounds, ev
-
-    def test_a_cfr_resolve_cannot_host_is_made_again(self):
-        ok, msg, made, bounds, ev = self._ensure(hostable=False)
-        self.assertTrue(ok)
-        self.assertEqual(made, [False])                              # removed before the redo
-        self.assertEqual(bounds, [])                                 # its frame bounds re-plan
-        self.assertIn("cannot host", ev.call_args.args[0])
-        self.assertIn("24000/1001", msg)
-
-    def test_a_hostable_cfr_is_reused_as_before(self):
-        ok, msg, made, bounds, _ev = self._ensure(hostable=True)
-        self.assertEqual((ok, made, bounds), (True, [], [2105, 4241]))
-        self.assertIn("reused", msg)
-
-    def test_the_download_stage_is_not_done_on_an_unhostable_cfr(self):
-        import orchestrator, topaz
-        p = _paths(tempfile.mkdtemp())
-        open(p.source, "wb").close()
-        with mock.patch.object(orchestrator, "_remote_size", return_value=0), \
-             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
-             mock.patch.object(topaz, "cfr_hostable", return_value=False):
-            self.assertFalse(orchestrator.stage_done("download", p))
-        with mock.patch.object(orchestrator, "_remote_size", return_value=0), \
-             mock.patch.object(topaz, "is_cfr_ready", return_value=True), \
-             mock.patch.object(topaz, "cfr_hostable", return_value=True):
-            self.assertTrue(orchestrator.stage_done("download", p))
 
 
 class ReplaceSourcePolicy(unittest.TestCase):
@@ -452,9 +377,9 @@ class FastPathDispatch(unittest.TestCase):
     the SOURCE, remux dispatches to the inject path (rpu-only) or the capped path otherwise."""
 
     RPU_PLAN = {"topaz": "rpu-only", "scale": 1, "res": None, "fit_height": None,
-                "resolve": "add_dv", "is_hdr": True, "reason": "4K HDR10 HEVC @ ~15 Mbps"}
-    RES_PLAN = {"topaz": "resolve-only", "scale": 1, "res": None, "fit_height": None,
-                "resolve": "add_hdr_dv", "is_hdr": False, "reason": "4K SDR HEVC @ ~15 Mbps"}
+                "dv": "add_dv", "is_hdr": True, "reason": "4K HDR10 HEVC @ ~15 Mbps"}
+    RES_PLAN = {"topaz": "dv-only", "scale": 1, "res": None, "fit_height": None,
+                "dv": "add_hdr_dv", "is_hdr": False, "reason": "4K SDR HEVC @ ~15 Mbps"}
 
     def test_topaz_noops_successfully_for_both_modes(self):
         import plan, topaz
@@ -468,7 +393,7 @@ class FastPathDispatch(unittest.TestCase):
             self.assertIn("skipping upscale", msg)
 
     def test_resolve_only_topaz_plans_scene_cut_bounds_for_the_remux(self):
-        # resolve-only still runs topaz's PLANNING front half: scene detect + grouping →
+        # dv-only still runs topaz's PLANNING front half: scene detect + grouping →
         # bounds stashed so the capped remux segments at scene cuts (user-dictated).
         import plan, topaz
         d = tempfile.mkdtemp()
@@ -527,61 +452,6 @@ class FastPathDispatch(unittest.TestCase):
         self.assertIn("flat remux segments", msg)
         self.assertEqual(bounds, [])
 
-    def test_resolve_runs_single_on_the_source(self):
-        import plan
-        p = _paths(tempfile.mkdtemp())
-        seen = {}
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-        import preflight, settings
-        # Deterministic pinning-off: on the maintainer's machine the LIVE settings pin a
-        # display, which would trip the pre-spawn host guard before Popen is reached.
-        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-            ok, msg = stages.run_stage("resolve", p)
-        self.assertFalse(ok)                              # launch failed on purpose — we only
-        cmd = seen["cmd"]                                 # care what it TRIED to run
-        self.assertIn("single", cmd)
-        # A FILE, not the segdir — and specifically the CFR, which is what render_is_complete
-        # and the remux's RPU alignment measure. This asserted p.source until 2026-08-21,
-        # pinning the divergence that made Don't Look Up render 206,200 frames for a
-        # 199,144-frame movie (see stages.resolve_input).
-        self.assertIn(p.source_cfr, cmd)
-        self.assertNotIn(p.source, cmd)
-        self.assertNotIn(p.segdir, cmd)
-        # 2000-nit is MANUAL-ONLY now (user-dictated 2026-08-09): auto = dv1000
-        # whatever the intake range.
-        self.assertEqual(cmd[cmd.index("single") + 3], "dv1000")
-        # argv: [py, resolve_pipeline.py, phase, in, out, mode, bitrate, host]
-        self.assertEqual(cmd[6], str(stages.EXPORT_BITRATE_FLOOR_KBPS))   # render video discarded
-        self.assertEqual(cmd[7], "-", "unpinned must pass '-' = drive the main display")
-
-    def test_resolve_only_uses_source_bitrate_floor_max(self):
-        import plan
-        p = _paths(tempfile.mkdtemp())
-        seen = {}
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-        import preflight, settings
-        with mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=90000), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-            stages.run_stage("resolve", p)
-        cmd = seen["cmd"]
-        self.assertIn("single", cmd)
-        self.assertEqual(cmd[cmd.index("single") + 3], "dv1000")   # SDR intake -> 1000-nit DV
-        self.assertEqual(cmd[6], "90000")                 # conversion IS the ship — match intake
-        self.assertEqual(cmd[7], "-", "unpinned must pass '-' = drive the main display")
 
     def test_remux_dispatches_to_inject_for_rpu_only(self):
         import plan, remux
@@ -724,421 +594,11 @@ class _InlineThread:
     def start(self): self._t()
 
 
-class ResolveRenderWatchdog(unittest.TestCase):
-    """The Resolve pass's budget kills an UNRESPONSIVE Resolve, never a render that is moving.
-    Live 2026-10-01/02: "Let's Game It Out - Astro Colony" (1080p60, SuperScale) finished its
-    render at 1 h 47 m, peaked over the cap, and was killed 12 minutes into the re-export the cap
-    gate asked for — five times, ten hours, with the queue held behind it."""
-
-    def test_rule_a_moving_render_gets_what_its_rate_needs(self):
-        w = {"t0": 0.0, "pct": 40, "moved": 7190.0, "first": None}
-        got = stages.resolve_deadline(7200.0, 0.0, 7200.0, w)
-        self.assertAlmostEqual(got, 7200 + (60 * 7200 / 40) * 1.25 + 300)
-
-    def test_rule_a_reexport_gets_as_long_as_the_render_before_it(self):
-        w = {"t0": 7000.0, "pct": None, "moved": 7000.0, "first": 2040.0}
-        self.assertAlmostEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, w),
-                               7200 + 2040 * 1.25 + 300)
-
-    def test_rule_no_render_or_a_stalled_one_is_killed(self):
-        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0,
-                                                 {"t0": None, "pct": None, "moved": None}), 7200.0)
-        stalled = {"t0": 0.0, "pct": 40, "moved": 7200.0 - stages.RENDER_STALL_SECS - 1}
-        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, stalled), 7200.0)
-
-    def test_rule_a_render_that_has_just_started_gets_a_look_again(self):
-        w = {"t0": 7180.0, "pct": 0, "moved": 7180.0, "first": None}
-        self.assertAlmostEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, w),
-                               7200 + stages.RENDER_STALL_SECS * 1.25 + 300)
-
-    def test_rule_a_finished_render_is_not_killed_while_its_peak_is_measured(self):
-        w = {"t0": 0.0, "pct": 100, "moved": 7150.0, "first": None}
-        self.assertAlmostEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, w), 7200 + 600 * 1.25 + 300)
-
-    def test_rule_never_past_the_ceiling(self):
-        crawl = {"t0": 0.0, "pct": 1, "moved": 7190.0}             # cannot finish before it: no time
-        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, crawl), 7200.0)
-        late = {"t0": 0.0, "pct": 28, "moved": 7190.0}              # can, just: capped at the ceiling
-        self.assertEqual(stages.resolve_deadline(7200.0, 0.0, 7200.0, late),
-                         stages.RESOLVE_CEILING_SECS)
-        at = stages.RESOLVE_CEILING_SECS + 1.0
-        moving = {"t0": 0.0, "pct": 50, "moved": at - 5}            # still moving at the ceiling
-        self.assertEqual(stages.resolve_deadline(at, 0.0, at - 10, moving), at - 10)
-        finishing = {"t0": 0.0, "pct": 100, "moved": at - 5}        # even finishing: not past it
-        self.assertEqual(stages.resolve_deadline(at, 0.0, at - 10, finishing), at - 10)
-
-    def _drive(self, script, end_at=None, budget=7200):
-        """Run the real resolve stage against a fake Resolve whose lines arrive on a simulated
-        clock as the stage's poll loop sleeps. Returns (seconds at kill or None, logbook events)."""
-        import queue, threading, plan, settings
-        clock = {"t": 1000.0}
-        q, pending, killed = queue.Queue(), sorted(script), []
-
-        class Out:
-            busy = False
-            def __iter__(self): return self
-            def __next__(self):
-                if self.busy:
-                    q.task_done()            # the reader finished the line before this one
-                item = q.get()
-                self.busy = True
-                if item is None:
-                    q.task_done(); self.busy = False
-                    raise StopIteration
-                return item
-
-        class Proc:
-            def __init__(self):
-                self.stdout, self.returncode = Out(), None
-            def poll(self):
-                if self.returncode is None and end_at is not None and clock["t"] - 1000 >= end_at:
-                    self.returncode = 0
-                    q.put(None)
-                return self.returncode
-            def kill(self):
-                killed.append(clock["t"] - 1000)
-                self.returncode = -9
-                q.put(None)
-
-        def sleep(_s):
-            clock["t"] += 60
-            while pending and pending[0][0] <= clock["t"] - 1000:
-                q.put(pending.pop(0)[1])
-            q.join()                             # every line due by now has been read
-
-        p = _paths(tempfile.mkdtemp())
-        with mock.patch.object(plan, "plan_for", return_value=FastPathDispatch.RES_PLAN), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_resolve_budget", return_value=budget), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.time, "monotonic", side_effect=lambda: clock["t"]), \
-             mock.patch.object(stages.time, "sleep", side_effect=sleep), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", return_value=False), \
-             mock.patch.object(stages, "_build_mezzanine", return_value=(False, "no")), \
-             mock.patch.object(stages.logbook, "event") as ev, \
-             mock.patch.object(stages.logbook, "failure"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=lambda *a, **k: Proc()):
-            stages.run_stage("resolve", p)
-        return (killed[0] if killed else None), [c.args[0] for c in ev.call_args_list]
-
-    def test_astro_colony_finishes_its_re_export(self):
-        # setup + analysis 74 min, render 34 min, over the cap, re-export 34 min
-        script = [(4400, "RENDER_PCT 0\n"), (5400, "RENDER_PCT 50\n"), (6400, "RENDER_PCT 100\n"),
-                  (6460, "RENDER_REEXPORT 79.0 Mbps at 14000 kb/s > 50 cap — re-exporting at 9000 kb/s\n")]
-        script += [(6480 + 20 * i, f"RENDER_PCT {i}\n") for i in range(0, 101)]
-        killed, events = self._drive(script, end_at=8600)
-        self.assertIsNone(killed)
-        self.assertEqual(len([e for e in events if "past its 120-minute budget but rendering" in e]), 1)
-
-    def test_a_re_export_that_has_not_reported_yet_is_not_taken_for_a_wedge(self):
-        # the first render's last % is 20 minutes old when the budget runs out, but the re-export
-        # it handed over to started 50 s ago — that is not an unresponsive Resolve
-        script = [(4400, "RENDER_PCT 0\n"), (6000, "RENDER_PCT 100\n"),
-                  (7150, "RENDER_REEXPORT 79.0 Mbps at 14000 kb/s > 50 cap — re-exporting at 9000 kb/s\n")]
-        script += [(7400 + 16 * i, f"RENDER_PCT {i}\n") for i in range(0, 101)]
-        killed, events = self._drive(script, end_at=9100)
-        self.assertIsNone(killed)
-        self.assertTrue(any("letting it finish" in e for e in events))
-
-    def test_a_wedged_resolve_is_still_killed_at_its_budget(self):
-        killed, _ = self._drive([(300, "SCREEN_TAKEOVER_SOON\n")])
-        self.assertIsNotNone(killed)
-        self.assertLessEqual(killed, 7200 + 60)
-
-    def test_a_render_that_stops_moving_gets_no_more_time(self):
-        killed, events = self._drive([(5000, "RENDER_PCT 0\n"), (5600, "RENDER_PCT 40\n")])
-        self.assertTrue(7200 <= killed <= 7200 + 60)              # the budget, as before
-        self.assertFalse(any("letting it finish" in e for e in events))
-
-    def test_a_render_that_stalls_after_its_extension_is_killed_soon_after(self):
-        script = [(6000, "RENDER_PCT 0\n")] + [(6000 + 60 * i, f"RENDER_PCT {i}\n") for i in range(1, 25)]
-        killed, events = self._drive(script)                      # moving at the budget, then stuck at 24%
-        self.assertTrue(any("letting it finish" in e for e in events))
-        self.assertIsNotNone(killed)                              # within a poll of the stall rule,
-        self.assertLessEqual(killed, 6000 + 60 * 24 + stages.RENDER_STALL_SECS + 60)   # not hours on
-
-
-class MezzanineFallback(unittest.TestCase):
-    """FAST-PATH compat mezzanine: a Resolve INGEST failure (VP9/AV1 the pinned Resolve
-    can't decode → 'IMPORT FAILED'/'FPS UNREADABLE') builds a lightweight HEVC Main10
-    mezzanine and retries ONCE; render failures and the normal segment path never do."""
-
-    RES_PLAN = FastPathDispatch.RES_PLAN
-
-    def test_command_is_lightweight_hevc_main10_cfr(self):
-        cmd = stages.build_mezzanine_command("/ff", "/in.webm", "/out_mezz.mp4",
-                                             rate="24000/1001",
-                                             color={"primaries": "bt709",
-                                                    "transfer": "bt709", "space": "bt709"},
-                                             kbps=123456)
-        self.assertIn("hevc_videotoolbox", cmd)               # hardware, plain ffmpeg — no Topaz/ProRes
-        self.assertEqual(cmd[cmd.index("-b:v") + 1], "123456k")
-        self.assertEqual(cmd[cmd.index("-pix_fmt") + 1], "p010le")      # Main10
-        self.assertEqual(cmd[cmd.index("-tag:v") + 1], "hvc1")
-        self.assertEqual(cmd[cmd.index("-r") + 1], "24000/1001")        # uniform PTS out
-        self.assertIn("cfr", cmd)
-        self.assertIn("-an", cmd)                             # video only — audio ships from the CFR
-        self.assertNotIn("-map 0:s", " ".join(cmd))
-        self.assertIn("bt709", cmd)                           # color tags carried
-
-    def _run_resolve(self, p, procs, mezz_ok=True, dv_ok_sequence=(False, True)):
-        """Drive _resolve with scripted subprocess passes; returns (ok, msg, popen_calls, mezz_calls)."""
-        import plan
-        calls, mezz_calls = [], []
-        mezz = stages.mezzanine_path(p.source)
-        def fake_popen(cmd, **kw):
-            calls.append(cmd)
-            return procs.pop(0)
-        def fake_mezz(pp, abort, progress=None, src=None):
-            mezz_calls.append(pp.source)
-            if not mezz_ok:
-                return False, "encode blew up"
-            with open(mezz, "w") as fh:
-                fh.write("m")
-            return True, mezz
-        import settings
-        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_resolve_budget",
-                               return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.threading, "Thread", _InlineThread), \
-             mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", side_effect=list(dv_ok_sequence)), \
-             mock.patch.object(stages, "_build_mezzanine", side_effect=fake_mezz), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
-            ok, msg = stages.run_stage("resolve", p)
-        return ok, msg, calls, mezz_calls
-
-    def test_import_failure_builds_mezz_and_retries_once(self):
-        p = _paths(tempfile.mkdtemp())
-        ok, msg, calls, mezz_calls = self._run_resolve(
-            p, [_FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1),
-                _FakeResolveProc(["render ok\n"], 0)])
-        self.assertTrue(ok)
-        self.assertIn("compat mezzanine", msg)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(mezz_calls, [p.source])
-        mezz = stages.mezzanine_path(p.source)
-        self.assertIn(mezz, calls[1])                          # retry ingests the mezzanine
-        self.assertNotIn(p.source, calls[1])
-        self.assertEqual(calls[1][6], calls[0][6])             # export bitrate from the ORIGINAL
-        self.assertFalse(os.path.exists(mezz))                 # big temp deleted after success
-
-    def test_retry_failure_stops_after_second_run(self):
-        p = _paths(tempfile.mkdtemp())
-        ok, _msg, calls, mezz_calls = self._run_resolve(
-            p, [_FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1),
-                _FakeResolveProc(["FPS UNREADABLE from the imported clip\n"], 1)],
-            dv_ok_sequence=(False, False))
-        self.assertFalse(ok)
-        self.assertEqual(len(calls), 2)                        # never a third attempt
-        self.assertEqual(len(mezz_calls), 1)
-        # KEPT on failure (changed 2026-08-06): the next attempt REUSES it instead of
-        # re-encoding ~10 minutes; cleanup sweeps a stray. Success still deletes it.
-        self.assertTrue(os.path.exists(stages.mezzanine_path(p.source)))
-
-    def test_mezz_build_failure_fails_the_stage(self):
-        p = _paths(tempfile.mkdtemp())
-        ok, msg, calls, _ = self._run_resolve(
-            p, [_FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1)], mezz_ok=False,
-            dv_ok_sequence=(False,))
-        self.assertFalse(ok)
-        self.assertIn("compat mezzanine failed", msg)
-        self.assertEqual(len(calls), 1)
-
-    def test_unrelated_failure_never_builds_a_mezzanine(self):
-        p = _paths(tempfile.mkdtemp())
-        ok, _msg, calls, mezz_calls = self._run_resolve(
-            p, [_FakeResolveProc(["render exploded at 42%\n"], 1)], dv_ok_sequence=(False,))
-        self.assertFalse(ok)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(mezz_calls, [])
-
-    def test_segment_path_never_builds_a_mezzanine(self):
-        import plan
-        p = _paths(tempfile.mkdtemp())
-        normal = dict(self.RES_PLAN, topaz="upscale")          # the ordinary Topaz-segment path
-        calls = []
-        def fake_popen(cmd, **kw):
-            calls.append(cmd)
-            return _FakeResolveProc(["IMPORT FAILED: 0/1 clips\n"], 1)
-        import settings
-        with mock.patch.object(plan, "plan_for", return_value=normal), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_resolve_budget",
-                               return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.threading, "Thread", _InlineThread), \
-             mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", return_value=False), \
-             mock.patch.object(stages, "_build_mezzanine",
-                               side_effect=AssertionError("segment path must never mezzanine")), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
-            ok, _msg = stages.run_stage("resolve", p)
-        self.assertFalse(ok)
-        self.assertEqual(len(calls), 1)
-        self.assertIn(p.segdir, calls[0])                      # episode mode ingests the segdir
-
-    def test_cleanup_sweeps_a_stranded_mezzanine(self):
-        p = _paths(tempfile.mkdtemp())
-        mezz = stages.mezzanine_path(p.source)
-        with open(mezz, "w") as fh:
-            fh.write("x")
-        ok, _msg = stages.run_stage("cleanup", p)
-        self.assertTrue(ok)
-        self.assertFalse(os.path.exists(mezz))
-
-
-class OutputModeOverride(unittest.TestCase):
-    """The per-item override picks the Resolve project. "auto" must keep the long-standing
-    rule exactly; the three explicit values pin it regardless of what the source is."""
-
-    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False)
-
-    def _mode(self, override, is_hdr):
-        """Drive the REAL resolve stage and read back the mode argv it hands
-        resolve_pipeline.py — mirroring the branch here would test nothing."""
-        import plan, settings
-        pl = dict(self.RES_PLAN, is_hdr=is_hdr)
-        calls = []
-        def fake_popen(cmd, **kw):
-            calls.append(cmd)
-            return _FakeResolveProc(["render exploded\n"], 1)   # fail fast; argv is the point
-        p = _paths(tempfile.mkdtemp())
-        with mock.patch.object(settings, "get_show_output_mode", return_value=override), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(plan, "plan_for", return_value=pl), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_resolve_budget",
-                               return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.threading, "Thread", _InlineThread), \
-             mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", return_value=False), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
-            stages.run_stage("resolve", p)
-        self.assertTrue(calls, "the resolve stage never spawned resolve_pipeline")
-        # argv: [python, resolve_pipeline.py, episode|single, in, out, MODE, bitrate]
-        return calls[0][5]
-
-    def test_auto_is_always_1000_nits(self):
-        # 2000-nit DV is manual-only (user-dictated 2026-08-09): nothing selects it
-        # automatically — HDR intake included.
-        self.assertEqual(self._mode("auto", is_hdr=False), "dv1000")
-        self.assertEqual(self._mode("auto", is_hdr=True), "dv1000")
-
-    def test_an_unset_override_is_also_auto(self):
-        self.assertEqual(self._mode("", is_hdr=True), "dv1000")
-        self.assertEqual(self._mode(None, is_hdr=False), "dv1000")
-
-    def test_an_override_wins_over_the_source(self):
-        # Deliberately contradictory: an HDR source pinned to SDR, and to 1000 nits.
-        self.assertEqual(self._mode("sdr", is_hdr=True), "sdr")
-        self.assertEqual(self._mode("dv1000", is_hdr=True), "dv1000")
-
-    def test_the_retired_2000_nit_pin_renders_at_1000(self):
-        # 2026-10-18 (user decision 2026-10-15): the 2000-nit mode is retired. settings already
-        # reads a stale pin as dv1000; even handed "dv2000" raw, the stage never passes it on.
-        self.assertEqual(self._mode("dv2000", is_hdr=False), "dv1000")
-        self.assertEqual(self._mode("dv2000", is_hdr=True), "dv1000")
-
-    def test_the_automatic_rule_can_never_pick_sdr_or_2000(self):
-        """User-dictated invariants: automatically it is ALWAYS Dolby Vision at 1000 nits.
-        A non-DV master AND the 2000-nit target are manual choices only — no source range,
-        and no junk left in the setting, may fall through to either."""
-        for stored in ("auto", "", None, "SDR", "sdr ", "hdr", "dv3000", 0, True):
-            for is_hdr in (False, True):
-                got = self._mode(stored, is_hdr=is_hdr)
-                self.assertNotEqual(got, "sdr", f"{stored!r}/is_hdr={is_hdr} fell through to SDR")
-                self.assertEqual(got, "dv1000")
-
-    def test_the_sdr_mode_is_the_only_headless_one(self):
-        import resolve_pipeline as RP
-        self.assertFalse(RP.is_dv_mode("sdr"))       # no DV -> no Analyze All -> no screen
-        self.assertTrue(RP.is_dv_mode("dv1000"))
-        self.assertTrue(RP.is_dv_mode("dv2000"))
-
-    def test_each_mode_resolves_to_a_distinct_project_list(self):
-        import resolve_pipeline as RP
-        lists = [RP.SDR_OUT_PROJECTS, RP.DV1000_PROJECTS, RP.DV2000_PROJECTS]
-        firsts = [l[0] for l in lists]
-        self.assertEqual(len(set(firsts)), 3)        # no two modes prefer the same project
-
-
-class HostDisplayFailSafe(unittest.TestCase):
-    """A pinned display that is unplugged, asleep or unmovable must DEFER the item —
-    never quietly fall back to the main display, which is the exact screen the user
-    pinned Resolve away from."""
-
-    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False)
-
-    def _resolve_with_output(self, out_lines, host_key="-"):
-        import plan, preflight
-        p = _paths(tempfile.mkdtemp())
-        host = None if host_key == "-" else {"key": host_key, "name": "HDMI"}
-        calls = []
-
-        def fake_popen(cmd, **kw):
-            calls.append(cmd)
-            return _FakeResolveProc(out_lines, 3)
-
-        import settings
-        with mock.patch.object(plan, "plan_for", return_value=dict(self.RES_PLAN)), \
-             mock.patch.object(preflight, "chosen_host", return_value=(host, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_resolve_budget",
-                               return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.threading, "Thread", _InlineThread), \
-             mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", return_value=False), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
-            ok, msg = stages.run_stage("resolve", p)
-        return ok, msg, calls
-
-    def test_an_unavailable_host_defers_rather_than_failing_the_episode(self):
-        ok, msg, _ = self._resolve_with_output(
-            ["HOST_UNAVAILABLE uuid:HDMI not attached\n"], host_key="uuid:HDMI")
-        self.assertFalse(ok)
-        self.assertIn("host-display", msg)
-        self.assertIn("not attached", msg)
-
-    def test_an_ordinary_render_failure_is_still_an_ordinary_failure(self):
-        # The deferral must not swallow real failures — those still count toward the
-        # give-up threshold.
-        ok, msg, _ = self._resolve_with_output(["render exploded at 42%\n"])
-        self.assertFalse(ok)
-        self.assertNotIn("host-display", msg)
-
-    def test_the_chosen_host_key_is_what_reaches_the_subprocess(self):
-        _ok, _msg, calls = self._resolve_with_output(["boom\n"], host_key="uuid:HDMI")
-        self.assertEqual(calls[0][7], "uuid:HDMI")
-
-    def test_unpinned_passes_the_main_display_sentinel(self):
-        _ok, _msg, calls = self._resolve_with_output(["boom\n"])
-        self.assertEqual(calls[0][7], "-")
-
-
 class ScopeHdr10IsNeverReEncoded(unittest.TestCase):
     """END TO END, through the REAL plan: a 2.39:1 HDR10 source must reach remux_inject.
 
     The tier used to require width==3840 AND height==2160 exactly, so a scope film (3840x1600)
-    — i.e. most blockbusters — fell through to resolve-only and had its HDR10 video re-encoded
+    — i.e. most blockbusters — fell through to dv-only and had its HDR10 video re-encoded
     by the capped x265 path. Composing plan + stages here rather than mocking the plan is the
     point: the bug lived in the seam between them."""
 
@@ -1246,56 +706,6 @@ class DownloadRefusesDolbyVision(unittest.TestCase):
         ev.assert_called()
 
 
-class ResolveHostPreSpawnGuard(unittest.TestCase):
-    """A PINNED display that is already gone must defer the stage BEFORE the subprocess
-    spawns — never silently drive the main display (the documented fail-safe). The guard
-    is also the consumer of resolve_host_fallback_main: True = proceed on main instead."""
-
-    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False)
-
-    def _run(self, *, pinning, fallback, why="not attached", priority=("uuid:X",)):
-        import plan, preflight, settings
-        p = _paths(tempfile.mkdtemp())
-        s = dict(settings.DEFAULT_SETTINGS,
-                 resolve_host_pinning=pinning, resolve_host_fallback_main=fallback)
-        calls = []
-        def fake_popen(cmd, **kw):
-            calls.append(cmd)
-            raise RuntimeError("stop here")     # argv is the point; fail fast after spawn
-        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, why)), \
-             mock.patch.object(settings, "get_settings", return_value=s), \
-             mock.patch.object(settings, "get_display_priority", return_value=list(priority)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=fake_popen):
-            ok, msg = stages.run_stage("resolve", p)
-        return ok, msg, calls
-
-    def test_unplugged_pinned_display_defers_before_spawn(self):
-        ok, msg, calls = self._run(pinning=True, fallback=False)
-        self.assertFalse(ok)
-        self.assertIn("host-display", msg)                # the retryable-hold reason string
-        self.assertIn("not attached", msg)
-        self.assertEqual(calls, [])                       # never spawned → main never driven
-
-    def test_fallback_main_true_proceeds_on_main(self):
-        _ok, _msg, calls = self._run(pinning=True, fallback=True)
-        self.assertTrue(calls)                            # spawned...
-        self.assertEqual(calls[0][7], "-")                # ...driving the main display
-
-    def test_deliberate_main_choice_is_allowed_through(self):
-        _ok, _msg, calls = self._run(pinning=True, fallback=False,
-                                     why="chosen display is the main one")
-        self.assertTrue(calls)                            # main-as-chosen is not a failure
-        self.assertEqual(calls[0][7], "-")
-
-    def test_pinning_off_never_defers(self):
-        _ok, _msg, calls = self._run(pinning=False, fallback=False)
-        self.assertTrue(calls)
-        self.assertEqual(calls[0][7], "-")
-
-
 class RepairProgressPlumbing(unittest.TestCase):
     """stages._remux forwards on_repair into remux() and publishes the repair keys on the
     same progress surface as the segment bar — full-bar frames, plus which segment is
@@ -1353,7 +763,7 @@ class FastPathSkipsTheCfrReencode(unittest.TestCase):
         self.assertTrue(self._cfr_kwargs("rpu-only")["copy_only"])
 
     def test_resolve_only_copies(self):
-        self.assertTrue(self._cfr_kwargs("resolve-only")["copy_only"])
+        self.assertTrue(self._cfr_kwargs("dv-only")["copy_only"])
 
     def test_upscale_still_true_cfr(self):
         self.assertFalse(self._cfr_kwargs("upscale")["copy_only"])
@@ -1361,91 +771,8 @@ class FastPathSkipsTheCfrReencode(unittest.TestCase):
     def test_a_variable_frame_rate_4k_source_is_really_re_timed(self):
         """No 4K source goes through Topaz (2026-09-30), a VFR one included — so the CFR pass
         must re-encode it to one rate: Resolve imports this file and its timeline runs at one rate."""
-        self.assertFalse(self._cfr_kwargs("resolve-only", source_cfr=False)["copy_only"])
-        self.assertTrue(self._cfr_kwargs("resolve-only", source_cfr=True)["copy_only"])
-
-
-class YouTubeSkipsTopaz(unittest.TestCase):
-    """YouTube items skip Topaz entirely (user-dictated 2026-08-06): Resolve scales them —
-    SuperScale 2x for ~1080p sources (a scripting-API clip property, argv 7), the 4K
-    timeline's plain scaling otherwise. Single mode ingests the TRUE-CFR file (web sources
-    are routinely VFR, and the render gate counts frames against source_cfr)."""
-
-    def _yt(self):
-        from orchestrator import youtube_paths
-        return youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T",
-                             scratch_dir=tempfile.mkdtemp())
-
-    def test_topaz_noops_and_plans_scene_cuts(self):
-        import plan
-        p = self._yt()
-        with mock.patch.object(plan, "plan_for",
-                               return_value={"topaz": "upscale", "resolve": "run"}), \
-             mock.patch.object(stages, "_plan_fast_path_bounds",
-                               return_value=" — 3 scene-cut segments planned for the remux") as b:
-            ok, msg = stages.run_stage("topaz", p)
-        self.assertTrue(ok)
-        self.assertIn("skipping Topaz", msg)
-        b.assert_called_once()                    # the capped remux still segments at cuts
-
-    def _resolve_cmd(self, height):
-        import plan, preflight, settings
-        p = self._yt()
-        seen = {}
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-        with mock.patch.object(plan, "plan_for",
-                               return_value={"resolve": "run", "topaz": "upscale",
-                                             "is_hdr": False, "input": {"height": height}}), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-            stages.run_stage("resolve", p)
-        return seen["cmd"], p
-
-    def test_1080p_youtube_gets_superscale_2x(self):
-        cmd, p = self._resolve_cmd(1080)
-        self.assertIn("single", cmd)              # no Topaz segdir — single-clip mode
-        self.assertIn(p.source_cfr, cmd)          # the TRUE-CFR file, not the raw source
-        self.assertNotIn(p.segdir, cmd)
-        # index 8, NOT [-1]: the cleanup flag is appended after it, and indexing from the
-        # end silently followed every future argument added to the tail.
-        self.assertEqual(cmd[8], "2")             # SuperScale 2x
-
-    def test_720p_youtube_scales_plainly(self):
-        cmd, _p = self._resolve_cmd(720)
-        self.assertIn("single", cmd)
-        self.assertEqual(cmd[8], "-")             # no SuperScale below ~1080p
-
-    def test_4k_youtube_no_superscale(self):
-        cmd, _p = self._resolve_cmd(2160)
-        self.assertEqual(cmd[8], "-")
-
-    def test_tv_episode_keeps_the_topaz_path(self):
-        import plan, preflight, settings
-        p = _paths(tempfile.mkdtemp())
-        seen = {}
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-        with mock.patch.object(plan, "plan_for",
-                               return_value={"resolve": "run", "topaz": "upscale",
-                                             "is_hdr": False, "input": {"height": 1080}}), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-            stages.run_stage("resolve", p)
-        cmd = seen["cmd"]
-        self.assertIn("episode", cmd)             # Topaz-fed segdir mode, unchanged
-        self.assertIn(p.segdir, cmd)
-        self.assertEqual(cmd[-1], "-")            # lockstep argv: ss present, none
+        self.assertFalse(self._cfr_kwargs("dv-only", source_cfr=False)["copy_only"])
+        self.assertTrue(self._cfr_kwargs("dv-only", source_cfr=True)["copy_only"])
 
 
 class YouTubeFastRemux(unittest.TestCase):
@@ -1514,172 +841,6 @@ class YouTubeFastRemux(unittest.TestCase):
             ok, _msg = stages.run_stage("remux", p, progress=lambda d: None)
         self.assertTrue(ok)
 
-    def test_youtube_render_targets_the_ship_safe_bitrate(self):
-        import plan, preflight, settings
-        p = self._yt()
-        seen = {}
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-        with mock.patch.object(plan, "plan_for",
-                               return_value={"resolve": "run", "topaz": "upscale",
-                                             "is_hdr": False, "input": {"height": 1080}}), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-            stages.run_stage("resolve", p)
-        self.assertEqual(seen["cmd"][6], str(stages.YOUTUBE_RENDER_KBPS))   # the YT target, not the 60000 floor
-
-
-class MezzanineReuse(unittest.TestCase):
-    """A lid-close/transient that kills a Resolve pass used to cost a full ~10-minute
-    mezzanine REBUILD on every retry. A complete mezzanine (frame-count-verified against
-    its input) is now reused; a partial can never match."""
-
-    def test_complete_mezz_is_reused_without_reencoding(self):
-        p = _paths(tempfile.mkdtemp())
-        mezz = stages.mezzanine_path(p.source)
-        with open(mezz, "w") as fh:
-            fh.write("m")
-        import topaz
-        with mock.patch.object(topaz, "total_frames", return_value=1000), \
-             mock.patch.object(topaz, "_run_ffmpeg",
-                               side_effect=AssertionError("a complete mezz must be reused")):
-            ok, path = stages._build_mezzanine(p, None)
-        self.assertTrue(ok)
-        self.assertEqual(path, mezz)
-
-    def test_frame_mismatch_rebuilds(self):
-        p = _paths(tempfile.mkdtemp())
-        mezz = stages.mezzanine_path(p.source)
-        with open(mezz, "w") as fh:
-            fh.write("partial")
-        import topaz
-        counts = {p.source: 1000, mezz: 400}                  # a cut-short partial
-        with mock.patch.object(topaz, "total_frames", side_effect=lambda f: counts.get(f, 0)), \
-             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
-             mock.patch.object(topaz, "source_color", return_value=None), \
-             mock.patch.object(topaz, "_run_ffmpeg", return_value=(1, 0, False, "boom")) as rf:
-            ok, _ = stages._build_mezzanine(p, None)
-        rf.assert_called_once()                               # rebuild attempted, no silent reuse
-        self.assertFalse(ok)
-
-
-class SegmentedMezzanine(unittest.TestCase):
-    """The mezzanine builds in dvcap-style ~5-min chunks with atomic publish (user-
-    dictated: it must save its progress). A kill keeps finished chunks; the retry
-    encodes only what's missing, then a stream-copy concat assembles the file."""
-
-    def _run(self, p, *, existing_ok=(), runner=None, concat_rc=0, total_ok=True):
-        import topaz, dvcap, types
-        inp = p.source
-        with open(inp, "w") as fh:
-            fh.write("src")
-        segs = [(0, 100), (100, 200)]
-        calls = {"enc": [], "concat": 0}
-        def fake_count(path, *a, **k):
-            base = os.path.basename(str(path))
-            if base in existing_ok:
-                return 100
-            if str(path).endswith(".part"):
-                return 100                              # a fresh encode lands exactly n
-            return 0
-        def fake_run_ffmpeg(cmd, env, **k):
-            calls["enc"].append(cmd)
-            out = cmd[-1]
-            with open(out, "w") as fh:
-                fh.write("seg")
-            return (0, 100, False, "")
-        def fake_subprocess_run(cmd, **k):
-            calls["concat"] += 1
-            with open(cmd[-1], "w") as fh:
-                fh.write("mezz")
-            return types.SimpleNamespace(returncode=concat_rc, stderr="")
-        want_frames = 200
-        def fake_total(path, *a, **k):
-            if path == inp:
-                return want_frames
-            return want_frames if total_ok else 5
-        def fake_exact(path, *a, **k):
-            # The plan now takes the EXACT count (duration x fps overran the real video and
-            # made the last segment ask for frames that do not exist). Mocked here so its
-            # ffprobe calls don't land on this harness's subprocess.run stub.
-            return want_frames if str(path) == inp else fake_count(path)
-        with mock.patch.object(topaz, "total_frames", side_effect=fake_total), \
-             mock.patch.object(topaz, "_frame_count", side_effect=fake_exact), \
-             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
-             mock.patch.object(topaz, "source_color", return_value=None), \
-             mock.patch.object(topaz, "_run_ffmpeg", side_effect=fake_run_ffmpeg), \
-             mock.patch.object(dvcap, "plan_segments", return_value=segs), \
-             mock.patch.object(dvcap, "count_hevc_frames", side_effect=fake_count), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages.subprocess, "run", side_effect=fake_subprocess_run):
-            ok, out = stages._build_mezzanine(p, None)
-        return ok, out, calls
-
-    def test_fresh_build_encodes_every_chunk_then_concats(self):
-        p = _paths(tempfile.mkdtemp())
-        ok, out, calls = self._run(p)
-        self.assertTrue(ok)
-        self.assertEqual(len(calls["enc"]), 2)
-        self.assertEqual(calls["concat"], 1)
-        self.assertFalse(os.path.isdir(stages.mezzanine_path(p.source) + ".segments"))
-
-    def test_resume_skips_finished_chunks(self):
-        p = _paths(tempfile.mkdtemp())
-        # seg 0 already published from the killed attempt → only seg 1 encodes
-        segdir = stages.mezzanine_path(p.source) + ".segments"
-        os.makedirs(segdir, exist_ok=True)
-        with open(os.path.join(segdir, "seg_0000.mp4"), "w") as fh:
-            fh.write("done")
-        ok, _out, calls = self._run(p, existing_ok=("seg_0000.mp4",))
-        self.assertTrue(ok)
-        self.assertEqual(len(calls["enc"]), 1)          # ONLY the missing chunk
-        self.assertIn("seg_0001.mp4.part", calls["enc"][0][-1])
-
-    def test_short_concat_never_ships(self):
-        p = _paths(tempfile.mkdtemp())
-        ok, _out, _calls = self._run(p, total_ok=False)
-        self.assertFalse(ok)
-        self.assertFalse(os.path.exists(stages.mezzanine_path(p.source)))
-
-
-class RenderPhaseFlag(unittest.TestCase):
-    def test_render_pct_events_carry_rendering_and_others_do_not(self):
-        # The app's live screen preview hides for the render phase (user-dictated). The
-        # flag rides ONLY on RENDER_PCT events; state["progress"] is replaced per event,
-        # so any non-render event (a retry's setup) brings the preview back by itself.
-        import plan, preflight, settings
-        p = _paths(tempfile.mkdtemp())
-        emitted = []
-        with mock.patch.object(plan, "plan_for",
-                               return_value={"resolve": "run", "topaz": "upscale",
-                                             "is_hdr": False, "input": {"height": 1080}}), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings",
-                               return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(stages, "_resolve_budget",
-                               return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.threading, "Thread", _InlineThread), \
-             mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", return_value=False), \
-             mock.patch.object(stages.subprocess, "Popen",
-                               side_effect=lambda *a, **k: _FakeResolveProc(
-                                   ["SCREEN_TAKEOVER_SOON\n", "RENDER_PCT 42\n"], 1)):
-            stages.run_stage("resolve", p, progress=lambda d: emitted.append(d))
-        takeover = [d for d in emitted if d.get("takeover_soon")]
-        render = [d for d in emitted if d.get("pct") == 42]
-        self.assertTrue(render)
-        self.assertTrue(render[0]["rendering"])            # the preview-off signal
-        self.assertTrue(takeover)
-        self.assertNotIn("rendering", takeover[0])         # pre-render events carry nothing
-
 
 class FastRemuxStepProgress(unittest.TestCase):
     def test_steps_reach_the_lane_with_label_and_pct(self):
@@ -1733,23 +894,6 @@ class CombineStages(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("combine", msg)
 
-    def test_resolve_skips_on_a_real_rpu(self):
-        import companion
-        p = self._p(tempfile.mkdtemp())
-        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
-             mock.patch.object(stages.subprocess, "Popen",
-                               side_effect=AssertionError("must not launch Resolve")):
-            ok, msg = stages.run_stage("resolve", p)
-        self.assertTrue(ok)
-        self.assertIn("Resolve not needed", msg)
-
-    def test_resolve_parks_when_the_book_is_lost(self):
-        import companion
-        p = self._p(tempfile.mkdtemp())
-        with mock.patch.object(companion, "confirmed_verdict", return_value=None):
-            ok, msg = stages.run_stage("resolve", p)
-        self.assertFalse(ok)
-        self.assertTrue(msg.startswith("permanent:"))
 
     def test_an_unverifiable_partial_nas_copy_is_kept_but_never_reused(self):
         import companion
@@ -2165,33 +1309,6 @@ class ExtendStage(unittest.TestCase):
             self.assertEqual(got["input"], self.p.source_wide)
 
 
-class ResolveBudget(unittest.TestCase):
-    """The flat 120-min budget is episode-sized: the Star Wars Ep III "Siege of
-    Mandalore" fan cut (4h19m, 372,831 frames) rendered for two hours and was killed at
-    exactly the wall, every attempt (live 2026-08-16). Features scale with runtime,
-    capped at 6h; episodes keep the proven flat budget."""
-
-    def _budget(self, dur):
-        import topaz
-        p = _paths(tempfile.mkdtemp())
-        with mock.patch.object(topaz, "media_timing", return_value=(23.976, dur)):
-            return stages._resolve_budget(p)
-
-    def test_episode_keeps_the_flat_budget(self):
-        self.assertEqual(self._budget(42 * 60), stages.RESOLVE_TIMEOUT)
-        self.assertEqual(self._budget(50 * 60), stages.RESOLVE_TIMEOUT)
-
-    def test_features_scale_with_runtime(self):
-        self.assertEqual(self._budget(100 * 60), 3600 + int(100 * 60 * 1.8) + 1200)
-        # Ep III fan cut: 372,831 frames @ 23.976 = 15,550 s (4h19m) -> capped at 6 h,
-        # which still fits its ~2.2 h render + a scaled analysis with hours to spare.
-        self.assertEqual(self._budget(15550), 6 * 3600)
-        self.assertLessEqual(self._budget(8 * 3600), 6 * 3600)      # cap holds
-
-    def test_unprobeable_falls_back_to_flat(self):
-        self.assertEqual(self._budget(0.0), stages.RESOLVE_TIMEOUT)
-
-
 class YoutubeShipsItsRender(unittest.TestCase):
     """YouTube's whole point is speed: Resolve exports at a cap-safe bitrate so the render
     IS the deliverable and the remux stream-COPIES its video (minutes) instead of running
@@ -2268,34 +1385,6 @@ class UnverifiableSourceIsNeverTrusted(unittest.TestCase):
     def test_verified_partial_is_deleted_and_repulled(self):
         ok, _msg, dl, _p = self._run(False)
         dl.assert_called_once()                      # verified short -> clean re-pull
-
-
-class MezzaninePlansFromExactFrames(unittest.TestCase):
-    """The segment plan used to come from format=duration x fps while every segment was
-    gated on an EXACT frame count. An audio track running past the last video frame (an
-    Opus/AAC tail of a few hundred ms is routine) inflated the estimate, so the last
-    segment asked for frames that do not exist, hit EOF short, failed the gate, and the
-    item failed identically on every retry until it parked."""
-
-    def test_exact_count_wins_over_the_duration_estimate(self):
-        import dvcap, topaz
-        seen = {}
-        with mock.patch.object(topaz, "_frame_count", return_value=138196) as exact, \
-             mock.patch.object(topaz, "total_frames", return_value=138205) as est, \
-             mock.patch.object(topaz, "_fps_fraction", return_value="24000/1001"), \
-             mock.patch.object(topaz, "source_color", return_value=None), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=20000), \
-             mock.patch.object(dvcap, "ensure_segdir",
-                               side_effect=lambda d, m: seen.update(m) or "fresh"), \
-             mock.patch.object(dvcap, "plan_segments", return_value=[]):
-            p = _paths(tempfile.mkdtemp())
-            try:
-                stages._build_mezzanine(p, abort=None)
-            except Exception:
-                pass                      # only the PLAN matters here
-        self.assertTrue(exact.called)
-        self.assertEqual(seen.get("frames"), 138196)   # the real count, not 138205
-        est.assert_not_called()
 
 
 class SeasonScopedLoudness(unittest.TestCase):
@@ -2421,113 +1510,6 @@ class YouTubeRenderBitrate(unittest.TestCase):
 
     def test_an_unknown_height_is_treated_as_the_common_case(self):
         self.assertEqual(stages.youtube_render_kbps(None), stages.YOUTUBE_RENDER_KBPS)
-
-
-class ResolveRendersTheFileTheGatesMeasure(unittest.TestCase):
-    """The fast path handed Resolve p.source while render_is_complete() and the remux's RPU
-    alignment both measure p.source_cfr — two different files. Don't Look Up's original
-    carries ~294s of audio past the end of its picture, so Resolve took the clip length from
-    the CONTAINER: 8591.648s x 24 is exactly the 206,200 frames it rendered for a
-    199,144-frame movie, five times over (live-caught 2026-08-21)."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.p = _paths(self.tmp)
-
-    def _with_cfr(self):
-        open(self.p.source_cfr, "w").close()
-        return self.p
-
-    def test_the_cfr_is_what_goes_on_the_timeline(self):
-        p = self._with_cfr()
-        self.assertEqual(stages.resolve_input(p), p.source_cfr)
-
-    def test_it_is_NOT_the_original_source(self):
-        p = self._with_cfr()
-        self.assertNotEqual(stages.resolve_input(p), p.source)
-
-    def test_there_is_no_silent_fallback_to_the_source(self):
-        # Even with nothing on disk it names the CFR. A fallback would quietly reintroduce
-        # the divergence; stage_done("download") already guarantees the file is there.
-        self.assertEqual(stages.resolve_input(self.p), self.p.source_cfr)
-
-    def test_a_youtube_item_is_unchanged(self):
-        # YouTube already rendered from its CFR — that behaviour must survive the fix
-        p = episode_paths("Show", "S01E01", "e.mp4", scratch_dir=self.tmp,
-                          nas_tv_root="/Media/TV")
-        open(p.source_cfr, "w").close()
-        self.assertEqual(stages.resolve_input(p), p.source_cfr)
-
-    def test_a_combine_item_still_renders_its_verdict_winner(self):
-        from orchestrator import movie_paths
-        p = movie_paths("m.mkv", "/Media/Movies", "M", scratch_dir=self.tmp, combine=True)
-        open(p.source_cfr, "w").close()          # even with one on disk, combine wins
-        self.assertTrue(p.combine)               # the fixture is really a combine item
-        import orchestrator
-        with mock.patch.object(orchestrator, "combine_winner_path", return_value="/w/win.mkv"):
-            self.assertEqual(stages.resolve_input(p), "/w/win.mkv")
-
-    def test_a_plain_movie_takes_the_cfr(self):
-        from orchestrator import movie_paths
-        p = movie_paths("m.mkv", "/Media/Movies", "M", scratch_dir=self.tmp)
-        open(p.source_cfr, "w").close()
-        self.assertFalse(p.combine)
-        self.assertEqual(stages.resolve_input(p), p.source_cfr)
-
-
-class TheCleanupFlagReachesResolve(unittest.TestCase):
-    """Only a YouTube item, only with the setting on, and only once a grade actually exists."""
-
-    def _argv(self, *, youtube, setting=True, drx=True):
-        import plan, preflight, settings as st, stages as S
-        seen = {}
-        tmp = tempfile.mkdtemp()
-        # a REAL file, so nothing has to patch os.path.exists — patching it globally broke
-        # every other existence check in the stage and never reached Popen at all
-        drx_path = os.path.join(tmp, "cleanup.drx")
-        if drx:
-            open(drx_path, "w").close()
-        p = (_paths(tmp) if not youtube
-             else orch_youtube_paths("Chan", os.path.join(tmp, "v [aaaaaaaaaaa].mp4"), "V",
-                                     scratch_dir=tmp))
-
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-
-        conf = dict(st.DEFAULT_SETTINGS)
-        conf["youtube_cleanup_grade"] = setting
-        with mock.patch.object(plan, "plan_for",
-                               return_value={"topaz": "upscale", "resolve": "add_hdr_dv",
-                                             "input": {"height": 1080}}), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(st, "get_settings", return_value=conf), \
-             mock.patch.object(S, "resolve_pipeline_cleanup_drx", return_value=drx_path), \
-             mock.patch.object(S, "_quit_resolve"), \
-             mock.patch.object(S.subprocess, "Popen", side_effect=boom):
-            S.run_stage("resolve", p)
-        return seen["cmd"]
-    CLEANUP = 9      # its fixed place: py, script, phase, in, out, mode, kbps, host, ss, CLEANUP, cap
-
-    def test_a_youtube_item_with_a_saved_grade_asks_for_it(self):
-        self.assertEqual(self._argv(youtube=True)[self.CLEANUP], "1")
-
-    def test_no_saved_grade_means_no(self):
-        self.assertEqual(self._argv(youtube=True, drx=False)[self.CLEANUP], "-")
-
-    def test_the_setting_can_turn_it_off(self):
-        self.assertEqual(self._argv(youtube=True, setting=False)[self.CLEANUP], "-")
-
-    def test_an_episode_never_asks_for_it(self):
-        self.assertEqual(self._argv(youtube=False)[self.CLEANUP], "-")
-
-    def test_every_arg_keeps_its_place_so_older_builds_ignore_the_tail(self):
-        cmd = self._argv(youtube=True)
-        # py, script, phase, in, out, mode, kbps, host, ss, cleanup, cap — appended, never
-        # inserted (the peak cap joined the tail 2026-09-14)
-        self.assertEqual(len(cmd), 11)
-        self.assertEqual(cmd[8], "2")          # superscale kept ITS place (1080p -> 2x)
-        self.assertEqual(cmd[10], str(int(cmd[10])))   # the cap is a number for a YouTube item
 
 
 class ImportedVideosUseTheirBatchSettings(unittest.TestCase):
@@ -2673,360 +1655,6 @@ class DownloadYieldsToASentVideo(unittest.TestCase):
         with mock.patch.object(stages, "_download", side_effect=spy):
             stages.run_stage("download", mock.MagicMock(ep="X"), should_pause=sp)
         self.assertIs(seen["sp"], sp)
-
-
-class YouTubeReexport(unittest.TestCase):
-    """The YouTube gamble's second throw (user-dictated 2026-09-14): a render whose 1-s
-    peak is over the SHIELD cap is re-exported at a target scaled by the burst ratio it
-    just measured, inside the same Resolve session — minutes — instead of losing the
-    whole hour-class x265 capped re-encode at remux."""
-
-    def _gate(self, cap=50):
-        import resolve_pipeline as RP, dvcap
-        return cap * dvcap.PEAK_TOLERANCE * RP.REEXPORT_MARGIN     # 51.75 for a 50 cap
-
-    def test_the_math_scales_the_target_by_the_measured_burst_ratio(self):
-        import resolve_pipeline as RP
-        # 20 Mb/s peaked at 59.9 (live 2026-08-18) under a 50 cap
-        self.assertEqual(RP.reexport_kbps(20000, 59.9, 50), int(20000 * self._gate() / 59.9))
-        self.assertIsNone(RP.reexport_kbps(20000, 40.0, 50), "not over — nothing to lower")
-        self.assertIsNone(RP.reexport_kbps(20000, 300.0, 50), "under the floor — the remux caps it")
-        self.assertIsNone(RP.reexport_kbps(0, 60, 50))
-        self.assertIsNone(RP.reexport_kbps("x", 60, 50))
-
-    def test_it_aims_at_the_gate_that_decides_not_at_the_bare_cap(self):
-        """dvcap.peak_ok accepts peak <= cap * PEAK_TOLERANCE, so aiming at the cap alone threw
-        away 15% of the budget before the safety margin even applied — and that is what pushed
-        marginal videos under the floor. Live 2026-09-26: a 14000 kb/s render peaked at 79.7
-        against a 50 cap, the old aim computed 7905 (under the 8000 floor), the gamble declined
-        and the item spent 4 h 36 m in the capped re-encode."""
-        import resolve_pipeline as RP
-        want = RP.reexport_kbps(14000, 79.7, 50)
-        self.assertIsNotNone(want, "this is the video that took the four-hour path")
-        self.assertGreaterEqual(want, RP.REEXPORT_FLOOR_KBPS)
-        self.assertEqual(want, int(14000 * self._gate() / 79.7))
-        self.assertLess(want, 14000)                       # still a REDUCTION
-
-    def test_two_measured_points_are_fitted_rather_than_assumed_proportional(self):
-        """The peak does not scale with the target: live 2026-09-25, 14000 kb/s peaked at 75.4
-        and its 8358 kb/s re-export still peaked at 61.7 — the burst ratio GREW as the target
-        fell. Assuming proportionality makes the second throw undershoot the reduction it needs,
-        so once two points exist the line through them is used instead."""
-        import resolve_pipeline as RP
-        proportional = int(17000 * self._gate() / 55.0)
-        fitted = RP.reexport_kbps(17000, 55.0, 50, prev=(20000, 60.0))
-        self.assertIsNotNone(fitted)
-        self.assertLess(fitted, proportional, "a fit through both points asks for a real cut")
-        # the line: peak = a + b*target through (20000, 60) and (17000, 55)
-        b = (60.0 - 55.0) / (20000 - 17000)
-        self.assertEqual(fitted, int((self._gate() - (55.0 - b * 17000)) / b))
-
-    def test_a_fit_that_lands_under_the_floor_still_declines(self):
-        """The Xiaomi review, live: (14000, 75.4) then (8358, 61.7) fits to ~4300 kb/s, far under
-        the floor. The capped re-encode really is the right call for that one."""
-        import resolve_pipeline as RP
-        self.assertIsNone(RP.reexport_kbps(8358, 61.7, 50, prev=(14000, 75.4)))
-
-    def test_a_line_that_never_reaches_the_gate_declines_instead_of_guessing(self):
-        """Some content's peak barely answers to bitrate at all. If the fitted line's floor is
-        already over the gate, no target gets there and a third render would be wasted."""
-        import resolve_pipeline as RP
-        self.assertIsNone(RP.reexport_kbps(15000, 68.0, 50, prev=(20000, 70.0)))
-
-    def test_the_stage_forwards_every_render_marker_to_the_log(self):
-        """RENDER_PEAK carries the peak a render LANDED at against the target it asked for, and
-        it was the one marker the stage dropped. Three audits of this mechanism had to infer the
-        distribution from how often the slow path fired, because the log held 0 of them."""
-        import inspect, stages
-        src = inspect.getsource(stages._resolve)
-        line = next(l for l in src.splitlines() if "RENDER_OVER_CAP" in l and "startswith" in l)
-        for marker in ("RENDER_PEAK", "RENDER_REEXPORT", "RENDER_OVER_CAP"):
-            self.assertIn(marker, line)
-
-    def _real_loop(self, peaks, cap=50, bitrate=20000):
-        """The loop against REAL files: `render` writes the target it was given into the output,
-        so the surviving file says which render the remux would get."""
-        import resolve_pipeline as RP, dvcap, tempfile, os
-        d = tempfile.mkdtemp()
-        out = os.path.join(d, "render.mov")
-        peaks = list(peaks)
-        def fake_render(path, mode, kbps):
-            with open(path, "w") as f:
-                f.write(str(kbps))
-            return 0
-        with mock.patch.object(RP, "render", side_effect=fake_render), \
-             mock.patch.object(dvcap, "video_peak_1s_mbps", side_effect=lambda *a, **k: peaks.pop(0)), \
-             mock.patch("builtins.print"):
-            RP.render_under_cap(out, "dv1000", bitrate, cap)
-        survivor = open(out).read() if os.path.exists(out) else None
-        strays = [f for f in os.listdir(d) if f != "render.mov"]
-        return survivor, strays
-
-    def test_cleanup_sweeps_a_gamble_stray_a_kill_left_behind(self):
-        """render_under_cap clears its own kept render in a finally — but a hard kill (a deploy
-        mid-gamble) skips that, and the stray is a multi-GB 4K render."""
-        import inspect, stages
-        self.assertIn('.best', inspect.getsource(stages._cleanup),
-                      "a killed gamble would leak its kept render onto the scratch disk")
-
-    def test_a_lost_gamble_leaves_the_FIRST_render_for_the_fallback(self):
-        """The x265 fallback re-encodes whatever survived. Encoding it from a half-bitrate
-        re-export is pure loss: measured, that path delivers 19.2 Mbps from a full render
-        against the 8.5-11 Mbps a re-export ships."""
-        survivor, strays = self._real_loop([75.4, 61.7, 61.0])    # never gets under the gate
-        self.assertEqual(survivor, "20000", "the fallback must get the best render, not the last")
-        self.assertEqual(strays, [], "and nothing is left beside it")
-
-    def test_a_won_gamble_ships_the_re_export_and_keeps_no_stray(self):
-        survivor, strays = self._real_loop([59.9, 44.0])
-        self.assertNotEqual(survivor, "20000")                    # the re-export is what ships
-        self.assertEqual(strays, [])
-
-    def test_a_first_render_under_the_cap_is_untouched(self):
-        survivor, strays = self._real_loop([40.0])
-        self.assertEqual(survivor, "20000")
-        self.assertEqual(strays, [])
-
-    def test_each_no_says_which_no_it_is(self):
-        """All three declines in the log read "under the floor" and none read "out of attempts",
-        which is what pointed at the arithmetic instead of the retry budget. A census that cannot
-        tell an arithmetic problem from a content one cannot find the next bug either."""
-        import resolve_pipeline as RP
-        self.assertEqual(RP.reexport_plan(14000, 300.0, 50)[1], "under-floor")
-        self.assertEqual(RP.reexport_plan(15000, 68.0, 50, prev=(20000, 70.0))[1], "content-floor")
-        self.assertEqual(RP.reexport_plan(20000, 40.0, 50)[1], "not-over")
-        self.assertEqual(RP.reexport_plan("x", 60, 50)[1], "unreadable")
-        self.assertEqual(RP.reexport_plan(14000, 79.7, 50)[1], "", "a target is not a no")
-
-    def test_the_two_declines_read_differently_in_the_log(self):
-        _rc, _r, lines = self._loop([300.0])                      # target under the floor
-        floor_line = next(l for l in lines if l.startswith("RENDER_OVER_CAP"))
-        self.assertIn("under 8000 kb/s", floor_line)
-        _rc, _r, lines = self._loop([70.0, 68.0])                 # a line that never gets there
-        fit_line = next(l for l in lines if l.startswith("RENDER_OVER_CAP"))
-        self.assertIn("never reaches the gate", fit_line)
-
-    def test_a_useless_fit_falls_back_to_the_ratio(self):
-        import resolve_pipeline as RP
-        same = RP.reexport_kbps(20000, 60.0, 50, prev=(20000, 59.0))   # same target, no slope
-        self.assertEqual(same, int(20000 * self._gate() / 60.0))
-        backwards = RP.reexport_kbps(17000, 62.0, 50, prev=(20000, 60.0))  # peak ROSE as target fell
-        self.assertEqual(backwards, int(17000 * self._gate() / 62.0))
-
-    def _loop(self, peaks, cap=50, bitrate=20000):
-        import resolve_pipeline as RP, dvcap
-        renders, peaks = [], list(peaks)
-        with mock.patch.object(RP, "render", side_effect=lambda out, mode, kbps: renders.append(kbps) or 0), \
-             mock.patch.object(dvcap, "video_peak_1s_mbps", side_effect=lambda *a, **k: peaks.pop(0)), \
-             mock.patch.object(RP.os.path, "exists", return_value=True), \
-             mock.patch.object(RP.os, "remove"), \
-             mock.patch("builtins.print") as pr:
-            rc = RP.render_under_cap("/out.mov", "dv1000", bitrate, cap)
-        lines = [str(c.args[0]) for c in pr.call_args_list if c.args]
-        return rc, renders, lines
-
-    def test_an_over_cap_render_is_re_exported_lower_and_then_accepted(self):
-        rc, renders, lines = self._loop([59.9, 44.0])
-        self.assertEqual(rc, 0)
-        self.assertEqual(renders, [20000, int(20000 * self._gate() / 59.9)])
-        self.assertTrue(any(l.startswith("RENDER_REEXPORT") for l in lines))
-        self.assertTrue(any(l.startswith("RENDER_PEAK") for l in lines))
-
-    def test_the_second_throw_fits_the_line_through_both_measurements(self):
-        rc, renders, _ = self._loop([59.9, 58.0, 44.0])     # the peak barely moved — a steep line
-        self.assertEqual(len(renders), 3)
-        b = (59.9 - 58.0) / (renders[0] - renders[1])
-        self.assertEqual(renders[2], int((self._gate() - (58.0 - b * renders[1])) / b))
-        self.assertLess(renders[2], int(renders[1] * self._gate() / 58.0),
-                        "the fit asks for more than the ratio would have")
-
-    def test_it_stops_guessing_after_two_re_exports(self):
-        rc, renders, lines = self._loop([60, 60, 60, 60])
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(renders), 3)
-        self.assertTrue(any(l.startswith("RENDER_OVER_CAP") for l in lines), "the remux is told to cap it")
-
-    def test_under_the_floor_it_leaves_the_render_to_the_remux(self):
-        rc, renders, lines = self._loop([300.0])
-        self.assertEqual(renders, [20000])
-        self.assertTrue(any(l.startswith("RENDER_OVER_CAP") for l in lines))
-
-    def test_a_render_that_lands_under_the_cap_is_rendered_once(self):
-        rc, renders, lines = self._loop([40.0])
-        self.assertEqual(renders, [20000])
-        self.assertFalse(any("RENDER_REEXPORT" in l for l in lines))
-
-    def test_no_cap_means_the_plain_render(self):
-        import resolve_pipeline as RP, dvcap
-        with mock.patch.object(RP, "render", return_value=0), \
-             mock.patch.object(dvcap, "video_peak_1s_mbps",
-                               side_effect=AssertionError("must not measure")):
-            self.assertEqual(RP.render_under_cap("/out.mov", "dv1000", 20000, 0), 0)
-
-    def test_the_resolve_stage_hands_the_cap_to_youtube_renders_only(self):
-        import plan, preflight, settings
-        from orchestrator import youtube_paths
-        seen = {}
-        def boom(cmd, **kw):
-            seen["cmd"] = cmd
-            raise RuntimeError("stop here")
-        common = dict(resolve="run", topaz="upscale", is_hdr=False, input={"height": 1080})
-        st = dict(settings.DEFAULT_SETTINGS, max_peak_mbps=50)
-        with mock.patch.object(plan, "plan_for", return_value=common), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings", return_value=st), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_quit_resolve"), \
-             mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-            stages.run_stage("resolve", youtube_paths("Chan", "YouTube-raw/Chan/vid/vid.mp4", "T",
-                                                      scratch_dir=tempfile.mkdtemp()))
-            yt_cmd = seen["cmd"]
-            stages.run_stage("resolve", _paths(tempfile.mkdtemp()))
-            tv_cmd = seen["cmd"]
-        self.assertEqual(yt_cmd[-1], "50", "a YouTube render is gated at max_peak_mbps")
-        self.assertEqual(tv_cmd[-1], "-", "a TV render is never a gamble — the x265 pass caps it")
-
-    def test_a_re_export_is_named_in_the_stage_result(self):
-        # the subprocess printed the gamble's second throw; the stage says so in its result
-        # and files a log line, so the outcome is visible without the raw stdout
-        events = []
-        p = _paths(tempfile.mkdtemp())
-        harness = MezzanineFallback("test_import_failure_builds_mezz_and_retries_once")
-        with mock.patch.object(stages.logbook, "event", side_effect=lambda m: events.append(m)):
-            ok, msg, calls, _ = harness._run_resolve(
-                p, [_FakeResolveProc(["RENDER_REEXPORT 59.9 Mbps at 20000 kb/s > 50 cap — "
-                                      "re-exporting at 15025 kb/s\n", "render ok\n"], 0)],
-                dv_ok_sequence=(True,))
-        self.assertTrue(ok)
-        self.assertIn("re-exported under the cap", msg)
-        self.assertTrue(any("RENDER_REEXPORT" in e for e in events))
-
-
-class YouTubeKeepsResolveOpen(unittest.TestCase):
-    """User-caught 2026-09-16: every YouTube video relaunched Resolve although each spends
-    about three minutes in it. A successful YouTube pass now leaves Resolve running; the
-    run's end closes it, and anything suspect still kills it at once."""
-
-    RES_PLAN = dict(resolve="run", topaz="upscale", is_hdr=False, input={"height": 1080})
-
-    def setUp(self):
-        self.kills = []
-        stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0)
-        p = mock.patch.object(stages, "_kill_resolve",
-                              side_effect=lambda: (self.kills.append(1),
-                                                   stages._RESOLVE_KEPT.update(open=False, mode=None, passes=0)))
-        p.start()
-        self.addCleanup(p.stop)
-        self.addCleanup(stages._RESOLVE_KEPT.update, open=False, mode=None, passes=0)
-
-    def _pass(self, *, youtube=True, rc=0, dv=True, mode="auto", abort=None):
-        import plan, preflight, settings, orchestrator
-        from orchestrator import youtube_paths
-        tmp = tempfile.mkdtemp()
-        p = (youtube_paths("Chan", os.path.join(tmp, "v [aaaaaaaaaaa].mp4"), "V", scratch_dir=tmp)
-             if youtube else _paths(tmp))
-        with mock.patch.object(plan, "plan_for", return_value=self.RES_PLAN), \
-             mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-             mock.patch.object(settings, "get_settings", return_value=dict(settings.DEFAULT_SETTINGS)), \
-             mock.patch.object(settings, "get_show_output_mode", return_value=mode), \
-             mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-             mock.patch.object(stages, "_resolve_budget", return_value=stages.RESOLVE_TIMEOUT), \
-             mock.patch.object(stages.threading, "Thread", _InlineThread), \
-             mock.patch.object(stages.time, "sleep"), \
-             mock.patch.object(stages, "_vstream", return_value=None), \
-             mock.patch.object(stages, "_is_dv81", return_value=dv), \
-             mock.patch.object(orchestrator, "render_is_complete", return_value=True), \
-             mock.patch.object(stages.subprocess, "Popen",
-                               side_effect=lambda cmd, **kw: _FakeResolveProc(["render ok\n"], rc)):
-            return stages.run_stage("resolve", p, abort=abort)
-
-    def test_a_successful_video_leaves_resolve_open(self):
-        ok, _msg = self._pass()
-        self.assertTrue(ok)
-        self.assertEqual(self.kills, [], "Resolve was killed after a good video")
-        self.assertTrue(stages.resolve_kept_open())
-
-    def test_the_next_video_reuses_it(self):
-        self._pass()
-        self._pass()
-        self.assertEqual(self.kills, [])
-        self.assertEqual(stages._RESOLVE_KEPT["passes"], 2)
-
-    def test_a_failed_video_still_kills_it(self):
-        self._pass()
-        ok, _msg = self._pass(dv=False)
-        self.assertFalse(ok)
-        self.assertEqual(self.kills, [1], "a suspect Resolve must not survive into the next video")
-        self.assertFalse(stages.resolve_kept_open())
-
-    def test_an_aborted_pass_kills_it(self):
-        ab = mock.Mock()
-        ab.is_set.return_value = False
-        self._pass()
-        ab.is_set.return_value = True
-        self._pass(abort=ab)
-        self.assertTrue(self.kills)
-
-    def test_a_tv_episode_never_keeps_it(self):
-        ok, _msg = self._pass(youtube=False)
-        self.assertTrue(ok)
-        self.assertEqual(self.kills, [1])
-        self.assertFalse(stages.resolve_kept_open())
-
-    def test_a_different_output_project_starts_fresh(self):
-        self._pass(mode="dv1000")
-        self._pass(mode="sdr")
-        self.assertEqual(self.kills, [1], "closed before switching projects, then kept again")
-        self.assertEqual(stages._RESOLVE_KEPT["mode"], "sdr")
-
-    def test_a_long_run_gets_a_fresh_resolve_now_and_then(self):
-        for _ in range(stages.RESOLVE_REUSE_MAX):
-            self._pass()
-        self.assertEqual(len(self.kills), 1)
-        self.assertFalse(stages.resolve_kept_open())
-
-    def test_closing_is_a_no_op_unless_the_pipeline_kept_it(self):
-        self.assertFalse(stages.close_kept_resolve("test"))
-        self.assertEqual(self.kills, [], "never touch a Resolve the pipeline did not leave open")
-        self._pass()
-        self.assertTrue(stages.close_kept_resolve("test"))
-        self.assertEqual(self.kills, [1])
-
-
-class HostDisplayProblem(unittest.TestCase):
-    """The one verdict both the Resolve stage and the orchestrator use: may Resolve run now, or is
-    its pinned display missing? (the orchestrator holds the item instead of counting a failure)"""
-
-    def _problem(self, host=None, why="not attached", **s):
-        base = {"resolve_host_pinning": True, "resolve_host_fallback_main": False}
-        base.update(s)
-        prio = base.pop("prio", ["uuid:DUMMY"])
-        import settings
-        with mock.patch.object(settings, "get_settings", return_value=base), \
-             mock.patch.object(settings, "get_display_priority", return_value=prio):
-            return stages._host_problem(host, why)
-
-    def test_a_missing_pinned_display_is_the_problem(self):
-        self.assertEqual(self._problem(), "not attached")
-        self.assertEqual(self._problem(why=""), "pinned display unavailable")
-
-    def test_nothing_stops_resolve_otherwise(self):
-        self.assertIsNone(self._problem(host={"key": "uuid:DUMMY"}))           # it is there
-        self.assertIsNone(self._problem(resolve_host_pinning=False))           # pinning off
-        self.assertIsNone(self._problem(prio=[]))                              # nothing pinned
-        self.assertIsNone(self._problem(resolve_host_fallback_main=True))      # main allowed
-        self.assertIsNone(self._problem(why="chosen display is the main one"))
-
-    def test_tests_never_read_the_real_screens(self):
-        import preflight, settings
-        calls = []
-        with mock.patch.object(settings, "get_settings",
-                               return_value={"resolve_host_pinning": True}), \
-             mock.patch.object(settings, "get_display_priority", return_value=["uuid:DUMMY"]), \
-             mock.patch.object(preflight, "chosen_host",
-                               side_effect=lambda: calls.append(1) or (None, "not attached")):
-            self.assertIsNone(stages.host_display_problem())
-        self.assertEqual(calls, [])                       # not even asked
 
 
 # ---- native DV (settings dv_engine 'native') ----------------------------------------------
@@ -3453,8 +2081,7 @@ class _DvRenderItem(unittest.TestCase):
                    mock.patch.object(nativelane, "probe_stream",
                                      side_effect=lambda _p, **kw: self.probes.append(kw) or dict(self.info)),
                    mock.patch.object(nativelane, "cfr_info", side_effect=lambda _p: dict(self.cfr)),
-                   mock.patch.object(nativelane, "lut_path", side_effect=lambda: self.cube),
-                   mock.patch.object(settings, "dv_routes", _REAL_DV_ROUTES)):
+                   mock.patch.object(nativelane, "lut_path", side_effect=lambda: self.cube)):
             cm.start()
             self.addCleanup(cm.stop)
 
@@ -3492,7 +2119,7 @@ class NativeRenderSpec(_DvRenderItem):
             spec, why = stages.dvrender_spec(self.p, route)
             self.assertIsNone(spec)
             return why
-        for route in ("tv_sdr_topaz", "tv_disk_fallback", "unknown", None):
+        for route in ("dvp7", "already_dv", "combine_rpu", "unknown", None):
             self.assertIn("has no native render yet", refused(route), route)
         self.toolchain = (False, "dovi_tool is 2.2.0, pinned 2.3.0")
         self.assertEqual(refused(), "the native toolchain is not ready: dovi_tool is 2.2.0, pinned 2.3.0")
@@ -3502,9 +2129,11 @@ class NativeRenderSpec(_DvRenderItem):
                                   ("color_transfer", "smpte2084", "the source is already HDR")):
             self.info = dict(self.INFO, **{key: value})
             self.assertIn(words, refused())
-        for w, h in ((1920, 1080), (4096, 2160), (3840, 1600), (2160, 3840)):
+        for w, h in ((4096, 2160), (3840, 1600), (2160, 3840)):   # not refused: fitted into 16:9
             self.info = dict(self.INFO, width=w, height=h)
-            self.assertIn(f"the source is {w}x{h}, not 3840x2160", refused())
+            spec, why = stages.dvrender_spec(self.p, "sdr4k")
+            self.assertEqual(why, "", (w, h))
+            self.assertIn("pad=3840:2160:", spec.pre_vf)
         self.info = dict(self.INFO)
         self.cfr = dict(self.cfr, frames=None)
         self.assertIn("frame count or frame rate is unknown", refused())
@@ -3567,28 +2196,6 @@ class NativeRenderFitSpec(_DvRenderItem):
         self.assertEqual(spec.kbps, stages.youtube_render_kbps(1920))
         self.assertEqual(spec.kbps, stages.YOUTUBE_RENDER_KBPS_4K)
 
-    def test_the_bitrate_is_exactly_what_resolve_would_export_at(self):
-        import plan, preflight, settings
-        for w, h in ((640, 480), (1280, 720), (1920, 1080), (1920, 1200), (2560, 1440),
-                     (1080, 1920), (2160, 3840), (3840, 1600)):
-            seen = {}
-
-            def boom(cmd, **kw):
-                seen["cmd"] = cmd
-                raise RuntimeError("stop here")
-            with mock.patch.object(plan, "plan_for",
-                                   return_value={"resolve": "run", "topaz": "upscale", "is_hdr": False,
-                                                 "input": {"width": w, "height": h}}), \
-                 mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-                 mock.patch.object(settings, "get_settings",
-                                   return_value=dict(settings.DEFAULT_SETTINGS)), \
-                 mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
-                 mock.patch.object(stages, "_quit_resolve"), \
-                 mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-                stages.run_stage("resolve", self.p)
-                spec = self._spec("yt_1080" if 900 <= h <= 1200 else "yt_plain", width=w, height=h)
-            self.assertEqual(str(spec.kbps), seen["cmd"][6], (w, h))         # the export bitrate
-            self.assertEqual(str(spec.cap_mbps), seen["cmd"][10], (w, h))    # the render's peak gate
 
     def test_untagged_full_range_and_pal_sources(self):
         untagged = {"color_space": None, "color_primaries": None, "color_transfer": None,
@@ -3616,60 +2223,84 @@ class NativeRenderFitSpec(_DvRenderItem):
         self.info = {}
         self.assertEqual(stages.dvrender_spec(self.p, "yt_plain"), (None, "the source could not be probed"))
 
-    def test_the_no_front_end_routes_probe_and_refuse_as_before(self):
-        stages.dvrender_spec(self.p, "yt_native4k")
-        self.assertEqual(self.probes, [{}])                       # the lane's own probe, unchanged
-        self.info = dict(self.INFO, width=1920, height=1080)
-        self.assertEqual(stages.dvrender_spec(self.p, "yt_native4k")[1],
-                         "the source is 1920x1080, not 3840x2160 — route yt_native4k renders its "
-                         "frame as it is")
+    def test_a_native_4k_frame_takes_no_front_end_and_any_other_is_fitted(self):
+        spec, _why = stages.dvrender_spec(self.p, "yt_native4k")
+        self.assertEqual(self.probes, [{"extra": ("sample_aspect_ratio",)}])
+        self.assertIsNone(spec.pre_vf)                            # 3840x2160 BT.709: the LUT alone
+        self.info = dict(self.INFO, width=4096, height=2160)      # DCI 4K: letterboxed into 16:9
+        spec, why = stages.dvrender_spec(self.p, "yt_native4k")
+        self.assertEqual(why, "")
+        self.assertIn("pad=3840:2160:", spec.pre_vf)
+
+
+class RouteRefusal(unittest.TestCase):
+    """route_refusal: the refusals that do not depend on the chunks, asked before Topaz."""
+
+    def _ask(self, route, *, base=None, youtube=False, combine=False, size=(3840, 2160)):
+        import routes, plan
+        p = types.SimpleNamespace(source="/x/src.mkv", youtube=youtube, combine=combine)
+        def item_route(_p, mode=None):
+            return base if mode == "dv1000" else route
+        with mock.patch.object(routes, "item_route", side_effect=item_route), \
+             mock.patch.object(plan, "probe_input", return_value={"width": size[0], "height": size[1]}):
+            return stages.route_refusal(p)
+
+    def test_makeable_and_unknown_yet_are_not_refused(self):
+        for route in ("tv_sdr_topaz", "movie_sdr_topaz", "yt_plain", "rpu_only", "hdr_topaz", None,
+                      "combine_rpu", "already_dv", "dvp7"):
+            self.assertEqual(self._ask(route), "", route)
+
+    def test_no_route_at_all(self):
+        self.assertIn("has no native render", self._ask("unknown"))
+
+    def test_hdr_under_an_sdr_pin_needs_a_tone_map(self):
+        self.assertIn("tone map", self._ask("sdr_out", base="hdr_topaz"))
+        self.assertEqual(self._ask("sdr_out", base="tv_sdr_topaz"), "")
+
+    def test_an_hdr_youtube_video_of_another_size(self):
+        self.assertIn("no HDR fit", self._ask("hdr_reencode", youtube=True, size=(1920, 1080)))
+        self.assertEqual(self._ask("hdr_reencode", youtube=True), "")
+        self.assertEqual(self._ask("rpu_only", youtube=True, size=(1920, 1080)), "")  # keeps its stream
+
+    def test_it_never_raises(self):
+        import routes
+        with mock.patch.object(routes, "item_route", side_effect=OSError("probe")):
+            self.assertEqual(stages.route_refusal(types.SimpleNamespace(source="/x")), "")
 
 
 class NativeRouteDecision(_DvRenderItem):
-    """native_route: one settings read while no route is 'native', else the item's route and
-    whether the stage can make it."""
+    """native_route: the item's route and whether the native render can make it."""
 
-    def test_nothing_is_probed_or_classified_while_every_route_is_resolve(self):
-        import routes, settings
-        every = {r: "resolve" for r in routes.ROUTES}
-        for table in ({}, every):
-            settings.set_settings({"dv_routes": table})
-            with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")), \
-                 mock.patch.object(stages, "dvrender_spec", side_effect=AssertionError("spec")):
-                self.assertEqual(stages.native_route(self.p), (None, None, ""))
-
-    def test_a_native_route_gets_its_spec(self):
-        import routes, settings
-        settings.set_settings({"dv_routes": {"yt_native4k": "native"}})
+    def test_a_route_gets_its_spec(self):
+        import routes
         with mock.patch.object(routes, "item_route", return_value="yt_native4k"):
             route, spec, why = stages.native_route(self.p)
         self.assertEqual((route, why), ("yt_native4k", ""))
         self.assertEqual(spec.kbps, stages.YOUTUBE_RENDER_KBPS_4K)
 
-    def test_another_route_is_left_on_resolve_unasked(self):
-        import routes, settings
-        settings.set_settings({"dv_routes": {"yt_native4k": "native"}})
-        with mock.patch.object(routes, "item_route", return_value="yt_1080"), \
-             mock.patch.object(stages, "dvrender_spec", side_effect=AssertionError("spec")):
-            self.assertEqual(stages.native_route(self.p), ("yt_1080", None, ""))
-
     def test_a_route_the_stage_cannot_make_says_why(self):
-        import routes, settings
-        settings.set_settings({"dv_routes": {"tv_disk_fallback": "native"}})
-        with mock.patch.object(routes, "item_route", return_value="tv_disk_fallback"):
+        import routes
+        with mock.patch.object(routes, "item_route", return_value="dvp7"):
             route, spec, why = stages.native_route(self.p)
-        self.assertEqual((route, spec), ("tv_disk_fallback", None))
+        self.assertEqual((route, spec), ("dvp7", None))
         self.assertIn("has no native render yet", why)
 
-    def test_a_fit_route_set_native_gets_its_spec(self):
-        import routes, settings
+    def test_a_fit_route_gets_its_spec(self):
+        import routes
         self.info = dict(self.INFO, width=1920, height=1080)
-        settings.set_settings({"dv_routes": {"yt_1080": "native"}})
         with mock.patch.object(routes, "item_route", return_value="yt_1080"):
             route, spec, why = stages.native_route(self.p)
         self.assertEqual((route, why), ("yt_1080", ""))
         self.assertTrue(spec.pre_vf.startswith("zscale=w=3840:h=2160:filter=lanczos"))
 
+    def test_a_combine_whose_verdict_is_lost_is_refused_for_good(self):
+        import companion, routes, types
+        p = types.SimpleNamespace(**dict(vars(self.p), combine=True))
+        with mock.patch.object(companion, "confirmed_verdict", return_value=None), \
+             mock.patch.object(routes, "item_route", return_value=routes.UNKNOWN):
+            route, spec, why = stages.native_route(p)
+        self.assertIsNone(spec)
+        self.assertTrue(why.startswith("permanent: combine verdict lost"), why)
 
 class _FakeSpec:
     total = 1000
@@ -3748,11 +2379,9 @@ class NativeRenderStage(_DvRenderItem):
 
 
 class NativeRenderMessages(_DvRenderItem):
-    """The skip messages name who makes the item's DV: byte-identical while every route is on
-    Resolve; the native render when the item's route is set 'native' and the stage can make it."""
+    """The skip messages name who makes the item's DV: the native render."""
 
-    YT = "YouTube → Resolve scales it (SuperScale for 1080p) — skipping Topaz (scene plan cached)"
-    FAST = "4K SDR (av1) @ ~20 Mbps — no upscale, Resolve adds HDR + DV"
+    FAST = "4K SDR (av1) @ ~20 Mbps — no upscale, HDR + DV added"
 
     def _topaz(self, plan_topaz, native=None):
         import plan
@@ -3764,26 +2393,19 @@ class NativeRenderMessages(_DvRenderItem):
         with contextlib_exit(cms):
             return stages._topaz(self.p, None)
 
-    def test_the_default_texts_are_unchanged_and_nothing_is_asked(self):
-        import routes
-        with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")):
-            self.assertEqual(self._topaz("upscale"), (True, self.YT))
-            self.assertEqual(self._topaz("resolve-only"),
-                             (True, self.FAST + " — skipping upscale (scene plan cached)"))
-
-    def test_a_native_route_names_the_native_render(self):
+    def test_a_route_names_the_native_render(self):
         self.assertEqual(self._topaz("upscale", ("yt_native4k", _FakeSpec(), "")),
                          (True, "YouTube → the native DV render (yt_native4k) — skipping Topaz"
                                 " (scene plan cached)"))
-        self.assertEqual(self._topaz("resolve-only", ("yt_native4k", _FakeSpec(), "")),
-                         (True, "4K SDR (av1) @ ~20 Mbps — no upscale, the native DV render adds "
-                                "HDR + DV — skipping upscale (scene plan cached)"))
+        self.assertEqual(self._topaz("dv-only", ("yt_native4k", _FakeSpec(), "")),
+                         (True, self.FAST + " — skipping upscale (scene plan cached)"))
 
-    def test_a_refused_or_broken_decision_keeps_the_resolve_text(self):
+    def test_a_refused_or_broken_decision_never_costs_the_stage(self):
         self.assertEqual(self._topaz("upscale", ("yt_plain", None, "no native render yet")),
-                         (True, self.YT))
+                         (True, "YouTube → the native DV render (its route) — skipping Topaz"
+                                " (scene plan cached)"))
         with mock.patch.object(stages, "native_route", side_effect=RuntimeError("boom")):
-            self.assertEqual(self._topaz("upscale"), (True, self.YT))
+            self.assertEqual(self._topaz("upscale")[0], True)
 
 
 def contextlib_exit(cms):
@@ -3991,33 +2613,6 @@ class NativeRenderHdrSpec(_DvRenderItem):
         with mock.patch.object(nativelane, "chunks", side_effect=ValueError("chunk 1 (c1.mov) is missing")):
             self.assertEqual(self.refused("hdr_topaz"), "the Topaz chunks: chunk 1 (c1.mov) is missing")
 
-    def test_the_bitrate_is_what_resolve_would_export_at(self):
-        import plan, preflight, settings
-        cases = (("rpu_only", self.movie, {"topaz": "rpu-only", "resolve": "add_dv", "is_hdr": True}, {}),
-                 ("rpu_only", self.p, {"topaz": "rpu-only", "resolve": "add_dv", "is_hdr": True}, {}),
-                 ("hdr_reencode", self.movie, {"topaz": "resolve-only", "resolve": "add_dv", "is_hdr": True},
-                  {"codec_name": "av1"}),
-                 ("hlg", self.movie, {"topaz": "resolve-only", "resolve": "add_dv", "is_hdr": True},
-                  {"color_transfer": "arib-std-b67"}),
-                 ("hdr_reencode", self.p, {"topaz": "upscale", "resolve": "add_dv", "is_hdr": True},
-                  {"codec_name": "vp9"}))
-        for route, p, pl, info in cases:
-            seen = {}
-
-            def boom(cmd, **kw):
-                seen["cmd"] = cmd
-                raise RuntimeError("stop here")
-            with self.subTest(route=route, youtube=p.youtube), \
-                 mock.patch.object(plan, "plan_for", return_value=dict(pl, input={"width": 3840, "height": 2160})), \
-                 mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
-                 mock.patch.object(settings, "get_settings", return_value=dict(settings.DEFAULT_SETTINGS)), \
-                 mock.patch.object(stages, "_quit_resolve"), \
-                 mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
-                stages.run_stage("resolve", p)
-                spec = self.spec(route, p=p, **info)
-                self.assertEqual(str(spec.kbps), seen["cmd"][6])          # the export bitrate
-                if not spec.keep_video:                                   # (a kept stream has no gate)
-                    self.assertEqual(str(spec.cap_mbps or "-"), seen["cmd"][10])
 
     def test_it_probes_and_writes_nothing(self):
         before = sorted(os.listdir(self.d))
@@ -4025,13 +2620,8 @@ class NativeRenderHdrSpec(_DvRenderItem):
             self.spec(route)
         self.assertEqual(sorted(os.listdir(self.d)), before)
 
-    def test_a_route_set_native_gets_its_hdr_spec_and_nothing_is_asked_while_none_is(self):
-        import routes, settings
-        settings.set_settings({"dv_routes": {}})
-        with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")):
-            self.assertEqual(stages.native_route(self.movie), (None, None, ""))
-        self.assertEqual((self.probes, self.hdr10_asked), ([], []))
-        settings.set_settings({"dv_routes": {"rpu_only": "native"}})
+    def test_the_route_gets_its_hdr_spec(self):
+        import routes
         with mock.patch.object(routes, "item_route", return_value="rpu_only"):
             route, spec, why = stages.native_route(self.movie)
         self.assertEqual((route, why, spec.keep_video), ("rpu_only", "", True))
@@ -4136,15 +2726,15 @@ class NativeRenderSdrChunkSpec(_DvRenderItem):
         dvn = stages_dvnative()
         self.assertEqual(spec.pre_vf, dvn.colour_vf("170m", "170m") + "," + dvn.fit_pad_vf(2880, 2160, "1:1"))
         os.makedirs(nativelane.native_dir(self.ep), exist_ok=True)
-        with open(nativelane.fallback_path(self.ep), "w") as fh:
-            fh.write("{}")
-        spec, why = stages.dvrender_spec(self.ep, "sd_sdr_topaz")
-        self.assertIsNone(spec)
-        self.assertIn("fell back", why)
-        os.remove(nativelane.fallback_path(self.ep))
         with open(nativelane.marker_path(self.ep), "w") as fh:
             fh.write("{}")
-        self.assertIn("claimed", stages.dvrender_spec(self.ep, "sd_sdr_topaz")[1])
+        for route in ("sd_sdr_topaz", "tv_sdr_topaz", "tv_disk_fallback"):     # the lane claimed it
+            self.assertIn("claimed", stages.dvrender_spec(self.ep, route)[1], route)
+        with open(nativelane.fallback_path(self.ep), "w") as fh:
+            fh.write("{}")
+        spec, why = stages.dvrender_spec(self.ep, "sd_sdr_topaz")     # ...and fell back: the render's
+        self.assertEqual(why, "")
+        self.assertIsNotNone(spec)
 
     def test_refusals_say_why(self):
         import nativelane
@@ -4166,13 +2756,8 @@ class NativeRenderSdrChunkSpec(_DvRenderItem):
         self.toolchain = (False, "dovi_tool is 2.2.0")
         self.assertIn("toolchain is not ready", refused())
 
-    def test_nothing_is_probed_while_its_route_is_resolve(self):
-        import routes, settings
-        settings.set_settings({"dv_routes": {}})
-        with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")):
-            self.assertEqual(stages.native_route(self.movie), (None, None, ""))
-        self.assertEqual(self.asked, [])
-        settings.set_settings({"dv_routes": {"movie_sdr_topaz": "native"}})
+    def test_the_route_gets_its_chunk_spec(self):
+        import routes
         with mock.patch.object(routes, "item_route", return_value="movie_sdr_topaz"):
             route, spec, why = stages.native_route(self.movie)
         self.assertEqual((route, why), ("movie_sdr_topaz", ""))

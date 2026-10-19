@@ -2,7 +2,7 @@
     "date": "Sat Jun 13 12:00:00 2026 GMT-0600",
     "editable": true,
     "enabled": true,
-    "name": "1080p to 4K HDR XQ - DIGITAL (Resolve DoVi)",
+    "name": "1080p to 4K HDR XQ - FILM (DoVi)",
     "outputSettings": {
         "active": true,
         "appendModelNameForIS": false,
@@ -21,22 +21,22 @@
         "startFrameNumber": 0,
         "videoBitrate": 40
     },
-    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K HDR XQ - DIGITAL (Resolve DoVi).json",
+    "path": "/Applications/Topaz Video AI.app/Contents/Resources/presets/1080p to 4K HDR XQ - FILM (DoVi).json",
     "saveOutputSettings": true,
     "settings": {
         "enhance": {
             "active": true,
             "addNoise": 0,
             "auto": 2,
-            "compress": 20,
+            "compress": 18,
             "deblur": 0,
-            "dehalo": 10,
+            "dehalo": 8,
             "denoise": 0,
-            "detail": 8,
+            "detail": 4,
             "fieldOrder": 0,
             "focusFixLevel": "Off",
             "model": "prob-4",
-            "recoverOriginalDetailValue": 20,
+            "recoverOriginalDetailValue": 30,
             "sharpen": 0,
             "videoType": 1,
             "isSecondEnhancement": false

@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-time: create a STABLE self-signed code-signing identity in the login keychain.
-# build.sh signs the app with this so macOS ties Screen Recording + Accessibility to a
+# build.sh signs the app with this so macOS ties the app's permission grants to a
 # fixed certificate (not the binary hash) — grants then survive every rebuild. After
 # running this once and re-granting the app once, you never have to re-grant again.
 set -e

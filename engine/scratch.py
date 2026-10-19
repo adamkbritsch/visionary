@@ -117,9 +117,9 @@ def default_scratch() -> str:
 
     UNDER TESTS this is a temp dir, never the real one. A unit test that reads the
     developer's actual scratch passes or fails by what happens to be on disk that day —
-    which is not a test. This bit three times in one session: _drain_backlog() counts
-    segdirs there, so ResolveGate and the disk-gate tests silently started asserting
-    against a live 3-item stall buffer. Same reasoning as logbook's test redirect."""
+    which is not a test. This bit three times in one session: a gate that counted segdirs
+    there made the disk-gate tests silently assert against a live 3-item buffer. Same
+    reasoning as logbook's test redirect."""
     base = _TEST_SCRATCH or INTERNAL_SCRATCH
     os.makedirs(base, exist_ok=True)
     return base

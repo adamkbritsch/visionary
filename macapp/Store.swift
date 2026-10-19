@@ -16,10 +16,6 @@ final class AppStore: ObservableObject {
     @Published var ytConnected = false
     @Published var ytConfigured = false                        // Google OAuth client present in config?
     @Published var selftest: SelftestDTO?
-    // UI: the Resolve preview blown up to the full window width (click to toggle). Lives
-    // here, not in view @State — the card and the RootView overlay both need it, and the
-    // pipeline card is re-initialised on every 1.5 s poll.
-    @Published var resolvePreviewExpanded = false
 
     // In-flight ADD state, hoisted OUT of the mode views: the tab views are recreated on
     // every mode switch, so view-local @State silently dropped a pending add (preset
@@ -71,7 +67,7 @@ final class AppStore: ObservableObject {
             var tick = 0
             while self.polling {
                 await self.refresh()
-                if tick % 8 == 0 { await self.runSelftest() }   // re-check grants ~every 12 s, not just at launch
+                if tick % 8 == 0 { await self.runSelftest() }   // re-check the version gate ~every 12 s, not just at launch
                 tick += 1
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
@@ -120,48 +116,6 @@ final class AppStore: ObservableObject {
         else { return t }
         return "\(t) (\(source[r]))"
     }
-    // --- WHICH SCREEN RESOLVE RUNS ON -------------------------------------------------
-    // Deliberately NOT part of /api/state: that polls every 1.5 s and re-enumerating
-    // displays at that rate is pointless. Fetched when Settings opens, and when macOS says
-    // the display arrangement changed.
-    @Published var displays: DisplaysDTO?
-    @Published var smokeRunning: String? = nil     // key currently being template-tested
-
-    func fetchDisplays() async {
-        if let d: DisplaysDTO = await get("/api/displays") { self.displays = d }
-    }
-    func setDisplayPinning(_ on: Bool) async {
-        await post("/api/displays", ["resolve_host_pinning": on]); await fetchDisplays()
-    }
-    func setDisplayPriority(_ keys: [String]) async {
-        await post("/api/displays", ["priority": keys]); await fetchDisplays()
-    }
-    func setTakeoverWarning(_ on: Bool) async {
-        await post("/api/displays", ["warn_takeover": on]); await fetchDisplays()
-    }
-    /// Score every template against one screen and remember the result. A display cannot
-    /// host Resolve until this passes — driving a screen nobody is watching turns a bad
-    /// template match from a loud failure into silent wrong clicks.
-    func runDisplaySmoke(_ key: String) async {
-        smokeRunning = key
-        await post("/api/display-smoke", ["display": key])
-        smokeRunning = nil
-        await fetchDisplays()
-    }
-
-    /// About to take the screen and mouse — roughly ten seconds of real setup work still to
-    /// run. Deliberately not a countdown: see ProgressDTO.takeover_soon.
-    var takeoverSoon: Bool { state?.orchestrator?.progress?.takeover_soon == true }
-    /// True only while the pipeline is ACTUALLY moving the pointer — within
-    /// MOUSE_IN_USE_SECONDS of the last click. Self-expiring: recomputed against `now` on
-    /// every poll, so nothing is left on screen if a stage dies mid-way, and the hour of
-    /// screenshot-only analysis after the clicks does not keep it up.
-    static let mouseInUseWindow: TimeInterval = 10
-    var takeoverActive: Bool {
-        guard let at = state?.orchestrator?.progress?.mouse_at, at > 0 else { return false }
-        return Date().timeIntervalSince1970 - TimeInterval(at) < AppStore.mouseInUseWindow
-    }
-
     func runSelftest() async {
         if let t: SelftestDTO = await get("/api/selftest") { self.selftest = t }
     }
@@ -185,25 +139,6 @@ final class AppStore: ObservableObject {
         } else if ok {
             lastError = nil
         }
-        await refresh()
-    }
-    // SCREEN CONTROL. quietMode == true means the pipeline is NOT using the screen.
-    // Turning it off is always a TIMED pause — the engine restores it at `quietUntil`
-    // even if the app never reopens, so it can't be left off until the disk fills.
-    var quietMode: Bool { state?.settings?.quiet_mode ?? false }
-    /// When the pause self-cancels, or nil when screen control is on.
-    var quietUntil: Date? {
-        guard quietMode, let t = state?.settings?.quiet_until, t > 0 else { return nil }
-        return Date(timeIntervalSince1970: TimeInterval(t))
-    }
-    /// Stop the pipeline using the screen for `seconds` (engine clamps to 4 h).
-    func pauseScreenControl(seconds: Int) async {
-        await post("/api/quiet-mode", ["enabled": true, "seconds": seconds])
-        await refresh()
-    }
-    /// Hand the screen back to the pipeline now, cancelling any pause.
-    func resumeScreenControl() async {
-        await post("/api/quiet-mode", ["enabled": false])
         await refresh()
     }
     func saveSettings(_ body: [String: Any]) async {
@@ -409,7 +344,7 @@ final class AppStore: ObservableObject {
     // Skip/delete ONE video: aborts it if currently processing, deletes its download from
     // staging, and tells youtarr to forget + never re-download it.
     /// "Run this video now": jumps it ahead of everything and asks the in-flight item to
-    /// yield at its next SAFE boundary (a Topaz segment boundary — Resolve is never cut off).
+    /// yield at its next SAFE boundary (a Topaz segment boundary — a running Dolby Vision render is never cut off).
     func runYoutubeNow(name: String) async {
         guard !name.isEmpty else { return }
         let (_, data) = await postResult("/api/youtube-queue",
@@ -499,12 +434,6 @@ final class AppStore: ObservableObject {
     func profileFor(_ show: String) async -> ShowProfileDTO? {
         let enc = show.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? show
         return await get("/api/show-profile?show=\(enc)")
-    }
-    func requestAccessibility() async {
-        await post("/api/request-accessibility", [:]); await runSelftest()
-    }
-    func requestScreenRecording() async {
-        await post("/api/request-screen-recording", [:]); await runSelftest()
     }
 
     // ---- in-app Setup (onboarding) ----------------------------------------------
@@ -598,14 +527,6 @@ final class AppStore: ObservableObject {
             lastError = err == "homebrew-missing"
                 ? "Homebrew isn't installed — run its installer in Terminal first (command in the row)."
                 : err == "busy" ? "Another install is still running." : err
-            return
-        }
-        await followInstalls()
-    }
-    func importResolve() async {
-        let (ok, data) = await postResult("/api/setup/import-resolve", [:])
-        if !ok, let data, let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data) {
-            lastError = e.detail ?? e.error
             return
         }
         await followInstalls()

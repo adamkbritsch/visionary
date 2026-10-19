@@ -1,12 +1,12 @@
 """User-adjustable settings + per-show Topaz preset selection.
 
 Two JSON files under ~/.topaz-pipeline/ (atomic writes):
-  settings.json       — global knobs (power policy, disk floor, quiet mode, …)
+  settings.json       — global knobs (power policy, disk floor, …)
   show_profiles.json  — { "<show name>": "<preset key>" }
 
 Topaz presets are a FIXED CATALOG — all SDR ProRes 4444 XQ. They differ ONLY by
 what the footage needs (the camera / the kind of content), NOT by output format:
-DaVinci Resolve adds HDR + Dolby Vision afterward in every scenario. A show is
+HDR + Dolby Vision are added afterward in every scenario (nativerender / dvnative). A show is
 assigned ONE preset (you only CHOOSE, never hand-tune params in the app); the
 Topaz stage looks it up by series name. `scale` is NOT part of a preset — it's
 decided by the input plan (2× for 1080p, 1× for already-4K). See plan.py.
@@ -31,26 +31,6 @@ PROFILES_FILE = os.path.join(CONFIG_DIR, "show_profiles.json")
 # already running must not silently drop one (see series.max_active / get_active_series).
 MAX_ACTIVE_CEILING = 4
 
-# Longest Screen Control may be switched off for. It is a TIMED pause, never a latch:
-# while it is off, items hold before Resolve and their ~190 GiB Topaz intermediates pile up
-# against the min_free_gb floor, so a forgotten "off" stalls the run on low disk instead of
-# doing anything useful. Four hours is about where the buffer runs out (2-3 items at
-# 1-2 h of Topaz each), so that is the ceiling — and every pause self-cancels.
-MAX_QUIET_SECONDS = 4 * 3600
-MIN_QUIET_SECONDS = 60
-
-
-def clamp_quiet_seconds(v) -> int:
-    """Seconds a Screen Control pause may last: 0 (turn it straight back on) or a value
-    inside [MIN_QUIET_SECONDS, MAX_QUIET_SECONDS]. Junk becomes the 1 h default."""
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return 3600
-    if n <= 0:
-        return 0
-    return max(MIN_QUIET_SECONDS, min(MAX_QUIET_SECONDS, n))
-
 # Global, user-adjustable — everything here is UNIVERSAL (per-show options live in
 # show_profiles.json). The block after `youtube_every_tv_episodes` are SCHEDULING/CAPACITY
 # knobs that used to be hardcoded constants in orchestrator.py / series.py; each defaults to
@@ -60,15 +40,6 @@ DEFAULT_SETTINGS = {
     "activated": False,         # APPLIANCE mode: persisted arm state. While True the app runs
                                 # whenever it can — the server re-enables the orchestrator on
                                 # launch (see server._rearm_loop). A run ends only on a manual stop.
-    "quiet_until": 0,           # SCREEN CONTROL is only ever turned off TEMPORARILY: this is the epoch
-                                # second it comes back on by itself (0 = not currently timed). Holding
-                                # items before Resolve piles up ~190 GiB ProRes intermediates against the
-                                # min_free_gb floor, so an indefinite "off" would quietly stall the run
-                                # on low disk — hence MAX_QUIET_SECONDS. The expiry is enforced in the
-                                # ENGINE (orchestrator._quiet_mode), so it survives an app relaunch.
-    "quiet_mode": False,        # QUIET MODE: keep download+topaz running but DEFER each item before the
-                                # screen-invasive Resolve stage, so the laptop stays usable. Items pile up
-                                # (no drain to remux/upload/cleanup) → the run pauses on low disk until off.
     "plex_throttle": True,      # PLEX THROTTLE (user-dictated toggle 2026-09-30): while anyone has Plex
                                 # open, ease off the NAS — the DV 7 -> 8.1 lane's transfers drop to
                                 # 25 MB/s and the pipeline's download-ahead pauses. Off = full speed
@@ -89,25 +60,13 @@ DEFAULT_SETTINGS = {
                                 # integrated LUFS and boosts (never attenuates) to this, limiter at
                                 # -2 dB. MP4/AAC path only (MKV = lossless audio, never transcoded).
                                 # 0 = off. Derived from the Office pilot (-23 LUFS measured).
-    "youtube_cleanup_grade": True,  # Apply the saved cleanup grade to YouTube videos. YouTube is
-                                # the one path with nothing between the source and the deliverable
-                                # (it skips Topaz on purpose), so its VP9/AV1 banding and block noise
-                                # scale up and freeze into the master. Deband + a small spatial NR
-                                # costs a fraction of an upscale. INERT until the grade exists at
-                                # resolve_pipeline.CLEANUP_DRX — made once by hand in Resolve, like
-                                # the DV render preset; on its own this setting changes nothing.
     "max_peak_mbps": 50,        # PEAK BITRATE CAP for every shipped master: the remux stage re-encodes
-                                # the Resolve DV render through x265 with a hard VBV ceiling at this
-                                # rate (dvcap.py). Resolve's VideoToolbox export spikes to ~139 Mbps on
-                                # a ~27 Mbps average, which glitches players; ~2x the average only clips
-                                # the pathological seconds. NO uncapped fallback — cap fails => stage fails.
+                                # the DV render through x265 with a hard VBV ceiling at this rate
+                                # (dvcap.py). A VideoToolbox export spikes to ~139 Mbps on a ~27 Mbps
+                                # average, which glitches players; ~2x the average only clips the
+                                # pathological seconds. NO uncapped fallback — cap fails => stage fails.
                                 # LIMIT capped at 62 so cap + gate tolerance + TrueHD headroom stays
                                 # under the SHIELD's ~80 Mbps whole-stream DV ceiling (dvcap constants).
-    "resolve_share_remuxes": 0, # When Resolve runs it is the ONLY thing running (user-dictated
-                                # 2026-08-06, reversing the same-day sharing experiment): 0 = never
-                                # share, every Resolve takes the whole machine (SIGSTOP). Raising it
-                                # opts back in: up to this many remux lanes keep encoding beside a
-                                # FAST-PATH (rpu-only/resolve-only) item's Resolve pass only.
     "max_youtube_minutes": 20,  # YouTube: the per-channel length-cap threshold (applied only to channels
                                 # whose 'capped' toggle is on).
     "youtube_fetch_ahead": 12,  # FETCH-AHEAD: keep at least this many not-yet-upscaled videos
@@ -135,7 +94,7 @@ DEFAULT_SETTINGS = {
                                 # starting the next. Governs only ADDING a show — see series.max_active().
     "finisher_lanes": 2,        # PARALLEL REMUXES (was orchestrator.FINISHER_LANES): how many topaz-done
                                 # items may remux at once. 1 = a quieter machine and the whole GPU for
-                                # Topaz; 2 = the current throughput (Resolve gets 2 items ahead).
+                                # Topaz; 2 = the current throughput.
     "min_free_gb": 400,         # DISK FLOOR (was orchestrator.MIN_FREE_GB): free space that must remain
                                 # before an item may START, and the base of the prefetch gate. A Topaz
                                 # ProRes working set is ~190 GiB per episode (re-measured 2026-08-05), ~245 GB for a feature.
@@ -155,56 +114,6 @@ DEFAULT_SETTINGS = {
                                 # mid-stage, wait this long for the power to come back before abandoning
                                 # the stage. 0 = abandon immediately.
 
-    # --- WHICH SCREEN RESOLVE RUNS ON (all default to today's behaviour) -------------
-    "resolve_host_pinning": False,   # MASTER SWITCH. Off = Resolve runs wherever it opens (the
-                                # main display), exactly as it always has. On = it is moved to the
-                                # highest-priority attached display that is eligible AND has a
-                                # recorded template-smoke pass.
-    "resolve_host_displays": [],  # ordered display keys, highest priority first. The ONLY
-                                # non-scalar setting — see VALIDATORS.
-    "resolve_host_fallback_main": False,  # host unavailable -> fall back to the main display?
-                                # Off (default) is the FAIL-SAFE: the item defers instead, so a
-                                # yanked cable stalls the run rather than seizing the screen the
-                                # user was told would be left alone.
-    "resolve_takeover_warn": True,   # show a notice on the main display just before the pipeline
-                                # takes the screen and mouse. NOT a countdown and NOT a delay: it
-                                # fires from run_dv_ui, where ~10 s of real setup work (Color page,
-                                # activate, placement, full screen, screenshot) still has to run
-                                # before the first click. A timer was tried and removed — it had to
-                                # start at the top of the stage, but the takeover lands whenever
-                                # setup() finishes, so it hit zero and sat at "now..." for minutes.
-
-    # --- WHO MAKES A TV EPISODE'S DOLBY VISION (defaults to today's behaviour) ---------
-    "dv_engine": "resolve",     # 'resolve' | 'native'. 'resolve' = Resolve's DV pass for every item,
-                                # exactly as it always was. 'native' = an ELIGIBLE TV episode (Topaz
-                                # path, SDR intake, dv1000 output; never a movie, YouTube, fast path
-                                # or combine) is analysed by hdr_analyzer_mvp + the pinned LUT
-                                # instead (dvnative.py), with no screen takeover. This IS how a file
-                                # is encoded, hence no app control (POST /api/settings only, which
-                                # refuses 'native' with a 409 while preflight.check_native_dv fails).
-                                # Read at USE time via dv_engine(); an item that has started native
-                                # stays native whatever this says later (its segdir marker decides).
-    "dv_routes": {},            # {route id: 'resolve' | 'native'} (routes.py ids). A route set 'native'
-                                # has its render — p.dv_render, the very file Resolve writes — made by
-                                # the 'dvrender' stage instead (nativerender.py: analysis + VideoToolbox,
-                                # no screen), whenever that stage can make the item (stages.native_route;
-                                # one 3840x2160 BT.709 SDR file straight through the pinned LUT:
-                                # yt_native4k, sdr4k; or any SDR YouTube file through the fit front end
-                                # — BT.601 / full range to BT.709, a Lanczos fit and pad into 3840x2160:
-                                # yt_plain, yt_1080; or an HDR source with no LUT, keeping its own
-                                # mastering: rpu_only — its own stream with the RPU injected, no
-                                # encode — hdr_reencode, and hlg through BT.2100 HLG -> PQ at 1000
-                                # nits; or Topaz's chunks through the chunk front end and the LUT:
-                                # movie_sdr_topaz, and sd_sdr_topaz when the chunk lane declines it;
-                                # or a combine's PQ winner as rpu_only measures a source:
-                                # combine_nodv; or, for an item pinned to SDR, the SDR render the
-                                # true SDR master is made from: sdr_out). Anything it cannot make
-                                # still goes to Resolve. 2026-10-18: sd_sdr_topaz 'native' ALSO opens
-                                # the chunk lane (nativelane) to 480p/576p episodes, with the BT.601
-                                # chunk front end — its own switch, never dv_engine's.
-                                # {} = EVERY route 'resolve', exactly as before. tv_sdr_topaz is not set
-                                # here (the key is dropped): it keeps following dv_engine, the chunk
-                                # lane. POST /api/settings only; read at USE time via dv_routes().
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -219,7 +128,6 @@ LIMITS = {
                                 # EVERY output is budgeted as if it carries TrueHD (user-dictated)
     "audio_target_lufs": (-24, -10),
     "min_adapter_watts": (1, 500),
-    "resolve_share_remuxes": (0, 2),
     "max_youtube_minutes": (1, 600),
     "youtube_every_tv_episodes": (1, 50),
     "youtube_videos_per_burst": (0, 10),   # 0 IS a setting: the cadence serves no videos at all
@@ -355,34 +263,9 @@ def tunable(key: str) -> int:
     return clamp_setting(key, get_settings().get(key, DEFAULT_SETTINGS[key]))
 
 
-def _valid_display_list(v):
-    """A hand-edited settings.json must not be able to feed the engine garbage. LIMITS
-    covers numbers; this covers the one list-valued setting."""
-    if not isinstance(v, list):
-        return []
-    out = []
-    for item in v:
-        if isinstance(item, str) and 0 < len(item) <= 128 and item not in out:
-            out.append(item)
-    return out[:8]
-
 
 # Non-numeric settings need their own validation — LIMITS is a numeric clamp table and
 # silently passes anything it has no entry for.
-def _valid_quiet_until(v):
-    """The 4-hour Screen Control cap, enforced at the PERSISTENCE layer. The app's own
-    path (/api/quiet-mode) already clamps via clamp_quiet_seconds, but a raw client
-    writing quiet_until through /api/settings — or a hand-edited settings.json — could
-    park the pipeline for days, which is exactly the stall MAX_QUIET_SECONDS exists to
-    prevent. 0/junk = not paused; a future epoch is capped at now + MAX_QUIET_SECONDS."""
-    import time as _t
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return 0
-    return 0 if n <= 0 else min(n, int(_t.time()) + MAX_QUIET_SECONDS)
-
-
 def _valid_plex_throttle(v):
     """A hand-edited "false"/0 turns it off; anything unreadable leaves the protection ON."""
     if isinstance(v, bool):
@@ -401,58 +284,8 @@ def _valid_nas_network(v):
     return v if v in ("ethernet", "wifi", "ethernet_only") else "ethernet"
 
 
-DV_ENGINES = ("resolve", "native")
-
-
-def _valid_dv_engine(v):
-    """Only the exact two values survive; anything else is 'resolve', the old safe path."""
-    return v if isinstance(v, str) and v in DV_ENGINES else "resolve"
-
-
-def dv_engine() -> str:
-    """The live DV-engine choice, validated on READ: get_settings() merges the file over the
-    defaults without checking it, so a hand-edited "Native" or "x" must not reach the engine
-    as-is. Engine code calls this at USE time (like tunable()), never at import."""
-    return _valid_dv_engine(get_settings().get("dv_engine", "resolve"))
-
-
-_ROUTE_ID = re.compile(r"[a-z][a-z0-9_]{0,39}")   # a routes.py id's shape (settings cannot import
-                                                   # the table; a name no route produces never matches)
-TV_LANE_ROUTE = "tv_sdr_topaz"    # the route dv_engine owns (the chunk lane): never a dv_routes key
-
-
-def _valid_dv_routes(v):
-    """{route id: 'resolve' | 'native'}, and nothing else. A key need only be route-id SHAPED
-    (routes.py owns the table; a name no route produces never matches), an engine must be one of
-    the exact DV_ENGINES, and TV_LANE_ROUTE is dropped — dv_engine decides that route. Anything
-    that is not a dict is {}: every route on Resolve, the old behaviour."""
-    if not isinstance(v, dict):
-        return {}
-    return {k: e for k, e in v.items()
-            if isinstance(k, str) and _ROUTE_ID.fullmatch(k) and k != TV_LANE_ROUTE
-            and isinstance(e, str) and e in DV_ENGINES}
-
-
-def dv_routes() -> dict:
-    """The live per-route engine choice, validated on READ (like dv_engine()). A route that is
-    absent is 'resolve'; {} — the default — sends every item through Resolve as it always has."""
-    return _valid_dv_routes(get_settings().get("dv_routes", {}))
-
-
-def dv_route(route) -> str:
-    """'native' | 'resolve' for one route id: its dv_routes entry, 'resolve' when it has none.
-    TV_LANE_ROUTE answers dv_engine() — that setting, not this table, picks the chunk lane."""
-    if route == TV_LANE_ROUTE:
-        return dv_engine()
-    return dv_routes().get(route, "resolve")
-
-
-VALIDATORS = {"resolve_host_displays": _valid_display_list,
-              "quiet_until": _valid_quiet_until,
-              "nas_network": _valid_nas_network,
-              "plex_throttle": _valid_plex_throttle,
-              "dv_engine": _valid_dv_engine,
-              "dv_routes": _valid_dv_routes}
+VALIDATORS = {"nas_network": _valid_nas_network,
+              "plex_throttle": _valid_plex_throttle}
 
 
 def set_settings(updates: dict) -> dict:
@@ -467,10 +300,6 @@ def set_settings(updates: dict) -> dict:
             s[k] = fn(s.get(k, DEFAULT_SETTINGS[k]))
         _save(SETTINGS_FILE, s)
         return s
-
-
-def get_display_priority() -> list:
-    return _valid_display_list(get_settings().get("resolve_host_displays", []))
 
 
 # ---- Topaz preset catalog -------------------------------------------------
@@ -602,14 +431,13 @@ def set_show_do_featurettes(key: str, value) -> bool:
     return bool(value)
 
 
-# What the Resolve stage should OUTPUT for an item. "auto" is the default and ALWAYS
-# resolves to 1000-nit Dolby Vision, whatever the intake range (user-dictated 2026-08-09).
-# The other two pin it regardless of the source. "sdr" is the only one that produces a non-DV
-# master, and the only one whose Resolve stage needs no screen automation at all (no DV analyze).
+# What an item should OUTPUT. "auto" is the default and ALWAYS resolves to 1000-nit Dolby
+# Vision, whatever the intake range (user-dictated 2026-08-09). The other two pin it regardless
+# of the source. "sdr" is the only one that produces a non-DV master.
 # THE 2000-NIT MODE IS RETIRED (user decision 2026-10-15, built 2026-10-18): "dv2000" is no longer
 # offered or stored. A profile that still holds it (written before) READS as "dv1000" — the
-# 1000-nit master it now gets everywhere (Resolve stage, native lane, route classifier, the app's
-# rows) — and a "dv2000" still sent by an older client is stored as "dv1000".
+# 1000-nit master it now gets everywhere (route classifier, the app's rows) — and a "dv2000"
+# still sent by an older client is stored as "dv1000".
 OUTPUT_MODES = ("auto", "sdr", "dv1000")
 RETIRED_OUTPUT_MODES = {"dv2000": "dv1000"}
 

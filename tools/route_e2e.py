@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end check of the native render ('dvrender') for ONE route, on a REAL source
-(Resolve-free plan, P3).
+(the native-routes plan, P3).
 
 Builds p.dv_render for a route through the production stage functions — the download stage's
 CFR step (stages._ensure_cfr), the scene plan (stages._plan_fast_path_bounds), the route and its
@@ -19,7 +19,7 @@ never see it), at nice 15 (the stage's own children add their nice 10 on top).
      with the fit front end: printed, with the geometry it fits the picture to)
   2. --resume-check: a child process is SIGKILLed once the first analysis range is published;
      the in-process run must resume without measuring that range again
-  3. the render: stages._dvrender ok; the orchestrator's own gate, stage_done("resolve"), accepts
+  3. the render: stages._dvrender ok; the orchestrator's own gate, stage_done("dv"), accepts
      p.dv_render (DV 8.1, the whole source, its frame rate); the frame count is the spec's; it is
      3840x2160 with square pixels, and for a fit route its pad (if any) is exactly black (luma
      64, chroma 512) where fit_geometry put it, but for the encoder's band beside the picture's
@@ -345,8 +345,8 @@ def run(a, work: str, source: str) -> int:
                              os.path.exists(first) and os.path.getmtime(first) == m0))
     if not ok:
         return summary(results, t0, work, a.keep)
-    results.append(check('the orchestrator\'s gate: stage_done("resolve")',
-                         orchestrator.stage_done("resolve", p)))
+    results.append(check('the orchestrator\'s gate: stage_done("dv")',
+                         orchestrator.stage_done("dv", p)))
     frames = dvcap.count_hevc_frames(p.dv_render)
     results.append(check("render frames == the spec's", frames == spec.total,
                          f"{frames} vs {spec.total}"))

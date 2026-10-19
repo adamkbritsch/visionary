@@ -4,7 +4,7 @@ A DV profile 7 movie has already proven it can carry a Dolby Vision layer — it
 HDR10 base layer is copied bit for bit and only the Dolby Vision metadata is rewritten: dovi_tool
 mode 2 turns each RPU into profile 8.1 and discards the enhancement layer (dropping a full
 enhancement layer is user-approved), and mkvmerge puts the new video back beside every other track
-of the original. No Topaz, no Resolve, no x265, and no peak cap: nothing about the picture changes,
+of the original. No Topaz, no DV render, no x265, and no peak cap: nothing about the picture changes,
 so there is nothing for a cap to protect (user-dictated 2026-09-27/29).
 
 The recipe and every verification are ported one for one from the user's reference driver

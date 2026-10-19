@@ -166,12 +166,13 @@ class Regimes(unittest.TestCase):
     def test_the_resolve_gate_parking_the_run_thread_is_solo(self):
         self.assertEqual(eta.regime_of(run_stage=None, run_active=False), eta.SOLO)
 
-    def test_no_speedup_is_predicted_while_resolve_has_the_machine(self):
-        # Resolve PREEMPTS the lane, so its next regime is rate ZERO, not a speed-up. Predicting
-        # one would be wrong in the dangerous direction.
-        self.assertFalse(eta.correction_applies(run_stage="resolve", run_active=True))
+    def test_no_speedup_is_predicted_while_outpainting_has_the_machine(self):
+        # AI outpainting PREEMPTS the lane (SIGSTOP), so its next regime is rate ZERO, not a
+        # speed-up. Predicting one would be wrong in the dangerous direction.
+        self.assertFalse(eta.correction_applies(run_stage="extend", run_active=True))
         self.assertTrue(eta.correction_applies(run_stage="topaz", run_active=True))
-        self.assertTrue(eta.correction_applies(run_stage="resolve", run_active=False))
+        self.assertTrue(eta.correction_applies(run_stage="dvrender", run_active=True))
+        self.assertTrue(eta.correction_applies(run_stage="extend", run_active=False))
 
 
 if __name__ == "__main__":
@@ -237,15 +238,15 @@ class NativeAnalysisRegime(unittest.TestCase):
         self.assertTrue(eta.correction_applies(run_stage="dvnative", run_active=True))
 
     def test_every_existing_stage_keeps_its_regime(self):
-        # dv_engine = 'resolve' must be byte-identical: the stage list as it was before the
-        # native lane, run against the live function for every input it can see.
+        # the stage list as it was before the native lane, run against the live function for
+        # every input it can see.
         def before(run_stage, run_active, other_lane_live):
             if other_lane_live:
                 return eta.CONTENDED
             if run_active and run_stage in ("download", "extend", "topaz"):
                 return eta.CONTENDED
             return eta.SOLO
-        for st in (None, "", "download", "extend", "topaz", "resolve", "remux", "upload",
+        for st in (None, "", "download", "extend", "topaz", "dv", "remux", "upload",
                    "cleanup", "idle"):
             for active in (True, False):
                 for other in (True, False):
@@ -253,7 +254,7 @@ class NativeAnalysisRegime(unittest.TestCase):
                                                    other_lane_live=other),
                                      before(st, active, other), (st, active, other))
                 self.assertEqual(eta.correction_applies(run_stage=st, run_active=active),
-                                 not (active and st == "resolve"), (st, active))
+                                 not (active and st == "extend"), (st, active))
 
 
 class ChunkReplay(unittest.TestCase):

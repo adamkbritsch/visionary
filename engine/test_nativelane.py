@@ -26,7 +26,7 @@ def _append(path, data):
 
 
 def _plan(**kw):
-    pl = {"topaz": "upscale", "resolve": "add_hdr_dv", "res": "1080p", "scale": 2,
+    pl = {"topaz": "upscale", "dv": "add_hdr_dv", "res": "1080p", "scale": 2,
           "input": {"height": 1080}}
     pl.update(kw)
     return pl
@@ -129,13 +129,12 @@ class Eligibility(unittest.TestCase):
             "movie": (_item(movie=True), _plan(), "dv1000"),
             "youtube": (_item(youtube=True), _plan(), "dv1000"),
             "combine": (_item(combine=True), _plan(), "dv1000"),
-            "rpu-only fast path": (_item(), _plan(topaz="rpu-only", resolve="add_dv"), "dv1000"),
-            "resolve-only fast path": (_item(), _plan(topaz="resolve-only"), "dv1000"),
-            "already DV": (_item(), _plan(topaz="skip", resolve="skip"), "dv1000"),
-            "HDR intake": (_item(), _plan(resolve="add_dv"), "dv1000"),
+            "rpu-only fast path": (_item(), _plan(topaz="rpu-only", dv="add_dv"), "dv1000"),
+            "dv-only fast path": (_item(), _plan(topaz="dv-only"), "dv1000"),
+            "already DV": (_item(), _plan(topaz="skip", dv="skip"), "dv1000"),
+            "HDR intake": (_item(), _plan(dv="add_dv"), "dv1000"),
             "dv2000": (_item(), _plan(), "dv2000"),
             "sdr output": (_item(), _plan(), "sdr"),
-            "480p": (_item(), _plan(res="480p", scale=4), "dv1000"),
             "no plan": (_item(), {}, "dv1000"),
         }
         for name, (p, pl, mode) in cases.items():
@@ -170,14 +169,6 @@ class Eligibility(unittest.TestCase):
             with mock.patch.object(nativelane.settings, "get_show_output_mode", return_value=override):
                 self.assertEqual(nativelane.effective_mode(_item()), want)
 
-    def test_engine_setting_is_resolve_unless_exactly_native(self):
-        for v, want in (("native", "native"), ("resolve", "resolve"), ("Native", "resolve"),
-                        (None, "resolve")):
-            with mock.patch.object(nativelane.settings, "dv_engine", return_value=v, create=True):
-                self.assertEqual(nativelane.engine_setting(), want)
-        with mock.patch.object(nativelane.settings, "dv_engine", side_effect=OSError, create=True):
-            self.assertEqual(nativelane.engine_setting(), "resolve")
-
 
 class Decide(Fixture):
     COLOUR = {"height": 2160, "color_primaries": "bt709", "color_space": "bt709",
@@ -185,9 +176,7 @@ class Decide(Fixture):
 
     def decide(self, setting="native", pl=None, colour=None, tool=(True, "ok"), disk=(True, "room"),
                sd_on=False):
-        with mock.patch.object(nativelane, "engine_setting", return_value=setting), \
-             mock.patch.object(nativelane, "sd_route_on", return_value=sd_on), \
-             mock.patch.object(nativelane, "probe_stream", return_value=colour or self.COLOUR), \
+        with mock.patch.object(nativelane, "probe_stream", return_value=colour or self.COLOUR), \
              mock.patch.object(nativelane, "toolchain_ok", return_value=tool), \
              mock.patch.object(nativelane, "disk_fits", return_value=disk):
             return nativelane.decide(self.p, pl=pl or _plan(), mode="dv1000")
@@ -195,33 +184,21 @@ class Decide(Fixture):
     def test_native_when_every_check_passes(self):
         self.assertEqual(self.decide(), ("native", "eligible"))
 
-    def test_setting_resolve_touches_nothing_else(self):
-        """U1: with the default 'resolve', no probe, plan, toolchain or disk check runs."""
-        boom = mock.Mock(side_effect=AssertionError("must not be called"))
-        with mock.patch.object(nativelane, "engine_setting", return_value="resolve"), \
-             mock.patch.object(nativelane, "sd_route_on", return_value=False), \
-             mock.patch.object(nativelane, "probe_stream", boom), \
-             mock.patch.object(nativelane, "toolchain_ok", boom), \
-             mock.patch.object(nativelane, "disk_fits", boom), \
-             mock.patch.object(nativelane, "chunks", boom), \
-             mock.patch("plan.plan_for", boom):
-            self.assertEqual(nativelane.decide(self.p)[0], "resolve")
-        self.assertFalse(os.path.exists(nativelane.native_dir(self.p)))    # nothing written
 
     def test_each_failing_check_means_resolve(self):
-        cases = {"not eligible": dict(pl=_plan(resolve="add_dv")),
+        cases = {"not eligible": dict(pl=_plan(dv="add_dv")),
                  "colour": dict(colour={"height": 2160, "color_primaries": "smpte170m"}),
                  "toolchain": dict(tool=(False, "dovi_tool is 2.2.0")),
                  "disk": dict(disk=(False, "projected 200 < 310"))}
         for name, kw in cases.items():
             with self.subTest(name):
                 engine, why = self.decide(**kw)
-                self.assertEqual(engine, "resolve")
+                self.assertEqual(engine, "render")
                 self.assertTrue(why)
 
     def test_unreadable_chunks_mean_resolve(self):
         os.remove(os.path.join(self.segdir, "seg_0001.mov"))
-        self.assertEqual(self.decide()[0], "resolve")
+        self.assertEqual(self.decide()[0], "render")
 
     def test_a_marker_keeps_the_item_native_after_the_setting_flips_back(self):
         nativelane.begin_marker(self.p, nativelane.chunks(self.segdir), FPS, self.cfr_facts())
@@ -233,13 +210,13 @@ class Decide(Fixture):
         os.makedirs(nativelane.native_dir(self.p), exist_ok=True)
         with open(nativelane.fallback_path(self.p), "w") as f:
             f.write("{}")                                    # the manual per-item fallback
-        self.assertEqual(self.decide()[0], "resolve")
+        self.assertEqual(self.decide()[0], "render")
 
     def test_a_broken_toolchain_is_resolve_this_time_and_writes_nothing(self):
         engine, why = self.decide(tool=(False, "dovi_tool is 2.2.0, pinned 2.3.0"))
-        self.assertEqual(engine, "resolve")
-        for words in ("toolchain is not ready", "Resolve takes this item this time",
-                      "no fallback.json", "dovi_tool is 2.2.0, pinned 2.3.0"):
+        self.assertEqual(engine, "render")
+        for words in ("toolchain is not ready", "no fallback.json",
+                      "dovi_tool is 2.2.0, pinned 2.3.0"):
             self.assertIn(words, why)                    # the reason the orchestrator logs
         self.assertFalse(os.path.exists(nativelane.native_dir(self.p)))   # not sticky: nothing
         self.assertEqual(self.decide(), ("native", "eligible"))           # fixed -> native again
@@ -253,8 +230,7 @@ class Decide(Fixture):
             nativelane._TOOLCHAIN.update(at=_time.monotonic() - cached_at_age, result=cached)
         probe = mock.Mock(return_value=list(problems))
         disk = mock.Mock(return_value=(True, "room"))
-        with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
-             mock.patch.object(nativelane, "probe_stream", return_value=self.COLOUR), \
+        with mock.patch.object(nativelane, "probe_stream", return_value=self.COLOUR), \
              mock.patch.object(nativelane, "toolchain_problems", probe), \
              mock.patch.object(nativelane, "disk_fits", disk):
             return nativelane.decide(self.p, pl=_plan(), mode="dv1000"), probe, disk
@@ -263,7 +239,7 @@ class Decide(Fixture):
         # the 10-minute cache said fine, but the toolchain broke since: the claim re-checks
         (engine, why), probe, _ = self._decide_live_toolchain(
             ["dovi_tool is 2.2.0"], cached_at_age=nativelane.CLAIM_TOOLCHAIN_SECONDS + 5)
-        self.assertEqual(engine, "resolve")
+        self.assertEqual(engine, "render")
         self.assertIn("dovi_tool is 2.2.0", why)
         self.assertEqual(probe.call_count, 1)
         self.assertFalse(os.path.exists(nativelane.native_dir(self.p)))
@@ -277,7 +253,7 @@ class Decide(Fixture):
     def test_a_cached_failure_answers_without_probing_or_disk_checks(self):
         (engine, why), probe, disk = self._decide_live_toolchain(
             [], cached_at_age=120, cached=(False, "ffmpeg major is 9, pinned 8"))
-        self.assertEqual(engine, "resolve")
+        self.assertEqual(engine, "render")
         self.assertIn("ffmpeg major is 9", why)
         probe.assert_not_called()
         disk.assert_not_called()
@@ -671,8 +647,8 @@ class Fallback(Fixture):
         self.assertTrue(os.path.exists(os.path.join(self.segdir, "seg_0000.mov")))   # Resolve needs them
         with open(nativelane.fallback_path(self.p)) as f:
             self.assertEqual(json.load(f), {"why": "2 native failures", "failures": 2})
-        with mock.patch.object(nativelane, "engine_setting", return_value="native"):
-            self.assertEqual(nativelane.decide(self.p, pl=_plan(), mode="dv1000")[0], "resolve")
+        if True:
+            self.assertEqual(nativelane.decide(self.p, pl=_plan(), mode="dv1000")[0], "render")
 
     def test_native_fallback_reason_falls_back_at_once(self):
         self.assertTrue(nativelane.should_fall_back("native-fallback: toolchain: x", 1))
@@ -789,11 +765,10 @@ class RunAnalysis(_RunAnalysisBase):
             ok, msg = self.run_it()
             self.assertFalse(ok)
             self.assertFalse(msg.startswith("native-fallback:"), msg)
-            with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
-                 mock.patch.object(nativelane, "probe_stream", return_value=Decide.COLOUR), \
+            with mock.patch.object(nativelane, "probe_stream", return_value=Decide.COLOUR), \
                  mock.patch.object(nativelane, "disk_fits", return_value=(True, "room")):
                 engine, why = nativelane.decide(self.p, pl=_plan(), mode="dv1000")
-        self.assertEqual(engine, "resolve")
+        self.assertEqual(engine, "render")
         self.assertIn("ffmpeg major is 9", why)
         self.assertFalse(nativelane.has_fallback(self.p))
         self.assertFalse(nativelane.has_marker(self.p))
@@ -998,38 +973,15 @@ def _sd_plan(**kw):
 
 
 class SdRoute(unittest.TestCase):
-    def test_the_switch_is_dv_routes_never_dv_engine(self):
-        for routes, want in (({"sd_sdr_topaz": "native"}, True), ({"sd_sdr_topaz": "resolve"}, False),
-                             ({}, False), ({"yt_plain": "native"}, False)):
-            with self.subTest(routes=routes), \
-                 mock.patch.object(nativelane.settings, "dv_routes", return_value=routes), \
-                 mock.patch.object(nativelane.settings, "dv_engine", return_value="native", create=True):
-                self.assertEqual(nativelane.sd_route_on(), want)
-        with mock.patch.object(nativelane.settings, "dv_route", side_effect=OSError):
-            self.assertFalse(nativelane.sd_route_on())          # unreadable -> off
-        self.assertEqual(nativelane.SD_ROUTE, "sd_sdr_topaz")
-        import routes as routes_mod
-        self.assertIn(nativelane.SD_ROUTE, routes_mod.ROUTES)
-        self.assertEqual(nativelane.SD_RES, routes_mod.SD_RES)
 
-    def test_lane_on_reads_dv_engine_first(self):
-        sd = mock.Mock(return_value=True)
-        with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
-             mock.patch.object(nativelane, "sd_route_on", sd):
-            self.assertTrue(nativelane.lane_on())
-        sd.assert_not_called()                                    # today's one read, nothing more
-        for sd_on in (True, False):
-            with mock.patch.object(nativelane, "engine_setting", return_value="resolve"), \
-                 mock.patch.object(nativelane, "sd_route_on", return_value=sd_on):
-                self.assertEqual(nativelane.lane_on(), sd_on)
 
-    def test_eligibility_takes_480p_only_when_the_caller_says_the_route_is_on(self):
-        off = nativelane.eligible(_item(), _sd_plan(), "dv1000")
-        self.assertEqual(off, (False, "a 480p-bucket source (480p/BT.601 stays on Resolve)"))   # today's
-        self.assertEqual(nativelane.eligible(_item(), _sd_plan(), "dv1000", sd=True), (True, "eligible"))
+    def test_eligibility_takes_480p_unless_the_caller_says_no(self):
+        self.assertEqual(nativelane.eligible(_item(), _sd_plan(), "dv1000"), (True, "eligible"))
+        self.assertEqual(nativelane.eligible(_item(), _sd_plan(), "dv1000", sd=False),
+                         (False, "a 480p-bucket source"))
         for name, (p, pl, mode) in {"movie": (_item(movie=True), _sd_plan(), "dv1000"),
                                     "youtube": (_item(youtube=True), _sd_plan(), "dv1000"),
-                                    "HDR intake": (_item(), _sd_plan(resolve="add_dv"), "dv1000"),
+                                    "HDR intake": (_item(), _sd_plan(dv="add_dv"), "dv1000"),
                                     "sdr output": (_item(), _sd_plan(), "sdr"),
                                     "no plan": (_item(), {}, "dv1000")}.items():
             with self.subTest(name):
@@ -1061,9 +1013,7 @@ class DecideSd(Fixture):
     def decide(self, setting="native", sd_on=True, pl=None, colour=None, tool=(True, "ok"),
                disk=(True, "room"), probe=None):
         probe = probe or mock.Mock(return_value=colour or SD_CHUNK)
-        with mock.patch.object(nativelane, "engine_setting", return_value=setting), \
-             mock.patch.object(nativelane, "sd_route_on", return_value=sd_on), \
-             mock.patch.object(nativelane, "probe_stream", probe), \
+        with mock.patch.object(nativelane, "probe_stream", probe), \
              mock.patch.object(nativelane, "toolchain_ok", return_value=tool), \
              mock.patch.object(nativelane, "disk_fits", return_value=disk):
             return nativelane.decide(self.p, pl=pl or _sd_plan(), mode="dv1000")
@@ -1072,21 +1022,6 @@ class DecideSd(Fixture):
         nativelane._SD_CLAIMS.clear()
         super().tearDown()
 
-    def test_with_the_route_off_an_sd_episode_is_resolve_exactly_as_today(self):
-        probe = mock.Mock(side_effect=AssertionError("must not be probed"))
-        engine, why = self.decide(sd_on=False, probe=probe)
-        self.assertEqual((engine, why), ("resolve", "a 480p-bucket source (480p/BT.601 stays on Resolve)"))
-        self.assertIsNone(nativelane.sd_claim(self.p))
-
-    def test_an_hd_episode_never_reads_the_sd_switch_while_dv_engine_is_native(self):
-        sd = mock.Mock(side_effect=AssertionError("must not be read"))
-        with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
-             mock.patch.object(nativelane, "sd_route_on", sd), \
-             mock.patch.object(nativelane, "probe_stream", return_value=Decide.COLOUR), \
-             mock.patch.object(nativelane, "toolchain_ok", return_value=(True, "ok")), \
-             mock.patch.object(nativelane, "disk_fits", return_value=(True, "room")):
-            self.assertEqual(nativelane.decide(self.p, pl=_plan(), mode="dv1000"), ("native", "eligible"))
-        self.assertIsNone(nativelane.sd_claim(self.p))
 
     def test_route_on_claims_with_the_601_front_end_and_probes_the_sample_aspect(self):
         probe = mock.Mock(return_value=SD_CHUNK)
@@ -1099,26 +1034,16 @@ class DecideSd(Fixture):
                 self.assertEqual(probe.call_args, mock.call(os.path.join(self.segdir, "seg_0000.mov"),
                                                             extra=("sample_aspect_ratio",)))
 
-    def test_route_on_alone_never_opens_the_720p_lane(self):
-        engine, why = self.decide(setting="resolve", sd_on=True, pl=_plan(), colour=Decide.COLOUR)
-        self.assertEqual(engine, "resolve")
-        self.assertIn("dv_engine is 'resolve'", why)
-        self.assertIsNone(nativelane.sd_claim(self.p))
-
-    def test_both_switches_off_touch_nothing(self):
-        probe = mock.Mock(side_effect=AssertionError("must not be probed"))
-        with mock.patch("plan.plan_for", probe):
-            self.assertEqual(self.decide(setting="resolve", sd_on=False, probe=probe)[0], "resolve")
 
     def test_an_sd_chunk_it_cannot_convert_is_resolve(self):
         engine, why = self.decide(colour=dict(SD_CHUNK, color_transfer="smpte2084"))
-        self.assertEqual(engine, "resolve")
+        self.assertEqual(engine, "render")
         self.assertIn("already HDR", why)
         self.assertIsNone(nativelane.sd_claim(self.p))
 
     def test_disk_and_toolchain_still_decide(self):
-        self.assertEqual(self.decide(disk=(False, "projected 1 < 2"))[0], "resolve")
-        self.assertEqual(self.decide(tool=(False, "dovi_tool is 2.2.0"))[0], "resolve")
+        self.assertEqual(self.decide(disk=(False, "projected 1 < 2"))[0], "render")
+        self.assertEqual(self.decide(tool=(False, "dovi_tool is 2.2.0"))[0], "render")
         self.assertIsNone(nativelane.sd_claim(self.p))
 
 

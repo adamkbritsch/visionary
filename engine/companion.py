@@ -1,7 +1,7 @@
 """Companion combine: pair a NAS movie with its seedbox copy and decide, track by
 track, what to keep — the goal is ONE best-of MKV per film: the genuinely better
 HDR10 video, a REAL (studio) Dolby Vision RPU whenever either copy carries one
-(Resolve's analysis is only the no-RPU fallback), and the best lossless audio
+(a generated, native analysis is only the no-RPU fallback), and the best lossless audio
 (TrueHD Atmos), peak-budgeted for the SHIELD like every other output.
 
 Three parts, all stdlib:
@@ -531,7 +531,7 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
     loser_side = "remote" if video_from == "nas" else "nas"
     loser_probe = remote_probe if video_from == "nas" else nas_probe
 
-    # ---- RPU source: real DV beats Resolve; graft follows the better base -----
+    # ---- RPU source: real DV beats generated DV; graft follows the better base -----
     w_dv = winner_probe.get("dv_profile")
     l_dv = loser_probe.get("dv_profile")
     w_transfer = winner_probe.get("transfer") or ""
@@ -541,12 +541,12 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
         rpu_why = f"the {video_from} copy carries real Dolby Vision (P{w_dv})"
     elif w_transfer != "smpte2084":
         # The winner's OWN pixels ship (stream-copied, or x265'd from the winner), and an
-        # RPU describes a PQ base: on SDR/HLG pixels a grafted RPU or Resolve's analysis
+        # RPU describes a PQ base: on SDR/HLG pixels a grafted RPU or a generated analysis
         # would ship a mislabeled picture. REFUSED, never guessed — pair() turns this into
         # an error, so the card never offers Confirm and no stage ever sees it.
         kind = "HLG" if w_transfer == "arib-std-b67" else f"SDR ({w_transfer or 'untagged'})"
         what = (f"the real Dolby Vision (P{l_dv}) of the {loser_side} copy" if l_dv
-                else "Resolve's Dolby Vision analysis")
+                else "a generated Dolby Vision analysis")
         rpu_from, rpu_inline, rpu_profile = None, False, None
         rpu_why = refused = (f"the better video ({video_from} copy) is {kind}, not PQ HDR "
                              f"— it cannot carry {what}")
@@ -555,8 +555,8 @@ def build_verdict(nas_probe: dict, remote_probe: dict, nas_name: str,
         rpu_why = (f"real Dolby Vision (P{l_dv}) grafted from the {loser_side} copy "
                    f"onto the better {video_from} video")
     else:
-        rpu_from, rpu_inline, rpu_profile = "resolve", False, "resolve"
-        rpu_why = "neither copy has real DV — Resolve analyzes the winner"
+        rpu_from, rpu_inline, rpu_profile = GENERATED_RPU, False, GENERATED_RPU
+        rpu_why = "neither copy has real DV — the native DV render analyzes the winner"
 
     # ---- audio donor: best single track wins the whole file's audio -----------
     n_best = max(nas_probe.get("audio") or [], key=audio_rank, default=None)
@@ -607,13 +607,25 @@ _INFLIGHT = set()               # basenames with a worker running (search or pai
 _INFLIGHT_LOCK = threading.Lock()
 
 
+GENERATED_RPU = "native"     # rpu_from / rpu_profile of a verdict whose RPU the DV render generates
+_OLD_GENERATED = "resolve"   # ...as verdicts written before 2026-10-18 spell it
+
+
 def _book() -> dict:
     try:
         with open(BOOK_FILE) as f:
             d = json.load(f)
-        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(d, dict):
+        return {}
+    for e in d.values():         # an old book reads in today's words
+        v = e.get("verdict") if isinstance(e, dict) else None
+        if isinstance(v, dict):
+            for k in ("rpu_from", "rpu_profile"):
+                if v.get(k) == _OLD_GENERATED:
+                    v[k] = GENERATED_RPU
+    return d
 
 
 def _save(d: dict) -> None:

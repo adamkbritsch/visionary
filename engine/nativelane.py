@@ -1,13 +1,15 @@
 """The native Dolby Vision lane: which TV episodes take it, and the on-disk record that says so.
 
-settings `dv_engine` = 'native' sends an ELIGIBLE TV episode's DV analysis through dvnative
-(hdr_analyzer_mvp + the pinned SDR->PQ LUT, no screen takeover) instead of Resolve. With the
-default 'resolve' nothing here is consulted for a new item, so every path stays as it was.
-dv_routes {"sd_sdr_topaz": "native"} (2026-10-18) opens the lane to 480p/576p episodes as well,
-with a BT.601 -> BT.709 chunk front end (see "the SD route" below); its own switch, not dv_engine's.
-This module is the lane's bookkeeping; the run thread and the stages call it:
+An ELIGIBLE TV episode's DV analysis runs here, straight from Topaz's chunks: dvnative
+(hdr_analyzer_mvp + the pinned SDR->PQ LUT), with the chunks kept through the remux, which
+decodes them itself. 480p/576p episodes take it too, with a BT.601 -> BT.709 chunk front end (see
+"the SD route" below). An episode the lane passes on — ineligible, no room to keep its chunks,
+or fallen back after failures — is made by the native chunk RENDER instead (nativerender, route
+tv_sdr_topaz / tv_disk_fallback / sd_sdr_topaz in stages.DVRENDER_SDR_CHUNK_ROUTES), which
+writes a render file and lets the chunks go at the hand-off. This module is the lane's
+bookkeeping; the run thread and the stages call it:
 
-  decide(p)        after Topaz: ('native' | 'resolve', why) for this item
+  decide(p)        after Topaz: ('native' | 'render', why) for this item
   run_analysis(p)  the 'dvnative' stage body: chunks -> analysis -> RPU -> ready marker
   ready(p)         the analysis is published AND still matches what is on disk
   bundle(p)        what remux.remux(native=) needs
@@ -16,7 +18,7 @@ This module is the lane's bookkeeping; the run thread and the stages call it:
 
 THE MARKER (segdir/native/native.json) is the source of truth for the engine choice — not a
 finisher_queue field and not the live setting. Once an item has one it stays native whatever
-the setting says now (a fallback.json beside it is the only way back to Resolve). It records
+anything else says now (a fallback.json beside it is the only way to the render). It records
 every input the analysis depends on (manifest, chunk size+mtime, LUT and analyzer hashes, the
 filter chain, dovi_tool version, avg floor, fps, the CFR's frames/fps/size/mtime), is
 'analyzing' while measuring and becomes 'ready' only after the RPU is generated, checked and
@@ -29,7 +31,7 @@ the lane's files with it:
   segdir/native/rpu.bin        the generated RPU (+ .generate.json, the dovi_tool config)
   segdir/native/sidecar.json   the merged sidecar it was generated from
   segdir/native/failures.json  failed native attempts (MAX_FAILURES -> fallback)
-  segdir/native/fallback.json  this item goes through Resolve, whatever the setting says
+  segdir/native/fallback.json  this item goes to the native chunk render instead
   segdir/native/cpu.json       CPU ledger: os.wait4 user+sys per analysis chunk / remux segment
 """
 from __future__ import annotations
@@ -68,7 +70,7 @@ AVG_FLOOR = "V40"               # CM v4.0 L1 floor: the blind-tested native clip
 PEAK_ESTIMATOR = "max"          # dvnative.analyze_chunks' default, pinned into the marker
 WITH_L4 = True
 
-MAX_FAILURES = 2                # the 2nd failed native attempt sends the item to Resolve for good
+MAX_FAILURES = 2                # the 2nd failed native attempt sends the item to the render for good
 FALLBACK_PREFIX = "native-fallback:"   # a stage reason that falls back at once (no retry helps)
 
 TOOLCHAIN_CACHE_SECONDS = 600   # toolchain_ok() re-checks at most this often
@@ -88,12 +90,11 @@ MIN_CHUNK_HEIGHT = 720
 # ---- the SD route (2026-10-18) -----------------------------------------------------------
 # sd_sdr_topaz — a TV episode from the 480p/576p bucket (BT.601-era SD) — takes this lane too, with
 # dvnative.chunk_front_end in front of the LUT (BT.601 -> BT.709 by the standard conversion; square
-# pixels for an anamorphic DVD). Its switch is settings dv_routes {"sd_sdr_topaz": "native"} —
-# NEVER dv_engine, which owns the 720p+ episodes (and is already 'native' live): flipping one never
-# moves the other's items. The front end is decided once, at the claim, from chunk 0's tags and the
-# source's frame, and lives in the marker ("pre_vf"; vf and analysis_vf carry it), so a claimed SD
-# item resumes, remuxes and is checked with exactly the chain it was measured with whatever the
-# switch says later. A marker without "pre_vf" is byte for byte the TV lane's.
+# pixels for an anamorphic DVD; a 4:3 picture pillarboxed into 3840x2160). The front end is
+# decided once, at the claim, from chunk 0's tags and the source's frame, and lives in the marker
+# ("pre_vf"; vf and analysis_vf carry it), so a claimed SD item resumes, remuxes and is checked
+# with exactly the chain it was measured with. A marker without "pre_vf" is byte for byte the TV
+# lane's.
 SD_ROUTE = "sd_sdr_topaz"          # = routes.py's id (test-pinned)
 SD_RES = "480p"                    # = routes.SD_RES: plan.resolution_bucket's SD bucket (480p and 576p)
 _SD_CLAIMS = {}                    # segdir -> the front end decide() approved for an SD claim, which
@@ -238,36 +239,10 @@ def cpu_path(p) -> str:
     return os.path.join(native_dir(p), CPU_LEDGER)
 
 
-# ---- the setting and eligibility ---------------------------------------------------------
-
-def engine_setting() -> str:
-    """The live dv_engine ('resolve' | 'native'), validated; anything unreadable is 'resolve'."""
-    try:
-        fn = getattr(settings, "dv_engine", None)
-        v = fn() if callable(fn) else settings.get_settings().get("dv_engine")
-    except Exception:  # noqa: BLE001 — a settings hiccup must never pick the new path
-        return "resolve"
-    return "native" if v == "native" else "resolve"
-
-
-def sd_route_on() -> bool:
-    """settings dv_routes sets sd_sdr_topaz 'native' (validated on read); anything unreadable is
-    False — a settings hiccup must never pick the new path."""
-    try:
-        return settings.dv_route(SD_ROUTE) == "native"
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def lane_on() -> bool:
-    """Could a NEW item take the lane at all: dv_engine 'native' (the 720p+ episodes) or the SD
-    route switched on. dv_engine is read first, so with it 'native' this is the one read it
-    always was."""
-    return engine_setting() == "native" or sd_route_on()
-
+# ---- eligibility -----------------------------------------------------------------------
 
 def effective_mode(p) -> str:
-    """The Resolve-equivalent output mode stages._resolve would use for this TV item: the
+    """The output mode of this TV item: the
     per-show override when it is a real mode, else dv1000 ("auto" is always 1000 nits). The
     2000-nit mode is retired (user decision 2026-10-15): a show still pinned to it is dv1000."""
     try:
@@ -277,13 +252,13 @@ def effective_mode(p) -> str:
     return override if override in ("sdr", "dv1000") else "dv1000"
 
 
-def eligible(p, plan: dict, mode: str, *, sd: bool = False) -> tuple:
+def eligible(p, plan: dict, mode: str, *, sd: bool = True) -> tuple:
     """PURE. (True, "eligible") when the item itself qualifies for the native lane, else
     (False, why). TV only (no movie, YouTube or combine); the Topaz UPSCALE path (fast paths
-    rpu-only / resolve-only and already-DV are not); SDR intake ('add_hdr_dv' — the LUT is
-    BT.709 SDR -> PQ, so HDR intake 'add_dv' is out); a 720p+ source — or, with `sd` (the caller
-    read the SD route's switch: on), a 480p/576p one, which then takes the chunk front end; and
-    the dv1000 output mode (sdr stays on Resolve). Chunk colour, the toolchain and disk are
+    rpu-only / dv-only and already-DV are not); SDR intake ('add_hdr_dv' — the LUT is
+    BT.709 SDR -> PQ, so HDR intake 'add_dv' is out); a 720p+ source — or, with `sd` (the
+    default), a 480p/576p one, which then takes the chunk front end; and the dv1000 output mode
+    (an SDR-pinned item is the render's: sdr_out). Chunk colour, the toolchain and disk are
     decide()'s further checks."""
     if getattr(p, "movie", False):
         return False, "a movie (the native lane is TV only)"
@@ -294,11 +269,11 @@ def eligible(p, plan: dict, mode: str, *, sd: bool = False) -> tuple:
     pl = plan or {}
     if pl.get("topaz") != "upscale":
         return False, f"plan topaz is {pl.get('topaz')!r}, not the Topaz upscale path"
-    if pl.get("resolve") != "add_hdr_dv":
-        return False, (f"plan resolve is {pl.get('resolve')!r}: not an SDR intake "
+    if pl.get("dv") != "add_hdr_dv":
+        return False, (f"plan dv is {pl.get('dv')!r}: not an SDR intake "
                        "(the LUT converts BT.709 SDR only)")
     if pl.get("res") not in ELIGIBLE_RES and not (sd and pl.get("res") == SD_RES):
-        return False, f"a {pl.get('res') or 'unknown'}-bucket source (480p/BT.601 stays on Resolve)"
+        return False, f"a {pl.get('res') or 'unknown'}-bucket source"
     if mode != "dv1000":
         return False, f"output mode is {mode}, not dv1000"
     return True, "eligible"
@@ -450,8 +425,8 @@ def cfr_info(p) -> dict:
 def cfr_check(total: int, cfr_frames, chunk_fps, cfr_fps) -> tuple:
     """PURE. The chunks against the CFR their audio comes from: total within 0.995..1.005 of
     the CFR's frames, and chunk 0's frame rate EXACTLY the CFR's (as a fraction). Unlike the
-    render check, unknown is a failure here — the remux needs both numbers, and the fallback
-    (Resolve) is always available."""
+    render check, unknown is a failure here — the remux needs both numbers, and the native
+    render is always there to take the item instead."""
     if not cfr_frames:
         return False, "the CFR's frame count is unknown"
     # Exact fractions: as a float 1.005 is 1.00499..., which refused 40,200 against 40,000.
@@ -517,7 +492,8 @@ def held_native_bytes(root: str | None = None, exclude: str | None = None) -> in
 def disk_fits(p, *, phys_free_gb=None, prefetch_gb=None, held_gb=None) -> tuple:
     """(fits, why): is there room to keep this item's chunks through its remux and still
     start the next item (disk_verdict)? A throughput guard only — when it says no, the item
-    simply goes through Resolve; the run-thread gates keep the disk safe either way."""
+    simply goes to the native render (its chunks go at the hand-off); the run-thread gates keep
+    the disk safe either way."""
     own = chunk_bytes(p.segdir)
     if own <= 0:
         return False, "no chunks on disk to keep"
@@ -855,9 +831,9 @@ def has_fallback(p) -> bool:
 
 
 def write_fallback(p, why: str) -> None:
-    """Send this item to Resolve for good: fallback.json first (decide() reads it before the
-    marker, so a crash between the two writes still means Resolve), then the marker and the
-    lane's outputs go. The chunks are untouched — Resolve needs them."""
+    """Send this item to the native render for good: fallback.json first (decide() reads it
+    before the marker, so a crash between the two writes still means the render), then the marker
+    and the lane's outputs go. The chunks are untouched — the render needs them."""
     _write_json(fallback_path(p), {"why": str(why)[:300], "failures": failure_count(p)})
     _rm(marker_path(p))
     _clear_outputs(p, work=True)
@@ -898,65 +874,51 @@ def cpu_line(p, phase: str) -> str:
 # ---- the decision and the stage body -----------------------------------------------------
 
 def decide(p, *, pl: dict | None = None, mode: str | None = None) -> tuple:
-    """('native' | 'resolve', why) for an item whose Topaz is done. In order:
-      fallback.json present            -> resolve (sticky, manual or after failures)
-      a native marker present          -> native (claimed: the setting no longer matters)
-      dv_engine != 'native' and the SD route off
-                                       -> resolve (today's path, byte for byte)
+    """('native' | 'render', why) for an item whose Topaz is done. In order:
+      fallback.json present            -> render (sticky, manual or after failures)
+      a native marker present          -> native (claimed)
       eligible() / chunk 0 colour / chunks readable / toolchain_ok() / disk_fits() / the
       toolchain once more, at most CLAIM_TOOLCHAIN_SECONDS old
                                        -> native only when all pass
-    A 720p+ episode needs dv_engine 'native'; a 480p/576p one needs dv_routes sd_sdr_topaz
-    'native' (sd_route_on, read only for an SD source while dv_engine is 'native') and passes
-    sd_front instead of source_ok — its chunk front end is what run_analysis' first pass then
-    writes into the marker (_SD_CLAIMS). A broken toolchain is a per-item, THIS-TIME answer: the
-    item goes through Resolve and nothing is written (no fallback.json), so items take the lane
-    again once it is fixed. The orchestrator logs `why` (once per reason per item). `pl`
-    (plan.plan_for of the ORIGINAL source) and `mode` may be passed when the caller already has
-    them."""
+    A 480p/576p episode passes sd_front instead of source_ok — its chunk front end is what
+    run_analysis' first pass then writes into the marker (_SD_CLAIMS). A broken toolchain is a
+    per-item, THIS-TIME answer: nothing is written (no fallback.json), and the render — which
+    needs the same toolchain — refuses the item too until it is fixed. The orchestrator logs
+    `why` (once per reason per item). `pl` (plan.plan_for of the ORIGINAL source) and `mode` may
+    be passed when the caller already has them."""
     if has_fallback(p):
-        return "resolve", "native fell back for this item (native/fallback.json)"
+        return "render", "native fell back for this item (native/fallback.json)"
     if has_marker(p):
         return "native", "claimed by the native lane (native/native.json)"
-    tv_on = engine_setting() == "native"
-    sd_on = None                            # the SD route's switch, read only when it can matter
-    if not tv_on:
-        sd_on = sd_route_on()
-        if not sd_on:
-            return "resolve", "dv_engine is 'resolve'"
     if pl is None:
         import plan as _plan
         pl = _plan.plan_for(p.source)
-    sd = pl.get("res") == SD_RES and (sd_route_on() if sd_on is None else sd_on)
+    sd = pl.get("res") == SD_RES
     ok, why = eligible(p, pl, effective_mode(p) if mode is None else mode, sd=sd)
     if not ok:
-        return "resolve", why
-    if not sd and not tv_on:
-        return "resolve", (f"dv_engine is 'resolve' (route {SD_ROUTE}, switched on, takes 480p/576p "
-                           "episodes only)")
+        return "render", why
     try:
         chunk_list = chunks(p.segdir)
     except ValueError as e:
-        return "resolve", f"chunks: {e}"
+        return "render", f"chunks: {e}"
     if sd:
         ok, front = sd_front(probe_stream(chunk_list[0][1], extra=("sample_aspect_ratio",)),
                              pl.get("input"))
         if not ok:
-            return "resolve", front
+            return "render", front
     else:
         ok, why = source_ok(probe_stream(chunk_list[0][1]))
         if not ok:
-            return "resolve", why
+            return "render", why
     ok, why = toolchain_ok()                # cached: a toolchain known to be broken spawns nothing
     if ok:
         ok, why = disk_fits(p)
         if not ok:
-            return "resolve", f"disk: {why}"
+            return "render", f"disk: {why}"
         ok, why = toolchain_ok(max_age=CLAIM_TOOLCHAIN_SECONDS)   # fresh, before the claim
     if not ok:
-        return "resolve", (f"the native toolchain is not ready, so Resolve takes this item this "
-                           f"time (no fallback.json: the lane takes new items again once it is "
-                           f"fixed): {why}")
+        return "render", (f"the native toolchain is not ready (no fallback.json: the lane takes "
+                          f"new items again once it is fixed): {why}")
     if sd:
         with _SD_LOCK:
             _SD_CLAIMS[os.path.abspath(p.segdir)] = front
@@ -1001,14 +963,14 @@ def _resume_chunk_drift(p, marker: dict):
 def _toolchain_failure(claimed: bool, marker: dict, why: str) -> str:
     """The stage reason for a failed toolchain check (flow step a). Never a fallback.json on
     the FIRST claim: nothing is claimed yet and the failure is cached, so the next pass's
-    decide() sends the item through Resolve this time only. On a RESUME only a definitive
+    decide() passes the item on this time only. On a RESUME only a definitive
     mismatch falls back at once — the analyzer build or LUT the analysis began with is not on
     disk any more, so no chunk measured so far is valid. Anything else (a probe that hung or
     failed, dovi_tool/ffmpeg beside them) is an ordinary counted failure: the 2-failure rule
     decides, and one hiccup throws no finished chunk away."""
     if not claimed:
         return (f"native toolchain not ready ({why}) — the item is not claimed; the next pass "
-                f"sends it through Resolve (no fallback.json)")
+                f"decides again (no fallback.json)")
     drift = _toolchain_drift(marker)
     if drift:
         return (f"{FALLBACK_PREFIX} toolchain: the {' and the '.join(drift)} changed since this "
@@ -1037,7 +999,7 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
       b. chunk list from segments.json vs the CFR
       c. CFR frames (0.995..1.005) and exact fps
          a-c on the FIRST claim (no marker yet): a toolchain failure is a plain reason (the
-         next decide() sends the item to Resolve, no fallback.json); a chunk/CFR misfit is
+         next decide() decides again, no fallback.json); a chunk/CFR misfit is
          "native-fallback: ...". On a RESUME (a marker exists) only a definitive mismatch is
          "native-fallback: ..." — the analyzer build or LUT sha256 changed, or the chunk set
          changed — and every probe failure is a plain reason, counted by the caller

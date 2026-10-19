@@ -1,11 +1,11 @@
 """Peak-bitrate-capped Dolby Vision re-encode — the stage that makes masters ACTUALLY playable.
 
-WHY: Resolve's DV export uses the VideoToolbox hardware encoder, which has no real peak
+WHY: the DV render uses the VideoToolbox hardware encoder, which has no real peak
 control — S05E23 measured 27.5 Mbps average with a 138.9 Mbps single-second spike, which
 underruns a SHIELD's link and glitches playback. VideoToolbox cannot fix this; x265 can.
 
 HOW (the industry-standard conformant-DV path):
-  1. `dovi_tool extract-rpu` pulls the per-frame Dolby Vision RPU out of Resolve's render.
+  1. `dovi_tool extract-rpu` pulls the per-frame Dolby Vision RPU out of the render.
   2. x265 re-encodes the video in its NATIVE Dolby Vision mode (`--dolby-vision-profile 8.1
      --dolby-vision-rpu`), which *mandates* VBV (`--vbv-maxrate/--vbv-bufsize`) because DV
      certification requires HRD conformance — a hard ceiling on any 1-second window. x265
@@ -58,7 +58,7 @@ RPU_SHIP_VIDEO_GATE_MBPS = DV_STREAM_CEILING_MBPS - TRUEHD_HEADROOM_MBPS   # = 7
                                 # path honours the same budget through the max_peak_mbps
                                 # LIMIT: cap * PEAK_TOLERANCE + TRUEHD_HEADROOM <= CEILING.
 
-# Resolve project constant: "1000-nit, P3, D65, ST.2084" mastering display, in x265's units
+# The 1000-nit master's "P3, D65, ST.2084" mastering display, in x265's units
 # (chromaticities in 0.00002, luminance in 0.0001 nit) — used when the render carries no
 # mastering-display side data.
 FALLBACK_MASTER_DISPLAY = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
@@ -86,7 +86,7 @@ def probe_video(path: str, ffprobe: str = FFPROBE) -> dict:
         # is the .mkv CFR whenever TrueHD/DTS-HD/PGS forced that container — i.e. exactly the
         # UHD remuxes that exceed the peak gate) and every companion combine grafting a REAL
         # DV RPU (a P7 donor is Matroska by construction). Both branches were deterministically
-        # dead, failing 5x with a reason that blamed a Resolve render never involved.
+        # dead, failing 5x with a reason that blamed a render never involved.
         # count_hevc_frames is the exact packet count the callers ultimately compare against.
         # Same root cause as the topaz._frame_count tagless-MKV bug fixed in 8bc83fd.
         frames = max(0, count_hevc_frames(path, ffprobe))
@@ -499,7 +499,7 @@ def build_seg_decode_command(ffmpeg: str, src: str, a: int, n: int, fps_str: str
       frame `a`, seeking only within it (the concat demuxer decodes every earlier chunk to
       seek: ~5 min per segment, measured). A segment must not cross a chunk end — the remux
       plan's boundaries ARE the chunk ends (topaz_segbounds) — so one that does raises.
-      {"vf": "..."} is the filter chain (the captured Resolve SDR->PQ LUT)."""
+      {"vf": "..."} is the filter chain (the captured SDR->PQ LUT)."""
     decode = decode or {}
     chunks = decode.get("chunks")
     if chunks:
@@ -514,7 +514,7 @@ def build_seg_decode_command(ffmpeg: str, src: str, a: int, n: int, fps_str: str
     # -fps_mode passthrough: y4m is a constant-rate muxer, so ffmpeg's default ("cfr") pads
     # the output timeline. After the midpoint seek the first kept frame sits half a frame in,
     # and cfr filled the gap by emitting it TWICE — frames a, a, a+1, ... a+n-2 (measured on a
-    # Resolve render: 20098, 20098, 20099, 20100). Every non-first segment then ran one frame
+    # VideoToolbox render: 20098, 20098, 20099, 20100). Every non-first segment then ran one frame
     # late against the audio and its own RPU slice, opened on a frozen frame and lost its last
     # one, and the frame count still matched. Passthrough emits the decoded frames as they are.
     cmd += ["-fps_mode", "passthrough",
@@ -528,7 +528,7 @@ _RPU_FRAMES_RE = re.compile(r"Frames:\s*(\d+)")
 def rpu_frame_count(rpu_path: str, *, dovi_tool=DOVI_TOOL) -> int:
     """Real coded-frame count from the RPU summary — GROUND TRUTH (one RPU per coded picture).
     A VideoToolbox .mov's nb_frames HEADER can over-report vs the decodable/RPU tail (documented
-    for these renders: topaz.py / resolve_pipeline.py). Planning + slicing against the header
+    for these renders in topaz.py). Planning + slicing against the header
     instead of this made dovi_tool's remove-ranges go out of range → permanent park."""
     if not (rpu_path and os.path.exists(rpu_path) and os.path.getsize(rpu_path) > 0):
         return 0
@@ -585,11 +585,11 @@ def count_hevc_frames(path: str, ffprobe: str = FFPROBE) -> int:
         return 0
 
 
-# --- SUSPENDING A REMUX SO RESOLVE GETS THE WHOLE MACHINE ---------------------------------
+# --- SUSPENDING A REMUX SO ANOTHER STAGE GETS THE WHOLE MACHINE ----------------------------
 # Yielding at a segment boundary is not enough. A segment is 5 minutes of VIDEO but ~7
-# minutes of wall clock, so an encode that is mid-segment when Resolve starts keeps running
-# for most of Resolve's ~19-minute pass — measured live: 4 minutes in, both lanes were still
-# at the same seg_done and still burning CPU.
+# minutes of wall clock, so an encode that is mid-segment when an exclusive stage (AI
+# outpainting) starts keeps running for most of it — measured live: 4 minutes in, both lanes
+# were still at the same seg_done and still burning CPU.
 #
 # SIGSTOP is the right tool rather than killing: the encode freezes immediately, uses no CPU
 # while stopped, and resumes exactly where it was — no lost work and no segment-granularity
@@ -642,8 +642,8 @@ def _encode_pipe(dec_cmd, enc_cmd, out_hevc, abort, on_frame):
     pair = (dec, enc)
     with _ENCODER_LOCK:
         _LIVE_ENCODERS.add(pair)
-        # Spawned while Resolve already holds the machine — start stopped, or this segment
-        # would run free for the rest of Resolve's pass.
+        # Spawned while another stage already holds the machine — start stopped, or this
+        # segment would run free for the rest of that stage.
         if _ENCODERS_SUSPENDED:
             _signal_pair(pair, signal.SIGSTOP)
     tail = []
@@ -706,7 +706,7 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
     the same notched segment bar Topaz uses (seg_done is derived from cumulative frames ≥ each end).
     `should_pause` (like topaz's): polled between segments — a True yields cleanly with a benign
     "paused:" reason (every finished segment kept; the next attempt resumes right here). Used to
-    give the run thread's Resolve the whole machine (user-dictated: Resolve finishes ASAP)."""
+    give a sibling app's lease or AI outpainting the whole machine."""
     if total_frames <= 0:
         return False, 0, "unknown total frame count"
     os.makedirs(segdir, exist_ok=True)
@@ -725,7 +725,7 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         if abort is not None and abort.is_set():
             return False, base, "aborted"
         if should_pause is not None and should_pause():
-            return False, base, "paused: Resolve has the machine — this remux resumes when it finishes"
+            return False, base, "paused: another stage has the machine — this remux resumes when it finishes"
         if count_hevc_frames(sf, ffprobe) == n:          # already encoded (resume) → skip
             base += n
             if on_progress:
