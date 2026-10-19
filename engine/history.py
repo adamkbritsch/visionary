@@ -67,6 +67,20 @@ def record(*, nas_path, kind, title, series="", ep="", gain=None, note="") -> No
         _write(rows)
 
 
+def forget(nas_path: str) -> bool:
+    """Drop a master's row once the file is gone from the NAS (superseded by a Matroska re-run,
+    stages._supersede_legacy) — a revision must never target a file that no longer exists."""
+    if not nas_path:
+        return False
+    with _LOCK:
+        rows = _read()
+        kept = [r for r in rows if r.get("nas_path") != nas_path]
+        if len(kept) == len(rows):
+            return False
+        _write(kept)
+        return True
+
+
 def view(limit: int = 60) -> list:
     """Newest first, with the live revision state folded in so the UI can disable a row."""
     rows = list(reversed(_read()))[:max(1, int(limit))]
@@ -419,16 +433,28 @@ def _revise_audio(nas_path: str, *, scratch_dir=None) -> dict:
             maps = ["-map", "0"]
             enc = ["-c:a", "aac_at", "-b:a", "384k",
                    "-filter:a", remux.build_audio_boost_filter(gain, src=work)]
+        # The container keeps its Dolby Vision record only when asked: ffmpeg's MP4 muxer writes
+        # the dvcC box ONLY with `-strict unofficial` (tested 2026-10-19 — without it a revised
+        # legacy .mp4 master silently lost DV), and hvc1 keeps SHIELD direct play. Matroska keeps
+        # the record on a copy; `infer_no_subs` stops it switching a subtitle track on.
+        box = (["-strict", "unofficial", "-tag:v", "hvc1"] if ext.lower() == ".mp4"
+               else ["-default_mode", "infer_no_subs"])
         cmd = [remux.FFMPEG, "-hide_banner", "-nostdin", "-y",
                "-progress", "pipe:1", "-nostats", "-i", work,
                *maps, "-c", "copy",                       # keep video + subs bit-exact (DV intact)
-               *enc, fixed]
+               *enc, *box, fixed]
         _step(label, "remux", pct=0, step=f"applying +{gain:.1f} dB", kind=kind)
         rc, tail = _run_with_progress(
             cmd, _duration(work),
             lambda pct: _step(label, "remux", pct=pct, step=f"applying +{gain:.1f} dB", kind=kind))
         if rc != 0 or not os.path.exists(fixed):
             return {"status": "remux-failed", "detail": tail[-300:]}
+        # ...and PROVE it: a revision that loses the master's Dolby Vision is not shipped
+        dv_before = remux.parse_streams(remux._probe(work, remux.FFPROBE))["dovi_profile"]
+        dv_after = remux.parse_streams(remux._probe(fixed, remux.FFPROBE))["dovi_profile"]
+        if dv_before != dv_after:
+            return {"status": "remux-failed",
+                    "detail": f"the revision changed Dolby Vision {dv_before} -> {dv_after}"}
 
         _step(label, "remux", step="verifying the new level", kind=kind)
         landed = remux.measure_lufs(fixed)

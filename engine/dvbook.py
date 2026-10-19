@@ -153,6 +153,11 @@ def add(items) -> int:
             host = prof.get("host") or it.get("host")
             if not host:
                 continue                                     # nowhere to fetch it from
+            if not str(host).lower().endswith(".mkv"):
+                # the lane writes Matroska (mkvmerge) and swaps it in under the ORIGINAL's name:
+                # an .mp4/.m4v/.ts original would end up holding Matroska bytes under its old
+                # extension. Profile 7 is a Blu-ray layer, so its remuxes are .mkv in practice.
+                continue
             q = [e for e in q if e["name"] != name]          # a failed entry is re-queued fresh
             q.append({"name": name, "dir": it.get("dir") or "", "title": it.get("title") or name,
                       "bytes": int(it.get("bytes") or prof.get("size") or 0), "el": prof.get("el"),

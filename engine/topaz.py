@@ -490,11 +490,9 @@ def _period_exact_in_timebase(r_frame_rate: str, time_base: str) -> bool:
 # until the LAST segment, which reads to EOF: 11,899 of 12,826 frames after nine hours of
 # upscaling, failing identically on every ~44-minute retry (live 2026-09-06). The frames are
 # the truth: an exact frame count over the span their own timestamps cover.
-STANDARD_FRAME_RATES = ("24000/1001", "24/1", "25/1", "30000/1001", "30/1", "48000/1001",
-                        "48/1", "50/1", "60000/1001", "60/1", "100/1", "120000/1001", "120/1",
-                        "12000/1001", "12/1", "15000/1001", "15/1")
-RATE_SNAP_TOLERANCE = 2e-4    # how close a measured cadence must sit to a standard rate. NTSC
-                              # and whole rates are 1e-3 apart, so a snap never confuses them
+# the standard rates and how close a measured cadence must sit to one (NTSC and whole rates are
+# 1e-3 apart, so a snap never confuses them) — ONE list, dvcap's (its snap_fps uses it too)
+from dvcap import STANDARD_FPS as STANDARD_FRAME_RATES, FPS_SNAP_TOLERANCE as RATE_SNAP_TOLERANCE  # noqa: E402
 RATE_MIN_SPAN_SECS = 10.0     # shorter, a millisecond of timestamp rounding outweighs the check
 RATE_LIE_FRAMES = 2           # the declared rate must mispredict the frame count by this much
 RATE_MISMATCH = "frame-rate mismatch:"   # upscale_resumable's refusal; stages._topaz rebuilds on it

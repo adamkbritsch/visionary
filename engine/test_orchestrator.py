@@ -1,4 +1,5 @@
 import contextlib
+import shutil
 import tempfile
 import datetime
 import time
@@ -105,13 +106,13 @@ class Paths(unittest.TestCase):
         stem = SRC[:-4]
         self.assertEqual(self.p.prores, "/scratch/" + stem + "_prob4_upscaled.mov")
         self.assertEqual(self.p.dv_render, "/scratch/" + stem + " HDR10 DV upscaled.mov")
-        self.assertEqual(self.p.final, "/scratch/" + stem + " HDR10 DV upscaled.mp4")
+        self.assertEqual(self.p.final, "/scratch/" + stem + " HDR10 DV upscaled.mkv")
         for f in (self.p.prores, self.p.dv_render, self.p.final):   # every output is tagged
             self.assertIn("upscaled", f)
 
     def test_nas_season_dir_and_final_name(self):
         self.assertEqual(self.p.nas_dir, "/Media/TV-Shows/The Office X/S02")
-        self.assertTrue(self.p.nas_final.endswith("(Extended Cut) HDR10 DV upscaled.mp4"))
+        self.assertTrue(self.p.nas_final.endswith("(Extended Cut) HDR10 DV upscaled.mkv"))
 
     def test_working_files_are_the_locals(self):
         self.assertEqual(set(self.p.working_files()),
@@ -120,34 +121,164 @@ class Paths(unittest.TestCase):
 
 
 class ApplyContainer(unittest.TestCase):
-    """Container is locked from the LOCAL source: MKV when it needs it, else the .mp4 default."""
+    """The CFR INTERMEDIATE's container is locked from the LOCAL source (MKV when it needs it,
+    else the .mp4 default); the MASTER is always .mkv (2026-10-18)."""
     def _paths(self):
         return episode_paths("Show", "S01E01", "Ep.mkv",
                              scratch_dir="/scratch", nas_tv_root="/Media/TV-Shows")
 
-    def test_no_source_keeps_mp4_default(self):
+    def test_no_source_keeps_the_defaults(self):
         p = self._paths()
         with mock.patch("os.path.exists", return_value=False):
             orch.apply_container(p)
-        self.assertTrue(p.final.endswith(".mp4"))
-        self.assertTrue(p.source_cfr.endswith(".mp4"))
+        self.assertTrue(p.final.endswith(".mkv"))
+        self.assertTrue(p.source_cfr.endswith("_cfr.mp4"))
 
-    def test_mkv_when_container_ext_says_mkv(self):
+    def test_mkv_when_the_cfr_needs_it(self):
         p = self._paths()
         with mock.patch("os.path.exists", return_value=True), \
-             mock.patch("remux.container_ext", return_value=".mkv"):
+             mock.patch("remux.cfr_container_ext", return_value=".mkv"):
             orch.apply_container(p)
         self.assertEqual(p.source_cfr, "/scratch/Ep_cfr.mkv")
         self.assertEqual(p.final, "/scratch/Ep HDR10 DV upscaled.mkv")
         self.assertEqual(p.nas_final, "/Media/TV-Shows/Show/S01/Ep HDR10 DV upscaled.mkv")
 
-    def test_mp4_when_container_ext_says_mp4(self):
+    def test_an_mp4_cfr_never_makes_an_mp4_master(self):
         p = self._paths()
         with mock.patch("os.path.exists", return_value=True), \
-             mock.patch("remux.container_ext", return_value=".mp4"):
+             mock.patch("remux.cfr_container_ext", return_value=".mp4"):
             orch.apply_container(p)
-        self.assertTrue(p.final.endswith(" HDR10 DV upscaled.mp4"))
-        self.assertTrue(p.nas_final.endswith(" HDR10 DV upscaled.mp4"))
+        self.assertEqual(p.source_cfr, "/scratch/Ep_cfr.mp4")          # only the CFR moved
+        self.assertTrue(p.final.endswith(" HDR10 DV upscaled.mkv"))
+        self.assertTrue(p.nas_final.endswith(" HDR10 DV upscaled.mkv"))
+
+    def test_the_master_ext_is_remuxs(self):
+        import remux
+        self.assertEqual(orch.MASTER_EXT, remux.MASTER_EXT)
+
+
+class LegacyMasters(unittest.TestCase):
+    """ACROSS THE SWITCH TO MATROSKA: an item whose .mp4 master was remuxed and gated by the old
+    build but not uploaded ships it as it is; an interrupted remux's x265 segments move to the
+    .mkv name; nothing happens to an item that never had an .mp4 master."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = episode_paths("Show", "S01E01", "Ep.mkv", scratch_dir=self.d,
+                               nas_tv_root="/Media/TV-Shows")
+        self.legacy, self.legacy_nas = orch.legacy_master_names(self.p)
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_the_legacy_names(self):
+        self.assertEqual(self.legacy, os.path.join(self.d, "Ep HDR10 DV upscaled.mp4"))
+        self.assertEqual(self.legacy_nas, "/Media/TV-Shows/Show/S01/Ep HDR10 DV upscaled.mp4")
+
+    def test_a_gated_legacy_master_ships_as_it_is(self):
+        open(self.legacy, "w").close()
+        with mock.patch.object(orch, "_vstream", return_value=[{"codec_type": "video"},
+                                                               {"codec_type": "audio"}]), \
+             mock.patch.object(orch, "_is_dv81", return_value=True):
+            self.assertTrue(orch.adopt_legacy_master(self.p))
+        self.assertEqual((self.p.final, self.p.nas_final), (self.legacy, self.legacy_nas))
+
+    def test_an_unfinished_legacy_master_is_not_adopted(self):
+        open(self.legacy, "w").close()
+        with mock.patch.object(orch, "_vstream", return_value=None):
+            self.assertFalse(orch.adopt_legacy_master(self.p))
+        self.assertTrue(self.p.final.endswith(".mkv"))
+
+    def test_an_existing_mkv_master_wins(self):
+        open(self.legacy, "w").close()
+        open(self.p.final, "w").close()
+        with mock.patch.object(orch, "_vstream", side_effect=AssertionError("never probed")):
+            self.assertFalse(orch.adopt_legacy_master(self.p))
+
+    def test_a_park_keeps_a_finished_legacy_master_nobody_adopted_yet(self):
+        # a park can come before apply_container ever ran with the source on disk
+        open(self.legacy, "w").close()
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        o._dir_gb = lambda d: 0.0
+        with mock.patch.object(orch, "_vstream", return_value=[{"codec_type": "video"},
+                                                               {"codec_type": "audio"}]), \
+             mock.patch.object(orch, "_is_dv81", return_value=True), \
+             mock.patch.object(orch, "_mkv_complete", return_value=True), \
+             mock.patch.object(orch, "_native_encoded", return_value=False), \
+             mock.patch.object(orch.logbook, "event"):
+            o._sweep_parked_files(self.p, "Show S01E01")
+        self.assertTrue(os.path.exists(self.legacy))
+        self.assertEqual(self.p.final, self.legacy)
+
+    def test_interrupted_remux_segments_move_to_the_mkv_name(self):
+        os.makedirs(self.legacy + ".remuxsegs")
+        open(os.path.join(self.legacy + ".remuxsegs", "seg_0000.hevc"), "w").close()
+        self.assertTrue(orch.migrate_legacy_remuxsegs(self.p))
+        self.assertTrue(os.path.isfile(os.path.join(self.p.final + ".remuxsegs", "seg_0000.hevc")))
+        self.assertFalse(os.path.exists(self.legacy + ".remuxsegs"))
+        self.assertFalse(orch.migrate_legacy_remuxsegs(self.p))          # once
+
+    def test_segments_never_overwrite_an_mkv_resume_dir(self):
+        os.makedirs(self.legacy + ".remuxsegs")
+        os.makedirs(self.p.final + ".remuxsegs")
+        self.assertFalse(orch.migrate_legacy_remuxsegs(self.p))
+        self.assertTrue(os.path.isdir(self.legacy + ".remuxsegs"))
+
+    def test_a_legacy_descriptor_resumes_with_an_mkv_master_and_its_mp4_cfr(self):
+        o = orch.Orchestrator.__new__(orch.Orchestrator)
+        d = {"kind": "episode", "ep": "S01E01", "series": "Show", "source_basename": "Ep.mkv",
+             "nas_tv_root": "/Media/TV-Shows", "nas_dir": "/Media/TV-Shows/Show/S01",
+             "container_ext": ".mp4"}                       # written by the pre-Matroska build
+        with mock.patch.object(orch.scratch, "default_scratch", return_value=self.d):
+            p = o._finisher_reconstruct(d)
+        self.assertTrue(p.final.endswith(" HDR10 DV upscaled.mkv"))
+        self.assertTrue(p.source_cfr.endswith("_cfr.mp4"))
+        desc = orch.Orchestrator._finisher_descriptor(p)
+        self.assertEqual((desc["cfr_ext"], desc["final_ext"], desc["container_ext"]),
+                         (".mp4", ".mkv", ".mp4"))
+
+
+class MatroskaMasterMustBeWhole(unittest.TestCase):
+    """A killed mkvmerge leaves a file whose header already says DV 8.1 + audio; only the
+    statistics tags mkvmerge writes LAST tell a whole master from a truncated one."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        self.dv = {"side_data_type": "DOVI configuration record", "dv_profile": 8,
+                   "dv_bl_signal_compatibility_id": 1}
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _streams(self, tags):
+        return [{"codec_type": "video", "side_data_list": [self.dv], "tags": tags},
+                {"codec_type": "audio"}]
+
+    def test_a_whole_master_is_done(self):
+        with mock.patch.object(orch, "_vstream",
+                               return_value=self._streams({"NUMBER_OF_FRAMES-eng": "1"})):
+            self.assertTrue(orch.stage_done("remux", self.p))
+
+    def test_a_truncated_master_is_not(self):
+        # a killed mkvmerge OR a killed ffmpeg mux: the header reads DV 8.1 + audio, no end tags
+        for tags in ({}, {"HANDLER_NAME": "x", "VENDOR_ID": "[0][0][0][0]"},
+                     {"DURATION": "00:00:00.000000000"}, {"DURATION": "garbage"}):
+            with self.subTest(tags=tags), \
+                 mock.patch.object(orch, "_vstream", return_value=self._streams(tags)):
+                self.assertFalse(orch.stage_done("remux", self.p))
+
+    def test_a_whole_master_muxed_by_ffmpeg_before_the_switch_is_done(self):
+        # the pre-2026-10-18 build wrote lossless-audio / bitmap-sub / combine masters as .mkv
+        # with ffmpeg: no statistics tags, but a DURATION ffmpeg fills in only from its trailer
+        with mock.patch.object(orch, "_vstream", return_value=self._streams(
+                {"HANDLER_NAME": "VideoHandler", "DURATION": "00:42:01.502000000"})):
+            self.assertTrue(orch.stage_done("remux", self.p))
+
+    def test_a_legacy_mp4_master_needs_no_tags(self):
+        self.p.final = orch.legacy_master_names(self.p)[0]
+        with mock.patch.object(orch, "_vstream", return_value=self._streams({})):
+            self.assertTrue(orch.stage_done("remux", self.p))
 
 
 class YouTubePaths(unittest.TestCase):
@@ -163,13 +294,13 @@ class YouTubePaths(unittest.TestCase):
         self.assertEqual(p.nas_source, self.VP)                    # raw source stays in STAGING
         self.assertEqual(p.sidecar_dir, "/Media/YouTube-raw/Chan/Chan - Title - abc123")
         self.assertEqual(p.nas_dir, self.PLEX_DIR)                 # publish INTO the Plex lib
-        self.assertEqual(p.nas_final, self.PLEX_DIR + "/Chan - Title [abc12345678].mp4")
+        self.assertEqual(p.nas_final, self.PLEX_DIR + "/Chan - Title [abc12345678].mkv")   # Matroska
         self.assertEqual(p.source, "/scratch/Chan - Title [abc12345678].mp4")
 
-    def test_apply_container_keeps_stem_and_locks_ext(self):
+    def test_apply_container_keeps_stem_and_the_master_is_mkv(self):
         p = orch.youtube_paths("Chan", self.VP, scratch_dir="/scratch")
         with mock.patch("os.path.exists", return_value=True), \
-             mock.patch("remux.container_ext", return_value=".mkv"):
+             mock.patch("remux.cfr_container_ext", return_value=".mp4"):
             orch.apply_container(p)
         # master keeps youtarr's stem (so the copied .nfo matches) — NO "upscaled" suffix — ext locked
         self.assertEqual(p.nas_final, self.PLEX_DIR + "/Chan - Title [abc12345678].mkv")
@@ -2253,8 +2384,8 @@ class MasterNaming(unittest.TestCase):
                               scratch_dir="/tmp", nas_tv_root="/Vol/TV")
             other = episode_paths("Other", "S01E01", "Other.S01E01.1080p.BluRay.x264-BiA.mkv",
                                   scratch_dir="/tmp", nas_tv_root="/Vol/TV")
-        self.assertTrue(p.final.endswith(" SDR upscaled.mp4"), p.final)
-        self.assertTrue(other.final.endswith(" HDR10 DV upscaled.mp4"), other.final)
+        self.assertTrue(p.final.endswith(" SDR upscaled.mkv"), p.final)
+        self.assertTrue(other.final.endswith(" HDR10 DV upscaled.mkv"), other.final)
         # THE load-bearing round trip: an SDR master must be recognised as DONE. If it is not,
         # it is re-classified as a source and re-upscaled forever — and with replace_source on,
         # the real source is already gone.
@@ -2265,7 +2396,7 @@ class MasterNaming(unittest.TestCase):
         p = episode_paths("Show", "S01E01", "Show.S01E01.1080p.BluRay.x264-BiA.mkv",
                           scratch_dir="/tmp", nas_tv_root="/Vol/TV")
         self.assertTrue(p.nas_source.endswith("Show.S01E01.1080p.BluRay.x264-BiA.mkv"))  # SOURCE as-is
-        self.assertTrue(p.final.endswith("Show.S01E01.2160p.BluRay.x265-BiA HDR10 DV upscaled.mp4"))
+        self.assertTrue(p.final.endswith("Show.S01E01.2160p.BluRay.x265-BiA HDR10 DV upscaled.mkv"))
         self.assertEqual(os.path.basename(p.final), os.path.basename(p.nas_final))  # upload derives
         self.assertIn("hdr10 dv", os.path.basename(p.nas_final).lower())            # done-mark kept
         self.assertIn("S01E01", p.nas_final)                                        # queue key kept
@@ -3023,7 +3154,7 @@ class CombinePaths(unittest.TestCase):
         p = self._combine_paths(d)
         open(p.source, "w").write("x")           # source exists → classic path would probe
         import remux
-        with mock.patch.object(remux, "container_ext",
+        with mock.patch.object(remux, "cfr_container_ext",
                                side_effect=AssertionError("combine must not probe")):
             q = orch.apply_container(p)
         self.assertTrue(q.final.endswith(".mkv"))
@@ -3034,7 +3165,8 @@ class CombinePaths(unittest.TestCase):
         p = self._combine_paths(d)
         desc = orch.Orchestrator._finisher_descriptor(p)
         self.assertTrue(desc["combine"])
-        self.assertEqual(desc["container_ext"], ".mkv")
+        self.assertEqual(desc["final_ext"], ".mkv")
+        self.assertEqual(desc["cfr_ext"], os.path.splitext(p.source_cfr)[1])   # build-time default
         o = orch.Orchestrator.__new__(orch.Orchestrator)
         with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)):
             q = o._finisher_reconstruct(desc)
@@ -4810,7 +4942,8 @@ class SdrOutputStageDone(unittest.TestCase):
             self.assertFalse(orch._native_sdr_render(self.dv_named))
 
     def test_the_master_counts_only_under_the_sdr_name(self):
-        sdr = [{"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709"},
+        sdr = [{"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709",
+                "tags": {"NUMBER_OF_FRAMES": "48"}},                   # mkvmerge wrote it to the end
                {"codec_type": "audio"}]
         dv_named = self.dv_named
         self.assertIn(orch.DV_TAG, os.path.basename(dv_named.final))
@@ -4822,7 +4955,8 @@ class SdrOutputStageDone(unittest.TestCase):
             self.assertTrue(orch.stage_done("remux", sdr_named))
         for bad in ([sdr[0]],                                              # no audio
                     [dict(sdr[0], color_transfer="smpte2084"), sdr[1]],      # HDR
-                    [dict(sdr[0], codec_name="h264"), sdr[1]]):
+                    [dict(sdr[0], codec_name="h264"), sdr[1]],
+                    [dict(sdr[0], tags={}), sdr[1]]):                        # a killed mux
             with self.subTest(bad=bad), mock.patch.object(orch, "_vstream", return_value=bad):
                 self.assertFalse(orch.stage_done("remux", sdr_named))
 
@@ -5157,7 +5291,8 @@ class NativeEncodedProof(unittest.TestCase):
                               side_effect=lambda path: ({"v": 1} if path == p.final and self.dv
                                                         else None)),
             mock.patch.object(orch, "_is_dv81", side_effect=bool),
-            mock.patch.object(orch, "_has_audio", side_effect=bool)]
+            mock.patch.object(orch, "_has_audio", side_effect=bool),
+            mock.patch.object(orch, "_mkv_complete", side_effect=bool)]   # a whole mkvmerge master
         for pt in self.probe:
             pt.start()
 

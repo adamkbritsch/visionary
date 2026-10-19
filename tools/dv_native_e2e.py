@@ -9,7 +9,7 @@ pinned analyzer and LUT are linked in. Then checks what shipped:
 
   1. kill mid-analysis, resume: finished chunks are reused, the rest analysed
   2. the native remux through stages._remux: ok, marker 'encoded', chunk files released
-  3. format: DV 8.1 (compat 1), hvc1, PQ / BT.2020, frame count == chunks, peak <= cap
+  3. format: Matroska, DV 8.1 (compat 1), PQ / BT.2020, frame count == chunks, peak <= cap
   4. the master's embedded RPU == the generated RPU, frame for frame (L1, L3, L4)
   5. audio vs video duration within one frame
   6. picture: VMAF of the master vs the lossless LUT reference
@@ -282,8 +282,9 @@ def run(work: str, chunks: str, cfr: str) -> int:
     dovi = next((sd for sd in v.get("side_data_list", []) if "DOVI" in sd.get("side_data_type", "")), {})
     results.append(check("Dolby Vision 8.1", dovi.get("dv_profile") == 8 and dovi.get("dv_bl_signal_compatibility_id") == 1,
                          f"profile {dovi.get('dv_profile')} compat {dovi.get('dv_bl_signal_compatibility_id')}"))
-    if final.endswith(".mp4"):
-        results.append(check("hvc1 sample entry", v.get("codec_tag_string") == "hvc1", v.get("codec_tag_string", "")))
+    results.append(check("Matroska master", final.endswith(".mkv") and
+                         "matroska" in (pr.get("format", {}).get("format_name") or ""),
+                         pr.get("format", {}).get("format_name", "")))
     results.append(check("PQ / BT.2020", v.get("color_transfer") == "smpte2084" and v.get("color_primaries") == "bt2020"))
     frames = dvcap.count_hevc_frames(final)
     results.append(check("frame count == chunks", frames == b["total"], f"{frames} vs {b['total']}"))
@@ -324,7 +325,7 @@ def run(work: str, chunks: str, cfr: str) -> int:
     p2 = stage_episode(work, chunks, cfr, "run2")
     ok2, msg2 = stages._dvnative(p2, threading.Event())            # its own marker/RPU (fast: same chunks)
     b2 = nativelane.bundle(p2)
-    out2 = os.path.join(work, "run2", "repair.mp4")
+    out2 = os.path.join(work, "run2", "repair.mkv")
     tr = time.time()
     # 6 Mbps: well under what x265's VBV lets through on 4K content, so the peak gate
     # (cap x 1.15) fails and a REPAIR must run (12 Mbps passed outright on S06E05: 12.4 Mbps).
@@ -337,7 +338,8 @@ def run(work: str, chunks: str, cfr: str) -> int:
     if res.ok:
         f2 = dvcap.count_hevc_frames(out2)
         results.append(check("repaired master keeps every frame and its DV", f2 == b2["total"] and
-                             (probe(out2)["streams"][0].get("side_data_list") or [{}])[0].get("dv_profile") == 8,
+                             next((sd for sd in probe(out2)["streams"][0].get("side_data_list") or []
+                                   if "DOVI" in sd.get("side_data_type", "")), {}).get("dv_profile") == 8,
                              f"{f2} frames"))
 
     # 8. tampered marker

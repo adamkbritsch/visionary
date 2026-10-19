@@ -365,7 +365,7 @@ def fit_pad_vf(width, height, sar=None, frame=FIT_FRAME) -> str:
     output's sample aspect whenever the new size's ratio differs from the old one's — and
     fit_geometry's even rounding and hairline snap always differ a little (1080x1920 -> 1216 wide
     for 1215 is sar 1215:1216; 854x480 stretched to 3840x2160 is 1281:1280). VideoToolbox writes
-    that into the HEVC VUI, MP4Box keeps it and the y4m pipe hands it to x265, so a player that
+    that into the HEVC VUI, mkvmerge keeps it and the y4m pipe hands it to x265, so a player that
     honours it would rescale the whole 4K frame to 3837 / 3843 wide. The fitted picture IS square
     by construction (the snap is the deliberate, sub-0.2% stretch), so the step says so: setsar=1,
     as square_vf does."""

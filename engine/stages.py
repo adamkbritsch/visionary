@@ -1701,9 +1701,9 @@ def _remux(p, abort, progress=None, should_pause=None):
     ceiling — see remux.py; NO uncapped fallback) + audio (CFR file) + subtitles (ORIGINAL
     download) -> final master. Audio comes from the CFR file — the DV video derives from the
     CFR timeline, so that audio is guaranteed in sync; subtitles come from the original because
-    the CFR pass no longer carries them. remux() dispatches on p.final's extension: MKV
-    (lossless audio / bitmap subs) or MP4 (default). The x265 pass makes this stage LONG
-    (~an hour per episode) — it reports live progress and honours abort."""
+    the CFR pass no longer carries them. The master is Matroska (mkvmerge), whatever the source
+    holds. The x265 pass makes this stage LONG (~an hour per episode) — it reports live progress
+    and honours abort."""
     import dvcap
     import plan
     import remux
@@ -1722,10 +1722,10 @@ def _remux(p, abort, progress=None, should_pause=None):
     # and records the gain, and every later episode from the same source reuses it. "Same
     # source" is read off the filename, so a WEB-DL episode dropped into a BluRay season is
     # measured on its own rather than inheriting a gain never meant for it. Movies (one item
-    # each) and YouTube (unrelated videos) keep measuring per item; the MKV path is exempt
-    # from boosting altogether, so it is not measured at all.
+    # each) and YouTube (unrelated videos) keep measuring per item. Every master is Matroska and
+    # every route boosts (lossless audio keeps its original track), so this holds for all of them.
     audio_gain = None
-    if lufs and not p.movie and not p.youtube and not str(p.final).lower().endswith(".mkv"):
+    if lufs and not p.movie and not p.youtube:
         import audiogain
         gkey = audiogain.key_for(p.series, p.ep, p.source_basename)
         if gkey:
@@ -1973,17 +1973,67 @@ def _upload(p, abort, progress=None):
             abort=abort, on_wait=_slot_note(progress, "upload", p.ep))
         if ok:
             _remember_finished(p, p.nas_final)
+            reason += _supersede_legacy(p, p.nas_final)
         return ok, (reason if ok else _stopped_is_interrupted(reason))
     ok, remote, reason = transfer.upload(p.final, p.nas_dir, on_progress=on_prog, abort=abort,
                                          on_wait=_slot_note(progress, "upload", p.ep))
     if not ok:
         return False, _stopped_is_interrupted(reason)
     _remember_finished(p, remote)
+    reason += _supersede_legacy(p, remote)
     import settings as settings_mod
     if settings_mod.get_show_replace_source(p.series):
         rok, rmsg = transfer.replace_original(remote, p.nas_source, p.final)
         return True, f"{reason}; {rmsg}"
     return True, f"{reason}; source kept (Plex serves the 4K version)"
+
+
+def legacy_master_candidates(p, new_remote: str) -> list:
+    """PURE. The NAS paths of THIS item's earlier .mp4 master, the ones a Matroska re-run lands
+    beside (every master is .mkv since 2026-10-18; upload only replaces the same name). TV/movie:
+    the new master's name with .mp4, and its pre-retag spelling (<source stem><tag>.mp4) — each
+    only when series.is_master_name says it IS a pipeline master. YouTube: <youtarr stem>.mp4 in
+    the Plex folder the master was published to — never when the Plex library and youtarr's
+    staging library are the same folder, where that name could be the source itself. Never the
+    new master, never the item's source."""
+    import orchestrator as O
+    import series as series_mod
+    if not str(new_remote).lower().endswith(".mkv"):
+        return []
+    base = os.path.splitext(new_remote)[0]
+    out = []
+    if p.youtube:
+        if transfer.NAS_FTP_YOUTUBE_ROOT.rstrip("/") == transfer.NAS_FTP_YOUTUBE_STAGING.rstrip("/"):
+            return []
+        out = [base + ".mp4"]
+    else:
+        stem = os.path.splitext(p.source_basename)[0]
+        tag = O.SDR_TAG if O.SDR_TAG.strip() in os.path.basename(base) else O.DV_TAG
+        out = [base + ".mp4", f"{p.nas_dir.rstrip('/')}/{stem}{tag}.mp4"]
+        out = [c for c in out if series_mod.is_master_name(os.path.basename(c))]
+    seen, keep = set(), []
+    for c in out:
+        if c not in seen and c not in (new_remote, p.nas_source):
+            seen.add(c)
+            keep.append(c)
+    return keep
+
+
+def _supersede_legacy(p, new_remote: str) -> str:
+    """After the new master is VERIFIED on the NAS: delete this item's earlier .mp4 master
+    (legacy_master_candidates) so Plex does not show two versions, and drop its history row.
+    Best-effort — a failure here never fails the upload; the note says what happened."""
+    cands = legacy_master_candidates(p, new_remote)
+    if not cands:
+        return ""
+    gone, why = transfer.supersede_masters(new_remote, p.final, cands)
+    if gone:
+        import history
+        for g in gone:
+            history.forget(g)
+        logbook.event(f"upload {p.ep}: superseded the earlier master(s) "
+                      f"{', '.join(os.path.basename(g) for g in gone)} with the Matroska one")
+    return f"; {why}" if why else ""
 
 
 def _cleanup(p, abort, progress=None):
@@ -1992,27 +2042,36 @@ def _cleanup(p, abort, progress=None):
     fill the disk. If ANY file can't be removed it is reported and the stage fails —
     a silently-undeleted file is exactly what would stop the pipeline indefinitely."""
     # Also sweep the intermediate TEMP files a crash could orphan (a Topaz encode renames
-    # base.part.ext → prores on success; a remux writes final.tracks.mp4). They aren't in
-    # working_files() (so stage_done/resume stays simple), but they'd silently eat ~hundreds
-    # of GB if left behind, so cleanup removes them best-effort.
+    # base.part.ext → prores on success; a remux writes final.tracks.mka and final.part). They
+    # aren't in working_files() (so stage_done/resume stays simple), but they'd silently eat
+    # ~hundreds of GB if left behind, so cleanup removes them best-effort.
     try:
-        if os.path.exists(p.final + ".tracks.mp4"):     # remux temp
-            os.remove(p.final + ".tracks.mp4")
-        if os.path.exists(p.final + ".capped.hevc"):    # remux temp: the concat of the segments
-            os.remove(p.final + ".capped.hevc")
-        if os.path.exists(p.final + ".dv.mp4"):         # remux temp: MKV-path DV video intermediate
-            os.remove(p.final + ".dv.mp4")
-        if os.path.exists(p.final + ".src.hevc"):       # inject temp: source Annex-B ES
-            os.remove(p.final + ".src.hevc")
-        if os.path.exists(p.final + ".inject.hevc"):    # inject temp: RPU-injected ES
-            os.remove(p.final + ".inject.hevc")
-        if os.path.exists(p.final + ".ship.hevc"):      # ship-render temp: the render's ES
-            os.remove(p.final + ".ship.hevc")
+        # BOTH master names around the switch to Matroska (2026-10-18): the other one's transients,
+        # and the other master itself when it is not the one that shipped (an unadopted pre-switch
+        # .mp4, or an .mkv attempt begun before a later resume adopted the .mp4)
+        stem = os.path.splitext(p.final)[0]
+        other = stem + (".mp4" if str(p.final).lower().endswith(".mkv") else ".mkv")
+        if os.path.exists(other):
+            os.remove(other)
+        shutil.rmtree(other + ".remuxsegs", ignore_errors=True)
+        for base in (p.final, other):
+            for sfx in (".part",            # the mkvmerge mux, before it passed its gates
+                        ".tracks.mka",      # remux temp: audio + subtitles for the mux
+                        ".capped.hevc",     # remux temp: the concat of the segments
+                        ".src.hevc",        # inject temp: source Annex-B ES
+                        ".src.hevc.vui",    # ...its VUI rewrite (dvcap.ensure_pq_vui)
+                        ".ship.hevc.vui",
+                        ".inject.hevc",     # inject temp: RPU-injected ES
+                        ".fix.hevc",        # inject temp: an inline-P7 winner through nalfix
+                        ".ship.hevc",       # ship-render temp: the render's ES
+                        ".tracks.mp4",      # the pre-Matroska build's (2026-10-18) temps, left
+                        ".dv.mp4"):         # by an item in flight across that deploy
+                if os.path.exists(base + sfx):
+                    os.remove(base + sfx)
         if os.path.exists(p.dv_render + ".best"):       # the re-export gamble's kept first render
             os.remove(p.dv_render + ".best")            # (its own finally clears it; a kill does not)
-        # A hard kill during the mux can strand remux.mp4box_safe_input's hardlink — and a
-        # leftover link keeps the multi-GB transient it points at ALIVE (second reference
-        # to the same inode), so sweep any that share this item's directory.
+        # The pre-Matroska build's mux hardlinked unsafe paths as _mp4box_*; a kill could strand
+        # one, keeping the multi-GB transient it points at ALIVE — swept while any may remain.
         import glob
         for stray in glob.glob(os.path.join(os.path.dirname(p.final) or ".", "_mp4box_*")):
             try: os.remove(stray)

@@ -62,7 +62,7 @@ CONTENDED = "contended"
 SOLO = "solo"
 
 # After the last frame is encoded the remux is FAR from finished: concat of the whole elementary
-# stream, LUFS measure, audio/subtitle extract, MP4Box mux, verify, and a full packet-level peak
+# stream, LUFS measure, audio/subtitle extract, mkvmerge mux, verify, and a full packet-level peak
 # measurement of the shipped 4K file. All of it is invisible to progress, so the countdown used to
 # reach 0 with many minutes left. Every one of those terms is linear in output size, so the tail
 # is modelled per 1000 frames and learned from what actually happens.

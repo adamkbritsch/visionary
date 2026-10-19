@@ -69,7 +69,7 @@ ANALYSIS_PAT='/topaz-scratch/[^/]*_upscaled[.]segments/native/work/chunk_[0-9]+[
 # intermediate, ~/topaz-scratch/<stem> HDR10 DV upscaled.mov.dvrender/analysis/range_K_A_N.mkv
 # (RANGE_PAT: the boundary watch); the encode writes .dvrender/encode.hevc, the HDR10 SEI pass
 # rewrites it via .dvrender/encode.sei.hevc, dovi_tool reads it and writes <render>.dv.hevc, and
-# MP4Box writes <render>.part.
+# mkvmerge writes <render>.part (Matroska; the render keeps its .mov name).
 # RENDER_PAT matches every one of them (and no remux: its transients are named after the master).
 RANGE_PAT='/topaz-scratch/[^/]*[.]dvrender/analysis/range_[0-9]+_[0-9]+_[0-9]+[.]mkv'
 RENDER_PAT='/topaz-scratch/[^/]*[.]mov([.]dvrender/(analysis/range_[0-9]+_[0-9]+_[0-9]+[.]mkv|encode([.]sei)?[.]hevc)|[.]dv[.]hevc|[.]part)'

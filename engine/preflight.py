@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import versions  # noqa: E402
 
 BREW = "/opt/homebrew/bin"
-BREW_TOOLS = ("ffmpeg", "ffprobe", "x265", "dovi_tool", "MP4Box")
+BREW_TOOLS = ("ffmpeg", "ffprobe", "x265", "dovi_tool", "mkvmerge")
+BREW_FORMULAE = "ffmpeg x265 dovi_tool mkvtoolnix"     # what installs BREW_TOOLS (mkvmerge: mkvtoolnix)
 
 
 def _check(cid, ok, severity, detail, fix=""):
@@ -123,12 +124,30 @@ def check_power_adapter():
                   f"adapter reads {w} W (require >= {need} W)", fix)
 
 
+def mkvmerge_version(text):
+    """PURE. (major, minor) from `mkvmerge --version` output, or None."""
+    m = re.search(r"mkvmerge v(\d+)\.(\d+)", text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def check_brew_tools():
     missing = [t for t in BREW_TOOLS if not os.path.exists(os.path.join(BREW, t))]
-    return _check("brew_tools", not missing, "fail",
-                  ("all present: " + ", ".join(BREW_TOOLS)) if not missing
-                  else "missing from /opt/homebrew/bin: " + ", ".join(missing),
-                  "brew install ffmpeg x265 dovi_tool gpac")
+    problems = ["missing from /opt/homebrew/bin: " + ", ".join(missing)] if missing else []
+    fix = f"brew install {BREW_FORMULAE}"
+    if "mkvmerge" not in missing:
+        # every master's Dolby Vision record is written by mkvmerge: below the floor it may
+        # miss the RPU or mis-time a raw HEVC stream (versions.MKVMERGE_MIN_VERSION)
+        rc, text = _probe([os.path.join(BREW, "mkvmerge"), "--version"])
+        got = mkvmerge_version(text) if rc == 0 else None
+        want = versions.MKVMERGE_MIN_VERSION
+        if got is None or got < want:
+            shown = "unreadable" if got is None else "%d.%d" % got
+            problems.append(f"mkvmerge {shown} is older than {want[0]}.{want[1]} (it writes every "
+                            f"master's Dolby Vision record)")
+            fix = f"brew install {BREW_FORMULAE}; brew upgrade mkvtoolnix"
+    return _check("brew_tools", not problems, "fail",
+                  ("all present: " + ", ".join(BREW_TOOLS)) if not problems
+                  else "; ".join(problems), fix)
 
 
 _SHA_CACHE = {}     # path -> ((size, mtime_ns), sha256 hex)
@@ -244,7 +263,7 @@ def check_native_dv():
     return _check("native_dv", not problems, "fail", detail, fix)
 
 
-# check_sublercli was RETIRED (2026-08-09): the enforced-VBV x265 + fresh MP4Box mux
+# check_sublercli was RETIRED (2026-08-09): the enforced-VBV x265 + fresh master mux
 # superseded the Subler-optimize step long ago (see remux.py's header) — optimize_dv has
 # no pipeline callers and is reference-only, so demanding an x86_64 tool + Rosetta from
 # every fresh install was pure vestige. remux.SUBLERCLI + optimize_dv remain for manual use.

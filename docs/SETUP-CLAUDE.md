@@ -49,8 +49,10 @@ Watch `topaz_version`. It must report the exact pin (`7.0.1` — from `engine/ve
   everything else and preflight never checks it.
 
 ### Step 3 — Brew tools
-`brew_tools` check. Run the command from `fix` (it's in the README too), then
-`brew pin ffmpeg dovi_tool` — the Dolby Vision step is pinned to ffmpeg 8 and dovi_tool 2.3.0.
+`brew_tools` check. Run the command from `fix` (`brew install ffmpeg x265 dovi_tool mkvtoolnix`;
+it's in the README too), then `brew pin ffmpeg dovi_tool` — the Dolby Vision step is pinned to
+ffmpeg 8 and dovi_tool 2.3.0. mkvtoolnix's mkvmerge muxes every master (Matroska, DV 8.1); the
+check wants mkvmerge 90.0 or newer.
 
 ### Step 4 — Dolby Vision toolchain
 `native_dv` check (severity fail — part of the arm gate). It verifies hdr_analyzer_mvp by

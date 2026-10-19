@@ -18,8 +18,11 @@ HOW, render(p, spec):
               p010le at the attempt's bitrate, tagged BT.2020 / PQ, every frame once
               (-fps_mode passthrough), straight to an Annex B ES (no container to copy out of)
   3. finish   hdr10sei puts the HDR10 mastering-display + content-light-level SEI into every
-              keyframe, exactly as the x265 path writes them -> dovi_tool inject-rpu -> MP4Box
-              `:dvp=8.1:fps=` into <dv_render>.part: the file that ships, video for video
+              keyframe, exactly as the x265 path writes them -> dovi_tool inject-rpu -> mkvmerge
+              (`--default-duration 0:<fps>p`; it writes the DV 8.1 record from the RPU itself)
+              into <dv_render>.part: the file that ships, video for video. The render is
+              MATROSKA under its long-standing `.mov` name (renders and their books already on
+              scratch keep their names; every reader probes the content, not the extension)
   4. peak     dvcap.video_peak_1s_mbps OF THAT FILE (RPU and SEI bytes included — the very
               number remux_ship_render re-measures) against cap x 1.15 (dvcap.peak_ok). Over it,
               peakplan's loop encodes and finishes again at a fitted target, at most
@@ -71,7 +74,7 @@ item's:
   cpu.json         os.wait4 CPU per analysis unit and per encode attempt
   sdr.json         an SDR render's proof (sdr specs only): its size and mtime, as published
 The finish step's transients (<dv_render>.dv.hevc, .part) sit beside the render, where remux
-keeps its own, so MP4Box's path parsing sees the scratch directory, not a show name.
+keeps its own.
 """
 from __future__ import annotations
 import json
@@ -93,7 +96,7 @@ import remux
 FFMPEG = dvnative.FFMPEG
 FFPROBE = dvcap.FFPROBE
 DOVI_TOOL = dvnative.DOVI_TOOL
-MP4BOX = remux.MP4BOX
+MKVMERGE = remux.MKVMERGE
 GiB = 1024 ** 3
 
 BOOKS_SUFFIX = ".dvrender"
@@ -411,10 +414,13 @@ def begin(p, spec: RenderSpec, stats: list) -> dict:
     analysis, encode = fingerprints(spec, stats)
     old = _read_json(_book(p, SPEC_BOOK))
     old = old if isinstance(old, dict) else {}
-    same_analysis = old.get("analysis") == analysis
+    # rates compared SNAPPED (dvcap.snap_fps_fields): a book written with a Matroska readback
+    # rate (19001/317) is the same work as its standard rate — a deploy must not wipe it
+    snap = dvcap.snap_fps_fields
+    same_analysis = snap(old.get("analysis")) == snap(analysis)
     if not same_analysis:
         _clear(p, analysis=True)
-    elif old.get("encode") != encode:
+    elif snap(old.get("encode")) != snap(encode):
         _clear(p, analysis=False)
     state = {"analysis": analysis, "encode": encode}
     if same_analysis:
@@ -437,12 +443,12 @@ def build_encode_command(ffmpeg: str, spec: RenderSpec, out: str, kbps: int, *,
                          concat: str | None = None, progress: str | None = None) -> list:
     """ffmpeg: the spec's picture chain -> VideoToolbox HEVC Main10 (p010le) at `kbps`, tagged
     BT.2020 / PQ / limited, video only, written as a raw Annex B ES (`-f hevc`: parameter sets
-    in-band on every keyframe — what hdr10sei, dovi_tool and MP4Box all read). One file is read
+    in-band on every keyframe — what hdr10sei, dovi_tool and mkvmerge all read). One file is read
     directly; chunks through an ffconcat list. `-fps_mode passthrough` encodes every decoded
     frame exactly once, re-stamped at N / fps (dvnative.uniform_pts — the range intermediates'
     guard: a millisecond-timebase source can carry irregular or repeated stamps, and the
-    encoder's rate control should see real seconds whatever the source's were); MP4Box sets the
-    final timing from the same fps. `-progress` feeds the stage's progress bar. An `sdr` spec is
+    encoder's rate control should see real seconds whatever the source's were); mkvmerge sets
+    the final timing from the same fps. `-progress` feeds the stage's progress bar. An `sdr` spec is
     tagged BT.709 instead (2026-10-18): the SDR master's colour."""
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
     if progress:
@@ -630,11 +636,13 @@ def _checkpoint(abort, should_pause, where: str) -> None:
         raise dvnative.Paused(f"paused: yielded before {where}")
 
 
-def _run(cmd: list, timeout: float, abort, should_pause, what: str, on_poll=None, cwd=None) -> float:
-    """One child via dvnative.run_step at NICE -> its CPU seconds. A non-zero exit raises."""
+def _run(cmd: list, timeout: float, abort, should_pause, what: str, on_poll=None, cwd=None,
+         ok_rcs=(0,)) -> float:
+    """One child via dvnative.run_step at NICE -> its CPU seconds. An exit outside `ok_rcs`
+    raises (mkvmerge's mux passes remux.MKVMERGE_OK: its rc 1 is a warning, not a failure)."""
     rc, tail, cpu = dvnative.run_step(dvnative.niced(cmd, NICE), timeout=timeout, abort=abort,
                                       should_pause=should_pause, what=what, on_poll=on_poll, cwd=cwd)
-    if rc != 0:
+    if rc not in ok_rcs:
         raise RuntimeError(f"{what} failed (rc={rc}): {tail.strip()[-300:]}")
     return cpu or 0.0
 
@@ -744,7 +752,7 @@ def _need_room(p, need: int, what: str) -> None:
 def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progress,
                     sei_step: bool = True) -> float:
     """Phase 3 for one encode: books/encode.hevc -> HDR10 SEI (in place) -> RPU inject ->
-    MP4Box -> <dv_render>.part, the file that ships. -> CPU seconds. The encode is deleted as
+    mkvmerge -> <dv_render>.part, the file that ships. -> CPU seconds. The encode is deleted as
     soon as the RPU is in (its only reader), so at most two encode-sized files exist at once;
     a finish cut short re-encodes on the next pass. `sei_step` False (a keep_video render: the
     source's own stream already carries its HDR10 SEI) skips the SEI and `hdr` is unused. An
@@ -758,9 +766,9 @@ def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progre
     cpu = 0.0
     if spec.sdr:
         _report(progress, ep, "finish", 0.6, step="mux", attempt=attempt)
-        with remux.mp4box_safe_input(enc) as es_in:
-            cpu += _run(remux.build_capped_video_mux_command(MP4BOX, es_in, str(spec.fps), part,
-                                                             dv=False), tmo, abort, None, "SDR mux")
+        cpu += _run(remux.build_master_mux_command(MKVMERGE, enc, str(spec.fps), part,
+                                                   colour=remux.mkv_colour_args(sdr=True)),
+                    tmo, abort, None, "SDR mux", ok_rcs=remux.MKVMERGE_OK)
         _rm(enc)
         return cpu
     if sei_step:
@@ -773,9 +781,12 @@ def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progre
                 "RPU inject")
     _rm(enc)
     _report(progress, ep, "finish", 0.6, step="mux", attempt=attempt)
-    with remux.mp4box_safe_input(es_dv) as es_in:
-        cpu += _run(remux.build_capped_video_mux_command(MP4BOX, es_in, str(spec.fps), part), tmo,
-                    abort, None, "DV mux")
+    # the container's HDR10 description = the SEI this very stream carries (the finish's own, or
+    # a keep_video source's) — read off its first frame
+    md, cll = dvcap.first_frame_hdr10(es_dv, FFPROBE)
+    cpu += _run(remux.build_master_mux_command(MKVMERGE, es_dv, str(spec.fps), part,
+                                               colour=remux.mkv_colour_args(False, md, cll)),
+                tmo, abort, None, "DV mux", ok_rcs=remux.MKVMERGE_OK)
     _rm(es_dv)
     return cpu
 
@@ -890,9 +901,10 @@ def _encode(p, spec: RenderSpec, rpu: dict, abort, progress, should_pause) -> di
 
 def build_copy_command(ffmpeg: str, src: str, out: str, progress: str | None = None) -> list:
     """PURE. ffmpeg: one file's own coded video, stream-copied to a raw Annex B ES (every
-    parameter set in-band — what dovi_tool and MP4Box read): the original bits, untouched.
-    dvcap.build_annexb_file_command's copy (the remux inject path's base layer), plus the
-    progress feed."""
+    parameter set in-band — what dovi_tool and mkvmerge read): the original coded pictures,
+    untouched. dvcap.build_annexb_file_command's copy (the remux inject path's base layer), plus
+    the progress feed. _copy_video then makes its VUI say BT.2020/PQ when it does not
+    (dvcap.ensure_pq_vui): a DV 8.1 base, and mkvmerge reads its compatibility id from the VUI."""
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
     if progress:
         cmd += ["-progress", progress, "-nostats"]
@@ -930,6 +942,9 @@ def _copy_video(p, spec: RenderSpec, rpu: dict, abort, progress) -> dict:
     frames = dvcap.count_hevc_frames(out, FFPROBE)
     if frames != total:
         raise RuntimeError(f"the source's stream has {frames} frames, the RPU {total}")
+    ok, why = dvcap.ensure_pq_vui(out, FFMPEG, FFPROBE, timeout=dvnative.step_timeout(total))
+    if not ok:                            # mkvmerge would write DV 8.2 for a base that says nothing
+        raise RuntimeError(why)
     # the source's own HDR10 SEI rides along when L6 declares the source's own light level; a
     # source that says 0,0 ("unknown") has its level measured, and the SEI then says the same as L6
     cpu += _finish_attempt(p, spec, hdr10_values(spec, rpu), 1, abort, progress,

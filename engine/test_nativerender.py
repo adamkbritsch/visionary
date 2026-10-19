@@ -235,7 +235,9 @@ class SelfCheck(_Base):
             pt.start()
 
     def tearDown(self):
-        for pt in self.patches:
+        # innermost first: a subclass stacks a second patch of the same name on top of these,
+        # and stopping in start order put the FIRST mock back for every later test module
+        for pt in reversed(self.patches):
             pt.stop()
         super().tearDown()
 
@@ -301,6 +303,8 @@ class Render(_Base):
             mock.patch.object(NR, "_disk", side_effect=lambda path, usage_fn=None: self.disk),
             mock.patch.object(NR.nativelane, "analyzer_path", return_value=self.an),
             mock.patch.object(NR.logbook, "event", side_effect=self.logs.append),
+            mock.patch.object(NR.dvcap, "first_frame_hdr10", return_value=self.HDR),
+            mock.patch.object(NR.dvcap, "ensure_pq_vui", side_effect=self.fake_vui),
         ]
         for pt in self.patches:
             pt.start()
@@ -334,9 +338,13 @@ class Render(_Base):
             shutil.copyfile(cmd[3], cmd[4])
         elif what == "RPU inject":
             shutil.copyfile(cmd[cmd.index("-i") + 1], cmd[cmd.index("-o") + 1])
-        elif what == "DV mux":
-            shutil.copyfile(cmd[2].split(":dvp=")[0], cmd[-1])
+        elif what == "DV mux":                             # mkvmerge: the ES (last) -> -o
+            shutil.copyfile(cmd[-1], cmd[cmd.index("-o") + 1])
         return 0, "", 0.5
+
+    def fake_vui(self, es, *a, **k):
+        self.vui_checked = getattr(self, "vui_checked", []) + [es]
+        return getattr(self, "vui_result", (True, ""))
 
     def fake_peak(self, path, *a, **k):
         self.measured.append(path)
@@ -427,7 +435,9 @@ class Render(_Base):
         self.assertEqual(cmds["HDR10 metadata"], NR.build_sei_command(sys.executable, enc, sei, *self.HDR))
         self.assertEqual(cmds["RPU inject"],
                          dvcap.build_inject_command(NR.DOVI_TOOL, enc, os.path.join(books, "rpu.bin"), es_dv))
-        self.assertEqual(cmds["DV mux"], remux.build_capped_video_mux_command(NR.MP4BOX, es_dv, FPS, part))
+        # the container's HDR10 description is read off the injected ES's own first frame
+        self.assertEqual(cmds["DV mux"], remux.build_master_mux_command(
+            NR.MKVMERGE, es_dv, FPS, part, colour=remux.mkv_colour_args(False, *self.HDR)))
         self.assertEqual(cmds["encode attempt 1"][-1], enc)
 
     def test_the_peak_is_measured_on_the_file_that_ships(self):
@@ -524,10 +534,10 @@ class Render(_Base):
 
     def test_a_failed_mux_leaves_no_render_and_no_strays(self):
         self.peaks = [40.0]
-        self.fail_rc["DV mux"] = 1
+        self.fail_rc["DV mux"] = 2                         # mkvmerge's error (1 = warnings: fine)
         ok, msg = self.render()
         self.assertFalse(ok)
-        self.assertIn("DV mux failed (rc=1): DV mux said no", msg)
+        self.assertIn("DV mux failed (rc=2): DV mux said no", msg)
         self.assertFalse(os.path.exists(self.p.dv_render))
         self.assertEqual(self.strays(), [])
 
@@ -720,15 +730,16 @@ class Render(_Base):
 
 
 def _tools_present() -> bool:
-    return all(os.path.exists(t) for t in (NR.FFMPEG, NR.FFPROBE, NR.DOVI_TOOL, NR.MP4BOX))
+    return all(os.path.exists(t) for t in (NR.FFMPEG, NR.FFPROBE, NR.DOVI_TOOL, NR.MKVMERGE))
 
 
-@unittest.skipUnless(_tools_present(), "ffmpeg/ffprobe/dovi_tool/MP4Box not installed")
+@unittest.skipUnless(_tools_present(), "ffmpeg/ffprobe/dovi_tool/mkvmerge not installed")
 class VideoToolboxRender(unittest.TestCase):
     """REAL tools end to end (the analysis alone faked — the analyzer is pinned and tested on
     its own): a tiny noisy BT.709 clip through the LUT chain, hevc_videotoolbox, dovi_tool
-    generate + inject-rpu and MP4Box must come out as a render the orchestrator's own gates
-    accept, at a path whose name has the characters MP4Box's -add parsing trips on."""
+    generate + inject-rpu and mkvmerge must come out as a render the orchestrator's own gates
+    accept — Matroska under its .mov name — at a path whose name has characters a muxer's
+    argument parsing could trip on."""
 
     @classmethod
     def setUpClass(cls):
@@ -771,7 +782,7 @@ class VideoToolboxRender(unittest.TestCase):
         out = subprocess.run([NR.FFPROBE, "-v", "error", "-select_streams", "v:0", "-count_packets",
                               "-show_streams", "-of", "json", p.dv_render], capture_output=True, text=True).stdout
         s = json.loads(out)["streams"][0]
-        self.assertEqual((s["codec_name"], s["codec_tag_string"], s["profile"]), ("hevc", "hvc1", "Main 10"))
+        self.assertEqual((s["codec_name"], s["profile"]), ("hevc", "Main 10"))
         self.assertEqual((s["color_transfer"], s["color_primaries"], s["width"]), ("smpte2084", "bt2020", 1920))
         self.assertEqual((s["r_frame_rate"], int(s["nb_read_packets"])), (FPS, TOTAL))
         dv = [x for x in s.get("side_data_list", []) if x.get("side_data_type") == "DOVI configuration record"]
@@ -936,12 +947,13 @@ class KeepVideoRender(Render):
     def test_the_copy_touches_no_picture(self):
         self.render()
         cmd = dict(self.calls)["stream copy"]
+        bsf = "hevc_mp4toannexb"                  # the VUI is ensure_pq_vui's job, after the copy
         self.assertEqual(cmd[cmd.index("-i"):], ["-i", self.src, "-map", "0:v:0", "-c:v", "copy",
-                                                 "-bsf:v", "hevc_mp4toannexb", "-f", "hevc",
+                                                 "-bsf:v", bsf, "-f", "hevc",
                                                  os.path.join(NR.books_dir(self.p), NR.ENCODE)])
         self.assertEqual(NR.build_copy_command("ff", "s", "o"),
                          ["ff", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", "s",
-                          "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "o"])
+                          "-map", "0:v:0", "-c:v", "copy", "-bsf:v", bsf, "-f", "hevc", "o"])
 
     def test_a_copy_of_another_length_publishes_nothing(self):
         self.frames[NR.ENCODE] = TOTAL - 1
@@ -950,6 +962,16 @@ class KeepVideoRender(Render):
         self.assertIn("the source's stream has 47 frames, the RPU 48", msg)
         self.assertFalse(os.path.exists(self.p.dv_render))
         self.assertEqual(self.strays(), [])
+
+    def test_the_copy_is_checked_for_a_pq_vui_and_a_failed_rewrite_publishes_nothing(self):
+        # mkvmerge derives the DV record's compatibility id from the VUI: a base that does not say
+        # BT.2020/PQ would mux as 8.2. ensure_pq_vui runs on the COPY, after the frame count
+        self.vui_result = (False, "the stream's VUI does not say BT.2020/PQ and rewriting it failed")
+        ok, msg = self.render()
+        self.assertFalse(ok)
+        self.assertIn("VUI does not say BT.2020/PQ", msg)
+        self.assertEqual(self.vui_checked, [os.path.join(NR.books_dir(self.p), NR.ENCODE)])
+        self.assertFalse(os.path.exists(self.p.dv_render))
 
     def test_room_is_asked_for_the_copy_and_its_inject(self):
         size = os.path.getsize(self.src)
@@ -1002,7 +1024,7 @@ class SelfCheckAsSource(SelfCheck):
         pt = mock.patch.object(dvcap, "probe_video", side_effect=lambda path, *a: {
             "frames": TOTAL, "master_display": self.by_path[path][0], "max_cll": self.by_path[path][1]})
         pt.start()
-        self.addCleanup(pt.stop)
+        self.patches.append(pt)          # stopped FIRST by SelfCheck.tearDown (it stacks on its patch)
 
     def test_the_sources_own_metadata_passes_whatever_it_is(self):
         self.assertTrue(NR.self_check(self.p, self.part, TOTAL, as_source=True)[0])
@@ -1061,8 +1083,9 @@ class KeepVideoRealTools(unittest.TestCase):
         cls.d = tempfile.mkdtemp()
         cls.src = cls._make("src.mp4", "500,100")
         cls.unknown = cls._make("unknown.mp4", "0,0")       # a WEB source that says "unknown" (Hamilton)
-        if not (cls.src and cls.unknown) or not os.path.exists(dvnative.DOVI_TOOL):
-            raise unittest.SkipTest("libx265 (10-bit) or dovi_tool unavailable")
+        if (not (cls.src and cls.unknown) or not os.path.exists(dvnative.DOVI_TOOL)
+                or not os.path.exists(NR.MKVMERGE)):
+            raise unittest.SkipTest("libx265 (10-bit), dovi_tool or mkvmerge unavailable")
 
     @classmethod
     def tearDownClass(cls):
@@ -1179,7 +1202,7 @@ class SdrRender(Render):
         if what == "SDR mux":
             self.assertEqual(cmd[:3], ["/usr/bin/nice", "-n", "10"])
             self.calls.append((what, cmd[3:]))
-            shutil.copyfile(cmd[5].split(":fps=")[0], cmd[-1])
+            shutil.copyfile(cmd[-1], cmd[cmd.index("-o") + 1])     # mkvmerge: the ES -> -o
             return 0, "", 0.5
         return super().fake_step(cmd, timeout=timeout, abort=abort, should_pause=should_pause,
                                  what=what, on_poll=on_poll, **kw)
@@ -1196,6 +1219,7 @@ class SdrRender(Render):
         self.assertEqual(self.analyses, [])                                    # nothing measured
         mux = dict(self.calls)["SDR mux"]
         self.assertNotIn("dvp", " ".join(mux))
+        self.assertIn("--colour-primaries 0:1", " ".join(mux))               # BT.709 container
         self.assertEqual(self.checked, [(self.kept(), TOTAL, None, {"sdr": True})])
         self.assertIn("native SDR render: 48 frames, 20000 kb/s, peak 30.0 Mbps (under-cap)", msg)
         self.assertTrue(NR.sdr_render_ok(self.p))
@@ -1287,3 +1311,26 @@ class SelfCheckSdr(SelfCheck):
         self.frames = TOTAL
         self.ok["complete"] = False
         self.assertIn("whole source", NR.self_check(self.p, self.part, TOTAL, sdr=True)[1])
+
+
+class BooksSurviveTheFpsSnap(unittest.TestCase):
+    """spec.json written before dvcap.snap_fps recorded a Matroska readback rate (19001/317 for
+    60000/1001): the same work, so a deploy keeps the analysis instead of re-measuring hours."""
+
+    def test_an_old_readback_rate_keeps_the_analysis(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = types.SimpleNamespace(ep="X", dv_render=os.path.join(d, "X HDR10 DV upscaled.mov"))
+            spec = NR.RenderSpec(inputs=[[0, os.path.join(d, "s.mkv")], [10, None]],
+                                 fps="60000/1001", kbps=20000, cap_mbps=50)
+            analysis, encode = NR.fingerprints(spec, [])
+            old = {"analysis": dict(analysis, fps="19001/317"), "encode": dict(encode, fps="19001/317"),
+                   "rpu": {"frames": 10}}
+            os.makedirs(NR.books_dir(p), exist_ok=True)
+            with open(os.path.join(NR.books_dir(p), NR.SPEC_BOOK), "w") as f:
+                json.dump(old, f)
+            with mock.patch.object(NR, "_clear", side_effect=AssertionError("cleared")):
+                state = NR.begin(p, spec, [])
+            self.assertEqual(state.get("rpu"), {"frames": 10})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

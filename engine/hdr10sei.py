@@ -8,9 +8,10 @@ tone-map from them. hevc_videotoolbox writes neither (measured on ffmpeg 8.0: it
 carries only SEI 5), so the native render ('dvrender', nativerender.py) shipped without them:
 an HDR10-fallback player lost MaxCLL/MaxFALL and the mastering display, and an x265 remux of the
 render read none back (dvcap.probe_video) and wrote CLL 0,0. This module puts the same two
-messages, the same way, into the render's ES before the RPU is injected; MP4Box keeps them in
-the samples AND writes the matching mdcv/clli boxes, and dvcap.probe_video reads them back
-(measured 2026-10-15: VT encode -> this -> dovi_tool inject-rpu -> MP4Box `:dvp=8.1`).
+messages, the same way, into the render's ES before the RPU is injected; the mux (mkvmerge)
+keeps them in-band in every picture's block, the container's Colour element carries the same
+values (remux.mkv_colour_args), and dvcap.probe_video reads them back (measured 2026-10-15:
+VT encode -> this -> dovi_tool inject-rpu -> the mux).
 
 HOW: one streaming pass, constant memory. Before the FIRST slice of every IRAP picture (NAL
 types 16-23 with first_slice_segment_in_pic_flag set) it writes a prefix-SEI NAL with the CLL

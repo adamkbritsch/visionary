@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest import mock
 
@@ -100,26 +101,21 @@ class PeakMeasurement(unittest.TestCase):
 
 
 class CappedMuxCommands(unittest.TestCase):
-    def test_mp4_mux_signals_dv_and_fps(self):
-        c = remux.build_capped_mux_command("/MP4Box", "/v.hevc", "24000/1001", "/t.mp4", "/o.mp4")
-        self.assertEqual(c[c.index("-add") + 1], "/v.hevc:dvp=8.1:fps=24000/1001")
-        self.assertIn("-inter", c)          # playback interleave kept
-        self.assertEqual(c[c.index("-new") + 1], "/o.mp4")
+    def test_the_master_mux_carries_the_rate_a_raw_es_lacks(self):
+        # MP4Box's `:fps=` is mkvmerge's --default-duration: a raw ES has no container timing
+        c = remux.build_master_mux_command("/mkvmerge", "/v.hevc", "24000/1001", "/o.mkv.part",
+                                           tracks="/t.mka")
+        self.assertEqual(c[c.index("--default-duration") + 1], "0:24000/1001p")
+        self.assertEqual(c[c.index("-o") + 1], "/o.mkv.part")
+        self.assertNotIn("dvp=", " ".join(c))     # the DV record comes from the stream itself
 
-    def test_no_xps_inband_ever(self):
-        # xps_inband => hev1 sample entry => SHIELD refuses to direct-play (S05E24 regression)
-        for c in (remux.build_capped_mux_command("/MP4Box", "/v.hevc", "24/1", "/t.mp4", "/o.mp4"),
-                  remux.build_capped_video_mux_command("/MP4Box", "/v.hevc", "24/1", "/o.dv.mp4")):
-            self.assertNotIn("xps_inband", " ".join(c))
-
-    def test_video_only_wrap_for_mkv_path(self):
-        c = remux.build_capped_video_mux_command("/MP4Box", "/v.hevc", "24000/1001", "/o.dv.mp4")
-        self.assertEqual(c, ["/MP4Box", "-add", "/v.hevc:dvp=8.1:fps=24000/1001",
-                             "-new", "/o.dv.mp4"])
-
-    def test_parse_streams_reports_video_tag(self):
-        pj = '{"streams": [{"codec_type": "video", "codec_tag_string": "hev1"}]}'
-        self.assertEqual(remux.parse_streams(pj)["video_tag"], "hev1")
+    def test_parse_streams_reports_the_dv_record(self):
+        pj = ('{"streams": [{"codec_type": "video", "side_data_list": [{"side_data_type": '
+              '"DOVI configuration record", "dv_profile": 8, "dv_bl_signal_compatibility_id": 1, '
+              '"rpu_present_flag": 1, "bl_present_flag": 1, "el_present_flag": 0}]}]}')
+        s = remux.parse_streams(pj)
+        self.assertEqual(s["dovi_profile"], "8.1")
+        self.assertEqual(s["dovi"]["el_present_flag"], 0)
 
 
 if __name__ == "__main__":
@@ -128,7 +124,7 @@ if __name__ == "__main__":
 
 class SmartLoudnessBoost(unittest.TestCase):
     """Remux-stage loudness normalization: per-item measured gain to the target, boost-only,
-    limiter-capped, MP4 path only (MKV = lossless audio, never transcoded)."""
+    limiter-capped. Lossless audio is never transcoded away (its original track is kept)."""
 
     def test_parse_integrated_lufs(self):
         err = "  Integrated loudness:\n    I:         -23.2 LUFS\n    Threshold: -34.6 LUFS"
@@ -149,20 +145,17 @@ class SmartLoudnessBoost(unittest.TestCase):
         self.assertTrue(f.startswith("volume=7.20dB,alimiter="))
         self.assertIn("limit=0.794", f)                            # -2 dB ceiling for the stings
 
-    def test_extract_boosted_reencodes_audio_only(self):
-        c = remux.build_extract_command("/ff", "/cfr.mp4", "/orig.mp4", "/t.mp4", gain_db=7.2)
+    def test_tracks_boosted_reencodes_audio_only(self):
+        c = remux.build_tracks_command("/ff", "/cfr.mp4", "/orig.mp4", "/t.mka", gain_db=7.2,
+                                       subs=[(0, "copy")])
         self.assertIn("-filter:a", c)
         self.assertEqual(c[c.index("-c:a") + 1], "aac_at")
-        self.assertEqual(c[c.index("-c:s") + 1], "mov_text")       # subs untouched
+        self.assertEqual(c[c.index("-c:s:0") + 1], "copy")          # subs untouched
 
-    def test_extract_unboosted_is_pure_copy(self):
-        c = remux.build_extract_command("/ff", "/cfr.mp4", "/orig.mp4", "/t.mp4")
+    def test_tracks_unboosted_is_pure_copy(self):
+        c = remux.build_tracks_command("/ff", "/cfr.mp4", "/orig.mp4", "/t.mka")
         self.assertNotIn("-filter:a", c)
         self.assertNotIn("aac_at", c)                              # bit-exact copy path preserved
-
-    def test_mkv_mux_never_boosts(self):
-        c = remux.build_mkv_mux_command("/ff", "/dv.mp4", "/cfr.mkv", "/orig.mkv", "/o.mkv")
-        self.assertNotIn("-filter:a", " ".join(c))                 # lossless audio is sacred
         self.assertIn("copy", c)
 
 
@@ -538,7 +531,7 @@ class ResumeRobustness(unittest.TestCase):
         bad = {"frames": 0, "fps": "24000/1001", "start_time": 0.0, "master_display": None, "max_cll": None}
         with mock.patch.object(remux.dvcap, "probe_video", return_value=bad), \
              mock.patch.object(remux.dvcap, "ensure_segdir") as ens:
-            res = remux.remux("/dv.mov", "/cfr.mp4", "/orig.mp4", "/out.mp4")
+            res = remux.remux("/dv.mov", "/cfr.mp4", "/orig.mp4", "/out.mkv")
         self.assertFalse(res.ok)
         self.assertIn("probe", res.reason)
         ens.assert_not_called()                      # segdir untouched — resume survives a probe hiccup
@@ -861,6 +854,10 @@ class InjectBuilders(unittest.TestCase):
         self.assertEqual(cmd[-1], "out.hevc")
         self.assertNotIn("-c:v libx265", " ".join(cmd))
 
+    def test_the_stream_copy_never_rewrites_the_vui_itself(self):
+        cmd = dvcap.build_annexb_file_command("ffmpeg", "src.mkv", "out.hevc")
+        self.assertNotIn("hevc_metadata", " ".join(cmd))      # ensure_pq_vui decides, after
+
     def test_inject_command_uses_dovi_tool_inject_rpu(self):
         cmd = dvcap.build_inject_command("/opt/homebrew/bin/dovi_tool", "src.hevc", "r.bin", "inj.hevc")
         self.assertEqual(cmd[:2], ["/opt/homebrew/bin/dovi_tool", "inject-rpu"])
@@ -1146,3 +1143,143 @@ class SdrSegmentedEncode(unittest.TestCase):
         self.assertNotIn("sdr", dv)
         self.assertEqual(dvcap.resume_manifest("/x.mov", 50, 100, "25", 300, sdr=True),
                          dict(dv, sdr=True))
+
+
+class SnapFps(unittest.TestCase):
+    """A Matroska file cannot carry 60000/1001 exactly (whole-ns DefaultDuration): ffprobe reads
+    it back as 19001/317. Every master is Matroska, so rates snap to the standard one they sit on."""
+
+    def test_matroska_roundings_snap_to_their_standard_rate(self):
+        for raw, want in (("19001/317", "60000/1001"), ("7001/146", "48000/1001"),
+                          ("29011/242", "120000/1001"), ("24000/1001", "24000/1001"),
+                          ("25", "25/1"), ("30000/1001", "30000/1001")):
+            self.assertEqual(dvcap.snap_fps(raw), want, raw)
+
+    def test_a_rate_off_every_standard_is_kept_and_garbage_is_none(self):
+        self.assertEqual(dvcap.snap_fps("47/2"), "47/2")
+        for bad in (None, "", "0/0", "-24", "abc"):
+            self.assertIsNone(dvcap.snap_fps(bad), bad)
+
+    def test_topaz_uses_the_same_list(self):
+        import topaz
+        self.assertIs(topaz.STANDARD_FRAME_RATES, dvcap.STANDARD_FPS)
+
+    def test_probe_video_reports_the_snapped_rate(self):
+        js = json.dumps({"streams": [{"nb_frames": "10", "r_frame_rate": "19001/317"}],
+                         "frames": []})
+        with mock.patch.object(dvcap.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=js)):
+            self.assertEqual(dvcap.probe_video("/x.mkv")["fps"], "60000/1001")
+
+
+class FirstFrameHdr10(unittest.TestCase):
+    def test_reads_the_first_frame_only_and_never_counts(self):
+        js = json.dumps({"frames": [{"side_data_list": [
+            {"side_data_type": "Content light level metadata", "max_content": 1000,
+             "max_average": 400}]}]})
+        with mock.patch.object(dvcap.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=js)) as run, \
+             mock.patch.object(dvcap, "count_hevc_frames",
+                               side_effect=AssertionError("a full scan of a raw ES")):
+            self.assertEqual(dvcap.first_frame_hdr10("/es.hevc"), (None, "1000,400"))
+        self.assertIn("%+#1", run.call_args.args[0])
+
+    def test_unreadable_is_none(self):
+        with mock.patch.object(dvcap.subprocess, "run", side_effect=OSError("x")):
+            self.assertEqual(dvcap.first_frame_hdr10("/x"), (None, None))
+
+
+class EnsurePqVui(unittest.TestCase):
+    """A DV 8.1 base must SAY BT.2020/PQ (mkvmerge derives the record's compatibility id from the
+    VUI); most sources already do and are left alone; a rewrite that drops a packet (FFmpeg's
+    parser discards an access unit whose SEI it cannot read, exit code 0) is refused."""
+
+    def test_a_stream_that_already_says_pq_is_left_alone(self):
+        with mock.patch.object(dvcap, "es_says_pq", return_value=True), \
+             mock.patch.object(dvcap.subprocess, "run", side_effect=AssertionError("no rewrite")):
+            self.assertEqual(dvcap.ensure_pq_vui("/es.hevc"), (True, ""))
+
+    def _rewrite(self, before, after, stderr="", make=True):
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        es = os.path.join(d, "es.hevc")
+        open(es, "wb").write(b"es")
+        def run(cmd, **kw):
+            if make:
+                open(cmd[-1], "wb").write(b"vui")
+            return mock.Mock(returncode=0, stderr=stderr)
+        counts = {es: before, es + ".vui": after}
+        with mock.patch.object(dvcap, "es_says_pq", return_value=False), \
+             mock.patch.object(dvcap.subprocess, "run", side_effect=run), \
+             mock.patch.object(dvcap, "count_hevc_frames", side_effect=lambda p, fp=None: counts[p]):
+            res = dvcap.ensure_pq_vui(es)
+        return res, open(es, "rb").read(), os.path.exists(es + ".vui")
+
+    def test_a_clean_rewrite_replaces_the_stream(self):
+        (ok, note), data, left = self._rewrite(240, 240)
+        self.assertTrue(ok)
+        self.assertIn("BT.2020/PQ", note)
+        self.assertEqual((data, left), (b"vui", False))
+
+    def test_a_dropped_access_unit_is_refused_and_nothing_replaced(self):
+        (ok, why), data, left = self._rewrite(240, 239, "Error applying bitstream filters")
+        self.assertFalse(ok)
+        self.assertIn("240 -> 239", why)
+        self.assertEqual((data, left), (b"es", False))
+
+    def test_no_output_is_a_failure_not_a_crash(self):
+        (ok, _why), data, _left = self._rewrite(240, 0, make=False)
+        self.assertFalse(ok)
+        self.assertEqual(data, b"es")
+
+    def test_for_real_on_a_stream_whose_vui_is_silent(self):
+        import tempfile, os, shutil as sh, subprocess as sp
+        if not os.path.exists(dvcap.FFMPEG):
+            self.skipTest("no ffmpeg")
+        d = tempfile.mkdtemp()
+        try:
+            es = os.path.join(d, "es.hevc")
+            r = sp.run([dvcap.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                        "-i", "testsrc2=size=320x180:rate=24", "-frames:v", "24", "-c:v", "libx265",
+                        "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error", "-f", "hevc", es],
+                       capture_output=True)
+            if r.returncode:
+                self.skipTest("no 10-bit libx265")
+            self.assertFalse(dvcap.es_says_pq(es))
+            ok, note = dvcap.ensure_pq_vui(es)
+            self.assertTrue(ok, note)
+            self.assertTrue(dvcap.es_says_pq(es))
+            self.assertEqual(dvcap.count_hevc_frames(es), 24)
+        finally:
+            sh.rmtree(d, ignore_errors=True)
+
+
+class ResumeIdentitySurvivesTheSnap(unittest.TestCase):
+    """A resume dir made before snap_fps recorded a Matroska readback rate (19001/317): the same
+    work as 60000/1001, so the segments are KEPT, and the manifest is rewritten with the new rate."""
+
+    def test_a_snapped_rate_resumes(self):
+        import tempfile, os
+        seg = os.path.join(tempfile.mkdtemp(), "x.remuxsegs")
+        os.makedirs(seg)
+        with open(os.path.join(seg, "manifest.json"), "w") as f:
+            json.dump({"src": "a", "fps": "19001/317", "frames": 10}, f)
+        open(os.path.join(seg, "seg_0000.hevc"), "w").close()
+        new = {"src": "a", "fps": "60000/1001", "frames": 10}
+        self.assertEqual(dvcap.ensure_segdir(seg, new), "resume")
+        self.assertTrue(os.path.exists(os.path.join(seg, "seg_0000.hevc")))
+        self.assertEqual(json.load(open(os.path.join(seg, "manifest.json"))), new)
+
+    def test_a_really_different_rate_still_wipes(self):
+        import tempfile, os
+        seg = os.path.join(tempfile.mkdtemp(), "x.remuxsegs")
+        os.makedirs(seg)
+        with open(os.path.join(seg, "manifest.json"), "w") as f:
+            json.dump({"fps": "24000/1001"}, f)
+        open(os.path.join(seg, "seg_0000.hevc"), "w").close()
+        self.assertEqual(dvcap.ensure_segdir(seg, {"fps": "24/1"}), "fresh")
+        self.assertFalse(os.path.exists(os.path.join(seg, "seg_0000.hevc")))
+
+    def test_nested_fields_snap_too(self):
+        self.assertEqual(dvcap.snap_fps_fields({"cfr": {"fps": "19001/317"}, "x": [{"fps": "25"}]}),
+                         {"cfr": {"fps": "60000/1001"}, "x": [{"fps": "25/1"}]})

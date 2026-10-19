@@ -1115,6 +1115,35 @@ def replace_original(master_remote, original_remote, local_master) -> tuple:
         except ftplib.all_errors: pass
 
 
+def supersede_masters(master_remote, local_master, older) -> tuple:
+    """Delete this item's OLDER masters (`older`: NAS paths — the caller vouches each is a
+    pipeline master of this very item, stages._supersede_legacy) once the new `master_remote` is
+    verified intact on the NAS (remote size == local size). A re-run that now ships Matroska
+    lands beside an earlier .mp4 master instead of over it (upload only replaces the SAME name),
+    and Plex would show both. Never touches `master_remote` itself. -> (deleted paths, reason)."""
+    try:
+        ftp = connect()
+    except ftplib.all_errors as e:
+        return [], f"FTP connect/login failed: {_why(e)}"
+    gone = []
+    try:
+        if remote_size(ftp, master_remote) != os.path.getsize(local_master):
+            return [], "new master NOT verified on NAS (size mismatch) — older masters kept"
+        for old in older:
+            if not old or old == master_remote or remote_size(ftp, old) is None:
+                continue
+            ftp.delete(old)
+            gone.append(old)
+        return gone, (f"superseded {len(gone)} older master(s)" if gone else "")
+    except ftplib.all_errors as e:
+        return gone, f"superseding an older master failed: {_why(e)}"
+    except OSError as e:
+        return gone, f"superseding an older master failed: {e}"
+    finally:
+        try: ftp.quit()
+        except ftplib.all_errors: pass
+
+
 def _rmtree(ftp, path):
     path = path.rstrip("/")
     try:

@@ -83,6 +83,12 @@ class Queue(Book):
         self.assertEqual((e["name"], e["host"], e["state"], e["phase"], e["rk"]),
                          (NAME, HOST, dvbook.PENDING, None, "123"))
 
+    def test_a_non_matroska_original_is_never_queued(self):
+        # the lane swaps Matroska in under the ORIGINAL's name: an .mp4 would hold MKV bytes
+        mp4 = HOST[:-4] + ".mp4"
+        dvbook.record_profile(os.path.basename(mp4), 10, 7, src="probe")
+        self.assertEqual(dvbook.add([dict(self.row(os.path.basename(mp4), 10), host=mp4)]), 0)
+
     def test_a_movie_is_queued_once(self):
         dvbook.add([self.row()])
         self.assertEqual(dvbook.add([self.row()]), 0)

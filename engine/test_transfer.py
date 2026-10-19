@@ -1127,3 +1127,31 @@ class UnicodePathsOnTheWire(unittest.TestCase):
 
     def test_non_strings_are_left_alone(self):
         self.assertIsNone(transfer.to_wire(None))
+
+
+class SupersedeOlderMasters(unittest.TestCase):
+    """supersede_masters: an item's earlier .mp4 master goes ONLY once the new Matroska master is
+    verified on the NAS (remote size == local), and the new one is never touched."""
+
+    def _local(self, n=4):
+        t = tempfile.NamedTemporaryFile(suffix=".mkv", delete=False)
+        t.write(b"x" * n); t.close()
+        self.addCleanup(os.remove, t.name)
+        return t.name
+
+    def test_deletes_the_old_masters_once_the_new_one_verifies(self):
+        new, old, gone = "/TV/ep HDR10 DV upscaled.mkv", "/TV/ep HDR10 DV upscaled.mp4", "/TV/x.mp4"
+        f = FakeFTP(files={new: 4, old: 999})
+        with mock.patch.object(transfer, "connect", return_value=f):
+            deleted, why = transfer.supersede_masters(new, self._local(4), [old, gone, new])
+        self.assertEqual(deleted, [old])          # a missing one is skipped, the new one never
+        self.assertEqual(f.deleted, [old])
+        self.assertIn("superseded 1", why)
+
+    def test_an_unverified_new_master_keeps_everything(self):
+        new, old = "/TV/ep HDR10 DV upscaled.mkv", "/TV/ep HDR10 DV upscaled.mp4"
+        f = FakeFTP(files={new: 3, old: 999})
+        with mock.patch.object(transfer, "connect", return_value=f):
+            deleted, why = transfer.supersede_masters(new, self._local(4), [old])
+        self.assertEqual((deleted, f.deleted), ([], []))
+        self.assertIn("NOT verified", why)

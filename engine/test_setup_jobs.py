@@ -72,3 +72,10 @@ class Jobs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrewToolsJob(unittest.TestCase):
+    def test_it_installs_mkvtoolnix_not_gpac(self):
+        cmd = setup_jobs.TARGETS["brew_tools"]["cmd"]
+        self.assertIn("mkvtoolnix", cmd)
+        self.assertNotIn("gpac", cmd)

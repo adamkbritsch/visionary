@@ -375,3 +375,42 @@ class NativeDvLiveOnReferenceMachine(unittest.TestCase):
             self.skipTest("hdr_analyzer_mvp not installed — not the reference machine")
         c = preflight.check_native_dv()
         self.assertTrue(c["ok"], c["detail"])
+
+
+class MasterMuxTool(unittest.TestCase):
+    """Every master is Matroska (2026-10-18): the arm gate checks mkvmerge, with a version floor,
+    and MP4Box is gone from it."""
+
+    def test_the_tools_and_their_installer(self):
+        self.assertIn("mkvmerge", preflight.BREW_TOOLS)
+        self.assertNotIn("MP4Box", preflight.BREW_TOOLS)
+        self.assertIn("mkvtoolnix", preflight.BREW_FORMULAE)
+        self.assertNotIn("gpac", preflight.BREW_FORMULAE)
+
+    def test_version_parse(self):
+        self.assertEqual(preflight.mkvmerge_version("mkvmerge v99.0 ('Buka') 64-bit"), (99, 0))
+        self.assertIsNone(preflight.mkvmerge_version("garbage"))
+
+    def _check(self, version_text, rc=0):
+        with mock.patch.object(preflight.os.path, "exists", return_value=True), \
+             mock.patch.object(preflight, "_probe", return_value=(rc, version_text)):
+            return preflight.check_brew_tools()
+
+    def test_a_current_mkvmerge_passes(self):
+        self.assertTrue(self._check("mkvmerge v99.0 ('Buka') 64-bit")["ok"])
+
+    def test_one_below_the_floor_fails_and_says_why(self):
+        c = self._check("mkvmerge v89.0 ('x') 64-bit")
+        self.assertFalse(c["ok"])
+        self.assertIn("89.0 is older than 90.0", c["detail"])
+        self.assertIn("mkvtoolnix", c["fix"])
+
+    def test_an_unreadable_version_fails(self):
+        self.assertFalse(self._check("", rc=None)["ok"])
+
+    def test_a_missing_tool_is_named(self):
+        with mock.patch.object(preflight.os.path, "exists",
+                               side_effect=lambda p: not p.endswith("/mkvmerge")):
+            c = preflight.check_brew_tools()
+        self.assertFalse(c["ok"])
+        self.assertIn("mkvmerge", c["detail"])

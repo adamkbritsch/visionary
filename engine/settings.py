@@ -58,7 +58,7 @@ DEFAULT_SETTINGS = {
                                 # back. 0 = Off (never dim). See orchestrator._dimmer / brightness.dim_tick.
     "audio_target_lufs": -16,   # SMART LOUDNESS BOOST target: the remux stage measures each item's
                                 # integrated LUFS and boosts (never attenuates) to this, limiter at
-                                # -2 dB. MP4/AAC path only (MKV = lossless audio, never transcoded).
+                                # -2 dB. Lossless audio keeps its original track behind the boosted one.
                                 # 0 = off. Derived from the Office pilot (-23 LUFS measured).
     "max_peak_mbps": 50,        # PEAK BITRATE CAP for every shipped master: the remux stage re-encodes
                                 # the DV render through x265 with a hard VBV ceiling at this rate

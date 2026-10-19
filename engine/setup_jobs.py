@@ -25,7 +25,7 @@ TARGETS = {
     # Only the MISSING tools, and never an upgrade (HOMEBREW_NO_INSTALL_UPGRADE in _run): ffmpeg
     # and dovi_tool are pinned (versions.py) — an upgrade past them would fail preflight's
     # native_dv row, which is part of the arm gate.
-    "brew_tools": {"cmd": f'for f in ffmpeg x265 dovi_tool gpac; do {BREW} list --versions "$f" '
+    "brew_tools": {"cmd": f'for f in ffmpeg x265 dovi_tool mkvtoolnix; do {BREW} list --versions "$f" '
                           f'>/dev/null 2>&1 || {BREW} install "$f"; done',
                    "needs_brew": True},
     # the bundled Dolby Vision toolchain files (dv/): argv computed by the caller (engine/

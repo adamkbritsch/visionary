@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -101,6 +102,27 @@ class Revise(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "aac_at")
         seen["swap"].assert_called_once()
         self.assertEqual(history.view()[0]["gain"], out["gain"])
+
+    def test_an_mp4_revision_asks_ffmpeg_to_keep_the_dv_box(self):
+        # without -strict unofficial ffmpeg's MP4 muxer drops the dvcC box (tested 2026-10-19)
+        out, seen = self._run()
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[cmd.index("-strict") + 1], "unofficial")
+        self.assertEqual(cmd[cmd.index("-tag:v") + 1], "hvc1")
+        self.assertLess(cmd.index("-strict"), len(cmd) - 1)          # an output option
+
+    def test_a_revision_that_loses_dolby_vision_is_refused(self):
+        import remux
+        dv = json.dumps({"streams": [{"codec_type": "video", "side_data_list": [
+            {"side_data_type": "DOVI configuration record", "dv_profile": 8,
+             "dv_bl_signal_compatibility_id": 1}]}]})
+        plain = json.dumps({"streams": [{"codec_type": "video"}]})
+        with mock.patch.object(remux, "_probe",
+                               side_effect=lambda path, fp: plain if ".revised" in path else dv):
+            out, seen = self._run()
+        self.assertEqual(out["status"], "remux-failed")
+        self.assertIn("8.1 -> None", out["detail"])
+        seen["swap"].assert_not_called()
 
     def test_an_already_loud_master_is_left_alone(self):
         out, _ = self._run(measured=-15.0)

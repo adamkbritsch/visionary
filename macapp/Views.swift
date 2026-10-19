@@ -4104,8 +4104,9 @@ struct ScratchContentsCard: View {
         if n.hasSuffix(".inject.hevc") { return "DV-injected stream · temp" }
         if n.hasSuffix(".ship.hevc") { return "Render stream · temp" }
         if n.hasSuffix(".capped.hevc") { return "Capped stream · temp" }
-        if n.hasSuffix(".tracks.mp4") { return "Audio tracks · temp" }
-        if n.hasSuffix(".dv.mp4") { return "DV wrap · temp" }
+        if n.hasSuffix(".tracks.mka") { return "Audio tracks · temp" }
+        if n.hasSuffix(".mov.part") { return "DV render · muxing" }      // the render's mkvmerge pass
+        if n.hasSuffix(".mkv.part") { return "4K DV master · muxing" }   // gated, then renamed
         if n.contains("_mezz.mp4.segments") { return "Compat copy segments" }
         if n.hasSuffix("_mezz.mp4") { return "Compat copy" }
         if n.contains("_prob4_upscaled.segments") { return "Topaz segments" }

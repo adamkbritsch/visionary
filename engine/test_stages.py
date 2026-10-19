@@ -202,6 +202,7 @@ class ReplaceSourcePolicy(unittest.TestCase):
                           scratch_dir=tempfile.mkdtemp())
         with mock.patch.object(stages.transfer, "publish_master",
                                return_value=(True, "/Media/YouTube/x.mp4", "published")), \
+             mock.patch.object(stages.transfer, "supersede_masters", return_value=([], "")), \
              mock.patch.object(stages.transfer, "replace_original",
                                side_effect=AssertionError("youtube must not replace")), \
              mock.patch.object(settings, "get_show_replace_source",
@@ -576,6 +577,42 @@ class FastPathDispatch(unittest.TestCase):
         self.assertTrue(ok)
         self.assertFalse(os.path.exists(p.final + ".src.hevc"))
         self.assertFalse(os.path.exists(p.final + ".inject.hevc"))
+
+    def test_cleanup_sweeps_the_mkv_mux_temps_and_the_old_builds(self):
+        import orchestrator as O
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        legacy = O.legacy_master_names(p)[0]
+        made = [p.final + sfx for sfx in (".part", ".tracks.mka", ".fix.hevc", ".capped.hevc")]
+        made += [legacy + sfx for sfx in (".tracks.mp4", ".dv.mp4", ".part")]   # pre-Matroska strays
+        for f in made:
+            open(f, "w").close()
+        os.makedirs(legacy + ".remuxsegs")                  # an unmigrated resume dir
+        ok, _msg = stages.run_stage("cleanup", p)
+        self.assertTrue(ok)
+        self.assertEqual([f for f in made if os.path.exists(f)], [])
+        self.assertFalse(os.path.exists(legacy + ".remuxsegs"))
+
+    def test_cleanup_removes_the_master_that_did_not_ship(self):
+        import orchestrator as O
+        d = tempfile.mkdtemp()
+        p = _paths(d)
+        legacy = O.legacy_master_names(p)[0]
+        open(legacy, "w").close()                          # an unadopted pre-switch .mp4
+        ok, _msg = stages.run_stage("cleanup", p)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(legacy))
+        # ...and the other way round: the adopted .mp4 shipped, an .mkv attempt was left over
+        p2 = _paths(tempfile.mkdtemp())
+        mkv_attempt = p2.final
+        p2.final = O.legacy_master_names(p2)[0]
+        for f in (mkv_attempt, mkv_attempt + ".part"):
+            open(f, "w").close()
+        os.makedirs(mkv_attempt + ".remuxsegs")
+        ok, _msg = stages.run_stage("cleanup", p2)
+        self.assertTrue(ok)
+        self.assertEqual([f for f in (mkv_attempt, mkv_attempt + ".part", mkv_attempt + ".remuxsegs")
+                          if os.path.exists(f)], [])
 
 
 class _FakeResolveProc:
@@ -1419,6 +1456,14 @@ class SeasonScopedLoudness(unittest.TestCase):
             ok, _ = stages.run_stage("remux", p, progress=lambda d: None)
         seen["ok"], seen["measured_times"] = ok, m.call_count
         return seen
+
+    def test_a_matroska_master_gets_the_season_gain_too(self):
+        # the gain used to be skipped for .mkv finals; every master is .mkv now (2026-10-18)
+        p = episode_paths("Lost (2004)", "S04E01", "x.mp4", scratch_dir="/tmp",
+                          nas_tv_root="/Media/TV-Shows")
+        self.assertTrue(p.final.endswith(".mkv"))
+        self._run("S04E01", self.BLURAY % 1, measured=-20.0)
+        self.assertEqual(self._run("S04E02", self.BLURAY % 2, measured=-30.0)["gain"], 4.0)
 
     def test_first_episode_measures_and_the_next_reuses_it(self):
         a = self._run("S04E01", self.BLURAY % 1, measured=-20.0)
@@ -2975,3 +3020,62 @@ class SdrOutRemux(_DvRenderItem):
             self.assertEqual(stages.run_stage("remux", self.p, progress=lambda d: None), (True, "ok"))
         self.assertNotIn("sdr", got)
 
+
+
+class SupersedeLegacyMasters(unittest.TestCase):
+    """A Matroska re-run lands BESIDE an earlier .mp4 master (upload only replaces the same name);
+    once the new master verifies, the old one goes, so Plex never shows two versions."""
+
+    def test_tv_candidates_are_both_spellings_of_the_old_master(self):
+        p = episode_paths("Show", "S01E01", "Show.S01E01.1080p.BluRay.x264-BiA.mkv",
+                          scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+        c = stages.legacy_master_candidates(p, p.nas_final)
+        self.assertEqual(c, ["/Vol/TV/Show/S01/Show.S01E01.2160p.BluRay.x265-BiA HDR10 DV upscaled.mp4",
+                             "/Vol/TV/Show/S01/Show.S01E01.1080p.BluRay.x264-BiA HDR10 DV upscaled.mp4"])
+
+    def test_never_the_source_never_a_non_master_never_after_an_mp4_upload(self):
+        p = episode_paths("Show", "S01E01", "Ep.mkv", scratch_dir="/tmp", nas_tv_root="/Vol/TV")
+        self.assertEqual(stages.legacy_master_candidates(p, p.nas_final[:-4] + ".mp4"), [])
+        for c in stages.legacy_master_candidates(p, p.nas_final):
+            self.assertNotEqual(c, p.nas_source)
+            self.assertIn("HDR10 DV upscaled", c)
+
+    def test_youtube_takes_the_old_mp4_in_the_plex_folder_only(self):
+        from orchestrator import youtube_paths
+        p = youtube_paths("Chan", "/Media/YouTube-raw/Chan/v/v [abcdefghijk].mp4", scratch_dir="/tmp")
+        with mock.patch.object(stages.transfer, "NAS_FTP_YOUTUBE_ROOT", "/Media/YouTube"), \
+             mock.patch.object(stages.transfer, "NAS_FTP_YOUTUBE_STAGING", "/Media/YouTube-raw"):
+            self.assertEqual(stages.legacy_master_candidates(p, p.nas_final),
+                             [p.nas_final[:-4] + ".mp4"])
+        with mock.patch.object(stages.transfer, "NAS_FTP_YOUTUBE_ROOT", "/Media/YT/"), \
+             mock.patch.object(stages.transfer, "NAS_FTP_YOUTUBE_STAGING", "/Media/YT"):
+            # one folder for both: <stem>.mp4 could be the SOURCE itself
+            self.assertEqual(stages.legacy_master_candidates(p, p.nas_final), [])
+
+    def test_an_upload_supersedes_and_forgets_the_old_row(self):
+        import settings, history
+        p = _paths(tempfile.mkdtemp())
+        old = p.nas_final[:-4] + ".mp4"
+        with mock.patch.object(stages.transfer, "upload",
+                               return_value=(True, p.nas_final, "uploaded 1 bytes")), \
+             mock.patch.object(stages.transfer, "supersede_masters",
+                               return_value=([old], "superseded 1 older master(s)")) as sup, \
+             mock.patch.object(history, "forget") as forget, \
+             mock.patch.object(settings, "get_show_replace_source", return_value=False):
+            ok, msg = stages.run_stage("upload", p)
+        self.assertTrue(ok)
+        self.assertEqual(sup.call_args.args[:2], (p.nas_final, p.final))
+        self.assertIn(old, sup.call_args.args[2])
+        forget.assert_called_once_with(old)
+        self.assertIn("superseded 1 older master", msg)
+
+    def test_nothing_to_supersede_touches_nothing(self):
+        import settings
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(stages.transfer, "upload",
+                               return_value=(True, p.nas_final[:-4] + ".mp4", "uploaded")), \
+             mock.patch.object(stages.transfer, "supersede_masters",
+                               side_effect=AssertionError("no candidates, no FTP")), \
+             mock.patch.object(settings, "get_show_replace_source", return_value=False):
+            ok, _msg = stages.run_stage("upload", p)
+        self.assertTrue(ok)

@@ -387,12 +387,10 @@ def chunk_bytes(segdir: str) -> int:
 
 
 def normalize_fps(rate):
-    """PURE. "24000/1001" / Fraction / "24" -> "num/den" in lowest terms; None if unknown."""
-    try:
-        f = Fraction(str(rate).strip())
-    except (ValueError, ZeroDivisionError):
-        return None
-    return f"{f.numerator}/{f.denominator}" if f > 0 else None
+    """PURE. "24000/1001" / Fraction / "24" -> "num/den" in lowest terms, snapped to the standard
+    rate it sits on (dvcap.snap_fps: a Matroska file reads 60000/1001 back as 19001/317); None if
+    unknown."""
+    return dvcap.snap_fps(rate)
 
 
 def fps_fraction(path: str):
@@ -705,7 +703,8 @@ def begin_marker(p, chunk_list: list, fps: str, cfr: dict, pre_vf: str | None = 
     dir is kept and the analysis resumes chunk by chunk."""
     inputs = marker_inputs(p, chunk_list, fps, cfr, pre_vf)
     old = read_marker(p)
-    same = (old is not None and all(old.get(k) == v for k, v in inputs.items())
+    snap = dvcap.snap_fps_fields          # a pre-snap marker's readback rate is the same input
+    same = (old is not None and all(snap({k: old.get(k)}) == snap({k: v}) for k, v in inputs.items())
             and old.get("pre_vf") == inputs.get("pre_vf"))
     _clear_outputs(p, work=not same)
     return write_marker(p, dict(inputs, state="analyzing"))

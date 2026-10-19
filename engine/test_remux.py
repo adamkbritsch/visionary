@@ -7,9 +7,9 @@ import unittest
 from unittest import mock
 
 import remux
-from remux import (build_extract_command, build_mkv_mux_command,
+from remux import (build_tracks_command, build_master_mux_command,
                    parse_streams, has_dolby_vision, dolby_vision_profile, verify_remux,
-                   needs_mkv, container_ext)
+                   needs_mkv, cfr_container_ext)
 
 # Real ffprobe shape (captured from a dovi_tool-built Profile 8.1 file).
 DOVI = {"side_data_type": "DOVI configuration record", "dv_profile": 8,
@@ -19,50 +19,229 @@ SAMPLE = json.dumps({"streams": [
     {"codec_type": "video", "codec_name": "hevc", "side_data_list": [DOVI]},
     {"codec_type": "audio", "codec_name": "eac3"},
     {"codec_type": "audio", "codec_name": "aac"},
-    {"codec_type": "subtitle", "codec_name": "mov_text"},
+    {"codec_type": "subtitle", "codec_name": "subrip"},
 ]})
 
 
+def fake_mux(seen=None, reason="DV 8.1 · 1 audio · 1 sub"):
+    """remux._mux_verified stand-in: the .part appears (so atomic_ship renames it for real) and
+    passes. `seen` collects each call's (es, fps, tracks, kwargs)."""
+    def run(es, fps, tracks, output, **kw):
+        if seen is not None:
+            seen.append(dict(kw, es=es, fps=fps, tracks=tracks))
+        with open(remux.part_path(output), "w") as f:
+            f.write("mkv")
+        return remux.RemuxResult(True, output, "8.1", 1, 1, reason)
+    return run
+
+
+TRACKS_OK = (True, "", "", 0)   # remux._prepare_tracks: built, no audio note, no failure, no sync
+
+
 class BuildCommands(unittest.TestCase):
-    def test_extract_audio_from_cfr_subs_from_original(self):
-        # MP4 path: audio comes from the CFR file (input 0), subs from the ORIGINAL (input 1).
-        cmd = build_extract_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mp4")
+    def test_tracks_take_audio_from_cfr_subs_from_original(self):
+        # Audio comes from the CFR file (input 0), subs from the ORIGINAL (input 1), into a
+        # MATROSKA tracks file — never any video.
+        cmd = build_tracks_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mka",
+                                   subs=[(0, "copy"), (2, "srt")])
         inputs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"]
         self.assertEqual(inputs, ["/cfr.mp4", "/orig.mkv"])
         self.assertIn("0:a", cmd)        # all audio from input 0 (the CFR file)
-        self.assertIn("1:s?", cmd)       # subs from input 1 (the original)
-        self.assertIn("mov_text", cmd)   # text subs -> mp4 timed text
         self.assertNotIn("0:v", cmd)     # never copies video
-        self.assertEqual(cmd[-1], "/t.mp4")
-        # -fix_sub_duration guards the ORIGINAL input (S09E08: a negative-duration .ass cue
-        # otherwise aborts the whole mux) — it must sit BEFORE the second -i, as an input option.
-        fix = cmd.index("-fix_sub_duration")
-        second_i = [i for i, x in enumerate(cmd) if x == "-i"][1]
-        self.assertEqual(fix, second_i - 1)
+        self.assertEqual(cmd[-3:], ["-f", "matroska", "/t.mka"])
+        # -fix_sub_duration is a RETRY only: it swallows the LAST line of every decoded track
+        self.assertNotIn("-fix_sub_duration", cmd)
+        fixed = build_tracks_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mka",
+                                     subs=[(0, "srt")], fix_sub_duration=True)
+        # ...and when used it guards the ORIGINAL input: BEFORE the second -i, an input option
+        second_i = [i for i, x in enumerate(fixed) if x == "-i"][1]
+        self.assertEqual(fixed.index("-fix_sub_duration"), second_i - 1)
 
-    def test_extract_without_subs_drops_all_sub_flags(self):
+    def test_each_subtitle_is_mapped_with_its_own_codec(self):
+        # the n-th SOURCE subtitle, copied or converted per output stream: mov_text has no
+        # Matroska codec ID, so it becomes SRT while PGS/ASS/SRT stay as they are
+        cmd = build_tracks_command("/ff", "/c", "/o", "/t.mka", subs=[(0, "copy"), (2, "srt")])
+        j = " ".join(cmd)
+        self.assertIn("-map 1:s:0 -c:s:0 copy", j)
+        self.assertIn("-map 1:s:2 -c:s:1 srt", j)
+        self.assertIn("-map 1:t?", j)                  # the fonts those subtitles render with
+        # the per-stream subtitle codecs come AFTER the blanket -c copy, so they win
+        self.assertGreater(cmd.index("-c:s:1"), cmd.index("-c"))
+
+    def test_no_subtitles_means_no_subtitle_or_font_maps(self):
         # Last-resort retry: an unconvertible subtitle track ships the master without subs
         # instead of parking the episode.
-        cmd = build_extract_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mp4", include_subs=False)
-        self.assertNotIn("1:s?", cmd)
-        self.assertNotIn("mov_text", cmd)
-        self.assertIn("0:a", cmd)                      # audio untouched
-        self.assertIn("-fix_sub_duration", cmd)        # harmless to keep; input opt only
+        for subs in (None, []):
+            cmd = build_tracks_command("/ff", "/cfr.mp4", "/orig.mkv", "/t.mka", subs=subs)
+            self.assertFalse([x for x in cmd if x.startswith("1:s") or x == "1:t?"])
+            self.assertIn("0:a", cmd)                  # audio untouched
 
-    def test_mkv_mux_copies_dv_video_audio_subs(self):
-        # MKV path: one ffmpeg copy — DV video (in0) + audio (CFR, in1) + all subs (original, in2).
-        cmd = build_mkv_mux_command("/ff", "/dv.mov", "/cfr.mkv", "/orig.mkv", "/out.mkv")
-        self.assertEqual(cmd[0], "/ff")
-        inputs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"]
-        self.assertEqual(inputs, ["/dv.mov", "/cfr.mkv", "/orig.mkv"])
-        self.assertIn("0:v:0", cmd)      # DV video
-        self.assertIn("1:a", cmd)        # audio from the CFR file
-        self.assertIn("2:s?", cmd)       # ALL subs (incl. bitmap PGS) from the original
-        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
-        self.assertEqual(cmd[-1], "/out.mkv")
+    def test_no_default_subtitle_and_no_release_title(self):
+        cmd = build_tracks_command("/ff", "/c", "/o", "/t.mka", subs=[(0, "copy")])
+        self.assertEqual(cmd[cmd.index("-disposition:s") + 1], "-default")   # forced is kept
+        self.assertEqual(cmd[cmd.index("-default_mode") + 1], "infer_no_subs")
+        # GLOBAL only: a bare -map_metadata -1 also strips stream/chapter tags (languages,
+        # names, a font attachment's filename — without which the whole file fails)
+        self.assertEqual(cmd[cmd.index("-map_metadata:g") + 1], "-1")
+        self.assertNotIn("-map_metadata", cmd)
 
-class ContainerDecision(unittest.TestCase):
-    """MP4 by default; MKV only for content MP4 can't hold (lossless audio / bitmap subs)."""
+    def test_master_mux_is_mkvmerge_with_the_exact_rate(self):
+        cmd = build_master_mux_command("/mkvmerge", "/s/v.hevc", "24000/1001", "/s/o.mkv.part",
+                                       tracks="/s/t.mka", colour=["--colour-primaries", "0:9"],
+                                       seed="o.mkv")
+        self.assertEqual(cmd[0], "/mkvmerge")
+        self.assertEqual(cmd[cmd.index("-o") + 1], "/s/o.mkv.part")
+        self.assertEqual(cmd[cmd.index("--default-duration") + 1], "0:24000/1001p")
+        self.assertEqual(cmd[cmd.index("--title") + 1], "")
+        import zlib
+        self.assertEqual(cmd[cmd.index("--deterministic") + 1], str(zlib.crc32(b"o.mkv")))
+        self.assertEqual(cmd[-2:], ["/s/v.hevc", "/s/t.mka"])   # the ES is track 0, then the tracks
+        self.assertIn("--colour-primaries", cmd)
+        self.assertNotIn("dvp", " ".join(cmd))                  # no forced DV record: from the stream
+
+    def test_master_mux_passes_every_path_absolute(self):
+        # mkvmerge reads an argument starting with '+', '@', '=' or '(' as syntax: a relative
+        # path like "+ Fire.hevc" would never be opened as a file
+        cmd = build_master_mux_command("/m", "+ Fire.hevc", "25", "(x).mkv", tracks="@t.mka")
+        for path in (cmd[cmd.index("-o") + 1], cmd[-2], cmd[-1]):
+            self.assertTrue(os.path.isabs(path), path)
+
+    def test_a_video_only_mux_has_no_tracks_input(self):
+        cmd = build_master_mux_command("/m", "/v.hevc", "25/1", "/r.part")
+        self.assertEqual(cmd[-1], "/v.hevc")
+
+    def test_warnings_are_a_successful_mux(self):
+        for rc, ok in ((0, True), (1, True), (2, False)):
+            with mock.patch("subprocess.run", return_value=mock.Mock(returncode=rc, stdout="w",
+                                                                     stderr="")):
+                self.assertEqual(remux.run_mux(["/m"])[0], ok, rc)
+
+
+class MuxSeedAndSync(unittest.TestCase):
+    def test_a_name_starting_with_at_never_reaches_mkvmerge_as_an_option_file(self):
+        cmd = build_master_mux_command("/m", "/v.hevc", "25", "/o.part", seed="@midnight S01E01.mkv")
+        self.assertTrue(cmd[cmd.index("--deterministic") + 1].isdigit())
+
+    def test_a_positive_shift_delays_the_video_a_negative_one_the_tracks(self):
+        late = build_master_mux_command("/m", "/v.hevc", "25", "/o.part", tracks="/t.mka", sync_ms=21)
+        self.assertEqual(late[late.index("--sync") + 1], "0:21")
+        self.assertLess(late.index("--sync"), late.index("/v.hevc"))      # applies to the ES
+        early = build_master_mux_command("/m", "/v.hevc", "25", "/o.part", tracks="/t.mka", sync_ms=-7)
+        self.assertEqual(early[early.index("--sync") + 1], "-1:7")
+        self.assertEqual(early[-1], "/t.mka")
+        self.assertGreater(early.index("--sync"), early.index("/v.hevc"))  # applies to the tracks
+        self.assertNotIn("--sync", build_master_mux_command("/m", "/v", "25", "/o", tracks="/t"))
+
+    def test_the_shift_is_measured_on_a_copied_track_against_the_picture(self):
+        pts = {("/t.mka", "a:0"): 0.0, ("/c.mp4", "a:0"): -0.021333, ("/c.mp4", "v:0"): 0.0}
+        with mock.patch.object(remux, "_first_pts", side_effect=lambda p, sel, fp=None: pts[(p, sel)]):
+            self.assertEqual(remux.tracks_sync_ms("/c.mp4", "/t.mka", (0, 0)), 21)
+        pts[("/t.mka", "a:0")] = -0.021333                  # nothing shifted: nothing to undo
+        with mock.patch.object(remux, "_first_pts", side_effect=lambda p, sel, fp=None: pts[(p, sel)]):
+            self.assertEqual(remux.tracks_sync_ms("/c.mp4", "/t.mka", (0, 0)), 0)
+        with mock.patch.object(remux, "_first_pts", return_value=None):
+            self.assertEqual(remux.tracks_sync_ms("/c.mp4", "/t.mka", (0, 0)), 0)
+
+
+class SubtitlePlan(unittest.TestCase):
+    def _plan(self, codecs):
+        js = json.dumps({"streams": [{"codec_type": "video"}] + [
+            {"codec_type": "subtitle", "codec_name": c} for c in codecs]})
+        with mock.patch.object(remux, "_probe", return_value=js):
+            return remux.subtitle_plan("/orig")
+
+    def test_copy_what_matroska_holds_convert_mov_text_drop_the_rest(self):
+        self.assertEqual(self._plan(["subrip", "mov_text", "eia_608", "hdmv_pgs_subtitle",
+                                     "webvtt", "ass"]),
+                         [(0, "copy"), (1, "srt"), (3, "copy"), (4, "srt"), (5, "copy")])
+
+    def test_none_or_unreadable(self):
+        self.assertEqual(self._plan([]), [])
+        with mock.patch.object(remux, "_probe", return_value="{}"):
+            self.assertEqual(remux.subtitle_plan("/x"), [])
+
+
+class TracksRetryLadder(unittest.TestCase):
+    """_prepare_tracks: subtitles as planned; a failure that converts any retries with
+    -fix_sub_duration (it costs each converted track its last line, so never first); then the
+    master ships without subtitles rather than parking."""
+
+    def _go(self, outcomes, plan):
+        calls = []
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=outcomes[len(calls) - 1], stderr="boom")
+        with mock.patch.object(remux, "atmos_audio_index", return_value=None), \
+             mock.patch.object(remux, "subtitle_plan", return_value=plan), \
+             mock.patch.object(remux, "tracks_sync_ms", return_value=0), \
+             mock.patch.object(remux.subprocess, "run", side_effect=run):
+            res = remux._prepare_tracks("/c", "/o", "/t.mka")
+        return res, calls
+
+    def test_a_clean_build_is_one_pass_without_the_fix(self):
+        res, calls = self._go([0], [(0, "srt")])
+        self.assertEqual(res, (True, "", "", 0))
+        self.assertNotIn("-fix_sub_duration", calls[0])
+
+    def test_a_failed_conversion_retries_with_the_fix_then_ships_with_subs(self):
+        res, calls = self._go([1, 0], [(0, "srt")])
+        self.assertTrue(res[0])
+        self.assertIn("durations repaired", res[1])
+        self.assertIn("-fix_sub_duration", calls[1])
+        self.assertIn("1:s:0", calls[1])
+
+    def test_then_without_subtitles(self):
+        res, calls = self._go([1, 1, 0], [(0, "srt")])
+        self.assertTrue(res[0])
+        self.assertIn("subs dropped", res[1])
+        self.assertFalse([x for x in calls[2] if x.startswith("1:s")])
+
+    def test_copied_tracks_skip_the_fix_rung(self):
+        res, calls = self._go([1, 0], [(0, "copy")])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("-fix_sub_duration", calls[1])
+        self.assertIn("subs dropped", res[1])
+
+    def test_nothing_works_is_a_failure(self):
+        res, _ = self._go([1, 1, 1], [(0, "srt")])
+        self.assertFalse(res[0])
+        self.assertIn("tracks failed", res[2])
+
+
+class ColourArgs(unittest.TestCase):
+    MD = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
+
+    def test_hdr10_from_the_same_values_the_sei_carries(self):
+        a = " ".join(remux.mkv_colour_args(False, self.MD, "1000,400"))
+        for want in ("--colour-primaries 0:9", "--colour-transfer-characteristics 0:16",
+                     "--colour-matrix-coefficients 0:9", "--colour-range 0:1",
+                     "--chromaticity-coordinates 0:0.68,0.32,0.265,0.69,0.15,0.06",
+                     "--white-colour-coordinates 0:0.3127,0.329", "--max-luminance 0:1000",
+                     "--min-luminance 0:0.005", "--max-content-light 0:1000",
+                     "--max-frame-light 0:400"):
+            self.assertIn(want, a)
+
+    def test_nothing_invented_when_unknown(self):
+        a = " ".join(remux.mkv_colour_args(False, None, None))
+        self.assertIn("--colour-transfer-characteristics 0:16", a)
+        for absent in ("chromaticity", "luminance", "content-light"):
+            self.assertNotIn(absent, a)
+        self.assertNotIn("content-light", " ".join(remux.mkv_colour_args(False, None, "0,0")))
+
+    def test_sdr_is_bt709(self):
+        a = " ".join(remux.mkv_colour_args(True, self.MD, "1000,400"))
+        self.assertIn("--colour-primaries 0:1", a)
+        self.assertIn("--colour-transfer-characteristics 0:1", a)
+        self.assertNotIn("luminance", a)
+
+    def test_parse_rejects_garbage(self):
+        self.assertIsNone(remux.parse_x265_master_display("nope"))
+        self.assertIsNone(remux.parse_x265_master_display(None))
+
+
+class CfrContainerDecision(unittest.TestCase):
+    """The CFR INTERMEDIATE: MP4 by default, MKV only for content an MP4 can't hold (lossless
+    audio / bitmap subs). The master is always MKV — this decides nothing about it."""
     def _probe(self, streams):
         return json.dumps({"streams": streams})
 
@@ -78,7 +257,7 @@ class ContainerDecision(unittest.TestCase):
                 [{"codec_type": "subtitle", "codec_name": sub}])), sub)
 
     def test_lossy_audio_and_text_subs_stay_mp4(self):
-        # AAC / AC3 / E-AC3 / DTS-core / DTS-HD HRA (lossy) + text subs → MP4.
+        # AAC / AC3 / E-AC3 / DTS-core / DTS-HD HRA (lossy) + text subs → an MP4 CFR.
         streams = [{"codec_type": "audio", "codec_name": "aac", "profile": "LC"},
                    {"codec_type": "audio", "codec_name": "ac3"},
                    {"codec_type": "audio", "codec_name": "eac3"},
@@ -88,14 +267,27 @@ class ContainerDecision(unittest.TestCase):
         self.assertFalse(needs_mkv(self._probe(streams)))
 
     def test_pgs_with_aac_forces_mkv(self):
-        # The real Hairspray case: AAC audio + PGS subs → MKV (to keep the subtitles).
+        # The real Hairspray case: AAC audio + PGS subs → an MKV CFR.
         streams = [{"codec_type": "audio", "codec_name": "aac", "profile": "LC"},
                    {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"}]
         self.assertTrue(needs_mkv(self._probe(streams)))
 
-    def test_container_ext_defaults_mp4_when_unprobeable(self):
+    def test_cfr_ext_defaults_mp4_when_unprobeable(self):
         # A missing/unprobeable source (e.g. not downloaded yet) → safe '.mp4' default.
-        self.assertEqual(container_ext("/no/such/file.mkv"), ".mp4")
+        self.assertEqual(cfr_container_ext("/no/such/file.mkv"), ".mp4")
+
+
+class EveryMasterIsMatroska(unittest.TestCase):
+    def test_a_non_mkv_output_is_refused_before_anything_runs(self):
+        with mock.patch("subprocess.run") as run, mock.patch.object(remux.dvcap, "probe_video") as pv:
+            for fn, args in ((remux.remux, ("/r", "/c", "/o", "/out.mp4")),
+                             (remux.remux_inject, ("/r", "/c", "/o", "/out.mp4")),
+                             (remux.remux_ship_render, ("/r", "/c", "/o", "/out.mp4"))):
+                res = fn(*args)
+                self.assertFalse(res.ok)
+                self.assertIn("Matroska", res.reason)
+            run.assert_not_called()
+            pv.assert_not_called()
 
 
 class DolbyVision(unittest.TestCase):
@@ -132,6 +324,26 @@ class ParseAndVerify(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("dolby", reason.lower())
 
+    def test_verify_demands_exactly_8_1_single_layer(self):
+        # mkvmerge DERIVES the record (MP4Box forced it): an 8.4 / 8.2 / dual-layer result fails
+        for change in ({"dv_bl_signal_compatibility_id": 4}, {"dv_bl_signal_compatibility_id": 2},
+                       {"dv_profile": 7, "el_present_flag": 1}, {"el_present_flag": 1},
+                       {"rpu_present_flag": 0}):
+            js = json.dumps({"streams": [
+                {"codec_type": "video", "side_data_list": [dict(DOVI, **change)]},
+                {"codec_type": "audio", "codec_name": "aac"}]})
+            ok, reason = verify_remux(js)
+            self.assertFalse(ok, change)
+            self.assertIn("8.1", reason)
+
+    def test_an_sdr_master_must_not_claim_dolby_vision(self):
+        ok, reason = verify_remux(SAMPLE, require_dv=False)
+        self.assertFalse(ok)
+        self.assertIn("SDR", reason)
+        plain = json.dumps({"streams": [{"codec_type": "video", "codec_name": "hevc"},
+                                        {"codec_type": "audio", "codec_name": "aac"}]})
+        self.assertTrue(verify_remux(plain, require_dv=False)[0])
+
     def test_verify_fails_without_audio(self):
         no_audio = json.dumps({"streams": [
             {"codec_type": "video", "codec_name": "hevc", "side_data_list": [DOVI]},
@@ -166,9 +378,8 @@ class PeakRepairLadder(unittest.TestCase):
              mock.patch.object(remux.dvcap, "encode_capped_segmented", return_value=(True, 100, "ok")), \
              mock.patch.object(remux.dvcap, "reencode_segments_tighter", side_effect=fake_reencode), \
              mock.patch.object(remux.dvcap, "video_peak_buckets", side_effect=list(buckets_seq)), \
-             mock.patch.object(remux, "_verify",
-                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1,
-                                                                           "DV 8.1 · 1 audio · 1 sub")), \
+             mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="DV 8.1 · 1 audio · 1 sub")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
              mock.patch.object(remux.subprocess, "run", return_value=ran):
             return remux.remux(os.path.join(tmp, "dv.mov"), "cfr.mp4", "orig.mkv", out)
 
@@ -236,9 +447,8 @@ class EncodeSourceRouting(unittest.TestCase):
                  mock.patch.object(remux.dvcap, "reencode_segments_tighter", side_effect=fake_repair), \
                  mock.patch.object(remux.dvcap, "video_peak_buckets",
                                    side_effect=[{1: 58.6}, {1: 40.0}]), \
-                 mock.patch.object(remux, "_verify",
-                                   side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1,
-                                                                               "ok")), \
+                 mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="ok")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
                  mock.patch.object(remux.subprocess, "run", return_value=ran):
                 res = remux.remux(render, "cfr.mkv", "orig.mkv", out, encode_source=source_cfr)
         self.assertTrue(res.ok)
@@ -265,9 +475,8 @@ class EncodeSourceRouting(unittest.TestCase):
                  mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
                  mock.patch.object(remux.dvcap, "encode_capped_segmented", side_effect=fake_encode), \
                  mock.patch.object(remux.dvcap, "video_peak_buckets", return_value={1: 45.0}), \
-                 mock.patch.object(remux, "_verify",
-                                   side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1,
-                                                                               "ok")), \
+                 mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="ok")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
                  mock.patch.object(remux.subprocess, "run", return_value=ran):
                 res = remux.remux(render, "cfr.mkv", "orig.mkv", out)
         self.assertTrue(res.ok)
@@ -303,9 +512,9 @@ class InjectPath(unittest.TestCase):
                  mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
                  mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
                  mock.patch.object(remux.dvcap, "video_peak_buckets") as peak, \
-                 mock.patch.object(remux, "_verify",
-                                   side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 2, 1,
-                                                                               "DV 8.1 · 2 audio · 1 sub")), \
+                 mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
+                 mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="DV 8.1 · 2 audio · 1 sub")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
                  mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run):
                 res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
             self.assertTrue(res.ok)
@@ -351,6 +560,7 @@ class InjectPath(unittest.TestCase):
             with mock.patch.object(remux.dvcap, "probe_video",
                                    side_effect=[self.R_INFO, self.S_INFO]), \
                  mock.patch.object(remux.dvcap, "count_hevc_frames", side_effect=[100, 99]), \
+                 mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
                  mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
                  mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
                  mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run):
@@ -358,48 +568,6 @@ class InjectPath(unittest.TestCase):
             self.assertFalse(res.ok)
             self.assertIn("frame count changed", res.reason)
             self.assertFalse(os.path.exists(out + ".inject.hevc"))   # transients swept on failure too
-
-
-class MP4BoxSafeInput(unittest.TestCase):
-    """MP4Box's -add parser mangles characters in the INPUT path: a "+" fails with
-    "Requested URL is not valid or cannot be found" (live-caught on "Lost - S02E12 -
-    Fire + Water", parked after 5 identical failures). Backslash-escaping does not help,
-    so a sanitised HARDLINK is handed to MP4Box instead."""
-
-    def test_safe_name_is_passed_through_untouched(self):
-        import tempfile, os as _os
-        d = tempfile.mkdtemp()
-        p = _os.path.join(d, "Plain Name HDR10 DV upscaled.mkv.capped.hevc")
-        open(p, "wb").write(b"x")
-        with remux.mp4box_safe_input(p) as got:
-            self.assertEqual(got, p)                       # no link created for a safe name
-            self.assertEqual(len(_os.listdir(d)), 1)
-
-    def test_plus_gets_a_sanitised_hardlink_that_is_removed(self):
-        import tempfile, os as _os
-        d = tempfile.mkdtemp()
-        p = _os.path.join(d, "Fire + Water HDR10 DV upscaled.mkv.capped.hevc")
-        open(p, "wb").write(b"payload")
-        with remux.mp4box_safe_input(p) as got:
-            self.assertNotEqual(got, p)
-            self.assertNotIn("+", _os.path.basename(got))
-            self.assertTrue(_os.path.exists(got))
-            self.assertEqual(open(got, "rb").read(), b"payload")     # same inode, same bytes
-            self.assertEqual(_os.stat(got).st_ino, _os.stat(p).st_ino)
-        self.assertFalse(_os.path.exists(got))             # ALWAYS removed — a leftover
-        self.assertTrue(_os.path.exists(p))                # hardlink would pin the transient
-
-    def test_link_is_removed_even_when_the_mux_raises(self):
-        import tempfile, os as _os
-        d = tempfile.mkdtemp()
-        p = _os.path.join(d, "A + B.hevc")
-        open(p, "wb").write(b"x")
-        seen = {}
-        with self.assertRaises(RuntimeError):
-            with remux.mp4box_safe_input(p) as got:
-                seen["path"] = got
-                raise RuntimeError("MP4Box blew up")
-        self.assertFalse(_os.path.exists(seen["path"]))
 
 
 class ShipRender(unittest.TestCase):
@@ -415,7 +583,7 @@ class ShipRender(unittest.TestCase):
              mock.patch.object(remux.subprocess, "run",
                                side_effect=AssertionError("must bail before any work")):
             res = remux.remux_ship_render("/dv.mov", "/cfr.mp4", "/orig.mp4",
-                                          "/tmp/out.mp4", cap_mbps=50)
+                                          "/tmp/out.mkv", cap_mbps=50)
         self.assertFalse(res.ok)
         self.assertTrue(res.reason.startswith("render-over-cap"))
         self.assertIn("81.2", res.reason)
@@ -424,7 +592,7 @@ class ShipRender(unittest.TestCase):
         import dvcap
         with mock.patch.object(dvcap, "probe_video", return_value={"frames": 0, "fps": ""}):
             res = remux.remux_ship_render("/dv.mov", "/cfr.mp4", "/orig.mp4",
-                                          "/tmp/out.mp4", cap_mbps=50)
+                                          "/tmp/out.mkv", cap_mbps=50)
         self.assertFalse(res.ok)
         self.assertFalse(res.reason.startswith("render-over-cap"))   # a real failure retries
 
@@ -542,9 +710,9 @@ class InjectSkipAndConvert(unittest.TestCase):
                                side_effect=AssertionError("skip_inject must not extract")), \
              mock.patch.object(remux.dvcap, "build_inject_command",
                                side_effect=AssertionError("skip_inject must not inject")), \
-             mock.patch.object(remux, "_verify",
-                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 2, 1,
-                                                                           "DV 8.1")), \
+             mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
+             mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="DV 8.1")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
              mock.patch.object(remux.subprocess, "run", side_effect=fake_run):
             return remux.remux_inject("winner.mkv", "audio.mkv", "winner.mkv", out,
                                       skip_inject=skip_inject, convert_es=convert_es)
@@ -628,9 +796,10 @@ class AudioDonorSyncGate(unittest.TestCase):
 
 
 class MkvLoudnessBoost(unittest.TestCase):
-    """The MKV branch skipped the loudness boost outright because Matroska is where LOSSLESS
-    audio lives — but the rule is about the CODEC, not the container, and most masters here
-    carry AAC or AC3. A 4K master with AAC 5.1 shipped simply quiet (user-caught 2026-08-18)."""
+    """The old MKV branch skipped the loudness boost outright because Matroska is where LOSSLESS
+    audio lives — but the rule is about the CODEC, not the container, and most masters carry AAC
+    or AC3. A 4K master with AAC 5.1 shipped simply quiet (user-caught 2026-08-18). Every master
+    is Matroska now; the tracks builder boosts whatever is lossy."""
 
     def test_lossless_codecs_are_identified(self):
         for c, p in (("truehd", ""), ("mlp", ""), ("flac", ""), ("alac", ""),
@@ -643,13 +812,13 @@ class MkvLoudnessBoost(unittest.TestCase):
             self.assertFalse(remux.is_lossless_audio_codec(c, p), c)
 
     def test_a_gain_re_encodes_only_the_audio(self):
-        c = remux.build_mkv_mux_command("/ff", "/v.mp4", "/a.mkv", "/o.mkv", "/out.mkv", gain_db=6.0)
+        c = remux.build_tracks_command("/ff", "/a.mkv", "/o.mkv", "/t.mka", gain_db=6.0)
         self.assertEqual(c[c.index("-c") + 1], "copy")          # video + subs untouched (DV survives)
         self.assertEqual(c[c.index("-c:a") + 1], "aac_at")
         self.assertIn("-filter:a", c)
 
     def test_no_gain_is_a_pure_copy_mux(self):
-        c = remux.build_mkv_mux_command("/ff", "/v.mp4", "/a.mkv", "/o.mkv", "/out.mkv")
+        c = remux.build_tracks_command("/ff", "/a.mkv", "/o.mkv", "/t.mka")
         self.assertNotIn("aac_at", c)
         self.assertNotIn("-filter:a", c)
 
@@ -701,15 +870,15 @@ class LosslessIsBoostedButKeptWhole(unittest.TestCase):
     one rather than being replaced (user-dictated 2026-08-21)."""
 
     def _cmd(self, gain=6.0, keep=2):
-        return remux.build_mkv_mux_command("/ff", "/dv.mp4", "/cfr.mkv", "/orig.mkv",
-                                           "/out.mkv", gain_db=gain, keep_original_audio=keep)
+        return remux.build_tracks_command("/ff", "/cfr.mkv", "/orig.mkv", "/t.mka",
+                                          gain_db=gain, keep_original_audio=keep)
 
     def test_the_boosted_copy_comes_first(self):
         c = self._cmd()
-        self.assertLess(c.index("1:a:0"), c.index("1:a"))     # map order decides track order
+        self.assertLess(c.index("0:a:0"), c.index("0:a"))     # map order decides track order
 
     def test_every_original_track_is_still_there(self):
-        self.assertIn("1:a", self._cmd())
+        self.assertIn("0:a", self._cmd())
 
     def test_only_the_first_track_is_re_encoded(self):
         c = self._cmd()
@@ -734,16 +903,16 @@ class LosslessIsBoostedButKeptWhole(unittest.TestCase):
 
     def test_a_lossy_source_is_unchanged(self):
         # keep=0 -> the long-standing single-track boost, byte for byte as before
-        c = remux.build_mkv_mux_command("/ff", "/dv.mp4", "/c", "/o", "/out.mkv", gain_db=6.0)
+        c = remux.build_tracks_command("/ff", "/c", "/o", "/t.mka", gain_db=6.0)
         self.assertIn("-c:a", c)
-        self.assertNotIn("1:a:0", c)
+        self.assertNotIn("0:a:0", c)
         self.assertNotIn("-disposition:a:0", c)
 
     def test_no_gain_means_no_encoder_and_no_duplicate_track(self):
-        c = remux.build_mkv_mux_command("/ff", "/dv.mp4", "/c", "/o", "/out.mkv",
+        c = remux.build_tracks_command("/ff", "/c", "/o", "/t.mka",
                                         gain_db=0.0, keep_original_audio=2)
         self.assertNotIn("aac_at", c)
-        self.assertNotIn("1:a:0", c)
+        self.assertNotIn("0:a:0", c)
 
     def test_the_lossless_check_itself_is_unchanged(self):
         # keeping the original depends on correctly RECOGNISING lossless
@@ -787,7 +956,7 @@ class AtmosIsLeftAlone(unittest.TestCase):
         self.assertEqual(len([x for x in m if x == "-map"]), 4)   # every track exactly once
 
     def test_the_extract_copies_atmos_instead_of_boosting_it(self):
-        c = remux.build_extract_command("/ff", "/cfr", "/orig", "/t.mp4",
+        c = remux.build_tracks_command("/ff", "/cfr", "/orig", "/t.mka",
                                         gain_db=10.9, atmos_lead=2, n_audio=4)
         self.assertNotIn("aac_at", c)              # nothing re-encoded
         self.assertNotIn("-filter:a", c)           # no gain applied
@@ -795,22 +964,15 @@ class AtmosIsLeftAlone(unittest.TestCase):
         self.assertLess(c.index("0:a:2"), c.index("0:a:0"))       # Atmos first
         self.assertEqual(c[c.index("-disposition:a:0") + 1], "default")
 
-    def test_the_mkv_mux_does_the_same(self):
-        c = remux.build_mkv_mux_command("/ff", "/dv", "/cfr", "/orig", "/o.mkv",
-                                        gain_db=10.9, atmos_lead=2, n_audio=4)
-        self.assertNotIn("aac_at", c)
-        self.assertLess(c.index("1:a:2"), c.index("1:a:0"))
-        self.assertEqual(c[c.index("-disposition:a:0") + 1], "default")
-
     def test_atmos_outranks_keeping_a_lossless_original(self):
         # a TrueHD Atmos bed is BOTH — untouched wins over boost-and-keep
-        c = remux.build_mkv_mux_command("/ff", "/dv", "/cfr", "/orig", "/o.mkv",
+        c = remux.build_tracks_command("/ff", "/cfr", "/orig", "/t.mka",
                                         gain_db=10.9, keep_original_audio=2,
                                         atmos_lead=0, n_audio=2)
         self.assertNotIn("aac_at", c)
 
     def test_a_non_atmos_title_is_completely_unchanged(self):
-        c = remux.build_extract_command("/ff", "/cfr", "/orig", "/t.mp4", gain_db=10.9)
+        c = remux.build_tracks_command("/ff", "/cfr", "/orig", "/t.mka", gain_db=10.9)
         self.assertIn("aac_at", c)
         self.assertIn("-map", c)
         self.assertIn("0:a", c)
@@ -824,22 +986,10 @@ class MastersMustBeInterleaved(unittest.TestCase):
     """Don't Look Up's master streamed at 154 MB/s from the NAS and still stalled the SHIELD
     from ~1:45 on. Its audio drifted away from its own video and kept drifting — 5.7 MB by
     1 minute, 12 by 2, 32 by 5, 115 by 20 — so a player had to hold that whole span to keep
-    picture and sound together. The mux's 500 ms interleave window did it, and only with
-    SUBTITLE tracks present; small AAC audio hid it (other masters measured 1-3 MB), four
-    full-bitrate stream-copied tracks did not. Measured on the same file, same mux:
-        audio only,  -inter 500 -> 0.0 / 1.5 / 0.9 MB
-        + subtitles, -inter 500 -> 0.2 / 5.7 / 8.4 MB    <- what shipped
-        + subtitles, -inter 100 -> 0.0 / 0.0 / 0.0 MB
-    (live-caught 2026-08-22)"""
-
-    def test_the_mux_interleaves_tightly(self):
-        self.assertEqual(remux.MUX_INTERLEAVE_MS, 100)
-        c = remux.build_capped_mux_command("/mp4box", "/es.hevc", "24", "/t.mp4", "/o.mp4")
-        self.assertEqual(c[c.index("-inter") + 1], "100")
-
-    def test_the_window_comes_before_the_output(self):
-        c = remux.build_capped_mux_command("/mp4box", "/es.hevc", "24", "/t.mp4", "/o.mp4")
-        self.assertLess(c.index("-inter"), c.index("-new"))
+    picture and sound together (an MP4Box mux's 500 ms interleave window, live-caught
+    2026-08-22). mkvmerge orders every track's blocks by timestamp, so a Matroska master should
+    never come near the limit — the gate stays, measured on the file that ships, as the check
+    that would catch a muxer that does."""
 
     def _gap(self, positions):
         """positions: {(stream, t): byte_pos}"""
@@ -849,7 +999,7 @@ class MastersMustBeInterleaved(unittest.TestCase):
             p = positions.get((sel, t))
             return mock.Mock(stdout="" if p is None else "%d.0,%d\n" % (t, p))
         with mock.patch.object(remux.subprocess, "run", side_effect=run):
-            return remux.interleave_gap_mb("/x.mp4", at=(60, 300))
+            return remux.interleave_gap_mb("/x.mkv", at=(60, 300))
 
     def test_a_tight_file_measures_near_zero(self):
         self.assertLess(self._gap({("v:0", 60): 100_000_000, ("a:0", 60): 100_200_000,
@@ -864,26 +1014,29 @@ class MastersMustBeInterleaved(unittest.TestCase):
         self.assertEqual(self._gap({}), -1.0)
 
     def test_the_gate_rejects_a_drifting_master_and_removes_it(self):
-        res = remux.RemuxResult(True, "/o.mp4")
+        res = remux.RemuxResult(True, "/o.mkv")
         with mock.patch.object(remux, "interleave_gap_mb", return_value=115.6), \
+             mock.patch.object(remux, "subtitle_gap_mb", return_value=(0.0, 0.0)), \
              mock.patch.object(remux, "_rm") as rm:
-            out = remux._gate_interleave(res, "/o.mp4")
+            out = remux._gate_interleave(res, "/o.mkv.part")
         self.assertFalse(out.ok)
         self.assertIn("115.6 MB", out.reason)
-        rm.assert_called_once_with("/o.mp4")               # never leave a bad master on disk
+        rm.assert_called_once_with("/o.mkv.part")          # never leave a bad master on disk
 
     def test_the_gate_passes_a_tight_master(self):
-        res = remux.RemuxResult(True, "/o.mp4")
+        res = remux.RemuxResult(True, "/o.mkv")
         with mock.patch.object(remux, "interleave_gap_mb", return_value=0.03), \
+             mock.patch.object(remux, "subtitle_gap_mb", return_value=(0.4, 0.2)), \
              mock.patch.object(remux, "_rm") as rm:
-            self.assertTrue(remux._gate_interleave(res, "/o.mp4").ok)
+            self.assertTrue(remux._gate_interleave(res, "/o.mkv.part").ok)
         rm.assert_not_called()
 
     def test_an_unmeasurable_gap_passes_rather_than_parking_the_item(self):
-        res = remux.RemuxResult(True, "/o.mp4")
+        res = remux.RemuxResult(True, "/o.mkv")
         with mock.patch.object(remux, "interleave_gap_mb", return_value=-1.0), \
+             mock.patch.object(remux, "subtitle_gap_mb", return_value=(-1.0, -1.0)), \
              mock.patch.object(remux, "_rm"):
-            self.assertTrue(remux._gate_interleave(res, "/o.mp4").ok)
+            self.assertTrue(remux._gate_interleave(res, "/o.mkv.part").ok)
 
     def test_the_threshold_sits_between_what_shipped_and_what_works(self):
         # 8.4 MB was already stalling; 0.03 MB is the fixed mux. The gate has to split them.
@@ -892,9 +1045,10 @@ class MastersMustBeInterleaved(unittest.TestCase):
 
 
 class SubtitlesSitWithTheirPicture(unittest.TestCase):
-    """2026-10-18: MP4Box wrote every subtitle of an episode into the first ~150 MB while the
-    picture ran to 2.5 GB; the SHIELD stuttered seeking back for each one. The audio gate never
-    looked at subtitles. Now they are measured on the shipped file and re-interleaved."""
+    """2026-10-18: an MP4Box mux wrote every subtitle of an episode into the first ~150 MB while
+    the picture ran to 2.5 GB; the SHIELD stuttered seeking back for each one. The audio gate
+    never looked at subtitles. They are measured on the file that ships, and a master whose
+    subtitles sit too far from their picture is refused (mkvmerge places them by timestamp)."""
 
     def test_distance_is_measured_against_the_picture_at_the_same_instant(self):
         video = [(t / 24, int(t / 24 * 1_412_000)) for t in range(0, 24 * 1001)]   # ~11 Mbps
@@ -920,74 +1074,159 @@ class SubtitlesSitWithTheirPicture(unittest.TestCase):
         self.assertEqual(remux.subtitle_gaps([(0.0, 1)], []), (0.0, 0.0))
         self.assertEqual(remux.subtitle_gaps([], [(1.0, 5, 10)]), (-1.0, -1.0))
 
-    def test_the_reinterleave_keeps_dolby_vision_and_hvc1(self):
-        c = remux.build_reinterleave_command("/ff", "/in.mp4", "/out.mp4")
-        self.assertEqual(c[c.index("-strict") + 1], "unofficial")      # else the DV box is dropped
-        self.assertEqual(c[c.index("-tag:v") + 1], "hvc1")
-        self.assertEqual(c[c.index("-c") + 1], "copy")
-        self.assertEqual(c[c.index("-map") + 1], "0")
-        self.assertEqual(c[-1], "/out.mp4")
-        self.assertNotIn("-tag:v", remux.build_reinterleave_command("/ff", "/i", "/o", hevc=False))
-
-    def test_the_gate_fixes_misplaced_subtitles_and_says_so(self):
-        res = remux.RemuxResult(True, "/o.mp4", reason="DV 8.1 · 1 audio · 1 sub")
+    def test_the_gate_refuses_misplaced_subtitles_and_removes_the_master(self):
+        res = remux.RemuxResult(True, "/o.mkv")
         with mock.patch.object(remux, "interleave_gap_mb", return_value=0.1), \
-             mock.patch.object(remux, "fix_subtitle_interleave",
-                               return_value=(True, "subtitles re-interleaved (2314 -> 1 MB)")), \
+             mock.patch.object(remux, "subtitle_gap_mb", return_value=(2314.0, 1900.0)), \
              mock.patch.object(remux, "_rm") as rm:
-            out = remux._gate_interleave(res, "/o.mp4")
-        self.assertTrue(out.ok)
-        self.assertIn("re-interleaved", out.reason)
-        rm.assert_not_called()
-
-    def test_the_gate_refuses_subtitles_it_could_not_fix_and_removes_the_master(self):
-        res = remux.RemuxResult(True, "/o.mp4")
-        with mock.patch.object(remux, "interleave_gap_mb", return_value=0.1), \
-             mock.patch.object(remux, "fix_subtitle_interleave",
-                               return_value=(False, "subtitles sit 2314 MB from their picture")), \
-             mock.patch.object(remux, "_rm") as rm:
-            out = remux._gate_interleave(res, "/o.mp4")
+            out = remux._gate_interleave(res, "/o.mkv.part")
         self.assertFalse(out.ok)
         self.assertIn("2314 MB", out.reason)
-        rm.assert_called_once_with("/o.mp4")
+        rm.assert_called_once_with("/o.mkv.part")
 
-    def test_a_tight_master_is_left_alone(self):
-        with mock.patch.object(remux, "subtitle_gap_mb", return_value=(1.0, 0.7)), \
-             mock.patch.object(remux.subprocess, "run") as run:
-            self.assertEqual(remux.fix_subtitle_interleave("/o.mp4"), (True, ""))
-        run.assert_not_called()
+    def test_one_far_subtitle_is_enough(self):
+        res = remux.RemuxResult(True, "/o.mkv")
+        with mock.patch.object(remux, "interleave_gap_mb", return_value=0.1), \
+             mock.patch.object(remux, "subtitle_gap_mb",
+                               return_value=(remux.MAX_SUBTITLE_WORST_MB + 1, 0.5)), \
+             mock.patch.object(remux, "_rm"):
+            self.assertFalse(remux._gate_interleave(res, "/o.mkv.part").ok)
 
 
-@unittest.skipUnless(os.path.exists(remux.FFMPEG) and os.path.exists(remux.MP4BOX)
-                     and os.path.exists(remux.FFPROBE), "ffmpeg/MP4Box not installed")
-class SubtitleReinterleaveForReal(unittest.TestCase):
-    """A real MP4 with its subtitles stored AFTER all the picture (MP4Box -flat), fixed for real."""
+@unittest.skipUnless(all(os.path.exists(t) for t in (remux.FFMPEG, remux.FFPROBE, remux.MKVMERGE)),
+                     "ffmpeg/ffprobe/mkvmerge not installed")
+class MkvMasterForReal(unittest.TestCase):
+    """A real master built the way remux builds one — the tracks file (audio + an SRT and a
+    mov_text subtitle, through build_tracks_command / subtitle_plan) muxed by mkvmerge with a raw
+    HEVC ES — passes both interleave gates, keeps every subtitle line, converts the mov_text one
+    to SRT, turns no subtitle on, and carries the exact frame count and rate."""
 
-    def test_a_flat_master_is_reinterleaved_losslessly(self):
+    def test_a_real_mkvmerge_master(self):
         d = tempfile.mkdtemp()
         try:
-            v, srt, flat = (os.path.join(d, n) for n in ("v.mp4", "s.srt", "flat.mp4"))
-            r = subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-                                "-i", "testsrc2=size=320x180:rate=24", "-t", "40", "-c:v", "libx264",
-                                "-b:v", "4M", "-g", "48", v], capture_output=True)
+            j = lambda n: os.path.join(d, n)
+            r = subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24000/1001",
+                                "-t", "40", "-c:v", "libx265", "-x265-params", "log-level=error",
+                                "-b:v", "4M", "-f", "hevc", j("v.hevc")], capture_output=True)
             if r.returncode:
-                self.skipTest("no libx264 here")
-            with open(srt, "w") as f:
+                self.skipTest("no libx265 here")
+            with open(j("s.srt"), "w") as f:
                 for i in range(1, 19):
                     f.write(f"{i}\n00:00:{i * 2:02d},000 --> 00:00:{i * 2 + 1:02d},000\nline {i}\n\n")
-            r = subprocess.run([remux.MP4BOX, "-add", v, "-add", srt + ":lang=en", "-flat", "-new", flat],
-                               capture_output=True)
+            # the "CFR": 40 s of audio; the "original": two subtitle tracks, one of them mov_text
+            subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                            "-i", "sine=f=440:d=40", "-c:a", "aac", j("cfr.mp4")], check=True)
+            subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                            "-i", "anullsrc=d=40", "-i", j("s.srt"), "-i", j("s.srt"), "-map", "0",
+                            "-map", "1", "-map", "2", "-c:a", "aac", "-c:s", "mov_text",
+                            j("orig.mp4")], check=True)
+            plan = remux.subtitle_plan(j("orig.mp4"))
+            self.assertEqual(plan, [(0, "srt"), (1, "srt")])
+            r = subprocess.run(build_tracks_command(remux.FFMPEG, j("cfr.mp4"), j("orig.mp4"),
+                                                    j("t.mka"), subs=plan), capture_output=True)
             self.assertEqual(r.returncode, 0, r.stderr)
-            worst0, _ = remux.subtitle_gap_mb(flat)
-            self.assertGreater(worst0, 4.0)                          # subtitles parked after the picture
+            ok, why = remux.run_mux(build_master_mux_command(remux.MKVMERGE, j("v.hevc"),
+                                                             "24000/1001", j("o.mkv.part"),
+                                                             tracks=j("t.mka"),
+                                                             colour=remux.mkv_colour_args(True),
+                                                             seed="o.mkv"))
+            self.assertTrue(ok, why)
+            res = remux._verify(j("o.mkv.part"), remux.FFPROBE, require_dv=False, frames=959,
+                                output=j("o.mkv"))
+            self.assertTrue(res.ok, res.reason)
+            self.assertEqual(res.subtitle, 2)
             with mock.patch.object(remux, "MAX_SUBTITLE_GAP_MB", 1.0), \
                  mock.patch.object(remux, "MAX_SUBTITLE_WORST_MB", 2.0):   # a 20 MB clip, scaled limits
-                ok, note = remux.fix_subtitle_interleave(flat)
-            self.assertTrue(ok, note)
-            self.assertIn("re-interleaved", note)
-            worst1, p991 = remux.subtitle_gap_mb(flat)
-            self.assertLess(worst1, 2.0)
-            self.assertFalse(os.path.exists(flat + ".reinterleave.mp4"))
+                self.assertTrue(remux._gate_interleave(res, j("o.mkv.part")).ok, res.reason)
+            js = json.loads(subprocess.run([remux.FFPROBE, "-v", "error", "-show_streams", "-of",
+                                            "json", j("o.mkv.part")], capture_output=True,
+                                           text=True).stdout)
+            v = [x for x in js["streams"] if x["codec_type"] == "video"][0]
+            self.assertEqual(v["r_frame_rate"], "24000/1001")
+            subs = [x for x in js["streams"] if x["codec_type"] == "subtitle"]
+            self.assertEqual([x["codec_name"] for x in subs], ["subrip", "subrip"])
+            self.assertFalse(any(x.get("disposition", {}).get("default") for x in subs))
+            lines = remux._packets(j("o.mkv.part"), "s", size=True)
+            self.assertEqual(len(lines), 36)                       # 18 lines x 2 tracks
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+@unittest.skipUnless(all(os.path.exists(t) for t in (remux.FFMPEG, remux.FFPROBE, remux.MKVMERGE)),
+                     "ffmpeg/ffprobe/mkvmerge not installed")
+class MkvMasterKeepsWhatTheSourceSays(unittest.TestCase):
+    """A real MKV original the way a WEB-DL / fansub release looks — Spanish AAC, an English FORCED
+    SRT, a French ASS with its FONT attached, named chapters — through the real _prepare_tracks and
+    mkvmerge: every language, the forced flag, the font, the chapter names and both subtitle tracks
+    survive; no subtitle is default; no release title; and the audio keeps its place against the
+    picture across the MP4 CFR's AAC priming (review-caught 2026-10-19: -map_metadata -1 dropped
+    all of it, and the font failure took every subtitle with it)."""
+
+    FONT = next((f for f in ("/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+                             "/Library/Fonts/AbrilFatface-Regular.ttf") if os.path.exists(f)), None)
+
+    def test_languages_forced_font_chapters_and_sync(self):
+        if not self.FONT:
+            self.skipTest("no TTF font to attach")
+        d = tempfile.mkdtemp()
+        try:
+            j = lambda n: os.path.join(d, n)
+            run = lambda c: subprocess.run(c, capture_output=True, text=True, check=True)
+            run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                 "-i", "testsrc2=size=320x180:rate=24000/1001", "-f", "lavfi", "-i", "sine=f=440",
+                 "-t", "12", "-c:v", "libx264", "-c:a", "aac", "-shortest", j("av.mkv")])
+            with open(j("en.srt"), "w") as f:
+                f.write("1\n00:00:02,000 --> 00:00:03,000\nforced line\n\n"
+                        "2\n00:00:06,000 --> 00:00:07,000\nsecond\n\n")
+            with open(j("fr.ass"), "w") as f:
+                f.write("[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, "
+                        "Fontsize\nStyle: Default,Andale Mono,20\n\n[Events]\nFormat: Layer, Start, End, "
+                        "Style, Text\nDialogue: 0,0:00:04.00,0:00:05.00,Default,bonjour\n")
+            with open(j("ch.txt"), "w") as f:
+                f.write("CHAPTER01=00:00:00.000\nCHAPTER01NAME=Opening\n"
+                        "CHAPTER02=00:00:06.000\nCHAPTER02NAME=Act One\n")
+            run([remux.MKVMERGE, "-q", "-o", j("orig.mkv"), "--title", "Some.Release.1080p.WEB-DL",
+                 "--chapters", j("ch.txt"), "--language", "1:spa", "--track-name", "1:Espanol 2.0",
+                 j("av.mkv"), "--language", "0:eng", "--forced-display-flag", "0:yes",
+                 "--default-track-flag", "0:no", j("en.srt"), "--language", "0:fre", j("fr.ass"),
+                 "--attachment-mime-type", "font/ttf", "--attach-file", self.FONT])
+            # the CFR: an MP4 stream copy, as topaz.build_cfr_copy_command makes it (AAC priming)
+            run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", j("orig.mkv"),
+                 "-map", "0:v:0", "-map", "0:a", "-c", "copy", j("cfr.mp4")])
+            ok, note, why, sync = remux._prepare_tracks(j("cfr.mp4"), j("orig.mkv"), j("t.mka"))
+            self.assertTrue(ok, why)
+            self.assertNotIn("subs dropped", note)
+            a0 = remux._first_pts(j("cfr.mp4"), "a:0")
+            v0 = remux._first_pts(j("cfr.mp4"), "v:0")
+            self.assertLess(a0, v0)                     # the AAC priming this test is about...
+            self.assertGreater(sync, 0)                 # ...and the shift that undoes it
+            run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                 "-i", "testsrc2=size=320x180:rate=24000/1001", "-t", "12", "-c:v", "libx265",
+                 "-x265-params", "log-level=error", "-f", "hevc", j("v.hevc")])
+            ok, why = remux.run_mux(build_master_mux_command(
+                remux.MKVMERGE, j("v.hevc"), "24000/1001", j("o.mkv"), tracks=j("t.mka"),
+                colour=remux.mkv_colour_args(True), seed="o.mkv", sync_ms=sync))
+            self.assertTrue(ok, why)
+            info = json.loads(run([remux.MKVMERGE, "-J", j("o.mkv")]).stdout)
+            self.assertFalse(info["container"]["properties"].get("title"))      # no release name
+            tr = {t["type"]: [] for t in info["tracks"]}
+            for t in info["tracks"]:
+                tr[t["type"]].append(t["properties"])
+            self.assertEqual([a.get("language") for a in tr["audio"]], ["spa"])
+            subs = tr["subtitles"]
+            self.assertEqual([x.get("language") for x in subs], ["eng", "fre"])
+            self.assertEqual([bool(x.get("forced_track")) for x in subs], [True, False])
+            self.assertFalse(any(x.get("default_track") for x in subs))
+            self.assertEqual([a["file_name"] for a in info["attachments"]],
+                             [os.path.basename(self.FONT)])
+            chapters = run([remux.FFPROBE, "-v", "error", "-show_chapters", "-of", "json",
+                            j("o.mkv")]).stdout
+            self.assertEqual([c["tags"]["title"] for c in json.loads(chapters)["chapters"]],
+                             ["Opening", "Act One"])
+            # the audio starts where it did against the picture in the CFR (a priming -21 ms)
+            ma, mv = remux._first_pts(j("o.mkv"), "a:0"), remux._first_pts(j("o.mkv"), "v:0")
+            self.assertAlmostEqual((ma - mv), (a0 - v0), delta=0.0015)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -1101,7 +1340,7 @@ class AacAtCannotBeTrustedWithExoticLayouts(unittest.TestCase):
             src = open(mod.__file__.replace(".pyc", ".py")).read()
         r = open(remux.__file__).read()
         h = open(history.__file__).read()
-        self.assertEqual(r.count("build_audio_boost_filter(gain_db, src="), 3)
+        self.assertEqual(r.count("build_audio_boost_filter(gain_db, src="), 2)
         self.assertEqual(h.count("build_audio_boost_filter(gain, src=work)"), 1)
         self.assertEqual(h.count("boost_keeping_original_args(gain, keep, src=work)"), 1)
 
@@ -1239,8 +1478,9 @@ class NativeBundle(unittest.TestCase):
              mock.patch.object(remux.dvcap, "encode_capped_segmented", side_effect=fake_encode) as enc, \
              mock.patch.object(remux.dvcap, "reencode_segments_tighter", side_effect=fake_repair), \
              mock.patch.object(remux.dvcap, "video_peak_buckets", side_effect=list(buckets_seq)), \
-             mock.patch.object(remux, "_verify",
-                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1, "ok")), \
+             mock.patch.object(remux, "_mux_verified",
+                               side_effect=fake_mux(seen.setdefault("mux", []), reason="ok")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
              mock.patch.object(remux.subprocess, "run", return_value=ran) as run:
             res = remux.remux("/unused/render.mov", "cfr.mkv", "orig.mkv", out, native=bundle, **kw)
         seen["segdir"], seen["enc_mock"], seen["runs"] = segdir, enc, run.call_args_list
@@ -1266,10 +1506,16 @@ class NativeBundle(unittest.TestCase):
         for src in [s for s, _k in seen["enc"]] + [r[0] for r in seen["repair"]]:
             self.assertEqual(src, "/scratch/ep/seg_0000.mov")   # nominal: decode overrides it
         self.assertEqual(seen["repair"][0][1:3], ([0], 42))
-        # the MP4Box wrap carries the bundle's exact fps fraction
-        wraps = [c[0][0] for c in seen["runs"] if ":dvp=8.1:" in " ".join(map(str, c[0][0]))]
-        self.assertTrue(wraps)
-        self.assertTrue(all(w[2].endswith(":dvp=8.1:fps=24000/1001") for w in wraps))
+        # every mux (the first pass and the repaired one) carries the bundle's exact fps fraction,
+        # the frame count, and the HDR10 description the x265 SEI says (dvcap's 1000-nit fallback)
+        self.assertEqual(len(seen["mux"]), 2)
+        for m in seen["mux"]:
+            self.assertEqual(m["fps"], "24000/1001")
+            self.assertEqual(m["frames"], 6000)
+            self.assertTrue(m["require_dv"])
+            c = " ".join(m["colour"])
+            self.assertIn("--max-luminance 0:1000", c)
+            self.assertIn("--max-content-light 0:1000", c)
 
     def test_the_generated_rpu_is_copied_into_the_segdir(self):
         import os, tempfile
@@ -1400,8 +1646,8 @@ class ResolvePathPinned(unittest.TestCase):
                                return_value=(True, "ok")) as rep, \
              mock.patch.object(remux.dvcap, "video_peak_buckets",
                                side_effect=[{1: 58.6}, {1: 40.0}]), \
-             mock.patch.object(remux, "_verify",
-                               side_effect=lambda o, fp: remux.RemuxResult(True, o, "8.1", 1, 1, "ok")), \
+             mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="ok")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
              mock.patch.object(remux.subprocess, "run", return_value=ran):
             res = remux.remux(render, "cfr.mkv", "orig.mkv", out, boundaries=[50, 100], **kw)
         calls = {"probe": probe.call_args_list, "manifest": man.call_args_list,
@@ -1469,19 +1715,22 @@ class SdrMaster(unittest.TestCase):
              mock.patch.object(remux.dvcap, "reencode_segments_tighter",
                                return_value=(True, "ok")) as rep, \
              mock.patch.object(remux.dvcap, "video_peak_buckets", side_effect=[{1: 58.6}, {1: 40.0}]), \
-             mock.patch.object(remux, "_verify", side_effect=lambda o, fp, **k: verified.append(k)
-                               or remux.RemuxResult(True, o, None, 1, 1, "SDR · 1 audio · 1 sub")), \
-             mock.patch.object(remux.subprocess, "run", return_value=ran) as run:
+             mock.patch.object(remux, "_mux_verified",
+                               side_effect=fake_mux(verified, reason="SDR · 1 audio · 1 sub")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
+             mock.patch.object(remux.subprocess, "run", return_value=ran):
             out = os.path.join(tmp, "master SDR upscaled.mkv")
             res = remux.remux("/r/render.mov", "cfr.mkv", "orig.mkv", out, boundaries=[50, 100], sdr=True)
+            self.assertTrue(os.path.exists(out))               # the gated .part was renamed onto it
         self.assertTrue(res.ok, res.reason)
         self.assertEqual(man.call_args.kwargs.get("sdr"), True)
         for call in enc.call_args_list + rep.call_args_list:
             self.assertEqual(call.kwargs.get("dv"), False)
-        muxes = [c.args[0] for c in run.call_args_list if c.args and remux.MP4BOX in c.args[0][:1]]
-        self.assertTrue(muxes)
-        self.assertFalse(any("dvp=" in " ".join(m) for m in muxes))
-        self.assertEqual(verified, [{"require_dv": False}, {"require_dv": False}])
+        self.assertEqual([m["require_dv"] for m in verified], [False, False])   # both muxes
+        for m in verified:                                     # BT.709 container colour, no HDR10
+            c = " ".join(m["colour"])
+            self.assertIn("--colour-primaries 0:1", c)
+            self.assertNotIn("luminance", c)
 
     def test_sdr_refuses_what_only_dv_has(self):
         for kw in ({"native": {"chunks": []}}, {"encode_source": "/s.mkv"}, {"rpu_mode": 2}):
@@ -1490,13 +1739,11 @@ class SdrMaster(unittest.TestCase):
                 self.assertFalse(res.ok)
                 self.assertIn("no RPU", res.reason)
 
-    def test_the_mux_builders(self):
-        self.assertEqual(remux.build_capped_video_mux_command("MP4Box", "a.hevc", "25", "o.mp4", dv=False),
-                         ["MP4Box", "-add", "a.hevc:fps=25", "-new", "o.mp4"])
-        self.assertEqual(remux.build_capped_video_mux_command("MP4Box", "a.hevc", "25", "o.mp4"),
-                         ["MP4Box", "-add", "a.hevc:dvp=8.1:fps=25", "-new", "o.mp4"])
-        self.assertNotIn("dvp", " ".join(remux.build_capped_mux_command("MP4Box", "a.hevc", "25", "t.mp4",
-                                                                          "o.mp4", dv=False)))
+    def test_an_sdr_render_muxes_with_no_dv_and_bt709(self):
+        c = " ".join(remux.build_master_mux_command("/m", "/a.hevc", "25", "/o.part",
+                                                    colour=remux.mkv_colour_args(sdr=True)))
+        self.assertNotIn("dvp", c)
+        self.assertIn("--colour-transfer-characteristics 0:1", c)
 
     def test_verify_relaxes_only_the_dv_claim(self):
         sdr = json.dumps({"streams": [{"codec_type": "video"}, {"codec_type": "audio"}]})
@@ -1518,18 +1765,13 @@ class SdrMaster(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(remux.dvcap, "probe_video", return_value={"frames": 100, "fps": "25"}), \
              mock.patch.object(remux.dvcap, "video_peak_1s_mbps", return_value=20.0), \
-             mock.patch.object(remux, "_verify", side_effect=lambda o, fp, **k: verified.append(k)
-                               or remux.RemuxResult(True, o, None, 1, 0, "SDR · 1 audio · 0 sub")), \
-             mock.patch.object(remux, "_gate_interleave", side_effect=lambda r, o, fp: r), \
-             mock.patch.object(remux, "parse_streams", return_value={"video_tag": "hvc1"}), \
-             mock.patch.object(remux, "_probe", return_value="{}"), \
-             mock.patch.object(remux, "atmos_audio_index", return_value=None), \
-             mock.patch.object(remux, "measure_lufs", return_value=None), \
-             mock.patch.object(remux.subprocess, "run", side_effect=fake_run) as run:
+             mock.patch.object(remux, "_mux_verified",
+                               side_effect=fake_mux(verified, reason="SDR · 1 audio · 0 sub")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
+             mock.patch.object(remux.subprocess, "run", side_effect=fake_run):
             res = remux.remux_ship_render("/r.mov", "/c.mp4", "/o.mp4", os.path.join(tmp, "o.mkv"),
                                           cap_mbps=50, sdr=True)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "o.mkv")))
         self.assertTrue(res.ok, res.reason)
-        self.assertEqual(verified, [{"require_dv": False}])
-        muxes = [c.args[0] for c in run.call_args_list if c.args[0][:1] == [remux.MP4BOX]]
-        self.assertTrue(muxes)
-        self.assertFalse(any("dvp=" in " ".join(m) for m in muxes))
+        self.assertEqual([m["require_dv"] for m in verified], [False])
+        self.assertIn("--colour-primaries 0:1", " ".join(verified[0]["colour"]))

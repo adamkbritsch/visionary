@@ -124,7 +124,7 @@ Mac always passes; a 14-inch M1/M2 MacBook Pro or a MacBook Air is refused.
 ### 3. Command-line tools
 
 ```bash
-brew install ffmpeg x265 dovi_tool gpac
+brew install ffmpeg x265 dovi_tool mkvtoolnix
 brew pin ffmpeg dovi_tool     # the Dolby Vision step is pinned to ffmpeg 8 and dovi_tool 2.3.0
 ```
 
@@ -135,6 +135,9 @@ arm. If Homebrew has already moved past them: dovi_tool 2.3.0 is on its
 analyzer links Homebrew's `ffmpeg` at `/opt/homebrew/opt/ffmpeg`, so install the `ffmpeg@8`
 formula, `brew link --force ffmpeg@8`, and point that path at it
 (`ln -s ffmpeg@8 /opt/homebrew/opt/ffmpeg`).
+
+mkvtoolnix's **mkvmerge** muxes every master — each one is a Matroska file (`.mkv`) carrying
+Dolby Vision 8.1 — and preflight wants version 90.0 or newer (any current Homebrew build is).
 
 ### 4. Dolby Vision™ toolchain
 
@@ -261,7 +264,8 @@ NAS (FTP) ──download──▶ local scratch
                           │  measures every shot → dovi_tool writes the DV 8.1 metadata (RPU)
                           ▼
                         remux — x265 re-encode under a hard peak-bitrate cap (native DV RPU),
-                          │  original audio folded back + smart loudness boost, hvc1 mp4
+                          │  original audio + subtitles folded back + smart loudness boost,
+                          │  muxed by mkvmerge into a Dolby Vision 8.1 MKV
                           ▼
 NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the source (default) or lands
                        NEXT TO it — per-show/movie "Replaces source" setting; keeping
@@ -378,7 +382,7 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   seeding), and the combined master obeys the same playback peak budget as every other
   output, taking the capped re-encode (real RPU preserved) when the winner's peaks bust it.
 
-- **Dolby Vision™ profile 7 → 8.1, in place** (needs `brew install mkvtoolnix`; it
+- **Dolby Vision™ profile 7 → 8.1, in place** (it
   reaches the NAS over Visionary's own FTP, so it works away from home too, over Tailscale): Blu-ray remuxes carry Dolby Vision™ as **profile 7**, which most
   streaming players (Google TV, Apple TV, the SHIELD in some modes) will only play as HDR10.
   The Movies pane's **DV 7** filter lists every movie known to be profile 7 — read from the

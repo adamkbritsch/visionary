@@ -9,25 +9,27 @@ measured 139 Mbps single-second spikes on a 27.5 Mbps average, which underruns p
      if capping fails in any way, the stage FAILS — an uncapped file IS the broken file.
      A chunk-lane item (`remux(native=)`) has no render: the RPU is
      dvnative's generated one and x265 reads Topaz's ProRes chunks through the SDR->PQ LUT.
-  1. ffmpeg extracts every audio + subtitle track from the source (its `-map`
-     is reliable; subs -> mov_text) into a temp track file.
-  2. MP4Box muxes the capped ES (`:dvp=8.1:fps=`) + those tracks into the final
-     container, writing the Profile 8.1 dvcC box.
-A verification gate then confirms DV 8.1 + tracks survived AND re-measures the actual
-1-second peak of the shipped file (must be <= cap * tolerance) — this is where DV or the
-cap silently dies, so a miss parks the episode instead of shipping a broken file.
+  1. ffmpeg builds the TRACKS file (`<output>.tracks.mka`, Matroska): every audio track from
+     the CFR file (loudness-boosted or stream-copied — see build_tracks_command) plus the
+     subtitles, chapters and font attachments of the ORIGINAL download (the CFR pass no longer
+     carries subtitles — they don't need frame-rate re-timing).
+  2. mkvmerge muxes the capped ES (`--default-duration 0:<fps>p`, the timing a raw ES does not
+     carry) + the tracks file into `<output>.part`. It writes the Dolby Vision configuration
+     record (BlockAdditionMapping dvvC) ITSELF from the RPU NALs and the HEVC VUI, and the HDR10
+     colour description / mastering display / light level from mkv_colour_args.
+A verification gate then confirms DV 8.1 (profile 8, compat 1), the tracks and the exact frame
+count survived AND re-measures the actual 1-second peak of the shipped file (must be <= cap *
+tolerance) — this is where DV or the cap silently dies, so a miss parks the episode instead of
+shipping a broken file. Only a master that passed every gate is renamed from `.part` onto
+`output` (atomic_ship): a killed mkvmerge leaves a Matroska file whose header already says DV
+8.1 + audio, so a partial master must never sit at the name the resume logic trusts.
 
-The output container is MP4 by default, MKV only when the source has content MP4
-can't hold — lossless audio (TrueHD/DTS-HD MA/PCM/FLAC) or bitmap subtitles (PGS/
-VOBSUB). `container_ext()` decides; `remux()` dispatches on the output extension.
-The MKV path wraps the capped ES in a video-only MP4 first (MP4Box writes the dvcC),
-then a single ffmpeg copy muxes it with audio + all subs: ffmpeg's **Matroska** muxer
-(unlike its mp4 one) PRESERVES the DV config record on copy. Audio is taken from
-the CFR file; subtitles from the ORIGINAL download (the CFR pass no longer carries
-them — they don't need frame-rate re-timing).
+EVERY master is Matroska (user decision 2026-10-18: no MP4Box, every output MKV); `output` must
+end in .mkv. Matroska holds every source's audio (TrueHD/DTS-HD MA/PCM/FLAC included) and its
+subtitles as they are (SRT/ASS/PGS/VobSub), converting only what it has no codec for (mov_text).
+The CFR intermediate keeps its own container (cfr_container_ext): it is not an output.
 """
 from __future__ import annotations
-import contextlib
 import json
 import os
 import re
@@ -40,13 +42,31 @@ import dvcap
 
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 FFPROBE = "/opt/homebrew/bin/ffprobe"
-MP4BOX = "/opt/homebrew/bin/MP4Box"
+MKVMERGE = "/opt/homebrew/bin/mkvmerge"
 _DOVI_RECORD = "DOVI configuration record"
 
-# --- container choice: MP4 by default, MKV only when the content can't live in an MP4 -------
-# Audio MP4 can't carry losslessly (must go to MKV so the master keeps the original track):
+# --- THE MASTER IS ALWAYS MATROSKA ----------------------------------------------------------
+MASTER_EXT = ".mkv"
+
+
+def is_master_container(output: str) -> bool:
+    """Every master is .mkv. A '.mp4' output can only be a pre-2026-10-18 resume: mkvmerge writes
+    Matroska whatever the name says, so muxing it would ship Matroska bytes under an MP4 name."""
+    return str(output).lower().endswith(MASTER_EXT)
+
+
+def _not_mkv(output: str) -> "RemuxResult":
+    return RemuxResult(False, output, reason=f"every master is Matroska: {os.path.basename(output)!r} "
+                                             f"does not end in {MASTER_EXT} (shipped nothing)")
+
+
+# --- the CFR INTERMEDIATE's container (not the master's) -------------------------------------
+# The CFR copy (<stem>_cfr.*) carries the AUDIO the master gets, so it must hold the source's audio
+# as it is: MP4 unless the source has lossless audio (or bitmap subtitles, the old rule kept so a
+# CFR never changes container under an in-flight item). It stays MP4 by default ON PURPOSE:
+# Matroska's 1 ms timestamps re-declare a rounded rate on a stream copy, which once cost Topaz a
+# nine-hour run (topaz.py declared_rate_mismatch). It never decides the master's container.
 _LOSSLESS_AUDIO = {"truehd", "mlp", "flac", "alac"}    # + any pcm_*, + DTS-HD MA (checked below)
-# Bitmap subtitles MP4 can't hold at all (and can't convert to mov_text) → MKV to preserve them:
 _BITMAP_SUBS = {"hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "xsub"}
 
 
@@ -55,12 +75,13 @@ def _is_lossless_audio(codec: str, profile: str) -> bool:
     if c in _LOSSLESS_AUDIO or c.startswith("pcm_"):
         return True
     # ffprobe reports DTS-HD Master Audio (lossless) as codec 'dts', profile 'DTS-HD MA'; the
-    # lossy DTS variants (core, 'DTS-HD HRA', 'DTS Express') stay in MP4.
+    # lossy DTS variants (core, 'DTS-HD HRA', 'DTS Express') fit an MP4.
     return c == "dts" and "ma" in (profile or "").lower().split()
 
 
 def needs_mkv(probe_json: str) -> bool:
-    """True if the source has any stream MP4 can't hold — lossless audio or bitmap subtitles."""
+    """True if the source has any stream an MP4 CFR copy can't hold — lossless audio or bitmap
+    subtitles."""
     for s in json.loads(probe_json or "{}").get("streams", []):
         t = s.get("codec_type")
         if t == "audio" and _is_lossless_audio(s.get("codec_name"), s.get("profile")):
@@ -70,18 +91,65 @@ def needs_mkv(probe_json: str) -> bool:
     return False
 
 
-def container_ext(source: str, ffprobe: str = FFPROBE) -> str:
-    """'.mkv' if the source needs it (lossless audio / bitmap subs), else '.mp4'. Falls back to
-    '.mp4' when the source can't be probed (e.g. not downloaded yet) — a safe, common-case default."""
+def cfr_container_ext(source: str, ffprobe: str = FFPROBE) -> str:
+    """The CFR INTERMEDIATE's extension: '.mkv' if the source needs it (lossless audio / bitmap
+    subs), else '.mp4'. Falls back to '.mp4' when the source can't be probed (not downloaded
+    yet). The master is always MASTER_EXT, whatever this says."""
     return ".mkv" if needs_mkv(_probe(source, ffprobe)) else ".mp4"
 
 
-# ---- SMART LOUDNESS BOOST (remux-stage, MP4/AAC path only) --------------------------------
+# --- SUBTITLES INTO MATROSKA ------------------------------------------------------------------
+# Matroska holds these as they are (ffmpeg's matroska muxer has a codec ID for each):
+SUBS_COPY = {"subrip", "ass", "ssa", "hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
+# ...and has NO codec ID for these, so they are converted to SRT (S_TEXT/UTF8, which every Plex
+# client reads). mov_text is the common one: MP4 originals and youtarr's embedded YouTube subtitles
+# carry it, and an ffmpeg `-c copy` of it into Matroska fails the whole file ("Subtitle codec
+# mov_text is not supported" — tested). WebVTT is converted too: Plex's Matroska WebVTT support is
+# unproven, SRT is not.
+SUBS_TO_SRT = {"mov_text", "webvtt", "text", "subviewer", "subviewer1", "microdvd", "mpl2",
+               "realtext", "sami", "vplayer", "pjs", "jacosub", "stl"}
+# Anything else (eia_608 captions, dvb_teletext, arib_caption, hdmv_text_subtitle) is left out —
+# a track the container cannot carry must not cost the master its other subtitles.
+
+
+def subtitle_plan(orig_source: str, ffprobe: str = FFPROBE) -> list:
+    """[(n, action)] for the n-th subtitle stream of `orig_source`: 'copy' or 'srt', in source
+    order; streams Matroska cannot carry are left out. [] when it has none or can't be probed
+    (the tracks file then carries no subtitles rather than failing)."""
+    plan = []
+    try:
+        streams = json.loads(_probe(orig_source, ffprobe) or "{}").get("streams", [])
+    except ValueError:
+        return []
+    n = 0
+    for s in streams:
+        if s.get("codec_type") != "subtitle":
+            continue
+        codec = (s.get("codec_name") or "").lower()
+        if codec in SUBS_COPY:
+            plan.append((n, "copy"))
+        elif codec in SUBS_TO_SRT:
+            plan.append((n, "srt"))
+        n += 1
+    return plan
+
+
+def subtitle_args(plan: list, input_idx: int = 1) -> list:
+    """PURE. ffmpeg -map / per-output-stream codec args for `plan` (subtitle_plan), reading the
+    subtitles from input `input_idx`."""
+    args = []
+    for k, (n, action) in enumerate(plan):
+        args += ["-map", f"{input_idx}:s:{n}", f"-c:s:{k}", "copy" if action == "copy" else "srt"]
+    return args
+
+
+# ---- SMART LOUDNESS BOOST -------------------------------------------------------------------
 # Web 5.1 tracks ship quiet (The Office measured -23 LUFS; streaming target is -16). Each item
 # is measured individually (ebur128 integrated) and gained to `audio_target_lufs` with a -2 dB
 # limiter for the rare stings — dialogue dynamics untouched. Only BOOSTS (never attenuates), so
-# already-normalized sources pass through bit-exact on the copy path. The MKV path is exempt:
-# it exists to preserve LOSSLESS audio (TrueHD/DTS-HD MA), which we will not transcode.
+# already-normalized sources pass through bit-exact on the copy path. The rule is about the
+# CODEC, not the container: LOSSLESS audio (TrueHD/DTS-HD MA/PCM/FLAC) is never transcoded — a
+# boosted AAC copy of it leads and the untouched original follows (boost_keeping_original_args).
 AUDIO_MAX_GAIN_DB = 12.0
 AUDIO_MIN_GAIN_DB = 0.5           # under this, not worth a lossy AAC re-encode
 # How much of the REQUESTED gain a pass has to actually deliver to be believed. The alimiter
@@ -221,20 +289,35 @@ def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
         return None
 
 
-def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_out: str,
-                          gain_db: float = 0.0, include_subs: bool = True,
-                          atmos_lead=None, n_audio: int = 0) -> list:
-    """Pull audio from the CFR file (input 0) + text subtitles from the ORIGINAL (input 1) into an
-    MP4 track file. Subtitles come from the original because the CFR pass no longer carries them
-    (they don't need frame-rate re-timing); bitmap subs never reach the MP4 path (they force MKV).
+def build_tracks_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_out: str,
+                         gain_db: float = 0.0, subs=None, keep_original_audio: int = 0,
+                         atmos_lead=None, n_audio: int = 0, fix_sub_duration: bool = False) -> list:
+    """The master's TRACKS file (Matroska): every audio track from the CFR file (input 0) + the
+    subtitles, chapters and font attachments of the ORIGINAL (input 1). mkvmerge then muxes it
+    with the capped/injected/render ES (build_master_mux_command). Subtitles come from the
+    original because the CFR pass no longer carries them (they don't need frame-rate re-timing).
+    `subs` = subtitle_plan(orig_source): each stream copied as it is or converted to SRT ([] or
+    None = no subtitles: the last-resort retry ships the master without them rather than park
+    the item over a subtitle track). Font attachments ride along only with subtitles (they exist
+    for ASS).
     With `gain_db` > 0 the audio is loudness-boosted (volume + limiter -> aac_at 384k) instead of
-    stream-copied; subtitles are unaffected either way.
-    `-fix_sub_duration` on the original: a corrupt text cue with a NEGATIVE duration (S09E08's
-    .ass had end < start, wrapping to 4294967213000 ms) is otherwise passed through by the
-    mov_text encoder and the mp4 muxer aborts the WHOLE extract on it ("Error submitting a
-    packet to the muxer: Invalid argument"). The flag recomputes cue durations at decode.
-    `include_subs=False` is the last-resort retry: ship the master without subs rather than
-    park the episode over a subtitle track."""
+    stream-copied; `keep_original_audio` (the source's audio track count, set when any of it is
+    LOSSLESS) makes the boosted copy of track 0 LEAD and every original track follow untouched
+    (boost_keeping_original_args) — lossless audio is never transcoded away.
+    `fix_sub_duration` (-fix_sub_duration on the original): a corrupt text cue with a NEGATIVE
+    duration (S09E08's .ass had end < start, wrapping to 4294967213000 ms) once aborted the whole
+    MP4 track file. It is a RETRY only (_prepare_tracks), never the default: it holds every
+    DECODED cue until the next one arrives, so the LAST line of each converted track never comes
+    out (measured 2026-10-19: 34 of 36 lines — every MP4 master shipped before this lost its last
+    subtitle line). Copied tracks are not decoded, and the ASS reader already mends such a cue.
+    NO SUBTITLE IS DEFAULT: Matroska players switch a default subtitle track ON, and an MP4
+    source marks its first subtitle "enabled", which ffmpeg reads as default (live-caught in the
+    real-mux test, 2026-10-19). `-disposition:s -default` clears that flag and keeps `forced` (the
+    foreign-dialogue lines a player shows on its own); `-default_mode infer_no_subs` stops the
+    muxer inferring one. `-map_metadata:g -1`: no GLOBAL tags, so no release name rides into the
+    master's title — global only: a bare `-map_metadata -1` also strips every stream's and chapter's
+    tags (the languages Plex picks tracks by, track and chapter names, and the filename/mimetype
+    of font attachments, without which the whole file fails — review-caught 2026-10-19)."""
     # ATMOS IS NEVER TOUCHED, and it LEADS. The boost re-encodes every audio track to AAC,
     # which silently discarded the Atmos metadata on any title that carried it — Don't Look
     # Up shipped with its 'Dolby Digital Plus + Dolby Atmos' track flattened to AAC LC
@@ -243,18 +326,26 @@ def build_extract_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks
     if atmos_lead is not None:
         amaps = audio_map_args(0, n_audio, atmos_lead)
         audio = lead_track_disposition_args(n_audio)
-    else:
+    elif gain_db > 0 and keep_original_audio > 0:
+        amaps = ["-map", "0:a:0", "-map", "0:a"]      # boosted copy first, then the originals
+        audio = boost_keeping_original_args(gain_db, keep_original_audio, src=cfr_source)
+    elif gain_db > 0:
         amaps = ["-map", "0:a"]            # ALL audio tracks from CFR, in their own order
-        audio = (["-filter:a", build_audio_boost_filter(gain_db, src=cfr_source),
-                  "-c:a", "aac_at", "-b:a", "384k"] if gain_db > 0 else [])
-    subs = (["-map", "1:s?"] if include_subs else [])
-    subs_codec = (["-c:s", "mov_text"] if include_subs else [])
+        audio = ["-filter:a", build_audio_boost_filter(gain_db, src=cfr_source),
+                 "-c:a", "aac_at", "-b:a", "384k"]
+    else:
+        amaps, audio = ["-map", "0:a"], []
+    sub_args = subtitle_args(subs or [], input_idx=1)
     return [
         ffmpeg, "-hide_banner", "-nostdin", "-y",
-        "-i", cfr_source, "-fix_sub_duration", "-i", orig_source,
-        *amaps, *subs,                      # audio from the CFR, subs (optional) from the original
-        "-c", "copy", *audio, *subs_codec,  # subs -> mp4 timed text
-        tracks_out,
+        "-i", cfr_source, *(["-fix_sub_duration"] if fix_sub_duration else []), "-i", orig_source,
+        *amaps,                             # audio from the CFR...
+        "-c", "copy", *audio,
+        *sub_args,                          # ...subtitles (copied / -> SRT) from the original...
+        *(["-map", "1:t?"] if subs else []),   # ...and the fonts those subtitles render with
+        *(["-disposition:s", "-default"] if subs else []),
+        "-map_metadata:g", "-1", "-default_mode", "infer_no_subs",
+        "-f", "matroska", tracks_out,
     ]
 
 
@@ -404,110 +495,27 @@ def subtitle_gap_mb(path: str, ffprobe=FFPROBE) -> tuple:
     return subtitle_gaps(_packets(path, "v:0", ffprobe), subs)
 
 
-def build_reinterleave_command(ffmpeg: str, src: str, out: str, hevc: bool = True) -> list:
-    """Lossless re-interleave: every stream copied, written in time order. `-strict unofficial`
-    is what makes ffmpeg write the Dolby Vision configuration box (without it the master loses
-    DV); hvc1 keeps SHIELD direct play (see build_capped_mux_command) — HEVC only, so `hevc`
-    False (any other codec) leaves the tag alone."""
-    return ([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", src, "-map", "0",
-             "-c", "copy", "-map_metadata", "0", "-strict", "unofficial"]
-            + (["-tag:v", "hvc1"] if hevc else [])
-            + ["-movflags", "+faststart", "-max_interleave_delta", "0", "-f", "mp4", out])
-
-
-def _stream_signature(path: str, ffprobe=FFPROBE) -> tuple:
-    """(codec list, packet count per stream, Dolby Vision config) — what a re-interleave must keep."""
-    try:
-        js = json.loads(subprocess.run(
-            [ffprobe, "-v", "error", "-count_packets", "-show_entries",
-             "stream=index,codec_type,codec_name,nb_read_packets:stream_side_data", "-of", "json", path],
-            capture_output=True, text=True, errors="replace", timeout=600).stdout or "{}")
-    except Exception:
-        return None
-    sts = js.get("streams", [])
-    dv = None
-    for st in sts:
-        for sd in st.get("side_data_list") or []:
-            if "dv_profile" in sd:
-                dv = tuple(sd.get(k) for k in ("dv_profile", "dv_level", "rpu_present_flag",
-                                               "bl_present_flag", "el_present_flag",
-                                               "dv_bl_signal_compatibility_id"))
-    return ([(st.get("codec_type"), st.get("codec_name")) for st in sts],
-            [int(st.get("nb_read_packets") or 0) for st in sts], dv)
-
-
-def fix_subtitle_interleave(output: str, ffmpeg=FFMPEG, ffprobe=FFPROBE) -> tuple:
-    """(ok, note). Measure the shipped master's subtitles; if they sit too far from their
-    picture, re-interleave it losslessly and replace it — only after the rewrite keeps every
-    stream, every video/audio packet, every subtitle line (ffmpeg may add EMPTY gap samples) and the Dolby
-    Vision configuration, and its subtitles measure within the limits. ok=False when the
-    subtitles are misplaced and could not be fixed (the caller fails the master)."""
-    worst, p99 = subtitle_gap_mb(output, ffprobe)
-    if worst < 0 or (p99 <= MAX_SUBTITLE_GAP_MB and worst <= MAX_SUBTITLE_WORST_MB):
-        return True, ""
-    tmp = output + ".reinterleave.mp4"
-    a = _stream_signature(output, ffprobe)
-    hevc = not a or ("video", "hevc") in a[0]
-    try:
-        r = subprocess.run(build_reinterleave_command(ffmpeg, output, tmp, hevc=hevc), capture_output=True,
-                           text=True, errors="replace", timeout=3600)
-    except Exception as e:
-        _rm(tmp)
-        return False, f"subtitles sit {worst:.0f} MB from their picture and the re-interleave failed: {e}"
-    if r.returncode or not os.path.exists(tmp):
-        _rm(tmp)
-        return False, (f"subtitles sit {worst:.0f} MB from their picture and the re-interleave "
-                       f"failed: {_tail(r.stderr)}")
-    b = _stream_signature(tmp, ffprobe)
-    w2, p2 = subtitle_gap_mb(tmp, ffprobe)
-    why = None
-    if not a or not b or a[0] != b[0]:
-        why = "streams differ"
-    elif a[2] != b[2]:
-        why = f"Dolby Vision config {a[2]} -> {b[2]}"
-    else:
-        for (kind, _c), n0, n1 in zip(a[0], a[1], b[1]):
-            if kind != "subtitle" and n1 != n0:
-                why = f"{kind} packets {n0} -> {n1}"
-                break
-    if why is None:
-        # Subtitles: ffmpeg fills the gaps between lines with EMPTY samples (it may add more than
-        # MP4Box wrote), so the raw count is not the content. Every line that SHOWS — every
-        # non-empty sample — must come through at the same instant with the same bytes.
-        def lines(path):
-            return [(round(t, 3), sz) for t, _p, sz in _packets(path, "s", ffprobe, size=True) if sz > 2]
-        l0, l1 = lines(output), lines(tmp)
-        if l0 != l1:
-            why = f"subtitle lines differ ({len(l0)} -> {len(l1)})"
-    if why is None and (p2 > MAX_SUBTITLE_GAP_MB or w2 > MAX_SUBTITLE_WORST_MB):
-        why = f"subtitles still {w2:.0f} MB (p99 {p2:.1f}) away"
-    if why:
-        _rm(tmp)
-        return False, f"subtitles sit {worst:.0f} MB from their picture; the re-interleave was refused: {why}"
-    os.replace(tmp, output)
-    return True, f"subtitles re-interleaved ({worst:.0f} -> {w2:.0f} MB)"
-
-
-def _gate_interleave(res, output: str, ffprobe=FFPROBE, ffmpeg=FFMPEG):
-    """Refuse a master whose audio sits too far from its own video. Verified the same way the
-    hvc1 check is — on the SHIPPED file, not on what we meant to write — because this is a
-    property of the mux, and the one that shipped was measured at 115 MB by 20 minutes in.
-    Its SUBTITLES are checked the same way and re-interleaved losslessly when misplaced
-    (fix_subtitle_interleave); a master whose subtitles cannot be fixed is refused too."""
-    gap = interleave_gap_mb(output, ffprobe)
+def _gate_interleave(res, path: str, ffprobe=FFPROBE):
+    """Refuse a master whose audio or subtitles sit too far from their own video. Verified on the
+    file that will SHIP (`path`, the muxed .part), not on what we meant to write: an MP4Box mux
+    once measured 115 MB by 20 minutes in (audio, -inter 500) and 1.2-2.9 GB (every mov_text
+    sample written at the start of the file — the SHIELD stuttered). mkvmerge writes the blocks
+    of every track in timestamp order inside its clusters, so a Matroska master should never fail
+    this; it stays as the measurement that would catch a muxer that does. There is no fixer: a
+    master that fails is refused (and deleted), and the stage retries/parks it."""
+    gap = interleave_gap_mb(path, ffprobe)
     if gap > MAX_INTERLEAVE_GAP_MB:
         res.ok = False
         res.reason = (f"badly interleaved: audio sits {gap:.1f} MB from its own video "
                       f"(max {MAX_INTERLEAVE_GAP_MB:.0f}) — players stall on this")
-        _rm(output)
+        _rm(path)
         return res
-    ok, note = fix_subtitle_interleave(output, ffmpeg, ffprobe)
-    if not ok:
+    worst, p99 = subtitle_gap_mb(path, ffprobe)
+    if worst >= 0 and (p99 > MAX_SUBTITLE_GAP_MB or worst > MAX_SUBTITLE_WORST_MB):
         res.ok = False
-        res.reason = "badly interleaved: " + note + " — players stall on this"
-        _rm(output)
-    elif note:
-        res.reason += " · " + note
+        res.reason = (f"badly interleaved: subtitles sit {worst:.0f} MB (p99 {p99:.1f}) from their "
+                      f"picture — players stall on this")
+        _rm(path)
     return res
 
 
@@ -595,103 +603,101 @@ def boost_keeping_original_args(gain_db: float, n_audio: int, bitrate: str = "38
     return args
 
 
-def build_mkv_mux_command(ffmpeg: str, dv_video: str, cfr_source: str,
-                          orig_source: str, output: str, gain_db: float = 0.0,
-                          keep_original_audio: int = 0,
-                          atmos_lead=None, n_audio: int = 0) -> list:
-    """Single-pass ffmpeg mux for the MKV master: DV video (copy) + audio (from the CFR file) +
-    ALL subtitles (from the original, incl. bitmap PGS). Unlike its mp4/mov muxer — which drops the
-    Dolby Vision config box (that's why the MP4 path needs MP4Box) — ffmpeg's **Matroska** muxer
-    PRESERVES the DOVI configuration record on copy. Validated on a real 8.1 master: DV + AAC + PGS
-    all survive. Matroska also holds lossless audio (TrueHD/DTS-HD MA/PCM/FLAC) + bitmap subs, which
-    is exactly why these titles route here instead of MP4."""
-    # SMART LOUDNESS BOOST reaches the MKV path too (user-caught 2026-08-18: a 4K master
-    # with AAC 5.1 shipped unboosted and was simply quiet). This branch used to skip the
-    # boost outright because Matroska is where LOSSLESS audio lives — but the rule is about
-    # the CODEC, not the container, and most MKV masters here carry AAC/AC3. The caller only
-    # passes a gain once has_lossless_audio() says every track is lossy.
-    # LOSSLESS SOURCES KEEP THEIR ORIGINAL TRACK. `keep_original_audio` = how many audio
-    # tracks the source has; when set, a boosted copy of the first one leads and all the
-    # originals follow untouched (see boost_keeping_original_args).
-    if atmos_lead is not None:
-        # Atmos: nothing re-encoded, and it leads (see build_extract_command).
-        amaps = audio_map_args(1, n_audio, atmos_lead)
-        boost = lead_track_disposition_args(n_audio)
-    elif gain_db > 0 and keep_original_audio > 0:
-        amaps = ["-map", "1:a:0", "-map", "1:a"]      # boosted copy first, then the originals
-        boost = boost_keeping_original_args(gain_db, keep_original_audio, src=cfr_source)
-    elif gain_db > 0:
-        amaps = ["-map", "1:a"]
-        boost = ["-filter:a", build_audio_boost_filter(gain_db, src=cfr_source),
-                 "-c:a", "aac_at", "-b:a", "384k"]
-    else:
-        amaps, boost = ["-map", "1:a"], []
-    return [ffmpeg, "-hide_banner", "-nostdin", "-y",
-            "-i", dv_video, "-i", cfr_source, "-i", orig_source,
-            "-map", "0:v:0", *amaps, "-map", "2:s?",          # video / audio / all subs
-            "-c", "copy", *boost,
-            output]
-
-_MP4BOX_UNSAFE = re.compile(r"[+#:,@]")
+# ---- THE MKVMERGE MUX ----------------------------------------------------------------------
+# mkvmerge muxes every master (and the native render): it reads a raw HEVC ES, writes the Dolby
+# Vision configuration record ITSELF from the RPU NALs + the SPS VUI (profile 8, compat 1 for a
+# BT.2020/PQ base — verified in _verify), carries every NAL (RPU, AUD, HDR10 SEI) inside its
+# picture's block, and orders the blocks of all tracks by timestamp inside its clusters.
+MKVMERGE_OK = (0, 1)    # 1 = finished with WARNINGS (normal on many retail streams), 2 = error
 
 
-@contextlib.contextmanager
-def mp4box_safe_input(path: str):
-    """Yield a path MP4Box's `-add` can definitely open — `path` itself when it's already
-    safe, else a temporary hardlink beside it. The link is ALWAYS removed: a leftover
-    would keep the (huge) transient alive by holding a second reference to its inode."""
-    base = os.path.basename(path)
-    if not _MP4BOX_UNSAFE.search(base):
-        yield path
-        return
-    safe = os.path.join(os.path.dirname(path) or ".", "_mp4box_" + _MP4BOX_UNSAFE.sub("_", base))
+def mkv_colour_args(sdr: bool = False, master_display=None, max_cll=None, tid: int = 0) -> list:
+    """PURE. mkvmerge flags for track `tid`'s Matroska Colour element. mkvmerge writes none from
+    a raw ES (tested: no Colour, MasteringMetadata or MaxCLL from the VUI or the SEI), and MP4Box
+    wrote the mdcv/clli boxes, so an HDR10-fallback player that reads container metadata keeps it.
+    DV/HDR10: BT.2020 primaries + non-constant matrix (9), PQ (16), limited range (1), plus the
+    mastering display (`master_display`, dvcap's x265 string) and light level (`max_cll`, 'a,b')
+    when known — the SAME values the in-band SEI carries; nothing is invented when they are
+    absent. SDR: BT.709 (1/1/1), limited range."""
+    t = int(tid)
+    if sdr:
+        return ["--colour-matrix-coefficients", f"{t}:1", "--colour-range", f"{t}:1",
+                "--colour-transfer-characteristics", f"{t}:1", "--colour-primaries", f"{t}:1"]
+    args = ["--colour-matrix-coefficients", f"{t}:9", "--colour-range", f"{t}:1",
+            "--colour-transfer-characteristics", f"{t}:16", "--colour-primaries", f"{t}:9"]
+    md = parse_x265_master_display(master_display)
+    if md:
+        (gx, gy), (bx, by), (rx, ry), (wx, wy), (lmax, lmin) = md
+        args += ["--chromaticity-coordinates", f"{t}:{rx:g},{ry:g},{gx:g},{gy:g},{bx:g},{by:g}",
+                 "--white-colour-coordinates", f"{t}:{wx:g},{wy:g}",
+                 "--max-luminance", f"{t}:{lmax:g}", "--min-luminance", f"{t}:{lmin:g}"]
     try:
-        if os.path.exists(safe):
-            os.remove(safe)
-        os.link(path, safe)
-    except OSError:
-        yield path            # couldn't link — try the real path rather than fail outright
-        return
+        cll, fall = (int(v) for v in str(max_cll).split(","))
+        if cll > 0:
+            args += ["--max-content-light", f"{t}:{cll}", "--max-frame-light", f"{t}:{fall}"]
+    except (TypeError, ValueError):
+        pass
+    return args
+
+
+def parse_x265_master_display(md):
+    """PURE. x265's 'G(gx,gy)B(bx,by)R(rx,ry)WP(wx,wy)L(max,min)' (chromaticity in 0.00002,
+    luminance in 0.0001 cd/m², dvcap.mastering_to_x265's units) -> ((gx,gy),(bx,by),(rx,ry),
+    (wx,wy),(max,min)) as floats, or None when absent or malformed."""
+    m = re.fullmatch(r"G\((\d+),(\d+)\)B\((\d+),(\d+)\)R\((\d+),(\d+)\)WP\((\d+),(\d+)\)"
+                     r"L\((\d+),(\d+)\)", str(md or "").strip())
+    if not m:
+        return None
+    v = [int(x) for x in m.groups()]
+    c = [x / 50000 for x in v[:8]]
+    return (c[0], c[1]), (c[2], c[3]), (c[4], c[5]), (c[6], c[7]), (v[8] / 10000, v[9] / 10000)
+
+
+def build_master_mux_command(mkvmerge: str, es: str, fps: str, output: str, tracks=None,
+                             colour=(), seed=None, sync_ms: int = 0) -> list:
+    """mkvmerge: the raw HEVC `es` (+ the TRACKS file, build_tracks_command) -> `output`.
+    `--default-duration 0:<fps>p` is REQUIRED: a raw ES carries no container timing (a
+    VideoToolbox ES carries none at all — mkvmerge then assumes 25 fps), and mkvmerge also derives
+    the Dolby Vision LEVEL from it. `fps` must be the exact rational ('24000/1001'), the rate the
+    encode was planned at (dvcap.snap_fps). There is no DV flag to pass (MP4Box's `:dvp=8.1`):
+    mkvmerge builds the record from the stream, and _verify demands 8.1 of the result.
+    `--title ""`: no release name in the master's title. `seed` -> `--deterministic`: the same
+    inputs mux to the same bytes, so a resumed upload can never splice two different muxes (passed
+    as a NUMBER — mkvmerge reads any argument starting with '@' as an option file, a name too).
+    `sync_ms` (tracks_sync_ms): the shift ffmpeg applied to the tracks file, undone — positive
+    delays the video (`--sync 0:` on the ES), negative delays the tracks file (`--sync -1:` on it).
+    Every path is absolute: mkvmerge reads an argument starting with '+', '@', '=' or '(' as
+    syntax, never as a file name."""
+    import zlib
+    s = int(sync_ms or 0)
+    return [mkvmerge, "-q",
+            *(["--deterministic", str(zlib.crc32(str(seed).encode()))] if seed else []),
+            "-o", os.path.abspath(output), "--title", "",
+            "--default-duration", f"0:{fps}p", *colour,
+            *(["--sync", f"0:{s}"] if s > 0 else []), os.path.abspath(es),
+            *((["--sync", f"-1:{-s}"] if s < 0 else []) + [os.path.abspath(tracks)] if tracks else [])]
+
+
+def run_mux(cmd: list, timeout=None) -> tuple:
+    """(ok, detail) for an mkvmerge run; a warning-only run (rc 1) is a success."""
     try:
-        yield safe
-    finally:
-        try: os.remove(safe)
-        except OSError: pass
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+    except Exception as e:  # noqa: BLE001 — a missing binary / timeout is a failed mux
+        return False, str(e)
+    if r.returncode in MKVMERGE_OK:
+        return True, _tail(r.stdout) if r.returncode == 1 else ""
+    return False, _tail(r.stdout or r.stderr)
 
 
-# INTERLEAVE WINDOW. 500 ms looked harmless and was not: with SUBTITLE tracks in the mux the
-# audio drifts away from its own video and keeps drifting — measured on Don't Look Up's master
-# at 5.7 MB by 1 minute, 12 MB by 2, 32 MB by 5 and 115 MB by 20. A player has to hold that
-# whole span to keep picture and sound together, so the SHIELD stalled and rebuffered from
-# about 1:45 on (live-caught 2026-08-22) while the NAS was serving that byte range at
-# 154 MB/s. Small AAC audio mostly hid it (other masters measured 1-3 MB); four full-bitrate
-# stream-copied tracks did not. Measured, same file, same mux:
-#     audio only,  -inter 500 -> 0.0 / 1.5 / 0.9 MB
-#     + subtitles, -inter 500 -> 0.2 / 5.7 / 8.4 MB     <- what shipped
-#     + subtitles, -inter 100 -> 0.0 / 0.0 / 0.0 MB
-MUX_INTERLEAVE_MS = 100
+def part_path(output: str) -> str:
+    """Where a master is muxed before it has passed every gate (atomic_ship)."""
+    return output + ".part"
 
 
-def build_capped_mux_command(mp4box: str, hevc_es: str, fps: str, tracks: str, output: str,
-                             interleave_ms: int = MUX_INTERLEAVE_MS, dv: bool = True) -> list:
-    """MP4Box mux for the CAPPED raw HEVC ES (x265 output). `:dvp=8.1` writes the DV config box
-    signaling the RPUs x265 interleaved; `:fps=` is REQUIRED — a raw ES carries no container
-    timing, so MP4Box would otherwise assume 25 fps and silently desync the master. NO
-    `xps_inband`: that made the sample entry `hev1`, which the SHIELD refused to direct-play
-    (S05E24 "keeps loading"); without it MP4Box hoists the parameter sets into hvcC -> `hvc1`,
-    matching every master that played (x265's --repeat-headers keeps in-band copies too).
-    `dv=False` (an SDR master, 2026-10-18): no `:dvp=8.1` — there is no RPU to signal."""
-    return [mp4box, "-add", f"{hevc_es}{':dvp=8.1' if dv else ''}:fps={fps}", "-add", tracks,
-            "-inter", str(interleave_ms), "-new", output]
+def atomic_ship(part: str, output: str) -> None:
+    """Put a master that passed EVERY gate (verify, interleave, peak) at its real name."""
+    os.replace(part, output)
 
-
-def build_capped_video_mux_command(mp4box: str, hevc_es: str, fps: str, output: str,
-                                   dv: bool = True) -> list:
-    """Video-only MP4 wrap of the capped ES — the MKV path's intermediate: MP4Box writes the
-    DV config box, then ffmpeg's Matroska muxer (which preserves the DOVI record on copy,
-    unlike its mp4 muxer) carries it into the .mkv alongside the audio + bitmap subs.
-    Same no-`xps_inband` rule as above -> `hvc1`. `dv=False`: an SDR master, no DV box."""
-    return [mp4box, "-add", f"{hevc_es}{':dvp=8.1' if dv else ''}:fps={fps}", "-new", output]
 
 def _rm(path: str):
     try:
@@ -721,26 +727,41 @@ def dolby_vision_profile(stream: dict):
 
 def parse_streams(probe_json: str) -> dict:
     streams = json.loads(probe_json).get("streams", [])
-    counts = {"video": 0, "audio": 0, "subtitle": 0, "dovi_profile": None, "video_tag": None}
+    counts = {"video": 0, "audio": 0, "subtitle": 0, "dovi_profile": None, "dovi": None}
     for s in streams:
         t = s.get("codec_type")
         if t in counts:
             counts[t] += 1
-        if t == "video":
-            counts["video_tag"] = counts["video_tag"] or s.get("codec_tag_string")
-            if has_dolby_vision(s):
-                counts["dovi_profile"] = dolby_vision_profile(s)
+        if t == "video" and counts["dovi"] is None and has_dolby_vision(s):
+            counts["dovi_profile"] = dolby_vision_profile(s)
+            sd = next(d for d in s.get("side_data_list", []) if d.get("side_data_type") == _DOVI_RECORD)
+            counts["dovi"] = {k: sd.get(k) for k in ("dv_profile", "dv_level", "rpu_present_flag",
+                                                     "el_present_flag", "bl_present_flag",
+                                                     "dv_bl_signal_compatibility_id")}
     return counts
 
 
 def verify_remux(probe_json: str, min_audio: int = 1, require_dv: bool = True):
-    """`require_dv=False` for an item PINNED to SDR output: that master legitimately carries no
-    DOVI record, so the DV assertion would fail a perfectly good file. Everything else (audio
-    presence, and the hvc1 + peak checks at the call site) still applies — only the Dolby
-    Vision claim is relaxed, and only when the item asked for no Dolby Vision."""
+    """A DV master must carry EXACTLY Dolby Vision 8.1: profile 8, BL compatibility 1 (the HDR10
+    base every non-DV player falls back to), the RPU and the base layer present and NO enhancement
+    layer. MP4Box's `:dvp=8.1` used to FORCE that record whatever the stream held; mkvmerge DERIVES
+    it from the RPU and the HEVC VUI (a base without BT.2020/PQ VUI would come out 8.0 or 8.2), so
+    the result is checked rather than trusted. `require_dv=False` — an item PINNED to SDR output —
+    asks the opposite: no DOVI record at all (an SDR picture must never claim Dolby Vision).
+    Audio presence applies to both; the frame count and the peak are checked at the call site."""
     s = parse_streams(probe_json)
-    if require_dv and not s["dovi_profile"]:
-        return False, "no Dolby Vision RPU in output (DOVI configuration record missing)"
+    dv = s["dovi"]
+    if require_dv:
+        if not dv:
+            return False, "no Dolby Vision RPU in output (DOVI configuration record missing)"
+        if s["dovi_profile"] != "8.1" or dv.get("el_present_flag") or not dv.get("rpu_present_flag") \
+                or not dv.get("bl_present_flag"):
+            return False, (f"Dolby Vision is not 8.1 single-layer: profile {dv.get('dv_profile')} "
+                           f"compat {dv.get('dv_bl_signal_compatibility_id')} rpu "
+                           f"{dv.get('rpu_present_flag')} bl {dv.get('bl_present_flag')} el "
+                           f"{dv.get('el_present_flag')}")
+    elif dv:
+        return False, f"an SDR master claims Dolby Vision {s['dovi_profile']}"
     if s["audio"] < min_audio:
         return False, f"no audio tracks (need >= {min_audio})"
     kind = f"DV {s['dovi_profile']}" if s["dovi_profile"] else "SDR"
@@ -767,11 +788,21 @@ def _tail(text: str, n: int = 12) -> str:
     return "\n".join((text or "").splitlines()[-n:])
 
 
-def _verify(output: str, ffprobe: str, require_dv: bool = True) -> RemuxResult:
-    probe_json = _probe(output, ffprobe)
+def _verify(path: str, ffprobe: str, require_dv: bool = True, frames=None,
+            output=None) -> RemuxResult:
+    """Verify the muxed file at `path` (the .part); the result names `output` (the master's
+    real name). `frames`: the exact frame count the master must hold — the mux must neither drop
+    nor invent a picture (mkvmerge parses access units itself; a split one would add a frame)."""
+    probe_json = _probe(path, ffprobe)
     s = parse_streams(probe_json)
     ok, reason = verify_remux(probe_json, require_dv=require_dv)
-    return RemuxResult(ok, output, s["dovi_profile"], s["audio"], s["subtitle"], reason)
+    res = RemuxResult(ok, output or path, s["dovi_profile"], s["audio"], s["subtitle"], reason)
+    if ok and frames:
+        got = dvcap.count_hevc_frames(path, ffprobe)
+        if got != int(frames):
+            res.ok = False
+            res.reason = f"frame count changed in the mux: {got} != {frames} (shipped nothing)"
+    return res
 
 
 def _copy_native_rpu(src: str, rpu_out: str):
@@ -794,17 +825,156 @@ def _copy_native_rpu(src: str, rpu_out: str):
     return True, "native rpu copied (%d bytes)" % size
 
 
+def _prepare_tracks(cfr_source: str, orig_source: str, tracks: str, *, audio_target_lufs=None,
+                    audio_gain_db=None, ffmpeg=FFMPEG, ffprobe=FFPROBE, timeout=None) -> tuple:
+    """Build the master's TRACKS file once -> (ok, audio_note, reason, sync_ms). The SAME rules on every
+    route (the capped encode, the RPU inject, the shipped render, the companion combine) — they
+    used to differ by container, and the routes that took the MKV branch shipped without the
+    boost, the Atmos lead or the no-subtitles retry:
+      ATMOS: nothing re-encoded, the Atmos track leads (user-dictated 2026-08-22).
+      BOOST: to `audio_target_lufs` (or the season's `audio_gain_db`, stages/audiogain) — LOSSLESS
+        sources keep every original track behind the boosted copy (2026-08-21). The landing is
+        measured on this cheap file BEFORE the mux; a boost that misses (or that the encoder
+        refuses — aac_at and an exotic 7.1 bed) falls back to a bit-exact copy, never a park.
+      SUBTITLES: copied / converted to SRT (subtitle_plan). A build that fails retries with
+        -fix_sub_duration when it converts any (corrupt cue durations; that costs each converted
+        track its last line, so it is never the default), and only then drops the subtitles
+        rather than parking the item over them (the last-resort retry, said in the note).
+      SYNC: sync_ms for the mux (tracks_sync_ms) — Matroska has no edit list, so an MP4 CFR's
+        AAC priming (its audio starting at -21 ms) comes out of ffmpeg shifted to 0, and every
+        track of the tracks file with it; the mux undoes exactly the shift measured."""
+    atmos_lead = atmos_audio_index(cfr_source, ffprobe)
+    n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
+    note, measured, gain, keep = "", None, 0.0, 0
+    if atmos_lead is not None:
+        note = " · audio untouched (Atmos, now the main track)"
+    elif audio_target_lufs:
+        measured = measure_lufs(cfr_source, ffmpeg)
+        gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
+                else boost_gain_db(measured, audio_target_lufs))
+        if gain > 0 and has_lossless_audio(cfr_source, ffprobe):
+            keep = audio_track_count(cfr_source, ffprobe)
+    plan, subs_note = subtitle_plan(orig_source, ffprobe), ""
+
+    def build(g, subs, fix=False):
+        cmd = build_tracks_command(ffmpeg, cfr_source, orig_source, tracks, gain_db=g, subs=subs,
+                                   keep_original_audio=(keep if g > 0 else 0),
+                                   atmos_lead=atmos_lead, n_audio=n_audio, fix_sub_duration=fix)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            return False, f"timed out: {e}"
+        return r.returncode == 0, _tail(r.stderr)
+
+    fix = False
+    shipped = 0.0
+    for attempt in ([gain, 0.0] if gain > 0 else [0.0]):
+        shipped = attempt
+        ok, err = build(attempt, plan, fix)
+        if not ok and plan and not fix and any(a == "srt" for _n, a in plan):
+            ok, _e = build(attempt, plan, True)
+            if ok:
+                fix, subs_note = True, " · subtitle durations repaired"
+        if not ok and plan:
+            ok, err2 = build(attempt, [])
+            if ok:
+                plan, subs_note = [], " · subs dropped (unconvertible track)"
+            else:
+                err = err2 or err
+        if not ok:
+            if attempt > 0:
+                note = " · audio unboosted (encoder refused the track)"
+                continue
+            return False, "", "tracks failed: " + err, 0
+        if attempt <= 0:
+            break
+        landed = measure_lufs(tracks, ffmpeg)
+        if landing_ok(landed, float(audio_target_lufs), attempt, measured=measured):
+            note = (f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
+                    + (" · original lossless kept" if keep else ""))
+            break
+        # SAY THE NUMBERS. "landing off target" with nothing to check it against is
+        # unfalsifiable from the log — the one thing you want when a file ships quiet is what
+        # it measured and where it went.
+        note = _unboosted_note(measured, landed, audio_target_lufs)
+    # a STREAM-COPIED audio track of the tracks file and the CFR track it was copied from: track 0
+    # on a copy (the Atmos lead's own CFR index), track 1 when a boosted copy leads the originals.
+    # A boost without kept originals copies no audio — re-encodes carry their own delay.
+    if shipped <= 0:
+        pair = (0, atmos_lead if atmos_lead is not None else 0)
+    elif keep:
+        pair = (1, 0)
+    else:
+        pair = None
+    sync = tracks_sync_ms(cfr_source, tracks, pair, ffprobe) if pair else 0
+    if sync:
+        note += f" · audio start realigned ({sync:+d} ms)"
+    return True, note + subs_note, "", sync
+
+
+def _first_pts(path: str, sel: str, ffprobe: str = FFPROBE):
+    """The first packet's pts (seconds) of stream `sel` in `path`, or None."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", sel, "-read_intervals",
+                              "%+#1", "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=120).stdout
+        tok = (out.splitlines() or [""])[0].split(",")[0].strip()
+        return float(tok)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def tracks_sync_ms(cfr_source: str, tracks: str, pair, ffprobe: str = FFPROBE) -> int:
+    """How far ffmpeg moved the tracks file against the picture, in ms (0 when it did not, or it
+    cannot be measured). `pair` = (audio index in the tracks file, audio index in the CFR) of a
+    stream-COPIED track. In the CFR the picture starts at V and that track at A (an MP4's AAC
+    priming: A = -0.021, skipped by its edit list); in the tracks file the track starts at T. The
+    master's ES starts at 0, so keeping A - V means delaying the picture by T - A + V."""
+    t = _first_pts(tracks, f"a:{pair[0]}", ffprobe)
+    a = _first_pts(cfr_source, f"a:{pair[1]}", ffprobe)
+    v = _first_pts(cfr_source, "v:0", ffprobe)
+    if t is None or a is None:
+        return 0
+    ms = round((t - a + (v or 0.0)) * 1000)
+    return ms if abs(ms) >= 1 else 0
+
+
+def _mux_verified(es: str, fps: str, tracks, output: str, *, require_dv: bool = True,
+                  frames=None, colour=(), mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None,
+                  on_step=None, step_size=0, sync_ms: int = 0) -> RemuxResult:
+    """mkvmerge `es` + `tracks` into part_path(output), then verify it (DV 8.1 / no DV for SDR,
+    audio, the exact frame count) and gate its interleaving. ok -> the .part passed and is
+    waiting for the caller's last gate (the peak) and atomic_ship; not ok -> the .part is gone."""
+    part = part_path(output)
+    _rm(part)
+    cmd = build_master_mux_command(mkvmerge, es, fps, part, tracks=tracks, colour=colour,
+                                   seed=os.path.basename(output), sync_ms=sync_ms)
+    with _StepWatch(on_step, "muxing the master", part, step_size):
+        ok, detail = run_mux(cmd, timeout=timeout)
+    if not ok or not os.path.exists(part):
+        _rm(part)
+        return RemuxResult(False, output, reason="mkv mux failed: " + detail)
+    if on_step:
+        on_step("verifying the master", None)
+    res = _verify(part, ffprobe, require_dv=require_dv, frames=frames, output=output)
+    if not res.ok:
+        _rm(part)
+        return res
+    return _gate_interleave(res, part, ffprobe)
+
+
 def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
           audio_gain_db=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
           encode_source=None, rpu_mode=None, native=None, sdr=False,
-          ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
+          ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the DV render's video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
     failure (RPU, encode, frame mismatch, DV lost, measured peak over cap) fails the stage.
     Audio comes from the CFR file (same timing as the pipeline video); subs from the ORIGINAL.
-    Dispatches on `output`'s extension, decided by `container_ext` upstream.
+    `output` must be a .mkv (every master is Matroska); the mux goes to <output>.part and only a
+    master that passed every gate is renamed onto `output`.
     `should_pause`: polled between x265 segments — yields a benign "paused:" result so the
     finisher can hold this remux while another stage has the whole machine (a sibling's lease,
     AI outpainting); every finished segment is kept and the retry resumes here.
@@ -828,15 +998,17 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     in the mux, and the verify asks for no DOVI record. The peak gate and its repair ladder, the
     audio and the resume rules are the DV path's; the resume manifest says "sdr" so the two
     never share segments. Without it every call below is exactly the DV path's."""
+    if not is_master_container(output):
+        return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     nat_kw, dec_kw = {}, {}   # render path: NO extra kwargs — every dvcap call is the plain call
-    sdr_kw, mux_kw = {}, {}   # ...and none for SDR unless asked: the DV calls stay byte-identical
+    sdr_kw = {}               # ...and none for SDR unless asked: the DV calls stay byte-identical
     if sdr:
         if native is not None or encode_source is not None or rpu_mode is not None:
             return RemuxResult(False, output,
                                reason="an SDR master has no RPU: no native bundle, encode source "
                                       "or RPU mode applies (shipped nothing)")
-        nat_kw, sdr_kw, mux_kw = {"sdr": True}, {"dv": False}, {"dv": False}
+        nat_kw, sdr_kw = {"sdr": True}, {"dv": False}
     if native is not None:
         # GUARD BEFORE touching the resume state, like the probe guard below: a bundle whose
         # chunk list does not end at its total would plan (and wipe/resume) a different episode.
@@ -878,7 +1050,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         encode_source=encode_source, rpu_mode=rpu_mode, **nat_kw))
     rpu = os.path.join(segdir, "rpu.bin")
     hevc = output + ".capped.hevc"          # transient: the concat of the segments, rebuilt each attempt
-    tracks = dv_mp4 = None
+    tracks = None
     try:
         if sdr:
             pass                              # no RPU at all: the frame count below is the render's
@@ -931,58 +1103,18 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         if frames != real_frames:
             return RemuxResult(False, output,
                                reason=f"frame count changed by cap encode: {frames} != {real_frames}")
-        if not output.lower().endswith(".mkv"):
-            # MP4 path: extract audio (CFR) + text subs (original) → track file, built ONCE — it's
-            # video-independent, so the peak-repair rungs below reuse it.
-            # SMART LOUDNESS BOOST: measure this item's integrated LUFS, gain to the target (boost-only,
-            # limiter-capped). Validated on the cheap tracks file BEFORE the mux — a bad landing falls
-            # back to a bit-exact copy of the original audio (never fails the 75-min x265 pass over audio).
-            # `audio_gain_db` = a gain already decided for this item (TV: the SEASON's, set
-            # by its first episode — see audiogain). Only measure when nobody decided for us.
-            # ATMOS OUTRANKS THE BOOST: an Atmos title is left exactly as it is (user-dictated
-            # 2026-08-22), with the Atmos track promoted to first so players pick it. The
-            # boost re-encodes EVERY audio track to AAC, which silently flattened the
-            # 'Dolby Digital Plus + Dolby Atmos' track on Don't Look Up's master.
-            atmos_lead = atmos_audio_index(cfr_source, ffprobe)
-            n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
-            measured_lufs = measure_lufs(cfr_source, ffmpeg)
-            gain = 0.0 if atmos_lead is not None else (
-                round(float(audio_gain_db), 2) if audio_gain_db is not None
-                else boost_gain_db(measured_lufs, audio_target_lufs))
-            if atmos_lead is not None:
-                audio_note = " · audio untouched (Atmos, now the main track)"
-            tracks = output + ".tracks.mp4"   # temp, next to output (on scratch)
-            subs_note = ""
-            for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
-                ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
-                                                          gain_db=attempt_gain,
-                                                          atmos_lead=atmos_lead, n_audio=n_audio),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-                if ex.returncode != 0:
-                    # LAST-RESORT RETRY, no subs: a still-broken subtitle track (even past
-                    # -fix_sub_duration) must not park the episode — audio is essential,
-                    # subs are not. Same gain; the landing check below still applies.
-                    ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
-                                                              tracks, gain_db=attempt_gain,
-                                                              include_subs=False,
-                                                              atmos_lead=atmos_lead,
-                                                              n_audio=n_audio),
-                                        capture_output=True, text=True, errors="replace", timeout=timeout)
-                    if ex.returncode != 0:
-                        return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
-                    subs_note = " · subs dropped (unconvertible track)"
-                if attempt_gain <= 0:
-                    break
-                landed = measure_lufs(tracks, ffmpeg)
-                want = float(audio_target_lufs)
-                if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
-                    audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
-                    break
-                # SAY THE NUMBERS. "landing off target" with nothing to check it
-                # against is unfalsifiable from the log — the one thing you want
-                # when a file ships quiet is what it measured and where it went.
-                audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)   # MP4 branch: measured_lufs
-            audio_note += subs_note
+        # The TRACKS file (audio from the CFR + the original's subtitles), built ONCE — it is
+        # video-independent, so every peak-repair rung below muxes against the same file.
+        # SMART LOUDNESS BOOST, Atmos, lossless and the subtitle retry: _prepare_tracks.
+        # `audio_gain_db` = a gain already decided for this item (TV: the SEASON's, set by its
+        # first episode — see audiogain); measured here only when nobody decided for us.
+        tracks = output + ".tracks.mka"   # temp, next to output (on scratch)
+        ok, audio_note, why, sync = _prepare_tracks(cfr_source, orig_source, tracks,
+                                              audio_target_lufs=audio_target_lufs,
+                                              audio_gain_db=audio_gain_db, ffmpeg=ffmpeg,
+                                              ffprobe=ffprobe, timeout=timeout)
+        if not ok:
+            return RemuxResult(False, output, reason=why)
         # ---- mux + verify + PEAK GATE, with a tightening ladder on a peak miss ------------------
         # VBV bufsize == maxrate legally allows a 1-second burst past cap × tolerance, and an
         # identical retry reuses the identical segments — it can never pass (user-caught: a movie
@@ -990,6 +1122,10 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         # segment(s) and re-encode only those at 85% then 70% of the cap, then re-gate.
         segs_plan = dvcap.plan_segments(real_frames, info["fps"], dvcap.SEG_SECONDS,
                                         boundaries=boundaries)
+        # the container's HDR10 description = what the x265 SEI says (its fallback included)
+        colour = mkv_colour_args(sdr, None if sdr else (info["master_display"]
+                                                        or dvcap.FALLBACK_MASTER_DISPLAY),
+                                 None if sdr else info["max_cll"])
         repair_note, buckets, peak = "", None, 0.0
         for tight in (None, int(cap_mbps * 0.85), int(cap_mbps * 0.70)):
             if tight is not None:
@@ -1015,92 +1151,26 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 if not ok or frames != real_frames:
                     return RemuxResult(False, output, reason="peak repair concat: " + why)
                 repair_note = f" · peak repair: {len(offenders)} seg(s) re-capped @ {tight} Mbps"
-            if output.lower().endswith(".mkv"):
-                # wrap the ES in a video-only MP4 (writes the dvcC), then one ffmpeg copy-mux to MKV
-                dv_mp4 = output + ".dv.mp4"
-                with mp4box_safe_input(hevc) as _hevc_in:
-                    vx = subprocess.run(build_capped_video_mux_command(mp4box, _hevc_in, info["fps"], dv_mp4,
-                                                                       **mux_kw),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-                if vx.returncode != 0:
-                    return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-                mkv_gain, mkv_measured, keep = 0.0, None, 0
-                mkv_atmos = atmos_audio_index(cfr_source, ffprobe)
-                mkv_n = audio_track_count(cfr_source, ffprobe) if mkv_atmos is not None else 0
-                if mkv_atmos is not None:
-                    audio_note = " · audio untouched (Atmos, now the main track)"
-                elif audio_target_lufs:
-                    # LOSSLESS IS BOOSTED TOO NOW, keeping its original track (user-dictated
-                    # 2026-08-21). It used to be skipped outright, so a quiet DTS-HD MA or
-                    # TrueHD master just stayed quiet with nothing to be done about it.
-                    if has_lossless_audio(cfr_source, ffprobe):
-                        keep = audio_track_count(cfr_source, ffprobe)
-                    mkv_measured = measure_lufs(cfr_source, ffmpeg)
-                    mkv_gain = (round(float(audio_gain_db), 2) if audio_gain_db is not None
-                                else boost_gain_db(mkv_measured,
-                                                   audio_target_lufs))
-                for attempt in ([mkv_gain, 0.0] if mkv_gain > 0 else [0.0]):
-                    mx = subprocess.run(
-                        build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output,
-                                              gain_db=attempt,
-                                              keep_original_audio=(keep if attempt > 0 else 0),
-                                              atmos_lead=mkv_atmos, n_audio=mkv_n),
-                        capture_output=True, text=True, errors="replace", timeout=timeout)
-                    if mx.returncode != 0:
-                        # A failed BOOST must not fail the master. aac_at can refuse an exotic
-                        # layout (a 7.1 TrueHD bed), and before the boost reached lossless at
-                        # all these titles simply muxed straight through — so fall back to
-                        # exactly that rather than parking the item over loudness.
-                        if attempt > 0:
-                            audio_note = " · audio unboosted (encoder refused the track)"
-                            continue
-                        return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
-                    if attempt <= 0:
-                        break
-                    # Same landing rule as the MP4 path: a boost that misses is not shipped —
-                    # the copy-mux retry costs seconds because gain 0 stream-copies again.
-                    landed = measure_lufs(output, ffmpeg)
-                    if landing_ok(landed, float(audio_target_lufs), attempt, measured=mkv_measured):
-                        audio_note = (f" · audio +{attempt:.1f}dB → {landed:.1f} LUFS"
-                                      + (" · original lossless kept" if keep else ""))
-                        break
-                    # SAY THE NUMBERS. "landing off target" with nothing to check it
-                    # against is unfalsifiable from the log — the one thing you want
-                    # when a file ships quiet is what it measured and where it went.
-                    audio_note = _unboosted_note(mkv_measured, landed, audio_target_lufs)   # MKV branch: mkv_measured
-            else:
-                with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
-                    mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output,
-                                                                 **mux_kw),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-                if mx.returncode != 0:
-                    return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
-            res = _verify(output, ffprobe, **({"require_dv": False} if sdr else {}))
+            res = _mux_verified(hevc, info["fps"], tracks, output, require_dv=not sdr,
+                                frames=real_frames, colour=colour, mkvmerge=mkvmerge,
+                                ffprobe=ffprobe, timeout=timeout, sync_ms=sync)
             if not res.ok:
                 return res
-            if output.lower().endswith(".mp4"):
-                tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
-                if tag != "hvc1":                          # hev1 masters DON'T direct-play (SHIELD)
-                    res.ok = False
-                    res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
-                    _rm(output)
-                    return res
-                res = _gate_interleave(res, output, ffprobe)
-                if not res.ok:
-                    return res
-            buckets = dvcap.video_peak_buckets(output, ffprobe)   # re-measure the SHIPPED file
+            part = part_path(output)
+            buckets = dvcap.video_peak_buckets(part, ffprobe)   # re-measure the file that SHIPS
             peak = max(buckets.values()) if buckets else 0.0
             if dvcap.peak_ok(peak, cap_mbps):
                 res.reason += f" · peak {peak:.1f} ≤ {cap_mbps} Mbps cap" + repair_note + audio_note
+                atomic_ship(part, output)
                 shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the segments won't be needed again
                 return res
-            _rm(output)                                    # never leave an over-peak master around
+            _rm(part)                                      # never leave an over-peak master around
         return RemuxResult(False, output,
                            reason=f"peak still over cap after encode + repair: "
                                   f"{peak:.1f} Mbps > {cap_mbps} (shipped nothing)")
     finally:
         # transient only — segdir is KEPT on any non-success return so the next attempt resumes
-        _rm(hevc); _rm(tracks); _rm(dv_mp4)
+        _rm(hevc); _rm(tracks); _rm(part_path(output))
 
 
 # ---- STEP PROGRESS for the fast (no-re-encode) remuxes -------------------------------------
@@ -1152,7 +1222,7 @@ def _fsize(path) -> int:
 def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                  audio_target_lufs=None, abort=None, on_step=None,
                  rpu_mode=None, skip_inject=False, convert_es=False,
-                 ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
+                 ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream
     (orig_source) with a Dolby Vision RPU from `dv_video` injected — no re-encode (the
     caller peak-gates before choosing this path). The RPU donor contributes ONLY its
@@ -1165,7 +1235,10 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
     `skip_inject=True` means orig_source ALREADY carries the wanted RPU inline (the
     winner is itself the real-DV file) — no extraction, no inject, its own bits ship;
     `convert_es=True` (with skip_inject) runs dovi_tool `-m 2 convert --discard` on the
-    copied ES first, single-layer-ifying an inline-P7 winner."""
+    copied ES first, single-layer-ifying an inline-P7 winner (through nalfix first: a P7
+    release's split access units would otherwise reach mkvmerge as picture-less frames)."""
+    if not is_master_container(output):
+        return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     info = dvcap.probe_video(dv_video, ffprobe)
     if info["frames"] <= 0:      # transient ffprobe blip — fail cleanly, resume state intact
@@ -1184,7 +1257,7 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
         return RemuxResult(False, output, reason="unreadable fps — RPU alignment unverifiable")
     src_es = output + ".src.hevc"           # transient: the source's Annex-B ES (original bits)
     inj_es = output + ".inject.hevc"        # transient: same ES with the RPU interleaved
-    tracks = dv_mp4 = None
+    tracks = None
     segdir = None
     try:
         if not skip_inject:
@@ -1223,11 +1296,25 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                                 capture_output=True, text=True, errors="replace", timeout=timeout)
         if ex.returncode != 0 or not (os.path.exists(src_es) and os.path.getsize(src_es) > 0):
             return RemuxResult(False, output, reason="source ES extract failed: " + _tail(ex.stderr))
+        # a DV 8.1 base must SAY BT.2020/PQ in its VUI: mkvmerge derives the record from it
+        ok, vui_note = dvcap.ensure_pq_vui(src_es, ffmpeg, ffprobe, timeout=timeout)
+        if not ok:
+            return RemuxResult(False, output, reason=vui_note + " (shipped nothing)")
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
         if skip_inject:
             if convert_es:
-                # inline-P7 winner: drop the EL, rewrite the RPU to 8.1, in one pass
+                # inline-P7 winner: hand split-off DV NALs back to their picture (nalfix — a
+                # no-op on a normal stream), then drop the EL, rewrite the RPU to 8.1, in one pass
+                import nalfix
+                fixed = output + ".fix.hevc"
+                try:
+                    with open(src_es, "rb") as a, open(fixed, "wb") as b:
+                        nalfix.run(a, b)
+                    os.replace(fixed, src_es)
+                except OSError as e:
+                    _rm(fixed)
+                    return RemuxResult(False, output, reason=f"nalfix failed: {e}")
                 with _StepWatch(on_step, "converting DV to profile 8.1", inj_es, _fsize(src_es)):
                     cv = subprocess.run(dvcap.build_dovi_convert_command(dvcap.DOVI_TOOL,
                                                                          src_es, inj_es),
@@ -1249,91 +1336,24 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             return RemuxResult(False, output,
                                reason=f"processed ES frame count changed: {n_inj} != {n_src} "
                                       f"(shipped nothing)")
-        audio_note = ""
-        if output.lower().endswith(".mkv"):
-            dv_mp4 = output + ".dv.mp4"
-            with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(inj_es)), \
-                 mp4box_safe_input(inj_es) as _es_in:
-                vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
-                                capture_output=True, text=True, errors="replace", timeout=timeout)
-            if vx.returncode != 0:
-                return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-            with _StepWatch(on_step, "muxing the master", output, _fsize(dv_mp4)):
-                mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-            if mx.returncode != 0:
-                return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
-        else:
-            # same audio machinery as the cap path (boost validated, falls back to a copy);
-            # the CFR gate guarantees cfr audio is a bit-exact stream copy of the source's
-            if on_step:
-                on_step("preparing audio", None)
-            atmos_lead = atmos_audio_index(cfr_source, ffprobe)      # see the cap path
-            n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
-            # measured ONCE and kept: the landing test and the off-target note both need it.
-            # It used to be inline in boost_gain_db and the note named a variable that only
-            # the cap path binds — a NameError the first time a boost here landed off-target
-            # (Pyright-caught 2026-09-05; never fired live only because none had yet).
-            measured_lufs = None if atmos_lead is not None else measure_lufs(cfr_source, ffmpeg)
-            gain = (0.0 if atmos_lead is not None
-                    else boost_gain_db(measured_lufs, audio_target_lufs))
-            if atmos_lead is not None:
-                audio_note = " · audio untouched (Atmos, now the main track)"
-            tracks = output + ".tracks.mp4"
-            subs_note = ""
-            for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
-                ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
-                                                          gain_db=attempt_gain,
-                                                          atmos_lead=atmos_lead, n_audio=n_audio),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-                if ex.returncode != 0:
-                    # LAST-RESORT RETRY, no subs (same rule as the cap path): a broken
-                    # subtitle track must not park a fast-path item over nice-to-haves.
-                    ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
-                                                              tracks, gain_db=attempt_gain,
-                                                              include_subs=False,
-                                                              atmos_lead=atmos_lead,
-                                                              n_audio=n_audio),
-                                        capture_output=True, text=True, errors="replace", timeout=timeout)
-                    if ex.returncode != 0:
-                        return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
-                    subs_note = " · subs dropped (unconvertible track)"
-                if attempt_gain <= 0:
-                    break
-                landed = measure_lufs(tracks, ffmpeg)
-                want = float(audio_target_lufs)
-                # the same landing rule as the cap path (user-dictated: "normalize audio should
-                # normalize the audio"): BETTER than before passes — a limiter shortfall on a
-                # wide mix is not a reason to throw the whole boost away
-                if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
-                    audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
-                    break
-                # SAY THE NUMBERS. "landing off target" with nothing to check it
-                # against is unfalsifiable from the log — the one thing you want
-                # when a file ships quiet is what it measured and where it went.
-                audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)
-            audio_note += subs_note
-            with _StepWatch(on_step, "muxing the master", output, _fsize(inj_es)), \
-                 mp4box_safe_input(inj_es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
-                mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
-                                capture_output=True, text=True, errors="replace", timeout=timeout)
-            if mx.returncode != 0:
-                return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+        # same audio machinery as every route (boost validated, falls back to a copy); the CFR
+        # gate guarantees cfr audio is a bit-exact stream copy of the source's
         if on_step:
-            on_step("verifying the master", None)
-        res = _verify(output, ffprobe)
+            on_step("preparing audio", None)
+        tracks = output + ".tracks.mka"
+        ok, audio_note, why, sync = _prepare_tracks(cfr_source, orig_source, tracks,
+                                              audio_target_lufs=audio_target_lufs, ffmpeg=ffmpeg,
+                                              ffprobe=ffprobe, timeout=timeout)
+        if not ok:
+            return RemuxResult(False, output, reason=why)
+        # the container's HDR10 description = the shipped stream's own SEI
+        res = _mux_verified(inj_es, info["fps"], tracks, output, frames=n_src,
+                            colour=mkv_colour_args(False, src_info.get("master_display"),
+                                                   src_info.get("max_cll")),
+                            mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout,
+                            on_step=on_step, step_size=_fsize(inj_es), sync_ms=sync)
         if not res.ok:
             return res
-        if output.lower().endswith(".mp4"):
-            tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
-            if tag != "hvc1":                          # hev1 masters DON'T direct-play (SHIELD)
-                res.ok = False
-                res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
-                _rm(output)
-                return res
-            res = _gate_interleave(res, output, ffprobe)
-            if not res.ok:
-                return res
         # NO peak gate here: the caller gated the source's peaks before choosing this path.
         if skip_inject and convert_es:
             note = " · original stream, DV converted to 8.1 (no re-encode)"
@@ -1341,14 +1361,15 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             note = " · original DV stream shipped as-is (no re-encode)"
         else:
             note = " · original stream + injected RPU (no re-encode)"
-        res.reason += note + audio_note
+        res.reason += note + audio_note + vui_note
+        atomic_ship(part_path(output), output)
         if segdir:
             shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the RPU won't be needed again
         return res
     finally:
         # the two big ESes are transient EVERY attempt (recreated in minutes); only the small
         # rpu.bin persists (in segdir) for resume — segdir is KEPT on any non-success return
-        _rm(src_es); _rm(inj_es); _rm(tracks); _rm(dv_mp4)
+        _rm(src_es); _rm(inj_es); _rm(tracks); _rm(part_path(output))
 
 
 def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
@@ -1356,7 +1377,7 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
             cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, boundaries=None,
             audio_target_lufs=None, abort=None, on_step=None, on_progress=None,
             on_plan=None, should_pause=None, on_repair=None,
-            ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
+            ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """COMPANION COMBINE (user-dictated): one best-of master from two copies of a film.
     `winner` = the video that ships (the genuinely better HDR10 base, or the real-DV file
     itself); `rpu_source` = where the Dolby Vision metadata comes from (the real-DV copy,
@@ -1409,17 +1430,17 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
                      boundaries=boundaries, abort=abort, on_progress=on_progress,
                      on_plan=on_plan, should_pause=should_pause, on_repair=on_repair,
                      encode_source=winner, rpu_mode=mode,
-                     ffmpeg=ffmpeg, mp4box=mp4box, ffprobe=ffprobe, timeout=timeout)
+                     ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
     return remux_inject(rpu_source, audio_source, winner, output,
                         audio_target_lufs=audio_target_lufs, abort=abort, on_step=on_step,
                         rpu_mode=mode, skip_inject=rpu_inline,
                         convert_es=(rpu_inline and p7),
-                        ffmpeg=ffmpeg, mp4box=mp4box, ffprobe=ffprobe, timeout=timeout)
+                        ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
 
 
 def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                       cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
-                      abort=None, on_step=None, ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE,
+                      abort=None, on_step=None, ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE,
                       timeout=None, sdr: bool = False) -> RemuxResult:
     """YOUTUBE FAST REMUX (user-asked 2026-08-06: videos should move through fast). The
     native render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
@@ -1432,7 +1453,8 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
     accepted the render (render_is_complete). No resume dir — a kill just redoes minutes.
     `sdr` (2026-10-18): a native SDR render (an item pinned to SDR output) — shipped the same
     way, with no DV box in the mux and a verify that asks for no DOVI record."""
-    mux_kw = {"dv": False} if sdr else {}   # none for DV: those calls stay byte-identical
+    if not is_master_container(output):
+        return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     info = dvcap.probe_video(dv_video, ffprobe)
     if info["frames"] <= 0:
@@ -1443,7 +1465,7 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                            reason=f"render-over-cap: {mbps:.1f} Mbps > {cap_mbps} cap — "
                                   f"using the capped re-encode")
     es = output + ".ship.hevc"              # transient: the render's ES, RPU already in-band
-    tracks = dv_mp4 = None
+    tracks = None
     try:
         if abort is not None and abort.is_set():
             return RemuxResult(False, output, reason="aborted")
@@ -1452,99 +1474,40 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
                                 capture_output=True, text=True, errors="replace", timeout=timeout)
         if ex.returncode != 0 or not (os.path.exists(es) and os.path.getsize(es) > 0):
             return RemuxResult(False, output, reason="render ES extract failed: " + _tail(ex.stderr))
-        audio_note = ""
-        if output.lower().endswith(".mkv"):
-            dv_mp4 = output + ".dv.mp4"
-            with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(es)), \
-                 mp4box_safe_input(es) as _es_in:
-                vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4, **mux_kw),
-                                capture_output=True, text=True, errors="replace", timeout=timeout)
-            if vx.returncode != 0:
-                return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
-            with _StepWatch(on_step, "muxing the master", output, _fsize(dv_mp4)):
-                mx = subprocess.run(build_mkv_mux_command(ffmpeg, dv_mp4, cfr_source, orig_source, output),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-            if mx.returncode != 0:
-                return RemuxResult(False, output, reason="mkv mux failed: " + _tail(mx.stderr))
-        else:
-            # same audio machinery as the cap/inject paths (boost validated, falls back to copy)
-            if on_step:
-                on_step("preparing audio", None)
-            atmos_lead = atmos_audio_index(cfr_source, ffprobe)      # see the cap path
-            n_audio = audio_track_count(cfr_source, ffprobe) if atmos_lead is not None else 0
-            # measured ONCE and kept: the landing test and the off-target note both need it.
-            # It used to be inline in boost_gain_db and the note named a variable that only
-            # the cap path binds — a NameError the first time a boost here landed off-target
-            # (Pyright-caught 2026-09-05; never fired live only because none had yet).
-            measured_lufs = None if atmos_lead is not None else measure_lufs(cfr_source, ffmpeg)
-            gain = (0.0 if atmos_lead is not None
-                    else boost_gain_db(measured_lufs, audio_target_lufs))
-            if atmos_lead is not None:
-                audio_note = " · audio untouched (Atmos, now the main track)"
-            tracks = output + ".tracks.mp4"
-            subs_note = ""
-            for attempt_gain in ([gain, 0.0] if gain > 0 else [0.0]):
-                ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source, tracks,
-                                                          gain_db=attempt_gain,
-                                                          atmos_lead=atmos_lead, n_audio=n_audio),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-                if ex.returncode != 0:
-                    ex = subprocess.run(build_extract_command(ffmpeg, cfr_source, orig_source,
-                                                              tracks, gain_db=attempt_gain,
-                                                              include_subs=False,
-                                                              atmos_lead=atmos_lead,
-                                                              n_audio=n_audio),
-                                        capture_output=True, text=True, errors="replace", timeout=timeout)
-                    if ex.returncode != 0:
-                        return RemuxResult(False, output, reason="extract failed: " + _tail(ex.stderr))
-                    subs_note = " · subs dropped (unconvertible track)"
-                if attempt_gain <= 0:
-                    break
-                landed = measure_lufs(tracks, ffmpeg)
-                want = float(audio_target_lufs)
-                # the same landing rule as the cap path (user-dictated: "normalize audio should
-                # normalize the audio"): BETTER than before passes — a limiter shortfall on a
-                # wide mix is not a reason to throw the whole boost away
-                if landing_ok(landed, want, attempt_gain, measured=measured_lufs):
-                    audio_note = f" · audio +{attempt_gain:.1f}dB → {landed:.1f} LUFS"
-                    break
-                # SAY THE NUMBERS. "landing off target" with nothing to check it
-                # against is unfalsifiable from the log — the one thing you want
-                # when a file ships quiet is what it measured and where it went.
-                audio_note = _unboosted_note(measured_lufs, landed, audio_target_lufs)
-            audio_note += subs_note
-            with _StepWatch(on_step, "muxing the master", output, _fsize(es)), \
-                 mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
-                mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output, **mux_kw),
-                                capture_output=True, text=True, errors="replace", timeout=timeout)
-            if mx.returncode != 0:
-                return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
+        if not sdr:                       # a DV base must say BT.2020/PQ (see remux_inject)
+            ok, _vui = dvcap.ensure_pq_vui(es, ffmpeg, ffprobe, timeout=timeout)
+            if not ok:
+                return RemuxResult(False, output, reason=_vui + " (shipped nothing)")
         if on_step:
-            on_step("verifying the master", None)
-        res = _verify(output, ffprobe, **({"require_dv": False} if sdr else {}))
+            on_step("preparing audio", None)
+        tracks = output + ".tracks.mka"
+        ok, audio_note, why, sync = _prepare_tracks(cfr_source, orig_source, tracks,
+                                              audio_target_lufs=audio_target_lufs, ffmpeg=ffmpeg,
+                                              ffprobe=ffprobe, timeout=timeout)
+        if not ok:
+            return RemuxResult(False, output, reason=why)
+        # the container's HDR10 description = the render's own SEI (nativerender wrote it)
+        res = _mux_verified(es, info["fps"], tracks, output, require_dv=not sdr,
+                            frames=info["frames"],
+                            colour=mkv_colour_args(sdr, info.get("master_display"),
+                                                   info.get("max_cll")),
+                            mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout,
+                            on_step=on_step, step_size=_fsize(es), sync_ms=sync)
         if not res.ok:
             return res
-        if output.lower().endswith(".mp4"):
-            tag = parse_streams(_probe(output, ffprobe)).get("video_tag")
-            if tag != "hvc1":                          # hev1 masters DON'T direct-play (SHIELD)
-                res.ok = False
-                res.reason = f"sample entry is {tag!r}, need hvc1 (hev1 broke SHIELD direct play)"
-                _rm(output)
-                return res
-            res = _gate_interleave(res, output, ffprobe)
-            if not res.ok:
-                return res
-        shipped = dvcap.video_peak_1s_mbps(output, ffprobe)   # belt: same bits, re-measured
+        part = part_path(output)
+        shipped = dvcap.video_peak_1s_mbps(part, ffprobe)   # belt: same bits, re-measured
         if not dvcap.peak_ok(shipped, cap_mbps):
-            _rm(output)
+            _rm(part)
             return RemuxResult(False, output,
                                reason=f"render-over-cap: shipped file measured {shipped:.1f} Mbps "
                                       f"> {cap_mbps} — using the capped re-encode")
         res.reason += (f" · render shipped as-is (peak {mbps:.1f} ≤ {cap_mbps} Mbps, "
                        f"no re-encode)") + audio_note
+        atomic_ship(part, output)
         return res
     finally:
-        _rm(es); _rm(tracks); _rm(dv_mp4)
+        _rm(es); _rm(tracks); _rm(part_path(output))
 
 
 def main(argv=None):
@@ -1553,7 +1516,7 @@ def main(argv=None):
     ap.add_argument("dv_video", help="mute Dolby Vision video (the native render)")
     ap.add_argument("cfr_source", help="the CFR file (audio donor)")
     ap.add_argument("orig_source", help="the original download (subtitle donor)")
-    ap.add_argument("output", help="master; .mkv or .mp4 decides the mux path")
+    ap.add_argument("output", help="the master (.mkv)")
     args = ap.parse_args(argv)
     res = remux(args.dv_video, args.cfr_source, args.orig_source, args.output)
     print(("OK: " if res.ok else "FAILED: ") + res.reason)

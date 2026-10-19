@@ -60,3 +60,10 @@ NATIVE_LUT_SHA256 = "e410e5b7b899a07096a77e2f65bdeb6a4ab3cc60126358a81c8050251d8
                                     # manifest); any other file changes the picture
 NATIVE_FFMPEG_MAJOR = 8             # Homebrew ffmpeg: the LUT's colour was measured on 8.0, and
                                     # the analyzer links ffmpeg 8's major-versioned libraries
+
+# THE MASTER MUX (remux.py, nativerender.py; 2026-10-18 — every master is Matroska). mkvmerge writes
+# each master's Dolby Vision configuration record itself, from the RPU NALs and the HEVC VUI, so it
+# has a FLOOR, not a pin: the mux is lossless and every master is verified after it (DV 8.1, the
+# exact frame count, the RPU). 90.0 is the first release with every fix the mux relies on — Dolby
+# Vision from an Annex B ES (58.0), unspec62/63 NALs never missed (69.0), HEVC POC handling (90.0).
+MKVMERGE_MIN_VERSION = (90, 0)      # `mkvmerge --version`: "mkvmerge v99.0 ('Buka') 64-bit"

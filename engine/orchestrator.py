@@ -256,8 +256,8 @@ class EpisodePaths:
     source_cfr: str         # source re-encoded to CONSTANT frame rate (Topaz/DV/remux IN)
     prores: str             # legacy single-file Topaz out name (now only the segdir stem)
     segdir: str             # Topaz output: scene-cut ProRes chunks + manifest (DV IN)
-    dv_render: str          # the native render: mute DV .mov (remux IN)
-    final: str              # remuxed master .mp4 (upload IN)
+    dv_render: str          # the native render: mute DV video, Matroska under its .mov name (remux IN)
+    final: str              # remuxed master .mkv (upload IN)
     nas_dir: str            # NAS FTP dir for this season (YouTube: the Plex-lib video folder)
     nas_source: str         # NAS FTP path of the 1080p source (YouTube: in the STAGING lib)
     nas_final: str          # NAS FTP path of the finished master (YouTube: in the Plex lib)
@@ -318,6 +318,7 @@ _MASTER_RETAG = (
 
 DV_TAG = " HDR10 DV upscaled"     # Dolby Vision masters (the long-standing convention)
 SDR_TAG = " SDR upscaled"         # an item PINNED to non-DV SDR output
+MASTER_EXT = ".mkv"                # EVERY master is Matroska (remux.MASTER_EXT, 2026-10-18)
 
 
 def master_tag(key) -> str:
@@ -366,9 +367,9 @@ def episode_paths(series_name, ep, source_basename, *,
         series=series_name, ep=ep, source_basename=source_basename,
         source=j(source_basename),
         # The CFR re-encode of the source (constant frame rate, same rate) — an INTERMEDIATE,
-        # not a deliverable, so no "upscaled" tag; Topaz, the DV step and the remux all read this file. The
-        # container here (and for final/nas_final) is a pre-download DEFAULT — orchestrator.
-        # apply_container() rewrites it to .mkv/.mp4 once the downloaded source is probed.
+        # not a deliverable, so no "upscaled" tag; Topaz, the DV step and the remux all read this file. Its
+        # container is a pre-download DEFAULT — orchestrator.apply_container() rewrites it to
+        # .mkv/.mp4 once the downloaded source is probed. The master is ALWAYS .mkv.
         source_cfr=j(stem + "_cfr.mp4"),
         # Every PRODUCED file carries an "upscaled" tag. "HDR10 DV" stays in the deliverable
         # names too — the queue's done-detection (_DV_MARK) and the app's Outputs panel both
@@ -376,10 +377,10 @@ def episode_paths(series_name, ep, source_basename, *,
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),   # Topaz chunks + manifest live here
         dv_render=j(stem + DV_TAG + ".mov"),      # local intermediate; tag is cosmetic here
-        final=j(mstem + tag + ".mp4"),
+        final=j(mstem + tag + MASTER_EXT),
         nas_dir=nas_dir,
         nas_source=f"{nas_dir}/{source_basename}",
-        nas_final=f"{nas_dir}/{mstem}{tag}.mp4",
+        nas_final=f"{nas_dir}/{mstem}{tag}{MASTER_EXT}",
         source_wide=j(stem + "_wide.mp4"),        # extend-stage output (TV episodes only)
     )
 
@@ -394,15 +395,15 @@ def movie_paths(source_basename, nas_dir, title=None, *, scratch_dir=None,
 
     `combine=True` = COMPANION COMBINE: the item also fetches its confirmed seedbox
     companion (coordinates from the companions book) and the remux merges the two per the
-    confirmed verdict. Container is FORCED to .mkv (the goal output carries TrueHD-class
-    audio) — apply_container() is bypassed for combine items."""
+    confirmed verdict. apply_container() is bypassed for combine items (their CFR stays the
+    default). Every master — combine or not — is .mkv."""
     scratch_dir = scratch_dir or scratch.default_scratch()
     stem = os.path.splitext(source_basename)[0]
     nas_dir = nas_dir.rstrip("/")
     tag = master_tag(title or os.path.splitext(source_basename)[0])
     mstem = master_stem(source_basename, sdr=(tag == SDR_TAG))
     j = lambda n: os.path.join(scratch_dir, n)
-    ext = ".mkv" if combine else ".mp4"
+    ext = MASTER_EXT
     comp_virtual, comp_src, comp_size = "", "", 0
     if combine:
         import companion as companion_mod
@@ -458,11 +459,11 @@ def youtube_paths(channel, video_path, title=None, *, scratch_dir=None) -> Episo
         prores=j(stem + "_prob4_upscaled.mov"),
         segdir=j(stem + "_prob4_upscaled.segments"),
         dv_render=j(stem + DV_TAG + ".mov"),
-        final=j(stem + tag + ".mp4"),                # LOCAL master name — youtarr's stem
+        final=j(stem + tag + MASTER_EXT),            # LOCAL master name — youtarr's stem
                                                      # (no retag: the .nfo/.jpg/.srt must match)
         nas_dir=plex_dir,                           # publish INTO the Plex library
         nas_source=video_path,                      # raw source in STAGING
-        nas_final=plex_dir + "/" + source_basename, # keep youtarr's stem (ext locked in apply_container)
+        nas_final=plex_dir + "/" + stem + MASTER_EXT,   # youtarr's stem, Matroska
         youtube=True,
         title=(title or stem),
         sidecar_dir=src_dir,                        # copy sidecars from here + purge staging on cleanup
@@ -482,7 +483,7 @@ class _AnyEvent:
 def _buffer_names(source_basename: str) -> set:
     """The prefetch-buffer filenames that belong to ONE item: its source + its CFR (either container).
     EXACT names (not a `startswith` prefix) so one item's stem can never match another item's file —
-    the CFR is always `<stem>_cfr.mp4` or `<stem>_cfr.mkv` (remux.container_ext yields only those)."""
+    the CFR is always `<stem>_cfr.mp4` or `<stem>_cfr.mkv` (remux.cfr_container_ext yields only those)."""
     stem = os.path.splitext(source_basename)[0]
     return {source_basename, stem + "_cfr.mp4", stem + "_cfr.mkv"}
 
@@ -510,6 +511,14 @@ def discard_workfiles(source_basename: str) -> None:
                   master_stem(source_basename, sdr=True)}       # item ships under SDR_TAG
         for t in (DV_TAG, SDR_TAG) for e in (".mp4", ".mkv")
     }
+    masters = {n for n in names if n.endswith((".mp4", ".mkv")) and (DV_TAG in n or SDR_TAG in n)}
+    # ...and each master name's remux transients: the .part mkvmerge writes before the gates, the
+    # tracks file (.tracks.mka; .tracks.mp4 / .dv.mp4 from the pre-Matroska build), and the
+    # resumable x265 segments (<master>.remuxsegs/)
+    names |= {m + sfx for m in masters
+              for sfx in (".part", ".tracks.mka", ".tracks.mp4", ".dv.mp4", ".capped.hevc",
+                          ".src.hevc", ".inject.hevc", ".ship.hevc", ".fix.hevc",
+                          ".src.hevc.vui", ".ship.hevc.vui")}
     main = scratch.default_scratch()
     for d in (main, scratch.prefetch_dir()):
         for n in names:
@@ -517,6 +526,8 @@ def discard_workfiles(source_basename: str) -> None:
                 os.remove(os.path.join(d, n))
             except OSError:
                 pass
+    for m in masters:
+        shutil.rmtree(os.path.join(main, m + ".remuxsegs"), ignore_errors=True)
     shutil.rmtree(os.path.join(main, stem + "_prob4_upscaled.segments"), ignore_errors=True)
     # A NATIVE render's books (<render>.dvrender/: analysis ranges, encode, RPU) and its finish
     # transients (<render>.part, .dv.hevc) beside the render — a withdrawn item's are as orphaned
@@ -701,44 +712,98 @@ def _on_youtube_staging(tag, uploaders, listings=None) -> bool:
     return False
 
 def apply_container(p: EpisodePaths) -> EpisodePaths:
-    """Lock the working container to what the LOCAL source needs — MKV for lossless audio (TrueHD/
-    DTS-HD MA/PCM/FLAC) or bitmap subtitles (PGS/VOBSUB), else MP4 — by probing p.source, and
-    rewrite the three container-dependent paths (source_cfr, final, nas_final) in place. This is
-    resume-safe: paths are built (before download) with a '.mp4' default that is never consumed
-    until the source + CFR exist, and once the source is on disk the decision is deterministic and
-    stable (the source persists until cleanup). No-op until the source exists. Idempotent — called
-    at the top of _process (resume: source already present) and inside the download stage (first
-    run: source appears mid-stage, before the CFR is written)."""
+    """Lock the CFR INTERMEDIATE's container to what the LOCAL source needs — MKV for lossless
+    audio (TrueHD/DTS-HD MA/PCM/FLAC) or bitmap subtitles (PGS/VOBSUB), else MP4 — by probing
+    p.source, and rewrite the container-dependent paths in place (relabel_container). The MASTER
+    is always .mkv whatever the source holds. Resume-safe: paths are built (before download) with
+    a '_cfr.mp4' default that is never consumed until the source + CFR exist, and once the source
+    is on disk the decision is deterministic and stable (the source persists until cleanup).
+    No-op until the source exists. Idempotent — called at the top of _process (resume: source
+    already present) and inside the download stage (first run: source appears mid-stage, before
+    the CFR is written)."""
     if p.combine:
-        # COMBINE items are pinned to .mkv at build time (the goal output carries
-        # TrueHD-class audio, and the LOCAL source may not — probing it would flip the
-        # container back to .mp4 mid-pipeline).
+        # COMBINE items keep their build-time paths: their master is .mkv like every master, and
+        # the LOCAL source may not be the goal output's audio donor — probing it decides nothing.
         return p
     if not os.path.exists(p.source):
         return p
     import remux
-    return relabel_container(p, remux.container_ext(p.source))
+    relabel_container(p, remux.cfr_container_ext(p.source))
+    carry_over_legacy(p)
+    return p
 
 
-def relabel_container(p: EpisodePaths, ext: str) -> EpisodePaths:
-    """Rewrite the three container-dependent paths (source_cfr, final, nas_final) to `ext` in place.
-    Split out of apply_container so the FINISHER's durable-resume path can re-apply the SAME container
-    the run thread chose (persisted as container_ext) WITHOUT re-probing the source — otherwise a
-    resumed remux rebuilds an MKV item as .mp4, silently downgrading lossless audio / dropping bitmap
-    subs and orphaning the real .mkv partial + '.mkv.remuxsegs' resume dir (review-caught HIGH)."""
+def relabel_container(p: EpisodePaths, cfr_ext: str) -> EpisodePaths:
+    """Rewrite the container-dependent paths in place: source_cfr gets `cfr_ext` (the CFR
+    intermediate's container, remux.cfr_container_ext), final and nas_final the master's
+    MASTER_EXT (.mkv — every master, 2026-10-18). Split out of apply_container so the FINISHER's
+    durable-resume path can re-apply the SAME CFR container the run thread chose (persisted as
+    cfr_ext) WITHOUT re-probing the source — a resumed remux must find the CFR that is on disk
+    (its audio is the master's), and its '.mkv.remuxsegs' resume dir."""
     stem = os.path.splitext(p.source_basename)[0]
     # The DELIVERABLE carries the retagged stem (x264 -> x265, 1080p -> 2160p, ...), except
     # for YouTube, which keeps youtarr's exact stem so the copied sidecars still match.
     tag = master_tag(p.series)
     mstem = stem if p.youtube else master_stem(p.source_basename, sdr=(tag == SDR_TAG))
     d = os.path.dirname(p.source)
-    p.source_cfr = os.path.join(d, stem + "_cfr" + ext)
-    p.final = os.path.join(d, mstem + tag + ext)
+    p.source_cfr = os.path.join(d, stem + "_cfr" + cfr_ext)
+    p.final = os.path.join(d, mstem + tag + MASTER_EXT)
     if p.youtube:                                   # keep youtarr's stem so the copied .nfo matches
-        p.nas_final = f"{p.nas_dir}/{stem}{ext}"
+        p.nas_final = f"{p.nas_dir}/{stem}{MASTER_EXT}"
     else:
-        p.nas_final = f"{p.nas_dir}/{mstem}{tag}{ext}"
+        p.nas_final = f"{p.nas_dir}/{mstem}{tag}{MASTER_EXT}"
     return p
+
+
+def legacy_master_names(p: EpisodePaths) -> tuple:
+    """(local, nas) of the master this item WOULD have had before every master became Matroska
+    (2026-10-18): its .mkv names with '.mp4'. A master in flight across that deploy — remuxed
+    and gated, not yet uploaded — or one shipped earlier carries these names."""
+    lb, _ = os.path.splitext(p.final)
+    nb, _ = os.path.splitext(p.nas_final)
+    return lb + ".mp4", nb + ".mp4"
+
+
+def adopt_legacy_master(p: EpisodePaths) -> bool:
+    """A master finished under the pre-Matroska build (an .mp4 that passed every remux gate but was
+    not uploaded before the deploy) ships AS IT IS: re-muxing it would redo an hour-class encode
+    for nothing, and the native chunk lane's proof names that file. When this item's .mkv master
+    is absent and a legacy .mp4 one is on disk and passes the remux stage's own check, point
+    final/nas_final at it (True). Otherwise leave the item alone (False)."""
+    if os.path.exists(p.final):
+        return False
+    local, nas = legacy_master_names(p)
+    if not os.path.exists(local):
+        return False
+    v = _vstream(local)
+    if not ((_is_dv81(v) or _is_sdr_master(p, v)) and _has_audio(v)):
+        return False
+    p.final, p.nas_final = local, nas
+    return True
+
+
+def carry_over_legacy(p: EpisodePaths) -> None:
+    """ACROSS THE SWITCH TO MATROSKA (2026-10-18): a gated .mp4 master still waiting for its upload
+    ships as it is (adopt_legacy_master); otherwise an interrupted remux's x265 segments move to
+    the .mkv name and resume (migrate_legacy_remuxsegs). No-ops for an item that never had one."""
+    adopt_legacy_master(p)
+    migrate_legacy_remuxsegs(p)
+
+
+def migrate_legacy_remuxsegs(p: EpisodePaths) -> bool:
+    """The remux's resume dir is named after the master (<final>.remuxsegs). An item caught
+    mid-remux by the switch to Matroska has its hours of x265 segments under the .mp4 name; they
+    are container-free (HEVC segments + RPU + manifest), so they move to the .mkv name and the
+    remux resumes instead of re-encoding. True when a dir moved."""
+    old = legacy_master_names(p)[0] + ".remuxsegs"
+    new = p.final + ".remuxsegs"
+    if p.final.lower().endswith(".mp4") or not os.path.isdir(old) or os.path.exists(new):
+        return False
+    try:
+        os.rename(old, new)
+        return True
+    except OSError:
+        return False
 
 
 # ---- pure: gating ---------------------------------------------------------
@@ -815,6 +880,25 @@ def _vstream(path):
     except Exception:
         return None
     return streams or None
+
+
+def _mkv_complete(streams) -> bool:
+    """A WHOLE Matroska master: its video stream carries a tag the muxer writes only at the END —
+    mkvmerge's NUMBER_OF_FRAMES statistics, or (a master from the pre-2026-10-18 build, muxed by
+    ffmpeg) a DURATION above zero, which ffmpeg fills in from its trailer. Both are missing from a
+    killed mux (verified for each), whose header already says DV 8.1 + audio."""
+    for s in streams or []:
+        if isinstance(s, dict) and s.get("codec_type") == "video":
+            tags = {str(k).upper().split("-")[0]: v for k, v in (s.get("tags") or {}).items()}
+            if "NUMBER_OF_FRAMES" in tags:
+                return True
+            d = str(tags.get("DURATION") or "")
+            try:
+                h, m, sec = d.split(":")
+                return int(h) * 3600 + int(m) * 60 + float(sec) > 0
+            except ValueError:
+                return False
+    return False
 
 
 def _is_dv81(streams) -> bool:
@@ -960,6 +1044,7 @@ def _fps_matches(src, render) -> bool:
 
 def _fps_fraction_of(path):
     from fractions import Fraction
+    import dvcap
     if not (path and os.path.exists(path)):
         return None
     try:
@@ -970,7 +1055,10 @@ def _fps_fraction_of(path):
         # csv=p=0 emits a TRAILING COMMA, so Fraction() raised on "24000/1001," and the
         # mismatch was swallowed as "unknown" — take the first field of the first line.
         tok = (out.splitlines() or [""])[0].split(",")[0].strip()
-        return Fraction(tok) if tok and tok != "0/0" else None
+        # SNAPPED: a Matroska file reads 60000/1001 back as 19001/317 (dvcap.snap_fps), so an
+        # exact compare of an MKV render/master with an MP4 CFR of the same rate failed
+        snapped = dvcap.snap_fps(tok) if tok and tok != "0/0" else None
+        return Fraction(snapped) if snapped else None
     except Exception:
         return None
 
@@ -1054,6 +1142,9 @@ def _native_encoded(p) -> bool:
         import nativelane
         m = nativelane.read_marker(p) or {}
         final = getattr(p, "final", None)
+        if (final and m.get("final") and m.get("final") != final
+                and m.get("final") == legacy_master_names(p)[0] and adopt_legacy_master(p)):
+            final = p.final       # stamped before the switch to Matroska: its .mp4 master ships
         if m.get("state") != NATIVE_ENCODED or not final or m.get("final") != final:
             return False
         st = os.stat(final)
@@ -1137,7 +1228,11 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         s = _vstream(p.final)
         # ...or an item pinned to SDR output: its master is named SDR (master_tag) and is the true
         # SDR picture — HEVC, no Dolby Vision, not PQ/HLG (2026-10-18; only sdr_out makes one).
-        return (_is_dv81(s) or _is_sdr_master(p, s)) and _has_audio(s)
+        # A MATROSKA master must also be COMPLETE: a killed mux leaves a file whose header already
+        # says DV 8.1 + audio. The remux only ever renames a gated .part onto p.final, and mkvmerge
+        # writes the statistics tags (NUMBER_OF_FRAMES) last, so a master without them is not one.
+        return ((_is_dv81(s) or _is_sdr_master(p, s)) and _has_audio(s)
+                and (not str(p.final).lower().endswith(MASTER_EXT) or _mkv_complete(s)))
     if stage == "upload":
         return os.path.exists(p.final) and _remote_size(p.nas_final, ftp) == os.path.getsize(p.final)
     if stage == "cleanup":
@@ -1902,15 +1997,20 @@ class Orchestrator:
     def _finisher_descriptor(p: EpisodePaths) -> dict:
         """The minimal, FTP-free identity needed to rebuild an EpisodePaths on resume. For episodes
         we store the resolved nas_tv_root (recovered from p.nas_dir) so reconstruction never has to
-        re-list the NAS to find the show's volume. container_ext preserves apply_container's MKV/MP4
-        choice — the source's extension carries it (source_cfr/final/nas_final all share it)."""
-        ext = os.path.splitext(p.final)[1] or ".mp4"          # apply_container already locked this
+        re-list the NAS to find the show's volume. cfr_ext preserves apply_container's choice of the
+        CFR's container (MKV for lossless audio / bitmap subs, else MP4); final_ext the master's —
+        .mkv, or '.mp4' for a legacy master adopted across the switch to Matroska (2026-10-18).
+        container_ext repeats cfr_ext for a reader that predates the split."""
+        ext = os.path.splitext(p.source_cfr)[1] or ".mp4"     # apply_container already locked this
+        fext = os.path.splitext(p.final)[1] or MASTER_EXT
         if p.youtube:
             return {"kind": "youtube", "ep": p.ep, "channel": p.series,
-                    "video_path": p.nas_source, "title": p.title, "container_ext": ext}
+                    "video_path": p.nas_source, "title": p.title, "container_ext": ext,
+                    "cfr_ext": ext, "final_ext": fext}
         if p.movie:
             d = {"kind": "movie", "ep": p.ep, "source_basename": p.source_basename,
-                 "nas_dir": p.nas_dir, "title": p.title, "container_ext": ext}
+                 "nas_dir": p.nas_dir, "title": p.title, "container_ext": ext,
+                 "cfr_ext": ext, "final_ext": fext}
             if p.combine:
                 # the flag only — the VERDICT stays in the companions book (single source of
                 # truth); a reconstruct with the book missing parks rather than guessing
@@ -1925,7 +2025,8 @@ class Orchestrator:
         tail = f"/{p.series}/S{p.ep[1:3]}"
         nas_tv_root = p.nas_dir[:-len(tail)] if p.nas_dir.endswith(tail) else transfer.NAS_FTP_TV_ROOT
         return {"kind": "episode", "ep": p.ep, "series": p.series, "source_basename": p.source_basename,
-                "nas_tv_root": nas_tv_root, "nas_dir": p.nas_dir, "container_ext": ext}
+                "nas_tv_root": nas_tv_root, "nas_dir": p.nas_dir, "container_ext": ext,
+                "cfr_ext": ext, "final_ext": fext}
 
     @staticmethod
     def _desc_skip_key(d: dict) -> str:
@@ -1967,15 +2068,17 @@ class Orchestrator:
                 return None
         except Exception:
             return None
-        # Restore the container the run thread chose (MKV for lossless audio / bitmap subs, else MP4).
-        # The constructors default to .mp4; without this a resumed remux would rebuild an MKV item as
-        # .mp4 and corrupt/orphan it. Prefer the persisted ext; fall back to re-probing the on-disk
-        # source (present for any non-terminal item) so a legacy descriptor still resolves correctly.
-        ext = d.get("container_ext")
+        # Restore the CFR container the run thread chose (MKV for lossless audio / bitmap subs, else
+        # MP4): the constructors default to _cfr.mp4, and a resumed remux must find the CFR on disk
+        # (its audio is the master's). Prefer the persisted ext — cfr_ext, or a pre-split
+        # descriptor's container_ext, which named the CFR's container too; fall back to re-probing
+        # the on-disk source (present for any non-terminal item). The master is .mkv either way.
+        ext = d.get("cfr_ext") or d.get("container_ext")
         if ext:
             relabel_container(p, ext)
         else:
             p = apply_container(p)
+        carry_over_legacy(p)
         return p
 
     def _load_finisher_persisted(self) -> dict:
@@ -2470,6 +2573,9 @@ class Orchestrator:
         `_parked`, and the item simply re-downloads."""
         import shutil as _shutil
         freed = 0
+        # A master finished by the pre-Matroska build is the item's deliverable even when nothing
+        # adopted it yet (a park can come before apply_container ever ran with the source on disk)
+        adopt_legacy_master(p)
         # A NATIVE item whose master already passed keeps its segdir: no chunks are left in it,
         # only the 'encoded' marker that proves the kept master is this item's Topaz + DV work
         # (without it a re-pick would re-run Topaz for a master already on disk).
@@ -2484,7 +2590,8 @@ class Orchestrator:
                 pass
         # ...and a native render's books (<dv_render>.dvrender/: its sidecars, RPU and encodes —
         # nativerender.BOOKS_SUFFIX; absent for every item that never rendered natively).
-        for d in (p.segdir, str(p.final) + ".remuxsegs",
+        legacy_master = legacy_master_names(p)[0]     # pre-Matroska name (2026-10-18)
+        for d in (p.segdir, str(p.final) + ".remuxsegs", legacy_master + ".remuxsegs",
                   (str(p.source_wide) + ".segments") if getattr(p, "source_wide", "") else "",
                   str(p.dv_render) + ".dvrender"):
             if d and d != stamp and os.path.isdir(d):
@@ -2505,7 +2612,9 @@ class Orchestrator:
                               f"({os.path.basename(p.final)}) — only intermediates swept")
         except Exception:
             pass                            # unverifiable master -> old behaviour
-        for f in p.working_files():
+        # A legacy .mp4 master that was not adopted (adopt_legacy_master found it unfinished) is
+        # an intermediate like any other; an adopted one IS p.final and is kept above.
+        for f in list(p.working_files()) + [legacy_master]:
             if f in keep:
                 continue
             try:

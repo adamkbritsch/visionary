@@ -42,8 +42,8 @@ any that died, so a disable→enable can never leave the run armed without its w
 |---|----------|---------------------------------------|--------|
 | 1 | download | NAS source → `scratch/<src>`, then normalised to a CONSTANT frame rate → `<stem>_cfr.mp4` **or** `_cfr.mkv` | `transfer.download` (FTP) + `topaz.to_cfr` |
 | 2 | topaz    | CFR source → `<stem>_prob4_upscaled.segments/` (scene-cut ProRes chunks + manifest) | `topaz.upscale_resumable` |
-| 3 | dv       | ProRes segments (or the CFR source) → `<stem> HDR10 DV upscaled.mov` (mute), or for a chunk-lane item the RPU alone (`segdir/native/`) | `nativerender.render` / `nativelane.run_analysis` |
-| 4 | remux    | mute DV video + audio from the CFR copy + subtitles from the original download → peak-capped `<mstem> HDR10 DV upscaled.mp4\|.mkv` | `remux.remux` (dvcap x265 + MP4Box) |
+| 3 | dv       | ProRes segments (or the CFR source) → `<stem> HDR10 DV upscaled.mov` (mute; Matroska under that name), or for a chunk-lane item the RPU alone (`segdir/native/`) | `nativerender.render` / `nativelane.run_analysis` |
+| 4 | remux    | mute DV video + audio from the CFR copy + subtitles from the original download → peak-capped `<mstem> HDR10 DV upscaled.mkv` | `remux.remux` (dvcap x265 + mkvmerge) |
 | 5 | upload   | master → NAS library                  | `transfer.upload` (FTP STOR, owner 1000:10) |
 | 6 | cleanup  | delete **every** local working file   | `stages._cleanup` |
 
@@ -52,10 +52,17 @@ name because the queue's done-detection (`_DV_MARK`) and the app's Outputs panel
 on it. `<mstem>` is the **retagged** stem: `master_stem()` rewrites the source's own labels
 so the shipped file advertises what it now is — x264→x265, 1080p→2160p, 8bit→10bit,
 SDR→HDR (episodes and movies only; YouTube keeps youtarr's exact stem so its copied
-sidecars still match). `relabel_container` moves `source_cfr`, `final` and `nas_final` to
-the chosen container together, and the finisher re-applies the SAME one on a durable resume
-rather than re-probing — otherwise a resumed remux would rebuild an MKV item as `.mp4` and
-silently drop its lossless audio and bitmap subs.
+sidecars still match). Every master is Matroska (`.mkv`, 2026-10-18): `relabel_container`
+gives `final` and `nas_final` the `.mkv` extension and only `source_cfr` the CFR's own
+container, and the finisher re-applies that CFR container (`cfr_ext`) on a durable resume rather
+than re-probing, so a resumed remux finds the CFR that is on disk. The remux muxes into
+`<master>.part` and renames it onto the master only after every gate passed — a killed
+mkvmerge leaves a file whose header already reads DV 8.1 + audio, and `stage_done("remux")`
+also demands mkvmerge's NUMBER_OF_FRAMES statistics tag, which it writes last. An item caught
+mid-finish by the switch to Matroska keeps its work (`carry_over_legacy`): a gated `.mp4`
+master ships as it is, an interrupted remux's `.mp4.remuxsegs` move to the `.mkv` name. After a
+verified upload, the item's earlier `.mp4` master on the NAS is deleted (`stages._supersede_legacy`)
+so Plex never shows two versions.
 
 - **One download, reused.** The source is fetched once. The CFR copy derived from it
   feeds Topaz (2) and donates the **audio** to the remux (4); the original download
@@ -67,10 +74,11 @@ silently drop its lossless audio and bitmap subs.
   stream-copied (the common case for modern rips). An MKV whose 1 ms timebase cannot
   represent the frame period exactly — an NTSC 1001/24000 s frame — IS re-encoded,
   because a jittery stream-copy makes Topaz duplicate frames and drift the audio.
-- **The CFR container follows the source.** `remux.container_ext` picks `.mkv` when the
+- **The CFR container follows the source.** `remux.cfr_container_ext` picks `.mkv` when the
   source carries lossless audio (TrueHD / DTS-HD MA / PCM / FLAC) or bitmap subtitles
   (PGS / VOBSUB), else `.mp4`; `apply_container` locks it in once the file is on disk.
-  The `_cfr.mp4` in the path factories is only a pre-download default, never consumed.
+  The `_cfr.mp4` in the path factories is only a pre-download default, never consumed. It
+  decides nothing about the master, which is always `.mkv`.
 - **The remux is not a plain mux.** It re-encodes the DV render through x265
   under a hard peak-bitrate ceiling (`dvcap`, `max_peak_mbps`) and puts the original
   audio + subtitles back. HARD GATE — no uncapped fallback.

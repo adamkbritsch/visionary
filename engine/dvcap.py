@@ -10,7 +10,8 @@ HOW (the industry-standard conformant-DV path):
      --dolby-vision-rpu`), which *mandates* VBV (`--vbv-maxrate/--vbv-bufsize`) because DV
      certification requires HRD conformance — a hard ceiling on any 1-second window. x265
      interleaves the RPU NALs itself; no separate inject step.
-  3. The capped HEVC ES is muxed by the remux stage (MP4Box `:dvp=8.1:fps=`).
+  3. The capped HEVC ES is muxed by the remux stage (mkvmerge `--default-duration 0:<fps>p`;
+     it writes the DV 8.1 record from the RPU NALs itself).
 
 CONTRACT (user-dictated): there is NO uncapped fallback. If any step fails — RPU missing,
 encode error, frame-count mismatch, DV lost, or the measured peak still over the cap — the
@@ -90,22 +91,80 @@ def probe_video(path: str, ffprobe: str = FFPROBE) -> dict:
         # count_hevc_frames is the exact packet count the callers ultimately compare against.
         # Same root cause as the topaz._frame_count tagless-MKV bug fixed in 8bc83fd.
         frames = max(0, count_hevc_frames(path, ffprobe))
-    fps = s.get("r_frame_rate") or "24000/1001"
+    fps = snap_fps(s.get("r_frame_rate")) or "24000/1001"
     try:
         start = float(s.get("start_time") or 0.0)   # container offset for the frame-exact seek
     except (TypeError, ValueError):
         start = 0.0
+    md, cll = _hdr10_of_frames(data.get("frames", []))
+    return {"frames": frames, "fps": fps, "start_time": start,
+            "master_display": md, "max_cll": cll}
+
+
+def _hdr10_of_frames(frames: list) -> tuple:
+    """(master_display x265 string|None, 'cll,fall'|None) from ffprobe's first frame. Mastering
+    metadata rides on FRAME side data (the in-band SEI — more reliable than the stream entry)."""
     md, cll = None, None
-    # mastering metadata rides on frame side data (more reliable than the stream entry)
-    for f in data.get("frames", [])[:1]:
+    for f in frames[:1]:
         for sd in f.get("side_data_list", []):
             t = sd.get("side_data_type", "")
             if "Mastering display" in t:
                 md = mastering_to_x265(sd)
             elif "Content light" in t:
                 cll = "%d,%d" % (int(sd.get("max_content", 0)), int(sd.get("max_average", 0)))
-    return {"frames": frames, "fps": fps, "start_time": start,
-            "master_display": md, "max_cll": cll}
+    return md, cll
+
+
+def first_frame_hdr10(path: str, ffprobe: str = FFPROBE) -> tuple:
+    """(master_display, max_cll) of `path`'s first frame — a raw ES included — WITHOUT
+    probe_video's frame count (a full packet scan of a multi-GB file). (None, None) when
+    unreadable or absent."""
+    try:
+        r = subprocess.run([ffprobe, "-v", "quiet", "-select_streams", "v:0", "-print_format",
+                            "json", "-show_frames", "-read_intervals", "%+#1", path],
+                           capture_output=True, text=True, timeout=120)
+        return _hdr10_of_frames(json.loads(r.stdout or "{}").get("frames", []))
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+# The frame rates real video uses. A Matroska file CANNOT carry most NTSC multiples exactly: its
+# DefaultDuration is whole nanoseconds, and ffprobe reads 60000/1001 back as 19001/317 (48000/1001
+# as 7001/146, 120000/1001 as 29011/242 — measured, mkvmerge v99 + ffmpeg 8). Every master is
+# Matroska now, so an exact Fraction compare of an MKV against an MP4/MOV of the SAME rate failed.
+# A rate this close to a standard one IS that one (the snap tolerance is topaz's: NTSC and whole
+# rates are 1e-3 apart, so a snap never confuses them). topaz.py's declared-rate check uses the same
+# list (it imports these: dvcap stays importable without topaz's pins).
+STANDARD_FPS = ("24000/1001", "24/1", "25/1", "30000/1001", "30/1", "48000/1001", "48/1", "50/1",
+                "60000/1001", "60/1", "100/1", "120000/1001", "120/1", "12000/1001", "12/1",
+                "15000/1001", "15/1")
+FPS_SNAP_TOLERANCE = 2e-4
+
+
+def snap_fps_fields(d):
+    """PURE. A copy of the dict/list `d` with every "fps" value snapped (snap_fps) — so a resume
+    identity recorded with a Matroska readback rate still matches its standard rate."""
+    if isinstance(d, dict):
+        return {k: (snap_fps(v) or v) if k == "fps" and isinstance(v, str) else snap_fps_fields(v)
+                for k, v in d.items()}
+    if isinstance(d, list):
+        return [snap_fps_fields(x) for x in d]
+    return d
+
+
+def snap_fps(rate):
+    """PURE. A frame rate ('19001/317', Fraction, '25') -> 'num/den' in lowest terms, snapped to
+    the standard rate it is within FPS_SNAP_TOLERANCE of; None if unknown or not positive."""
+    try:
+        f = Fraction(str(rate).strip())
+    except (ValueError, ZeroDivisionError):
+        return None
+    if f <= 0:
+        return None
+    best = min((Fraction(r) for r in STANDARD_FPS), key=lambda r: abs(f / r - 1))
+    if abs(f / best - 1) <= FPS_SNAP_TOLERANCE:
+        f = best
+    return f"{f.numerator}/{f.denominator}"
 
 
 def _fr(v, scale) -> int:
@@ -134,11 +193,68 @@ def build_annexb_command(ffmpeg: str, src: str) -> list:
             "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"]
 
 
+# A Dolby Vision 8.1 base IS HDR10: BT.2020 primaries, PQ transfer, BT.2020 non-constant matrix.
+# mkvmerge DERIVES the DV record's compatibility id from the HEVC VUI (MP4Box forced 8.1), so a
+# source whose VUI leaves primaries/transfer "unknown" (an HDR10 file that signals it only in its
+# container — tested: compat 2) would mux as 8.2. hevc_metadata writes the colour description into
+# the SPS VUI and touches no coded picture (VCL bytes identical, measured).
+PQ_VUI_BSF = "hevc_metadata=colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9"
+
+
 def build_annexb_file_command(ffmpeg: str, src: str, out_hevc: str) -> list:
     """Source container -> Annex-B HEVC ES FILE, stream-copied — the original bits, untouched.
     The inject path's base layer (vs build_annexb_command's stdout pipe for RPU extraction)."""
     return [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", src,
             "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", out_hevc]
+
+
+def es_says_pq(es: str, ffprobe: str = FFPROBE) -> bool:
+    """The Annex-B ES's OWN VUI (not a container's Colour element, which can stand in for a missing
+    one) declares BT.2020 primaries and the PQ transfer."""
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=color_primaries,color_transfer", "-of", "json", es],
+                             capture_output=True, text=True, timeout=120).stdout
+        st = (json.loads(out or "{}").get("streams") or [{}])[0]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return st.get("color_primaries") == "bt2020" and st.get("color_transfer") == "smpte2084"
+
+
+def ensure_pq_vui(es: str, ffmpeg: str = FFMPEG, ffprobe: str = FFPROBE, timeout=None) -> tuple:
+    """(ok, note) — make a Dolby Vision base ES SAY it is BT.2020/PQ, in its VUI. Most HDR10 sources
+    already do, and are left exactly as they are (no second pass). Otherwise hevc_metadata writes
+    the colour description into the SPS (PQ_VUI_BSF; no coded picture changes) — accepted only
+    when it drops no packet and logs no filter error: FFmpeg's parser rejects SEI it cannot read
+    and DROPS that access unit with exit code 0 (review-caught 2026-10-19). ok=False says why."""
+    if es_says_pq(es, ffprobe):
+        return True, ""
+    tmp = es + ".vui"
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                            "-i", es, "-c:v", "copy", "-bsf:v", PQ_VUI_BSF, "-f", "hevc", tmp],
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        _rm_quiet(tmp)
+        return False, f"could not state BT.2020/PQ in the stream's VUI: {e}"
+    made = os.path.isfile(tmp)
+    before = count_hevc_frames(es, ffprobe)
+    after = count_hevc_frames(tmp, ffprobe) if made else 0
+    err = (r.stderr or "")
+    if (r.returncode != 0 or not made or "Error applying bitstream filters" in err
+            or after != before or before <= 0):
+        _rm_quiet(tmp)
+        return False, (f"the stream's VUI does not say BT.2020/PQ and rewriting it failed "
+                       f"({before} -> {after} frames; {err.strip().splitlines()[-1:] or ['no error']})")
+    os.replace(tmp, es)
+    return True, " · VUI set to BT.2020/PQ"
+
+
+def _rm_quiet(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def build_inject_command(dovi_tool: str, src_es: str, rpu: str, out_es: str) -> list:
@@ -374,7 +490,11 @@ def ensure_segdir(segdir: str, manifest: dict) -> str:
     if os.path.isdir(segdir):
         try:
             with open(mf) as f:
-                if json.load(f) == manifest:
+                # the rate compared SNAPPED: one recorded before snap_fps (a Matroska readback,
+                # 19001/317) is the same identity as its standard rate — a deploy must not wipe it
+                if snap_fps_fields(json.load(f)) == snap_fps_fields(manifest):
+                    with open(mf, "w") as g:
+                        json.dump(manifest, g)
                     return "resume"
         except (OSError, ValueError):
             pass
