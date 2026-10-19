@@ -466,7 +466,8 @@ struct YTLinkResolveDTO: Codable {            // action: resolve_link — NO sid
 }
 
 struct YTImportResultDTO: Codable {           // action: import_link
-    var status: String?        // queued | already-queued | bad-url | youtarr-unreachable | channel-queued | empty
+    var status: String?        // queued | already-queued | bad-url | youtarr-unreachable | channel-queued | empty | short
+    var shorts: Int?           // empty: how many of the playlist's videos were Shorts (never imported)
     var batch: String?
     var kind: String?
     var title: String?

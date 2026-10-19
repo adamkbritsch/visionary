@@ -21,8 +21,11 @@ import ftplib
 import json
 import os
 import re
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 
 from transfer import (connect as ftp_connect, ftp_listdir, remote_mtime, to_wire,
                       NAS_FTP_YOUTUBE_STAGING, NAS_FTP_YOUTUBE_ROOT)
@@ -206,6 +209,145 @@ def video_published(vid) -> int:
     return _published().get(vid, 0)
 
 
+# ---- Shorts are never processed (user-dictated 2026-10-19) ------------------------------
+# "block shorts from being processed in the youtube pipeline". A Short is never asked of
+# youtarr, never served from staging, never accepted as a send or an import. Which videos are
+# Shorts is ASKED OF YOUTUBE, never guessed from a title or a shape: youtube.com/shorts/<id>
+# answers 200 for a Short and redirects to /watch for anything else (checked against youtarr's
+# own shorts-tab index: the two agreed on all 1,196 videos in the libraries). A video's answer
+# never changes, so it is asked once and kept (SHORTS_FILE). No Short is longer than
+# SHORT_MAX_SECS, so a video measured longer than that is never asked at all.
+#
+# Polls and selection read the cache only (shorts_blocked); the asking (classify_shorts) runs
+# where videos ENTER: the staging re-list, fetch-ahead and the warm-up before youtarr is asked,
+# a send or an import, and the priority locator. A video not yet answered for is held only when
+# its measured length could be a Short's — an unmeasured one is not held hostage to the network.
+SHORTS_FILE = os.path.expanduser("~/.topaz-pipeline/youtube_shorts.json")
+SHORT_MAX_SECS = 180              # YouTube's longest Short (3 minutes since October 2024)
+SHORT_PROBE_TIMEOUT = 8.0
+SHORT_PROBES_PER_CALL = 60        # one classify call asks YouTube about at most this many videos
+_SHORTS = None                    # lazy-loaded {vid: bool}
+_SHORTS_LOCK = threading.Lock()
+_YT_ID = re.compile(r"^[0-9A-Za-z_-]{11}$")
+_UNDER_TEST = "unittest" in sys.modules   # tests never reach youtube.com (they patch _probe_http)
+
+
+def _shorts() -> dict:
+    global _SHORTS
+    if _SHORTS is None:
+        try:
+            with open(SHORTS_FILE) as f:
+                d = json.load(f)
+            _SHORTS = {k: bool(v) for k, v in d.items()} if isinstance(d, dict) else {}
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            _SHORTS = {}
+    return _SHORTS
+
+
+def remember_shorts(answers) -> None:
+    """Persist {vid: is_short} (permanent — a video never becomes or stops being a Short)."""
+    answers = {k: bool(v) for k, v in (answers or {}).items() if k and v is not None}
+    if not answers:
+        return
+    with _SHORTS_LOCK:
+        d = _shorts()
+        if all(d.get(k) == v for k, v in answers.items()):
+            return
+        d.update(answers)
+        try:
+            os.makedirs(os.path.dirname(SHORTS_FILE), exist_ok=True)
+            tmp = SHORTS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, SHORTS_FILE)
+        except OSError:
+            pass
+
+
+def is_short(vid):
+    """True / False when known, None when not yet asked. Cache and length only — never the
+    network. Anything that is not a YouTube id (a file placed by hand) is not a Short."""
+    if not vid or not _YT_ID.match(str(vid)):
+        return False
+    known = _shorts().get(vid)
+    if known is not None:
+        return known
+    if video_secs(vid) > SHORT_MAX_SECS:
+        return False
+    return None
+
+
+def shorts_blocked(vid) -> bool:
+    """POLL-SAFE. True for a Short, and for a video not yet answered for whose MEASURED length
+    is a Short's (the next classify asks). An unmeasured, unanswered video is not held."""
+    s = is_short(vid)
+    if s is not None:
+        return s
+    return 0 < video_secs(vid) <= SHORT_MAX_SECS
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def _probe_http(vid):
+    """(status, Location) of HEAD https://www.youtube.com/shorts/<vid>, redirects NOT followed."""
+    req = urllib.request.Request(f"https://www.youtube.com/shorts/{vid}", method="HEAD",
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        r = urllib.request.build_opener(_NoRedirect).open(req, timeout=SHORT_PROBE_TIMEOUT)
+        return r.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location")
+
+
+def probe_short(vid):
+    """Ask YouTube: True (a Short: /shorts/<id> is served), False (redirected to /watch), or
+    None (no answer — unreachable, rate-limited, anything else). Never raises."""
+    if not vid or not _YT_ID.match(str(vid)):
+        return False
+    if _UNDER_TEST and _probe_http is _PROBE_HTTP_REAL:
+        return None
+    try:
+        status, loc = _probe_http(vid)
+    except Exception:
+        return None
+    if status == 200:
+        return True
+    if status in (301, 302, 303, 307, 308) and "/watch" in str(loc or ""):
+        return False
+    return None
+
+
+_PROBE_HTTP_REAL = _probe_http
+
+
+def classify_shorts(vids, limit=SHORT_PROBES_PER_CALL) -> dict:
+    """Ask YouTube about every video in `vids` not yet answered for (a known length over
+    SHORT_MAX_SECS answers it without asking), at most `limit` asks; remember the answers.
+    -> {vid: True/False/None} for the asked ones. Never raises."""
+    asked, got = {}, {}
+    for vid in dict.fromkeys(v for v in (vids or ()) if v):
+        if is_short(vid) is not None:
+            continue
+        if len(asked) >= limit:
+            break
+        asked[vid] = probe_short(vid)
+        if asked[vid] is not None:
+            got[vid] = asked[vid]
+    remember_shorts(got)
+    return asked
+
+
+def short_now(vid) -> bool:
+    """A Short? The cache, else ask YouTube once (a send, an import, a fetch candidate). An
+    unanswered video counts as a Short only when its measured length is one's."""
+    if is_short(vid) is None:
+        classify_shorts([vid], limit=1)
+    return shorts_blocked(vid)
+
+
 _VIDEO_WARMING = set()
 _VIDEO_WARM_LOCK = threading.Lock()
 
@@ -271,6 +413,9 @@ def refresh_downloads() -> None:
             meta = ytdata.video_meta(missing) or {}         # videos.list — 1 unit/50: duration + date
             remember_durations({k: m.get("secs") for k, m in meta.items()})
             remember_published({k: m.get("pub") for k, m in meta.items()})
+        # what landed is asked about BEFORE selection can serve it (lengths first: a video
+        # measured longer than any Short is never asked)
+        classify_shorts([v["vid"] for v in cached_videos(folder)])
         prune_old(e)                                        # delete videos older than this channel's max age
 
 
@@ -575,6 +720,8 @@ def wanted_ids(entry, target) -> list:
         pub = pubs.get(vid)
         if max_age and pub and (now - pub) > max_age:
             continue
+        if short_now(vid):              # never ask youtarr for a Short
+            continue
         out.append(vid)
         if len(out) >= target:
             break
@@ -746,6 +893,8 @@ def warmup_candidates(entry) -> list:
             continue
         pub = pubs.get(v)
         if max_age and pub and (now - pub) > max_age:
+            continue
+        if short_now(v):                # a channel's first videos are never Shorts either
             continue
         out.append(v)
         if len(out) >= WARMUP_CANDIDATES:
@@ -1106,7 +1255,7 @@ def channel_pending(entry, skip=()) -> list:
     out = []
     for v in cached_videos(folder):
         vid, stem = v["vid"], os.path.splitext(v["name"])[0]
-        if vid in done or stem in skip:
+        if vid in done or stem in skip or shorts_blocked(vid):   # Shorts: never processed
             continue
         pub = pubs.get(vid)
         if max_age and pub and (now - pub) > max_age:  # older than this channel's max age (prune deletes it)
@@ -1534,6 +1683,8 @@ def send_priority(url_or_id, title=None) -> dict:
         return {"status": "bad-url"}
     if vid in get_done():
         return {"status": "already-upscaled", "id": vid}
+    if short_now(vid):
+        return {"status": "short", "id": vid}       # Shorts are never processed
     with _PRIORITY_LOCK:
         book = _priority()
         if any(e.get("vid") == vid for e in book):
@@ -1593,7 +1744,7 @@ def has_priority_ready(skip=()) -> bool:
     done = get_done()
     for e in _priority():
         p = e.get("path")
-        if not p or e.get("vid") in done or not _jumps(e):
+        if not p or e.get("vid") in done or not _jumps(e) or shorts_blocked(e.get("vid")):
             continue        # imports are cadence-joiners, never preemptors
         if os.path.splitext(os.path.basename(p))[0] in (skip or ()):
             continue
@@ -1634,6 +1785,8 @@ def _locate_scan() -> None:
     with _PRIORITY_LOCK:
         book = _priority()
         want = {e["vid"] for e in book if not e.get("path")}
+        unasked = [e.get("vid") for e in book if is_short(e.get("vid")) is None]
+    classify_shorts(unasked)            # a send whose check failed at send time is asked again
     if not want:
         return
     found = {}
@@ -1724,6 +1877,8 @@ def locate_priority(skip=()) -> dict | None:
         if e["vid"] in get_done():                          # finished via the ordinary stream
             _drop_priority(e["vid"])
             continue
+        if shorts_blocked(e["vid"]):                        # a Short is never served
+            continue
         return {"channel": e.get("channel"), "video_path": p,
                 "title": e.get("title"), "vid": e["vid"]}
     return None
@@ -1786,7 +1941,7 @@ def _import_pending(skip=()) -> list:
     paused = {r.get("id") for r in _imports() if r.get("paused")}
     for e in _priority():
         p = e.get("path")
-        if _jumps(e) or not p or e.get("vid") in done:
+        if _jumps(e) or not p or e.get("vid") in done or shorts_blocked(e.get("vid")):
             continue
         if e.get("batch") in paused:
             continue
@@ -1888,6 +2043,21 @@ def import_link(url, choice=None, title_hint=None) -> dict:
         src, batch_kind = "https://www.youtube.com/watch?v=" + vid, "video"
     if not ids:
         return {"status": "empty", "title": label}
+    # SHORTS ARE NEVER IMPORTED: lengths first (videos.list, one quota unit per 50), so YouTube
+    # is asked only about the videos short enough to be one
+    try:
+        meta = ytdata.video_meta([v for v in ids if is_short(v) is None]) or {}
+        remember_durations({k: m.get("secs") for k, m in meta.items()})
+        remember_published({k: m.get("pub") for k, m in meta.items()})
+    except Exception:
+        pass
+    classify_shorts(ids, limit=len(ids))
+    shorts = [v for v in ids if shorts_blocked(v)]
+    if shorts:
+        ids = [v for v in ids if v not in shorts]
+        if not ids:
+            return ({"status": "short", "id": shorts[0]} if batch_kind == "video"
+                    else {"status": "empty", "title": label, "shorts": len(shorts)})
 
     done = get_done()
     batch = "imp%d" % int(time.time() * 1000)

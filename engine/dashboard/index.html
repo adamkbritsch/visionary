@@ -827,7 +827,8 @@ async function importLink(choice){
     "channel-queued": "Added " + (imp.title || "that channel") + ".",
     "already-queued": "Already queued.",
     "youtarr-unreachable": "youtarr didn\u2019t respond \u2014 nothing was queued.",
-    empty: "Nothing to import."}[imp.status] || "Import failed.");
+    short: "That\u2019s a Short. Shorts are never upscaled.",
+    empty: imp.shorts ? "Only Shorts there \u2014 Shorts are never upscaled." : "Nothing to import."}[imp.status] || "Import failed.");
   if (imp.status === "queued" || imp.status === "channel-queued") $("linkIn").value = "";
   qSig = ""; await poll(true); drawPicker();
 }

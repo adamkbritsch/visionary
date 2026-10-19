@@ -3015,7 +3015,10 @@ private struct LinkImportRow: View {
         case "youtarr-unreachable":
             note = "youtarr didn't respond, so nothing was queued."
         case "empty":
-            note = "That playlist has nothing to import."
+            note = (out?.shorts ?? 0) > 0 ? "That playlist only has Shorts, which are never upscaled."
+                                          : "That playlist has nothing to import."
+        case "short":
+            note = "That's a Short. Shorts are never upscaled."
         case "bad-url":
             note = "That doesn't look like a YouTube link."
         default:

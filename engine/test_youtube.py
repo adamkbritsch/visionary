@@ -28,8 +28,17 @@ def setUpModule():
                      ("PRIORITY_FILE", "yt_priority.json"),
                      ("IMPORTS_FILE", "yt_imports.json"),
                      ("DONE_FILE", "yt_done.json"),
-                     ("QUEUE_FILE", "yt_queue.json")):
+                     ("QUEUE_FILE", "yt_queue.json"),
+                     ("SHORTS_FILE", "yt_shorts.json"),
+                     # the persisted caches too: the live durations file once picked up a
+                     # fixture id from a leaky run, and the Shorts length rule then held it
+                     ("DURATIONS_FILE", "yt_durations.json"),
+                     ("PUBLISHED_FILE", "yt_published.json")):
         p = mock.patch.object(youtube, name, os.path.join(d, fn))
+        p.start()
+        _BOOK_PATCHES.append(p)
+    for name in ("_SHORTS", "_DURATIONS", "_PUBLISHED"):   # load from the redirected files
+        p = mock.patch.object(youtube, name, None)
         p.start()
         _BOOK_PATCHES.append(p)
 
@@ -1964,3 +1973,105 @@ class Warmup(unittest.TestCase):
         self.assertTrue(e["paused"])
         self.assertEqual(e["max_age_days"], 7)
         self.assertEqual(e["warmup_asked"], {"v1": [1, 1]})
+
+
+class ShortsAreNeverProcessed(unittest.TestCase):
+    """User-dictated 2026-10-19: "block shorts from being processed in the youtube pipeline".
+    Which videos are Shorts is asked of YouTube (youtube.com/shorts/<id>: 200 = a Short, a
+    redirect to /watch = not) and remembered; every way a video enters is filtered."""
+
+    SHORT, LONG, CLIP = "shrtshrt001", "longlong001", "clipclip001"   # 11-char ids
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.ps = [mock.patch.object(youtube, "SHORTS_FILE", os.path.join(d, "s.json")),
+                   mock.patch.object(youtube, "_SHORTS", None),
+                   mock.patch.object(youtube, "PRIORITY_FILE", os.path.join(d, "p.json")),
+                   mock.patch.object(youtube, "DONE_FILE", os.path.join(d, "done.json")),
+                   mock.patch.object(youtube, "_DURATIONS",
+                                     {self.SHORT: 45, self.LONG: 900, self.CLIP: 150}),
+                   mock.patch.object(youtube, "_probe_http", side_effect=self._http)]
+        for p in self.ps:
+            p.start()
+        self.asked = []
+
+    def tearDown(self):
+        for p in self.ps:
+            p.stop()
+        youtube._VIDEO_CACHE.clear(); youtube._META.clear()
+
+    def _http(self, vid):
+        self.asked.append(vid)
+        if vid == self.SHORT:
+            return 200, None
+        return 303, "https://www.youtube.com/watch?v=" + vid
+
+    def test_youtube_answers_and_the_answer_is_kept(self):
+        self.assertIsNone(youtube.is_short(self.SHORT))
+        youtube.classify_shorts([self.SHORT, self.CLIP])
+        self.assertIs(youtube.is_short(self.SHORT), True)
+        self.assertIs(youtube.is_short(self.CLIP), False)
+        youtube._SHORTS = None                               # a relaunch reads the file
+        self.assertIs(youtube.is_short(self.SHORT), True)
+        youtube.classify_shorts([self.SHORT, self.CLIP])
+        self.assertEqual(self.asked, [self.SHORT, self.CLIP])   # never asked twice
+
+    def test_a_video_longer_than_any_short_is_never_asked(self):
+        self.assertIs(youtube.is_short(self.LONG), False)
+        youtube.classify_shorts([self.LONG])
+        self.assertEqual(self.asked, [])
+
+    def test_no_answer_is_not_remembered(self):
+        with mock.patch.object(youtube, "_probe_http", side_effect=OSError("offline")):
+            self.assertEqual(youtube.classify_shorts([self.CLIP]), {self.CLIP: None})
+        self.assertIsNone(youtube.is_short(self.CLIP))
+        # unanswered: held while its measured length is a Short's, never when unmeasured
+        self.assertTrue(youtube.shorts_blocked(self.CLIP))
+        self.assertFalse(youtube.shorts_blocked("unmeasured1"))
+
+    def test_a_file_placed_by_hand_is_not_a_short(self):
+        self.assertIs(youtube.is_short("Visionary A-B - A"), False)
+        self.assertIs(youtube.probe_short("Visionary A-B - A"), False)
+
+    def test_staging_never_serves_a_short(self):
+        youtube.remember_shorts({self.SHORT: True, self.CLIP: False})
+        youtube._VIDEO_CACHE["Chan"] = [_vid(f"Chan - x [{v}]") for v in (self.SHORT, self.CLIP, self.LONG)]
+        e = {"channelId": "UCx", "title": "Chan", "folder_name": "Chan", "scope": "all"}
+        got = [v["vid"] for v in youtube.channel_pending(e)]
+        self.assertEqual(sorted(got), sorted([self.CLIP, self.LONG]))
+
+    def test_youtarr_is_never_asked_for_a_short(self):
+        e = {"channelId": "C1", "folder_name": "Chan", "scope": "all"}
+        with mock.patch.object(youtube, "cached_videos", return_value=[]), \
+             mock.patch("youtarr.channel_video_ids", return_value=[self.SHORT, self.CLIP, self.LONG]):
+            got = youtube.wanted_ids(e, 10)
+        self.assertNotIn(self.SHORT, got)
+        self.assertEqual(sorted(got), sorted([self.CLIP, self.LONG]))
+        self.assertIs(youtube.is_short(self.SHORT), True)    # asked once, on the way
+
+    def test_a_sent_short_is_refused(self):
+        import youtarr
+        with mock.patch.object(youtarr, "download_videos",
+                               side_effect=AssertionError("never asked for")):
+            self.assertEqual(youtube.send_priority(self.SHORT)["status"], "short")
+        self.assertEqual(youtube._priority(), [])
+
+    def test_a_located_short_is_never_served(self):
+        youtube.remember_shorts({self.SHORT: True})
+        youtube._save_priority([{"vid": self.SHORT, "path": f"/s/Chan/x [{self.SHORT}].mp4",
+                                 "channel": "Chan"}])
+        self.assertIsNone(youtube.locate_priority())
+        self.assertFalse(youtube.has_priority_ready())
+
+    def test_an_imported_short_is_never_queued(self):
+        import youtarr, ytdata, ytlinks
+        link = {"kind": "playlist", "playlist_id": "PLx", "video_id": None, "ambiguous": False}
+        with mock.patch.object(ytlinks, "parse_link", return_value=link), \
+             mock.patch.object(ytdata, "playlist_video_ids", return_value=[self.SHORT, self.CLIP]), \
+             mock.patch.object(ytdata, "playlist_meta", return_value={"title": "P"}), \
+             mock.patch.object(ytdata, "video_meta", return_value={}), \
+             mock.patch.object(youtarr, "download_videos", return_value=True) as dl:
+            out = youtube.import_link("https://www.youtube.com/playlist?list=PLx")
+        self.assertEqual(out["status"], "queued")
+        dl.assert_called_once_with([self.CLIP])
+        self.assertEqual([e["vid"] for e in youtube._priority()], [self.CLIP])
