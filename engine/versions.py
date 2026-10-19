@@ -49,6 +49,13 @@ MODELS_BELOW_140W = frozenset({    # 14-inch M1/M2 MacBook Pro (96 W max) + ever
 # toolchain the blind A/B on the TV was judged on.
 DOVI_TOOL_VERSION = "2.3.0"         # `dovi_tool --version`. The `generate` config the lane writes
                                     # (CM v4.0, l1_avg_pq_cm_version) is version-sensitive.
+DOVI_TOOL_PATH = "/opt/homebrew/bin/dovi_tool"
+DOVI_TOOL_BUNDLE_SHA256 = "8de5496dc362cc1c600d6b781581730d9dd0e9ec8dd3f5d6b03e7df56250b3b6"
+                                    # dv/dovi_tool: quietvoid/dovi_tool's own 2.3.0 release build
+                                    # (dovi_tool-2.3.0-universal-macOS.zip, sha256 7ec7cea9...),
+                                    # installed where DOVI_TOOL_PATH is not already 2.3.0 — Homebrew
+                                    # has moved past it. Byte-identical output to a brew-built 2.3.0
+                                    # for generate / inject-rpu / extract-rpu / convert (measured).
 HDR_ANALYZER_PATH = os.path.expanduser("~/.topaz-pipeline/bin/hdr_analyzer_mvp")
 HDR_ANALYZER_COMMIT = "383b0ad"     # tinof/hdr-analyze, built from source (cargo) at this commit
 HDR_ANALYZER_SHA256 = "41727312f4a960b27d59cb0c0f24c2922dc82768da3503f083e4842a87fc099e"
@@ -60,6 +67,10 @@ NATIVE_LUT_SHA256 = "e410e5b7b899a07096a77e2f65bdeb6a4ab3cc60126358a81c8050251d8
                                     # manifest); any other file changes the picture
 NATIVE_FFMPEG_MAJOR = 8             # Homebrew ffmpeg: the LUT's colour was measured on 8.0, and
                                     # the analyzer links ffmpeg 8's major-versioned libraries
+NATIVE_FFMPEG_FALLBACK_LIB = "/opt/homebrew/opt/ffmpeg@8/lib"
+                                    # where the analyzer finds ffmpeg 8's libraries when
+                                    # /opt/homebrew/opt/ffmpeg is a newer major (or absent): the
+                                    # keg-only ffmpeg@8 formula, the one Setup installs on a fresh Mac
 
 # THE MASTER MUX (remux.py, nativerender.py; 2026-10-18 — every master is Matroska). mkvmerge writes
 # each master's Dolby Vision configuration record itself, from the RPU NALs and the HEVC VUI, so it

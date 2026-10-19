@@ -29,6 +29,9 @@ class Install(unittest.TestCase):
         p = mock.patch.object(dvinstall, "FILES", files)
         p.start()
         self.addCleanup(p.stop)
+        q = mock.patch.object(dvinstall, "_install_dovi", return_value=[])   # its own class below
+        q.start()
+        self.addCleanup(q.stop)
         self._bundle()
 
     def _bundle(self, an=None, lut=None):
@@ -89,3 +92,77 @@ class TheRepoBundleIsThePinnedPair(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class DoviTool(unittest.TestCase):
+    """dovi_tool is judged by VERSION: any 2.3.0 is the pinned tool (a brew-built one stays);
+    the bundled release build goes where there is none, and replaces another version only on
+    repair, keeping it beside."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        self.bin = os.path.join(self.d, "bin")
+        os.makedirs(self.bin)
+        self.dest = os.path.join(self.bin, "dovi_tool")
+        self.res = os.path.join(self.d, "res")
+        os.makedirs(os.path.join(self.res, "dv"))
+        self.bundle = os.path.join(self.res, "dv", "dovi_tool")
+        self._script(self.bundle, "2.3.0")
+        self.pin = mock.patch.object(dvinstall.versions, "DOVI_TOOL_BUNDLE_SHA256",
+                                     dvinstall._sha256(self.bundle))
+        self.pin.start()
+        self.addCleanup(self.pin.stop)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _script(self, path, version):
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\necho 'dovi_tool {version}'\n")
+        os.chmod(path, 0o755)
+
+    def go(self, repair):
+        return dvinstall._install_dovi(self.res, repair, dest=self.dest)
+
+    def test_a_missing_one_is_installed(self):
+        out = self.go(False)
+        self.assertEqual(dvinstall.dovi_version(self.dest), "2.3.0")
+        self.assertIn("installed", out[-1])
+
+    def test_any_2_3_0_is_kept_even_on_repair(self):
+        self._script(self.dest, "2.3.0")
+        before = open(self.dest).read()
+        self.assertIn("already", self.go(True)[0])
+        self.assertEqual(open(self.dest).read(), before)
+
+    def test_another_version_is_left_by_ensure_and_replaced_by_repair(self):
+        self._script(self.dest, "2.3.4")
+        self.assertIn("left as it is", self.go(False)[0])
+        self.assertEqual(dvinstall.dovi_version(self.dest), "2.3.4")
+        out = self.go(True)
+        self.assertEqual(dvinstall.dovi_version(self.dest), "2.3.0")
+        kept = [n for n in os.listdir(self.bin) if n.startswith("dovi_tool.replaced-")]
+        self.assertEqual(len(kept), 1)                              # the old one, beside
+        self.assertEqual(dvinstall.dovi_version(os.path.join(self.bin, kept[0])), "2.3.4")
+        self.assertIn("kept as", out[0])
+
+    def test_a_bundle_that_is_not_the_pin_installs_nothing(self):
+        with mock.patch.object(dvinstall.versions, "DOVI_TOOL_BUNDLE_SHA256", "0" * 64):
+            out = self.go(False)
+        self.assertIn("NOT installed", out[0])
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_no_homebrew_bin_installs_nothing(self):
+        import shutil
+        shutil.rmtree(self.bin)
+        self.assertIn("does not exist", self.go(False)[0])
+
+
+class TheRepoBundlesThePinnedDoviTool(unittest.TestCase):
+    def test_the_bundled_dovi_tool_is_the_pinned_2_3_0(self):
+        src = os.path.join(dvinstall.DEFAULT_RESOURCES, "dv", "dovi_tool")
+        self.assertEqual(dvinstall._sha256(src), dvinstall.versions.DOVI_TOOL_BUNDLE_SHA256)
+        self.assertEqual(dvinstall.dovi_version(src), dvinstall.versions.DOVI_TOOL_VERSION)

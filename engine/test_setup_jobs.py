@@ -75,7 +75,10 @@ if __name__ == "__main__":
 
 
 class BrewToolsJob(unittest.TestCase):
-    def test_it_installs_mkvtoolnix_not_gpac(self):
-        cmd = setup_jobs.TARGETS["brew_tools"]["cmd"]
-        self.assertIn("mkvtoolnix", cmd)
-        self.assertNotIn("gpac", cmd)
+    def test_it_runs_brewdeps_and_needs_homebrew(self):
+        t = setup_jobs.TARGETS["brew_tools"]
+        self.assertIsNone(t["cmd"])              # argv computed by the server: engine/brewdeps.py
+        self.assertTrue(t["needs_brew"])
+        import brewdeps
+        self.assertEqual(brewdeps.ALWAYS, ("x265", "mkvtoolnix"))
+        self.assertNotIn("gpac", brewdeps.ALWAYS)

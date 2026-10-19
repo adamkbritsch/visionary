@@ -231,14 +231,17 @@ class _NativeToolchain:
 
         def probe(argv, timeout=10):
             self.probed.append(list(argv))
-            return self.answers[os.path.basename(argv[0])]
+            tool = argv[2] if argv[0] == "/usr/bin/env" else argv[0]   # dvnative.analyzer_argv
+            return self.answers[os.path.basename(tool)]
         p = mock.patch.object(preflight, "_probe", side_effect=probe)
         p.start(); self.addCleanup(p.stop)
         preflight._SHA_CACHE.clear()
         self.addCleanup(preflight._SHA_CACHE.clear)
 
     def ran(self, name):
-        return [a for a in self.probed if os.path.basename(a[0]) == name]
+        # the analyzer is started through env (dvnative.analyzer_argv): its path is argv[2]
+        return [a for a in self.probed
+                if os.path.basename(a[2] if a[0] == "/usr/bin/env" else a[0]) == name]
 
 
 class NativeDvCheck(_NativeToolchain, unittest.TestCase):
@@ -251,7 +254,8 @@ class NativeDvCheck(_NativeToolchain, unittest.TestCase):
         self.assertEqual((c["id"], c["severity"]), ("native_dv", "fail"))
         self.assertIn("383b0ad", c["detail"])
         self.assertTrue(c["fix"])                        # fix is kept even on a pass
-        self.assertEqual(self.ran("hdr_analyzer_mvp"), [[self.an, "--help"]])
+        import dvnative
+        self.assertEqual(self.ran("hdr_analyzer_mvp"), [dvnative.analyzer_argv(self.an) + ["--help"]])
 
     def test_a_missing_analyzer_fails_and_is_not_run(self):
         os.remove(self.an)
@@ -277,7 +281,7 @@ class NativeDvCheck(_NativeToolchain, unittest.TestCase):
         self.assertFalse(c["ok"])
         self.assertIn("does not run", c["detail"])
         self.assertIn("libavformat.62", c["detail"])
-        self.assertIn("brew upgrade ffmpeg", c["fix"])
+        self.assertIn("ffmpeg@8", c["fix"])                  # Setup links the keg-only formula
 
     def test_an_analyzer_that_hangs_fails(self):
         self.answers["hdr_analyzer_mvp"] = (None, "no answer within 10 s")

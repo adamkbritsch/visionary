@@ -32,7 +32,11 @@ import versions  # noqa: E402
 
 BREW = "/opt/homebrew/bin"
 BREW_TOOLS = ("ffmpeg", "ffprobe", "x265", "dovi_tool", "mkvmerge")
-BREW_FORMULAE = "ffmpeg x265 dovi_tool mkvtoolnix"     # what installs BREW_TOOLS (mkvmerge: mkvtoolnix)
+BREW_FORMULAE = "x265 mkvtoolnix ffmpeg@8"     # what installs BREW_TOOLS (mkvmerge: mkvtoolnix;
+                                               # dovi_tool: the bundled 2.3.0, engine/dvinstall.py)
+BREW_FIX = ("Settings → Setup → Command-line tools → Install (engine/brewdeps.py: brew install "
+            "x265 mkvtoolnix, and ffmpeg@8 linked unless an ffmpeg 8 is already there); dovi_tool "
+            "2.3.0: Settings → Setup → Dolby Vision toolchain → Install (engine/dvinstall.py)")
 
 
 def _check(cid, ok, severity, detail, fix=""):
@@ -133,7 +137,7 @@ def mkvmerge_version(text):
 def check_brew_tools():
     missing = [t for t in BREW_TOOLS if not os.path.exists(os.path.join(BREW, t))]
     problems = ["missing from /opt/homebrew/bin: " + ", ".join(missing)] if missing else []
-    fix = f"brew install {BREW_FORMULAE}"
+    fix = BREW_FIX
     if "mkvmerge" not in missing:
         # every master's Dolby Vision record is written by mkvmerge: below the floor it may
         # miss the RPU or mis-time a raw HEVC stream (versions.MKVMERGE_MIN_VERSION)
@@ -144,7 +148,7 @@ def check_brew_tools():
             shown = "unreadable" if got is None else "%d.%d" % got
             problems.append(f"mkvmerge {shown} is older than {want[0]}.{want[1]} (it writes every "
                             f"master's Dolby Vision record)")
-            fix = f"brew install {BREW_FORMULAE}; brew upgrade mkvtoolnix"
+            fix = BREW_FIX + "; then `brew upgrade mkvtoolnix`"
     return _check("brew_tools", not problems, "fail",
                   ("all present: " + ", ".join(BREW_TOOLS)) if not problems
                   else "; ".join(problems), fix)
@@ -210,14 +214,17 @@ def _native_dv_problems():
         # Only the PINNED build is ever executed. The hash can't see its dylibs: it links
         # Homebrew ffmpeg's libav*.62 by major version, so a `brew upgrade ffmpeg` breaks it
         # while the file is byte-identical — running it is the only proof it still loads.
-        rc, text = _probe([an, "--help"])
+        import dvnative                     # started exactly as the analysis starts it
+        rc, text = _probe(dvnative.analyzer_argv(an) + ["--help"])
         if rc != 0:
             tail = (text or "").strip().splitlines()[-1:] or ["no output"]
             out.append((f"hdr_analyzer_mvp does not run (--help: "
                         f"{'exit %s' % rc if rc is not None else 'failed'}: {tail[0][:160]})",
-                        f"It links Homebrew's ffmpeg {major} at /opt/homebrew/opt/ffmpeg, so its "
-                        f"libraries probably moved (brew upgrade ffmpeg?): reinstall ffmpeg "
-                        f"{major} and `brew pin ffmpeg`."))
+                        f"It needs Homebrew's ffmpeg {major} libraries, from an ffmpeg {major} "
+                        f"formula at /opt/homebrew/opt/ffmpeg or from "
+                        f"{versions.NATIVE_FFMPEG_FALLBACK_LIB}: Settings → Setup → Command-line "
+                        f"tools → Install puts ffmpeg@{major} there (or `brew install "
+                        f"ffmpeg@{major}`)."))
     lut = versions.NATIVE_LUT_PATH
     lut_fix = ("Install the bundled LUT: Settings → Setup → Dolby Vision toolchain → Install, or "
                f"python3 engine/dvinstall.py --repair (it copies dv/{os.path.basename(lut)} to "
@@ -233,16 +240,19 @@ def _native_dv_problems():
         got = m.group(1) if m else ("not runnable" if rc is None else "unreadable")
         out.append((f"dovi_tool is {got}; the native lane needs exactly "
                     f"{versions.DOVI_TOOL_VERSION}",
-                    f"Install dovi_tool {versions.DOVI_TOOL_VERSION} at {BREW}/dovi_tool and "
-                    f"`brew pin dovi_tool`: the `generate` config this lane writes is "
-                    f"version-sensitive."))
+                    f"Settings → Setup → Dolby Vision toolchain → Install, or python3 "
+                    f"engine/dvinstall.py --repair: it puts the bundled dovi_tool "
+                    f"{versions.DOVI_TOOL_VERSION} at {BREW}/dovi_tool (a newer one is kept aside) "
+                    f"— the `generate` config this lane writes is version-sensitive."))
     rc, text = _probe([os.path.join(BREW, "ffmpeg"), "-version"])
     m = re.match(r"\s*ffmpeg version n?(\d+)\.", text or "") if rc == 0 else None
     if not m or int(m.group(1)) != major:
         got = m.group(1) if m else ("not runnable" if rc is None else "unreadable")
         out.append((f"ffmpeg major is {got}; the native lane needs {major}",
-                    f"Install Homebrew ffmpeg {major} and `brew pin ffmpeg`: the LUT's colour "
-                    f"was measured on {major}, and hdr_analyzer_mvp links its libraries."))
+                    f"Settings → Setup → Command-line tools → Install (it links Homebrew's "
+                    f"ffmpeg@{major}; or `brew install ffmpeg@{major} && brew link --force "
+                    f"ffmpeg@{major}`): the LUT's colour was measured on {major}, and "
+                    f"hdr_analyzer_mvp links its libraries."))
     return out
 
 

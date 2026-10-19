@@ -49,20 +49,24 @@ Watch `topaz_version`. It must report the exact pin (`7.0.1` — from `engine/ve
   everything else and preflight never checks it.
 
 ### Step 3 — Brew tools
-`brew_tools` check. Run the command from `fix` (`brew install ffmpeg x265 dovi_tool mkvtoolnix`;
-it's in the README too), then `brew pin ffmpeg dovi_tool` — the Dolby Vision step is pinned to
-ffmpeg 8 and dovi_tool 2.3.0. mkvtoolnix's mkvmerge muxes every master (Matroska, DV 8.1); the
-check wants mkvmerge 90.0 or newer.
+`brew_tools` check. Run `python3 engine/brewdeps.py` (what Setup's Install button runs): it
+installs only what is missing — x265, mkvtoolnix, and ffmpeg 8 (an ffmpeg 8 at
+/opt/homebrew/bin/ffmpeg is kept; otherwise the keg-only `ffmpeg@8` formula is installed and
+linked, a newer `ffmpeg` formula unlinked first). If the user's ffmpeg 8 is the `ffmpeg` formula,
+`brew pin ffmpeg`. mkvtoolnix's mkvmerge muxes every master (Matroska, DV 8.1); the check wants
+mkvmerge 90.0 or newer. dovi_tool 2.3.0 is NOT installed here — it ships in dv/ (step 4).
 
 ### Step 4 — Dolby Vision toolchain
 `native_dv` check (severity fail — part of the arm gate). It verifies hdr_analyzer_mvp by
 sha256 AND runs it, the LUT by sha256, dovi_tool's exact version and ffmpeg's major.
-- hdr_analyzer_mvp and the LUT ship in `dv/` (dv/README.md). The app installs a missing one at
-  launch; from a clone run `python3 engine/dvinstall.py` (`--repair` also replaces a file that
-  is not the pinned one, keeping it beside as `.replaced-<stamp>`). Never substitute another
-  LUT — it IS the colour conversion.
-- A `does not run` result after a `brew upgrade ffmpeg` means the analyzer's libraries moved
-  (it links Homebrew's ffmpeg 8 at /opt/homebrew/opt/ffmpeg): reinstall ffmpeg 8 and pin it.
+- hdr_analyzer_mvp, the LUT and dovi_tool 2.3.0 ship in `dv/` (dv/README.md). The app installs
+  a missing one at launch; from a clone run `python3 engine/dvinstall.py` (`--repair` also
+  replaces a file that is not the pinned one — for dovi_tool, one of another version — keeping it
+  beside as `.replaced-<stamp>`; any dovi_tool 2.3.0 already at /opt/homebrew/bin is left alone).
+  Never substitute another LUT — it IS the colour conversion.
+- A `does not run` result means the analyzer found no ffmpeg 8 libraries: neither an ffmpeg 8
+  formula at /opt/homebrew/opt/ffmpeg nor /opt/homebrew/opt/ffmpeg@8/lib. Run step 3's
+  `python3 engine/brewdeps.py` (it installs and links ffmpeg@8).
 
 ### Step 5 — Python dependency
 `python_deps` probes `/usr/bin/python3` specifically (the app's engine interpreter; the

@@ -131,7 +131,8 @@ class SidecarValidation(unittest.TestCase):
 class AnalyzerCommand(unittest.TestCase):
     def test_defaults_force_pq_full_frame_full_res(self):
         c = dvnative.build_analyzer_command("/a", "/in.mkv", "/m.bin")
-        self.assertEqual(c[:5], ["/a", "-i", "/in.mkv", "-o", "/m.bin"])
+        self.assertEqual(c[:3], dvnative.analyzer_argv("/a"))       # through env (ffmpeg@8 libs)
+        self.assertEqual(c[3:7], ["-i", "/in.mkv", "-o", "/m.bin"])
         self.assertEqual(c[c.index("--transfer") + 1], "pq")
         self.assertIn("--no-crop", c)                       # Resolve writes L5 = 0
         self.assertEqual(c[c.index("--downscale") + 1], "1")
@@ -476,6 +477,9 @@ class AnalyzeChunks(unittest.TestCase):
     def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, cwd=None, what="step", poll=0.5):
         self.assertEqual(cmd[:3], ["/usr/bin/nice", "-n", "10"])
         cmd = cmd[3:]
+        if cmd[0] == dvnative.ENV:                          # the analyzer, through env (ffmpeg@8 libs)
+            self.assertTrue(cmd[1].startswith("DYLD_FALLBACK_LIBRARY_PATH="))
+            cmd = cmd[2:]
         if should_pause is not None and should_pause():     # run_step's poll, at the first tick
             raise dvnative.Paused(f"paused: yielded during {what}")
         if cmd[0] == "/ff":
@@ -1523,6 +1527,8 @@ class AnalyzeRanges(unittest.TestCase):
     def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, cwd=None, what="step", poll=0.5,
                   on_poll=None):
         cmd = cmd[3:]
+        if cmd[0] == dvnative.ENV:                          # the analyzer, through env (ffmpeg@8 libs)
+            cmd = cmd[2:]
         if cmd[0] == "/ff":
             step, k = "intermediate", self._k(cmd[-1])
             self.cmds.append(cmd)
@@ -1868,3 +1874,48 @@ class HlgToPqInFfmpeg(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class AnalyzerFindsFfmpeg8(unittest.TestCase):
+    """The pinned analyzer links /opt/homebrew/opt/ffmpeg/lib/libav*.62; on a Mac whose ffmpeg
+    formula is 9 (or absent) those come from the keg-only ffmpeg@8 through
+    DYLD_FALLBACK_LIBRARY_PATH — set by env, AFTER nice: macOS strips DYLD_* when it starts a
+    protected binary like /usr/bin/nice."""
+
+    def test_the_launcher(self):
+        self.assertEqual(dvnative.analyzer_argv("/x/an"),
+                         ["/usr/bin/env", "DYLD_FALLBACK_LIBRARY_PATH=" +
+                          dvnative._versions.NATIVE_FFMPEG_FALLBACK_LIB, "/x/an"])
+        self.assertEqual(dvnative.analyzer_argv("/x/an", lib="/l")[1], "DYLD_FALLBACK_LIBRARY_PATH=/l")
+
+    def test_for_real_through_nice(self):
+        import shutil, subprocess, tempfile
+        an = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dv",
+                          "hdr_analyzer_mvp")
+        libs = "/opt/homebrew/opt/ffmpeg/lib"
+        names = ["libavutil.60", "libavformat.62", "libswscale.9", "libavcodec.62"]
+        if not (os.path.exists(an) and all(os.path.exists(f"{libs}/{n}.dylib") for n in names)
+                and shutil.which("install_name_tool") and shutil.which("codesign")):
+            self.skipTest("needs the bundled analyzer, ffmpeg 8 libraries and the Xcode tools")
+        d = tempfile.mkdtemp()
+        try:
+            # a COPY whose links point where nothing is — as on a Mac whose ffmpeg is 9 — and a
+            # fallback dir holding the 8 libraries (on a fresh Mac: ffmpeg@8's own lib dir)
+            copy, fb = os.path.join(d, "an"), os.path.join(d, "ffmpeg8lib")
+            os.makedirs(fb)
+            shutil.copyfile(an, copy)
+            os.chmod(copy, 0o755)
+            for n in names:
+                subprocess.run(["install_name_tool", "-change", f"{libs}/{n}.dylib",
+                                f"/nonexistent/ffmpeg/lib/{n}.dylib", copy], check=True,
+                               capture_output=True)
+                os.symlink(f"{libs}/{n}.dylib", os.path.join(fb, f"{n}.dylib"))
+            subprocess.run(["codesign", "-f", "-s", "-", copy], check=True, capture_output=True)
+            bare = subprocess.run(dvnative.niced([copy, "--help"]), capture_output=True)
+            self.assertNotEqual(bare.returncode, 0)                    # no libraries: dyld fails
+            ok = subprocess.run(dvnative.niced(dvnative.analyzer_argv(copy, lib=fb) + ["--help"]),
+                                capture_output=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr[-300:])       # env after nice: found
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

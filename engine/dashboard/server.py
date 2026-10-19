@@ -1575,6 +1575,9 @@ class Handler(BaseHTTPRequestHandler):
             import setup_jobs
             what = (body or {}).get("what") or ""
             argv = None
+            if what == "brew_tools":
+                # x265 + mkvtoolnix + ffmpeg 8 (engine/brewdeps.py): argv ENGINE-computed
+                argv = [sys.executable, os.path.join(ENGINE_DIR, "brewdeps.py")]
             if what == "dv_toolchain":
                 # the bundled analyzer + LUT (dv/) to their pinned paths: argv ENGINE-computed
                 argv = [sys.executable, os.path.join(ENGINE_DIR, "dvinstall.py"), "--repair",

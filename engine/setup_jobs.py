@@ -22,12 +22,10 @@ BREW_INSTALL_HINT = ('/bin/bash -c "$(curl -fsSL '
                      'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
 
 TARGETS = {
-    # Only the MISSING tools, and never an upgrade (HOMEBREW_NO_INSTALL_UPGRADE in _run): ffmpeg
-    # and dovi_tool are pinned (versions.py) — an upgrade past them would fail preflight's
-    # native_dv row, which is part of the arm gate.
-    "brew_tools": {"cmd": f'for f in ffmpeg x265 dovi_tool mkvtoolnix; do {BREW} list --versions "$f" '
-                          f'>/dev/null 2>&1 || {BREW} install "$f"; done',
-                   "needs_brew": True},
+    # engine/brewdeps.py (argv computed by the caller): only the MISSING tools, never an upgrade
+    # (HOMEBREW_NO_INSTALL_UPGRADE in _run) — x265, mkvtoolnix, and ffmpeg 8 (an installed 8 is
+    # kept; otherwise the ffmpeg@8 formula, linked). dovi_tool is not Homebrew's: dv_toolchain.
+    "brew_tools": {"cmd": None, "needs_brew": True},
     # the bundled Dolby Vision toolchain files (dv/): argv computed by the caller (engine/
     # dvinstall.py --repair with the bundle's Resources dir) — copies the pinned analyzer and LUT
     "dv_toolchain": {"cmd": None},

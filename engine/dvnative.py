@@ -574,13 +574,30 @@ def hdr_front_end(info: dict):
 
 # ---- hdr-analyze ------------------------------------------------------------------------
 
+ENV = "/usr/bin/env"
+
+
+def analyzer_argv(analyzer: str, lib: str | None = None) -> list:
+    """PURE. How the pinned analyzer is started: through env(1), which sets
+    DYLD_FALLBACK_LIBRARY_PATH to the keg-only ffmpeg@8's libraries (versions.
+    NATIVE_FFMPEG_FALLBACK_LIB). The analyzer links /opt/homebrew/opt/ffmpeg/lib/libav*.62 by
+    absolute path; dyld looks in the fallback only when that file is MISSING — /opt/homebrew/opt/
+    ffmpeg absent, or a newer major whose libraries are .63 — so a Mac whose ffmpeg formula IS 8
+    loads exactly what it always did. env must be the LAST exec: the steps run under /usr/bin/nice,
+    and macOS strips DYLD_* variables when it starts a protected system binary, so a variable set
+    before nice never reaches the analyzer (tested 2026-10-19: through nice it is gone; env setting
+    it after nice works, same pid, same niceness)."""
+    return [ENV, f"DYLD_FALLBACK_LIBRARY_PATH={lib or _versions.NATIVE_FFMPEG_FALLBACK_LIB}", analyzer]
+
+
 def build_analyzer_command(analyzer: str, src: str, out_bin: str, *, peak_estimator: str = "max",
                            downscale: int = 1, threads: int | None = None,
                            frame_stats: str | None = None) -> list:
     """`src` must be PQ. --transfer pq because a raw/re-wrapped input can lose its colour
     tags; --no-crop because the reference masters carry L5 = 0 (full frame) and Topaz output is full frame."""
-    cmd = [analyzer, "-i", src, "-o", out_bin, "--transfer", "pq", "--no-crop",
-           "--peak-estimator", peak_estimator, "--downscale", str(int(downscale))]
+    cmd = analyzer_argv(analyzer) + ["-i", src, "-o", out_bin, "--transfer", "pq", "--no-crop",
+                                     "--peak-estimator", peak_estimator, "--downscale",
+                                     str(int(downscale))]
     if peak_estimator != "max":
         cmd += ["--peak-source", "max"]          # the estimator acts in the direct peak domain
     if threads:

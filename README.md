@@ -41,7 +41,7 @@ Arm it in the evening; wake up to finished episodes.
 > |---|---|
 > | Mac | **Any desktop Mac** (mini, Studio, iMac), or a **16-inch MacBook Pro** on its 140 W charger. A 14-inch MacBook Pro (M1/M2) or a MacBook Air can't sustain the power draw and is refused; a laptop too new for the model lists is judged by its live charger reading instead (see below). |
 > | Topaz Video AI | **7.0.1** — this exact build |
-> | Dolby Vision™ toolchain | Homebrew **ffmpeg 8** and **dovi_tool 2.3.0** (both pinned). The other two pieces — the **hdr_analyzer_mvp** build and the **SDR→PQ LUT** — ship with Visionary in [`dv/`](dv/README.md) and install themselves — see [step 4](#4-dolby-vision-toolchain) |
+> | Dolby Vision™ toolchain | Homebrew **ffmpeg 8** (Setup installs it — see [step 3](#3-command-line-tools)). Everything else — **dovi_tool 2.3.0**, the **hdr_analyzer_mvp** build and the **SDR→PQ LUT** — ships with Visionary in [`dv/`](dv/README.md) and installs itself — see [step 4](#4-dolby-vision-toolchain) |
 > | Local scratch | a **fast SSD with ~1 TB free** — the working files are enormous (see [Known limitations](#known-limitations)) |
 > | NAS | reachable over FTP, hosting your media (a Plex server is **optional** — see [Configuration](#configuration)) |
 > | AI border extension | **optional.** Requires the **[Comfy Desktop](https://www.comfy.org/) app** (run once so it builds its ComfyUI + venv — a hand-cloned ComfyUI is not detected), its **ComfyUI-VideoHelperSuite** node from Manager, and ~11.4 GB of WAN 2.1 models Visionary downloads for you from Settings → Setup. Without all of it, everything else works unchanged — the feature simply never appears. See [step 11](#11-ai-border-extension--optional-only-for-43-shows). |
@@ -123,42 +123,51 @@ Mac always passes; a 14-inch M1/M2 MacBook Pro or a MacBook Air is refused.
 
 ### 3. Command-line tools
 
+**Settings → Setup → Command-line tools → Install** does this step for you. By hand it is:
+
 ```bash
-brew install ffmpeg x265 dovi_tool mkvtoolnix
-brew pin ffmpeg dovi_tool     # the Dolby Vision step is pinned to ffmpeg 8 and dovi_tool 2.3.0
+python3 engine/brewdeps.py
 ```
 
-The Dolby Vision step needs **ffmpeg 8** and **dovi_tool 2.3.0** exactly, and pinning keeps a later
-`brew upgrade` from moving them — an upgrade fails the `native_dv` check, and the app will not
-arm. If Homebrew has already moved past them: dovi_tool 2.3.0 is on its
-[releases page](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.0); for ffmpeg, the bundled
-analyzer links Homebrew's `ffmpeg` at `/opt/homebrew/opt/ffmpeg`, so install the `ffmpeg@8`
-formula, `brew link --force ffmpeg@8`, and point that path at it
-(`ln -s ffmpeg@8 /opt/homebrew/opt/ffmpeg`).
+which installs only what is missing and upgrades nothing: **x265**, **mkvtoolnix**, and
+**ffmpeg 8**. The Dolby Vision step needs ffmpeg's major version to be exactly 8 (the LUT's colour
+was measured on it, and the analyzer links its libraries), and Homebrew's `ffmpeg` formula has
+moved on to 9 — so an ffmpeg 8 already at `/opt/homebrew/bin/ffmpeg` is kept as it is, and
+otherwise the keg-only **`ffmpeg@8`** formula is installed and linked there (`brew install
+ffmpeg@8 && brew link --force ffmpeg@8`; a newer `ffmpeg` formula is unlinked first, not
+uninstalled). The analyzer finds ffmpeg@8's libraries at `/opt/homebrew/opt/ffmpeg@8/lib` by
+itself. If your ffmpeg 8 is the `ffmpeg` formula, `brew pin ffmpeg` keeps a later `brew upgrade`
+from moving it — an upgrade fails the `native_dv` check, and the app will not arm.
+
+**dovi_tool 2.3.0** does not come from Homebrew (it has moved past 2.3.0 too): it ships in `dv/`
+— see step 4.
 
 mkvtoolnix's **mkvmerge** muxes every master — each one is a Matroska file (`.mkv`) carrying
 Dolby Vision 8.1 — and preflight wants version 90.0 or newer (any current Homebrew build is).
 
 ### 4. Dolby Vision™ toolchain
 
-Two more pieces ship with Visionary in [`dv/`](dv/README.md), so there is nothing to build or
+Three pieces ship with Visionary in [`dv/`](dv/README.md), so there is nothing to build or
 download:
 
 - **hdr_analyzer_mvp** — a build of [tinof/hdr-analyze](https://github.com/tinof/hdr-analyze)
   (MIT) at commit `383b0ad`, which measures every shot of the picture.
 - **The SDR→PQ LUT** — the one colour conversion every SDR source goes through (BT.709 SDR to
   BT.2020 PQ at 1000 nits).
+- **dovi_tool 2.3.0** — [quietvoid/dovi_tool](https://github.com/quietvoid/dovi_tool)'s own release
+  build (MIT), which writes and injects the Dolby Vision metadata.
 
-The app copies a missing one to its place (`~/.topaz-pipeline/bin/`, `~/.topaz-pipeline/luts/`)
-when it launches; **Settings → Setup → Dolby Vision toolchain → Install** also replaces one that
-isn't the pinned file. From a clone:
+The app copies a missing one to its place (`~/.topaz-pipeline/bin/`, `~/.topaz-pipeline/luts/`,
+`/opt/homebrew/bin/dovi_tool`) when it launches; **Settings → Setup → Dolby Vision toolchain →
+Install** also replaces one that isn't the pinned file (a dovi_tool of another version is kept
+beside it; any 2.3.0 already there — a brew-built one included — is left alone). From a clone:
 
 ```bash
 python3 engine/dvinstall.py          # add --repair to replace a mismatched file
 ```
 
-Preflight's `native_dv` row checks both by sha256 (and actually runs the analyzer), together
-with the ffmpeg and dovi_tool versions from step 3.
+Preflight's `native_dv` row checks the analyzer and the LUT by sha256 (and actually runs the
+analyzer), dovi_tool's version, and ffmpeg's major from step 3.
 
 ### 5. Python dependency (for the SYSTEM python)
 

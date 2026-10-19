@@ -1,3 +1,4 @@
 # the pinned Dolby Vision toolchain files (dv/README.md): byte-exact, never diffed or normalised
 dv/hdr_analyzer_mvp binary
 dv/*.cube -text -diff
+dv/dovi_tool binary

@@ -1213,6 +1213,25 @@ class YieldEndpoint(unittest.TestCase):
 
 
 
+class BrewToolsInstall(unittest.TestCase):
+    """POST /api/setup/install {what: brew_tools} runs engine/brewdeps.py (x265, mkvtoolnix,
+    ffmpeg 8) — an ENGINE-computed argv, nothing user-supplied."""
+
+    def test_the_argv_is_brewdeps(self):
+        import io, json, os, setup_jobs, sys
+        from unittest import mock
+        body = json.dumps({"what": "brew_tools"}).encode()
+        h = _req("127.0.0.1", path="/api/setup/install", **{"Content-Length": str(len(body))})
+        h.rfile = io.BytesIO(body)
+        sent = {}
+        h._json = lambda out, code=200: sent.update(out=out, code=code)
+        with mock.patch.object(setup_jobs, "start", return_value={"state": "running"}) as start:
+            h.do_POST()
+        self.assertEqual(start.call_args.args, ("brew_tools",))
+        self.assertEqual(start.call_args.kwargs["argv"],
+                         [sys.executable, os.path.join(server.ENGINE_DIR, "brewdeps.py")])
+
+
 class DvToolchainInstall(unittest.TestCase):
     """POST /api/setup/install {what: dv_toolchain} runs the ENGINE-computed installer — the
     bundled analyzer + LUT, --repair, from the bundle's own Resources dir."""

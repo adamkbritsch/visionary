@@ -577,7 +577,7 @@ def toolchain_problems() -> list:
     elif sha256_cached(an) != pin("HDR_ANALYZER_SHA256"):
         problems.append(f"hdr_analyzer_mvp is not the pinned build (commit {pin('HDR_ANALYZER_COMMIT')})")
     else:
-        rc, out = _run_quick([an, "--help"])
+        rc, out = _run_quick(dvnative.analyzer_argv(an) + ["--help"])
         if rc != 0:
             problems.append("hdr_analyzer_mvp does not run (was ffmpeg upgraded under it?): "
                             + (out or "").strip()[-160:])
