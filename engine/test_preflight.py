@@ -418,3 +418,31 @@ class MasterMuxTool(unittest.TestCase):
             c = preflight.check_brew_tools()
         self.assertFalse(c["ok"])
         self.assertIn("mkvmerge", c["detail"])
+
+
+class OptionalChecksNeverBlockSetup(unittest.TestCase):
+    """The lid-closed permission is an extra many users never want: Setup must still read
+    complete, and the CLI exit 0, while it is not set up."""
+
+    def test_an_unmet_optional_check_is_not_counted(self):
+        good = preflight._check("x", True, "fail", "fine")
+        lid = preflight._check("lid_awake", False, "optional", "optional: ...", "cmd")
+        with mock.patch.object(preflight, "run_arm_gate", return_value=[good]), \
+             mock.patch.object(preflight, "check_power_adapter", return_value=good), \
+             mock.patch.object(preflight, "check_lid_awake", return_value=lid), \
+             mock.patch.object(preflight, "check_config", return_value=good):
+            r = preflight.run_checks()
+            self.assertTrue(r["ok"])
+            self.assertTrue(r["hard_ok"])
+            self.assertIn(lid, r["checks"])
+            with mock.patch("builtins.print"):
+                self.assertEqual(preflight.main([]), 0)
+
+    def test_the_lid_check_is_optional_on_every_machine(self):
+        import lidsleep
+        for lid, allowed in ((False, False), (True, True), (True, False)):
+            with mock.patch.object(lidsleep, "has_lid", return_value=lid), \
+                 mock.patch.object(lidsleep, "allowed", return_value=allowed):
+                c = preflight.check_lid_awake()
+            self.assertEqual(c["severity"], "optional")
+            self.assertTrue(c["fix"].endswith("--install"))

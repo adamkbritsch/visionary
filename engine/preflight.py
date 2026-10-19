@@ -14,7 +14,9 @@ Two surfaces, one implementation:
 
 Severity semantics: "fail" checks gate hard_ok (the app refuses to arm); "warn" checks are
 setup-progress items (config not filled in yet) — they block a RUN from succeeding but not
-intentionally, so they only fail the strict exit code, not hard_ok.
+intentionally, so they only fail the strict exit code, not hard_ok. "optional" checks are
+extras the user may never want (keeping a closed lid awake): shown, never counted — neither
+`ok` (Setup's "complete") nor the exit code waits on them.
 """
 from __future__ import annotations
 import argparse
@@ -369,21 +371,21 @@ def run_arm_gate():
 
 
 def check_lid_awake():
-    """WARN, never an arm gate: can a closed lid be kept from sleeping the Mac while the pipeline
+    """OPTIONAL, never counted: can a closed lid be kept from sleeping the Mac while the pipeline
     runs on mains power (lidsleep.py)? Only `pmset disablesleep` does that, and it needs the
     one-time sudoers rule the fix installs. A Mac with no lid has nothing to set up."""
     import lidsleep
     if not lidsleep.has_lid():
-        return _check("lid_awake", True, "warn", "no lid — nothing to keep awake",
+        return _check("lid_awake", True, "optional", "no lid — nothing to keep awake",
                       lidsleep.install_command())
     if lidsleep.allowed(fresh=True):
-        return _check("lid_awake", True, "warn",
+        return _check("lid_awake", True, "optional",
                       "the Mac stays awake with the lid closed while activated on mains power",
                       lidsleep.install_command())
-    return _check("lid_awake", False, "warn",
-                  "closing the lid sleeps the Mac and stops the run — run this once in Terminal "
-                  "(it asks for your password) to let Visionary keep it awake while activated "
-                  "on mains power",
+    return _check("lid_awake", False, "optional",
+                  "optional: closing the lid sleeps the Mac and pauses the run — to keep it awake "
+                  "while activated on mains power, run this once in Terminal (it asks for your "
+                  "password)",
                   lidsleep.install_command())
 
 
@@ -391,7 +393,7 @@ def run_checks(network=False):
     checks = run_arm_gate() + [check_power_adapter(), check_lid_awake(),
                                check_config(network=network)]
     hard_ok = all(c["ok"] for c in checks if c["severity"] == "fail")
-    ok = all(c["ok"] for c in checks)
+    ok = all(c["ok"] for c in checks if c["severity"] != "optional")
     return {"ok": ok, "hard_ok": hard_ok, "checks": checks}
 
 
@@ -405,7 +407,7 @@ def main(argv=None):
         print(json.dumps(result, indent=2))
     else:
         for c in result["checks"]:
-            mark = "PASS" if c["ok"] else ("FAIL" if c["severity"] == "fail" else "WARN")
+            mark = "PASS" if c["ok"] else {"fail": "FAIL", "optional": "OPT"}.get(c["severity"], "WARN")
             print(f"[{mark:4}] {c['id']}: {c['detail']}")
             if not c["ok"] and c["fix"]:       # fix is now always populated — print on failure only
                 print(f"       fix: {c['fix']}")

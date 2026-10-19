@@ -777,7 +777,7 @@ struct SelftestDTO: Codable {
 struct PreflightCheckDTO: Codable, Identifiable {
     var id: String?                    // check id ("brew_tools", "topaz_version", ...)
     var ok: Bool?
-    var severity: String?              // "fail" | "warn"
+    var severity: String?              // "fail" | "warn" | "optional" (shown, never counted)
     var detail: String?
     var fix: String?                   // remediation text/command — ALWAYS present now
 }

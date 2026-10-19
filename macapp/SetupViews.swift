@@ -644,8 +644,8 @@ private struct ApplicationsGroup: View {
         let c = store.preflight?[check: "lid_awake"]
         return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                CheckDot(ok: c?.ok)
-                Text("Lid closed").font(.system(size: 12, weight: .medium))
+                CheckDot(ok: c?.ok == true ? true : nil)     // optional: never a red dot
+                Text("Lid closed (optional)").font(.system(size: 12, weight: .medium))
                 Spacer()
             }
             if let d = c?.detail, !d.isEmpty {

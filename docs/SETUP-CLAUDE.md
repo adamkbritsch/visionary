@@ -18,7 +18,8 @@ python3 engine/preflight.py --json
 ```
 
 and read `checks[]`. Each check has `id`, `ok`, `severity` (`fail` gates the app;
-`warn` is setup-progress), `detail` (what was found), and `fix` (the remediation —
+`warn` is setup-progress; `optional` is shown but never counted — `lid_awake`), `detail`
+(what was found), and `fix` (the remediation —
 relay it verbatim when the user must act). `hard_ok` false means the app will refuse
 to arm. Exit codes: 0 = all pass, 1 = a hard check fails, 2 = warnings only.
 
@@ -144,6 +145,15 @@ done
 Downloads resume in place (`curl -C -`), so a partial from an earlier attempt is fine.
 `env_ready()` returning `(True, [])` is the acceptance gate; the per-show "Extends to
 16:9" option then appears on 4:3 shows only.
+
+### Step 12 — Lid closed (OPTIONAL, MacBook only)
+The `lid_awake` check (severity `optional` — never part of `ok`/`setup_complete`). Only if
+the user wants a MacBook to keep running with its lid closed. Relay its `fix` verbatim:
+`python3 engine/lidsleep.py --install`. **The USER runs it** — it installs a sudoers rule
+(`/etc/sudoers.d/visionary-lidsleep`, exactly `pmset -a disablesleep 1` / `0`) and asks for
+their password; never run it for them or ask for the password. Verify with
+`python3 engine/lidsleep.py --status` (`"allowed": true`). The engine holds it only while
+activated on AC and releases it on deactivate, unplug, a power pause, or its own death.
 
 ---
 

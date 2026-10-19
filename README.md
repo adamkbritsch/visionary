@@ -50,7 +50,9 @@ Arm it in the evening; wake up to finished episodes.
 > wall, so it always qualifies. A laptop is judged by its model rather than by the charger
 > you plugged in — because a 140 W charger connected to a laptop that can only draw 96 W
 > still reports "140 W". A laptop too new to be on the list isn't blocked: Visionary falls
-> back to checking the charger, and warns.
+> back to checking the charger, and warns. On a MacBook, a **closed lid** pauses the run
+> unless you allow it to stay awake — one optional command, see
+> [step 12](#12-lid-closed--optional-macbook-only).
 >
 > Topaz Video AI is a commercial product — bring your own license.
 
@@ -76,6 +78,10 @@ The easy path — no clone, no Terminal for most of it:
    add **ComfyUI-VideoHelperSuite** from its Manager, then back in Setup use the *Border
    extender* group's one-click downloads for the ~11.4 GB of models. Skip this and the
    feature simply never appears — nothing else needs it.
+7. *Optional, MacBook only* — want it to keep running with the **lid closed** and no
+   screen attached? Run the one command Setup shows under *Applications & hardware → Lid
+   closed* (see [step 12](#12-lid-closed--optional-macbook-only)). It asks for your password
+   once. Skip it and a closed lid simply sleeps the Mac, as it always did.
 
 The pipeline won't arm until the exact Topaz build and the Dolby Vision™ toolchain are in
 place and the dependencies exist — and it names exactly what's missing rather than failing
@@ -258,6 +264,24 @@ relocates Comfy Desktop's layout, it doesn't replace it.
 
 The group turns green when all of it is present. Only then does the per-show
 **"Extends to 16:9"** option appear — and only on shows that actually measure 4:3.
+
+### 12. Lid closed — OPTIONAL, MacBook only
+
+macOS sleeps a MacBook the moment its lid closes unless an external display is attached, and
+no app can override that on its own: the only switch is `pmset disablesleep`, which needs
+root. Run this once (it asks for your password) and Visionary turns that switch on **only
+while the pipeline is activated and the Mac is on its charger**:
+
+```bash
+python3 engine/lidsleep.py --install
+```
+
+It installs a sudoers rule that allows exactly `pmset -a disablesleep 1` and `... 0` — nothing
+else — after checking it with `visudo`. Sleep comes back the moment you deactivate, unplug, or
+the run pauses for power; a watchdog turns it back within 5 seconds if Visionary itself stops
+or crashes, so the Mac can't end up awake in a bag. A desktop Mac has no lid and needs none of
+this. `python3 engine/lidsleep.py --status` shows where it stands. To remove it:
+`sudo rm /etc/sudoers.d/visionary-lidsleep`.
 
 ## How it works
 
@@ -576,12 +600,18 @@ same way: an 88-minute 4K interview needs about 80 GB. A 4K fast-path movie meas
 - **Channels.** Subscribe from your own YouTube subscriptions, or paste a channel link.
   Each channel has a **scope** (most popular or all), a **max age**, its own output mode,
   loudness setting and pause. Visionary reads a channel's whole back catalogue — videos and
-  live streams, **never Shorts** — not just the 50 newest youtarr indexes on its own, and
+  live streams, **never Shorts** (see below) — not just the 50 newest youtarr indexes on its own, and
   videos round-robin across channels. A **newly added channel gets its first two videos
   fast**: they are requested from youtarr the moment you add it and take the next YouTube
   slots (never interrupting TV), and after that it takes ordinary turns. Removing a channel
   deletes its downloads **and its finished 4K masters** from the NAS, and forgets youtarr's
   download record so re-adding it downloads fresh.
+
+- **Shorts are never processed.** However a video arrives — a channel's most-popular picks,
+  a new channel's first videos, a pasted link, a playlist, a send — Visionary asks YouTube
+  once whether it is a Short (`youtube.com/shorts/<id>` serves a Short and redirects anything
+  else) and keeps the answer; a Short is never requested, never upscaled, and a pasted or
+  sent one says so. A video longer than three minutes is never asked about: no Short is.
 
 - **Fetch-ahead** keeps the NAS stocked: Visionary used to only *subscribe* youtarr and then
   wait for its own schedule, so the upscale queue could run dry with the pipeline idle. It

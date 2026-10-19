@@ -106,7 +106,8 @@ def rule_line(user: str | None = None) -> str:
 def install_command(user: str | None = None) -> str:
     """The ONE command the user runs. No quotes or parentheses to survive a copy-paste (the
     first version, an echo of the rule line, reached the user's shell as an empty file)."""
-    return f"python3 {os.path.abspath(__file__)} --install"
+    import shlex
+    return f"python3 {shlex.quote(os.path.abspath(__file__))} --install"
 
 
 def install(dry_run: bool = False) -> int:
