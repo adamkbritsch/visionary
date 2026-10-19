@@ -116,7 +116,7 @@ if __name__ == "__main__":
 
 
 class ConfigCheck(unittest.TestCase):
-    """Plex is OPTIONAL (README 'Configuration'): a blank plex_token must neither fail the
+    """Plex is OPTIONAL (docs/CONFIGURATION.md): a blank plex_token must neither fail the
     config check nor block the FTP probe — it used to do both, so a Plex-less setup could
     never pass setup steps 9-10 (fact-check-caught)."""
 

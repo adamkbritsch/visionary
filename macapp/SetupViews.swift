@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-// The in-app onboarding: every README setup step as a live row inside Settings —
+// The in-app onboarding: every setup step (docs/SETUP.md) as a live row inside Settings —
 // connection fields (writing ~/.topaz-pipeline/config.json through the redacted
 // /api/config), one-click dependency installs with live output, version and
 // toolchain checks, and the optional NAS helper. Auto-expanded until every preflight

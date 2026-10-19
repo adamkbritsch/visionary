@@ -1,12 +1,12 @@
 # SETUP-CLAUDE — the guided-install runbook
 
-This mirrors the README's "Setup (manual / development path)" steps 1-10 **exactly**
-(same numbering — the README is the canonical source; if they ever disagree, the README
+This mirrors [docs/SETUP.md](SETUP.md)'s steps 1-12 **exactly**
+(same numbering — SETUP.md is the canonical source; if they ever disagree, SETUP.md
 wins). It adds what Claude needs: per-step checks, expected preflight output, and
 secrets etiquette.
 
 Note there is now a FASTER route for most steps: the app's own **Settings → Setup**
-section (README "Install") holds the config fields, one-click dependency installs and the
+section (the README's "Install") holds the config fields, one-click dependency installs and the
 Dolby Vision toolchain check. When guiding a user who already has the app
 running, prefer pointing them at the in-app rows; this runbook remains the full manual
 equivalent (and the only path on a machine where the app can't launch yet).
@@ -89,12 +89,12 @@ Optional: the user can import `bundle/topaz/*.json` in Topaz's GUI (reference on
 ```bash
 mkdir -p ~/.topaz-pipeline && cp config.example.json ~/.topaz-pipeline/config.json && chmod 600 ~/.topaz-pipeline/config.json
 ```
-Walk the user through each key (README "Configuration" table): NAS host(s) (VPN IP
+Walk the user through each key ([Configuration](CONFIGURATION.md) table): NAS host(s) (VPN IP
 first, LAN name second), FTP user/pass — then the OPTIONAL extras: Plex URL + token
 (only if they use Plex; link them Plex's find-your-token article), TMDb, youtarr. If
 their media roots differ from `/Media/TV-Shows` etc., set the `TOPAZ_NAS_FTP_*` env
 overrides. A user without Plex leaves the `plex_*` keys blank — that is a fully
-supported setup (see the README's "Plex is optional" note).
+supported setup (see the "Plex is optional" note in [Configuration](CONFIGURATION.md)).
 
 ### Step 9 — NAS check
 ```bash

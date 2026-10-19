@@ -7,8 +7,8 @@ peak-capped x265 → back to the NAS/Plex. It only runs on one exact setup — s
 
 ## Setting this repo up for a user
 
-Follow **`docs/SETUP-CLAUDE.md`** — it mirrors the README's "Setup (manual /
-development path)" steps exactly and adds per-step machine-readable checks. If the app is
+Follow **`docs/SETUP-CLAUDE.md`** — it mirrors the manual setup steps in `docs/SETUP.md`
+exactly and adds per-step machine-readable checks. If the app is
 already running, the in-app **Settings → Setup** section covers config and dependency
 installs — prefer it. The operating loop:
 

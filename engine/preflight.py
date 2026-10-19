@@ -313,7 +313,7 @@ def check_config(network=False):
     hosts = transfer.nas_hosts()
     s = transfer.ftp_settings()
     token = plex.plex_token()
-    # plex_token is NOT required — Plex is an optional extra (README 'Configuration'): the
+    # plex_token is NOT required — Plex is an optional extra (docs/CONFIGURATION.md): the
     # token is the optionality signal, so a blank one must neither fail this check nor block
     # the FTP probe below (it used to do both, so a Plex-less setup could never go all-green).
     missing = [k for k, v in (("ftp_host(s)", hosts), ("ftp_user", s["user"]),
@@ -323,7 +323,7 @@ def check_config(network=False):
                       f"{cfg_path}: missing/empty -> " + ", ".join(missing),
                       "cp config.example.json ~/.topaz-pipeline/config.json && chmod 600 "
                       "~/.topaz-pipeline/config.json — then fill in the NAS values (Plex is "
-                      "optional; see README 'Configuration').")
+                      "optional; see docs/CONFIGURATION.md).")
     if not network:
         note = "all required keys set" + ("" if token else " · Plex not configured (optional)")
         return _check("config", True, "warn", note + " (run --network to probe live)", "")

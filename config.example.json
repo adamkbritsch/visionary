@@ -1,5 +1,5 @@
 {
-  "_readme": "Copy to ~/.topaz-pipeline/config.json (chmod 600) and fill in. Every key also has a TOPAZ_* env-var override — see README 'Configuration'. Keys marked optional can be deleted.",
+  "_readme": "Copy to ~/.topaz-pipeline/config.json (chmod 600) and fill in. Every key also has a TOPAZ_* env-var override — see docs/CONFIGURATION.md. Keys marked optional can be deleted.",
 
   "ftp_hosts": ["100.x.y.z", "mynas.local"],
   "ftp_port": 21,
