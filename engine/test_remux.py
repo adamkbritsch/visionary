@@ -1442,3 +1442,94 @@ class ResolvePathPinned(unittest.TestCase):
             res_b, calls_b, _r, _o = self._run(tmp, native=None)
         self.assertEqual((res_a.ok, res_a.reason), (res_b.ok, res_b.reason))
         self.assertEqual(calls_a, calls_b)
+
+
+class SdrMaster(unittest.TestCase):
+    """remux(sdr=True) / remux_ship_render(sdr=True) (2026-10-18, an item pinned to SDR output,
+    from a native SDR render): no RPU anywhere — nothing extracted, the frame count is the render's
+    packets — the Rec.709 x265 (dvcap dv=False) under the cap, no DV box in either mux, a verify
+    that asks for no DOVI record, and an "sdr" resume identity. sdr=False calls stay the DV ones
+    (ResolvePathPinned)."""
+
+    def test_the_capped_sdr_master(self):
+        import tempfile, os
+        info = {"frames": 100, "fps": "24000/1001", "start_time": 0.0, "master_display": None,
+                "max_cll": None}
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+        verified = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(remux.dvcap, "probe_video", return_value=info), \
+             mock.patch.object(remux.dvcap, "resume_manifest", return_value={"m": 1}) as man, \
+             mock.patch.object(remux.dvcap, "ensure_segdir", return_value="fresh"), \
+             mock.patch.object(remux.dvcap, "extract_rpu", side_effect=AssertionError("extracted")), \
+             mock.patch.object(remux.dvcap, "rpu_frame_count", side_effect=AssertionError("rpu read")), \
+             mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
+             mock.patch.object(remux.dvcap, "encode_capped_segmented",
+                               return_value=(True, 100, "ok")) as enc, \
+             mock.patch.object(remux.dvcap, "reencode_segments_tighter",
+                               return_value=(True, "ok")) as rep, \
+             mock.patch.object(remux.dvcap, "video_peak_buckets", side_effect=[{1: 58.6}, {1: 40.0}]), \
+             mock.patch.object(remux, "_verify", side_effect=lambda o, fp, **k: verified.append(k)
+                               or remux.RemuxResult(True, o, None, 1, 1, "SDR · 1 audio · 1 sub")), \
+             mock.patch.object(remux.subprocess, "run", return_value=ran) as run:
+            out = os.path.join(tmp, "master SDR upscaled.mkv")
+            res = remux.remux("/r/render.mov", "cfr.mkv", "orig.mkv", out, boundaries=[50, 100], sdr=True)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(man.call_args.kwargs.get("sdr"), True)
+        for call in enc.call_args_list + rep.call_args_list:
+            self.assertEqual(call.kwargs.get("dv"), False)
+        muxes = [c.args[0] for c in run.call_args_list if c.args and remux.MP4BOX in c.args[0][:1]]
+        self.assertTrue(muxes)
+        self.assertFalse(any("dvp=" in " ".join(m) for m in muxes))
+        self.assertEqual(verified, [{"require_dv": False}, {"require_dv": False}])
+
+    def test_sdr_refuses_what_only_dv_has(self):
+        for kw in ({"native": {"chunks": []}}, {"encode_source": "/s.mkv"}, {"rpu_mode": 2}):
+            with self.subTest(kw=kw):
+                res = remux.remux("/r.mov", "c.mkv", "o.mkv", "/tmp/x/out.mkv", sdr=True, **kw)
+                self.assertFalse(res.ok)
+                self.assertIn("no RPU", res.reason)
+
+    def test_the_mux_builders(self):
+        self.assertEqual(remux.build_capped_video_mux_command("MP4Box", "a.hevc", "25", "o.mp4", dv=False),
+                         ["MP4Box", "-add", "a.hevc:fps=25", "-new", "o.mp4"])
+        self.assertEqual(remux.build_capped_video_mux_command("MP4Box", "a.hevc", "25", "o.mp4"),
+                         ["MP4Box", "-add", "a.hevc:dvp=8.1:fps=25", "-new", "o.mp4"])
+        self.assertNotIn("dvp", " ".join(remux.build_capped_mux_command("MP4Box", "a.hevc", "25", "t.mp4",
+                                                                          "o.mp4", dv=False)))
+
+    def test_verify_relaxes_only_the_dv_claim(self):
+        sdr = json.dumps({"streams": [{"codec_type": "video"}, {"codec_type": "audio"}]})
+        self.assertFalse(remux.verify_remux(sdr)[0])
+        self.assertEqual(remux.verify_remux(sdr, require_dv=False), (True, "SDR · 1 audio · 0 sub"))
+        none = json.dumps({"streams": [{"codec_type": "video"}]})
+        self.assertFalse(remux.verify_remux(none, require_dv=False)[0])
+
+    def test_ship_render_sdr(self):
+        import tempfile, os
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+        verified = []
+
+        def fake_run(cmd, **kw):
+            if cmd[-1].endswith(".ship.hevc"):
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"es")
+            return ran
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(remux.dvcap, "probe_video", return_value={"frames": 100, "fps": "25"}), \
+             mock.patch.object(remux.dvcap, "video_peak_1s_mbps", return_value=20.0), \
+             mock.patch.object(remux, "_verify", side_effect=lambda o, fp, **k: verified.append(k)
+                               or remux.RemuxResult(True, o, None, 1, 0, "SDR · 1 audio · 0 sub")), \
+             mock.patch.object(remux, "_gate_interleave", side_effect=lambda r, o, fp: r), \
+             mock.patch.object(remux, "parse_streams", return_value={"video_tag": "hvc1"}), \
+             mock.patch.object(remux, "_probe", return_value="{}"), \
+             mock.patch.object(remux, "atmos_audio_index", return_value=None), \
+             mock.patch.object(remux, "measure_lufs", return_value=None), \
+             mock.patch.object(remux.subprocess, "run", side_effect=fake_run) as run:
+            res = remux.remux_ship_render("/r.mov", "/c.mp4", "/o.mp4", os.path.join(tmp, "o.mkv"),
+                                          cap_mbps=50, sdr=True)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(verified, [{"require_dv": False}])
+        muxes = [c.args[0] for c in run.call_args_list if c.args[0][:1] == [remux.MP4BOX]]
+        self.assertTrue(muxes)
+        self.assertFalse(any("dvp=" in " ".join(m) for m in muxes))

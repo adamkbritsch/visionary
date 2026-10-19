@@ -331,7 +331,8 @@ def _rm(path: str):
 def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
                     seg_seconds: int, crf: float = X265_CRF, preset: str = X265_PRESET,
                     boundaries: list | None = None, encode_source: str | None = None,
-                    rpu_mode: int | None = None, native_id: str | None = None) -> dict:
+                    rpu_mode: int | None = None, native_id: str | None = None,
+                    sdr: bool = False) -> dict:
     """Identity of a segmented-encode run. If ANY of this changes between attempts, the
     persisted segments/RPU describe a DIFFERENT encode and must not be resumed: a re-rendered
     dv_video would pass the frame-count check yet concat WRONG CONTENT into the master. `segb`
@@ -360,6 +361,8 @@ def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
             m["enc"] = "missing"
     if rpu_mode is not None:                # a mode-2 (P7→8.1) RPU is a DIFFERENT RPU: switching
         m["rpu_mode"] = int(rpu_mode)       # modes must wipe the persisted rpu.bin + segments
+    if sdr:                                 # an SDR master's segments carry no RPU and no PQ: never
+        m["sdr"] = True                     # resumed into a DV encode, nor the reverse (2026-10-18)
     return m                                # and resumes instead of wiping on the schema change
 
 
@@ -691,9 +694,12 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
                             master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
                             boundaries: list | None = None,
                             abort=None, on_progress=None, on_plan=None, should_pause=None,
-                            decode: dict | None = None,
+                            decode: dict | None = None, dv: bool = True,
                             ffmpeg=FFMPEG, x265=X265, ffprobe=FFPROBE, dovi_tool=DOVI_TOOL):
     """Resumable peak-cap encode: per-segment native-DV x265 (own RPU slice) → concat.
+    `dv=False` (2026-10-18, an item pinned to SDR output): the TRUE SDR x265 (build_x265_command's
+    Rec.709 branch) with no RPU at all — `rpu` is unused and nothing is sliced; everything else
+    (the plan, the VBV cap, resume, pause, the frame gates) is the same.
     Segments persist in `segdir`; a completed segment is skipped on the next attempt.
     Returns (ok, frames_encoded, reason). Reports cumulative frames via on_progress, and fires
     on_plan([segment_end_frame, ...], total_frames) ONCE after planning so the dashboard can draw
@@ -735,11 +741,14 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
         stmp = sf + ".part"                              # ATOMIC: encode to temp, publish sf only on
         _rm(stmp)                                        # a clean got==n — a hard kill never leaves a
         rslice = os.path.join(segdir, f"seg_{i:04d}.rpu")   # truncated seg_*.hevc that resume would bless
-        ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
-        if not ok:
-            return False, base, why
-        enc = build_x265_command(x265, rslice, stmp, tights.get(i, cap_mbps),
-                                 master_display, max_cll)
+        if dv:
+            ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
+            if not ok:
+                return False, base, why
+            enc = build_x265_command(x265, rslice, stmp, tights.get(i, cap_mbps),
+                                     master_display, max_cll)
+        else:
+            enc = build_x265_command(x265, None, stmp, tights.get(i, cap_mbps), dv=False)
         b0 = base
         got, why, _tail = _encode_pipe(dec, enc, stmp, abort,
                                        (lambda f: on_progress(b0 + f, total_frames)) if on_progress else None)
@@ -767,7 +776,7 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
                               tight_cap_mbps: int, *, total_frames: int, fps: str,
                               master_display=None, max_cll=None, seg_seconds: int = SEG_SECONDS,
                               boundaries: list | None = None, abort=None, on_repair=None,
-                              decode: dict | None = None,
+                              decode: dict | None = None, dv: bool = True,
                               ffmpeg=FFMPEG, x265=X265, dovi_tool=DOVI_TOOL):
     """PEAK REPAIR: delete and re-encode ONLY `indices` segments at a TIGHTER cap. The full-cap
     encode can measure over the gate — VBV bufsize == maxrate legally allows a 1-second burst
@@ -775,7 +784,8 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
     reuses the identical segments, so it can never pass (user-caught: a movie parked at
     58.6 > 50 five times, shipped nothing). The resume manifest is deliberately unchanged
     (same source, same GLOBAL cap): a tighter segment is strictly safer to resume, and a
-    mid-repair kill just resumes with the already-tightened segments. Returns (ok, reason)."""
+    mid-repair kill just resumes with the already-tightened segments. `dv=False`: the SDR
+    master's segments (no RPU, Rec.709), as encode_capped_segmented. Returns (ok, reason)."""
     segs = plan_segments(total_frames, fps, seg_seconds, boundaries=boundaries)
     bad = plan_chunk_error(segs, decode)
     if bad:
@@ -799,10 +809,13 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
                                                          # resumes this segment at the tight cap
         _rm(sf); _rm(stmp)                               # the over-peak segment is what we're replacing
         rslice = os.path.join(segdir, f"seg_{i:04d}.rpu")
-        ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
-        if not ok:
-            return False, why
-        enc = build_x265_command(x265, rslice, stmp, tight_cap_mbps, master_display, max_cll)
+        if dv:
+            ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
+            if not ok:
+                return False, why
+            enc = build_x265_command(x265, rslice, stmp, tight_cap_mbps, master_display, max_cll)
+        else:
+            enc = build_x265_command(x265, None, stmp, tight_cap_mbps, dv=False)
         # Surface WHICH segment is being re-capped and its LIVE frame progress — the k'th
         # of the flagged set, re-encoding frame `done` of the segment's `n`. Without this
         # the lane sat at "remux · 100%" for the whole repair pass and read as stuck

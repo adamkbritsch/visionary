@@ -35,6 +35,16 @@ HOW, render(p, spec):
               it is renamed to p.dv_render — last and atomic, so a half-made render never sits
               where stage_done looks
 
+HDR INTAKE (2026-10-18): an HDR10 source keeps its own mastering — RenderSpec.master carries its
+mastering display and RenderSpec.light its content light level, declared as they are in L6 and in
+the SEI the finish writes (dvnative.source_mastering) — and is measured with no LUT (HLG through
+dvnative.hlg_to_pq_vf first). A keep_video spec (rpu_only) skips steps 2 and 4 altogether: the
+render is the source's own coded video, copied out as Annex B, with the RPU injected and the DV
+mux (step 3 without the SEI, which the source carries already) — exactly what the remux's inject
+path ships, so the original picture is never re-encoded. A source whose light level says 0,0
+("unknown") gets light None from its route (stages.declared_light): the level is measured, as
+Resolve did, and step 3 writes it into the SEI too, so L6 and the HDR10 SEI always agree.
+
 Every child runs through dvnative.run_step at nice 10 in its own process group: abort and
 should_pause kill it within a second ("aborted (run stopped)" / "paused: ..."), a wedged one
 times out. Analysis resumes range by range; an encode attempt restarts from scratch. Every
@@ -42,6 +52,14 @@ step that writes something big asks for room first (the native lane's 150 GiB fl
 analysis per range, each encode for its estimated size plus its finish, the finish for its
 transients — "paused: low disk ..." (a hold, never a failure), or a plain failure when even an
 empty volume could not hold it.
+
+SDR OUTPUT (2026-10-18, route sdr_out: an item PINNED to SDR): a `sdr` spec writes the file
+Resolve's SDR project wrote — HEVC Main10 BT.709 limited, NO RPU and no HDR10 SEI — so step 1 is
+skipped (nothing to measure), step 2 tags BT.709, step 3 is the plain mux (no SEI, no inject, no
+DV box), and steps 4-5 are the same peak loop and publish against an SDR self-check. Its proof is
+books/sdr.json (the published render's size and mtime, written just before the rename): the
+orchestrator's stage_done and the remux accept an SDR render ONLY when it vouches for it
+(sdr_render_ok), so nothing that was accepted before changes.
 
 THE BOOKS live in <dv_render>.dvrender/ — never in segdir/native/, so nativelane's marker logic
 (_native_claimed) stays false and the hand-off and backlog code treat the item exactly like a
@@ -54,6 +72,7 @@ Resolve item:
   render.mov       the finished render the loop kept, until it is published
   encode.json      every attempt's target and shipped peak, and the render that was kept
   cpu.json         os.wait4 CPU per analysis unit and per encode attempt
+  sdr.json         an SDR render's proof (sdr specs only): its size and mtime, as published
 The finish step's transients (<dv_render>.dv.hevc, .part) sit beside the render, where remux
 keeps its own, so MP4Box's path parsing sees the scratch directory, not a show name.
 """
@@ -93,6 +112,7 @@ ENCODE_BOOK = "encode.json"
 PROGRESS = "encode.progress"
 CONCAT = "inputs.ffconcat"
 CPU_LEDGER = "cpu.json"
+SDR_PROOF = "sdr.json"
 PART, ES_DV = ".part", ".dv.hevc"                       # suffixes on p.dv_render
 SPEC_VERSION = 2                # 2: capped ranges + joins, Annex B encode, HDR10 SEI, shipped-file peak
 
@@ -126,7 +146,20 @@ class RenderSpec:
     the scene scan's strong cut frames (the plan's own input, scenes.json): together they say
     where the file may be split for analysis without a seam (analysis_plan). `lut` None = an
     already-PQ picture; `pre_vf` a front end (dvnative.front_end); `cap_mbps` 0 = no peak gate
-    (a route whose remux re-encodes anyway). The analysis knobs default to the TV lane's."""
+    (a route whose remux re-encodes anyway). The analysis knobs default to the TV lane's.
+
+    HDR intake (2026-10-18): `light` (MaxCLL, MaxFALL) is declared exactly as given in the RPU's
+    L6 and in the HDR10 SEI the render carries — an HDR source's own content light level
+    (dvnative.source_mastering, with `master` keeping its mastering display) — instead of the
+    measured, clamped values; None (the SDR routes) keeps the measured ones. `keep_video` makes
+    the render out of the SOURCE'S OWN coded video (rpu_only): no encode, no SEI written (the
+    source's own HDR10 SEI rides along; with light None the measured level is written into it,
+    as_source), no peak gate — its Annex B stream with the generated RPU
+    injected, muxed as DV 8.1. It needs one file already PQ, no front end and cap_mbps 0.
+
+    SDR output (2026-10-18): `sdr` renders the SDR master's picture instead — no LUT, no RPU, no
+    HDR10 metadata: the front end (BT.709 limited) straight into a BT.709-tagged encode. Nothing
+    is analysed, so the analysis knobs, `light`, `master` and keep_video do not apply."""
     inputs: tuple
     fps: str
     kbps: int
@@ -139,6 +172,9 @@ class RenderSpec:
     avg_floor: str = nativelane.AVG_FLOOR
     with_l4: bool = nativelane.WITH_L4
     peak_estimator: str = nativelane.PEAK_ESTIMATOR
+    light: tuple | None = None
+    keep_video: bool = False
+    sdr: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "inputs", tuple((int(a), p) for a, p in self.inputs))
@@ -146,6 +182,8 @@ class RenderSpec:
             object.__setattr__(self, "bounds", tuple(int(b) for b in self.bounds))
         if self.cuts is not None:
             object.__setattr__(self, "cuts", tuple(sorted({int(c) for c in self.cuts})))
+        if self.light is not None:
+            object.__setattr__(self, "light", tuple(self.light))
 
     @property
     def total(self) -> int:
@@ -188,7 +226,26 @@ class RenderSpec:
             out.append(f"avg_floor {self.avg_floor!r}")
         if (self.bounds is not None or self.cuts is not None) and not self.single:
             out.append("bounds and cuts are for one source file; chunks are their own ranges")
+        if self.light is not None:
+            try:
+                ok = (len(self.light) == 2 and all(isinstance(v, int) and not isinstance(v, bool)
+                                                   and 0 <= v <= 65535 for v in self.light))
+            except TypeError:
+                ok = False
+            if not ok:
+                out.append(f"light {self.light!r} is not (MaxCLL, MaxFALL) in whole nits")
+        if self.keep_video and (not self.single or self.lut or self.pre_vf or int(self.cap_mbps or 0)):
+            out.append("keep_video ships one source file's own coded picture: no LUT, no front end, "
+                       "no peak gate")
+        if self.sdr and (self.lut or self.keep_video or self.light is not None
+                         or self.master != dvnative.DEFAULT_MASTER):
+            out.append("an SDR render has no LUT, RPU or HDR metadata: no lut, keep_video, light or "
+                       "master")
         return out
+
+    def light_text(self) -> str | None:
+        """`light` as the "MaxCLL,MaxFALL" string the HDR10 SEI is written from, or None."""
+        return f"{self.light[0]},{self.light[1]}" if self.light is not None else None
 
     def analysis_plan(self) -> tuple:
         """(ranges, joins) for one file: [(a, b), ...] from frame 0, none longer than
@@ -336,6 +393,17 @@ def fingerprints(spec: RenderSpec, stats: list) -> tuple:
     encode = {"version": SPEC_VERSION, "inputs": stats, "total": spec.total, "fps": str(spec.fps),
               "encode_vf": spec.encode_vf(), "lut_sha256": lut_sha,
               "kbps": int(spec.kbps), "cap_mbps": int(spec.cap_mbps)}
+    # The HDR intake's two knobs are booked only when set, so every SDR route's prints are exactly
+    # what they were (books made before 2026-10-18 stay valid). light reaches the RPU (analysis:
+    # generate is part of it) and the SEI (encode); keep_video replaces the encode altogether.
+    if spec.light is not None:
+        analysis["light"] = list(spec.light)
+        encode["light"] = list(spec.light)
+    if spec.keep_video:
+        encode["keep_video"] = True
+    if spec.sdr:                         # booked only when set, like the HDR knobs above
+        analysis["sdr"] = True
+        encode["sdr"] = True
     return analysis, encode
 
 
@@ -377,7 +445,8 @@ def build_encode_command(ffmpeg: str, spec: RenderSpec, out: str, kbps: int, *,
     frame exactly once, re-stamped at N / fps (dvnative.uniform_pts — the range intermediates'
     guard: a millisecond-timebase source can carry irregular or repeated stamps, and the
     encoder's rate control should see real seconds whatever the source's were); MP4Box sets the
-    final timing from the same fps. `-progress` feeds the stage's progress bar."""
+    final timing from the same fps. `-progress` feeds the stage's progress bar. An `sdr` spec is
+    tagged BT.709 instead (2026-10-18): the SDR master's colour."""
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
     if progress:
         cmd += ["-progress", progress, "-nostats"]
@@ -390,8 +459,10 @@ def build_encode_command(ffmpeg: str, spec: RenderSpec, out: str, kbps: int, *,
                   "-fps_mode", "passthrough",
                   "-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
                   "-b:v", f"{int(kbps)}k", "-allow_sw", "1",
-                  "-color_primaries", "bt2020", "-color_trc", "smpte2084",
-                  "-colorspace", "bt2020nc", "-color_range", "tv", "-f", "hevc", out]
+                  *(("-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
+                    if spec.sdr else
+                    ("-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc")),
+                  "-color_range", "tv", "-f", "hevc", out]
 
 
 def build_sei_command(python: str, src_es: str, out_es: str, master_display: str, max_cll) -> list:
@@ -490,20 +561,44 @@ class _AtPath:
         return getattr(self._p, name)
 
 
-def self_check(p, path: str, total: int | None = None, hdr: tuple | None = None) -> tuple:
+def _sdr_streams_why(streams):
+    """None when `streams` (ffprobe's) is an SDR render's video — HEVC, no Dolby Vision record,
+    no PQ/HLG transfer — else why not."""
+    v = next((s for s in streams or [] if s.get("codec_type") == "video"), None)
+    if v is None:
+        return "it has no video stream"
+    if any("DOVI" in str(sd.get("side_data_type", "")) for sd in v.get("side_data_list") or []):
+        return "it carries a Dolby Vision record"
+    if v.get("codec_name") != "hevc":
+        return f"it is {v.get('codec_name')}, not HEVC"
+    if v.get("color_transfer") in ("smpte2084", "arib-std-b67"):
+        return f"it is HDR ({v.get('color_transfer')})"
+    return None
+
+
+def self_check(p, path: str, total: int | None = None, hdr: tuple | None = None,
+               as_source: bool = False, sdr: bool = False) -> tuple:
     """(ok, why): would the orchestrator accept `path` as this item's render? The exact frame
     count first (when `total` is given: the RPU covers exactly that many), then the same gates
     stage_done('resolve') applies — a DV 8.1 configuration record (_is_dv81), the whole source
     and no more (render_is_complete) and the source's frame rate (_fps_matches) — and last the
     HDR10 static metadata every master carries: a mastering display and a content light level
     (dvcap.probe_video's first-frame read). `hdr` = (master_display, "cll,fall") demands those
-    exact values (what the finish wrote); without it they need only be there."""
+    exact values (what the finish wrote); without it they need only be there. `as_source` (a
+    keep_video render: the source's own coded picture) demands instead EXACTLY the source's own
+    HDR10 metadata, whatever it is — none, when the source carries none. `sdr` (an SDR render,
+    2026-10-18) demands the opposite of the DV checks: HEVC with NO Dolby Vision record and no
+    PQ/HLG transfer — then the same whole-source and frame-rate gates."""
     import orchestrator as O
     if total is not None:
         got = dvcap.count_hevc_frames(path, FFPROBE)
         if got != int(total):
-            return False, f"it has {got} frames, the RPU {total}"
-    if not O._is_dv81(O._vstream(path)):
+            return False, f"it has {got} frames, the {'source' if sdr else 'RPU'} {total}"
+    if sdr:
+        why = _sdr_streams_why(O._vstream(path))
+        if why:
+            return False, why
+    elif not O._is_dv81(O._vstream(path)):
         return False, "it carries no Dolby Vision 8.1 configuration record"
     src = O.combine_winner_path(p) or getattr(p, "source_cfr", None)
     if not O.render_is_complete(_AtPath(p, path)):
@@ -511,8 +606,17 @@ def self_check(p, path: str, total: int | None = None, hdr: tuple | None = None)
                        f"{O._nb_frames(src)}, or another frame rate)")
     if not O._fps_matches(src, path):
         return False, "its frame rate is not the source's"
+    if sdr:
+        return True, "an SDR HEVC render (no Dolby Vision), the whole source, at its frame rate"
     info = dvcap.probe_video(path, FFPROBE)
     md, cll = info.get("master_display"), info.get("max_cll")
+    if as_source:
+        own = dvcap.probe_video(src, FFPROBE)
+        if (md, cll) != (own.get("master_display"), own.get("max_cll")):
+            return False, (f"its HDR10 metadata says {md} / {cll}, the source's own "
+                           f"{own.get('master_display')} / {own.get('max_cll')}")
+        return True, ("Dolby Vision 8.1 on the source's own picture and HDR10 metadata, the "
+                      "whole source, at its frame rate")
     if not md or not cll:
         return False, "it carries no HDR10 mastering-display / content-light-level metadata"
     if hdr is not None and (md, cll) != (hdr[0], hdr[1] or "0,0"):
@@ -584,13 +688,17 @@ def _analyse(p, spec: RenderSpec, state: dict, abort, progress, should_pause) ->
         sc = dvnative.analyze_chunks([list(c) for c in spec.inputs], work, on_chunk=on_done,
                                      before_chunk=hook, **common)
     rpu = _book(p, RPU)
-    dvnative.generate_rpu(sc, rpu, avg_floor=spec.avg_floor, l4=spec.with_l4, master=spec.master)
+    # An HDR source's own light level (spec.light) is declared as it stands; otherwise L6 keeps
+    # the measured, clamped one — the generate call is then exactly what it always was.
+    dvnative.generate_rpu(sc, rpu, avg_floor=spec.avg_floor, l4=spec.with_l4, master=spec.master,
+                          **({"light": spec.light} if spec.light is not None else {}))
     got = dvcap.rpu_frame_count(rpu, dovi_tool=DOVI_TOOL)
     if got != total:
         raise RuntimeError(f"the generated RPU has {got} frames, the source {total}")
     _write_json(_book(p, SIDECAR), sc, indent=None)     # per-frame L4: tens of thousands of rows
     state["rpu"] = {"sha256": nativelane.sha256_file(rpu), "frames": got,
-                    "max_cll": dvnative.x265_max_cll(sc, spec.master),
+                    "max_cll": (spec.light_text() if spec.light is not None
+                                else dvnative.x265_max_cll(sc, spec.master)),
                     "shots": len(sc.get("scenes") or [])}
     _write_json(_book(p, SPEC_BOOK), state)
     return state["rpu"]
@@ -599,8 +707,18 @@ def _analyse(p, spec: RenderSpec, state: dict, abort, progress, should_pause) ->
 def hdr10_values(spec: RenderSpec, rpu: dict) -> tuple:
     """(master_display, "cll,fall" | None): the HDR10 static metadata the render carries — the
     master's display (dvcap.FALLBACK_MASTER_DISPLAY for the default 1000-nit master, as the x265
-    path writes it) and the light levels measured with the RPU (L6's own, clamped the same)."""
+    path writes it) and the light levels measured with the RPU (L6's own, clamped the same), or
+    an HDR source's own (spec.light) when the route keeps them."""
+    if spec.light is not None:
+        return spec.master.hdr10_mdcv, spec.light_text()
     return spec.master.hdr10_mdcv, rpu.get("max_cll")
+
+
+def as_source(spec: RenderSpec) -> bool:
+    """PURE. Does the render carry the SOURCE'S OWN HDR10 SEI — a keep_video render that declares
+    the source's own light level? A keep_video render whose light level is measured (the source
+    said 0,0) has the measured level written into its SEI, so it is checked like any other."""
+    return spec.keep_video and spec.light is not None
 
 
 def _kept_render(p):
@@ -626,11 +744,14 @@ def _need_room(p, need: int, what: str) -> None:
         raise dvnative.Paused(why)
 
 
-def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progress) -> float:
+def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progress,
+                    sei_step: bool = True) -> float:
     """Phase 3 for one encode: books/encode.hevc -> HDR10 SEI (in place) -> RPU inject ->
     MP4Box -> <dv_render>.part, the file that ships. -> CPU seconds. The encode is deleted as
     soon as the RPU is in (its only reader), so at most two encode-sized files exist at once;
-    a finish cut short re-encodes on the next pass."""
+    a finish cut short re-encodes on the next pass. `sei_step` False (a keep_video render: the
+    source's own stream already carries its HDR10 SEI) skips the SEI and `hdr` is unused. An
+    `sdr` spec's finish is the mux alone: no SEI, no RPU, no DV box."""
     ep = getattr(p, "ep", "?")
     part, es_dv = _transients(p)
     enc, sei = _book(p, ENCODE), _book(p, SEI_TMP)
@@ -638,10 +759,18 @@ def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progre
     _rm(part, es_dv, sei)
     _need_room(p, int(os.path.getsize(enc) * FINISH_HEADROOM), "the DV render's finish")
     cpu = 0.0
-    _report(progress, ep, "finish", 0.0, step="hdr10", attempt=attempt)
-    cpu += _run(build_sei_command(sys.executable, enc, sei, hdr[0], hdr[1]), tmo, abort, None,
-                "HDR10 metadata", cwd=dvnative.ENGINE_DIR)
-    os.replace(sei, enc)
+    if spec.sdr:
+        _report(progress, ep, "finish", 0.6, step="mux", attempt=attempt)
+        with remux.mp4box_safe_input(enc) as es_in:
+            cpu += _run(remux.build_capped_video_mux_command(MP4BOX, es_in, str(spec.fps), part,
+                                                             dv=False), tmo, abort, None, "SDR mux")
+        _rm(enc)
+        return cpu
+    if sei_step:
+        _report(progress, ep, "finish", 0.0, step="hdr10", attempt=attempt)
+        cpu += _run(build_sei_command(sys.executable, enc, sei, hdr[0], hdr[1]), tmo, abort, None,
+                    "HDR10 metadata", cwd=dvnative.ENGINE_DIR)
+        os.replace(sei, enc)
     _report(progress, ep, "finish", 0.3, step="inject", attempt=attempt)
     cpu += _run(dvcap.build_inject_command(DOVI_TOOL, enc, _book(p, RPU), es_dv), tmo, abort, None,
                 "RPU inject")
@@ -762,18 +891,101 @@ def _encode(p, spec: RenderSpec, rpu: dict, abort, progress, should_pause) -> di
     return final
 
 
+def build_copy_command(ffmpeg: str, src: str, out: str, progress: str | None = None) -> list:
+    """PURE. ffmpeg: one file's own coded video, stream-copied to a raw Annex B ES (every
+    parameter set in-band — what dovi_tool and MP4Box read): the original bits, untouched.
+    dvcap.build_annexb_file_command's copy (the remux inject path's base layer), plus the
+    progress feed."""
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
+    if progress:
+        cmd += ["-progress", progress, "-nostats"]
+    return cmd + ["-i", src, "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb",
+                  "-f", "hevc", out]
+
+
+def _copy_video(p, spec: RenderSpec, rpu: dict, abort, progress) -> dict:
+    """Phases 2-4 for a keep_video spec (rpu_only) -> the kept render's record, the render itself
+    at books/render.mov: the source's own coded video, copied out as Annex B (no encode, no
+    decode), its RPU injected, muxed as DV 8.1 — the very bytes the remux's inject path would
+    ship, so there is nothing to gate (the remux measures the SOURCE's peaks before choosing
+    that path, as it always has). Room is asked first for two source-sized files: the copy and
+    the injected stream exist at once, then the injected stream and the mux."""
+    ep = getattr(p, "ep", "?")
+    done = _kept_render(p)
+    if done:
+        return done
+    total, src = spec.total, spec.inputs[0][1]
+    out, kept, prog = _book(p, ENCODE), _book(p, KEPT), _book(p, PROGRESS)
+    part = _transients(p)[0]
+    _rm(out, kept, prog, _book(p, SEI_TMP), _book(p, BEST))
+    _checkpoint(abort, None, "the stream copy")
+    _need_room(p, int(os.path.getsize(src) * (1 + FINISH_HEADROOM)),
+               "the source's stream copy and its RPU inject")
+
+    def on_poll():
+        got = progress_frames(prog)
+        if got is not None:
+            _report(progress, ep, "encode", got / total, step="copy")
+
+    _report(progress, ep, "encode", 0.0, step="copy")
+    cpu = _run(build_copy_command(FFMPEG, src, out, prog), dvnative.step_timeout(total), abort,
+               None, "stream copy", on_poll=on_poll)
+    frames = dvcap.count_hevc_frames(out, FFPROBE)
+    if frames != total:
+        raise RuntimeError(f"the source's stream has {frames} frames, the RPU {total}")
+    # the source's own HDR10 SEI rides along when L6 declares the source's own light level; a
+    # source that says 0,0 ("unknown") has its level measured, and the SEI then says the same as L6
+    cpu += _finish_attempt(p, spec, hdr10_values(spec, rpu), 1, abort, progress,
+                           sei_step=spec.light is None)
+    record_cpu(p, "encode", "copy", cpu, total)
+    os.replace(part, kept)
+    _rm(prog)
+    st = os.stat(kept)
+    final = {"kbps": 0, "peak": 0.0, "cpu_s": round(cpu, 1), "verdict": "source-video",
+             "attempts": 0, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    _write_json(_book(p, ENCODE_BOOK), {"attempts": [], "final": final})
+    return final
+
+
 def _publish(p, spec: RenderSpec, rpu: dict, progress) -> str:
     """Phase 5: self-check the kept render, then rename it to p.dv_render. -> why."""
     ep = getattr(p, "ep", "?")
     kept = _book(p, KEPT)
     _report(progress, ep, "finish", 0.9, step="check")
-    ok, why = self_check(p, kept, spec.total, hdr=hdr10_values(spec, rpu))
+    if as_source(spec):      # the source's own HDR10 SEI, whatever it says (the finish wrote none)
+        ok, why = self_check(p, kept, spec.total, as_source=True)
+    elif spec.sdr:
+        ok, why = self_check(p, kept, spec.total, sdr=True)
+    else:
+        ok, why = self_check(p, kept, spec.total, hdr=hdr10_values(spec, rpu))
     if not ok:
         _rm(kept)
         raise RuntimeError(f"self-check: {why}")
+    if spec.sdr:
+        _write_sdr_proof(p, kept)       # BEFORE the rename: the rename keeps size and mtime, so
+                                        # a kill between the two leaves a proof of nothing at all
     os.replace(kept, p.dv_render)       # the publish: last, atomic
     _report(progress, ep, "finish", 1.0, step="done")
     return why
+
+
+def _write_sdr_proof(p, path: str) -> None:
+    """books/sdr.json = `path`'s size and mtime: what sdr_render_ok later matches p.dv_render to."""
+    st = os.stat(path)
+    _write_json(_book(p, SDR_PROOF), {"size": st.st_size, "mtime_ns": st.st_mtime_ns})
+
+
+def sdr_render_ok(p) -> bool:
+    """Is p.dv_render an SDR render this module published (or blessed) for the SDR output — its
+    proof (books/sdr.json) still naming exactly that file's size and mtime? Never raises; a DV
+    render, a Resolve render nobody blessed, or no render at all is False."""
+    try:
+        proof = _read_json(_book(p, SDR_PROOF))
+        st = os.stat(p.dv_render)
+    except (OSError, AttributeError, TypeError):
+        return False
+    return (isinstance(proof, dict)
+            and (proof.get("size"), proof.get("mtime_ns")) == (st.st_size, st.st_mtime_ns))
 
 
 def render(p, spec: RenderSpec, abort=None, progress=None, should_pause=None) -> tuple:
@@ -789,7 +1001,17 @@ def render(p, spec: RenderSpec, abort=None, progress=None, should_pause=None) ->
     bad = spec.problems()
     if bad:
         return False, "native render spec is unusable: " + "; ".join(bad)
-    if os.path.exists(p.dv_render) and self_check(p, p.dv_render)[0]:
+    if spec.sdr and os.path.exists(p.dv_render) and self_check(p, p.dv_render, sdr=True)[0]:
+        # an SDR render of this whole source is already there — ours (its proof just re-written),
+        # or one Resolve's SDR project made before the route was switched: either is the picture
+        # the SDR master is made from
+        try:
+            _write_sdr_proof(p, p.dv_render)
+        except OSError as e:
+            return False, f"native render failed: the SDR proof could not be written: {e}"
+        return True, "native SDR render already in place"
+    if not spec.sdr and os.path.exists(p.dv_render) and self_check(
+            p, p.dv_render, **({"as_source": True} if as_source(spec) else {}))[0]:
         return True, "native DV render already in place"
     try:
         stats = input_stats(spec)
@@ -806,8 +1028,9 @@ def render(p, spec: RenderSpec, abort=None, progress=None, should_pause=None) ->
             have = state["source_frames"]
             if have and have != spec.total:             # 0 = unreadable: the analysis decides
                 return False, f"native render source has {have} frames, the spec {spec.total}"
-        rpu = _analyse(p, spec, state, abort, progress, should_pause)
-        enc = _encode(p, spec, rpu, abort, progress, should_pause)
+        rpu = {} if spec.sdr else _analyse(p, spec, state, abort, progress, should_pause)
+        enc = (_copy_video(p, spec, rpu, abort, progress) if spec.keep_video
+               else _encode(p, spec, rpu, abort, progress, should_pause))
         why = _publish(p, spec, rpu, progress)
     except dvnative.Paused as e:
         msg = str(e)
@@ -819,7 +1042,17 @@ def render(p, spec: RenderSpec, abort=None, progress=None, should_pause=None) ->
     finally:
         _rm(*_transients(p), _book(p, PROGRESS), _book(p, SEI_TMP))
     _rm(*(_book(p, n) for n in (ENCODE, BEST, CONCAT)))
+    if spec.keep_video:
+        logbook.event(f"dvrender {ep}: {spec.total} frames, {rpu.get('shots')} shots, the source's "
+                      f"own video (no encode), L6 MaxCLL/MaxFALL "
+                      f"{spec.light_text() or 'measured ' + str(rpu.get('max_cll'))}")
+        return True, (f"native DV render: {spec.total} frames, {rpu.get('shots')} shots, the "
+                      f"source's own video with the RPU injected (no encode) — {why}")
     peak = f"peak {enc['peak']:.1f} Mbps ({enc['verdict']})" if spec.cap_mbps else "no peak gate"
+    if spec.sdr:
+        logbook.event(f"dvrender {ep}: SDR render, {spec.total} frames, {enc['kbps']} kb/s after "
+                      f"{enc['attempts']} encode(s), {peak}")
+        return True, (f"native SDR render: {spec.total} frames, {enc['kbps']} kb/s, {peak} — {why}")
     logbook.event(f"dvrender {ep}: {spec.total} frames, {rpu.get('shots')} shots, "
                   f"{enc['kbps']} kb/s after {enc['attempts']} encode(s), {peak}")
     return True, (f"native DV render: {spec.total} frames, {rpu.get('shots')} shots, "

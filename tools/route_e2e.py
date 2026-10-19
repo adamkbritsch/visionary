@@ -15,16 +15,28 @@ linked in — in a work directory that is NOT ~/topaz-scratch (deploy-now.sh's p
 never see it), at nice 15 (the stage's own children add their nice 10 on top).
 
   1. the route: routes.item_route names --route for the source (a YouTube video for a yt_*
-     route, a movie for sdr4k), and stages.dvrender_spec builds its spec
+     route, a movie for sdr4k), and stages.dvrender_spec builds its spec (for yt_plain / yt_1080,
+     with the fit front end: printed, with the geometry it fits the picture to)
   2. --resume-check: a child process is SIGKILLed once the first analysis range is published;
      the in-process run must resume without measuring that range again
   3. the render: stages._dvrender ok; the orchestrator's own gate, stage_done("resolve"), accepts
-     p.dv_render (DV 8.1, the whole source, its frame rate); the frame count is the spec's
-  4. the downstream: stages._remux ok; the master is DV 8.1 (compat 1), PQ / BT.2020, every
-     frame, and its 1-s video peak is inside the cap
+     p.dv_render (DV 8.1, the whole source, its frame rate); the frame count is the spec's; it is
+     3840x2160 with square pixels, and for a fit route its pad (if any) is exactly black (luma
+     64, chroma 512) where fit_geometry put it, but for the encoder's band beside the picture's
+     edge (EDGE_BAND)
+  4. the downstream: stages._remux ok; the master is DV 8.1 (compat 1), PQ / BT.2020, square
+     pixels, every frame, and its 1-s video peak is inside the cap
   5. the books (encode attempts, CPU per range and attempt), printed for the record
 
-  python3 tools/route_e2e.py --source SRC --work DIR --route yt_native4k|sdr4k
+The HDR intake routes (rpu_only, hdr_reencode, hlg — 2026-10-18) render the source's own frame
+(any 4K geometry), so step 3 checks the render is the SOURCE's size, and step 4 adds: the master's
+RPU (extracted again with dovi_tool) covers exactly its stream's frames; for a PQ route its L6
+mastering range and MaxCLL/MaxFALL and the master's HDR10 SEI are exactly the ORIGINAL's own
+SEI; for hlg the 1000-nit master; and for rpu_only, when the remux took the inject path, the
+master's coded picture is the original's bit for bit (the md5 of every VCL NAL unit, in order).
+
+  python3 tools/route_e2e.py --source SRC --work DIR
+                             --route yt_native4k|yt_plain|yt_1080|sdr4k|rpu_only|hdr_reencode|hlg
                              [--seconds 90] [--resume-check] [--keep]
 
 The work directory is deleted after a run whose every check passed, unless --keep; a failing
@@ -47,7 +59,10 @@ FF, FFPROBE = "/opt/homebrew/bin/ffmpeg", "/opt/homebrew/bin/ffprobe"
 NICE = 15
 CHANNEL = "E2E Route Channel"
 MOVIE_DIR = "/Media/Movies/E2E Route"      # a movie's NAS folder: named, never touched
-KINDS = {"yt_native4k": "youtube", "sdr4k": "movie"}
+KINDS = {"yt_native4k": "youtube", "yt_plain": "youtube", "yt_1080": "youtube", "sdr4k": "movie",
+         "rpu_only": "movie", "hdr_reencode": "movie", "hlg": "movie"}
+HDR_ROUTES = ("rpu_only", "hdr_reencode", "hlg")
+DOVI_TOOL = "/opt/homebrew/bin/dovi_tool"
 
 
 def fake_home(work: str) -> str:
@@ -92,6 +107,106 @@ def stage_source(source: str, dst: str, seconds) -> None:
         os.link(source, dst)
     except OSError:
         shutil.copyfile(source, dst)
+
+
+def nativelane_probe(path: str) -> dict:
+    import nativelane
+    return nativelane.probe_stream(path, extra=("sample_aspect_ratio",))
+
+
+EDGE_BAND = 32      # luma pixels beside the picture where the ENCODER may touch the pad: HEVC's
+                    # deblocking (3 px) and its chroma transforms (up to 32x32 chroma, 64 luma px,
+                    # on a grid the centred edge need not sit on) reach across a hard edge. Measured
+                    # 2026-10-18 on the vertical POV clip at 14 Mbps: chroma off by up to 25 codes,
+                    # at most 30 px out, luma by up to 3 codes, at most 2 px out; nothing further.
+                    # The front end's own pad is exact everywhere (test_dvnative FitFrontEndInFfmpeg).
+
+
+def square_pixels(stream: dict) -> bool:
+    """PURE. True when an ffprobe video stream's sample aspect is square: "1:1", or none stated
+    ("0:1" / "N/A" / absent — a player shows those square). 2026-10-18 review: the fit front end
+    once left zscale's near-1 sample aspect (1215:1216 on a vertical Short) in the master."""
+    sar = (stream or {}).get("sample_aspect_ratio")
+    return sar in (None, "", "N/A", "0:1", "1:1")
+
+
+def pad_check(path: str, geometry: tuple, n: int, fps: str):
+    """(ok, detail): frame `n` of a 3840x2160 4:2:0 render, decoded as 10-bit: every pad sample
+    further than EDGE_BAND from the picture rectangle (w, h, x, y) is exactly black (luma 64,
+    chroma 512) — the band beside the edge is the encoder's, and only reported. Also says how
+    bright the picture's own edge rows/columns are, as evidence the picture sits where the
+    geometry says (a source with black borders of its own can legitimately be black there)."""
+    import numpy as np
+    from fractions import Fraction
+    w, h, x, y = geometry
+    if (w, h) == (3840, 2160):
+        return True, "the picture fills the frame (no pad)"
+    ss = float(Fraction(int(n), 1) / Fraction(str(fps)))
+    raw = subprocess.run([FF, "-hide_banner", "-nostdin", "-loglevel", "error", "-ss", f"{ss:.6f}",
+                          "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-"],
+                         capture_output=True, check=True).stdout
+    Y = np.frombuffer(raw[:3840 * 2160 * 2], dtype="<u2").reshape(2160, 3840).astype(int)
+    C = np.frombuffer(raw[3840 * 2160 * 2:], dtype="<u2").reshape(2, 1080, 1920).astype(int)
+    b = EDGE_BAND
+    pic = np.zeros((2160, 3840), bool)
+    pic[y:y + h, x:x + w] = True
+    near = np.zeros((2160, 3840), bool)
+    near[max(0, y - b):y + h + b, max(0, x - b):x + w + b] = True
+    far, band = ~near, near & ~pic
+    cfar, cband = far[::2, ::2], band[::2, ::2]
+    bad_y, bad_c = int((Y[far] != 64).sum()), int((C[:, cfar] != 512).sum())
+    dev_y = int(np.abs(Y[band] - 64).max()) if band.any() else 0
+    dev_c = int(np.abs(C[:, cband] - 512).max()) if cband.any() else 0
+    edge = [round(float(v), 1) for v in (Y[y:y + h, x].mean(), Y[y:y + h, x + w - 1].mean(),
+                                         Y[y, x:x + w].mean(), Y[y + h - 1, x:x + w].mean())]
+    return (bad_y == 0 and bad_c == 0,
+            f"{bad_y} luma / {bad_c} chroma pad samples not black beyond {b} px of the picture "
+            f"(frame {n}); within it the encoder moved luma by at most {dev_y}, chroma by at most "
+            f"{dev_c} codes; picture edge means (left, right, top, bottom luma) {edge}")
+
+
+def annexb(path: str) -> bytes:
+    """`path`'s video as a raw Annex B HEVC stream (stream copy: the coded bits as they are)."""
+    return subprocess.run([FF, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path,
+                           "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc",
+                           "-"], capture_output=True, check=True).stdout
+
+
+def vcl_md5(path: str) -> tuple:
+    """(md5, count) over every VCL NAL unit (types 0-31: the coded picture) of `path`'s HEVC
+    stream, in order, each without its start code or trailing zero bytes — what is the SAME
+    picture whatever parameter sets, SEI or RPU NAL units a mux put around it."""
+    import hashlib
+    import re as _re
+    data = annexb(path)
+    h, n = hashlib.md5(), 0
+    starts = [m.end() for m in _re.finditer(b"\x00\x00\x01", data)]
+    for i, a in enumerate(starts):
+        b = starts[i + 1] - 3 if i + 1 < len(starts) else len(data)
+        nal = data[a:b].rstrip(b"\x00")
+        if nal and (nal[0] >> 1) & 0x3F < 32:
+            h.update(nal)
+            n += 1
+    return h.hexdigest(), n
+
+
+def master_rpu(path: str, out_dir: str) -> tuple:
+    """(frames, Level6 dict) of the RPU in `path`'s stream, extracted again with dovi_tool."""
+    rpu = os.path.join(out_dir, "master_rpu.bin")
+    es = annexb(path)
+    subprocess.run([DOVI_TOOL, "extract-rpu", "-", "-o", rpu], input=es, capture_output=True,
+                   check=True)
+    import dvcap
+    frames = dvcap.rpu_frame_count(rpu)
+    info = subprocess.run([DOVI_TOOL, "info", "-i", rpu, "-f", "0"], capture_output=True,
+                          text=True, check=True).stdout
+    d = json.loads(info[info.find("{"):])
+    l6 = {}
+    for b in (d.get("vdr_dm_data", {}).get("cmv29_metadata", {}).get("ext_metadata_blocks", [])):
+        if "Level6" in b:
+            l6 = b["Level6"]
+    os.remove(rpu)
+    return frames, l6
 
 
 def probe(path: str) -> dict:
@@ -185,6 +300,18 @@ def run(a, work: str, source: str) -> int:
                                 f"analysis ranges"))
     if spec is None or not results[-2]:
         return summary(results, t0, work, a.keep)
+    geometry = None
+    if spec.pre_vf and a.route in HDR_ROUTES:
+        print(f"  front end: {spec.pre_vf}", flush=True)
+    if a.route in HDR_ROUTES:
+        print(f"  master: {spec.master.max_nits}/{spec.master.min_nits} nits, mdcv "
+              f"{spec.master.hdr10_mdcv}, light {spec.light}, keep_video {spec.keep_video}", flush=True)
+    elif spec.pre_vf:
+        info = nativelane_probe(p.source_cfr)
+        geometry = dvnative.fit_geometry(info.get("width"), info.get("height"),
+                                         info.get("sample_aspect_ratio"))
+        print(f"  front end: {spec.pre_vf}\n  picture {geometry[0]}x{geometry[1]} at "
+              f"({geometry[2]}, {geometry[3]}) in 3840x2160", flush=True)
 
     # 2. kill after the first range, then resume (optional)
     ranges = spec.analysis_ranges()
@@ -223,6 +350,19 @@ def run(a, work: str, source: str) -> int:
     frames = dvcap.count_hevc_frames(p.dv_render)
     results.append(check("render frames == the spec's", frames == spec.total,
                          f"{frames} vs {spec.total}"))
+    v = next((s for s in probe(p.dv_render).get("streams", []) if s.get("codec_type") == "video"), {})
+    want = (3840, 2160)
+    if a.route in HDR_ROUTES:           # the source's own frame
+        sv = next((s for s in probe(p.source_cfr).get("streams", []) if s.get("codec_type") == "video"), {})
+        want = (sv.get("width"), sv.get("height"))
+    results.append(check(f"render is {want[0]}x{want[1]}", (v.get("width"), v.get("height")) == want,
+                         f"{v.get('width')}x{v.get('height')}"))
+    if a.route not in HDR_ROUTES:       # the master's frame, so square pixels (HDR keeps its own)
+        results.append(check("render has square pixels", square_pixels(v),
+                             f"sar {v.get('sample_aspect_ratio')}"))
+    if geometry is not None:
+        ok, detail = pad_check(p.dv_render, geometry, spec.total // 2, spec.fps)
+        results.append(check("the pad is exactly black, where fit_geometry put it", ok, detail))
     if spec.cap_mbps:
         peak = dvcap.video_peak_1s_mbps(p.dv_render)
         print(f"  render 1-s peak {peak:.1f} Mbps against the {spec.cap_mbps} Mbps cap "
@@ -243,6 +383,9 @@ def run(a, work: str, source: str) -> int:
                              f"{dovi.get('dv_bl_signal_compatibility_id')}"))
         results.append(check("master is PQ / BT.2020", v.get("color_transfer") == "smpte2084"
                              and v.get("color_primaries") == "bt2020"))
+        if a.route not in HDR_ROUTES:
+            results.append(check("master has square pixels", square_pixels(v),
+                                 f"sar {v.get('sample_aspect_ratio')}"))
         mf = dvcap.count_hevc_frames(p.final)
         results.append(check("master frames == the spec's", mf == spec.total, f"{mf} vs {spec.total}"))
         cap = 50
@@ -254,6 +397,8 @@ def run(a, work: str, source: str) -> int:
         mp = dvcap.video_peak_1s_mbps(p.final)
         results.append(check("master 1-s video peak within the cap", dvcap.peak_ok(mp, cap),
                              f"{mp:.1f} Mbps against {cap}"))
+        if a.route in HDR_ROUTES:
+            hdr_checks(a.route, p, mf, msg, results, work)
     elif ok:
         results.append(check("master exists", False, p.final))
 
@@ -266,6 +411,39 @@ def run(a, work: str, source: str) -> int:
         except (OSError, ValueError):
             print(f"  {name}: (none)")
     return summary(results, t0, work, a.keep)
+
+
+def hdr_checks(route: str, p, master_frames: int, remux_msg, results: list, work: str) -> None:
+    """Step 4's HDR intake checks (module docstring) on p.final against the ORIGINAL p.source."""
+    import dvcap, dvnative, stages
+    frames, l6 = master_rpu(p.final, work)
+    results.append(check("master RPU frames == its stream's frames", frames == master_frames,
+                         f"{frames} vs {master_frames}"))
+    print(f"  master L6: {json.dumps(l6)}")
+    got = dvcap.probe_video(p.final)
+    src = stages.source_hdr10(p.source) or (None, None)
+    if route == "hlg":
+        results.append(check("L6 is the 1000-nit master", (l6.get("max_display_mastering_luminance"),
+                                                            l6.get("min_display_mastering_luminance"))
+                             == (1000, 1), f"{l6}"))
+        results.append(check("master HDR10 SEI is the 1000-nit P3 display",
+                             got.get("master_display") == dvcap.FALLBACK_MASTER_DISPLAY,
+                             f"{got.get('master_display')} / {got.get('max_cll')}"))
+        return
+    master, light = dvnative.source_mastering(*src)
+    want = {"max_display_mastering_luminance": int(master.max_nits),
+            "min_display_mastering_luminance": master.l6_min,
+            "max_content_light_level": light[0], "max_frame_average_light_level": light[1]}
+    results.append(check("L6 mastering + MaxCLL/MaxFALL == the original's HDR10 SEI",
+                         all(l6.get(k) == v for k, v in want.items()),
+                         f"L6 {[l6.get(k) for k in want]} vs source {src[0]} / {src[1]}"))
+    results.append(check("master HDR10 SEI == the original's",
+                         (got.get("master_display"), got.get("max_cll")) == tuple(src),
+                         f"{got.get('master_display')} / {got.get('max_cll')} vs {src[0]} / {src[1]}"))
+    if route == "rpu_only" and "injected RPU" in str(remux_msg):
+        mine, theirs = vcl_md5(p.final), vcl_md5(p.source)
+        results.append(check("master picture == the original's, bit for bit (VCL NAL md5)",
+                             mine == theirs, f"{mine[0]} ({mine[1]} NALs) vs {theirs[0]} ({theirs[1]})"))
 
 
 def summary(results, t0, work: str, keep: bool) -> int:

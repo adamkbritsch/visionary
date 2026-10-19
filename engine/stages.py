@@ -1400,8 +1400,9 @@ def _resolve(p, abort, progress=None):
     that froze the app mid-run). As a child process it's killable on timeout/abort,
     so a Resolve hang fails this stage cleanly and the orchestrator keeps breathing.
     The OUTPUT MODE picks the Resolve project. Automatically that is ALWAYS the
-    1000-nit Dolby Vision project (user-dictated 2026-08-09); the 2000-nit DV project
-    and the non-DV SDR project are reachable ONLY through explicit per-item overrides.
+    1000-nit Dolby Vision project (user-dictated 2026-08-09); the non-DV SDR project is
+    reachable ONLY through an explicit per-item override. The 2000-nit DV project is retired
+    (user decision 2026-10-15): nothing selects it any more.
     When the stage finishes Resolve is quit (the app is never raised) — except after a
     successful YouTube pass, which leaves it running for the next video (_keep_resolve_open).
     FAST PATH: if Resolve can't INGEST the original source (VP9/AV1 — the gate excludes
@@ -1422,16 +1423,16 @@ def _resolve(p, abort, progress=None):
     if not p.combine and pl.get("resolve") == "skip":
         return False, "permanent: source is already Dolby Vision — nothing for Resolve to do"
     # OUTPUT MODE. "auto" = the 1000-nit DV project, whatever the intake range
-    # (user-dictated 2026-08-09; 2000-nit is manual-only). A per-item override pins it regardless of the source;
+    # (user-dictated 2026-08-09). A per-item override pins it regardless of the source;
     # "sdr" is the only value that produces a non-DV master, and the only one whose Resolve
     # stage needs no screen automation at all.
     import settings as _st
     override = _st.get_show_output_mode(_settings_scope(p))
-    # The setting's values ARE the Resolve modes now ("sdr" / "dv1000" / "dv2000"), so there is
-    # no translation table to get wrong. "auto" = ALWAYS 1000 nits (user-dictated
-    # 2026-08-09): the 2000-nit project stays available as an explicit per-item override,
-    # but nothing selects it automatically — HDR intake included.
-    mode = override if override in ("sdr", "dv1000", "dv2000") else "dv1000"
+    # The setting's values ARE the Resolve modes ("sdr" / "dv1000"), so there is no translation
+    # table to get wrong. "auto" = ALWAYS 1000 nits (user-dictated 2026-08-09), HDR intake
+    # included. The 2000-nit mode is RETIRED (user decision 2026-10-15): settings reads a
+    # profile still pinned to it as "dv1000", and this never passes "dv2000" either.
+    mode = override if override in ("sdr", "dv1000") else "dv1000"
     # WHICH SCREEN. Resolved ONCE here, before the subprocess spawns, so an unplugged or
     # unproven display is a clean stage-level decision with a log line — not a surprise
     # 200 seconds into a Resolve cold start.
@@ -1708,13 +1709,74 @@ def _dvnative(p, abort, progress=None, should_pause=None):
 
 
 # ---- the native DV render ('dvrender'): a route set 'native' in settings dv_routes -----------
-# The routes the stage can make TODAY: one source already at the master's 3840x2160, BT.709
-# limited-range SDR, straight through the pinned LUT (the TV lane's validated chain) — so no
-# front end at all. A route that needs one (a fit and pad, a BT.601 or full-range conversion:
-# dvnative.front_end) ships with its own phase and renders through Resolve until then, as does
-# every source of these routes the LUT cannot take as it is.
-DVRENDER_ROUTES = ("yt_native4k", "sdr4k")
+# The routes the stage can make. yt_native4k and sdr4k take one source already at the master's
+# 3840x2160, BT.709 limited-range SDR, straight through the pinned LUT (the TV lane's validated
+# chain) — no front end at all; any other size or colour of theirs renders through Resolve.
+# DVRENDER_FIT_ROUTES (2026-10-18: yt_plain, yt_1080 — every SDR YouTube video under native 4K,
+# and every vertical one) put the fit front end before the LUT (dvnative.fit_front_end): BT.601
+# or full range to BT.709 limited when the tags (or, untagged, the frame size) say so, then a
+# Lanczos fit into 3840x2160 with a black pad — the picture Resolve's 4K timeline makes of
+# them. yt_1080 is a plain 2x Lanczos (user decision: no SuperScale stand-in; a blind A/B against
+# MetalFX showed no difference). Each route still renders only when dv_routes sets it 'native'.
+# HDR INTAKE (2026-10-18): DVRENDER_HDR_ROUTES take an HDR source with NO LUT (_hdr_render_spec).
+#   rpu_only      4K HDR10 HEVC Main10 CFR: the source is measured as it is and keeps its own
+#                 mastering (its mastering-display and content-light-level SEI become L6), and the
+#                 render IS its own coded video with that RPU injected (keep_video: no encode) —
+#                 so the remux's untouched rpu-only branch ships exactly what it did with
+#                 Resolve's RPU: remux_inject onto the original bits under the 72 Mbps gate, the
+#                 capped x265 of the source (its own mastering display, encode_source) over it
+#   hdr_reencode  PQ that cannot carry an RPU as it is (AV1, H.264, 8-bit, VFR): measured and
+#                 VideoToolbox-encoded as it is, keeping its own mastering, at Resolve's export
+#                 bitrate; the remux's capped x265 then reads the render, as it read Resolve's
+#   hlg           HLG: dvnative.hlg_to_pq_vf (BT.2100 HLG -> PQ at 1000 nits) in front, then as
+#                 PQ, on the 1000-nit master every Resolve route writes
+#   hdr_topaz     sub-4K PQ or HLG upscaled by Topaz: the render is made from Topaz's chunks (the
+#                 native render's chunk input — per-chunk analysis, one concat encode), no LUT,
+#                 the HLG front end for HLG, the source's own mastering for PQ, at the export
+#                 bitrate Resolve's 'episode' render had; after it the item is a Resolve item in
+#                 every way (the chunks drop at hand-off, the remux's x265 reads the render). It is
+#                 NOT the dv_engine chunk lane (nativelane), which stays the SDR TV lane, untouched.
+# The source keeps its own frame (any 4K geometry, as rpu_only's original stream always has) —
+# except a YouTube video, whose render is the 3840x2160 frame Resolve's timeline makes: one of
+# another size needs an HDR fit, which is not built, so Resolve keeps it.
+# SDR TOPAZ CHUNKS (2026-10-18): DVRENDER_SDR_CHUNK_ROUTES render from Topaz's chunks through
+# dvnative.chunk_front_end (BT.601 -> BT.709 by the standard conversion when the chunk's tags — or,
+# untagged, the source's frame — say so; square pixels for an anamorphic chunk) and the pinned LUT,
+# at the export bitrate Resolve's 'episode' render had, no gate (_sdr_chunk_render_spec). After it
+# the item is a Resolve item in every way: the chunks drop at hand-off and the remux's x265 reads
+# the render — exactly the disk profile Resolve had, which is what movie_sdr_topaz must keep
+# (orchestrator: a movie's ~245 GB ProRes is never held through its remux).
+#   movie_sdr_topaz  a sub-4K SDR movie (any bucket: a 480p DVD film gets the 601 front end)
+#   sd_sdr_topaz     a 480p/576p TV episode the chunk lane (nativelane, its first choice) declined —
+#                    for disk, say; never one the lane fell back from (fallback.json: Resolve takes
+#                    it, as the lane promises) or claimed
+# COMBINE (2026-10-18): combine_nodv — neither copy has real DV, so the verdict's WINNER is analysed
+# (_combine_render_spec), exactly as rpu_only analyses its one source; companion.build_verdict
+# already refuses a winner that is not PQ, so there is no SDR winner to route.
+DVRENDER_HDR_ROUTES = ("rpu_only", "hdr_reencode", "hlg", "hdr_topaz")
+DVRENDER_SDR_CHUNK_ROUTES = ("movie_sdr_topaz", "sd_sdr_topaz")
+DVRENDER_CHUNK_ROUTES = ("hdr_topaz",) + DVRENDER_SDR_CHUNK_ROUTES   # from Topaz's chunks; the rest
+                                                                     # from one file
+# SDR OUTPUT (2026-10-18): sdr_out — any item PINNED to SDR (user decision: the SDR output mode
+# stays, with no Resolve). Resolve's SDR project could never finish such an item (its render has no
+# RPU, which the remux and stage_done both demand); this makes the SDR master without it
+# (_sdr_out_spec): the item is named by the route it would have unpinned (routes.item_route(p,
+# mode="dv1000")) and rendered as that route's picture with NO LUT — Topaz's chunks through the
+# chunk front end, a YouTube video through the fit front end, 4K SDR through the colour step
+# alone — into a BT.709 HEVC render with no RPU (nativerender's sdr spec, its proof books/sdr.json),
+# at the export bitrate and gate that route's render has. The remux then makes the TRUE SDR master
+# (x265 Rec.709 under the cap, no DV: remux(sdr=True), remux_ship_render(sdr=True) for a video).
+# An HDR source pinned to SDR needs a tone map (not built) and a combine an RPU: those refuse.
+DVRENDER_COMBINE_ROUTES = ("combine_nodv",)
+DVRENDER_OUTPUT_ROUTES = ("sdr_out",)
+SDR_OUT_CHUNK_BASES = ("tv_sdr_topaz", "tv_disk_fallback", "sd_sdr_topaz", "movie_sdr_topaz")
+SDR_OUT_FIT_BASES = ("yt_native4k", "yt_plain", "yt_1080")
+DVRENDER_ROUTES = (("yt_native4k", "sdr4k", "yt_plain", "yt_1080") + DVRENDER_HDR_ROUTES
+                   + DVRENDER_SDR_CHUNK_ROUTES + DVRENDER_COMBINE_ROUTES + DVRENDER_OUTPUT_ROUTES)
+DVRENDER_FIT_ROUTES = ("yt_plain", "yt_1080")
 DVRENDER_SIZE = (3840, 2160)
+DVRENDER_HDR_MAX = (4096, 2176)     # the largest frame an HDR re-encode makes: HEVC level 5.1's
+                                    # picture size (DV 8.1's UHD levels); larger goes to Resolve
 
 
 def _int0(v) -> int:
@@ -1728,40 +1790,344 @@ def dvrender_spec(p, route) -> tuple:
     """(nativerender.RenderSpec, "") for item `p`'s native render on `route`, or (None, why) when
     the stage cannot make it — then Resolve does, exactly as before. The spec is Resolve's render
     settings for the route: the CFR source (resolve_input), the pinned LUT, the export bitrate
-    _resolve would pass (youtube_render_kbps under the max_peak_mbps gate for a video; for 4K
+    _resolve would pass (youtube_render_kbps of the source's height under the max_peak_mbps gate
+    for a video — 14 Mbps for a native-4K or a vertical >= 1700-line one, 20 otherwise; for 4K
     SDR the intake's own bitrate floored at EXPORT_BITRATE_FLOOR_KBPS, no gate — its remux
-    re-encodes under the cap anyway), and the scene plan _plan_fast_path_bounds stashed as the
-    analysis ranges. Probes the CFR (stream tags, frame count) and asks the native toolchain
-    check (cached); never writes anything."""
+    re-encodes under the cap anyway), the scene plan _plan_fast_path_bounds stashed as the
+    analysis ranges, and for a fit route the fit front end its tags call for. The HDR intake,
+    SDR chunk, combine and SDR-output routes have specs of their own (_hdr_render_spec,
+    _sdr_chunk_render_spec, _combine_render_spec, _sdr_out_spec). Probes the CFR (stream tags,
+    frame count) and asks the native toolchain check (cached); never writes anything."""
     if route not in DVRENDER_ROUTES:
         return None, f"route {route or 'unknown'} has no native render yet"
     import nativelane
     import nativerender
     import settings as _st
+    if route in DVRENDER_COMBINE_ROUTES:        # a combine has no CFR: it renders the winner
+        ok, why = nativelane.toolchain_ok()
+        if not ok:
+            return None, f"the native toolchain is not ready: {why}"
+        return _combine_render_spec(p)
     src = getattr(p, "source_cfr", None)
     if not src or not os.path.exists(src):
         return None, "its CFR source is not on disk"
     ok, why = nativelane.toolchain_ok()
     if not ok:
         return None, f"the native toolchain is not ready: {why}"
-    info = nativelane.probe_stream(src)
-    ok, why = nativelane.source_ok(info)
-    if not ok:
-        return None, why.replace("chunk 0", "the source")
+    if route in DVRENDER_HDR_ROUTES:
+        return _hdr_render_spec(p, route, src)
+    if route in DVRENDER_SDR_CHUNK_ROUTES:
+        return _sdr_chunk_render_spec(p, route)
+    if route in DVRENDER_OUTPUT_ROUTES:
+        return _sdr_out_spec(p, src)
+    pre_vf = None
+    if route in DVRENDER_FIT_ROUTES:
+        import dvnative
+        info = nativelane.probe_stream(src, extra=("sample_aspect_ratio",))
+        if not info:
+            return None, "the source could not be probed"
+        try:
+            pre_vf = dvnative.fit_front_end(info, DVRENDER_SIZE)
+        except ValueError as e:
+            return None, str(e)
+    else:
+        info = nativelane.probe_stream(src)
+        ok, why = nativelane.source_ok(info)
+        if not ok:
+            return None, why.replace("chunk 0", "the source")
     size = (_int0(info.get("width")), _int0(info.get("height")))
-    if size != DVRENDER_SIZE:
+    if pre_vf is None and size != DVRENDER_SIZE:
         return None, (f"the source is {size[0]}x{size[1]}, not {DVRENDER_SIZE[0]}x"
-                      f"{DVRENDER_SIZE[1]} (the fit and pad front end comes later)")
+                      f"{DVRENDER_SIZE[1]} — route {route} renders its frame as it is")
     cfr = nativelane.cfr_info(p)
     if not cfr.get("frames") or not cfr.get("fps"):
         return None, "the CFR's frame count or frame rate is unknown"
-    if route == "yt_native4k":
+    if route.startswith("yt_"):
+        # _resolve's YouTube export: youtube_render_kbps(h) for the height of plan_for(p.source)'s
+        # probe — the same height as the CFR's, which never changes the geometry — and its
+        # cap_arg, the max_peak_mbps render gate.
         kbps, cap = youtube_render_kbps(size[1]), int(_st.get_settings().get("max_peak_mbps", 50))
     else:
         kbps, cap = max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS), 0
     spec = nativerender.RenderSpec(inputs=[[0, src], [cfr["frames"], None]], fps=cfr["fps"],
                                    kbps=kbps, cap_mbps=cap, lut=nativelane.lut_path(),
+                                   pre_vf=pre_vf,
                                    bounds=_read_topaz_bounds(p.source_basename) or None)
+    bad = spec.problems()
+    if bad:
+        return None, "; ".join(bad)
+    return spec, ""
+
+
+def declared_light(light):
+    """PURE. The content light level a native HDR route declares: the source's own (MaxCLL,
+    MaxFALL), or None — measure it, in L6 and in the HDR10 SEI alike — when the source says 0,0
+    (HDR10's "unknown", or no level at all: dvnative.source_mastering). Resolve measured it then:
+    its Hamilton render (2026-10-18) declared 620,41 in both over a 0,0 WEB source."""
+    return None if light is None or tuple(light) == (0, 0) else light
+
+
+def source_hdr10(path):
+    """(master_display, max_cll) of `path`'s first frame — dvcap.probe_video's own read of the
+    HDR10 SEI (x265's mastering-display string, "MaxCLL,MaxFALL"; None for one it lacks) — or
+    None when ffprobe cannot read the file. Only the first frame: probe_video would also count
+    a Matroska file's packets (a whole-file scan) for a frame count this does not need."""
+    import dvcap
+    try:
+        r = subprocess.run([FFPROBE, "-v", "quiet", "-select_streams", "v:0", "-print_format",
+                            "json", "-show_frames", "-read_intervals", "%+#1", path],
+                           capture_output=True, text=True, timeout=60)
+        frames = json.loads(r.stdout or "{}").get("frames") if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if not frames:
+        return None
+    md = cll = None
+    for sd in frames[0].get("side_data_list") or []:
+        t = sd.get("side_data_type", "")
+        if "Mastering display" in t:
+            md = dvcap.mastering_to_x265(sd)
+        elif "Content light" in t:
+            cll = "%d,%d" % (int(sd.get("max_content", 0)), int(sd.get("max_average", 0)))
+    return md, cll
+
+
+def _hdr_render_spec(p, route, src) -> tuple:
+    """dvrender_spec for an HDR intake route (DVRENDER_HDR_ROUTES): no LUT, a PQ picture as it is
+    and an HLG one through the HLG -> PQ front end (dvnative.hdr_front_end), BT.2020 limited only.
+    The picture is the CFR source — or, for hdr_topaz, Topaz's chunks (nativelane.chunks, checked
+    against the CFR they were made from, whose audio the remux takes). PQ routes keep the
+    ORIGINAL's own mastering — read from p.source, whose stream the rpu_only master ships (a VFR
+    source's CFR is a re-encode that need not carry the SEI) — and HLG takes the 1000-nit master
+    it is converted for. The bitrate and gate are _resolve's: the floor for rpu_only (its
+    render's picture is never re-encoded here at all — keep_video), youtube_render_kbps(h) under
+    max_peak_mbps for a YouTube video, else the intake's own bitrate floored at
+    EXPORT_BITRATE_FLOOR_KBPS with no gate (its remux re-encodes under the cap). Probes only;
+    writes nothing."""
+    import dvnative
+    import nativelane
+    import nativerender
+    import settings as _st
+    cfr = nativelane.cfr_info(p)
+    if not cfr.get("frames") or not cfr.get("fps"):
+        return None, "the CFR's frame count or frame rate is unknown"
+    inputs = [[0, src], [cfr["frames"], None]]
+    picture = src
+    if route in DVRENDER_CHUNK_ROUTES:
+        try:
+            inputs = nativelane.chunks(p.segdir, expected=cfr["frames"])
+        except ValueError as e:
+            return None, f"the Topaz chunks: {e}"
+        picture = inputs[0][1]
+    info = nativelane.probe_stream(picture, extra=("codec_name",))
+    if not info:
+        return None, "the source could not be probed"
+    if route in DVRENDER_CHUNK_ROUTES:
+        ok, why = nativelane.cfr_check(inputs[-1][0], cfr["frames"], info.get("r_frame_rate"),
+                                       cfr["fps"])
+        if not ok:
+            return None, why.replace("chunk 0", "Topaz's chunk 0")
+    want = {"hlg": (dvnative.HLG,), "hdr_topaz": (dvnative.PQ, dvnative.HLG)}.get(route, (dvnative.PQ,))
+    trc = info.get("color_transfer")
+    if trc not in want:
+        return None, (f"the source transfer is {trc or 'untagged'}; route {route} takes "
+                      f"{' or '.join('HLG' if t == dvnative.HLG else 'PQ' for t in want)}")
+    try:
+        pre_vf = dvnative.hdr_front_end(info)
+    except ValueError as e:
+        return None, str(e)
+    size = (_int0(info.get("width")), _int0(info.get("height")))
+    if size[0] <= 0 or size[1] <= 0:
+        return None, "the source's size is unknown"
+    keep = route == "rpu_only"
+    if keep and (info.get("codec_name"), info.get("pix_fmt")) != ("hevc", "yuv420p10le"):
+        return None, (f"the source is {info.get('codec_name')} {info.get('pix_fmt')}, not HEVC "
+                      "Main10 — its own stream cannot carry the RPU")
+    if not keep and (size[0] > DVRENDER_HDR_MAX[0] or size[1] > DVRENDER_HDR_MAX[1]):
+        return None, (f"the source is {size[0]}x{size[1]}, larger than "
+                      f"{DVRENDER_HDR_MAX[0]}x{DVRENDER_HDR_MAX[1]} (HEVC level 5.1)")
+    yt = bool(getattr(p, "youtube", False)) and not keep
+    if yt and size != DVRENDER_SIZE:
+        return None, (f"the source is {size[0]}x{size[1]}: a YouTube video renders at "
+                      f"{DVRENDER_SIZE[0]}x{DVRENDER_SIZE[1]}, and there is no HDR fit front end yet")
+    master, light = dvnative.DEFAULT_MASTER, None
+    if trc == dvnative.PQ:
+        hdr10 = source_hdr10(p.source)
+        if hdr10 is None:
+            return None, "the source's HDR10 metadata could not be read"
+        try:
+            master, light = dvnative.source_mastering(*hdr10)
+        except ValueError as e:
+            return None, str(e)
+        light = declared_light(light)
+    if keep:
+        kbps, cap = EXPORT_BITRATE_FLOOR_KBPS, 0
+    elif yt:
+        kbps, cap = youtube_render_kbps(size[1]), int(_st.get_settings().get("max_peak_mbps", 50))
+    else:
+        kbps, cap = max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS), 0
+    single = route not in DVRENDER_CHUNK_ROUTES
+    spec = nativerender.RenderSpec(inputs=inputs, fps=cfr["fps"], kbps=kbps, cap_mbps=cap,
+                                   lut=None, pre_vf=pre_vf,
+                                   bounds=(_read_topaz_bounds(p.source_basename) or None) if single else None,
+                                   master=master, light=light, keep_video=keep)
+    bad = spec.problems()
+    if bad:
+        return None, "; ".join(bad)
+    return spec, ""
+
+
+def _sdr_chunk_render_spec(p, route, *, sdr: bool = False) -> tuple:
+    """dvrender_spec for an SDR Topaz chunk route (DVRENDER_SDR_CHUNK_ROUTES): the render from
+    Topaz's chunks (nativelane.chunks, checked against the CFR whose audio the remux takes, chunk
+    0's rate exactly the CFR's) through dvnative.chunk_front_end — chunk 0's tags, an untagged one
+    judged by the source's frame (the CFR's: it keeps the source's geometry) — and the pinned LUT,
+    at the export bitrate Resolve's 'episode' render had: the intake's own, floored at
+    EXPORT_BITRATE_FLOOR_KBPS, no gate (its remux re-encodes under the cap). sd_sdr_topaz refuses an
+    item the chunk lane claimed or fell back from. `sdr` (sdr_out over a chunk route): the same
+    chunks and front end with no LUT, into the SDR render. Probes only; writes nothing."""
+    import dvnative
+    import nativelane
+    import nativerender
+    if route == "sd_sdr_topaz":
+        if nativelane.has_fallback(p):
+            return None, ("the native lane fell back for this item (native/fallback.json) — "
+                          "Resolve takes it")
+        if nativelane.has_marker(p):
+            return None, "the native lane has claimed this item (native/native.json)"
+    cfr = nativelane.cfr_info(p)
+    if not cfr.get("frames") or not cfr.get("fps"):
+        return None, "the CFR's frame count or frame rate is unknown"
+    try:
+        inputs = nativelane.chunks(p.segdir, expected=cfr["frames"])
+    except ValueError as e:
+        return None, f"the Topaz chunks: {e}"
+    info = nativelane.probe_stream(inputs[0][1], extra=("sample_aspect_ratio",))
+    if not info:
+        return None, "Topaz's chunk 0 could not be probed"
+    ok, why = nativelane.cfr_check(inputs[-1][0], cfr["frames"], info.get("r_frame_rate"), cfr["fps"])
+    if not ok:
+        return None, why.replace("chunk 0", "Topaz's chunk 0")
+    try:
+        pre_vf = dvnative.chunk_front_end(info, nativelane.probe_stream(p.source_cfr))
+    except ValueError as e:
+        return None, f"Topaz's chunk 0: {e}"
+    kbps = max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS)
+    spec = nativerender.RenderSpec(inputs=inputs, fps=cfr["fps"], kbps=kbps, cap_mbps=0,
+                                   lut=None if sdr else nativelane.lut_path(), pre_vf=pre_vf or None,
+                                   sdr=sdr)
+    bad = spec.problems()
+    if bad:
+        return None, "; ".join(bad)
+    return spec, ""
+
+
+def _sdr_out_spec(p, src) -> tuple:
+    """dvrender_spec for sdr_out (the SDR output mode, section comment above DVRENDER_ROUTES): the
+    item's unpinned route says what its picture is, and it is rendered as that route's, minus the
+    LUT, into the SDR render (nativerender sdr spec: BT.709 HEVC, no RPU):
+      a Topaz chunk route   its chunks through the chunk front end (_sdr_chunk_render_spec)
+      a YouTube route       the CFR through the fit front end to 3840x2160 — Resolve's 4K
+                            timeline — at youtube_render_kbps(h) under the max_peak_mbps gate
+      sdr4k                 the CFR at its own frame, through the colour step alone, at the
+                            intake's bitrate floored at EXPORT_BITRATE_FLOOR_KBPS, no gate
+    Anything else refuses with the reason (HDR needs a tone map; a combine an RPU). Probes only."""
+    import dvnative
+    import nativelane
+    import nativerender
+    import routes
+    import settings as _st
+    base = routes.item_route(p, mode="dv1000")
+    if base in SDR_OUT_CHUNK_BASES:
+        return _sdr_chunk_render_spec(p, base, sdr=True)
+    if base not in SDR_OUT_FIT_BASES + ("sdr4k",):
+        why = ("an HDR source mastered to SDR needs a tone map, which is not built"
+               if base in DVRENDER_HDR_ROUTES else
+               "a companion combine ships Dolby Vision" if str(base).startswith("combine")
+               else "no SDR render for it")
+        return None, f"underneath the SDR pin it is route {base or 'unknown'}: {why}"
+    info = nativelane.probe_stream(src, extra=("sample_aspect_ratio",))
+    if not info:
+        return None, "the source could not be probed"
+    try:
+        if base in SDR_OUT_FIT_BASES:
+            pre_vf = dvnative.fit_front_end(info, DVRENDER_SIZE)
+        else:
+            m, pr, full = dvnative.colour_front(info)
+            pre_vf = dvnative.colour_vf(m, pr, full)
+    except ValueError as e:
+        return None, str(e)
+    cfr = nativelane.cfr_info(p)
+    if not cfr.get("frames") or not cfr.get("fps"):
+        return None, "the CFR's frame count or frame rate is unknown"
+    if base in SDR_OUT_FIT_BASES:
+        kbps = youtube_render_kbps(_int0(info.get("height")))
+        cap = int(_st.get_settings().get("max_peak_mbps", 50))
+    else:
+        kbps, cap = max(_source_video_kbps(p.source), EXPORT_BITRATE_FLOOR_KBPS), 0
+    spec = nativerender.RenderSpec(inputs=[[0, src], [cfr["frames"], None]], fps=cfr["fps"],
+                                   kbps=kbps, cap_mbps=cap, lut=None, pre_vf=pre_vf or None,
+                                   bounds=_read_topaz_bounds(p.source_basename) or None, sdr=True)
+    bad = spec.problems()
+    if bad:
+        return None, "; ".join(bad)
+    return spec, ""
+
+
+def _combine_render_spec(p) -> tuple:
+    """dvrender_spec for combine_nodv: a companion combine where neither copy has real Dolby
+    Vision, so the RPU is measured from the verdict's WINNER (orchestrator.combine_winner_path —
+    the copy that ships), exactly as rpu_only measures its one source: no LUT, the winner's own
+    mastering (its HDR10 SEI -> L6 and the L1/L4 clamp, dvnative.source_mastering), and the
+    render IS the winner's own coded video with the RPU injected (keep_video) when it is HEVC
+    Main10 — else a VideoToolbox encode of it, at the floor bitrate Resolve's combine export used.
+    Its video never ships either way: remux.combine takes only the render's RPU (rpu_source =
+    p.dv_render), injected onto the winner's bits or carried by the capped x265 of the winner —
+    the very calls it made with Resolve's render. companion.build_verdict refuses a winner that
+    is not PQ, and so does this. No CFR exists for a combine: the frame count is the winner's
+    own (a header read, else a packet count — never a decode) and so is the rate. Probes only."""
+    import dvnative
+    import nativelane
+    import nativerender
+    import topaz
+    from orchestrator import combine_winner_path
+    winner = combine_winner_path(p)
+    if not winner or not os.path.exists(winner):
+        return None, "the combine verdict's winner is not on disk"
+    info = nativelane.probe_stream(winner, extra=("codec_name",))
+    if not info:
+        return None, "the winner could not be probed"
+    if info.get("color_transfer") != dvnative.PQ:
+        return None, (f"the winner's transfer is {info.get('color_transfer') or 'untagged'}, not PQ "
+                      "(an RPU describes a PQ base)")
+    try:
+        if dvnative.hdr_front_end(info) is not None:
+            raise ValueError("the winner needs a front end")
+    except ValueError as e:
+        return None, str(e)
+    frames = topaz._frame_count(winner, decode=False)
+    fps = nativelane.fps_fraction(winner)
+    if not frames or frames <= 0 or not fps:
+        return None, "the winner's frame count or frame rate is unknown"
+    size = (_int0(info.get("width")), _int0(info.get("height")))
+    keep = (info.get("codec_name"), info.get("pix_fmt")) == ("hevc", "yuv420p10le")
+    if size[0] <= 0 or size[1] <= 0:
+        return None, "the winner's size is unknown"
+    if not keep and (size[0] > DVRENDER_HDR_MAX[0] or size[1] > DVRENDER_HDR_MAX[1]):
+        return None, (f"the winner is {size[0]}x{size[1]}, larger than "
+                      f"{DVRENDER_HDR_MAX[0]}x{DVRENDER_HDR_MAX[1]} (HEVC level 5.1)")
+    hdr10 = source_hdr10(winner)
+    if hdr10 is None:
+        return None, "the winner's HDR10 metadata could not be read"
+    try:
+        master, light = dvnative.source_mastering(*hdr10)
+    except ValueError as e:
+        return None, str(e)
+    light = declared_light(light)
+    spec = nativerender.RenderSpec(inputs=[[0, winner], [frames, None]], fps=fps,
+                                   kbps=EXPORT_BITRATE_FLOOR_KBPS, cap_mbps=0, lut=None,
+                                   bounds=_read_topaz_bounds(p.source_basename) or None,
+                                   master=master, light=light, keep_video=keep)
     bad = spec.problems()
     if bad:
         return None, "; ".join(bad)
@@ -2097,6 +2463,27 @@ def _remux(p, abort, progress=None, should_pause=None):
 
     encode_source = None   # set when rpu-only loses its stream-copy privilege (peak-gated)
     combine_call = None    # set when a COMBINE item needs the capped path (notched bar below)
+    # SDR OUTPUT (2026-10-18, route sdr_out): an SDR render the native render published for an item
+    # pinned to SDR (its proof, nativerender.sdr_render_ok — nothing else is ever taken for one)
+    # becomes the TRUE SDR master: remux_ship_render / remux with sdr=True (no RPU, Rec.709 x265
+    # under the same cap, no DV box). Every other item makes exactly the calls it always made.
+    # ONLY while the item still ships as SDR (orchestrator.ships_as_sdr — p.final's name; 2026-10-18
+    # review): the finisher runs the remux without asking stage_done("resolve"), so an item unpinned
+    # after its SDR render and resumed under the DV name would otherwise have made an SDR master
+    # named '... HDR10 DV upscaled' and uploaded it. That render cannot make a DV master either, so
+    # the remux refuses at once (no hour of x265 first); the failed pick sends the item back
+    # through RUN_STAGES, where stage_done("resolve") no longer counts the SDR render
+    # (orchestrator._native_sdr_render asks the same question) and the item renders again as DV.
+    sdr_out = False
+    if not p.combine and os.path.isfile(str(p.dv_render) + ".dvrender/sdr.json"):   # one stat, else
+        import nativerender                                                      # nothing at all
+        if nativerender.sdr_render_ok(p):
+            from orchestrator import ships_as_sdr
+            if not ships_as_sdr(p):
+                return False, ("the render is the SDR output's (sdr_out), but the item now ships as "
+                               "Dolby Vision (its SDR pin is gone): it renders again before the remux")
+            sdr_out = True
+    sdr_kw = {"sdr": True} if sdr_out else {}
     if p.combine:
         # COMPANION COMBINE: the confirmed verdict names the donors; the peak gate picks
         # the path. Under the 72 Mbps gate the winner's own bits ship (RPU grafted or
@@ -2168,7 +2555,7 @@ def _remux(p, abort, progress=None, should_pause=None):
         # "render-over-cap" (and only that) falls through to the normal capped re-encode.
         res = remux.remux_ship_render(p.dv_render, p.source_cfr, p.source, p.final,
                                       cap_mbps=cap, audio_target_lufs=lufs, abort=abort,
-                                      on_step=_on_step)
+                                      on_step=_on_step, **sdr_kw)
         if res.ok or not str(res.reason).startswith("render-over-cap"):
             return res.ok, res.reason
         logbook.event(f"remux {p.ep}: {res.reason}")
@@ -2251,7 +2638,7 @@ def _remux(p, abort, progress=None, should_pause=None):
                       boundaries=bounds, abort=abort,
                       on_progress=on_prog, on_plan=on_plan, should_pause=should_pause,
                       on_repair=on_repair, encode_source=encode_source,
-                      **({"native": native} if native is not None else {}))
+                      **({"native": native} if native is not None else {}), **sdr_kw)
     if wall is not None:
         _never_raise(wall.finish)
     if res.ok and native is not None:

@@ -1044,10 +1044,15 @@ class OutputModeOverride(unittest.TestCase):
         self.assertEqual(self._mode(None, is_hdr=False), "dv1000")
 
     def test_an_override_wins_over_the_source(self):
-        # Deliberately contradictory: an SDR source pinned to 2000-nit, an HDR source to SDR.
-        self.assertEqual(self._mode("dv2000", is_hdr=False), "dv2000")
+        # Deliberately contradictory: an HDR source pinned to SDR, and to 1000 nits.
         self.assertEqual(self._mode("sdr", is_hdr=True), "sdr")
         self.assertEqual(self._mode("dv1000", is_hdr=True), "dv1000")
+
+    def test_the_retired_2000_nit_pin_renders_at_1000(self):
+        # 2026-10-18 (user decision 2026-10-15): the 2000-nit mode is retired. settings already
+        # reads a stale pin as dv1000; even handed "dv2000" raw, the stage never passes it on.
+        self.assertEqual(self._mode("dv2000", is_hdr=False), "dv1000")
+        self.assertEqual(self._mode("dv2000", is_hdr=True), "dv1000")
 
     def test_the_automatic_rule_can_never_pick_sdr_or_2000(self):
         """User-dictated invariants: automatically it is ALWAYS Dolby Vision at 1000 nits.
@@ -3437,6 +3442,7 @@ class _DvRenderItem(unittest.TestCase):
         with open(self.cube, "w") as fh:
             fh.write("LUT_3D_SIZE 2\n")
         self.info = dict(self.INFO)
+        self.probes = []                     # the keyword arguments of every probe_stream call
         self.cfr = {"path": self.p.source_cfr, "frames": 1000, "fps": "30000/1001"}
         self.toolchain = (True, "toolchain matches the pins")
         for cm in (mock.patch.multiple(settings, CONFIG_DIR=self.d,
@@ -3444,7 +3450,8 @@ class _DvRenderItem(unittest.TestCase):
                                        PROFILES_FILE=os.path.join(self.d, "show_profiles.json")),
                    mock.patch.object(stages, "_SEGBOUNDS_FILE", os.path.join(self.d, "bounds.json")),
                    mock.patch.object(nativelane, "toolchain_ok", side_effect=lambda **kw: self.toolchain),
-                   mock.patch.object(nativelane, "probe_stream", side_effect=lambda _p: dict(self.info)),
+                   mock.patch.object(nativelane, "probe_stream",
+                                     side_effect=lambda _p, **kw: self.probes.append(kw) or dict(self.info)),
                    mock.patch.object(nativelane, "cfr_info", side_effect=lambda _p: dict(self.cfr)),
                    mock.patch.object(nativelane, "lut_path", side_effect=lambda: self.cube),
                    mock.patch.object(settings, "dv_routes", _REAL_DV_ROUTES)):
@@ -3485,7 +3492,7 @@ class NativeRenderSpec(_DvRenderItem):
             spec, why = stages.dvrender_spec(self.p, route)
             self.assertIsNone(spec)
             return why
-        for route in ("yt_1080", "yt_plain", "tv_sdr_topaz", "rpu_only", "unknown", None):
+        for route in ("tv_sdr_topaz", "tv_disk_fallback", "unknown", None):
             self.assertIn("has no native render yet", refused(route), route)
         self.toolchain = (False, "dovi_tool is 2.2.0, pinned 2.3.0")
         self.assertEqual(refused(), "the native toolchain is not ready: dovi_tool is 2.2.0, pinned 2.3.0")
@@ -3511,6 +3518,111 @@ class NativeRenderSpec(_DvRenderItem):
         before = sorted(os.listdir(self.d))
         stages.dvrender_spec(self.p, "yt_native4k")
         self.assertEqual(sorted(os.listdir(self.d)), before)
+
+
+class NativeRenderFitSpec(_DvRenderItem):
+    """yt_plain and yt_1080 (2026-10-18): the fit front end before the LUT — BT.601 / full range to
+    BT.709 limited when the tags (or, untagged, the frame size) say so, a Lanczos fit into
+    3840x2160 and a black pad — at the bitrate and under the gate _resolve would give them."""
+
+    BT601 = {"color_space": "smpte170m", "color_primaries": "smpte170m", "color_transfer": "bt709"}
+
+    def _spec(self, route="yt_plain", **info):
+        self.info = dict(self.INFO, **info)
+        spec, why = stages.dvrender_spec(self.p, route)
+        self.assertEqual(why, "")
+        return spec
+
+    def test_1080p_is_an_exact_2x_lanczos_with_no_pad(self):
+        import dvnative
+        stages._write_topaz_bounds(self.p.source_basename, [300, 700, 1000])
+        spec = self._spec("yt_1080", width=1920, height=1080, sample_aspect_ratio="1:1")
+        self.assertEqual(spec.pre_vf, "zscale=w=3840:h=2160:filter=lanczos:param_a=3:"
+                                      "rangein=limited:range=limited,format=yuv444p16le,setsar=1")
+        self.assertEqual(spec.pre_vf, dvnative.fit_front_end(self.info))
+        self.assertEqual(self.probes, [{"extra": ("sample_aspect_ratio",)}])   # the SAR is asked for
+        self.assertEqual((spec.lut, spec.fps, spec.bounds), (self.cube, "30000/1001", (300, 700, 1000)))
+        self.assertEqual((spec.kbps, spec.cap_mbps), (stages.YOUTUBE_RENDER_KBPS, 50))
+        # scale BEFORE the LUT, in the encode and in the analysis alike
+        self.assertEqual(spec.encode_vf(), spec.pre_vf + "," + dvnative.lut_vf(self.cube))
+        self.assertTrue(spec.analysis_vf().startswith(spec.pre_vf + ",scale=1920:1080:flags=area,"
+                                                      "zscale=matrixin=709"))
+
+    def test_480p_bt601_gets_the_601_front_end_then_a_pillarbox(self):
+        spec = self._spec(width=640, height=480, **self.BT601)
+        colour, fit = spec.pre_vf.split(",zscale=w=")
+        self.assertEqual(colour, "zscale=matrixin=170m:rangein=limited:transferin=709:primariesin=170m:"
+                                 "transfer=709:primaries=709:matrix=709:range=limited,format=yuv444p16le")
+        self.assertEqual("zscale=w=" + fit,
+                         "zscale=w=2880:h=2160:filter=lanczos:param_a=3:rangein=limited:range=limited,"
+                         "format=yuv444p16le,setsar=1,setparams=range=pc,pad=3840:2160:480:0:color=black,"
+                         "setparams=range=tv")
+        self.assertEqual(spec.kbps, stages.YOUTUBE_RENDER_KBPS)
+
+    def test_a_vertical_video_is_pillarboxed_at_resolves_14_mbps(self):
+        spec = self._spec(width=1080, height=1920)
+        self.assertIn("zscale=w=1216:h=2160:", spec.pre_vf)
+        self.assertIn("pad=3840:2160:1312:0:", spec.pre_vf)
+        self.assertNotIn("matrixin", spec.pre_vf)                 # BT.709 tags: no colour step
+        self.assertEqual(spec.kbps, stages.youtube_render_kbps(1920))
+        self.assertEqual(spec.kbps, stages.YOUTUBE_RENDER_KBPS_4K)
+
+    def test_the_bitrate_is_exactly_what_resolve_would_export_at(self):
+        import plan, preflight, settings
+        for w, h in ((640, 480), (1280, 720), (1920, 1080), (1920, 1200), (2560, 1440),
+                     (1080, 1920), (2160, 3840), (3840, 1600)):
+            seen = {}
+
+            def boom(cmd, **kw):
+                seen["cmd"] = cmd
+                raise RuntimeError("stop here")
+            with mock.patch.object(plan, "plan_for",
+                                   return_value={"resolve": "run", "topaz": "upscale", "is_hdr": False,
+                                                 "input": {"width": w, "height": h}}), \
+                 mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+                 mock.patch.object(settings, "get_settings",
+                                   return_value=dict(settings.DEFAULT_SETTINGS)), \
+                 mock.patch.object(stages, "_source_video_kbps", return_value=8000), \
+                 mock.patch.object(stages, "_quit_resolve"), \
+                 mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+                stages.run_stage("resolve", self.p)
+                spec = self._spec("yt_1080" if 900 <= h <= 1200 else "yt_plain", width=w, height=h)
+            self.assertEqual(str(spec.kbps), seen["cmd"][6], (w, h))         # the export bitrate
+            self.assertEqual(str(spec.cap_mbps), seen["cmd"][10], (w, h))    # the render's peak gate
+
+    def test_untagged_full_range_and_pal_sources(self):
+        untagged = {"color_space": None, "color_primaries": None, "color_transfer": None,
+                    "color_range": None}
+        self.assertIn("matrixin=170m:rangein=limited:transferin=709:primariesin=170m:",
+                      self._spec(width=640, height=480, **untagged).pre_vf)        # NTSC SD
+        self.assertIn("matrixin=470bg:rangein=limited:transferin=709:primariesin=470bg:",
+                      self._spec(width=720, height=576, **untagged).pre_vf)        # PAL SD
+        self.assertNotIn("matrixin", self._spec(width=1280, height=720, **untagged).pre_vf)   # HD
+        self.assertTrue(self._spec("yt_1080", width=1920, height=1080, color_range="pc").pre_vf
+                        .startswith("zscale=matrixin=709:rangein=full:matrix=709:range=limited,"
+                                    "format=yuv444p16le,zscale=w=3840:h=2160:"))
+
+    def test_every_fit_refusal_says_why(self):
+        def refused(**info):
+            self.info = dict(dict(self.INFO, width=1920, height=1080), **info)
+            spec, why = stages.dvrender_spec(self.p, "yt_1080")
+            self.assertIsNone(spec)
+            return why
+        self.assertEqual(refused(color_transfer="smpte2084"), "the source is already HDR (smpte2084)")
+        self.assertIn("transfer is iec61966-2-1", refused(color_transfer="iec61966-2-1"))
+        self.assertIn("matrix are bt2020nc", refused(color_space="bt2020nc"))
+        self.assertIn("primaries are bt2020", refused(color_primaries="bt2020"))
+        self.assertIn("size is unknown", refused(width=0))
+        self.info = {}
+        self.assertEqual(stages.dvrender_spec(self.p, "yt_plain"), (None, "the source could not be probed"))
+
+    def test_the_no_front_end_routes_probe_and_refuse_as_before(self):
+        stages.dvrender_spec(self.p, "yt_native4k")
+        self.assertEqual(self.probes, [{}])                       # the lane's own probe, unchanged
+        self.info = dict(self.INFO, width=1920, height=1080)
+        self.assertEqual(stages.dvrender_spec(self.p, "yt_native4k")[1],
+                         "the source is 1920x1080, not 3840x2160 — route yt_native4k renders its "
+                         "frame as it is")
 
 
 class NativeRouteDecision(_DvRenderItem):
@@ -3543,11 +3655,20 @@ class NativeRouteDecision(_DvRenderItem):
 
     def test_a_route_the_stage_cannot_make_says_why(self):
         import routes, settings
-        settings.set_settings({"dv_routes": {"yt_plain": "native"}})
-        with mock.patch.object(routes, "item_route", return_value="yt_plain"):
+        settings.set_settings({"dv_routes": {"tv_disk_fallback": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="tv_disk_fallback"):
             route, spec, why = stages.native_route(self.p)
-        self.assertEqual((route, spec), ("yt_plain", None))
+        self.assertEqual((route, spec), ("tv_disk_fallback", None))
         self.assertIn("has no native render yet", why)
+
+    def test_a_fit_route_set_native_gets_its_spec(self):
+        import routes, settings
+        self.info = dict(self.INFO, width=1920, height=1080)
+        settings.set_settings({"dv_routes": {"yt_1080": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="yt_1080"):
+            route, spec, why = stages.native_route(self.p)
+        self.assertEqual((route, why), ("yt_1080", ""))
+        self.assertTrue(spec.pre_vf.startswith("zscale=w=3840:h=2160:filter=lanczos"))
 
 
 class _FakeSpec:
@@ -3710,8 +3831,24 @@ class RouteE2ETool(unittest.TestCase):
 
     def test_it_covers_exactly_the_stages_routes(self):
         t = self._tool()
-        self.assertEqual(sorted(t.KINDS), sorted(stages.DVRENDER_ROUTES))
-        self.assertEqual(t.KINDS, {"yt_native4k": "youtube", "sdr4k": "movie"})
+        # every route the stage renders from ONE file (a chunk route needs a Topaz run first,
+        # a combine two copies and a confirmed verdict)
+        self.assertEqual(sorted(t.KINDS), sorted(set(stages.DVRENDER_ROUTES)
+                                                 - set(stages.DVRENDER_CHUNK_ROUTES)
+                                                 - set(stages.DVRENDER_COMBINE_ROUTES)
+                                                 - set(stages.DVRENDER_OUTPUT_ROUTES)))
+        self.assertEqual(t.KINDS, {"yt_native4k": "youtube", "yt_plain": "youtube",
+                                   "yt_1080": "youtube", "sdr4k": "movie", "rpu_only": "movie",
+                                   "hdr_reencode": "movie", "hlg": "movie"})
+
+    def test_square_pixels_means_1_1_or_none_stated(self):
+        # 2026-10-18 review: the render / master geometry check also asks for square pixels
+        t = self._tool()
+        for sar in ("1:1", "0:1", "N/A", "", None):
+            self.assertTrue(t.square_pixels({"sample_aspect_ratio": sar}), sar)
+        self.assertTrue(t.square_pixels({}))
+        for sar in ("1215:1216", "1281:1280", "8:9", "32:27"):
+            self.assertFalse(t.square_pixels({"sample_aspect_ratio": sar}), sar)
 
     def test_it_refuses_the_live_directories(self):
         t = self._tool()
@@ -3721,3 +3858,535 @@ class RouteE2ETool(unittest.TestCase):
             with mock.patch("sys.stderr"):
                 self.assertEqual(t.main(["--source", src, "--work", work, "--route", "sdr4k"]), 2, work)
         self.assertFalse(os.path.exists(os.path.expanduser("~/topaz-scratch/e2e")))
+
+
+# ---- HDR intake on the native render (2026-10-18): rpu_only, hdr_reencode, hlg, hdr_topaz -------
+
+HDR_HAMILTON = ("G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)", "0,0")
+HDR_P3_4000 = ("G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50)", "850,210")
+
+
+class NativeRenderHdrSpec(_DvRenderItem):
+    """dvrender_spec for the HDR intake routes: no LUT; PQ as it is, HLG through the BT.2100
+    HLG -> PQ front end; the ORIGINAL's own mastering for PQ (its SEI as L6, as it stands); a
+    keep_video render for rpu_only; Resolve's export bitrate and gate; Topaz's chunks for
+    hdr_topaz. Every refusal names its reason, and Resolve then renders the item as before."""
+
+    PQ = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p10le", "r_frame_rate": "24000/1001",
+          "codec_name": "hevc", "color_primaries": "bt2020", "color_space": "bt2020nc",
+          "color_transfer": "smpte2084", "color_range": "tv"}
+
+    def setUp(self):
+        super().setUp()
+        import orchestrator
+        self.movie = orchestrator.movie_paths("Film (2020).mkv", "/Media/Movies/Film", scratch_dir=self.d)
+        for f in (self.movie.source, self.movie.source_cfr):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 64)
+        self.info = dict(self.PQ)
+        self.cfr = {"path": self.movie.source_cfr, "frames": 1000, "fps": "24000/1001"}
+        self.hdr10 = HDR_HAMILTON
+        self.hdr10_asked = []
+        for cm in (mock.patch.object(stages, "source_hdr10",
+                                     side_effect=lambda path: self.hdr10_asked.append(path) or self.hdr10),
+                   mock.patch.object(stages, "_source_video_kbps", return_value=16000)):
+            cm.start()
+            self.addCleanup(cm.stop)
+
+    def spec(self, route, p=None, **info):
+        self.info = dict(self.PQ, **info)
+        spec, why = stages.dvrender_spec(p or self.movie, route)
+        self.assertEqual(why, "")
+        return spec
+
+    def refused(self, route, p=None, **info):
+        self.info = dict(self.PQ, **info)
+        spec, why = stages.dvrender_spec(p or self.movie, route)
+        self.assertIsNone(spec)
+        return why
+
+    def test_rpu_only_is_the_sources_own_stream_with_its_own_mastering(self):
+        import dvnative
+        spec = self.spec("rpu_only")
+        self.assertEqual(spec.inputs, ((0, self.movie.source_cfr), (1000, None)))
+        self.assertEqual((spec.lut, spec.pre_vf, spec.keep_video, spec.cap_mbps),
+                         (None, None, True, 0))
+        self.assertEqual(spec.kbps, stages.EXPORT_BITRATE_FLOOR_KBPS)      # _resolve's rpu-only bitrate
+        # Hamilton's SEI says 0,0 ("unknown"): light None — measured, in L6 and the SEI (declared_light)
+        self.assertEqual((spec.master.mdcv, spec.master.max_nits, spec.light), (HDR_HAMILTON[0], 1000, None))
+        self.assertEqual(self.hdr10_asked, [self.movie.source])            # the ORIGINAL's SEI
+        self.assertEqual(self.probes, [{"extra": ("codec_name",)}])
+        self.assertEqual(spec.encode_vf(), "format=yuv420p10le")
+        self.assertEqual(spec.analysis_vf(), dvnative.analysis_vf(None))  # measured as it is
+        self.assertEqual(self.spec("rpu_only", p=self.p).keep_video, True)  # YouTube too (as _remux)
+
+    def test_a_source_that_says_unknown_has_its_light_measured(self):
+        self.assertIsNone(stages.declared_light((0, 0)))
+        self.assertIsNone(stages.declared_light(None))
+        self.assertEqual(stages.declared_light((850, 210)), (850, 210))
+        self.assertEqual(stages.declared_light((620, 0)), (620, 0))       # a level, however odd
+
+    def test_rpu_only_refusals(self):
+        self.assertIn("not HEVC Main10", self.refused("rpu_only", codec_name="av1"))
+        self.assertIn("not HEVC Main10", self.refused("rpu_only", pix_fmt="yuv420p"))
+        self.assertIn("route rpu_only takes PQ", self.refused("rpu_only", color_transfer="arib-std-b67"))
+        self.assertIn("full range", self.refused("rpu_only", color_range="pc"))
+        self.hdr10 = None
+        self.assertEqual(self.refused("rpu_only"), "the source's HDR10 metadata could not be read")
+        self.hdr10 = (HDR_HAMILTON[0].replace("L(10000000,1)", "L(10005000,1)"), "0,0")
+        self.assertIn("1000.5 nits", self.refused("rpu_only"))
+        self.hdr10 = HDR_HAMILTON
+        self.cfr = dict(self.cfr, frames=None)
+        self.assertIn("frame count or frame rate is unknown", self.refused("rpu_only"))
+
+    def test_hdr_reencode_keeps_its_frame_and_mastering_at_resolves_bitrate(self):
+        self.hdr10 = HDR_P3_4000
+        stages._write_topaz_bounds(self.movie.source_basename, [400, 1000])
+        for w, h in ((3840, 2160), (3840, 1600), (4096, 2160)):
+            spec = self.spec("hdr_reencode", width=w, height=h, codec_name="av1")
+            self.assertEqual((spec.keep_video, spec.lut, spec.pre_vf, spec.cap_mbps), (False, None, None, 0))
+            self.assertEqual(spec.kbps, stages.EXPORT_BITRATE_FLOOR_KBPS)  # max(16000, the floor)
+            self.assertEqual((spec.master.max_nits, spec.master.l6_min, spec.light), (4000, 50, (850, 210)))
+            self.assertEqual(spec.bounds, (400, 1000))
+        with mock.patch.object(stages, "_source_video_kbps", return_value=90000):
+            self.assertEqual(self.spec("hdr_reencode", codec_name="h264", pix_fmt="yuv420p").kbps, 90000)
+        self.assertIn("larger than 4096x2176", self.refused("hdr_reencode", width=5120, height=2160))
+        self.assertIn("route hdr_reencode takes PQ", self.refused("hdr_reencode", color_transfer="bt709"))
+        self.assertIn("primaries are bt709", self.refused("hdr_reencode", color_primaries="bt709"))
+
+    def test_a_youtube_hdr_video_renders_at_3840x2160_under_the_gate_or_stays_on_resolve(self):
+        spec = self.spec("hdr_reencode", p=self.p, codec_name="vp9")
+        self.assertEqual((spec.kbps, spec.cap_mbps), (stages.youtube_render_kbps(2160), 50))
+        self.assertEqual(spec.inputs, ((0, self.p.source_cfr), (1000, None)))
+        for w, h in ((1920, 1080), (3840, 1600)):
+            self.assertIn("no HDR fit front end yet", self.refused("hdr_reencode", p=self.p, width=w, height=h))
+            self.assertIn("no HDR fit front end yet",
+                          self.refused("hlg", p=self.p, width=w, height=h, color_transfer="arib-std-b67"))
+
+    def test_hlg_is_converted_to_pq_on_the_1000_nit_master(self):
+        import dvnative
+        spec = self.spec("hlg", color_transfer="arib-std-b67")
+        self.assertEqual(spec.pre_vf, dvnative.hlg_to_pq_vf())
+        self.assertEqual((spec.master, spec.light, spec.keep_video), (dvnative.DEFAULT_MASTER, None, False))
+        self.assertEqual(self.hdr10_asked, [])                             # HLG has no mastering to keep
+        self.assertEqual(spec.encode_vf(), dvnative.hlg_to_pq_vf() + ",format=yuv420p10le")
+        self.assertTrue(spec.analysis_vf().startswith(dvnative.hlg_to_pq_vf() + ",scale=1920:1080"))
+        self.assertIn("route hlg takes HLG", self.refused("hlg"))
+
+    def test_hdr_topaz_renders_topazs_chunks(self):
+        import dvnative, nativelane
+        chunks = [[0, os.path.join(self.d, "c0.mov")], [600, os.path.join(self.d, "c1.mov")], [998, None]]
+        with mock.patch.object(nativelane, "chunks", return_value=chunks) as ch:
+            spec = self.spec("hdr_topaz")
+            ch.assert_called_once_with(self.movie.segdir, expected=1000)
+            self.assertEqual(spec.inputs, tuple(tuple(c) for c in chunks))
+            self.assertEqual((spec.single, spec.bounds, spec.keep_video, spec.lut), (False, None, False, None))
+            self.assertEqual((spec.light, spec.master.mdcv), (None, HDR_HAMILTON[0]))   # 0,0 -> measured
+            self.assertEqual((spec.kbps, spec.cap_mbps), (stages.EXPORT_BITRATE_FLOOR_KBPS, 0))
+            self.assertEqual(self.probes, [{"extra": ("codec_name",)}])
+            hlg = self.spec("hdr_topaz", color_transfer="arib-std-b67")
+            self.assertEqual((hlg.pre_vf, hlg.master), (dvnative.hlg_to_pq_vf(), dvnative.DEFAULT_MASTER))
+            self.assertIn("chunk 0 runs at 25/1", self.refused("hdr_topaz", r_frame_rate="25/1"))
+            self.assertIn("takes PQ or HLG", self.refused("hdr_topaz", color_transfer="bt709"))
+        with mock.patch.object(nativelane, "chunks", side_effect=ValueError("chunk 1 (c1.mov) is missing")):
+            self.assertEqual(self.refused("hdr_topaz"), "the Topaz chunks: chunk 1 (c1.mov) is missing")
+
+    def test_the_bitrate_is_what_resolve_would_export_at(self):
+        import plan, preflight, settings
+        cases = (("rpu_only", self.movie, {"topaz": "rpu-only", "resolve": "add_dv", "is_hdr": True}, {}),
+                 ("rpu_only", self.p, {"topaz": "rpu-only", "resolve": "add_dv", "is_hdr": True}, {}),
+                 ("hdr_reencode", self.movie, {"topaz": "resolve-only", "resolve": "add_dv", "is_hdr": True},
+                  {"codec_name": "av1"}),
+                 ("hlg", self.movie, {"topaz": "resolve-only", "resolve": "add_dv", "is_hdr": True},
+                  {"color_transfer": "arib-std-b67"}),
+                 ("hdr_reencode", self.p, {"topaz": "upscale", "resolve": "add_dv", "is_hdr": True},
+                  {"codec_name": "vp9"}))
+        for route, p, pl, info in cases:
+            seen = {}
+
+            def boom(cmd, **kw):
+                seen["cmd"] = cmd
+                raise RuntimeError("stop here")
+            with self.subTest(route=route, youtube=p.youtube), \
+                 mock.patch.object(plan, "plan_for", return_value=dict(pl, input={"width": 3840, "height": 2160})), \
+                 mock.patch.object(preflight, "chosen_host", return_value=(None, "test")), \
+                 mock.patch.object(settings, "get_settings", return_value=dict(settings.DEFAULT_SETTINGS)), \
+                 mock.patch.object(stages, "_quit_resolve"), \
+                 mock.patch.object(stages.subprocess, "Popen", side_effect=boom):
+                stages.run_stage("resolve", p)
+                spec = self.spec(route, p=p, **info)
+                self.assertEqual(str(spec.kbps), seen["cmd"][6])          # the export bitrate
+                if not spec.keep_video:                                   # (a kept stream has no gate)
+                    self.assertEqual(str(spec.cap_mbps or "-"), seen["cmd"][10])
+
+    def test_it_probes_and_writes_nothing(self):
+        before = sorted(os.listdir(self.d))
+        for route in ("rpu_only", "hdr_reencode"):
+            self.spec(route)
+        self.assertEqual(sorted(os.listdir(self.d)), before)
+
+    def test_a_route_set_native_gets_its_hdr_spec_and_nothing_is_asked_while_none_is(self):
+        import routes, settings
+        settings.set_settings({"dv_routes": {}})
+        with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")):
+            self.assertEqual(stages.native_route(self.movie), (None, None, ""))
+        self.assertEqual((self.probes, self.hdr10_asked), ([], []))
+        settings.set_settings({"dv_routes": {"rpu_only": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="rpu_only"):
+            route, spec, why = stages.native_route(self.movie)
+        self.assertEqual((route, why, spec.keep_video), ("rpu_only", "", True))
+
+
+class SourceHdr10(unittest.TestCase):
+    """source_hdr10 reads the HDR10 SEI off the FIRST frame only (no packet count)."""
+
+    def _run(self, out, rc=0):
+        r = mock.Mock(returncode=rc, stdout=out)
+        with mock.patch.object(stages.subprocess, "run", return_value=r) as run:
+            got = stages.source_hdr10("/x/src.mkv")
+        self.assertIn("%+#1", run.call_args.args[0])
+        self.assertNotIn("-count_packets", run.call_args.args[0])
+        return got
+
+    def test_reads_both_values_or_none(self):
+        import json
+        frame = {"frames": [{"side_data_list": [
+            {"side_data_type": "Mastering display metadata", "red_x": "35400/50000", "red_y": "14600/50000",
+             "green_x": "8500/50000", "green_y": "39850/50000", "blue_x": "6550/50000", "blue_y": "2300/50000",
+             "white_point_x": "15635/50000", "white_point_y": "16450/50000",
+             "min_luminance": "1/10000", "max_luminance": "10000000/10000"},
+            {"side_data_type": "Content light level metadata", "max_content": 0, "max_average": 0}]}]}
+        self.assertEqual(self._run(json.dumps(frame)), HDR_HAMILTON)
+        self.assertEqual(self._run(json.dumps({"frames": [{}]})), (None, None))   # no SEI at all
+        self.assertIsNone(self._run(json.dumps({"frames": []})))                   # unreadable
+        self.assertIsNone(self._run("", rc=1))
+
+
+class NativeRenderSdrChunkSpec(_DvRenderItem):
+    """dvrender_spec for the SDR Topaz chunk routes (2026-10-18): movie_sdr_topaz, and
+    sd_sdr_topaz when the chunk lane declined it. Topaz's chunks, the chunk front end (chunk 0's
+    tags; untagged, the source's frame), the pinned LUT, Resolve's 'episode' export bitrate with no
+    gate — and the chunks drop at hand-off as Resolve's did, so the movie disk model holds."""
+
+    SUNNY = {"width": 2880, "height": 2160, "pix_fmt": "yuv422p10le", "r_frame_rate": "24000/1001",
+             "sample_aspect_ratio": "1:1", "color_primaries": "smpte170m", "color_space": "smpte170m",
+             "color_transfer": "smpte170m"}
+    HD = {"width": 3840, "height": 2160, "pix_fmt": "yuv422p10le", "r_frame_rate": "24000/1001",
+          "sample_aspect_ratio": "1:1", "color_primaries": "bt709", "color_space": "bt709",
+          "color_transfer": "bt709"}
+
+    def setUp(self):
+        super().setUp()
+        import nativelane, orchestrator
+        self.movie = orchestrator.movie_paths("Film (1999).mkv", "/Media/Movies/Film", scratch_dir=self.d)
+        self.ep = episode_paths("Show", "S02E06", "Show - 2x06.mkv", scratch_dir=self.d)
+        for p in (self.movie, self.ep):
+            for f in (p.source, p.source_cfr):
+                with open(f, "wb") as fh:
+                    fh.write(b"x" * 64)
+        self.cfr = {"path": self.movie.source_cfr, "frames": 1000, "fps": "24000/1001"}
+        self.chunk = dict(self.HD)
+        self.source = {"width": 1920, "height": 1080}
+        self.asked = []
+
+        def probe(path, **kw):
+            self.asked.append((os.path.basename(path), kw))
+            return dict(self.source if path.endswith(("_cfr.mkv", "_cfr.mp4")) else self.chunk)
+        self.chunks = [[0, os.path.join(self.d, "seg_0000.mov")],
+                       [600, os.path.join(self.d, "seg_0001.mov")], [998, None]]
+        for cm in (mock.patch.object(nativelane, "probe_stream", side_effect=probe),
+                   mock.patch.object(nativelane, "chunks", side_effect=lambda *a, **k: [list(c) for c in self.chunks]),
+                   mock.patch.object(stages, "_source_video_kbps", return_value=9000)):
+            cm.start()
+            self.addCleanup(cm.stop)
+
+    def test_an_hd_movie_renders_its_chunks_through_the_lut_alone(self):
+        spec, why = stages.dvrender_spec(self.movie, "movie_sdr_topaz")
+        self.assertEqual(why, "")
+        self.assertEqual(spec.inputs, tuple(tuple(c) for c in self.chunks))
+        self.assertEqual((spec.single, spec.lut, spec.pre_vf, spec.bounds), (False, self.cube, None, None))
+        self.assertEqual((spec.kbps, spec.cap_mbps), (stages.EXPORT_BITRATE_FLOOR_KBPS, 0))
+        self.assertEqual((spec.master, spec.light, spec.keep_video), (stages_dvnative().DEFAULT_MASTER, None, False))
+        self.assertEqual(self.asked[0], ("seg_0000.mov", {"extra": ("sample_aspect_ratio",)}))
+        with mock.patch.object(stages, "_source_video_kbps", return_value=80000) as kb:
+            self.assertEqual(stages.dvrender_spec(self.movie, "movie_sdr_topaz")[0].kbps, 80000)
+        kb.assert_called_once_with(self.movie.source)              # the ORIGINAL, as _resolve reads
+
+    def test_a_480p_dvd_film_gets_the_601_front_end(self):
+        dvn = stages_dvnative()
+        self.chunk, self.source = dict(self.SUNNY), {"width": 640, "height": 480}
+        pillar = dvn.fit_pad_vf(2880, 2160, "1:1")              # 4:3 SD pillarboxed, as Resolve did
+        spec, why = stages.dvrender_spec(self.movie, "movie_sdr_topaz")
+        self.assertEqual(spec.pre_vf, dvn.colour_vf("170m", "170m") + "," + pillar)
+        self.assertEqual(spec.encode_vf(),
+                         dvn.colour_vf("170m", "170m") + "," + pillar + "," + dvn.lut_vf(self.cube))
+        self.chunk = {k: v for k, v in self.SUNNY.items() if not k.startswith("color_")}   # untagged
+        self.assertEqual(stages.dvrender_spec(self.movie, "movie_sdr_topaz")[0].pre_vf,
+                         dvn.colour_vf("170m", "170m") + "," + pillar)   # judged by the source's frame
+        self.chunk = dict(self.SUNNY, width=3240, sample_aspect_ratio="8:9")
+        vf = stages.dvrender_spec(self.movie, "movie_sdr_topaz")[0].pre_vf
+        self.assertTrue(vf.endswith("," + dvn.fit_pad_vf(3240, 2160, "8:9")), vf)   # squared, then the pillar
+        self.assertIn(",setsar=1,", vf)
+
+    def test_sd_tv_renders_only_what_the_chunk_lane_left_to_it(self):
+        import nativelane
+        self.chunk, self.source = dict(self.SUNNY), {"width": 640, "height": 480}
+        spec, why = stages.dvrender_spec(self.ep, "sd_sdr_topaz")
+        self.assertEqual(why, "")
+        dvn = stages_dvnative()
+        self.assertEqual(spec.pre_vf, dvn.colour_vf("170m", "170m") + "," + dvn.fit_pad_vf(2880, 2160, "1:1"))
+        os.makedirs(nativelane.native_dir(self.ep), exist_ok=True)
+        with open(nativelane.fallback_path(self.ep), "w") as fh:
+            fh.write("{}")
+        spec, why = stages.dvrender_spec(self.ep, "sd_sdr_topaz")
+        self.assertIsNone(spec)
+        self.assertIn("fell back", why)
+        os.remove(nativelane.fallback_path(self.ep))
+        with open(nativelane.marker_path(self.ep), "w") as fh:
+            fh.write("{}")
+        self.assertIn("claimed", stages.dvrender_spec(self.ep, "sd_sdr_topaz")[1])
+
+    def test_refusals_say_why(self):
+        import nativelane
+
+        def refused(**kw):
+            spec, why = stages.dvrender_spec(self.movie, "movie_sdr_topaz")
+            self.assertIsNone(spec)
+            return why
+        self.chunk = dict(self.HD, color_transfer="smpte2084")
+        self.assertIn("Topaz's chunk 0: the source is already HDR", refused())
+        self.chunk = dict(self.HD, r_frame_rate="24/1")
+        self.assertIn("Topaz's chunk 0 runs at 24/1", refused())
+        self.chunk = dict(self.HD)
+        with mock.patch.object(nativelane, "chunks", side_effect=ValueError("chunk 1 is missing")):
+            self.assertEqual(refused(), "the Topaz chunks: chunk 1 is missing")
+        self.cfr = dict(self.cfr, fps=None)
+        self.assertIn("frame count or frame rate is unknown", refused())
+        self.cfr = dict(self.cfr, fps="24000/1001")
+        self.toolchain = (False, "dovi_tool is 2.2.0")
+        self.assertIn("toolchain is not ready", refused())
+
+    def test_nothing_is_probed_while_its_route_is_resolve(self):
+        import routes, settings
+        settings.set_settings({"dv_routes": {}})
+        with mock.patch.object(routes, "item_route", side_effect=AssertionError("classified")):
+            self.assertEqual(stages.native_route(self.movie), (None, None, ""))
+        self.assertEqual(self.asked, [])
+        settings.set_settings({"dv_routes": {"movie_sdr_topaz": "native"}})
+        with mock.patch.object(routes, "item_route", return_value="movie_sdr_topaz"):
+            route, spec, why = stages.native_route(self.movie)
+        self.assertEqual((route, why), ("movie_sdr_topaz", ""))
+        self.assertIsNotNone(spec)
+
+
+def stages_dvnative():
+    import dvnative
+    return dvnative
+
+
+class NativeRenderCombineSpec(_DvRenderItem):
+    """dvrender_spec for combine_nodv (2026-10-18): the verdict WINNER measured as rpu_only
+    measures its source — no LUT, the winner's own mastering, its own coded video kept (HEVC
+    Main10) or a VideoToolbox encode at the floor Resolve's combine export used. No CFR."""
+
+    def setUp(self):
+        super().setUp()
+        import nativelane, orchestrator, topaz
+        self.combine = orchestrator.movie_paths("Film (2020) REMUX.mkv", "/Media/Movies/Film",
+                                                scratch_dir=self.d)
+        self.combine.combine = True
+        self.winner = os.path.join(self.d, "Film (2020) WEB.mkv")
+        with open(self.winner, "wb") as fh:
+            fh.write(b"w" * 64)
+        self.info = dict(NativeRenderHdrSpec.PQ)
+        self.frames, self.fps = 5000, "24000/1001"
+        self.hdr10 = HDR_HAMILTON
+        for cm in (mock.patch.object(orchestrator, "combine_winner_path", side_effect=lambda p: self.winner),
+                   mock.patch.object(topaz, "_frame_count", side_effect=lambda path, **k: self.frames),
+                   mock.patch.object(nativelane, "fps_fraction", side_effect=lambda path: self.fps),
+                   mock.patch.object(stages, "source_hdr10", side_effect=lambda path: self.hdr10),
+                   mock.patch.object(nativelane, "cfr_info", side_effect=AssertionError("a combine has no CFR"))):
+            cm.start()
+            self.addCleanup(cm.stop)
+
+    def test_a_hevc_main10_winner_keeps_its_own_video(self):
+        spec, why = stages.dvrender_spec(self.combine, "combine_nodv")
+        self.assertEqual(why, "")
+        self.assertEqual(spec.inputs, ((0, self.winner), (5000, None)))
+        self.assertEqual((spec.keep_video, spec.lut, spec.pre_vf, spec.cap_mbps, spec.fps),
+                         (True, None, None, 0, "24000/1001"))
+        self.assertEqual(spec.kbps, stages.EXPORT_BITRATE_FLOOR_KBPS)
+        self.assertEqual((spec.master.mdcv, spec.light), (HDR_HAMILTON[0], None))   # 0,0 -> measured
+        self.assertFalse(os.path.exists(self.combine.source_cfr))           # never needed one
+
+    def test_another_pq_codec_is_encoded_at_the_floor(self):
+        self.info = dict(NativeRenderHdrSpec.PQ, codec_name="av1")
+        self.hdr10 = HDR_P3_4000
+        spec, why = stages.dvrender_spec(self.combine, "combine_nodv")
+        self.assertEqual((spec.keep_video, spec.kbps, spec.light), (False, stages.EXPORT_BITRATE_FLOOR_KBPS, (850, 210)))
+        self.assertEqual(spec.master.max_nits, 4000)
+
+    def test_refusals_say_why(self):
+        def refused():
+            spec, why = stages.dvrender_spec(self.combine, "combine_nodv")
+            self.assertIsNone(spec)
+            return why
+        self.info = dict(NativeRenderHdrSpec.PQ, color_transfer="bt709")
+        self.assertIn("not PQ", refused())
+        self.info = dict(NativeRenderHdrSpec.PQ, color_range="pc")
+        self.assertIn("full range", refused())
+        self.info = dict(NativeRenderHdrSpec.PQ, codec_name="av1", width=5120)
+        self.assertIn("larger than 4096x2176", refused())
+        self.info = dict(NativeRenderHdrSpec.PQ)
+        self.frames = -1
+        self.assertIn("frame count or frame rate is unknown", refused())
+        self.frames = 5000
+        self.hdr10 = None
+        self.assertIn("HDR10 metadata could not be read", refused())
+        self.hdr10 = HDR_HAMILTON
+        self.winner = os.path.join(self.d, "gone.mkv")
+        self.assertIn("winner is not on disk", refused())
+        self.toolchain = (False, "dovi_tool is 2.2.0")
+        self.assertIn("toolchain is not ready", refused())
+
+
+class NativeRenderSdrOutSpec(_DvRenderItem):
+    """dvrender_spec for sdr_out (2026-10-18): the item's unpinned route says what its picture is;
+    it renders as that route's picture with NO LUT into the SDR render (sdr spec), at that route's
+    export bitrate and gate. HDR and combines refuse."""
+
+    def setUp(self):
+        super().setUp()
+        import orchestrator
+        self.base = "yt_plain"
+        self.asked = []
+        self.movie = orchestrator.movie_paths("Film (1999).mkv", "/Media/Movies/Film", scratch_dir=self.d)
+        for f in (self.movie.source, self.movie.source_cfr):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 64)
+        import routes
+        for cm in (mock.patch.object(routes, "item_route",
+                                     side_effect=lambda p, mode=None: self.asked.append(mode) or self.base),
+                   mock.patch.object(stages, "_source_video_kbps", return_value=9000)):
+            cm.start()
+            self.addCleanup(cm.stop)
+
+    def test_a_youtube_video_takes_the_fit_front_end_and_its_gate(self):
+        import dvnative
+        self.info = dict(self.INFO, width=640, height=480, color_space="smpte170m",
+                         color_primaries="smpte170m", color_transfer="smpte170m")
+        spec, why = stages.dvrender_spec(self.p, "sdr_out")
+        self.assertEqual(why, "")
+        self.assertEqual(self.asked, ["dv1000"])                        # named as if unpinned
+        self.assertEqual((spec.sdr, spec.lut, spec.keep_video), (True, None, False))
+        self.assertEqual(spec.pre_vf, dvnative.fit_front_end(self.info, stages.DVRENDER_SIZE))
+        self.assertEqual((spec.kbps, spec.cap_mbps), (stages.youtube_render_kbps(480), 50))
+        self.assertTrue(spec.encode_vf().endswith(",format=yuv420p10le"))
+        self.assertNotIn("lut3d", spec.encode_vf())
+
+    def test_4k_sdr_keeps_its_frame_through_the_colour_step(self):
+        self.base = "sdr4k"
+        spec, why = stages.dvrender_spec(self.movie, "sdr_out")
+        self.assertEqual((spec.pre_vf, spec.kbps, spec.cap_mbps, spec.sdr),
+                         (None, stages.EXPORT_BITRATE_FLOOR_KBPS, 0, True))   # BT.709 already
+        self.info = dict(self.INFO, color_range="pc")
+        self.assertIn("rangein=full", stages.dvrender_spec(self.movie, "sdr_out")[0].pre_vf)
+
+    def test_a_topaz_route_renders_its_chunks_without_the_lut(self):
+        import nativelane
+        self.base = "movie_sdr_topaz"
+        chunks = [[0, os.path.join(self.d, "seg_0000.mov")], [500, os.path.join(self.d, "seg_0001.mov")],
+                  [998, None]]
+        self.cfr = dict(self.cfr, fps="30000/1001")
+        with mock.patch.object(nativelane, "chunks", return_value=[list(c) for c in chunks]):
+            spec, why = stages.dvrender_spec(self.movie, "sdr_out")
+        self.assertEqual(why, "")
+        self.assertEqual((spec.sdr, spec.lut, spec.single, spec.cap_mbps), (True, None, False, 0))
+        self.assertEqual(spec.inputs, tuple(tuple(c) for c in chunks))
+
+    def test_hdr_and_combines_refuse(self):
+        for base, words in (("rpu_only", "tone map"), ("hdr_topaz", "tone map"),
+                            ("combine_nodv", "combine ships Dolby Vision"), ("already_dv", "no SDR render"),
+                            (None, "route unknown")):
+            with self.subTest(base=base):
+                self.base = base
+                spec, why = stages.dvrender_spec(self.movie, "sdr_out")
+                self.assertIsNone(spec)
+                self.assertIn(words, why)
+
+
+class SdrOutRemux(_DvRenderItem):
+    """stages._remux: an SDR render the native render vouches for (nativerender.sdr_render_ok)
+    becomes the SDR master (sdr=True on the remux call) while the item still ships as SDR
+    (orchestrator.ships_as_sdr); without that proof every call is the DV one, with no `sdr`
+    keyword at all; and a proofed SDR render of an item that now ships as DV is refused."""
+
+    def _remux(self, proof, pinned=True):
+        import types, remux, nativerender, settings
+        got, results = {}, {}
+
+        def fake(name):
+            def f(*a, **kw):
+                got[name] = kw
+                return types.SimpleNamespace(ok=True, reason="shipped")
+            return f
+        import orchestrator
+        for key in ("Chan", "Film (1999)"):  # pinned to SDR: the paths are built under SDR_TAG;
+            settings.set_show_output_mode(key, "sdr" if pinned else "auto")      # else DV_TAG
+        orchestrator.relabel_container(self.p, ".mp4")           # what a resume does
+        movie = orchestrator.movie_paths("Film (1999).mkv", "/Media/Movies/Film", scratch_dir=self.d)
+        for q in (self.p, movie):
+            self.assertEqual(orchestrator.ships_as_sdr(q), pinned, q.final)
+        for f in (movie.source, movie.source_cfr):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 64)
+        for q in (self.p, movie):            # the proof file the remux looks for before anything
+            os.makedirs(q.dv_render + ".dvrender", exist_ok=True)
+            with open(q.dv_render + ".dvrender/sdr.json", "w") as fh:
+                fh.write("{}")
+        with mock.patch.object(nativerender, "sdr_render_ok", return_value=proof), \
+             mock.patch.object(remux, "remux", side_effect=fake("remux")), \
+             mock.patch.object(remux, "remux_ship_render", side_effect=fake("ship")), \
+             mock.patch("plan.plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": 0}):
+            results["youtube"] = stages.run_stage("remux", self.p, progress=lambda d: None)
+            results["movie"] = stages.run_stage("remux", movie, progress=lambda d: None)
+        self.results = results
+        return got
+
+    def test_the_proof_makes_the_sdr_master(self):
+        got = self._remux(True)
+        self.assertEqual(got["ship"].get("sdr"), True)
+        self.assertEqual(got["remux"].get("sdr"), True)
+
+    def test_without_it_nothing_changes(self):
+        for pinned in (True, False):
+            with self.subTest(pinned=pinned):
+                got = self._remux(False, pinned)
+                self.assertNotIn("sdr", got["ship"])
+                self.assertNotIn("sdr", got["remux"])
+
+    def test_a_proofed_sdr_render_of_an_item_that_now_ships_as_dv_is_refused(self):
+        # 2026-10-18 review: pinned SDR, rendered SDR, then unpinned and resumed under the DV name
+        # — the finisher's remux never asks stage_done("resolve"), so this is the last gate before
+        # an SDR master named '... HDR10 DV upscaled' would have been made and uploaded
+        got = self._remux(True, pinned=False)
+        self.assertEqual(got, {})                                   # no remux call of any kind
+        for kind in ("youtube", "movie"):
+            ok, msg = self.results[kind]
+            self.assertFalse(ok, kind)
+            self.assertIn("now ships as Dolby Vision", msg)
+
+    def test_no_proof_file_never_imports_or_asks(self):
+        import types, remux, nativerender, settings
+        got = {}
+        with mock.patch.object(nativerender, "sdr_render_ok", side_effect=AssertionError("asked")), \
+             mock.patch.object(remux, "remux_ship_render",
+                               side_effect=lambda *a, **kw: got.update(kw) or types.SimpleNamespace(ok=True, reason="ok")), \
+             mock.patch("plan.plan_for", return_value={"topaz": "upscale"}), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": 0}):
+            self.assertEqual(stages.run_stage("remux", self.p, progress=lambda d: None), (True, "ok"))
+        self.assertNotIn("sdr", got)
+

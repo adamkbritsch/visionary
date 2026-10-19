@@ -2054,17 +2054,13 @@ private struct TVMode: View {
 private struct LockedSettingsLine: View {
     let preset: String
     let isDefaultPreset: Bool
-    let output: String            // the RESOLVED range (dv1000 / dv2000 / sdr)
+    let output: String            // the RESOLVED range (dv1000 / sdr)
     let normalized: Bool
     let replaces: Bool
     var extending: Bool = false   // 4:3 show with border extension ON (hidden otherwise)
 
     private var outputLabel: String {
-        switch output {
-        case "sdr":    return "SDR"
-        case "dv2000": return "Dolby Vision 2000 nits"
-        default:       return "Dolby Vision 1000 nits"
-        }
+        output == "sdr" ? "SDR" : "Dolby Vision 1000 nits"
     }
 
     var body: some View {
@@ -2485,13 +2481,13 @@ private struct ReplaceSourceRow: View {
     }
 }
 
-// Per-item "Output range" row (shows, movies, YouTube channels): what Resolve DELIVERS.
+// Per-item "Output range" row (shows, movies, YouTube channels): what the item DELIVERS.
 // AUTO is the default and ALWAYS produces 1000-nit Dolby Vision, whatever the intake
-// range (user-dictated 2026-08-09: 2000-nit is MANUAL-ONLY — it stays in the picker but
-// nothing selects it automatically). Auto never yields a non-DV master either — SDR is
-// also a manual choice. The three explicit values PIN the output regardless of what came
-// in. Same preset-style shape as the rows above; the confirm sheet lists the ones you
-// aren't on.
+// range (user-dictated 2026-08-09). Auto never yields a non-DV master — SDR is a manual
+// choice. The two explicit values PIN the output regardless of what came in. The 2000-nit
+// target is RETIRED (user decision 2026-10-15): it is no longer offered, and the engine
+// reads a pin still holding it as 1000 nits. Same preset-style shape as the rows above;
+// the confirm sheet lists the one you aren't on.
 private struct OutputModeRow: View {
     @EnvironmentObject var store: AppStore
     let key: String
@@ -2500,13 +2496,9 @@ private struct OutputModeRow: View {
     let effective: String
     @State private var confirming = false
 
-    private static let modes = ["dv1000", "dv2000", "sdr"]
+    private static let modes = ["dv1000", "sdr"]
     private static func label(_ m: String) -> String {
-        switch m {
-        case "sdr":    return "SDR"
-        case "dv2000": return "Dolby Vision 2000 nits"
-        default:       return "Dolby Vision 1000 nits"
-        }
+        m == "sdr" ? "SDR" : "Dolby Vision 1000 nits"
     }
     private var current: String { Self.modes.contains(effective) ? effective : "dv1000" }
 
@@ -2519,9 +2511,8 @@ private struct OutputModeRow: View {
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(DS.steel)
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(RoundedRectangle(cornerRadius: DS.radiusChip, style: .continuous).fill(Color.white.opacity(0.07)))
-                .help("What Resolve masters this as. Left alone everything masters to "
-                      + "1000-nit Dolby Vision; the 2000-nit target and SDR are manual "
-                      + "choices only.")
+                .help("What this masters as. Left alone everything masters to "
+                      + "1000-nit Dolby Vision; SDR is a manual choice only.")
             Button("Change") { confirming = true }
                 .buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundStyle(Color.brand)
             Spacer()
@@ -2536,10 +2527,10 @@ private struct OutputModeRow: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Left alone, every item masters to 1000-nit Dolby Vision — the 2000-nit "
-                 + "target is never chosen automatically. Picking a value pins it whatever "
-                 + "the source is. SDR masters are named differently from Dolby Vision ones, "
-                 + "so anything already finished keeps the range it shipped with.")
+            Text("Left alone, every item masters to 1000-nit Dolby Vision. Picking a value "
+                 + "pins it whatever the source is. SDR masters are named differently from "
+                 + "Dolby Vision ones, so anything already finished keeps the range it "
+                 + "shipped with.")
         }
     }
 }

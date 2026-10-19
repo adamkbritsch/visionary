@@ -1350,7 +1350,7 @@ def queue_view() -> dict:
                       # per-channel loudness-boost gate — keyed by FOLDER like the preset
                       # (= p.series at the remux stage for YouTube items)
                       "normalize_audio": settings.get_show_normalize_audio(folder or ""),
-                      # per-channel output range (auto / sdr / dv1000 / dv2000), same key
+                      # per-channel output range (auto / sdr / dv1000; dv2000 retired), same key
                       "output_mode": settings.get_show_output_mode(folder or ""),
                       # youtarr's downloads are SDR, so auto always means the 1000-nit ceiling
                       "output_mode_effective": settings.effective_output_mode(folder or "", False),

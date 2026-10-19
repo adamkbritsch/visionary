@@ -30,7 +30,6 @@ after the CFR stage, and stages.native_route reads it to send a route set 'nativ
                      1440p, vertical, unprobed)
   combine_rpu        companion combine, either copy has real DV        Resolve-free
   combine_nodv       companion combine, neither copy has DV            Resolve analyses the winner
-  dv2000             any Resolve-rendered item pinned to 2000 nits     the DV2000 project
   sdr_out            any Resolve-rendered item pinned to SDR           the SDR project
   already_dv         the source is already Dolby Vision                refused; Resolve-free
   dvp7               DV profile 7 (the dvlane conversion)              Resolve-free
@@ -41,6 +40,11 @@ item for every route that renders through Resolve (stages._resolve renders every
 in the pinned project); rpu-only outranks YouTube (stages._remux tests it first); and HDR
 outranks the yt_* split, because every yt_* engine will run the BT.709 SDR LUT — a YouTube
 video in PQ or HLG (none so far) must never be named into one.
+
+THE 2000-NIT MODE IS RETIRED (user decision 2026-10-15, built 2026-10-18): there is no dv2000
+route any more. settings reads a profile still pinned to "dv2000" as "dv1000", and
+normalize_mode does the same with anything it is handed — so such an item is named by its kind,
+exactly like an unpinned one, and takes that route's engine.
 """
 from __future__ import annotations
 import os
@@ -61,7 +65,6 @@ ROUTES = {
     "yt_plain": "YouTube, plain fit (480p/720p/1440p/vertical)",
     "combine_rpu": "companion combine with a real DV RPU (Resolve-free)",
     "combine_nodv": "companion combine, neither copy has DV",
-    "dv2000": "pinned to the 2000-nit DV output",
     "sdr_out": "pinned to the SDR output",
     "already_dv": "already Dolby Vision (refused, Resolve-free)",
     "dvp7": "DV profile 7 -> 8.1 lane (Resolve-free)",
@@ -69,7 +72,7 @@ ROUTES = {
 UNKNOWN = "unknown"             # the facts do not name a route (no plan, no combine verdict)
 RESOLVE_FREE = frozenset(("combine_rpu", "already_dv", "dvp7"))   # no Resolve on any setting
 
-MODES = ("sdr", "dv1000", "dv2000")   # = settings.OUTPUT_MODES without "auto" (test-pinned)
+MODES = ("sdr", "dv1000")             # = settings.OUTPUT_MODES without "auto" (test-pinned)
 HLG = "arib-std-b67"                  # plan.HDR_TRANSFERS' HLG member (test-pinned)
 TV_LANE_RES = ("720p", "1080p")       # = nativelane.ELIGIBLE_RES (test-pinned)
 SD_RES = "480p"                       # plan.resolution_bucket's SD bucket (480p and 576p)
@@ -87,7 +90,8 @@ def describe(route) -> str:
 
 def normalize_mode(mode) -> str:
     """The output mode stages._resolve renders in: a real mode as given, anything else
-    ("auto", None, junk) dv1000 — the same rule as settings.effective_output_mode."""
+    ("auto", None, junk, the retired "dv2000") dv1000 — the same rule as
+    settings.effective_output_mode."""
     return mode if mode in MODES else "dv1000"
 
 
@@ -167,7 +171,7 @@ def _classify(p, plan, mode, facts) -> str:
             return UNKNOWN
         if verdict.get("rpu_from") != "resolve":
             return "combine_rpu"
-        return {"dv2000": "dv2000", "sdr": "sdr_out"}.get(mode, "combine_nodv")
+        return "sdr_out" if mode == "sdr" else "combine_nodv"
 
     # ALREADY DOLBY VISION: never rendered (a profile 7 has a lane of its own).
     major = _dv_major(facts.get("dv_profile"))
@@ -180,9 +184,7 @@ def _classify(p, plan, mode, facts) -> str:
     if topaz not in ("upscale", "rpu-only", "resolve-only"):
         return UNKNOWN                  # no plan (or one this table does not know)
 
-    # A PIN renders every remaining route in another Resolve project.
-    if mode == "dv2000":
-        return "dv2000"
+    # A PIN renders every remaining route in another Resolve project (SDR: the only pin left).
     if mode == "sdr":
         return "sdr_out"
 
@@ -215,13 +217,15 @@ def output_mode(p) -> str:
     return normalize_mode(settings.get_show_output_mode(stages._settings_scope(p)))
 
 
-def item_route(p):
+def item_route(p, mode=None):
     """classify() for a live item whose source (and CFR) are on disk, with the facts read the
     way the stages read them: the ORIGINAL source's plan (plan_for's probe and plan, minus its
     probe-cache write — this changes nothing), the output mode, and a combine's confirmed
     verdict. None when the source is not local yet, or anything at all goes wrong: it NEVER
     raises (its caller is a log line). The disk fallback is never reported here — the lane
-    asks about disk only after Topaz, long after this runs."""
+    asks about disk only after Topaz, long after this runs. `mode` names the item under that
+    output mode instead of its own (stages' sdr_out asks "dv1000": what kind of item a pinned
+    one is underneath — its route had it not been pinned)."""
     try:
         src = getattr(p, "source", None)
         if not src or not os.path.exists(src):
@@ -235,6 +239,6 @@ def item_route(p):
             import companion
             cv = companion.confirmed_verdict(p.source_basename)
             facts["verdict"] = cv.get("verdict") if isinstance(cv, dict) else None
-        return classify(p, pl, output_mode(p), facts)
+        return classify(p, pl, output_mode(p) if mode is None else mode, facts)
     except Exception:  # noqa: BLE001
         return None

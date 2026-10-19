@@ -1988,7 +1988,8 @@ class Handler(BaseHTTPRequestHandler):
                 settings.set_show_replace_source(show, bool(body.get("replace_source")))
             if "output_mode" in body:
                 # What Resolve should OUTPUT for this item: auto (the long-standing rule) or a
-                # pinned sdr / dv1000 / dv2000. Changing it changes the DELIVERABLE'S NAME too
+                # pinned sdr / dv1000 (dv2000 is retired: settings stores it as dv1000).
+                # Changing it changes the DELIVERABLE'S NAME too
                 # (SDR masters carry a different done-mark), so it only affects items not yet
                 # shipped — anything already finished keeps the name it was shipped under.
                 settings.set_show_output_mode(show, body.get("output_mode"))

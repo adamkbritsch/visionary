@@ -1035,6 +1035,384 @@ class FrontEnd(unittest.TestCase):
         self.assertEqual(dvnative.front_end(""), "")
 
 
+class FitGeometry(unittest.TestCase):
+    """fit_geometry (2026-10-18): the largest display-aspect-true size inside 3840x2160, even both
+    ways, on even offsets; 1920x1080 exactly 2x; a hairline pad closed by stretching."""
+
+    def test_the_common_youtube_sizes(self):
+        for size, want in (((1920, 1080), (3840, 2160, 0, 0)),        # exactly 2x
+                           ((1280, 720), (3840, 2160, 0, 0)),         # exactly 3x
+                           ((2560, 1440), (3840, 2160, 0, 0)),        # exactly 1.5x
+                           ((640, 480), (2880, 2160, 480, 0)),        # 4:3 -> pillarbox
+                           ((1080, 1920), (1216, 2160, 1312, 0)),     # vertical (1215 -> even 1216)
+                           ((2160, 3840), (1216, 2160, 1312, 0)),     # vertical 4K: a downscale
+                           ((3840, 1600), (3840, 1600, 0, 280)),      # 2.4:1: letterbox, no scale
+                           ((4096, 2160), (3840, 2026, 0, 66))):      # DCI 4K: down, then letterbox
+            with self.subTest(size=size):
+                self.assertEqual(dvnative.fit_geometry(*size), want)
+
+    def test_the_sample_aspect_ratio_is_the_display_shape(self):
+        self.assertEqual(dvnative.fit_geometry(720, 480, "8:9"), (2880, 2160, 480, 0))   # 4:3 DVD
+        self.assertEqual(dvnative.fit_geometry(720, 480, "32:27"), (3840, 2160, 0, 0))   # 16:9 DVD
+        self.assertEqual(dvnative.fit_geometry(1440, 1080, "4:3"), (3840, 2160, 0, 0))   # HDV
+        for square in (None, "1:1", "0:1", "N/A", "", "x"):
+            self.assertEqual(dvnative.fit_geometry(640, 480, square), (2880, 2160, 480, 0), square)
+
+    def test_a_hairline_pad_is_stretched_shut(self):
+        # 854x480 fits as 3840x2158.3 -> 2158: a 2-line bar; stretching 0.09% closes it
+        self.assertEqual(dvnative.fit_geometry(854, 480), (3840, 2160, 0, 0))
+        w, h, x, y = dvnative.fit_geometry(3840, 2150)          # a 10-line pad is real: kept
+        self.assertEqual((w, h, x, y), (3840, 2150, 0, 4))
+
+    def test_every_size_is_even_inside_the_frame_and_keeps_its_aspect(self):
+        for w0 in range(144, 4200, 37):
+            for h0 in range(144, 4200, 53):
+                w, h, x, y = dvnative.fit_geometry(w0, h0)
+                self.assertTrue(w % 2 == h % 2 == x % 2 == y % 2 == 0, (w0, h0))
+                self.assertTrue(0 < w <= 3840 and 0 < h <= 2160, (w0, h0))
+                self.assertTrue(x + w <= 3840 and y + h <= 2160, (w0, h0))
+                self.assertTrue(w == 3840 or h == 2160, (w0, h0))           # it fills one way
+                s = min(3840 / w0, 2160 / h0)                                # aspect: within the
+                self.assertLessEqual(abs(w - w0 * s), dvnative.PAD_SNAP_PX + 1, (w0, h0))   # even
+                self.assertLessEqual(abs(h - h0 * s), dvnative.PAD_SNAP_PX + 1, (w0, h0))   # rounding
+                self.assertLessEqual(abs((3840 - w) - 2 * x), 2, (w0, h0))   # centred
+                self.assertLessEqual(abs((2160 - h) - 2 * y), 2, (w0, h0))
+
+    def test_no_size_is_refused(self):
+        for bad in ((0, 1080), (1920, 0), (None, None), ("x", 5), (-4, 3)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                dvnative.fit_geometry(*bad)
+
+
+class ColourFront(unittest.TestCase):
+    """colour_front: the tags when present (an untagged half follows the tagged one), else the
+    frame size — SD BT.601 (EBU at 576 lines, SMPTE-C otherwise), HD BT.709."""
+
+    def front(self, w=1920, h=1080, **tags):
+        return dvnative.colour_front(dict({"width": w, "height": h}, **tags))
+
+    def test_tags_win(self):
+        self.assertEqual(self.front(color_space="bt709", color_primaries="bt709", color_transfer="bt709",
+                                    color_range="tv"), ("709", "709", False))
+        # the Rhett & Link samples: 640x480 tagged smpte170m matrix + primaries, bt709 transfer
+        self.assertEqual(self.front(640, 480, color_space="smpte170m", color_primaries="smpte170m",
+                                    color_transfer="bt709", color_range="tv"), ("170m", "170m", False))
+        self.assertEqual(self.front(color_space="smpte170m", color_primaries="smpte170m"),
+                         ("170m", "170m", False))                  # a 601-tagged HD frame: 601
+        self.assertEqual(self.front(640, 480, color_space="bt709", color_primaries="bt709"),
+                         ("709", "709", False))                    # a 709-tagged SD frame: 709
+        self.assertEqual(self.front(color_space="bt470bg", color_primaries="bt470bg",
+                                    color_transfer="bt470bg"), ("470bg", "470bg", False))
+        self.assertEqual(self.front(color_space="bt709", color_primaries="smpte170m"),
+                         ("709", "170m", False))                   # each tag for itself
+
+    def test_an_untagged_half_follows_the_tagged_one(self):
+        self.assertEqual(self.front(color_space="smpte170m"), ("170m", "170m", False))
+        self.assertEqual(self.front(color_space="bt470bg"), ("470bg", "470bg", False))
+        self.assertEqual(self.front(640, 480, color_primaries="bt709"), ("709", "709", False))
+        self.assertEqual(self.front(color_primaries="smpte170m", color_space="unknown"),
+                         ("170m", "170m", False))
+
+    def test_untagged_the_frame_decides(self):
+        for (w, h), want in (((640, 480), "170m"), ((720, 480), "170m"), ((320, 240), "170m"),
+                             ((720, 576), "470bg"), ((1024, 576), "470bg"),
+                             ((1280, 544), "709"), ((1280, 720), "709"), ((854, 578), "709"),
+                             ((1080, 1920), "709"), ((480, 854), "709")):
+            with self.subTest(size=(w, h)):
+                self.assertEqual(self.front(w, h, color_space="unknown", color_primaries=None,
+                                            color_transfer="unspecified"), (want, want, False))
+
+    def test_full_range(self):
+        self.assertEqual(self.front(color_range="pc"), ("709", "709", True))
+        self.assertEqual(self.front(color_range="unknown"), ("709", "709", False))
+
+    def test_what_no_standard_front_end_can_take(self):
+        for tags, words in (({"color_transfer": "smpte2084"}, "already HDR (smpte2084)"),
+                            ({"color_transfer": "arib-std-b67"}, "already HDR (arib-std-b67)"),
+                            ({"color_transfer": "iec61966-2-1"}, "transfer is iec61966-2-1"),
+                            ({"color_transfer": "linear"}, "transfer is linear"),
+                            ({"color_space": "bt2020nc"}, "matrix are bt2020nc"),
+                            ({"color_space": "gbr"}, "matrix are gbr"),
+                            ({"color_space": "smpte240m"}, "matrix are smpte240m"),
+                            ({"color_primaries": "bt2020"}, "primaries are bt2020"),
+                            ({"color_range": "weird"}, "range is weird")):
+            with self.subTest(tags=tags), self.assertRaises(ValueError) as cm:
+                self.front(**tags)
+            self.assertIn(words, str(cm.exception))
+        for bad in ({}, {"width": 0, "height": 480}, None):
+            with self.assertRaises(ValueError):
+                dvnative.colour_front(bad)
+
+
+class FitFrontEnd(unittest.TestCase):
+    """colour_vf / fit_pad_vf / fit_front_end build one plain chain: colour (only when needed) at
+    the source's size, then the Lanczos fit and the full-range-black pad."""
+
+    def test_colour_vf(self):
+        self.assertEqual(dvnative.colour_vf("709", "709"), "")
+        self.assertEqual(dvnative.colour_vf("170m", "709"),
+                         "zscale=matrixin=170m:rangein=limited:matrix=709:range=limited,format=yuv444p16le")
+        self.assertEqual(dvnative.colour_vf("709", "709", full=True),
+                         "zscale=matrixin=709:rangein=full:matrix=709:range=limited,format=yuv444p16le")
+        self.assertEqual(dvnative.colour_vf("470bg", "470bg"),
+                         "zscale=matrixin=470bg:rangein=limited:transferin=709:primariesin=470bg:"
+                         "transfer=709:primaries=709:matrix=709:range=limited,format=yuv444p16le")
+        for bad in (("2020_ncl", "709"), ("709", "2020"), (None, "709")):
+            with self.assertRaises(ValueError):
+                dvnative.colour_vf(*bad)
+
+    def test_fit_pad_vf(self):
+        self.assertEqual(dvnative.fit_pad_vf(1920, 1080),
+                         "zscale=w=3840:h=2160:filter=lanczos:param_a=3:rangein=limited:range=limited,"
+                         "format=yuv444p16le,setsar=1")
+        self.assertEqual(dvnative.fit_pad_vf(640, 480),
+                         "zscale=w=2880:h=2160:filter=lanczos:param_a=3:rangein=limited:range=limited,"
+                         "format=yuv444p16le,setsar=1,setparams=range=pc,pad=3840:2160:480:0:color=black,"
+                         "setparams=range=tv")
+
+    def test_every_fit_says_square_pixels_before_the_pad(self):
+        # 2026-10-18 review: zscale rewrites the sample aspect to keep the display aspect, and the
+        # even rounding / hairline snap always move the ratio a little (FitFrontEndInFfmpeg runs it)
+        for w, h, sar in ((1080, 1920, None), (854, 480, None), (720, 1280, None), (1920, 1080, None),
+                          (640, 480, None), (720, 480, "8:9"), (3840, 2160, None)):
+            with self.subTest(size=(w, h, sar)):
+                vf = dvnative.fit_pad_vf(w, h, sar)
+                self.assertIn("format=yuv444p16le,setsar=1", vf)
+                self.assertLess(vf.index("setsar=1"), vf.index("pad=") if "pad=" in vf else len(vf))
+
+    def test_colour_first_then_the_fit_as_one_plain_chain(self):
+        info = {"width": 640, "height": 480, "color_space": "smpte170m", "color_primaries": "smpte170m",
+                "color_transfer": "bt709", "color_range": "tv", "sample_aspect_ratio": "1:1"}
+        vf = dvnative.fit_front_end(info)
+        self.assertEqual(vf, dvnative.colour_vf("170m", "170m") + "," + dvnative.fit_pad_vf(640, 480))
+        self.assertEqual(dvnative.front_end(vf), vf + ",")            # a legal pre_vf
+        self.assertEqual(dvnative.fit_front_end(dict(info, color_space="bt709", color_primaries="bt709")),
+                         dvnative.fit_pad_vf(640, 480))               # BT.709: the fit alone
+        with self.assertRaises(ValueError):
+            dvnative.fit_front_end(dict(info, color_transfer="smpte2084"))
+
+
+def _identity_cube(path: str) -> str:
+    with open(path, "w") as f:
+        f.write("LUT_3D_SIZE 2\n" + "".join(f"{r} {g} {b}\n" for b in (0, 1) for g in (0, 1) for r in (0, 1)))
+    return path
+
+
+def _raw(vf: str, src_args: list, pix_fmt: str, size: tuple):
+    import numpy as np
+    out = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", *src_args,
+                          "-frames:v", "1", "-vf", vf, "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"],
+                         capture_output=True)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.decode(errors="replace"))
+    return np.frombuffer(out.stdout, dtype="<u2")
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG) and _have_numpy(), "ffmpeg/numpy not installed")
+class FitFrontEndInFfmpeg(unittest.TestCase):
+    """The fit front end run by the real ffmpeg/zimg: the BT.601 conversion is the standard one,
+    the geometry lands where fit_geometry says, and the pad leaves the LUT chain as exactly the
+    code source black does (an identity LUT stands in for the pinned one: only its black matters)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_601_with_smpte_c_primaries_is_converted_to_709_display_referred(self):
+        import numpy as np
+        rgb = np.array([[0.75, 0.25, 0.10], [0.10, 0.80, 0.20], [0.20, 0.30, 0.90], [0.5, 0.5, 0.5]])
+
+        def to_ycc(c, kr, kb):
+            y = kr * c[:, 0] + (1 - kr - kb) * c[:, 1] + kb * c[:, 2]
+            return np.stack([y * 219 * 256 + 4096, (c[:, 2] - y) / (2 - 2 * kb) * 224 * 256 + 32768,
+                             (c[:, 0] - y) / (2 - 2 * kr) * 224 * 256 + 32768], 1)
+
+        def xyz(prim):
+            m = np.array([[x / y, 1, (1 - x - y) / y] for x, y in prim]).T
+            return m * np.linalg.solve(m, [0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290])
+        to709 = np.linalg.solve(xyz([(0.64, 0.33), (0.30, 0.60), (0.15, 0.06)]),
+                                xyz([(0.630, 0.340), (0.310, 0.595), (0.155, 0.070)]))   # SMPTE-C
+        want = to_ycc(np.clip((to709 @ (rgb ** 2.4).T).T, 0, None) ** (1 / 2.4), 0.2126, 0.0722)
+        src = os.path.join(self.d, "in.raw")
+        frame = np.round(to_ycc(rgb, 0.299, 0.114)).astype("<u2").T.copy()      # planar Y, Cb, Cr
+        frame.tofile(src)
+        vf = ("setparams=range=tv:colorspace=smpte170m:color_primaries=smpte170m:color_trc=bt709,"
+              + dvnative.colour_vf("170m", "170m"))
+        got = _raw(vf, ["-f", "rawvideo", "-pix_fmt", "yuv444p16le", "-s", f"{len(rgb)}x1", "-i", src],
+                   "yuv444p16le", (len(rgb), 1)).reshape(3, len(rgb)).T.astype(float)
+        self.assertLess(np.abs(got - want).max(), 12)                 # of 65535: the standard conversion
+        matrix_only = to_ycc(rgb, 0.2126, 0.0722)                     # the primaries left alone
+        self.assertGreater(np.abs(got - matrix_only).max(), 1000)
+
+    def test_the_pad_is_exactly_the_luts_black_and_the_picture_sits_where_the_geometry_says(self):
+        import numpy as np
+        cube = _identity_cube(os.path.join(self.d, "id.cube"))
+        info = {"width": 64, "height": 48, "color_space": "bt709", "color_primaries": "bt709",
+                "color_transfer": "bt709", "color_range": "tv"}
+        frame = (96, 54)
+        w, h, x, y = dvnative.fit_geometry(64, 48, frame=frame)
+        self.assertEqual((w, h, x, y), (72, 54, 12, 0))
+        vf = (dvnative.front_end(dvnative.fit_front_end(info, frame))
+              + dvnative.lut_vf(cube, pix_fmt="yuv444p10le"))
+        # a source that is black on the left half and white on the right half
+        src = ["-f", "lavfi", "-i", "color=c=black:s=32x48,format=yuv420p[a];color=c=white:s=32x48,"
+               "format=yuv420p[b];[a][b]hstack,setparams=range=tv:colorspace=bt709:color_primaries=bt709:"
+               "color_trc=bt709"]
+        a = _raw(vf, src, "yuv444p10le", frame).reshape(3, frame[1], frame[0])
+        pad = np.concatenate([a[:, :, :x].reshape(3, -1), a[:, :, x + w:].reshape(3, -1)], axis=1)
+        self.assertEqual({tuple(v) for v in pad.T}, {(64, 512, 512)})        # exactly PQ black
+        self.assertEqual(tuple(a[:, 27, x + 4]), (64, 512, 512))             # ...as source black is
+        self.assertGreater(int(a[0, 27, x + w - 1]), 900)                    # white to the last column
+
+    def test_1080p_is_exactly_2x_and_fills_the_frame(self):
+        info = {"width": 1920, "height": 1080, "color_space": "bt709", "color_primaries": "bt709",
+                "color_transfer": "bt709", "color_range": "tv"}
+        vf = dvnative.fit_front_end(info)
+        out = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-loglevel", "info", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=1,format=yuv420p,"
+                              "setparams=range=tv:colorspace=bt709", "-frames:v", "1", "-vf",
+                              vf + ",showinfo", "-f", "null", "-"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("s:3840x2160", out.stderr)
+
+    def test_the_whole_fit_and_lut_chain_hands_on_square_pixels(self):
+        # 2026-10-18 review: without setsar=1 zscale left sar 1215:1216 on a vertical Short
+        # (1080x1920 -> 1216 wide for 1215) and 1281:1280 on a snapped 854x480, and VideoToolbox /
+        # MP4Box / the y4m pipe to x265 all carry it into the master
+        cube = _identity_cube(os.path.join(self.d, "id.cube"))
+        for w, h in ((1080, 1920), (854, 480), (720, 1280), (640, 480)):
+            with self.subTest(size=(w, h)):
+                info = {"width": w, "height": h, "color_space": "bt709", "color_primaries": "bt709",
+                        "color_transfer": "bt709", "color_range": "tv", "sample_aspect_ratio": "1:1"}
+                vf = dvnative.front_end(dvnative.fit_front_end(info)) + dvnative.lut_vf(cube)
+                out = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-loglevel", "info", "-nostdin",
+                                      "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=1,format=yuv420p,"
+                                      "setsar=1,setparams=range=tv:colorspace=bt709", "-frames:v", "1",
+                                      "-vf", vf + ",showinfo", "-f", "null", "-"],
+                                     capture_output=True, text=True)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn("sar:1/1 s:3840x2160", out.stderr)
+
+
+class ChunkFrontEnd(unittest.TestCase):
+    """dvnative.chunk_front_end (2026-10-18): a Topaz chunk's own tags pick the colour step, an
+    untagged chunk is judged by the SOURCE's frame, non-square pixels are squared at the chunk's
+    height, and a TV-lane chunk needs nothing at all."""
+    SUNNY = {"width": 2880, "height": 2160, "sample_aspect_ratio": "1:1", "color_primaries": "smpte170m",
+             "color_space": "smpte170m", "color_transfer": "smpte170m"}    # It's Always Sunny 2x06 chunk 0
+    C601 = dvnative.colour_vf("170m", "170m")
+
+    def test_a_tv_lane_chunk_needs_nothing(self):
+        for info in ({"width": 3840, "height": 2160, "color_primaries": "bt709", "color_space": "bt709",
+                      "color_transfer": "bt709", "color_range": "tv", "sample_aspect_ratio": "1:1"},
+                     {"width": 2880, "height": 2160},                        # untagged 720p 4:3
+                     {"width": 3840, "height": 1600, "sample_aspect_ratio": "0:1"}):
+            with self.subTest(info=info):
+                self.assertEqual(dvnative.chunk_front_end(info, {"width": 1280, "height": 720}), "")
+
+    PILLAR = dvnative.fit_pad_vf(2880, 2160, "1:1")                       # 4:3 centred in 3840x2160
+
+    def test_the_chunks_tags_decide_when_there_are_any(self):
+        self.assertEqual(dvnative.chunk_front_end(self.SUNNY, {"width": 640, "height": 480}),
+                         self.C601 + "," + self.PILLAR)                      # SD source: pillarboxed
+        self.assertEqual(dvnative.chunk_front_end(self.SUNNY, {"width": 1920, "height": 1080}), self.C601)
+        pal = dict(self.SUNNY, color_primaries="bt470bg", color_space="bt470bg", color_transfer="bt470bg")
+        self.assertEqual(dvnative.chunk_front_end(pal), dvnative.colour_vf("470bg", "470bg"))
+        self.assertEqual(dvnative.chunk_front_end(dict(self.SUNNY, color_range="pc")),
+                         dvnative.colour_vf("170m", "170m", True))
+
+    def test_an_untagged_chunk_is_judged_by_the_source_frame_not_its_own(self):
+        bare = {"width": 2880, "height": 2160}
+        self.assertEqual(dvnative.chunk_front_end(bare, {"width": 640, "height": 480}),
+                         self.C601 + "," + self.PILLAR)
+        self.assertEqual(dvnative.chunk_front_end(bare, {"width": 720, "height": 576}),
+                         dvnative.colour_vf("470bg", "470bg") + "," + self.PILLAR)
+        self.assertEqual(dvnative.chunk_front_end(bare, {"width": 960, "height": 720}), "")
+        self.assertEqual(dvnative.chunk_front_end(bare), "")                     # no source: its own
+
+    def test_non_square_pixels_are_squared_at_the_chunks_height(self):
+        for sar, w in (("8:9", 2880), ("32:27", 3840), ("10:11", 2946), ("40:33", 3928)):
+            with self.subTest(sar=sar):
+                vf = dvnative.chunk_front_end({"width": 3240, "height": 2160, "sample_aspect_ratio": sar,
+                                               "color_space": "bt709", "color_primaries": "bt709"})
+                self.assertEqual(vf, f"zscale=w={w}:h=2160:filter=lanczos:param_a=3:rangein=limited:"
+                                     "range=limited,format=yuv444p16le,setsar=1")
+        vf = dvnative.chunk_front_end({"width": 3240, "height": 2160, "sample_aspect_ratio": "8:9"},
+                                      {"width": 720, "height": 480})
+        self.assertEqual(vf.split(",zscale=w=")[0], self.C601)                 # colour first
+        self.assertEqual(dvnative.front_end(vf), vf + ",")                      # a legal pre_vf
+
+    def test_an_sd_chunk_is_pillarboxed_like_resolves_masters(self):
+        # Resolve shipped It's Always Sunny 2x06 as 3840x2160 with the 4:3 picture at x=480
+        vf = dvnative.chunk_front_end(self.SUNNY, {"width": 640, "height": 480})
+        self.assertIn("pad=3840:2160:480:0", vf)
+        self.assertIn("setsar=1", vf)
+        self.assertEqual(dvnative.front_end(vf), vf + ",")                      # a legal pre_vf
+        hd = dvnative.chunk_front_end({"width": 2880, "height": 2160}, {"width": 1440, "height": 1080})
+        self.assertNotIn("pad=", hd)                                            # 4:3 HD stays as it was
+
+    def test_what_it_refuses(self):
+        cases = {"no size": {"color_space": "bt709"},
+                 "PQ": dict(self.SUNNY, color_transfer="smpte2084"),
+                 "BT.2020": dict(self.SUNNY, color_primaries="bt2020", color_space="bt2020nc"),
+                 "RGB": dict(self.SUNNY, color_space="gbr"),
+                 "too wide square": {"width": 4096, "height": 2160, "sample_aspect_ratio": "4:3"}}
+        for name, info in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                dvnative.chunk_front_end(info, {"width": 640, "height": 480})
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG) and _have_numpy(), "ffmpeg/numpy not installed")
+class ChunkFrontEndInFfmpeg(unittest.TestCase):
+    """The chunk front end run by the real ffmpeg/zimg: an anamorphic chunk comes out square at
+    its height (display aspect kept), a BT.601 chunk's colour is the same standard conversion
+    the fit front end makes (FitFrontEndInFfmpeg pins that one against BT.1886), and the whole
+    pre_vf + LUT chain runs."""
+
+    def test_an_anamorphic_chunk_comes_out_square_at_its_height(self):
+        vf = dvnative.chunk_front_end({"width": 360, "height": 240, "sample_aspect_ratio": "8:9",
+                                       "color_space": "bt709", "color_primaries": "bt709"})
+        out = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-loglevel", "info", "-nostdin",
+                              "-f", "lavfi", "-i", "testsrc2=size=360x240:rate=1,format=yuv420p,"
+                              "setsar=8/9,setparams=range=tv:colorspace=bt709", "-frames:v", "1",
+                              "-vf", vf + ",showinfo", "-f", "null", "-"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("s:320x240", out.stderr)
+        self.assertIn("sar:1/1", out.stderr)
+
+    def test_the_601_chunk_chain_runs_into_the_lut(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        cube = _identity_cube(os.path.join(d, "id.cube"))
+        info = {"width": 64, "height": 48, "color_space": "smpte170m", "color_primaries": "smpte170m",
+                "color_transfer": "smpte170m"}
+        pre = dvnative.chunk_front_end(info, {"width": 1280, "height": 720})   # colour only, no pillarbox
+        self.assertEqual(pre, dvnative.colour_vf("170m", "170m"))
+        a = _raw(dvnative.front_end(pre) + dvnative.lut_vf(cube, pix_fmt="yuv444p10le"),
+                 ["-f", "lavfi", "-i", "color=c=black:s=64x48,format=yuv420p,setparams=range=tv:"
+                  "colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m"],
+                 "yuv444p10le", (64, 48)).reshape(3, 48, 64)
+        self.assertEqual({tuple(v) for v in a.reshape(3, -1).T}, {(64, 512, 512)})   # black stays black
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG) and _have_numpy(), "ffmpeg/numpy not installed")
+class SdPillarboxInFfmpeg(unittest.TestCase):
+    def test_the_bars_are_exactly_black_and_the_picture_sits_at_x480(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        cube = _identity_cube(os.path.join(d, "id.cube"))
+        info = {"width": 2880, "height": 2160, "color_space": "smpte170m", "color_primaries": "smpte170m",
+                "color_transfer": "smpte170m", "sample_aspect_ratio": "1:1"}
+        pre = dvnative.chunk_front_end(info, {"width": 640, "height": 480})
+        a = _raw(dvnative.front_end(pre) + dvnative.lut_vf(cube, pix_fmt="yuv444p10le"),
+                 ["-f", "lavfi", "-i", "color=c=white:s=2880x2160,format=yuv420p,setparams=range=tv:"
+                  "colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m"],
+                 "yuv444p10le", (3840, 2160)).reshape(3, 2160, 3840)
+        self.assertEqual({tuple(v) for v in a[:, :, 8:472].reshape(3, -1).T}, {(64, 512, 512)})   # bars
+        self.assertEqual({tuple(v) for v in a[:, :, 3368:3832].reshape(3, -1).T}, {(64, 512, 512)})
+        self.assertGreater(a[0, 1080, 1920], 600)                                            # picture
+
+
 class RangeIntermediate(unittest.TestCase):
     # The TV lane's whole-chunk argv (hardware decode, FFVHuff 4:4:4): the range keywords and
     # pre_vf default to it exactly.
@@ -1311,6 +1689,181 @@ class RangeIntermediateKeepsExactlyItsFrames(unittest.TestCase):
                                            + ["-fps_mode", "passthrough", "-"], capture_output=True).stdout
                     self.assertEqual(len(l4), n * 1920 * 1080 * 3 * 2)
                     self.assertEqual(l4, exact)
+
+
+
+# ---- HDR intake (2026-10-18): a source's own mastering, exact L6 light, the HDR front end -------
+
+HAMILTON_MDCV = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"   # the real SEI
+P3_4000 = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50)"
+
+
+class SourceMastering(unittest.TestCase):
+    """An HDR10 source's SEI -> the MasterSpec that keeps its mastering and the L6 light levels
+    declared as they stand."""
+
+    def test_the_hamilton_sei_keeps_its_bt2020_display_and_unknown_light(self):
+        m, light = dvnative.source_mastering(HAMILTON_MDCV, "0,0")
+        self.assertEqual((m.max_nits, m.min_nits, m.trim_targets, m.mdcv), (1000, 0.0001, (100, 600, 1000),
+                                                                             HAMILTON_MDCV))
+        self.assertEqual((m.source_max_pq, m.source_min_pq, m.l6_min, m.hdr10_mdcv), (3079, 7, 1, HAMILTON_MDCV))
+        self.assertEqual(light, (0, 0))
+
+    def test_a_4000_nit_p3_master_moves_every_range_and_keeps_its_light(self):
+        m, light = dvnative.source_mastering(P3_4000, "850,210")
+        self.assertEqual((m.max_nits, m.l6_min, m.source_max_pq, m.source_min_pq),
+                         (4000, 50, dvnative.nits_to_pq12(4000), dvnative.nits_to_pq12(0.005)))
+        self.assertEqual(m.trim_targets, (100, 600, 1000))
+        self.assertEqual(light, (850, 210))
+
+    def test_trim_targets_above_the_peak_are_dropped(self):
+        md = HAMILTON_MDCV.replace("L(10000000,1)", "L(6000000,1)")
+        self.assertEqual(dvnative.source_mastering(md, None)[0].trim_targets, (100, 600))
+
+    def test_missing_metadata_is_the_default_master_and_unknown_light(self):
+        self.assertEqual(dvnative.source_mastering(None, None), (dvnative.DEFAULT_MASTER, (0, 0)))
+        self.assertEqual(dvnative.source_mastering("", "1200,300"), (dvnative.DEFAULT_MASTER, (1200, 300)))
+
+    def test_a_zero_minimum_is_kept_when_the_source_says_so(self):
+        md = HAMILTON_MDCV.replace("L(10000000,1)", "L(10000000,0)")
+        m, _light = dvnative.source_mastering(md, "0,0")
+        self.assertEqual((m.min_nits, m.l6_min, m.source_min_pq), (0, 0, 0))
+        with self.assertRaises(ValueError):          # ...but never on a master with no display of its own
+            dvnative.MasterSpec(min_nits=0)
+
+    def test_every_refusal_says_why(self):
+        for md, cll, words in (
+                (HAMILTON_MDCV.replace("L(10000000,1)", "L(10005000,1)"), None, "1000.5 nits"),
+                (HAMILTON_MDCV.replace("L(10000000,1)", "L(500000,1)"), None, "50 nits"),
+                (HAMILTON_MDCV.replace("L(10000000,1)", "L(100010000,1)"), None, "10001 nits"),
+                (HAMILTON_MDCV.replace("L(10000000,1)", "L(10000000,10000000)"), None, "mastering range"),
+                ("L(10000000,1)", None, "does not read"),
+                (None, "lots", "does not read"),
+                (None, "70000,1", "out of range")):
+            with self.subTest(md=md, cll=cll), self.assertRaises(ValueError) as cm:
+                dvnative.source_mastering(md, cll)
+            self.assertIn(words, str(cm.exception))
+
+
+class ExactLight(unittest.TestCase):
+    """rpu_config(light=...) declares an HDR source's own MaxCLL/MaxFALL in L6 exactly as given:
+    not measured, not clamped. Without it nothing changes."""
+
+    def setUp(self):
+        self.sc = _sidecar([_scene(0, 9, 1, 1500, 3000)], cll=900, fall=200)
+
+    def test_light_is_declared_as_given_even_out_of_spec(self):
+        for light in ((0, 0), (1500, 1600), (850, 210)):
+            cfg = dvnative.rpu_config(self.sc, light=light, max_cll=1, max_fall=1)
+            self.assertEqual((cfg["level6"]["max_content_light_level"],
+                              cfg["level6"]["max_frame_average_light_level"]), light)
+
+    def test_no_light_is_exactly_the_old_rule(self):
+        for sc in (self.sc, _e2e_sidecar()):
+            self.assertEqual(dvnative.rpu_config(sc), dvnative.rpu_config(sc, light=None))
+        self.assertEqual(dvnative.rpu_config(self.sc)["level6"]["max_content_light_level"], 900)
+
+    def test_generate_passes_it_through(self):
+        d = tempfile.mkdtemp()
+        try:
+            with mock.patch.object(dvnative, "rpu_config", wraps=dvnative.rpu_config) as cfg, \
+                 mock.patch.object(dvnative.subprocess, "run", side_effect=OSError("no tool here")):
+                with self.assertRaises(OSError):
+                    dvnative.generate_rpu(self.sc, os.path.join(d, "r.bin"), light=(0, 0))
+            self.assertEqual(cfg.call_args.kwargs["light"], (0, 0))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(os.path.exists(dvnative.DOVI_TOOL), "dovi_tool not installed")
+    def test_dovi_tool_writes_a_source_master_and_zero_light(self):
+        d = tempfile.mkdtemp()
+        try:
+            m, light = dvnative.source_mastering(P3_4000, "0,0")
+            rpu = os.path.join(d, "rpu.bin")
+            dvnative.generate_rpu(_sidecar([_scene(0, 23, 1, 1500, 3500)], cll=900, fall=200), rpu,
+                                  master=m, light=light)
+            out = subprocess.run([dvnative.DOVI_TOOL, "info", "-i", rpu, "-f", "0"],
+                                 capture_output=True, text=True).stdout
+            vdr = json.loads(out[out.find("{"):])["vdr_dm_data"]
+            l6 = next(b["Level6"] for b in vdr["cmv29_metadata"]["ext_metadata_blocks"] if "Level6" in b)
+            self.assertEqual(l6, {"max_display_mastering_luminance": 4000, "min_display_mastering_luminance": 50,
+                                  "max_content_light_level": 0, "max_frame_average_light_level": 0})
+            self.assertEqual((vdr["source_min_pq"], vdr["source_max_pq"]), (m.source_min_pq, m.source_max_pq))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class HdrFrontEnd(unittest.TestCase):
+    PQ = {"color_transfer": "smpte2084", "color_primaries": "bt2020", "color_space": "bt2020nc",
+          "color_range": "tv"}
+
+    def test_pq_needs_none_and_hlg_is_converted(self):
+        self.assertIsNone(dvnative.hdr_front_end(self.PQ))
+        self.assertIsNone(dvnative.hdr_front_end({"color_transfer": "smpte2084"}))      # BT.2100 = BT.2020
+        hlg = dict(self.PQ, color_transfer="arib-std-b67")
+        self.assertEqual(dvnative.hdr_front_end(hlg), dvnative.hlg_to_pq_vf())
+        self.assertEqual(dvnative.hlg_to_pq_vf(),
+                         "zscale=matrixin=2020_ncl:transferin=arib-std-b67:primariesin=2020:rangein=limited:"
+                         "matrix=2020_ncl:transfer=smpte2084:primaries=2020:range=limited,"
+                         "format=yuv444p16le")
+        self.assertEqual(dvnative.front_end(dvnative.hlg_to_pq_vf()), dvnative.hlg_to_pq_vf() + ",")
+
+    def test_every_refusal_says_why(self):
+        for info, words in ((dict(self.PQ, color_transfer="bt709"), "bt709, not PQ or HLG"),
+                            (dict(self.PQ, color_transfer=None), "untagged, not PQ or HLG"),
+                            (dict(self.PQ, color_primaries="bt709"), "primaries are bt709"),
+                            (dict(self.PQ, color_space="bt2020c"), "matrix are bt2020c"),
+                            (dict(self.PQ, color_range="pc"), "full range")):
+            with self.subTest(info=info), self.assertRaises(ValueError) as cm:
+                dvnative.hdr_front_end(info)
+            self.assertIn(words, str(cm.exception))
+
+
+def _hlg_inverse_oetf(e: float) -> float:
+    import math
+    a = 0.17883277
+    b, c = 1 - 4 * a, 0.5 - a * math.log(4 * a)
+    return e * e / 3 if e <= 0.5 else (math.exp((e - c) / a) + b) / 12
+
+
+def _pq_signal(nits: float) -> float:
+    m1, m2, c1, c2, c3 = 2610 / 16384, 2523 / 32, 3424 / 4096, 2413 / 128, 2392 / 128
+    y = max(0.0, nits) / 10000
+    return ((c1 + c2 * y ** m1) / (1 + c3 * y ** m1)) ** m2
+
+
+@unittest.skipUnless(os.path.exists(dvnative.FFMPEG), "ffmpeg not installed")
+class HlgToPqInFfmpeg(unittest.TestCase):
+    """The real zscale against BT.2100 itself: grey HLG levels -> display light through the
+    OOTF at 1000 nits (gamma 1.2) -> PQ, as 10-bit limited codes. Measured 2026-10-18: within
+    0.025 of a code once the reference uses the same 10-bit input codes; HLG's 75% reference white
+    lands on 203 nits (BT.2408), 100% on exactly 1000; neutral chroma stays neutral."""
+
+    def test_grey_levels_match_bt2100(self):
+        import numpy as np
+        w, h, levels = 64, 8, (0.0, 0.1, 0.25, 0.5, 0.6, 0.75, 0.9, 1.0)
+        codes = [int(round(64 + e * 876)) for e in levels]
+        y = np.zeros((h, w), np.uint16)
+        for i, c in enumerate(codes):
+            y[:, i * 8:(i + 1) * 8] = c << 6
+        cbcr = np.full((h, w), 512 << 6, np.uint16)
+        r = subprocess.run([dvnative.FFMPEG, "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv444p16le",
+                            "-s", f"{w}x{h}", "-i", "-", "-vf", dvnative.hlg_to_pq_vf(), "-f", "rawvideo",
+                            "-pix_fmt", "yuv444p16le", "-"],
+                           input=y.tobytes() + cbcr.tobytes() + cbcr.tobytes(), capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        out = np.frombuffer(r.stdout, "<u2").reshape(3, h, w).astype(float) / 64
+        for i, c in enumerate(codes):
+            e = (c - 64) / 876
+            nits = dvnative.HLG_NPL * _hlg_inverse_oetf(e) ** 1.2   # grey: the OOTF's Ys is the level
+            want = 64 + _pq_signal(nits) * 876
+            with self.subTest(level=levels[i]):
+                self.assertAlmostEqual(out[0, :, i * 8:(i + 1) * 8].mean(), want, delta=0.1)
+                self.assertAlmostEqual(out[1, :, i * 8 + 4].mean(), 512, delta=0.05)
+                self.assertAlmostEqual(out[2, :, i * 8 + 4].mean(), 512, delta=0.05)
+        self.assertAlmostEqual(1000 * _hlg_inverse_oetf(0.75) ** 1.2, 203, delta=0.5)   # BT.2408 white
+        self.assertEqual(dvnative.HLG_NPL, 1000)
+        self.assertAlmostEqual(out[0, :, 56:64].mean(), 64 + _pq_signal(1000) * 876, delta=0.05)   # E' 1 -> 1000
 
 
 if __name__ == "__main__":

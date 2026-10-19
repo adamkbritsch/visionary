@@ -188,8 +188,20 @@ DEFAULT_SETTINGS = {
                                 # has its render — p.dv_render, the very file Resolve writes — made by
                                 # the 'dvrender' stage instead (nativerender.py: analysis + VideoToolbox,
                                 # no screen), whenever that stage can make the item (stages.native_route;
-                                # today one 3840x2160 BT.709 SDR file straight through the pinned LUT:
-                                # yt_native4k, sdr4k). Anything it cannot make still goes to Resolve.
+                                # one 3840x2160 BT.709 SDR file straight through the pinned LUT:
+                                # yt_native4k, sdr4k; or any SDR YouTube file through the fit front end
+                                # — BT.601 / full range to BT.709, a Lanczos fit and pad into 3840x2160:
+                                # yt_plain, yt_1080; or an HDR source with no LUT, keeping its own
+                                # mastering: rpu_only — its own stream with the RPU injected, no
+                                # encode — hdr_reencode, and hlg through BT.2100 HLG -> PQ at 1000
+                                # nits; or Topaz's chunks through the chunk front end and the LUT:
+                                # movie_sdr_topaz, and sd_sdr_topaz when the chunk lane declines it;
+                                # or a combine's PQ winner as rpu_only measures a source:
+                                # combine_nodv; or, for an item pinned to SDR, the SDR render the
+                                # true SDR master is made from: sdr_out). Anything it cannot make
+                                # still goes to Resolve. 2026-10-18: sd_sdr_topaz 'native' ALSO opens
+                                # the chunk lane (nativelane) to 480p/576p episodes, with the BT.601
+                                # chunk front end — its own switch, never dv_engine's.
                                 # {} = EVERY route 'resolve', exactly as before. tv_sdr_topaz is not set
                                 # here (the key is dropped): it keeps following dv_engine, the chunk
                                 # lane. POST /api/settings only; read at USE time via dv_routes().
@@ -591,20 +603,28 @@ def set_show_do_featurettes(key: str, value) -> bool:
 
 
 # What the Resolve stage should OUTPUT for an item. "auto" is the default and ALWAYS
-# resolves to 1000-nit Dolby Vision, whatever the intake range (user-dictated 2026-08-09:
-# the 2000-nit target is MANUAL-ONLY). The other three pin it regardless of the source. "sdr" is the only one that produces a non-DV master,
-# and the only one whose Resolve stage needs no screen automation at all (no DV analyze).
-OUTPUT_MODES = ("auto", "sdr", "dv1000", "dv2000")
+# resolves to 1000-nit Dolby Vision, whatever the intake range (user-dictated 2026-08-09).
+# The other two pin it regardless of the source. "sdr" is the only one that produces a non-DV
+# master, and the only one whose Resolve stage needs no screen automation at all (no DV analyze).
+# THE 2000-NIT MODE IS RETIRED (user decision 2026-10-15, built 2026-10-18): "dv2000" is no longer
+# offered or stored. A profile that still holds it (written before) READS as "dv1000" — the
+# 1000-nit master it now gets everywhere (Resolve stage, native lane, route classifier, the app's
+# rows) — and a "dv2000" still sent by an older client is stored as "dv1000".
+OUTPUT_MODES = ("auto", "sdr", "dv1000")
+RETIRED_OUTPUT_MODES = {"dv2000": "dv1000"}
 
 
 def get_show_output_mode(key: str) -> str:
-    """Per-item (TV show / movie title / channel folder — the same key the preset uses)."""
+    """Per-item (TV show / movie title / channel folder — the same key the preset uses). A
+    retired mode reads as its replacement (RETIRED_OUTPUT_MODES)."""
     v = _show_entry(key).get("output_mode")
+    v = RETIRED_OUTPUT_MODES.get(v, v) if isinstance(v, str) else v
     return v if v in OUTPUT_MODES else "auto"
 
 
 def set_show_output_mode(key: str, value) -> str:
-    v = value if value in OUTPUT_MODES else "auto"
+    v = RETIRED_OUTPUT_MODES.get(value, value) if isinstance(value, str) else value
+    v = v if v in OUTPUT_MODES else "auto"
     _update_show(key, output_mode=v)
     return v
 
@@ -664,13 +684,12 @@ def looks_hdr(name) -> bool:
 def effective_output_mode(key: str, hdr_source: bool = False) -> str:
     """What the item will ACTUALLY be mastered as — a pin if there is one, otherwise the
     automatic rule. Automatic is always Dolby Vision at 1000 nits, whatever the intake
-    range (user-dictated 2026-08-09: the 2000-nit target is MANUAL-ONLY — it stays a
-    per-item override but nothing selects it automatically). This is what the app
-    displays, so the row never shows an abstract "auto" the user has to translate.
-    `hdr_source` is retained for signature compatibility; it no longer changes the
-    automatic answer."""
+    range (user-dictated 2026-08-09; the 2000-nit target is retired, 2026-10-15). This is
+    what the app displays, so the row never shows an abstract "auto" the user has to
+    translate. `hdr_source` is retained for signature compatibility; it no longer changes
+    the automatic answer."""
     m = get_show_output_mode(key)
-    if m in ("sdr", "dv1000", "dv2000"):
+    if m in ("sdr", "dv1000"):
         return m
     return "dv1000"
 

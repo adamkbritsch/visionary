@@ -36,6 +36,7 @@ ships (settings `dv_engine`).
 """
 from __future__ import annotations
 import json
+import math
 import os
 import re
 import signal
@@ -45,6 +46,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 
 import dvcap
 import versions as _versions
@@ -105,7 +107,9 @@ class MasterSpec:
     when given, its L(max,min) must say the same nits as max_nits/min_nits, so the HDR10 SEI
     and the RPU can never disagree. Nothing in the RPU reads it; the native render writes it
     as the HDR10 mastering-display SEI (hdr10sei; None -> dvcap.FALLBACK_MASTER_DISPLAY, the
-    1000-nit P3 D65 display the x265 path writes)."""
+    1000-nit P3 D65 display the x265 path writes). A minimum of 0 nits is allowed only WITH an
+    mdcv (2026-10-18): it is what some HDR10 sources' own mastering display says, and an RPU
+    that keeps that source's mastering must say the same (L6 min 0, source_min_pq 0)."""
     max_nits: int = MASTER_MAX_NITS
     min_nits: float = MASTER_MIN_NITS
     trim_targets: tuple = TRIM_TARGETS_NITS
@@ -113,7 +117,8 @@ class MasterSpec:
 
     def __post_init__(self):
         object.__setattr__(self, "trim_targets", tuple(int(t) for t in self.trim_targets))
-        if not 0 < float(self.min_nits) < int(self.max_nits) <= 10000:
+        lowest_ok = float(self.min_nits) > 0 or (self.mdcv is not None and float(self.min_nits) == 0)
+        if not (lowest_ok and float(self.min_nits) < int(self.max_nits) <= 10000):
             raise ValueError(f"mastering range must be 0 < min < max <= 10000 nits, got "
                              f"{self.min_nits}..{self.max_nits}")
         t = self.trim_targets
@@ -153,6 +158,56 @@ class MasterSpec:
 
 
 DEFAULT_MASTER = MasterSpec()      # Resolve's 1000-nit project: today's RPU, unchanged
+
+# An HDR10 source KEEPS its own mastering (2026-10-18, the HDR intake routes rpu_only /
+# hdr_reencode): its mastering-display SEI becomes the RPU's L6 mastering range and the clamp for
+# L1/L4, and its content-light-level SEI is L6's MaxCLL/MaxFALL as it stands — never measured,
+# never clamped — so the RPU and the HDR10 metadata in the same stream can never disagree. That
+# is Dolby's rule for L6, and it is the rpu_only route's whole contract: the original stream ships
+# with its own SEI, so only the RPU can be made to match. (Resolve wrote its own project's L6
+# instead: the Hamilton render's RPU says MaxCLL 620 / MaxFALL 41 over a source whose SEI says 0,0.)
+SOURCE_TRIM_TARGETS = TRIM_TARGETS_NITS     # the L2 targets a source's master keeps, minus any above its peak
+SOURCE_MIN_PEAK_NITS = 100                  # a mastering display under this is not an HDR one (bad SEI)
+
+
+def source_mastering(master_display, max_cll) -> tuple:
+    """PURE. A source's HDR10 static metadata as dvcap.probe_video reads it — `master_display`
+    (x265's "G(..)B(..)R(..)WP(..)L(max,min)" in 0.0001-nit luminance units, or None) and
+    `max_cll` ("MaxCLL,MaxFALL", or None) — -> (MasterSpec, (MaxCLL, MaxFALL)): the master
+    that keeps the source's own mastering (its display as the mdcv, its peak and minimum as the
+    range, the L2 targets at or under its peak) and the light levels L6 must declare as given.
+    No mastering display -> DEFAULT_MASTER (the 1000-nit master every Resolve route writes); no
+    content light level -> (0, 0), HDR10's own "unknown", which is what such a stream says.
+    Raises ValueError (the reason) for a mastering display no RPU can carry exactly: a peak that
+    is not a whole number of nits, under SOURCE_MIN_PEAK_NITS or over 10000, or a minimum that
+    is not under the peak."""
+    light = (0, 0)
+    if max_cll:
+        try:
+            a, b = (int(v) for v in str(max_cll).split(","))
+        except ValueError:
+            raise ValueError(f"the source's content light level {max_cll!r} does not read")
+        if not (0 <= a <= 65535 and 0 <= b <= 65535):
+            raise ValueError(f"the source's content light level {max_cll!r} is out of range")
+        light = (a, b)
+    if not master_display:
+        return DEFAULT_MASTER, light
+    m = _MDCV_RE.match(str(master_display))
+    if not m:
+        raise ValueError(f"the source's mastering display {master_display!r} does not read")
+    lmax, lmin = int(m.group(1)), int(m.group(2))
+    if lmax % 10000:
+        raise ValueError(f"the source's mastering peak is {lmax / 10000:g} nits — an RPU's L6 "
+                         "declares whole nits")
+    peak = lmax // 10000
+    if not SOURCE_MIN_PEAK_NITS <= peak <= 10000:
+        raise ValueError(f"the source's mastering peak is {peak} nits (not an HDR mastering display)")
+    targets = tuple(t for t in SOURCE_TRIM_TARGETS if t <= peak)
+    try:
+        return MasterSpec(max_nits=peak, min_nits=lmin / 10000, trim_targets=targets,
+                          mdcv=str(master_display)), light
+    except ValueError as e:
+        raise ValueError(f"the source's mastering display {master_display!r}: {e}")
 
 
 # ---- colour: the captured Resolve conversion ---------------------------------------------
@@ -196,15 +251,37 @@ def lut_vf(cube: str, pix_fmt: str = "yuv420p10le") -> str:
 # zscale reads its input as matrix 709, limited range, whatever the frame says. So a front end
 # does geometry and standard matrix/range conversions only, and the one captured LUT (Resolve's
 # BT.709 DV1000 conversion) stays the only colour transform. It must hand on Y'CbCr, never RGB:
-# that zscale would read RGB planes as Y'CbCr. Designed, not wired yet (the routes that use
-# them ship later; user decision 2026-10-15: no further Resolve captures, standard front ends):
-#   BT.601 SD (smpte170m)   zscale=matrixin=170m:rangein=limited:matrix=709:range=limited,
-#                           format=yuv444p16le   (matrix only; 16-bit so 8-bit SD is not
-#                           rounded twice; converting the SMPTE-C primaries is the route's call)
-#   full-range BT.709       zscale=matrixin=709:rangein=full:matrix=709:range=limited,
-#                           format=yuv444p16le
-#   fit + pad to UHD        zscale=w=W:h=H:filter=spline36,pad=3840:2160:(ow-iw)/2:(oh-ih)/2
-#                           (pad's black is limited-range black, which the LUT maps to PQ black)
+# that zscale would read RGB planes as Y'CbCr.
+#
+# THE FIT FRONT END (fit_front_end; 2026-10-18, the single-file SDR routes whose source is not
+# already the master's 3840x2160 BT.709 frame: yt_plain and yt_1080, stages.dvrender_spec).
+# Standard zscale conversions only (user decision: no further Resolve captures), 16-bit 4:4:4
+# throughout so an 8-bit source is rounded once, at the very end:
+#   1. colour  (colour_vf, only when needed) BT.601 or full-range Y'CbCr -> BT.709 limited, at
+#              the SOURCE's size. SMPTE-C / EBU primaries are converted to BT.709 through linear
+#              light (zimg linearises "709" with BT.1886's 2.4 gamma: display-referred, so the
+#              picture keeps the colours it had on a monitor — measured 2026-10-18 within 6/65535
+#              of that reference); the LUT is BT.709 only. Which conversion a source needs is
+#              colour_front's rule: the tags when present, else the frame size.
+#   2. fit     (fit_pad_vf) Lanczos, 3 taps (user decision: plain Lanczos for the YouTube upscale
+#              — a blind A/B against MetalFX showed no difference), to the largest size that keeps
+#              the display aspect inside 3840x2160 (fit_geometry: 1920x1080 is exactly 2x),
+#              marked square-pixel (setsar=1: zscale would otherwise carry a near-1 sample aspect
+#              such as 1215:1216 into the master), then a centred black pad.
+#   3. the LUT chain, unchanged.
+# WHY SCALE BEFORE THE LUT: it is the TV lane's order — Topaz scales BT.709 Y'CbCr and the LUT
+# then runs on the 4K picture — so the validated chain (lut_vf) runs byte for byte on the kind of
+# frame it was made for; the analysis keeps its measured scale-first form (front end, area to
+# 1080p, LUT); and the pad, laid in Y'CbCr before the LUT, leaves it as EXACTLY the code source
+# black does. Measured 2026-10-18 against Resolve's own 4K render of a 1080p60 YouTube video (5
+# frames): the opposite order (LUT at 1080p, Lanczos in PQ R'G'B') moved the median dE2000 by at
+# most 0.02 and the p95 by at most 0.4 — so the order is chosen for exactness, not for a look.
+# THE PAD'S BLACK: pad writes FULL-range black (Y 0, neutral chroma — exact at any bit depth)
+# into this limited-range frame. That is below black, which the LUT clamps to its black, so the
+# bars come out exactly as source black does (measured: 64/512/512 both, 10-bit). ffmpeg's own
+# limited-range black is 16/255 of full scale (Y 4112, Cb/Cr 32896 at 16 bits, not 4096/32768),
+# which came out ONE CODE above black (65/513/512). The analysis' 2:1 area downscale never mixes
+# pad and picture either: fit_geometry keeps every size and offset even.
 _PRE_VF_BAD = re.compile(r"[;\[\]\n]")
 
 
@@ -216,6 +293,287 @@ def front_end(pre_vf: str | None) -> str:
     if _PRE_VF_BAD.search(pre_vf) or pre_vf.strip(", ") != pre_vf:
         raise ValueError(f"pre_vf must be one plain filter chain: {pre_vf!r}")
     return pre_vf + ","
+
+
+FIT_FRAME = (3840, 2160)        # the master's frame: every fitted picture ends up this size
+FIT_TAPS = 3                    # Lanczos taps (zimg's own default, pinned so a zimg change can't move it)
+PAD_SNAP_PX = 4                 # a pad of this many pixels or fewer is closed by stretching instead:
+                                # under 0.2% of either side is invisible, a hairline bar on a TV is not
+SD_MAX_LINES = 576              # an UNTAGGED frame of at most 576 lines (and narrower than
+HD_MIN_WIDTH = 1280             # 1280 — a cropped 2.39:1 720p is HD) is SD: BT.601. Anything else is
+PAL_LINES = 576                 # BT.709. Untagged SD of exactly 576 lines is 625-line (EBU) material,
+                                # every other SD height 525-line (SMPTE-C) — mpv's long-standing guess
+_FRONT_MATRIX = {"bt709": "709", "smpte170m": "170m", "bt470bg": "470bg"}      # ffprobe -> zscale
+_FRONT_PRIMARIES = {"bt709": "709", "smpte170m": "170m", "bt470bg": "470bg"}   # (170m and 470bg
+                                # share one matrix; their primaries differ)
+SDR_TRANSFERS = ("bt709", "smpte170m", "bt470bg")   # BT.709's curve under its three common tags
+                                # (601's is the same curve; "bt470bg" is how PAL encoders tag it)
+_UNTAGGED = (None, "", "unknown", "unspecified", "reserved")   # = nativelane.UNKNOWN_TAGS
+
+
+def _int0(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sar(sar) -> Fraction:
+    """A sample aspect ratio ("8:9", "1:1", Fraction, (n, d)) as a Fraction; square (1) for
+    none, "N/A", "0:1" (ffprobe's "unknown") or anything unreadable."""
+    try:
+        if isinstance(sar, Fraction):
+            f = sar
+        elif isinstance(sar, (tuple, list)):
+            f = Fraction(int(sar[0]), int(sar[1]))
+        else:
+            n, d = str(sar).split(":")
+            f = Fraction(int(n), int(d))
+    except (TypeError, ValueError, ZeroDivisionError, IndexError):
+        return Fraction(1)
+    return f if f > 0 else Fraction(1)
+
+
+def _even(v: Fraction) -> int:
+    """v rounded to the nearest even integer (halves up), never under 2."""
+    return max(2, 2 * math.floor(Fraction(v) / 2 + Fraction(1, 2)))
+
+
+def fit_geometry(width, height, sar=None, frame=FIT_FRAME) -> tuple:
+    """PURE. (w, h, x, y): the size of a `width` x `height` picture fitted into `frame` and its
+    top-left corner there. The largest size that keeps the DISPLAY aspect (width x sar : height)
+    inside the frame, rounded to even both ways (4:2:0), centred on even offsets (so the
+    analysis' 2:1 area downscale never mixes picture and pad); a pad of PAD_SNAP_PX or fewer is
+    closed by stretching. 1920x1080 -> (3840, 2160, 0, 0), exactly 2x; 640x480 -> (2880, 2160,
+    480, 0); 1080x1920 -> (1216, 2160, 1312, 0). Exact arithmetic (Fraction). Raises ValueError
+    for a size that is not positive."""
+    fw, fh = int(frame[0]), int(frame[1])
+    w0, h0 = _int0(width), _int0(height)
+    if w0 <= 0 or h0 <= 0 or fw <= 0 or fh <= 0:
+        raise ValueError(f"cannot fit a {width}x{height} picture into {frame[0]}x{frame[1]}")
+    dw = Fraction(w0) * _sar(sar)
+    s = min(Fraction(fw) / dw, Fraction(fh, h0))
+    w, h = min(fw, _even(dw * s)), min(fh, _even(h0 * s))
+    if fw - w <= PAD_SNAP_PX:
+        w = fw
+    if fh - h <= PAD_SNAP_PX:
+        h = fh
+    return w, h, (fw - w) // 4 * 2, (fh - h) // 4 * 2
+
+
+def fit_pad_vf(width, height, sar=None, frame=FIT_FRAME) -> str:
+    """PURE. The fit step: Lanczos to fit_geometry's size as 16-bit 4:4:4 BT.709 limited, square
+    pixels, then — when the picture does not fill the frame — the centred pad, in full-range black
+    (see the section comment: below black, which the LUT clamps to exactly source black's code).
+    SQUARE PIXELS (2026-10-18 review): zscale keeps the input's DISPLAY aspect by rewriting the
+    output's sample aspect whenever the new size's ratio differs from the old one's — and
+    fit_geometry's even rounding and hairline snap always differ a little (1080x1920 -> 1216 wide
+    for 1215 is sar 1215:1216; 854x480 stretched to 3840x2160 is 1281:1280). VideoToolbox writes
+    that into the HEVC VUI, MP4Box keeps it and the y4m pipe hands it to x265, so a player that
+    honours it would rescale the whole 4K frame to 3837 / 3843 wide. The fitted picture IS square
+    by construction (the snap is the deliberate, sub-0.2% stretch), so the step says so: setsar=1,
+    as square_vf does."""
+    w, h, x, y = fit_geometry(width, height, sar, frame)
+    vf = (f"zscale=w={w}:h={h}:filter=lanczos:param_a={FIT_TAPS}:rangein=limited:range=limited,"
+          "format=yuv444p16le,setsar=1")
+    if (w, h) != (int(frame[0]), int(frame[1])):
+        vf += (f",setparams=range=pc,pad={int(frame[0])}:{int(frame[1])}:{x}:{y}:color=black,"
+               "setparams=range=tv")
+    return vf
+
+
+def _front_tag(value, table: dict, what: str):
+    """A matrix / primaries tag as its zscale name; None when untagged. Raises for a tag no
+    standard front end turns into the LUT's BT.709 input."""
+    if value in _UNTAGGED:
+        return None
+    if value not in table:
+        raise ValueError(f"the source {what} are {value} (the LUT takes BT.709, and BT.601 through "
+                         "the front end)")
+    return table[value]
+
+
+def colour_front(info: dict) -> tuple:
+    """PURE. A source's ffprobe stream tags -> (matrix, primaries, full_range): what its Y'CbCr
+    is converted FROM to become the LUT's input, BT.709 limited (zscale names "709", "170m",
+    "470bg"). A tag says it when there is one. An untagged matrix or primaries follows the other
+    one's family when that one is tagged (a smpte170m matrix with no primaries tag is SMPTE-C);
+    with neither tagged the frame decides (the route plan's rule; the width guard is mpv's): SD
+    (at most SD_MAX_LINES lines, narrower than HD_MIN_WIDTH) is BT.601 — EBU primaries at exactly PAL_LINES, SMPTE-C
+    otherwise — and anything larger is BT.709. Range: "pc" is full, anything else limited.
+    Raises ValueError (the reason) for a source no standard front end makes the LUT's input:
+    unknown size, HDR, another transfer, matrix or primaries (BT.2020, RGB, ...)."""
+    info = info if isinstance(info, dict) else {}
+    w, h = _int0(info.get("width")), _int0(info.get("height"))
+    if w <= 0 or h <= 0:
+        raise ValueError("the source's size is unknown")
+    trc = info.get("color_transfer")
+    if trc in ("smpte2084", "arib-std-b67"):
+        raise ValueError(f"the source is already HDR ({trc})")
+    if trc not in _UNTAGGED and trc not in SDR_TRANSFERS:
+        raise ValueError(f"the source transfer is {trc}, not BT.709's curve (the LUT's input)")
+    rng = info.get("color_range")
+    if rng not in _UNTAGGED and rng not in ("tv", "pc"):
+        raise ValueError(f"the source range is {rng}")
+    m = _front_tag(info.get("color_space"), _FRONT_MATRIX, "matrix")
+    p = _front_tag(info.get("color_primaries"), _FRONT_PRIMARIES, "primaries")
+    if m is None and p is None:
+        sd = h <= SD_MAX_LINES and w < HD_MIN_WIDTH
+        m = p = ("470bg" if h == PAL_LINES else "170m") if sd else "709"
+    elif m is None:
+        m = p                       # the 601 matrix is one matrix under either name
+    elif p is None:
+        p = m
+    return m, p, rng == "pc"
+
+
+def colour_vf(matrix: str, primaries: str, full: bool = False) -> str:
+    """PURE. The colour step: '' when the source already is the LUT's BT.709 limited Y'CbCr, else
+    one zscale to BT.709 limited 16-bit 4:4:4 at the source's size — the matrix and range always,
+    and the primaries (through linear light, BT.709's curve both ways) when they are not
+    BT.709's. The transfer and the primaries are named explicitly, so an untagged source is
+    converted by the rule colour_front applied, never by whatever the frame says."""
+    names = ("709", "170m", "470bg")
+    if matrix not in names or primaries not in names:
+        raise ValueError(f"no colour front end from matrix {matrix!r} / primaries {primaries!r}")
+    if (matrix, primaries, bool(full)) == ("709", "709", False):
+        return ""
+    vf = f"zscale=matrixin={matrix}:rangein={'full' if full else 'limited'}"
+    if primaries != "709":
+        vf += f":transferin=709:primariesin={primaries}:transfer=709:primaries=709"
+    return vf + ":matrix=709:range=limited,format=yuv444p16le"
+
+
+def fit_front_end(info: dict, frame=FIT_FRAME) -> str:
+    """PURE. The whole fit front end for a source with these ffprobe stream tags (width, height,
+    sample_aspect_ratio, colour tags): colour (if any), then the fit — a pre_vf for the LUT
+    chain. Raises ValueError (colour_front's reason) for a source it cannot take."""
+    m, p, full = colour_front(info)
+    parts = (colour_vf(m, p, full),
+             fit_pad_vf(info.get("width"), info.get("height"), info.get("sample_aspect_ratio"), frame))
+    return ",".join(part for part in parts if part)
+
+
+# THE CHUNK FRONT END (chunk_front_end; 2026-10-18, the Topaz chunk routes past the TV lane's
+# 720p+ BT.709 episodes: sd_sdr_topaz in the chunk lane, and the native render from chunks for
+# movie_sdr_topaz — and sd_sdr_topaz when the lane declines it). Topaz upscales in the source's own
+# Y'CbCr and tags each chunk with the source's colour (topaz.color_flags): a 480p DVD episode's
+# chunk is BT.601 Y'CbCr tagged smpte170m, at 2880x2160 for 4:3. Measured 2026-10-18 on It's
+# Always Sunny 2x06's chunk 0: its Y'CbCr, area-scaled back to 640x480, fits the source's with a
+# diagonal of 0.99-1.04 and cross terms of at most 0.03 over five frames — Topaz kept the BT.601
+# matrix both ways (a 601/709 mix-up shows cross terms near 0.1). The LUT takes BT.709, so:
+#   1. colour  colour_vf from the CHUNK's tags, the same standard conversion the fit front end
+#              uses (user decision: no further Resolve captures). An UNTAGGED chunk is judged by the
+#              SOURCE's frame (colour_front's SD rule) — by its own 4K frame every untagged SD
+#              source would read as BT.709
+#   2. square  a chunk with non-square pixels (an anamorphic DVD: Topaz keeps the sample aspect,
+#              720x480 8:9 -> 3240x2160 8:9) is resampled to square pixels at its own height
+#              (Lanczos, 3 taps; 8:9 -> 2880x2160, 32:27 -> 3840x2160), so the master never
+#              depends on a player honouring a sample aspect. A square chunk keeps its own frame,
+#              as the TV lane's 2880x2160 4:3 episodes always have (no pad: the TV pillarboxes)
+#   3. the LUT chain, unchanged.
+# '' when the chunk already is the LUT's input — square BT.709 limited, every TV-lane chunk.
+CHUNK_MAX_WIDTH = 4096          # the widest square frame it makes (HEVC level 5.1's 4096x2176)
+
+
+def square_vf(width, height, sar=None) -> str:
+    """PURE. '' for square pixels; else Lanczos to (width x sar, rounded even) x height as 16-bit
+    4:4:4 BT.709 limited, then sar 1. Raises ValueError for an unknown size or a square frame
+    wider than CHUNK_MAX_WIDTH."""
+    w0, h0 = _int0(width), _int0(height)
+    if w0 <= 0 or h0 <= 0:
+        raise ValueError(f"the chunk's size is unknown ({width}x{height})")
+    s = _sar(sar)
+    if s == 1:
+        return ""
+    w = _even(Fraction(w0) * s)
+    if w > CHUNK_MAX_WIDTH:
+        raise ValueError(f"a {w0}x{h0} chunk at sample aspect {sar} is {w} pixels wide square, "
+                         f"over {CHUNK_MAX_WIDTH}")
+    return (f"zscale=w={w}:h={h0}:filter=lanczos:param_a={FIT_TAPS}:rangein=limited:range=limited,"
+            "format=yuv444p16le,setsar=1")
+
+
+def chunk_front_end(chunk: dict, source: dict | None = None) -> str:
+    """PURE. The front end for a Topaz chunk of an SDR source (section comment): `chunk` is chunk
+    0's ffprobe stream tags (width, height, sample_aspect_ratio, colour), `source` the source's
+    (only its width and height are read: the untagged rule). Colour (if any), then square pixels
+    (if needed) — a pre_vf for the LUT chain, '' for none. Raises ValueError (the reason) for a
+    chunk no standard front end makes the LUT's input."""
+    chunk = chunk if isinstance(chunk, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    judged = dict(chunk)
+    if _int0(source.get("width")) > 0 and _int0(source.get("height")) > 0:
+        judged.update(width=source["width"], height=source["height"])
+    m, p, full = colour_front(judged)
+    # PILLARBOX LIKE RESOLVE (2026-10-18): Resolve's SD masters are a full 3840x2160 frame with the
+    # 4:3 picture centred (It's Always Sunny 2x06's render, measured). A Topaz chunk of an SD
+    # source is 2880x2160, and shipping that bare would be a size no master has ever had on the
+    # SHIELD's Dolby Vision decoder. So a chunk whose picture does not fill the frame gets the
+    # same fit-and-pad step as a plain YouTube size (square pixels included). ONLY for an SD
+    # source: the 720p+ lane (live) ships 4:3 HD at 2880x2160 and scope at 3840x1600 unpadded,
+    # and its front end must not change under it.
+    w, h = chunk.get("width"), chunk.get("height")
+    sar = chunk.get("sample_aspect_ratio")
+    sw, sh = _int0(source.get("width")), _int0(source.get("height"))
+    sd = 0 < sh <= 576 and 0 < sw < 1280
+    try:
+        fills = fit_geometry(w, h, sar)[:2] == (int(FIT_FRAME[0]), int(FIT_FRAME[1]))
+    except ValueError:
+        fills = True
+    shape = square_vf(w, h, sar)            # first: it refuses a picture too wide to square
+    if sd and not fills:
+        shape = fit_pad_vf(w, h, sar)
+    parts = (colour_vf(m, p, full), shape)
+    return ",".join(part for part in parts if part)
+
+
+# ---- colour: HDR intake (no LUT) ---------------------------------------------------------
+# An HDR source is already the master's colour: BT.2020 primaries, the BT.2020 non-constant-
+# luminance matrix, limited range. PQ needs no front end at all — the picture is measured and
+# encoded as it is. HLG is converted to PQ by the standard BT.2100 conversion (user decision
+# 2026-10-15: standard conversions, no new Resolve captures): zimg's HLG inverse OETF, then
+# BT.2100's display-referred OOTF for a HLG_NPL-nit display (system gamma 1.2 at 1000 nits),
+# then the PQ inverse EOTF — BT.2408's "HLG to PQ at 1000 cd/m2", which puts HLG's 75% reference
+# white at 203 nits. zimg FIXES that display at 1000 nits: zscale's `npl` scales only SDR transfers
+# and is ignored for HLG (measured 2026-10-18: npl 203 / 1000 / 4000 / unset all give the same
+# codes), so the chain names no npl — HLG_NPL is the peak it converts for, which the test pins
+# (E' 1.0 -> 1000 nits, 0.75 -> 203). Primaries and matrix stay BT.2020; every property is named
+# explicitly, so the frame's own tags never decide anything. It runs at the source's size in
+# 16-bit 4:4:4 (zimg works in float), like the SDR fit front end, and the 1000-nit master is
+# exactly the display it is converted for (the RPU keeps dvnative's default mastering).
+PQ, HLG = "smpte2084", "arib-std-b67"
+HLG_NPL = 1000                  # the display peak zimg converts HLG for (BT.2408's reference); fixed
+_BT2020_PRIMARIES = ("bt2020",)
+_BT2020_MATRIX = ("bt2020nc",)  # constant-luminance BT.2020 (bt2020c) is refused: nothing makes it
+
+
+def hlg_to_pq_vf() -> str:
+    """PURE. The HLG -> PQ front end: BT.2020 limited Y'CbCr in, HLG -> PQ through display light
+    on an HLG_NPL-nit display (BT.2100's OOTF, system gamma 1.2), BT.2020 limited 16-bit 4:4:4 out."""
+    return ("zscale=matrixin=2020_ncl:transferin=arib-std-b67:primariesin=2020:rangein=limited:"
+            "matrix=2020_ncl:transfer=smpte2084:primaries=2020:range=limited,format=yuv444p16le")
+
+
+def hdr_front_end(info: dict):
+    """PURE. An HDR source's ffprobe stream tags -> its front end: None for PQ (nothing to do),
+    hlg_to_pq_vf() for HLG. Untagged primaries or matrix are read as BT.2020 (BT.2100 has no
+    other); full range, another primaries / matrix tag, or a transfer that is neither PQ nor HLG
+    raises ValueError (the reason), and the route stays on Resolve."""
+    info = info if isinstance(info, dict) else {}
+    trc = info.get("color_transfer")
+    if trc not in (PQ, HLG):
+        raise ValueError(f"the source transfer is {trc or 'untagged'}, not PQ or HLG")
+    for key, label, ok in (("color_primaries", "primaries", _BT2020_PRIMARIES),
+                           ("color_space", "matrix", _BT2020_MATRIX)):
+        v = info.get(key)
+        if v not in _UNTAGGED and v not in ok:
+            raise ValueError(f"the source {label} are {v}, not BT.2020 (an HDR master's)")
+    rng = info.get("color_range")
+    if rng not in _UNTAGGED and rng != "tv":
+        raise ValueError(f"the source is {'full' if rng == 'pc' else rng} range (an HDR master is "
+                         "limited range)")
+    return None if trc == PQ else hlg_to_pq_vf()
 
 
 # ---- hdr-analyze ------------------------------------------------------------------------
@@ -996,7 +1354,8 @@ AVG_FLOORS = ("V40", "V29")      # CM v4.0 floor 1229 (Resolve's own minimum; th
 
 
 def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = None,
-               l4: bool = True, avg_floor: str = "V40", master: MasterSpec = DEFAULT_MASTER) -> dict:
+               l4: bool = True, avg_floor: str = "V40", master: MasterSpec = DEFAULT_MASTER,
+               light: tuple | None = None) -> dict:
     """PURE. Sidecar -> `dovi_tool generate` JSON for Profile 8.1, CM v4.0.
 
     Shots follow the analyzer's scenes. Undecodable leading pictures come first in
@@ -1006,16 +1365,22 @@ def rpu_config(sc: dict, *, max_cll: int | None = None, max_fall: int | None = N
     819 (`avg_floor="V29"` selects that instead, for the blind A/B). `long_play_mode` flags
     a scene refresh on every frame, as Resolve does. With a per-frame "l4" list, every frame
     carries Level4 through a frame edit. `master` sets the mastering range, the source range
-    L1 is clamped to and the L2 targets; its default is Resolve's 1000-nit project."""
+    L1 is clamped to and the L2 targets; its default is Resolve's 1000-nit project. `light`
+    (MaxCLL, MaxFALL) is declared in L6 EXACTLY as given — an HDR source's own content light
+    level (source_mastering), which the stream's HDR10 SEI says too — and then max_cll /
+    max_fall and the measurement are not used; None (the default) keeps the rule above."""
     if avg_floor not in AVG_FLOORS:
         raise ValueError(f"avg_floor must be one of {AVG_FLOORS}")
     peak = int(master.max_nits)
-    if max_cll is None or max_fall is None:
-        m_cll, m_fall = light_levels(sc, master)
-        max_cll = max_cll if max_cll is not None else (m_cll or peak)
-        max_fall = max_fall if max_fall is not None else (m_fall or peak)
-    max_cll = min(int(max_cll), peak)
-    max_fall = min(int(max_fall), max_cll)
+    if light is not None:
+        max_cll, max_fall = int(light[0]), int(light[1])
+    else:
+        if max_cll is None or max_fall is None:
+            m_cll, m_fall = light_levels(sc, master)
+            max_cll = max_cll if max_cll is not None else (m_cll or peak)
+            max_fall = max_fall if max_fall is not None else (m_fall or peak)
+        max_cll = min(int(max_cll), peak)
+        max_fall = min(int(max_fall), max_cll)
     lead = leading_frames(sc)
     frames_l4 = sc.get("l4") if l4 else None
     length = stream_frames(sc)
@@ -1066,14 +1431,16 @@ def build_generate_command(dovi_tool: str, config_json: str, rpu_out: str) -> li
 
 def generate_rpu(sidecar, rpu_out: str, *, dovi_tool: str = DOVI_TOOL, l4: bool = True,
                  avg_floor: str = "V40", max_cll: int | None = None, max_fall: int | None = None,
-                 timeout: int = 600, master: MasterSpec = DEFAULT_MASTER) -> dict:
+                 timeout: int = 600, master: MasterSpec = DEFAULT_MASTER,
+                 light: tuple | None = None) -> dict:
     """Sidecar (file path, or an already-merged dict) -> binary RPU at `rpu_out` (atomic:
     written to .part, then renamed). Returns the config used. Raises RuntimeError when
-    dovi_tool refuses it. `master` as in rpu_config (default: today's RPU, byte for byte)."""
+    dovi_tool refuses it. `master` and `light` as in rpu_config (defaults: today's RPU, byte
+    for byte)."""
     sc = load_sidecar(sidecar) if isinstance(sidecar, str) else sidecar
     validate_sidecar(sc)
     cfg = rpu_config(sc, max_cll=max_cll, max_fall=max_fall, l4=l4, avg_floor=avg_floor,
-                     master=master)
+                     master=master, light=light)
     cfg_path = rpu_out + ".generate.json"
     with open(cfg_path, "w") as f:
         json.dump(cfg, f)

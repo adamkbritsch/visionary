@@ -164,7 +164,8 @@ class Eligibility(unittest.TestCase):
                 self.assertFalse(nativelane.source_ok(info)[0])
 
     def test_effective_mode_mirrors_the_resolve_stage(self):
-        for override, want in (("auto", "dv1000"), ("dv2000", "dv2000"), ("sdr", "sdr"),
+        # 2026-10-18: the 2000-nit mode is retired — a show still pinned to it is dv1000
+        for override, want in (("auto", "dv1000"), ("dv2000", "dv1000"), ("sdr", "sdr"),
                                ("dv1000", "dv1000"), ("junk", "dv1000")):
             with mock.patch.object(nativelane.settings, "get_show_output_mode", return_value=override):
                 self.assertEqual(nativelane.effective_mode(_item()), want)
@@ -182,8 +183,10 @@ class Decide(Fixture):
     COLOUR = {"height": 2160, "color_primaries": "bt709", "color_space": "bt709",
               "color_range": "tv"}
 
-    def decide(self, setting="native", pl=None, colour=None, tool=(True, "ok"), disk=(True, "room")):
+    def decide(self, setting="native", pl=None, colour=None, tool=(True, "ok"), disk=(True, "room"),
+               sd_on=False):
         with mock.patch.object(nativelane, "engine_setting", return_value=setting), \
+             mock.patch.object(nativelane, "sd_route_on", return_value=sd_on), \
              mock.patch.object(nativelane, "probe_stream", return_value=colour or self.COLOUR), \
              mock.patch.object(nativelane, "toolchain_ok", return_value=tool), \
              mock.patch.object(nativelane, "disk_fits", return_value=disk):
@@ -196,6 +199,7 @@ class Decide(Fixture):
         """U1: with the default 'resolve', no probe, plan, toolchain or disk check runs."""
         boom = mock.Mock(side_effect=AssertionError("must not be called"))
         with mock.patch.object(nativelane, "engine_setting", return_value="resolve"), \
+             mock.patch.object(nativelane, "sd_route_on", return_value=False), \
              mock.patch.object(nativelane, "probe_stream", boom), \
              mock.patch.object(nativelane, "toolchain_ok", boom), \
              mock.patch.object(nativelane, "disk_fits", boom), \
@@ -348,6 +352,21 @@ class Cfr(unittest.TestCase):
         self.assertFalse(nativelane.cfr_check(100, None, FPS, FPS)[0])
         self.assertFalse(nativelane.cfr_check(100, 100, None, FPS)[0])
         self.assertFalse(nativelane.cfr_check(100, 100, FPS, "0/0")[0])
+
+    def test_probe_stream_asks_exactly_what_it_always_asked_unless_told_more(self):
+        # The native render's fit routes ask for the sample aspect ratio as well (2026-10-18); the
+        # lane's own probe — what decide() and source_ok() read — must be the very same argv.
+        old = [nativelane.dvcap.FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=width,height,pix_fmt,r_frame_rate,color_primaries,color_space,"
+               "color_transfer,color_range", "-of", "json", "/c.mp4"]
+        out = types.SimpleNamespace(stdout=json.dumps({"streams": [{"width": 1920, "height": 1080}]}))
+        with mock.patch.object(nativelane.subprocess, "run", return_value=out) as run:
+            self.assertEqual(nativelane.probe_stream("/c.mp4"), {"width": 1920, "height": 1080})
+            nativelane.probe_stream("/c.mp4", extra=("sample_aspect_ratio",))
+        self.assertEqual(run.call_args_list[0].args[0], old)
+        more = list(old)
+        more[6] += ",sample_aspect_ratio"
+        self.assertEqual(run.call_args_list[1].args[0], more)
 
     def test_normalize_fps(self):
         self.assertEqual(nativelane.normalize_fps("24000/1001"), "24000/1001")
@@ -961,6 +980,231 @@ class RunAnalysisResume(_RunAnalysisBase):
             n = nativelane.count_failure(self.p, msg)
             self.assertEqual(n, attempt)
             self.assertEqual(nativelane.should_fall_back(msg, n), attempt == 2)
+
+
+# ---- the SD route (sd_sdr_topaz, 2026-10-18) ----------------------------------------------
+
+SD_CHUNK = {"width": 2880, "height": 2160, "sample_aspect_ratio": "1:1", "color_primaries": "smpte170m",
+            "color_space": "smpte170m", "color_transfer": "smpte170m"}   # Always Sunny 2x06's chunk 0
+SD_SOURCE = {"width": 640, "height": 480}
+SD_COLOUR = ("zscale=matrixin=170m:rangein=limited:transferin=709:primariesin=170m:transfer=709:"
+             "primaries=709:matrix=709:range=limited,format=yuv444p16le")
+SD_PILLAR = dvnative.fit_pad_vf(2880, 2160, "1:1")    # 4:3 SD pillarboxed to 3840x2160, as Resolve did
+SD_CHAIN = SD_COLOUR + "," + SD_PILLAR
+
+
+def _sd_plan(**kw):
+    return _plan(res="480p", scale=4, fit_height=2160, input=dict(SD_SOURCE), **kw)
+
+
+class SdRoute(unittest.TestCase):
+    def test_the_switch_is_dv_routes_never_dv_engine(self):
+        for routes, want in (({"sd_sdr_topaz": "native"}, True), ({"sd_sdr_topaz": "resolve"}, False),
+                             ({}, False), ({"yt_plain": "native"}, False)):
+            with self.subTest(routes=routes), \
+                 mock.patch.object(nativelane.settings, "dv_routes", return_value=routes), \
+                 mock.patch.object(nativelane.settings, "dv_engine", return_value="native", create=True):
+                self.assertEqual(nativelane.sd_route_on(), want)
+        with mock.patch.object(nativelane.settings, "dv_route", side_effect=OSError):
+            self.assertFalse(nativelane.sd_route_on())          # unreadable -> off
+        self.assertEqual(nativelane.SD_ROUTE, "sd_sdr_topaz")
+        import routes as routes_mod
+        self.assertIn(nativelane.SD_ROUTE, routes_mod.ROUTES)
+        self.assertEqual(nativelane.SD_RES, routes_mod.SD_RES)
+
+    def test_lane_on_reads_dv_engine_first(self):
+        sd = mock.Mock(return_value=True)
+        with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
+             mock.patch.object(nativelane, "sd_route_on", sd):
+            self.assertTrue(nativelane.lane_on())
+        sd.assert_not_called()                                    # today's one read, nothing more
+        for sd_on in (True, False):
+            with mock.patch.object(nativelane, "engine_setting", return_value="resolve"), \
+                 mock.patch.object(nativelane, "sd_route_on", return_value=sd_on):
+                self.assertEqual(nativelane.lane_on(), sd_on)
+
+    def test_eligibility_takes_480p_only_when_the_caller_says_the_route_is_on(self):
+        off = nativelane.eligible(_item(), _sd_plan(), "dv1000")
+        self.assertEqual(off, (False, "a 480p-bucket source (480p/BT.601 stays on Resolve)"))   # today's
+        self.assertEqual(nativelane.eligible(_item(), _sd_plan(), "dv1000", sd=True), (True, "eligible"))
+        for name, (p, pl, mode) in {"movie": (_item(movie=True), _sd_plan(), "dv1000"),
+                                    "youtube": (_item(youtube=True), _sd_plan(), "dv1000"),
+                                    "HDR intake": (_item(), _sd_plan(resolve="add_dv"), "dv1000"),
+                                    "sdr output": (_item(), _sd_plan(), "sdr"),
+                                    "no plan": (_item(), {}, "dv1000")}.items():
+            with self.subTest(name):
+                self.assertFalse(nativelane.eligible(p, pl, mode, sd=True)[0])
+        self.assertTrue(nativelane.eligible(_item(), _plan(), "dv1000", sd=True)[0])   # 1080p unaffected
+
+    def test_sd_front_reads_the_chunk_tags_and_the_source_frame(self):
+        self.assertEqual(nativelane.sd_front(SD_CHUNK, SD_SOURCE), (True, SD_CHAIN))
+        untagged = {"width": 2880, "height": 2160}
+        self.assertEqual(nativelane.sd_front(untagged, SD_SOURCE), (True, SD_CHAIN))      # SD -> 601
+        self.assertEqual(nativelane.sd_front(untagged, {"width": 1920, "height": 1080}), (True, ""))
+        bt709 = dict(SD_CHUNK, color_primaries="bt709", color_space="bt709", color_transfer="bt709")
+        self.assertEqual(nativelane.sd_front(bt709, SD_SOURCE), (True, SD_PILLAR))      # no 601, still SD
+        ok, chain = nativelane.sd_front(dict(untagged, width=3240, sample_aspect_ratio="8:9"),
+                                        {"width": 720, "height": 480})
+        self.assertTrue(ok)
+        self.assertEqual(chain, SD_COLOUR + "," + dvnative.fit_pad_vf(3240, 2160, "8:9"))   # squared, pillar
+        self.assertIn(",setsar=1,", chain)
+        for name, info in {"unprobed": {}, "under 720": dict(SD_CHUNK, height=480),
+                           "PQ": dict(SD_CHUNK, color_transfer="smpte2084"),
+                           "BT.2020": dict(SD_CHUNK, color_primaries="bt2020", color_space="bt2020nc")}.items():
+            with self.subTest(name):
+                ok, why = nativelane.sd_front(info, SD_SOURCE)
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith("chunk 0"), why)
+
+
+class DecideSd(Fixture):
+    def decide(self, setting="native", sd_on=True, pl=None, colour=None, tool=(True, "ok"),
+               disk=(True, "room"), probe=None):
+        probe = probe or mock.Mock(return_value=colour or SD_CHUNK)
+        with mock.patch.object(nativelane, "engine_setting", return_value=setting), \
+             mock.patch.object(nativelane, "sd_route_on", return_value=sd_on), \
+             mock.patch.object(nativelane, "probe_stream", probe), \
+             mock.patch.object(nativelane, "toolchain_ok", return_value=tool), \
+             mock.patch.object(nativelane, "disk_fits", return_value=disk):
+            return nativelane.decide(self.p, pl=pl or _sd_plan(), mode="dv1000")
+
+    def tearDown(self):
+        nativelane._SD_CLAIMS.clear()
+        super().tearDown()
+
+    def test_with_the_route_off_an_sd_episode_is_resolve_exactly_as_today(self):
+        probe = mock.Mock(side_effect=AssertionError("must not be probed"))
+        engine, why = self.decide(sd_on=False, probe=probe)
+        self.assertEqual((engine, why), ("resolve", "a 480p-bucket source (480p/BT.601 stays on Resolve)"))
+        self.assertIsNone(nativelane.sd_claim(self.p))
+
+    def test_an_hd_episode_never_reads_the_sd_switch_while_dv_engine_is_native(self):
+        sd = mock.Mock(side_effect=AssertionError("must not be read"))
+        with mock.patch.object(nativelane, "engine_setting", return_value="native"), \
+             mock.patch.object(nativelane, "sd_route_on", sd), \
+             mock.patch.object(nativelane, "probe_stream", return_value=Decide.COLOUR), \
+             mock.patch.object(nativelane, "toolchain_ok", return_value=(True, "ok")), \
+             mock.patch.object(nativelane, "disk_fits", return_value=(True, "room")):
+            self.assertEqual(nativelane.decide(self.p, pl=_plan(), mode="dv1000"), ("native", "eligible"))
+        self.assertIsNone(nativelane.sd_claim(self.p))
+
+    def test_route_on_claims_with_the_601_front_end_and_probes_the_sample_aspect(self):
+        probe = mock.Mock(return_value=SD_CHUNK)
+        for setting in ("native", "resolve"):                 # dv_engine does not matter
+            with self.subTest(dv_engine=setting):
+                engine, why = self.decide(setting=setting, probe=probe)
+                self.assertEqual(engine, "native")
+                self.assertIn("SD", why)
+                self.assertEqual(nativelane.sd_claim(self.p), SD_CHAIN)
+                self.assertEqual(probe.call_args, mock.call(os.path.join(self.segdir, "seg_0000.mov"),
+                                                            extra=("sample_aspect_ratio",)))
+
+    def test_route_on_alone_never_opens_the_720p_lane(self):
+        engine, why = self.decide(setting="resolve", sd_on=True, pl=_plan(), colour=Decide.COLOUR)
+        self.assertEqual(engine, "resolve")
+        self.assertIn("dv_engine is 'resolve'", why)
+        self.assertIsNone(nativelane.sd_claim(self.p))
+
+    def test_both_switches_off_touch_nothing(self):
+        probe = mock.Mock(side_effect=AssertionError("must not be probed"))
+        with mock.patch("plan.plan_for", probe):
+            self.assertEqual(self.decide(setting="resolve", sd_on=False, probe=probe)[0], "resolve")
+
+    def test_an_sd_chunk_it_cannot_convert_is_resolve(self):
+        engine, why = self.decide(colour=dict(SD_CHUNK, color_transfer="smpte2084"))
+        self.assertEqual(engine, "resolve")
+        self.assertIn("already HDR", why)
+        self.assertIsNone(nativelane.sd_claim(self.p))
+
+    def test_disk_and_toolchain_still_decide(self):
+        self.assertEqual(self.decide(disk=(False, "projected 1 < 2"))[0], "resolve")
+        self.assertEqual(self.decide(tool=(False, "dovi_tool is 2.2.0"))[0], "resolve")
+        self.assertIsNone(nativelane.sd_claim(self.p))
+
+
+class MarkerSd(Fixture):
+    def test_a_tv_marker_is_exactly_what_it_always_was(self):
+        m = nativelane.begin_marker(self.p, nativelane.chunks(self.segdir), FPS, self.cfr_facts())
+        self.assertNotIn("pre_vf", m)
+        self.assertEqual(m["vf"], dvnative.lut_vf(self.lut))
+        self.assertEqual(m["analysis_vf"], dvnative.analysis_vf(self.lut))
+        self.assertEqual(nativelane.marker_inputs(self.p, nativelane.chunks(self.segdir), FPS,
+                                                  self.cfr_facts(), None),
+                         nativelane.marker_inputs(self.p, nativelane.chunks(self.segdir), FPS,
+                                                  self.cfr_facts()))
+
+    def test_an_sd_marker_carries_its_front_end_into_every_chain(self):
+        cl = nativelane.chunks(self.segdir)
+        m = nativelane.begin_marker(self.p, cl, FPS, self.cfr_facts(), SD_CHAIN)
+        self.assertEqual(m["pre_vf"], SD_CHAIN)
+        self.assertEqual(m["vf"], SD_CHAIN + "," + dvnative.lut_vf(self.lut))
+        self.assertEqual(m["analysis_vf"], dvnative.analysis_vf(self.lut, SD_CHAIN))
+        with open(nativelane.rpu_path(self.p), "wb") as f:
+            f.write(b"rpu-bytes")
+        with mock.patch.object(nativelane.dvcap, "rpu_frame_count", return_value=TOTAL):
+            nativelane.publish_ready(self.p, _sc())
+        self.assertEqual(nativelane.check_ready(self.p), (True, "ready"))
+        self.assertEqual(nativelane.bundle(self.p)["vf"], SD_CHAIN + "," + dvnative.lut_vf(self.lut))
+
+    def test_a_changed_front_end_re_measures(self):
+        cl = nativelane.chunks(self.segdir)
+        nativelane.begin_marker(self.p, cl, FPS, self.cfr_facts(), SD_CHAIN)
+        os.makedirs(nativelane.work_dir(self.p))
+        keep = os.path.join(nativelane.work_dir(self.p), "chunk_0000.bin.l1.json")
+        open(keep, "w").close()
+        nativelane.begin_marker(self.p, cl, FPS, self.cfr_facts(), SD_CHAIN)       # same: resume
+        self.assertTrue(os.path.exists(keep))
+        nativelane.begin_marker(self.p, cl, FPS, self.cfr_facts())                 # none now
+        self.assertFalse(os.path.exists(keep))
+
+    def test_check_ready_refuses_a_marker_whose_chain_is_not_its_front_end_plus_the_lut(self):
+        cl = nativelane.chunks(self.segdir)
+        nativelane.begin_marker(self.p, cl, FPS, self.cfr_facts(), SD_CHAIN)
+        with open(nativelane.rpu_path(self.p), "wb") as f:
+            f.write(b"rpu-bytes")
+        with mock.patch.object(nativelane.dvcap, "rpu_frame_count", return_value=TOTAL):
+            m = nativelane.publish_ready(self.p, _sc())
+        m = dict(m, vf=dvnative.lut_vf(self.lut))          # the front end dropped from the chain
+        nativelane.write_marker(self.p, m)                  # (re-hashed: only the chain is wrong)
+        self.assertEqual(nativelane.check_ready(self.p), (False, "the LUT filter chain changed"))
+
+
+class RunAnalysisSd(_RunAnalysisBase):
+    def tearDown(self):
+        nativelane._SD_CLAIMS.clear()
+        super().tearDown()
+
+    def test_a_tv_claim_passes_no_front_end(self):
+        ok, msg = self.run_it()
+        self.assertTrue(ok, msg)
+        self.assertNotIn("pre_vf", self.calls["analyze"])
+        self.assertNotIn("pre_vf", nativelane.read_marker(self.p))
+        self.assertNotIn("SD", msg)
+
+    def test_an_sd_first_claim_measures_through_decides_front_end(self):
+        nativelane._SD_CLAIMS[os.path.abspath(self.segdir)] = SD_CHAIN
+        ok, msg = self.run_it()
+        self.assertTrue(ok, msg)
+        self.assertIn("SD chunk front end", msg)
+        self.assertEqual(self.calls["analyze"]["pre_vf"], SD_CHAIN)
+        m = nativelane.read_marker(self.p)
+        self.assertEqual((m["state"], m["pre_vf"]), ("ready", SD_CHAIN))
+        self.assertIsNone(nativelane.sd_claim(self.p))          # consumed by the claim
+        self.assertEqual(nativelane.bundle(self.p)["vf"], SD_CHAIN + "," + dvnative.lut_vf(self.lut))
+
+    def test_a_resume_keeps_the_markers_front_end_whatever_the_switch_says(self):
+        nativelane.begin_marker(self.p, nativelane.chunks(self.segdir), FPS, self.cfr_facts(), SD_CHAIN)
+        ok, msg = self.run_it()                                 # no claim recorded this time
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.calls["analyze"]["pre_vf"], SD_CHAIN)
+        self.assertEqual(nativelane.read_marker(self.p)["pre_vf"], SD_CHAIN)
+
+    def test_an_sd_source_that_needs_no_front_end_is_a_plain_tv_marker(self):
+        nativelane._SD_CLAIMS[os.path.abspath(self.segdir)] = ""
+        ok, msg = self.run_it()
+        self.assertTrue(ok, msg)
+        self.assertNotIn("pre_vf", self.calls["analyze"])
+        self.assertNotIn("pre_vf", nativelane.read_marker(self.p))
 
 
 if __name__ == "__main__":

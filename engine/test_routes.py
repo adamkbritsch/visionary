@@ -102,9 +102,10 @@ def matrix():
     """Every (kind, source, mode) row with the route it must classify as."""
     for name, routes_by_kind in GOLDEN.items():
         for kind, want in zip(KINDS, routes_by_kind):
+            # "dv2000" is RETIRED (2026-10-18): a stale pin names the item exactly as "auto" does
             for mode in ("auto", "dv1000", None, "junk", "dv2000", "sdr"):
-                if mode in ("dv2000", "sdr") and want not in routes.RESOLVE_FREE:
-                    want_m = "dv2000" if mode == "dv2000" else "sdr_out"
+                if mode == "sdr" and want not in routes.RESOLVE_FREE:
+                    want_m = "sdr_out"
                 else:
                     want_m = want
                 yield kind, name, mode, want_m
@@ -182,7 +183,7 @@ class Combine(unittest.TestCase):
     def test_no_rpu_follows_the_pin(self):
         v = {"verdict": {"rpu_from": "resolve"}}
         for mode, want in (("auto", "combine_nodv"), ("dv1000", "combine_nodv"),
-                           ("dv2000", "dv2000"), ("sdr", "sdr_out")):
+                           ("dv2000", "combine_nodv"), ("sdr", "sdr_out")):
             self.assertEqual(routes.classify(item("combine"), plan_of("4k_sdr"), mode, v), want)
 
     def test_a_lost_verdict_names_nothing(self):
@@ -233,8 +234,10 @@ class TVLaneDiskFallback(unittest.TestCase):
                          "movie_sdr_topaz")
         self.assertEqual(routes.classify(item("tv"), plan_of("480p_sdr"), "auto", no),
                          "sd_sdr_topaz")
+        self.assertEqual(routes.classify(item("tv"), plan_of("1080p_sdr"), "sdr", no),
+                         "sdr_out")
         self.assertEqual(routes.classify(item("tv"), plan_of("1080p_sdr"), "dv2000", no),
-                         "dv2000")
+                         "tv_disk_fallback")                    # the retired pin is dv1000
 
 
 class Facts(unittest.TestCase):
@@ -330,6 +333,8 @@ class PinnedToTheStages(unittest.TestCase):
 
     def test_modes(self):
         self.assertEqual(set(routes.MODES) | {"auto"}, set(settings.OUTPUT_MODES))
+        self.assertNotIn("dv2000", routes.ROUTES)               # retired 2026-10-18: no such route
+        self.assertEqual(routes.normalize_mode("dv2000"), "dv1000")
         for key in ("auto", "dv1000", "dv2000", "sdr"):
             with mock.patch.object(settings, "get_show_output_mode", return_value=key):
                 self.assertEqual(routes.normalize_mode(key), settings.effective_output_mode("k"))
@@ -378,8 +383,8 @@ class ItemRoute(unittest.TestCase):
         with mock.patch.object(plan, "probe_input", return_value=SOURCES["4k_sdr"][0]), \
              mock.patch.object(youtube, "settings_scope_for_vid", side_effect=scope.get), \
              mock.patch.object(settings, "get_show_output_mode",
-                               side_effect=lambda k: "dv2000" if k == "import:7" else "auto"):
-            self.assertEqual(routes.item_route(p), "dv2000")
+                               side_effect=lambda k: "sdr" if k == "import:7" else "auto"):
+            self.assertEqual(routes.item_route(p), "sdr_out")
             self.assertEqual(stages._settings_scope(p), "import:7")
 
     def test_a_combine_reads_its_confirmed_verdict(self):

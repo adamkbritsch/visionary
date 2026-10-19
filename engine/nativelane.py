@@ -3,6 +3,8 @@
 settings `dv_engine` = 'native' sends an ELIGIBLE TV episode's DV analysis through dvnative
 (hdr_analyzer_mvp + the pinned SDR->PQ LUT, no screen takeover) instead of Resolve. With the
 default 'resolve' nothing here is consulted for a new item, so every path stays as it was.
+dv_routes {"sd_sdr_topaz": "native"} (2026-10-18) opens the lane to 480p/576p episodes as well,
+with a BT.601 -> BT.709 chunk front end (see "the SD route" below); its own switch, not dv_engine's.
 This module is the lane's bookkeeping; the run thread and the stages call it:
 
   decide(p)        after Topaz: ('native' | 'resolve', why) for this item
@@ -82,6 +84,21 @@ CFR_LONG_TOLERANCE = 1.005      # the CFR's frames (its audio rides on them), as
 ELIGIBLE_RES = ("720p", "1080p")   # plan buckets; 480p/576p sources are BT.601-era SD
 UNKNOWN_TAGS = (None, "", "unknown", "unspecified", "reserved")
 MIN_CHUNK_HEIGHT = 720
+
+# ---- the SD route (2026-10-18) -----------------------------------------------------------
+# sd_sdr_topaz — a TV episode from the 480p/576p bucket (BT.601-era SD) — takes this lane too, with
+# dvnative.chunk_front_end in front of the LUT (BT.601 -> BT.709 by the standard conversion; square
+# pixels for an anamorphic DVD). Its switch is settings dv_routes {"sd_sdr_topaz": "native"} —
+# NEVER dv_engine, which owns the 720p+ episodes (and is already 'native' live): flipping one never
+# moves the other's items. The front end is decided once, at the claim, from chunk 0's tags and the
+# source's frame, and lives in the marker ("pre_vf"; vf and analysis_vf carry it), so a claimed SD
+# item resumes, remuxes and is checked with exactly the chain it was measured with whatever the
+# switch says later. A marker without "pre_vf" is byte for byte the TV lane's.
+SD_ROUTE = "sd_sdr_topaz"          # = routes.py's id (test-pinned)
+SD_RES = "480p"                    # = routes.SD_RES: plan.resolution_bucket's SD bucket (480p and 576p)
+_SD_CLAIMS = {}                    # segdir -> the front end decide() approved for an SD claim, which
+_SD_LOCK = threading.Lock()        # run_analysis' first pass (the next call, same pass) writes into the
+                                   # marker; a TV claim is never in it, so the TV path reads nothing new
 
 # ---- disk (GiB, like every gate in the engine) -------------------------------------------
 # U2, user-decided "Allow below 400 GB": while a finisher-owned native item holds its ProRes,
@@ -233,23 +250,41 @@ def engine_setting() -> str:
     return "native" if v == "native" else "resolve"
 
 
+def sd_route_on() -> bool:
+    """settings dv_routes sets sd_sdr_topaz 'native' (validated on read); anything unreadable is
+    False — a settings hiccup must never pick the new path."""
+    try:
+        return settings.dv_route(SD_ROUTE) == "native"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def lane_on() -> bool:
+    """Could a NEW item take the lane at all: dv_engine 'native' (the 720p+ episodes) or the SD
+    route switched on. dv_engine is read first, so with it 'native' this is the one read it
+    always was."""
+    return engine_setting() == "native" or sd_route_on()
+
+
 def effective_mode(p) -> str:
     """The Resolve-equivalent output mode stages._resolve would use for this TV item: the
-    per-show override when it is a real mode, else dv1000 ("auto" is always 1000 nits)."""
+    per-show override when it is a real mode, else dv1000 ("auto" is always 1000 nits). The
+    2000-nit mode is retired (user decision 2026-10-15): a show still pinned to it is dv1000."""
     try:
         override = settings.get_show_output_mode(p.series)
     except Exception:  # noqa: BLE001
         override = "auto"
-    return override if override in ("sdr", "dv1000", "dv2000") else "dv1000"
+    return override if override in ("sdr", "dv1000") else "dv1000"
 
 
-def eligible(p, plan: dict, mode: str) -> tuple:
+def eligible(p, plan: dict, mode: str, *, sd: bool = False) -> tuple:
     """PURE. (True, "eligible") when the item itself qualifies for the native lane, else
     (False, why). TV only (no movie, YouTube or combine); the Topaz UPSCALE path (fast paths
     rpu-only / resolve-only and already-DV are not); SDR intake ('add_hdr_dv' — the LUT is
-    BT.709 SDR -> PQ, so HDR intake 'add_dv' is out); a 720p+ source (480p/576p are BT.601-era
-    SD); and the dv1000 output mode (dv2000 and sdr stay on Resolve). Chunk colour, the
-    toolchain and disk are decide()'s further checks."""
+    BT.709 SDR -> PQ, so HDR intake 'add_dv' is out); a 720p+ source — or, with `sd` (the caller
+    read the SD route's switch: on), a 480p/576p one, which then takes the chunk front end; and
+    the dv1000 output mode (sdr stays on Resolve). Chunk colour, the toolchain and disk are
+    decide()'s further checks."""
     if getattr(p, "movie", False):
         return False, "a movie (the native lane is TV only)"
     if getattr(p, "youtube", False):
@@ -262,11 +297,30 @@ def eligible(p, plan: dict, mode: str) -> tuple:
     if pl.get("resolve") != "add_hdr_dv":
         return False, (f"plan resolve is {pl.get('resolve')!r}: not an SDR intake "
                        "(the LUT converts BT.709 SDR only)")
-    if pl.get("res") not in ELIGIBLE_RES:
+    if pl.get("res") not in ELIGIBLE_RES and not (sd and pl.get("res") == SD_RES):
         return False, f"a {pl.get('res') or 'unknown'}-bucket source (480p/BT.601 stays on Resolve)"
     if mode != "dv1000":
         return False, f"output mode is {mode}, not dv1000"
     return True, "eligible"
+
+
+def sd_front(info: dict, source: dict | None) -> tuple:
+    """PURE. An SD claim's chunk 0 (ffprobe tags, with sample_aspect_ratio) and the source's probe
+    -> (True, pre_vf) — dvnative.chunk_front_end's chain, '' when the chunk needs none — or
+    (False, why): unprobed, under MIN_CHUNK_HEIGHT lines, or a colour no standard front end makes
+    the LUT's BT.709 input (HDR, BT.2020, another transfer)."""
+    if not info:
+        return False, "chunk 0 could not be probed"
+    try:
+        height = int(info.get("height") or 0)
+    except (TypeError, ValueError):
+        height = 0
+    if height < MIN_CHUNK_HEIGHT:
+        return False, f"chunk 0 is {height} lines, under {MIN_CHUNK_HEIGHT}"
+    try:
+        return True, dvnative.chunk_front_end(info, source)
+    except ValueError as e:
+        return False, f"chunk 0: {e}"
 
 
 def source_ok(info: dict) -> tuple:
@@ -292,13 +346,15 @@ def source_ok(info: dict) -> tuple:
     return True, "BT.709 limited"
 
 
-def probe_stream(path: str) -> dict:
-    """Chunk 0's video stream tags; {} when unreadable."""
+def probe_stream(path: str, extra: tuple = ()) -> dict:
+    """Chunk 0's video stream tags; {} when unreadable. `extra` asks for more stream fields
+    (the native render's fit front end wants sample_aspect_ratio); without it the probe is
+    exactly the lane's own."""
     try:
         out = subprocess.run(
             [dvcap.FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
              "stream=width,height,pix_fmt,r_frame_rate,color_primaries,color_space,"
-             "color_transfer,color_range", "-of", "json", path],
+             "color_transfer,color_range" + "".join("," + str(e) for e in extra), "-of", "json", path],
             capture_output=True, text=True, timeout=60).stdout
         return (json.loads(out).get("streams") or [{}])[0]
     except Exception:  # noqa: BLE001
@@ -634,17 +690,20 @@ def chunk_stats(chunk_list: list) -> list:
     return out
 
 
-def marker_inputs(p, chunk_list: list, fps: str, cfr: dict) -> dict:
-    """Everything the published analysis depends on. Any change re-measures from scratch."""
+def marker_inputs(p, chunk_list: list, fps: str, cfr: dict, pre_vf: str | None = None) -> dict:
+    """Everything the published analysis depends on. Any change re-measures from scratch.
+    `pre_vf` (an SD claim's chunk front end) prefixes vf and analysis_vf and is recorded as
+    "pre_vf" — only when there is one, so a TV marker is exactly what it always was."""
     lut, an = lut_path(), analyzer_path()
-    return {
+    m = {
         "version": MARKER_VERSION,
         "manifest_sha256": sha256_file(os.path.join(_segdir(p), topaz.MANIFEST)),
         "chunks": chunk_stats(chunk_list),
         "total": int(chunk_list[-1][0]),
         "fps": fps,
-        "lut_path": lut, "lut_sha256": sha256_cached(lut), "vf": dvnative.lut_vf(lut),
-        "analysis_vf": dvnative.analysis_vf(lut),
+        "lut_path": lut, "lut_sha256": sha256_cached(lut),
+        "vf": dvnative.front_end(pre_vf) + dvnative.lut_vf(lut),
+        "analysis_vf": dvnative.analysis_vf(lut, pre_vf),
         "analyzer_commit": pin("HDR_ANALYZER_COMMIT"), "analyzer_sha256": sha256_cached(an),
         "peak_estimator": PEAK_ESTIMATOR, "with_l4": WITH_L4,
         "dovi_tool_version": pin("DOVI_TOOL_VERSION"),
@@ -652,6 +711,9 @@ def marker_inputs(p, chunk_list: list, fps: str, cfr: dict) -> dict:
         "cfr": {"frames": cfr.get("frames"), "fps": cfr.get("fps"),
                 "size": cfr.get("size"), "mtime_ns": cfr.get("mtime_ns")},
     }
+    if pre_vf:
+        m["pre_vf"] = pre_vf
+    return m
 
 
 def _clear_outputs(p, *, work: bool) -> None:
@@ -660,14 +722,15 @@ def _clear_outputs(p, *, work: bool) -> None:
         shutil.rmtree(work_dir(p), ignore_errors=True)
 
 
-def begin_marker(p, chunk_list: list, fps: str, cfr: dict) -> dict:
+def begin_marker(p, chunk_list: list, fps: str, cfr: dict, pre_vf: str | None = None) -> dict:
     """Claim the item: write the 'analyzing' marker. When an older marker was made from other
-    inputs (re-Topaz'd chunks, a new LUT or analyzer), its per-chunk results, RPU and sidecar
-    are deleted first so nothing stale is reused; with the same inputs the work dir is kept
-    and the analysis resumes chunk by chunk."""
-    inputs = marker_inputs(p, chunk_list, fps, cfr)
+    inputs (re-Topaz'd chunks, a new LUT or analyzer, another front end), its per-chunk results,
+    RPU and sidecar are deleted first so nothing stale is reused; with the same inputs the work
+    dir is kept and the analysis resumes chunk by chunk."""
+    inputs = marker_inputs(p, chunk_list, fps, cfr, pre_vf)
     old = read_marker(p)
-    same = old is not None and all(old.get(k) == v for k, v in inputs.items())
+    same = (old is not None and all(old.get(k) == v for k, v in inputs.items())
+            and old.get("pre_vf") == inputs.get("pre_vf"))
     _clear_outputs(p, work=not same)
     return write_marker(p, dict(inputs, state="analyzing"))
 
@@ -724,7 +787,7 @@ def check_ready(p) -> tuple:
     if sha256_cached(lut) != m.get("lut_sha256"):
         return False, "the LUT changed"
     try:
-        if dvnative.lut_vf(lut) != m.get("vf"):
+        if dvnative.front_end(m.get("pre_vf")) + dvnative.lut_vf(lut) != m.get("vf"):
             return False, "the LUT filter chain changed"
     except ValueError:
         return False, "the LUT path is unusable"
@@ -838,33 +901,52 @@ def decide(p, *, pl: dict | None = None, mode: str | None = None) -> tuple:
     """('native' | 'resolve', why) for an item whose Topaz is done. In order:
       fallback.json present            -> resolve (sticky, manual or after failures)
       a native marker present          -> native (claimed: the setting no longer matters)
-      dv_engine != 'native'            -> resolve (today's path, byte for byte)
+      dv_engine != 'native' and the SD route off
+                                       -> resolve (today's path, byte for byte)
       eligible() / chunk 0 colour / chunks readable / toolchain_ok() / disk_fits() / the
       toolchain once more, at most CLAIM_TOOLCHAIN_SECONDS old
                                        -> native only when all pass
-    A broken toolchain is a per-item, THIS-TIME answer: the item goes through Resolve and
-    nothing is written (no fallback.json), so items take the lane again once it is fixed.
-    The orchestrator logs `why` (once per reason per item). `pl` (plan.plan_for of the
-    ORIGINAL source) and `mode` may be passed when the caller already has them."""
+    A 720p+ episode needs dv_engine 'native'; a 480p/576p one needs dv_routes sd_sdr_topaz
+    'native' (sd_route_on, read only for an SD source while dv_engine is 'native') and passes
+    sd_front instead of source_ok — its chunk front end is what run_analysis' first pass then
+    writes into the marker (_SD_CLAIMS). A broken toolchain is a per-item, THIS-TIME answer: the
+    item goes through Resolve and nothing is written (no fallback.json), so items take the lane
+    again once it is fixed. The orchestrator logs `why` (once per reason per item). `pl`
+    (plan.plan_for of the ORIGINAL source) and `mode` may be passed when the caller already has
+    them."""
     if has_fallback(p):
         return "resolve", "native fell back for this item (native/fallback.json)"
     if has_marker(p):
         return "native", "claimed by the native lane (native/native.json)"
-    if engine_setting() != "native":
-        return "resolve", "dv_engine is 'resolve'"
+    tv_on = engine_setting() == "native"
+    sd_on = None                            # the SD route's switch, read only when it can matter
+    if not tv_on:
+        sd_on = sd_route_on()
+        if not sd_on:
+            return "resolve", "dv_engine is 'resolve'"
     if pl is None:
         import plan as _plan
         pl = _plan.plan_for(p.source)
-    ok, why = eligible(p, pl, effective_mode(p) if mode is None else mode)
+    sd = pl.get("res") == SD_RES and (sd_route_on() if sd_on is None else sd_on)
+    ok, why = eligible(p, pl, effective_mode(p) if mode is None else mode, sd=sd)
     if not ok:
         return "resolve", why
+    if not sd and not tv_on:
+        return "resolve", (f"dv_engine is 'resolve' (route {SD_ROUTE}, switched on, takes 480p/576p "
+                           "episodes only)")
     try:
         chunk_list = chunks(p.segdir)
     except ValueError as e:
         return "resolve", f"chunks: {e}"
-    ok, why = source_ok(probe_stream(chunk_list[0][1]))
-    if not ok:
-        return "resolve", why
+    if sd:
+        ok, front = sd_front(probe_stream(chunk_list[0][1], extra=("sample_aspect_ratio",)),
+                             pl.get("input"))
+        if not ok:
+            return "resolve", front
+    else:
+        ok, why = source_ok(probe_stream(chunk_list[0][1]))
+        if not ok:
+            return "resolve", why
     ok, why = toolchain_ok()                # cached: a toolchain known to be broken spawns nothing
     if ok:
         ok, why = disk_fits(p)
@@ -875,7 +957,19 @@ def decide(p, *, pl: dict | None = None, mode: str | None = None) -> tuple:
         return "resolve", (f"the native toolchain is not ready, so Resolve takes this item this "
                            f"time (no fallback.json: the lane takes new items again once it is "
                            f"fixed): {why}")
+    if sd:
+        with _SD_LOCK:
+            _SD_CLAIMS[os.path.abspath(p.segdir)] = front
+        return "native", ("eligible (SD: " + ("BT.601 -> BT.709 / square-pixel front end"
+                                              if front else "already square BT.709") + ")")
     return "native", "eligible"
+
+
+def sd_claim(p):
+    """The chunk front end decide() approved for this SD item's claim ('' = none needed), or None
+    when decide() approved no SD claim for it (every TV item): a dict read, nothing else."""
+    with _SD_LOCK:
+        return _SD_CLAIMS.get(os.path.abspath(_segdir(p)))
 
 
 def _toolchain_drift(marker: dict) -> list:
@@ -948,7 +1042,8 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
          "native-fallback: ..." — the analyzer build or LUT sha256 changed, or the chunk set
          changed — and every probe failure is a plain reason, counted by the caller
          (_toolchain_failure / _input_failure)
-      d. write the 'analyzing' marker (claims the item)
+      d. write the 'analyzing' marker (claims the item) — with an SD item's chunk front end
+         (decide()'s, on the first claim; the marker's own on a resume)
       e. dvnative.analyze_chunks into segdir/native/work: nice 10, killable, per-step
          timeouts, the 150 GiB mid-analysis floor, L4 in a child, CPU booked per chunk
       f. generate_rpu (CM v4.0 floor V40); its frame count must equal the chunks'
@@ -976,7 +1071,14 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
     ok, why = cfr_check(total, cfr.get("frames"), fps, cfr.get("fps"))
     if not ok:
         return False, _input_failure(claimed, p, marker, why)
-    begin_marker(p, chunk_list, fps, cfr)
+    # The chunk front end: a claimed item's is its marker's (none for a TV one); an SD item's
+    # first claim takes the one decide() approved — never re-decided, so a resume measures with
+    # exactly the chain the analysis began with.
+    pre_vf = (marker.get("pre_vf") if claimed else sd_claim(p)) or None
+    begin_marker(p, chunk_list, fps, cfr, pre_vf)
+    if not claimed:
+        with _SD_LOCK:
+            _SD_CLAIMS.pop(os.path.abspath(p.segdir), None)
     ends = [a for a, _p in chunk_list[1:]]
 
     def on_chunk(done, of):
@@ -997,7 +1099,8 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
         sc = dvnative.analyze_chunks(chunk_list, work_dir(p), cube=lut_path(), analyzer=analyzer_path(),
                                      peak_estimator=PEAK_ESTIMATOR, with_l4=WITH_L4, abort=abort,
                                      should_pause=should_pause, before_chunk=disk_floor_hook(p.segdir),
-                                     on_chunk=on_chunk, on_cpu=on_cpu)
+                                     on_chunk=on_chunk, on_cpu=on_cpu,
+                                     **({"pre_vf": pre_vf} if pre_vf else {}))
     except dvnative.Paused as e:
         msg = str(e)
         return False, msg if msg.startswith("paused:") else "paused: " + msg
@@ -1012,4 +1115,5 @@ def run_analysis(p, abort=None, progress=None, should_pause=None) -> tuple:
         return False, f"native RPU failed: {e}"
     logbook.event(f"dvnative {ep}: {cpu_line(p, 'analysis')}")
     return True, (f"native DV metadata ready: {len(ends)} chunks, {total} frames, "
-                  f"{m.get('shots')} shots, MaxCLL {m.get('max_cll') or 'unmeasured'}")
+                  f"{m.get('shots')} shots, MaxCLL {m.get('max_cll') or 'unmeasured'}"
+                  + (" (SD chunk front end)" if pre_vf else ""))

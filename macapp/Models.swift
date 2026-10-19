@@ -164,7 +164,7 @@ struct ShowSettingsDTO: Codable {
     var has_featurettes: Bool?
     var normalize_audio: Bool?
     var replace_source: Bool?
-    var output_mode: String?      // "auto" | "sdr" | "dv1000" | "dv2000"
+    var output_mode: String?      // "auto" | "sdr" | "dv1000" (dv2000 retired 2026-10-18)
     var output_mode_effective: String?   // what it will ACTUALLY master as (auto already resolved)
     var extend_borders: Bool?     // AI border extension opt-in (rendered only on 4:3 shows)
     var extend_prompt: String?    // per-show wing prompt ("" = the built-in default)
@@ -180,7 +180,7 @@ struct SeriesShowDTO: Codable, Identifiable {   // one active round-robin show (
     var do_featurettes: Bool?     // per-show: upscale the season-00 specials at all (they always run last)
     var normalize_audio: Bool?    // per-show loudness-boost gate (default on)
     var replace_source: Bool?     // per-show upload policy: master replaces the source (default on)
-    var output_mode: String?      // what Resolve OUTPUTS: auto | sdr | dv1000 | dv2000
+    var output_mode: String?      // what it OUTPUTS: auto | sdr | dv1000 (dv2000 retired)
     var output_mode_effective: String?   // auto already resolved against the source range
     var extend_borders: Bool?     // AI border extension (4:3 -> 16:9) opt-in, default off
     var extend_prompt: String?    // per-show wing prompt ("" = the built-in default)

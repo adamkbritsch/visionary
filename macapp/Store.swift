@@ -295,9 +295,9 @@ final class AppStore: ObservableObject {
         await post("/api/show-profile", ["show": key, "replace_source": on]); await refresh()
     }
 
-    /// What Resolve should OUTPUT for this item. "auto" always resolves to 1000-nit
-    /// Dolby Vision (2000-nit is manual-only); the rest pin it. Note "sdr"
-    /// also changes the master's FILENAME, so it only affects items not yet shipped.
+    /// What this item should OUTPUT. "auto" always resolves to 1000-nit Dolby Vision
+    /// (the 2000-nit target is retired); the rest pin it. Note "sdr" also changes the
+    /// master's FILENAME, so it only affects items not yet shipped.
     func setOutputMode(_ key: String, _ mode: String) async {
         guard !key.isEmpty else { return }
         await post("/api/show-profile", ["show": key, "output_mode": mode]); await refresh()

@@ -550,11 +550,41 @@ class QuietUntilValidator(unittest.TestCase):
 
 class ManualOnly2000Nits(unittest.TestCase):
     def test_auto_never_resolves_to_2000(self):
-        # 2000-nit DV is MANUAL-ONLY (user-dictated 2026-08-09): auto = 1000 nits
-        # whatever the intake range; the pin still wins.
+        # 2000-nit DV was MANUAL-ONLY (user-dictated 2026-08-09) and is now retired: auto = 1000
+        # nits whatever the intake range.
         import settings as s
         self.assertEqual(s.effective_output_mode("unpinned-title", True), "dv1000")
         self.assertEqual(s.effective_output_mode("unpinned-title", False), "dv1000")
+
+
+class Retired2000Nits(unittest.TestCase):
+    """The 2000-nit mode is RETIRED (user decision 2026-10-15): never offered, never stored, and a
+    profile still holding it (written before) reads as the 1000-nit pin it now is."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        p = mock.patch.multiple(settings, CONFIG_DIR=d,
+                                SETTINGS_FILE=os.path.join(d, "settings.json"),
+                                PROFILES_FILE=os.path.join(d, "show_profiles.json"))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_it_is_no_longer_a_mode(self):
+        self.assertEqual(settings.OUTPUT_MODES, ("auto", "sdr", "dv1000"))
+        self.assertNotIn("dv2000", settings.OUTPUT_MODES)
+
+    def test_a_stale_pin_reads_as_dv1000_everywhere(self):
+        settings._save(settings.PROFILES_FILE, {"Spider-Man": {"output_mode": "dv2000", "preset": "x"}})
+        self.assertEqual(settings.get_show_output_mode("Spider-Man"), "dv1000")
+        self.assertEqual(settings.effective_output_mode("Spider-Man", True), "dv1000")
+        self.assertFalse(settings.is_sdr_output("Spider-Man"))
+        self.assertEqual(settings.all_profiles()["Spider-Man"]["output_mode"], "dv2000")   # read-only
+
+    def test_an_older_client_sending_it_stores_dv1000(self):
+        self.assertEqual(settings.set_show_output_mode("Show", "dv2000"), "dv1000")
+        self.assertEqual(settings.all_profiles()["Show"]["output_mode"], "dv1000")
+        for junk, want in (("sdr", "sdr"), ("auto", "auto"), ("dv3000", "auto"), (None, "auto"),
+                           (["dv2000"], "auto")):
+            self.assertEqual(settings.set_show_output_mode("Show", junk), want, repr(junk))
 
 
 class DoFeaturettesReplacesFeaturettesLast(unittest.TestCase):

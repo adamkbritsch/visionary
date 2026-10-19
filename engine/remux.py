@@ -673,23 +673,25 @@ MUX_INTERLEAVE_MS = 100
 
 
 def build_capped_mux_command(mp4box: str, hevc_es: str, fps: str, tracks: str, output: str,
-                             interleave_ms: int = MUX_INTERLEAVE_MS) -> list:
+                             interleave_ms: int = MUX_INTERLEAVE_MS, dv: bool = True) -> list:
     """MP4Box mux for the CAPPED raw HEVC ES (x265 output). `:dvp=8.1` writes the DV config box
     signaling the RPUs x265 interleaved; `:fps=` is REQUIRED — a raw ES carries no container
     timing, so MP4Box would otherwise assume 25 fps and silently desync the master. NO
     `xps_inband`: that made the sample entry `hev1`, which the SHIELD refused to direct-play
     (S05E24 "keeps loading"); without it MP4Box hoists the parameter sets into hvcC -> `hvc1`,
-    matching every master that played (x265's --repeat-headers keeps in-band copies too)."""
-    return [mp4box, "-add", f"{hevc_es}:dvp=8.1:fps={fps}", "-add", tracks,
+    matching every master that played (x265's --repeat-headers keeps in-band copies too).
+    `dv=False` (an SDR master, 2026-10-18): no `:dvp=8.1` — there is no RPU to signal."""
+    return [mp4box, "-add", f"{hevc_es}{':dvp=8.1' if dv else ''}:fps={fps}", "-add", tracks,
             "-inter", str(interleave_ms), "-new", output]
 
 
-def build_capped_video_mux_command(mp4box: str, hevc_es: str, fps: str, output: str) -> list:
+def build_capped_video_mux_command(mp4box: str, hevc_es: str, fps: str, output: str,
+                                   dv: bool = True) -> list:
     """Video-only MP4 wrap of the capped ES — the MKV path's intermediate: MP4Box writes the
     DV config box, then ffmpeg's Matroska muxer (which preserves the DOVI record on copy,
     unlike its mp4 muxer) carries it into the .mkv alongside the audio + bitmap subs.
-    Same no-`xps_inband` rule as above -> `hvc1`."""
-    return [mp4box, "-add", f"{hevc_es}:dvp=8.1:fps={fps}", "-new", output]
+    Same no-`xps_inband` rule as above -> `hvc1`. `dv=False`: an SDR master, no DV box."""
+    return [mp4box, "-add", f"{hevc_es}{':dvp=8.1' if dv else ''}:fps={fps}", "-new", output]
 
 def _rm(path: str):
     try:
@@ -765,10 +767,10 @@ def _tail(text: str, n: int = 12) -> str:
     return "\n".join((text or "").splitlines()[-n:])
 
 
-def _verify(output: str, ffprobe: str) -> RemuxResult:
+def _verify(output: str, ffprobe: str, require_dv: bool = True) -> RemuxResult:
     probe_json = _probe(output, ffprobe)
     s = parse_streams(probe_json)
-    ok, reason = verify_remux(probe_json)
+    ok, reason = verify_remux(probe_json, require_dv=require_dv)
     return RemuxResult(ok, output, s["dovi_profile"], s["audio"], s["subtitle"], reason)
 
 
@@ -796,7 +798,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
           audio_gain_db=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
-          encode_source=None, rpu_mode=None, native=None,
+          encode_source=None, rpu_mode=None, native=None, sdr=False,
           ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the Resolve DV video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -818,9 +820,23 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     the bundle (nothing to probe), the segment plan is the chunk ends (`bounds`, overriding
     `boundaries`), and the mastering display is dvcap's 1000-nit P3 fallback — what the
     generated RPU's L6 declares. `dv_video` is unused: chunk 0 stands in as the nominal
-    source, which the decode chunks override segment by segment."""
+    source, which the decode chunks override segment by segment.
+    `sdr` (2026-10-18, an item PINNED to SDR output, rendered natively: stages._remux passes it
+    only for a render nativerender.sdr_render_ok vouches for) makes the TRUE SDR master from
+    `dv_video` (an SDR render): no RPU anywhere — nothing extracted, the frame count is the
+    render's own packets — the Rec.709 x265 under the same VBV cap (dvcap dv=False), no DV box
+    in the mux, and the verify asks for no DOVI record. The peak gate and its repair ladder, the
+    audio and the resume rules are the DV path's; the resume manifest says "sdr" so the two
+    never share segments. Without it every call below is exactly the DV path's."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     nat_kw, dec_kw = {}, {}   # Resolve path: NO extra kwargs — every dvcap call is the pre-native call
+    sdr_kw, mux_kw = {}, {}   # ...and none for SDR unless asked: the DV calls stay byte-identical
+    if sdr:
+        if native is not None or encode_source is not None or rpu_mode is not None:
+            return RemuxResult(False, output,
+                               reason="an SDR master has no RPU: no native bundle, encode source "
+                                      "or RPU mode applies (shipped nothing)")
+        nat_kw, sdr_kw, mux_kw = {"sdr": True}, {"dv": False}, {"dv": False}
     if native is not None:
         # GUARD BEFORE touching the resume state, like the probe guard below: a bundle whose
         # chunk list does not end at its total would plan (and wipe/resume) a different episode.
@@ -864,7 +880,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     hevc = output + ".capped.hevc"          # transient: the concat of the segments, rebuilt each attempt
     tracks = dv_mp4 = None
     try:
-        if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):   # resume keeps the extracted RPU
+        if sdr:
+            pass                              # no RPU at all: the frame count below is the render's
+        elif not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):   # resume keeps the extracted RPU
             if native is not None:
                 ok, why = _copy_native_rpu(native["rpu"], rpu)
             else:
@@ -875,9 +893,11 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         # RPU frame count is GROUND TRUTH (one per coded frame). The container nb_frames HEADER
         # can over-report a VideoToolbox .mov's decodable tail; planning/slicing the RPU against
         # the header instead → out-of-range dovi_tool remove → permanent park (review-caught).
-        real_frames = dvcap.rpu_frame_count(rpu)
+        real_frames = dvcap.count_hevc_frames(enc, ffprobe) if sdr else dvcap.rpu_frame_count(rpu)
         if real_frames <= 0:
-            return RemuxResult(False, output, reason="could not read RPU frame count — resume state intact")
+            return RemuxResult(False, output, reason=("could not count the SDR render's frames" if sdr
+                                                      else "could not read RPU frame count")
+                                                     + " — resume state intact")
         if native is not None and real_frames != info["frames"]:
             # FAIL FAST before the hours-long encode: the chunks ARE the video, so an RPU of any
             # other length is not their analysis. A shorter one would QUIETLY plan a shorter
@@ -903,7 +923,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
             master_display=info["master_display"], max_cll=info["max_cll"],
             abort=abort, on_progress=on_progress, on_plan=on_plan,
-            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw)
+            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw, **sdr_kw)
         if not ok:
             if why.startswith("paused:"):
                 return RemuxResult(False, output, reason=why)   # benign hold, not a failure
@@ -982,7 +1002,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     enc, rpu, segdir, offenders, tight,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
-                    abort=abort, on_repair=on_repair, ffmpeg=ffmpeg, **dec_kw)
+                    abort=abort, on_repair=on_repair, ffmpeg=ffmpeg, **dec_kw, **sdr_kw)
                 if not ok:
                     return RemuxResult(False, output, reason="peak repair: " + why)
                 # every segment is complete now → this call just re-verifies counts and re-concats
@@ -991,7 +1011,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     enc, rpu, hevc, cap_mbps, segdir=segdir,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
-                    abort=abort, ffmpeg=ffmpeg, **dec_kw)
+                    abort=abort, ffmpeg=ffmpeg, **dec_kw, **sdr_kw)
                 if not ok or frames != real_frames:
                     return RemuxResult(False, output, reason="peak repair concat: " + why)
                 repair_note = f" · peak repair: {len(offenders)} seg(s) re-capped @ {tight} Mbps"
@@ -999,7 +1019,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 # wrap the ES in a video-only MP4 (writes the dvcC), then one ffmpeg copy-mux to MKV
                 dv_mp4 = output + ".dv.mp4"
                 with mp4box_safe_input(hevc) as _hevc_in:
-                    vx = subprocess.run(build_capped_video_mux_command(mp4box, _hevc_in, info["fps"], dv_mp4),
+                    vx = subprocess.run(build_capped_video_mux_command(mp4box, _hevc_in, info["fps"], dv_mp4,
+                                                                       **mux_kw),
                                     capture_output=True, text=True, errors="replace", timeout=timeout)
                 if vx.returncode != 0:
                     return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
@@ -1049,11 +1070,12 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     audio_note = _unboosted_note(mkv_measured, landed, audio_target_lufs)   # MKV branch: mkv_measured
             else:
                 with mp4box_safe_input(hevc) as _hevc_in, mp4box_safe_input(tracks) as _tracks_in:
-                    mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output),
+                    mx = subprocess.run(build_capped_mux_command(mp4box, _hevc_in, info["fps"], _tracks_in, output,
+                                                                 **mux_kw),
                                     capture_output=True, text=True, errors="replace", timeout=timeout)
                 if mx.returncode != 0:
                     return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
-            res = _verify(output, ffprobe)
+            res = _verify(output, ffprobe, **({"require_dv": False} if sdr else {}))
             if not res.ok:
                 return res
             if output.lower().endswith(".mp4"):
@@ -1398,7 +1420,7 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
 def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                       cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
                       abort=None, on_step=None, ffmpeg=FFMPEG, mp4box=MP4BOX, ffprobe=FFPROBE,
-                      timeout=None) -> RemuxResult:
+                      timeout=None, sdr: bool = False) -> RemuxResult:
     """YOUTUBE FAST REMUX (user-asked 2026-08-06: videos should move through fast). The
     Resolve render IS already a DV 8.1 HEVC file — the hour-class x265 pass exists only
     to force video under the SHIELD peak cap, and a render encoded at the YouTube target
@@ -1407,7 +1429,10 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
     audio — minutes), over → reason "render-over-cap: ..." and the caller falls back to
     the normal capped re-encode, ladder and all. Same mux/audio/verify tail as
     remux_inject; the render↔CFR frame alignment was already gated when the resolve stage
-    accepted the render (render_is_complete). No resume dir — a kill just redoes minutes."""
+    accepted the render (render_is_complete). No resume dir — a kill just redoes minutes.
+    `sdr` (2026-10-18): a native SDR render (an item pinned to SDR output) — shipped the same
+    way, with no DV box in the mux and a verify that asks for no DOVI record."""
+    mux_kw = {"dv": False} if sdr else {}   # none for DV: those calls stay byte-identical
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     info = dvcap.probe_video(dv_video, ffprobe)
     if info["frames"] <= 0:
@@ -1432,7 +1457,7 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             dv_mp4 = output + ".dv.mp4"
             with _StepWatch(on_step, "wrapping the DV video", dv_mp4, _fsize(es)), \
                  mp4box_safe_input(es) as _es_in:
-                vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4),
+                vx = subprocess.run(build_capped_video_mux_command(mp4box, _es_in, info["fps"], dv_mp4, **mux_kw),
                                 capture_output=True, text=True, errors="replace", timeout=timeout)
             if vx.returncode != 0:
                 return RemuxResult(False, output, reason="dv wrap failed: " + _tail(vx.stderr))
@@ -1490,13 +1515,13 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             audio_note += subs_note
             with _StepWatch(on_step, "muxing the master", output, _fsize(es)), \
                  mp4box_safe_input(es) as _es_in, mp4box_safe_input(tracks) as _tracks_in:
-                mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output),
+                mx = subprocess.run(build_capped_mux_command(mp4box, _es_in, info["fps"], _tracks_in, output, **mux_kw),
                                 capture_output=True, text=True, errors="replace", timeout=timeout)
             if mx.returncode != 0:
                 return RemuxResult(False, output, reason="mux failed: " + _tail(mx.stderr))
         if on_step:
             on_step("verifying the master", None)
-        res = _verify(output, ffprobe)
+        res = _verify(output, ffprobe, **({"require_dv": False} if sdr else {}))
         if not res.ok:
             return res
         if output.lower().endswith(".mp4"):

@@ -799,5 +799,491 @@ class VideoToolboxRender(unittest.TestCase):
         self.assertEqual(trace.count("Content Light Level Information"), keys)
 
 
+
+# ---- HDR intake (2026-10-18): an HDR source's own light and mastering; keep_video ------------
+
+P3_4000 = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50)"
+HAMILTON_MDCV = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
+
+
+def _own_tests_only(cls):
+    """Class decorator: `cls` runs only the tests it defines itself. Inheriting Render (or
+    SelfCheck) brings its set-up and fakes, and every one of its tests too, which would re-run
+    under the subclass's spec; those are blanked (unittest collects only callable test_*)."""
+    for base in cls.__mro__[1:]:
+        for name in vars(base):
+            if name.startswith("test") and name not in vars(cls):
+                setattr(cls, name, None)
+    return cls
+
+
+def _hdr_spec(src, **kw):
+    master, light = dvnative.source_mastering(P3_4000, "850,210")
+    base = dict(inputs=[[0, src], [TOTAL, None]], fps=FPS, kbps=60000, cap_mbps=0, lut=None,
+                master=master, light=light)
+    base.update(kw)
+    return NR.RenderSpec(**base)
+
+
+class HdrSpec(_Base):
+    def test_light_and_keep_video_are_checked(self):
+        self.assertEqual(_hdr_spec(self.src).problems(), [])
+        self.assertEqual(_hdr_spec(self.src).light_text(), "850,210")
+        self.assertEqual(_hdr_spec(self.src, light=[0, 0]).light, (0, 0))   # a list becomes a tuple
+        self.assertIsNone(self.spec.light_text())
+        for light in ((1,), (1, -1), (1.5, 2), (True, 1), (70000, 1), "1,2"):
+            with self.subTest(light=light):
+                self.assertIn("light", " ".join(_hdr_spec(self.src, light=light).problems()))
+        self.assertEqual(_hdr_spec(self.src, keep_video=True).problems(), [])
+        for kw in ({"lut": self.lut}, {"pre_vf": "scale=1920:1080"}, {"cap_mbps": 50},
+                   {"inputs": [[0, self.src], [20, self.src], [TOTAL, None]]}):
+            with self.subTest(kw=kw):
+                self.assertIn("keep_video", " ".join(_hdr_spec(self.src, keep_video=True, **kw).problems()))
+
+    def test_the_hdr_knobs_are_booked_only_when_set(self):
+        stats = NR.input_stats(self.spec)
+        sdr_a, sdr_e = NR.fingerprints(self.spec, stats)
+        self.assertFalse({"light", "keep_video"} & (set(sdr_a) | set(sdr_e)))   # SDR prints unchanged
+        a, e = NR.fingerprints(_hdr_spec(self.src, keep_video=True), stats)
+        self.assertEqual((a["light"], e["light"], e["keep_video"]), ([850, 210], [850, 210], True))
+        self.assertEqual(a["master"]["mdcv"], P3_4000)
+        a2, e2 = NR.fingerprints(_hdr_spec(self.src, light=(0, 0)), stats)
+        self.assertNotEqual(a, a2)                        # other light -> another RPU: re-analysed
+        self.assertNotIn("keep_video", e2)
+
+
+@_own_tests_only
+class HdrLightRender(Render):
+    """A spec with an HDR source's own light: L6 (generate's `light`), the HDR10 SEI the finish
+    writes and the self-check all carry exactly it — never the measured, clamped values."""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = _hdr_spec(self.src)
+        self.gen_kw = []
+
+    def fake_generate(self, sc, rpu, **kw):
+        self.gen_kw.append(kw)
+        return super().fake_generate(sc, rpu, **kw)
+
+    def test_light_reaches_the_rpu_the_sei_and_the_check(self):
+        ok, msg = self.render()
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.gen_kw[0]["light"], (850, 210))
+        sei = next(c for w, c in self.calls if w == "HDR10 metadata")
+        self.assertEqual(sei[sei.index("--mdcv") + 1:], [P3_4000, "--cll", "850,210"])
+        self.assertEqual(self.checked, [(self.kept(), TOTAL, (P3_4000, "850,210"))])
+        self.assertEqual(self.book("spec.json")["rpu"]["max_cll"], "850,210")
+        self.assertEqual(self.whats(), ["encode attempt 1"] + self.FINISH)     # no gate: one encode
+        self.assertEqual(self.measured, [])
+
+    def test_without_light_generate_is_called_exactly_as_before(self):
+        self.spec = dataclasses.replace(self.spec, light=None, master=dvnative.DEFAULT_MASTER)
+        ok, msg = self.render()
+        self.assertTrue(ok, msg)
+        self.assertNotIn("light", self.gen_kw[0])
+        self.assertEqual(self.checked[0][2], (dvcap.FALLBACK_MASTER_DISPLAY, "900,200"))   # measured
+
+
+@_own_tests_only
+class KeepVideoRender(Render):
+    """keep_video (rpu_only): the render is the source's own coded video — a stream copy, the RPU
+    injected, the DV mux — with no encode, no SEI written, no peak gate, and a self-check that
+    demands the source's own HDR10 metadata."""
+
+    def setUp(self):
+        super().setUp()
+        master, light = dvnative.source_mastering(HAMILTON_MDCV, "0,0")
+        self.spec = NR.RenderSpec(inputs=[[0, self.src], [TOTAL, None]], fps=FPS,
+                                  kbps=60000, cap_mbps=0, master=master, light=light, keep_video=True)
+
+    def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, what="step", on_poll=None, **kw):
+        if what == "stream copy":
+            self.assertEqual(cmd[:3], ["/usr/bin/nice", "-n", "10"])
+            self.calls.append((what, cmd[3:]))
+            if what in self.raise_in:
+                raise self.raise_in.pop(what)
+            self.assertEqual(timeout, dvnative.step_timeout(TOTAL))
+            shutil.copyfile(self.src, cmd[-1])                 # the original bits, as they are
+            with open(cmd[cmd.index("-progress") + 1], "w") as f:
+                f.write("frame=24\nprogress=continue\n")
+            on_poll()
+            return 0, "", 0.25
+        return super().fake_step(cmd, timeout=timeout, abort=abort, should_pause=should_pause,
+                                 what=what, on_poll=on_poll, **kw)
+
+    def fake_check(self, p, path, total=None, hdr=None, **kw):
+        self.checked.append((path, total, hdr, kw))
+        return self.check
+
+    def test_the_render_is_the_sources_own_stream_with_the_rpu(self):
+        ok, msg = self.render()
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.whats(), ["stream copy", "RPU inject", "DV mux"])
+        self.assertEqual(self.shipped(), "src" * 100)
+        self.assertEqual(self.measured, [])
+        self.assertEqual(self.checked, [(self.kept(), TOTAL, None, {"as_source": True})])
+        self.assertIn("the source's own video with the RPU injected (no encode)", msg)
+        self.assertEqual(self.book("encode.json")["final"]["verdict"], "source-video")
+        self.assertEqual(sorted(self.book("cpu.json")["encode"]), ["copy"])
+        self.assertEqual(self.strays(), [])
+        self.assertEqual(sorted(os.listdir(NR.books_dir(self.p))),
+                         ["cpu.json", "encode.json", "rpu.bin", "sidecar.json", "spec.json"])
+        self.assertTrue(any("source's own video (no encode), L6 MaxCLL/MaxFALL 0,0" in m for m in self.logs))
+        self.assertEqual(self.analyses[0][3]["cube"], None)            # measured as it is: no LUT
+        self.assertEqual(self.analyses[0][3]["pre_vf"], None)
+
+    def test_the_copy_touches_no_picture(self):
+        self.render()
+        cmd = dict(self.calls)["stream copy"]
+        self.assertEqual(cmd[cmd.index("-i"):], ["-i", self.src, "-map", "0:v:0", "-c:v", "copy",
+                                                 "-bsf:v", "hevc_mp4toannexb", "-f", "hevc",
+                                                 os.path.join(NR.books_dir(self.p), NR.ENCODE)])
+        self.assertEqual(NR.build_copy_command("ff", "s", "o"),
+                         ["ff", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", "s",
+                          "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "o"])
+
+    def test_a_copy_of_another_length_publishes_nothing(self):
+        self.frames[NR.ENCODE] = TOTAL - 1
+        ok, msg = self.render()
+        self.assertFalse(ok)
+        self.assertIn("the source's stream has 47 frames, the RPU 48", msg)
+        self.assertFalse(os.path.exists(self.p.dv_render))
+        self.assertEqual(self.strays(), [])
+
+    def test_room_is_asked_for_the_copy_and_its_inject(self):
+        size = os.path.getsize(self.src)
+        floor = NR.DISK_FLOOR_GB * NR.GiB
+        self.disk = (floor + int(size * 2.1) - 1, 10 ** 16)       # one byte short of copy + inject
+        ok, msg = self.render()
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("paused: low disk — the source's stream copy and its RPU inject"), msg)
+        self.disk = (floor + int(size * 2.1) + 10 ** 6, 10 ** 16)
+        self.assertTrue(self.render()[0])
+
+    def test_a_render_in_place_is_judged_against_the_source(self):
+        with open(self.p.dv_render, "w") as f:
+            f.write("done")
+        ok, msg = self.render()
+        self.assertEqual((ok, msg), (True, "native DV render already in place"))
+        self.assertEqual(self.checked, [(self.p.dv_render, None, None, {"as_source": True})])
+
+    def test_a_source_of_unknown_light_gets_the_measured_level_in_its_sei_too(self):
+        # stages.declared_light: a 0,0 source's route passes light None — measured, as Resolve did;
+        # the SEI then says the same as L6, and the self-check holds the render to that
+        import dataclasses
+        spec = self.spec = dataclasses.replace(self.spec, light=None)
+        self.assertFalse(NR.as_source(spec))
+        ok, msg = self.render(spec)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.whats(), ["stream copy", "HDR10 metadata", "RPU inject", "DV mux"])
+        sei = next(c for w, c in self.calls if w == "HDR10 metadata")
+        self.assertEqual(sei[sei.index("--mdcv"):], ["--mdcv", HAMILTON_MDCV, "--cll", "900,200"])
+        self.assertEqual(self.checked, [(self.kept(), TOTAL, (HAMILTON_MDCV, "900,200"), {})])
+        self.assertTrue(any("L6 MaxCLL/MaxFALL measured 900,200" in m for m in self.logs))
+        self.checked.clear()
+        self.assertEqual(self.render(spec), (True, "native DV render already in place"))
+        self.assertEqual(self.checked, [(self.p.dv_render, None, None, {})])
+
+    def test_a_stop_during_the_copy_publishes_nothing(self):
+        self.raise_in["stream copy"] = dvnative.Aborted("stopped")
+        self.assertEqual(self.render(), (False, "aborted (run stopped)"))
+        self.assertFalse(os.path.exists(self.p.dv_render))
+
+
+@_own_tests_only
+class SelfCheckAsSource(SelfCheck):
+    """as_source: the render's HDR10 metadata must be exactly the source's own — none when it
+    has none — instead of 'there, and what the finish wrote'."""
+
+    def setUp(self):
+        super().setUp()
+        self.by_path = {self.part: (HAMILTON_MDCV, "0,0"), self.src: (HAMILTON_MDCV, "0,0")}
+        pt = mock.patch.object(dvcap, "probe_video", side_effect=lambda path, *a: {
+            "frames": TOTAL, "master_display": self.by_path[path][0], "max_cll": self.by_path[path][1]})
+        pt.start()
+        self.addCleanup(pt.stop)
+
+    def test_the_sources_own_metadata_passes_whatever_it_is(self):
+        self.assertTrue(NR.self_check(self.p, self.part, TOTAL, as_source=True)[0])
+        self.by_path = {self.part: (None, None), self.src: (None, None)}         # a source with no SEI
+        ok, why = NR.self_check(self.p, self.part, TOTAL, as_source=True)
+        self.assertTrue(ok, why)
+        self.assertIn("source's own picture", why)
+        self.assertFalse(NR.self_check(self.p, self.part, TOTAL)[0])             # the old rule refuses it
+
+    def test_anything_else_is_refused(self):
+        for render in ((None, None), (HAMILTON_MDCV, "100,10"), (dvcap.FALLBACK_MASTER_DISPLAY, "0,0")):
+            with self.subTest(render=render):
+                self.by_path = {self.part: render, self.src: (HAMILTON_MDCV, "0,0")}
+                ok, why = NR.self_check(self.p, self.part, TOTAL, as_source=True)
+                self.assertFalse(ok)
+                self.assertIn("the source's own", why)
+
+
+def _vcl_md5(path):
+    """md5 over every VCL NAL unit of `path`'s HEVC stream (the coded picture), in order."""
+    import hashlib, re
+    data = subprocess.run([NR.FFMPEG, "-v", "error", "-i", path, "-map", "0:v:0", "-c", "copy",
+                           "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"], capture_output=True).stdout
+    h, starts = hashlib.md5(), [m.end() for m in re.finditer(b"\x00\x00\x01", data)]
+    for i, a in enumerate(starts):
+        nal = data[a:(starts[i + 1] - 3 if i + 1 < len(starts) else len(data))].rstrip(b"\x00")
+        if nal and (nal[0] >> 1) & 0x3F < 32:
+            h.update(nal)
+    return h.hexdigest()
+
+
+class KeepVideoRealTools(unittest.TestCase):
+    """REAL tools (the analysis alone faked): a tiny HDR10 HEVC Main10 clip with its own
+    mastering-display and content-light SEI through a keep_video spec must come out as a render
+    the orchestrator's gates accept — DV 8.1, every frame — whose coded picture is the source's
+    bit for bit, whose HDR10 SEI is still the source's own, and whose RPU declares that same
+    mastering and light in L6."""
+
+    MD = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
+
+    @classmethod
+    def _make(cls, name, cll):
+        path = os.path.join(cls.d, name)
+        r = subprocess.run([NR.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                            "testsrc2=size=1280x720:rate=24000/1001,noise=alls=40:allf=t",   # over 1 MB:
+                            "-frames:v", str(TOTAL), "-c:v", "libx265", "-preset", "ultrafast",  # _vstream's floor
+                            "-crf", "12", "-pix_fmt", "yuv420p10le",
+                            "-x265-params", f"log-level=error:hdr10=1:repeat-headers=1:"
+                                            f"master-display={cls.MD}:max-cll={cll}",
+                            "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                            "-color_range", "tv", "-tag:v", "hvc1", path], capture_output=True)
+        return path if r.returncode == 0 else None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = tempfile.mkdtemp()
+        cls.src = cls._make("src.mp4", "500,100")
+        cls.unknown = cls._make("unknown.mp4", "0,0")       # a WEB source that says "unknown" (Hamilton)
+        if not (cls.src and cls.unknown) or not os.path.exists(dvnative.DOVI_TOOL):
+            raise unittest.SkipTest("libx265 (10-bit) or dovi_tool unavailable")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.d, ignore_errors=True)
+
+    def test_the_render_is_the_source_bit_for_bit_with_a_matching_rpu(self):
+        p = types.SimpleNamespace(ep="T01", dv_render=os.path.join(self.d, "Movie, The + #1_dv.mov"),
+                                  source_cfr=self.src, combine=False)
+        src_info = dvcap.probe_video(self.src)
+        self.assertEqual((src_info["master_display"], src_info["max_cll"]), (self.MD, "500,100"))
+        master, light = dvnative.source_mastering(src_info["master_display"], src_info["max_cll"])
+        spec = NR.RenderSpec(inputs=[[0, self.src], [TOTAL, None]], fps=FPS, kbps=60000, cap_mbps=0,
+                             master=master, light=light, keep_video=True)
+        with mock.patch.object(dvnative, "analyze_ranges",
+                               side_effect=lambda path, ranges, workdir, **kw: _sidecar(ranges)):
+            ok, msg = NR.render(p, spec)
+        self.assertTrue(ok, msg)
+        self.assertEqual(NR.self_check(p, p.dv_render, TOTAL, as_source=True)[0], True)
+        self.assertEqual(_vcl_md5(p.dv_render), _vcl_md5(self.src))
+        info = dvcap.probe_video(p.dv_render)
+        self.assertEqual((info["master_display"], info["max_cll"]), (self.MD, "500,100"))
+        out = subprocess.run([NR.FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_streams",
+                              "-of", "json", p.dv_render], capture_output=True, text=True).stdout
+        dv = [x for x in json.loads(out)["streams"][0].get("side_data_list", [])
+              if x.get("side_data_type") == "DOVI configuration record"]
+        self.assertEqual((dv[0]["dv_profile"], dv[0]["dv_bl_signal_compatibility_id"]), (8, 1))
+        rpu = os.path.join(self.d, "back.rpu")
+        self.assertTrue(dvcap.extract_rpu(p.dv_render, rpu)[0])
+        self.assertEqual(dvcap.rpu_frame_count(rpu), TOTAL)
+        txt = subprocess.run([dvnative.DOVI_TOOL, "info", "-i", rpu, "-f", "0"], capture_output=True,
+                             text=True).stdout
+        vdr = json.loads(txt[txt.find("{"):])["vdr_dm_data"]
+        l6 = next(b["Level6"] for b in vdr["cmv29_metadata"]["ext_metadata_blocks"] if "Level6" in b)
+        self.assertEqual(l6, {"max_display_mastering_luminance": 1000, "min_display_mastering_luminance": 50,
+                              "max_content_light_level": 500, "max_frame_average_light_level": 100})
+
+    def test_a_source_of_unknown_light_ships_the_measured_level_in_l6_and_its_sei(self):
+        import stages
+        p = types.SimpleNamespace(ep="T02", dv_render=os.path.join(self.d, "Unknown_dv.mov"),
+                                  source_cfr=self.unknown, combine=False)
+        src_info = dvcap.probe_video(self.unknown)
+        self.assertEqual((src_info["master_display"], src_info["max_cll"]), (self.MD, "0,0"))
+        master, light = dvnative.source_mastering(src_info["master_display"], src_info["max_cll"])
+        spec = NR.RenderSpec(inputs=[[0, self.unknown], [TOTAL, None]], fps=FPS, kbps=60000, cap_mbps=0,
+                             master=master, light=stages.declared_light(light), keep_video=True)
+        self.assertIsNone(spec.light)
+        with mock.patch.object(dvnative, "analyze_ranges",
+                               side_effect=lambda path, ranges, workdir, **kw: _sidecar(ranges)):
+            ok, msg = NR.render(p, spec)
+        self.assertTrue(ok, msg)
+        self.assertEqual(_vcl_md5(p.dv_render), _vcl_md5(self.unknown))     # still the source's picture
+        info = dvcap.probe_video(p.dv_render)
+        self.assertEqual((info["master_display"], info["max_cll"]), (self.MD, "900,200"))
+        self.assertEqual(NR.self_check(p, p.dv_render, TOTAL, hdr=(self.MD, "900,200"))[0], True)
+        rpu = os.path.join(self.d, "back2.rpu")
+        self.assertTrue(dvcap.extract_rpu(p.dv_render, rpu)[0])
+        txt = subprocess.run([dvnative.DOVI_TOOL, "info", "-i", rpu, "-f", "0"], capture_output=True,
+                             text=True).stdout
+        vdr = json.loads(txt[txt.find("{"):])["vdr_dm_data"]
+        l6 = next(b["Level6"] for b in vdr["cmv29_metadata"]["ext_metadata_blocks"] if "Level6" in b)
+        self.assertEqual((l6["max_content_light_level"], l6["max_frame_average_light_level"]), (900, 200))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- SDR output (sdr_out, 2026-10-18) ------------------------------------------------------
+
+def _sdr_spec(src, **kw):
+    base = dict(inputs=[[0, src], [TOTAL, None]], fps=FPS, kbps=20000, cap_mbps=50, lut=None,
+                pre_vf="zscale=w=3840:h=2160:filter=lanczos:param_a=3:rangein=limited:range=limited,"
+                       "format=yuv444p16le", sdr=True)
+    base.update(kw)
+    return NR.RenderSpec(**base)
+
+
+class SdrSpec(_Base):
+    def test_an_sdr_spec_has_no_lut_rpu_or_hdr_metadata(self):
+        self.assertEqual(_sdr_spec(self.src).problems(), [])
+        for kw in ({"lut": self.lut}, {"keep_video": True, "pre_vf": None, "cap_mbps": 0},
+                   {"light": (100, 10)}, {"master": dvnative.MasterSpec(max_nits=4000)}):
+            with self.subTest(kw=kw):
+                self.assertIn("an SDR render", " ".join(_sdr_spec(self.src, **kw).problems()))
+
+    def test_sdr_is_booked_only_when_set_and_the_encode_is_tagged_bt709(self):
+        stats = NR.input_stats(self.spec)
+        a, e = NR.fingerprints(self.spec, stats)
+        self.assertNotIn("sdr", a)
+        self.assertNotIn("sdr", e)                        # every DV route's books stay valid
+        a2, e2 = NR.fingerprints(_sdr_spec(self.src), stats)
+        self.assertEqual((a2["sdr"], e2["sdr"]), (True, True))
+        dv = NR.build_encode_command("ff", self.spec, "o.hevc", 14000)
+        self.assertEqual(dv[dv.index("-color_primaries"):],
+                         ["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace",
+                          "bt2020nc", "-color_range", "tv", "-f", "hevc", "o.hevc"])   # unchanged
+        sdr = NR.build_encode_command("ff", _sdr_spec(self.src), "o.hevc", 20000)
+        self.assertEqual(sdr[sdr.index("-color_primaries"):],
+                         ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                          "-color_range", "tv", "-f", "hevc", "o.hevc"])
+        self.assertTrue(sdr[sdr.index("-vf") + 1].endswith(",format=yuv420p10le"))    # no LUT
+
+
+@_own_tests_only
+class SdrRender(Render):
+    """An sdr spec: nothing analysed, the encode tagged BT.709, the plain mux (no SEI, no inject, no
+    DV box), the same peak loop, an SDR self-check, and the proof written before the rename."""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = _sdr_spec(self.src)
+
+    def fake_step(self, cmd, *, timeout, abort=None, should_pause=None, what="step", on_poll=None, **kw):
+        if what == "SDR mux":
+            self.assertEqual(cmd[:3], ["/usr/bin/nice", "-n", "10"])
+            self.calls.append((what, cmd[3:]))
+            shutil.copyfile(cmd[5].split(":fps=")[0], cmd[-1])
+            return 0, "", 0.5
+        return super().fake_step(cmd, timeout=timeout, abort=abort, should_pause=should_pause,
+                                 what=what, on_poll=on_poll, **kw)
+
+    def fake_check(self, p, path, total=None, hdr=None, **kw):
+        self.checked.append((path, total, hdr, kw))
+        return self.check
+
+    def test_the_sdr_render_is_encoded_muxed_checked_and_vouched_for(self):
+        self.peaks = [30.0]
+        ok, msg = self.render()
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.whats(), ["encode attempt 1", "SDR mux"])
+        self.assertEqual(self.analyses, [])                                    # nothing measured
+        mux = dict(self.calls)["SDR mux"]
+        self.assertNotIn("dvp", " ".join(mux))
+        self.assertEqual(self.checked, [(self.kept(), TOTAL, None, {"sdr": True})])
+        self.assertIn("native SDR render: 48 frames, 20000 kb/s, peak 30.0 Mbps (under-cap)", msg)
+        self.assertTrue(NR.sdr_render_ok(self.p))
+        self.assertEqual(sorted(os.listdir(NR.books_dir(self.p))),
+                         ["cpu.json", "encode.json", "sdr.json", "spec.json"])
+        enc = dict(self.calls)["encode attempt 1"]
+        self.assertEqual(enc[enc.index("-color_trc") + 1], "bt709")
+
+    def test_the_peak_loop_is_the_same(self):
+        self.peaks = [70.0, 40.0]
+        ok, msg = self.render()
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.whats(), ["encode attempt 1", "SDR mux", "encode attempt 2", "SDR mux"])
+        self.assertTrue(NR.sdr_render_ok(self.p))
+
+    def test_a_failed_check_publishes_nothing_and_vouches_for_nothing(self):
+        self.peaks = [30.0]
+        self.check = (False, "it carries a Dolby Vision record")
+        ok, msg = self.render()
+        self.assertFalse(ok)
+        self.assertIn("self-check: it carries a Dolby Vision record", msg)
+        self.assertFalse(os.path.exists(self.p.dv_render))
+        self.assertFalse(NR.sdr_render_ok(self.p))
+
+    def test_an_sdr_render_in_place_is_blessed_not_redone(self):
+        with open(self.p.dv_render, "w") as f:
+            f.write("an SDR render Resolve's SDR project made")
+        self.assertFalse(NR.sdr_render_ok(self.p))
+        ok, msg = self.render()
+        self.assertEqual((ok, msg), (True, "native SDR render already in place"))
+        self.assertEqual(self.checked, [(self.p.dv_render, None, None, {"sdr": True})])
+        self.assertEqual(self.calls, [])
+        self.assertTrue(NR.sdr_render_ok(self.p))
+        with open(self.p.dv_render, "a") as f:
+            f.write("changed")
+        self.assertFalse(NR.sdr_render_ok(self.p))                             # names that file only
+
+
+class SdrProof(_Base):
+    def test_sdr_render_ok_never_raises_and_needs_the_exact_file(self):
+        self.assertFalse(NR.sdr_render_ok(self.p))                             # no render, no proof
+        self.assertFalse(NR.sdr_render_ok(types.SimpleNamespace(dv_render=None)))
+        with open(self.p.dv_render, "w") as f:
+            f.write("render")
+        self.assertFalse(NR.sdr_render_ok(self.p))                             # a render, no proof
+        os.makedirs(NR.books_dir(self.p))
+        NR._write_sdr_proof(self.p, self.p.dv_render)
+        self.assertTrue(NR.sdr_render_ok(self.p))
+        os.utime(self.p.dv_render, ns=(1, 1))
+        self.assertFalse(NR.sdr_render_ok(self.p))
+        with open(os.path.join(NR.books_dir(self.p), NR.SDR_PROOF), "w") as f:
+            f.write("junk")
+        self.assertFalse(NR.sdr_render_ok(self.p))
+
+
+@_own_tests_only
+class SelfCheckSdr(SelfCheck):
+    """sdr=True: HEVC with NO Dolby Vision record and no PQ/HLG transfer, then the whole-source
+    and frame-rate gates; no HDR10 metadata asked for."""
+
+    def setUp(self):
+        super().setUp()
+        self.video = {"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709"}
+        self.vstream = mock.patch.object(self.O, "_vstream", side_effect=lambda path: [dict(self.video)])
+        self.vstream.start()
+        self.hdr10 = {"master_display": None, "max_cll": None}
+
+    def tearDown(self):
+        self.vstream.stop()             # before the base's patches: stopping it after them would
+        super().tearDown()              # put the base's mock back for every later test
+
+    def test_an_sdr_render_passes_without_hdr10_metadata(self):
+        ok, why = NR.self_check(self.p, self.part, TOTAL, sdr=True)
+        self.assertTrue(ok, why)
+        self.assertIn("SDR", why)
+        self.assertFalse(NR.self_check(self.p, self.part, TOTAL)[1].startswith("an SDR"))   # DV rule
+
+    def test_what_it_refuses(self):
+        cases = {"dovi": dict(self.video, side_data_list=[{"side_data_type": "DOVI configuration record"}]),
+                 "pq": dict(self.video, color_transfer="smpte2084"),
+                 "prores": dict(self.video, codec_name="prores")}
+        for name, video in cases.items():
+            with self.subTest(name):
+                self.video = video
+                self.assertFalse(NR.self_check(self.p, self.part, TOTAL, sdr=True)[0])
+        self.video = {"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709"}
+        self.frames = TOTAL - 1
+        self.assertIn("47 frames, the source 48", NR.self_check(self.p, self.part, TOTAL, sdr=True)[1])
+        self.frames = TOTAL
+        self.ok["complete"] = False
+        self.assertIn("whole source", NR.self_check(self.p, self.part, TOTAL, sdr=True)[1])

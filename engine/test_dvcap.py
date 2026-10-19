@@ -1096,3 +1096,53 @@ class SeekNeverDuplicatesAFrame(__import__("unittest").TestCase):
                     out = subprocess.run(dvcap.build_seg_decode_command(dvcap.FFMPEG, clip, a, 4, "24000/1001"),
                                          capture_output=True, check=True).stdout
                     self.assertEqual(self._levels(out), [a, a + 1, a + 2, a + 3])
+
+
+class SdrSegmentedEncode(unittest.TestCase):
+    """dv=False (an item pinned to SDR output, 2026-10-18): every segment is the Rec.709 x265 with
+    no RPU — nothing is sliced — and the resume identity says "sdr" so a DV run's segments are
+    never reused. dv=True (the default) stays exactly the DV call."""
+
+    def _run(self, fn, **kw):
+        import os, tempfile
+        encs = []
+
+        def fake_pipe(dec, enc, out, abort, cb):
+            encs.append(enc)
+            with open(out, "wb") as f:
+                f.write(b"SEG")
+            return 50, "ok", []
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(dvcap, "slice_rpu", side_effect=AssertionError("sliced")) as sl, \
+             mock.patch.object(dvcap, "count_hevc_frames", return_value=0), \
+             mock.patch.object(dvcap, "_encode_pipe", side_effect=fake_pipe):
+            if fn == "encode":
+                res = dvcap.encode_capped_segmented("r.mov", None, os.path.join(td, "o.hevc"), 50,
+                                                    segdir=td, total_frames=100, fps="25",
+                                                    boundaries=[50, 100], dv=False, **kw)
+            else:
+                res = dvcap.reencode_segments_tighter("r.mov", None, td, [1], 42, total_frames=100,
+                                                      fps="25", boundaries=[50, 100], dv=False, **kw)
+        return res, encs
+
+    def test_the_main_encode_slices_nothing_and_writes_rec709(self):
+        (ok, frames, why), encs = self._run("encode")
+        self.assertTrue(ok, why)
+        self.assertEqual((frames, len(encs)), (100, 2))
+        for enc in encs:
+            self.assertEqual(enc, dvcap.build_x265_command(dvcap.X265, None, enc[enc.index("--output") + 1],
+                                                           50, dv=False))
+            self.assertNotIn("--dolby-vision-rpu", enc)
+
+    def test_the_repair_rung_is_sdr_too(self):
+        (ok, why), encs = self._run("repair")
+        self.assertTrue(ok, why)
+        self.assertEqual(encs[0][encs[0].index("--vbv-maxrate") + 1], "42000")
+        self.assertIn("bt709", encs[0])
+        self.assertNotIn("--dolby-vision-rpu", encs[0])
+
+    def test_the_resume_identity_says_sdr_only_when_it_is(self):
+        dv = dvcap.resume_manifest("/x.mov", 50, 100, "25", 300)
+        self.assertNotIn("sdr", dv)
+        self.assertEqual(dvcap.resume_manifest("/x.mov", 50, 100, "25", 300, sdr=True),
+                         dict(dv, sdr=True))

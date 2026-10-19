@@ -5607,6 +5607,168 @@ class NativeSlot(_NativeRun):
             self.assertTrue(sp())                      # a sibling's lease is always honoured
 
 
+
+class NativeSlotSdRoute(_NativeRun):
+    """2026-10-18: the SD route's switch is dv_routes {"sd_sdr_topaz": "native"}, never dv_engine.
+    With dv_engine 'resolve' it alone opens the slot to the lane (decide() then refuses 720p+);
+    with both off nothing of the lane is asked at all."""
+
+    def test_the_sd_route_alone_opens_the_slot(self):
+        import settings
+        routes = mock.patch.object(settings, "dv_routes", return_value={"sd_sdr_topaz": "native"})
+        self._process({"dvnative": self._ready}, engine="resolve", extra=[routes])
+        self.assertEqual(self.ran, ["dvnative"])
+        self.assertTrue(self._handed_off())
+
+    def test_both_switches_off_never_ask_the_lane(self):
+        import nativelane
+        self._process(decide=None, engine="resolve",
+                      extra=[mock.patch.object(nativelane, "decide", side_effect=AssertionError("decide"))])
+        self.assertEqual(self.ran, ["resolve"])
+
+    def test_native_eligible_follows_each_routes_own_switch(self):
+        import nativelane, plan, settings
+        with open(self.p.source, "w") as f:
+            f.write("x")
+        hd = {"topaz": "upscale", "resolve": "add_hdr_dv", "res": "1080p"}
+        sd = {"topaz": "upscale", "resolve": "add_hdr_dv", "res": "480p"}
+        for engine, routes, pl, want in (("native", {}, hd, True), ("native", {}, sd, False),
+                                         ("resolve", {"sd_sdr_topaz": "native"}, sd, True),
+                                         ("resolve", {"sd_sdr_topaz": "native"}, hd, False),
+                                         ("native", {"sd_sdr_topaz": "native"}, sd, True),
+                                         ("resolve", {}, sd, False)):
+            with self.subTest(engine=engine, routes=routes, res=pl["res"]), \
+                 mock.patch.object(settings, "dv_engine", return_value=engine), \
+                 mock.patch.object(settings, "dv_routes", return_value=routes), \
+                 mock.patch.object(settings, "get_show_output_mode", return_value="auto"), \
+                 mock.patch.object(plan, "plan_for", return_value=dict(pl)):
+                self.assertEqual(self.o._native_eligible(self.p), want)
+        with mock.patch.object(settings, "dv_engine", return_value="resolve"), \
+             mock.patch.object(plan, "plan_for", side_effect=AssertionError("probed")):
+            self.assertFalse(self.o._native_eligible(self.p))         # both off: no probe
+
+    def test_an_hd_episode_never_reads_the_sd_switch_while_dv_engine_is_native(self):
+        # 2026-10-18 review: the live settings (dv_engine 'native', dv_routes {}) make exactly
+        # HEAD's calls for a 720p+ episode — the SD switch is read only for a 480p source. (The
+        # method swallows exceptions, so the switch is counted, not made to raise.)
+        import nativelane, plan, settings
+        sd_reads, asked = [], []
+
+        def eligible(ep, pl, mode, sd=False):
+            asked.append((pl["res"], sd))
+            return (self.answer, "the lane's answer")
+        with mock.patch.object(settings, "dv_engine", return_value="native"), \
+             mock.patch.object(nativelane, "sd_route_on", side_effect=lambda: sd_reads.append(1) or False), \
+             mock.patch.object(nativelane, "eligible", side_effect=eligible), \
+             mock.patch.object(settings, "get_show_output_mode", return_value="auto"):
+            self.answer = True
+            self.assertTrue(self.o._native_eligible(self.p))          # source not on disk yet
+            with open(self.p.source, "w") as f:
+                f.write("x")
+            for res in ("720p", "1080p", "2160p"):
+                for self.answer in (True, False):
+                    with self.subTest(res=res, answer=self.answer), \
+                         mock.patch.object(plan, "plan_for",
+                                           return_value={"topaz": "upscale", "res": res}):
+                        self.assertEqual(self.o._native_eligible(self.p), self.answer)
+            self.assertEqual(sd_reads, [])
+            self.assertEqual(asked, [(res, False) for res in ("720p", "1080p", "2160p") for _ in (1, 2)])
+            with mock.patch.object(plan, "plan_for", return_value={"topaz": "upscale", "res": "480p"}):
+                self.o._native_eligible(self.p)
+            self.assertEqual(sd_reads, [1])                           # a 480p source: one read,
+            self.assertEqual(asked[-1], ("480p", False))              # and the lane judges it as TV
+
+
+
+class SdrOutputStageDone(unittest.TestCase):
+    """2026-10-18 (sdr_out): stage_done accepts an SDR-output render ONLY when the native render's
+    proof vouches for it, and an SDR master ONLY under the SDR name; a Resolve SDR render (no
+    proof) is still never "done", exactly as before."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        with mock.patch("settings.is_sdr_output", return_value=True):     # the item pinned to SDR
+            self.p = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)
+        self.dv_named = episode_paths("A", "S01E01", SRC, scratch_dir=self.td)   # pin gone
+        self.assertEqual(self.p.dv_render, self.dv_named.dv_render)       # one render, one proof
+        with open(self.p.dv_render, "wb") as f:
+            f.write(b"r" * 2_000_000)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _proof(self):
+        import nativerender
+        os.makedirs(nativerender.books_dir(self.p), exist_ok=True)
+        nativerender._write_sdr_proof(self.p, self.p.dv_render)
+
+    def test_the_render_counts_only_with_its_proof(self):
+        sdr = [{"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709"}]
+        with mock.patch.object(orch, "_vstream", return_value=sdr), \
+             mock.patch.object(orch, "render_is_complete", return_value=True), \
+             mock.patch.object(orch, "_native_ready", return_value=False), \
+             mock.patch.object(orch, "_native_encoded", return_value=False):
+            self.assertFalse(orch.stage_done("resolve", self.p))          # a Resolve SDR render
+            self.assertFalse(orch.stage_done("topaz", self.p))
+            self._proof()
+            self.assertTrue(orch.stage_done("resolve", self.p))
+            self.assertTrue(orch.stage_done("topaz", self.p))
+            with mock.patch.object(orch, "render_is_complete", return_value=False):
+                self.assertFalse(orch.stage_done("resolve", self.p))      # still the length rule
+            with open(self.p.dv_render, "ab") as f:
+                f.write(b"changed")
+            self.assertFalse(orch.stage_done("resolve", self.p))          # the proof names a file
+
+    def test_a_proofed_render_stops_counting_once_the_item_ships_as_dv(self):
+        # 2026-10-18 review: pinned SDR, rendered SDR, then unpinned — the paths rebuilt under the
+        # DV name must not take the SDR render as done (the item renders again as DV)
+        sdr = [{"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709"}]
+        self._proof()
+        with mock.patch.object(orch, "_vstream", return_value=sdr), \
+             mock.patch.object(orch, "render_is_complete", return_value=True), \
+             mock.patch.object(orch, "_native_ready", return_value=False), \
+             mock.patch.object(orch, "_native_encoded", return_value=False), \
+             mock.patch("topaz.segments_complete", return_value=False):
+            self.assertTrue(orch.stage_done("resolve", self.p))
+            self.assertTrue(orch.stage_done("topaz", self.p))
+            self.assertFalse(orch.stage_done("resolve", self.dv_named))
+            self.assertFalse(orch.stage_done("topaz", self.dv_named))
+        self.assertTrue(orch.ships_as_sdr(self.p))
+        self.assertFalse(orch.ships_as_sdr(self.dv_named))
+        import types
+        self.assertFalse(orch.ships_as_sdr(types.SimpleNamespace()))        # no final: never raises
+
+    def test_no_proof_costs_one_stat(self):
+        import nativerender
+        with mock.patch.object(nativerender, "sdr_render_ok", side_effect=AssertionError("read")):
+            self.assertFalse(orch._native_sdr_render(self.p))
+
+    def test_a_dv_named_item_costs_nothing_at_all(self):
+        import nativerender
+        self._proof()                       # even with a proof on disk: the name answers first
+        with mock.patch.object(nativerender, "sdr_render_ok", side_effect=AssertionError("read")), \
+             mock.patch.object(orch.os.path, "isfile", side_effect=AssertionError("stat")):
+            self.assertFalse(orch._native_sdr_render(self.dv_named))
+
+    def test_the_master_counts_only_under_the_sdr_name(self):
+        sdr = [{"codec_type": "video", "codec_name": "hevc", "color_transfer": "bt709"},
+               {"codec_type": "audio"}]
+        dv_named = self.dv_named
+        self.assertIn(orch.DV_TAG, os.path.basename(dv_named.final))
+        with mock.patch.object(orch, "_vstream", return_value=sdr):
+            self.assertFalse(orch.stage_done("remux", dv_named))
+        sdr_named = self.p
+        self.assertIn(orch.SDR_TAG, os.path.basename(sdr_named.final))
+        with mock.patch.object(orch, "_vstream", return_value=sdr):
+            self.assertTrue(orch.stage_done("remux", sdr_named))
+        for bad in ([sdr[0]],                                              # no audio
+                    [dict(sdr[0], color_transfer="smpte2084"), sdr[1]],      # HDR
+                    [dict(sdr[0], codec_name="h264"), sdr[1]]):
+            with self.subTest(bad=bad), mock.patch.object(orch, "_vstream", return_value=bad):
+                self.assertFalse(orch.stage_done("remux", sdr_named))
+
+
 class NativeGate(_NativeRun):
     """The native hand-off gate: one-at-a-time pacing, plus another finisher-owned native item
     still holding chunks; applied after a relaunch too; the starvation guard reused."""
@@ -6368,7 +6530,8 @@ class RouteLoggedOnceAfterTheDownload(unittest.TestCase):
         probe = {"width": 1920, "height": 1080, "sar": "", "is_4k": False, "is_hdr": False,
                  "is_dv": False, "codec": "h264", "transfer": "bt709", "pix_fmt": "yuv420p",
                  "is_cfr": True, "video_kbps": 8000}
-        for mode, want in (("auto", "tv_sdr_topaz"), ("dv2000", "dv2000")):
+        for mode, want in (("auto", "tv_sdr_topaz"), ("sdr", "sdr_out"),
+                           ("dv2000", "tv_sdr_topaz")):      # the retired 2000-nit pin is dv1000
             with mock.patch.object(plan, "probe_input", return_value=probe), \
                  mock.patch.object(settings, "get_show_output_mode", return_value=mode):
                 _seen, lines = self._process(self._orch())
@@ -6589,6 +6752,14 @@ class DvRenderSlot(_DvRenderRun):
         self.assertTrue(self._handed_off())
         self.assertFalse(os.path.exists(self.p.segdir))         # dropped at hand-off, as Resolve's
         self.assertIn("v [aaaaaaaaaa9]: DV via the native render — route yt_native4k",
+                      [c.args[0] for c in ev.call_args_list])
+
+    def test_the_sdr_output_says_sdr(self):
+        # sdr_out (2026-10-18) makes the SDR master: its log line never claims Dolby Vision
+        with mock.patch.object(orch.logbook, "event") as ev:
+            self._process(decision=("sdr_out", _FakeRenderSpec(), ""))
+        self.assertEqual(self.ran, ["dvrender"])
+        self.assertIn("v [aaaaaaaaaa9]: SDR via the native render — route sdr_out",
                       [c.args[0] for c in ev.call_args_list])
 
     def test_quiet_mode_a_missing_display_and_a_stall_hold_nothing(self):
@@ -6821,3 +6992,30 @@ class DvRenderParkSweep(unittest.TestCase):
         with mock.patch.object(orch, "stage_done", return_value=False):
             o._sweep_parked_files(p, "V")
         self.assertFalse(os.path.exists(books))
+
+
+class VstreamFloor(unittest.TestCase):
+    """_vstream's size floor rules out stubs, not short videos: a few seconds of a near-static
+    native render (a YouTube Short's title card) is well under the old 1 MB and must still read."""
+
+    def test_a_small_real_video_reads_and_a_stub_does_not(self):
+        import shutil, subprocess
+        ffmpeg = orch.FFPROBE.replace("ffprobe", "ffmpeg")
+        if not shutil.which(ffmpeg):
+            self.skipTest("ffmpeg unavailable")
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        small, stub = os.path.join(d, "short.mp4"), os.path.join(d, "stub.mov")
+        r = subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "color=c=gray:size=1280x720:rate=24", "-frames:v", "72", "-c:v", "libx265",
+                            "-preset", "ultrafast", "-x265-params", "log-level=error", "-tag:v", "hvc1",
+                            small], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("libx265 unavailable")
+        self.assertLess(os.path.getsize(small), 1_000_000)
+        streams = orch._vstream(small)
+        self.assertEqual([s.get("codec_name") for s in streams], ["hevc"])
+        with open(stub, "w") as f:
+            f.write("done")
+        self.assertIsNone(orch._vstream(stub))
+        self.assertIsNone(orch._vstream(os.path.join(d, "missing.mov")))

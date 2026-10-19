@@ -860,8 +860,15 @@ def grace_label(seconds: int) -> str:
 
 # ---- ffprobe validation (stage-done detection) ---------------------------
 
+# A file this small cannot be a finished video (headers plus one coded frame are more): a stub. It
+# was 1 MB until 2026-10-18, but a few seconds of a near-static native render (a YouTube Short's
+# title card) can be under that and failed its own self-check; every caller pairs this read with a
+# frame count (render_is_complete) or the master's audio, so the floor only has to rule out stubs.
+VSTREAM_MIN_BYTES = 4096
+
+
 def _vstream(path):
-    if not (path and os.path.exists(path) and os.path.getsize(path) > 1_000_000):
+    if not (path and os.path.exists(path) and os.path.getsize(path) > VSTREAM_MIN_BYTES):
         return None
     try:
         out = subprocess.run([FFPROBE, "-v", "error", "-show_streams", "-of", "json", path],
@@ -883,6 +890,48 @@ def _is_dv81(streams) -> bool:
 
 def _has_audio(streams) -> bool:
     return any(s.get("codec_type") == "audio" for s in streams or [])
+
+
+def ships_as_sdr(p) -> bool:
+    """PURE. Does the item ship as the SDR output — SDR_TAG in p.final's name? master_tag put it
+    there from the item's pin when its paths were last (re)built (episode / movie / YouTube paths,
+    relabel_container on a resume), so this is the name the master will carry. 2026-10-18 review:
+    an SDR render (sdr_out) is the master's picture ONLY while this holds — a pin removed after
+    the render, then a relaunch that rebuilds p.final under DV_TAG, must not turn that render into
+    an SDR master named '... HDR10 DV upscaled'. Never raises."""
+    return SDR_TAG in os.path.basename(str(getattr(p, "final", "") or ""))
+
+
+def _native_sdr_render(p) -> bool:
+    """Is p.dv_render an SDR-output render the native render published (sdr_out, 2026-10-18)
+    for an item that still ships as SDR? The name first (ships_as_sdr: a DV-named item — every
+    item that is not pinned to SDR — costs nothing at all, and a stale SDR render stops counting
+    as done once the pin is gone, so the item renders again as DV); then its proof,
+    <dv_render>.dvrender/sdr.json, must exist and name exactly that file
+    (nativerender.sdr_render_ok). Never raises."""
+    try:
+        if not ships_as_sdr(p):
+            return False
+        if not os.path.isfile(str(p.dv_render) + ".dvrender/sdr.json"):
+            return False
+        import nativerender
+        return nativerender.sdr_render_ok(p)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_sdr_master(p, streams) -> bool:
+    """`streams` (p.final's) are an SDR-output master: the item ships under SDR_TAG (it was pinned
+    to SDR when its paths were built), and its video is HEVC with no Dolby Vision record and no
+    PQ/HLG transfer. A DV-named master is never one."""
+    if not ships_as_sdr(p):
+        return False
+    v = next((s for s in streams or [] if s.get("codec_type") == "video"), None)
+    if v is None or v.get("codec_name") != "hevc":
+        return False
+    if any(sd.get("side_data_type") == "DOVI configuration record" for sd in v.get("side_data_list", [])):
+        return False
+    return v.get("color_transfer") not in ("smpte2084", "arib-std-b67")
 
 
 RENDER_SHORT_TOLERANCE = 0.995   # a render this fraction of the source's frames is complete
@@ -1122,6 +1171,8 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         import topaz
         if _is_dv81(_vstream(p.dv_render)) and render_is_complete(p):
             return True
+        if _native_sdr_render(p) and render_is_complete(p):
+            return True                    # an SDR-output render (sdr_out): the same rule
         if topaz.segments_complete(p.segdir):
             return True
         # NATIVE DV: no render, and the chunks went when the master passed the peak gate —
@@ -1139,6 +1190,10 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         # DV profile AND length: a truncated render carries a perfectly valid DOVI record.
         if _is_dv81(_vstream(p.dv_render)) and render_is_complete(p):
             return True
+        # SDR OUTPUT (sdr_out, 2026-10-18): the native SDR render, ONLY when its proof vouches for
+        # it (nativerender.sdr_render_ok) — a Resolve SDR render is still never "done" here.
+        if not combine and _native_sdr_render(p) and render_is_complete(p):
+            return True
         # NATIVE DV: there is no render at all — the native lane's published analysis (its
         # 'ready' marker, still matching the chunks, LUT, RPU and CFR on disk) is the proof,
         # and once the master has passed the peak gate (chunks deleted) the 'encoded' one is.
@@ -1146,7 +1201,9 @@ def stage_done(stage, p: EpisodePaths, *, ftp=None) -> bool:
         return (not combine) and (_native_ready(p) or _native_encoded(p))
     if stage == "remux":
         s = _vstream(p.final)
-        return _is_dv81(s) and _has_audio(s)
+        # ...or an item pinned to SDR output: its master is named SDR (master_tag) and is the true
+        # SDR picture — HEVC, no Dolby Vision, not PQ/HLG (2026-10-18; only sdr_out makes one).
+        return (_is_dv81(s) or _is_sdr_master(p, s)) and _has_audio(s)
     if stage == "upload":
         return os.path.exists(p.final) and _remote_size(p.nas_final, ftp) == os.path.getsize(p.final)
     if stage == "cleanup":
@@ -2934,7 +2991,7 @@ class Orchestrator:
         # path stays untouched).
         try:
             import nativelane
-            if held or nativelane.engine_setting() == "native":
+            if held or nativelane.lane_on():
                 seen = {os.path.abspath(d) for d in held}
                 held += [d for d in nativelane.held_native_segdirs(states=("analyzing", "ready"))
                          if os.path.abspath(d) not in seen and _native_holds_chunks(d)]
@@ -3002,13 +3059,15 @@ class Orchestrator:
         return None
 
     def _native_eligible(self, ep) -> bool:
-        """Could this not-yet-upscaled item take the native lane? dv_engine 'native', a TV
-        episode, and nativelane.eligible on its plan once the source is on disk (before that
-        the plan is unknown, and unknown counts as eligible — the stricter side). False with
-        dv_engine 'resolve', after one settings read."""
+        """Could this not-yet-upscaled item take the native lane? A TV episode whose lane is
+        switched on — dv_engine 'native' for a 720p+ one, dv_routes sd_sdr_topaz 'native' for a
+        480p/576p one (2026-10-18) — and nativelane.eligible on its plan once the source is on
+        disk (before that the plan is unknown, and unknown counts as eligible — the stricter
+        side). False with dv_engine 'resolve' and the SD route off, after the settings reads."""
         try:
             import nativelane
-            if nativelane.engine_setting() != "native":
+            tv_on = nativelane.engine_setting() == "native"
+            if not tv_on and not nativelane.sd_route_on():
                 return False
         except Exception:  # noqa: BLE001 — no lane, no native items
             return False
@@ -3018,8 +3077,10 @@ class Orchestrator:
             if not os.path.exists(ep.source):
                 return True
             import plan as _plan
-            return nativelane.eligible(ep, _plan.plan_for(ep.source),
-                                       nativelane.effective_mode(ep))[0]
+            pl = _plan.plan_for(ep.source)
+            sd = pl.get("res") == nativelane.SD_RES and nativelane.sd_route_on()
+            return (sd or tv_on) and nativelane.eligible(ep, pl, nativelane.effective_mode(ep),
+                                                         sd=sd)[0]
         except Exception:  # noqa: BLE001 — unknown is the stricter answer here
             return True
 
@@ -4064,8 +4125,9 @@ class Orchestrator:
         if spec is None and not why:
             return None                              # its route is on Resolve (the default)
         key = self._skip_key(p)
-        say = (f"DV via the native render — route {route}" if spec is not None else
-               f"DV via Resolve — route {route} is set 'native', but {why}")
+        what = "SDR" if route == "sdr_out" else "DV"       # sdr_out makes the SDR master (no DV)
+        say = (f"{what} via the native render — route {route}" if spec is not None else
+               f"{what} via Resolve — route {route} is set 'native', but {why}")
         if self._dvrender_said.get(key) != say:
             self._dvrender_said[key] = say
             logbook.event(f"{ep_disp}: {say}")
@@ -4116,7 +4178,7 @@ class Orchestrator:
         settings read: nothing else in the lane runs."""
         try:
             import nativelane
-            if not nativelane.has_marker(p) and nativelane.engine_setting() != "native":
+            if not nativelane.has_marker(p) and not nativelane.lane_on():
                 return None                          # the default: today's path, byte for byte
             if p.movie or p.youtube or p.combine:
                 return None                          # TV only — never claimed, nothing to probe

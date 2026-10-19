@@ -311,8 +311,8 @@ flowchart TD
 Resolve does the scaling (SuperScale doubles a 1080p source), so a video spends minutes in
 the pipeline rather than hours. See [YouTube](#youtube) below.
 
-The nit ceiling is **1000 by default on every path** — the 2000-nit target exists but is
-manual-only, set per show, movie or channel (as is the true-SDR output).
+The nit ceiling is **1000 on every path** — the 2000-nit target is retired; the true-SDR
+output stays a manual choice, set per show, movie or channel.
 
 <p align="center">
   <img src="docs/assets/before-after-4k.png" alt="Before/after: a 1080p source frame vs Visionary's 4K upscale, cropped equally" width="880">
@@ -327,9 +327,8 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 
 - **Dolby Vision™ mastering at 1000 nits**: every item is automatically mastered to
   **Dolby Vision™ at 1000 nits** through a hand-configured Resolve project, whatever the
-  intake range. A second **2000-nit** project ships too, but it is **manual-only** — a
-  per-show/movie/channel override, never chosen automatically. Both export HDR10 +
-  Dolby Vision™ Profile 8.1.
+  intake range, exported as HDR10 + Dolby Vision™ Profile 8.1. (The old manual 2000-nit
+  target is retired: an item still pinned to it masters at 1000 nits.)
 
 - **4K fast paths**: every 4K source skips Topaz entirely, at any
   bitrate — its picture is already the deliverable. No 4K source goes through Topaz at all: a
@@ -506,7 +505,7 @@ manual-only, set per show, movie or channel (as is the true-SDR output).
 | Movies | YouTube |
 |:---:|:---:|
 | <img src="docs/assets/movies.png" alt="Movies tab: filters named for the source, and the Dolby Vision™ 7 → 8.1 lane converting profile 7 movies in place" width="420"> | <img src="docs/assets/youtube.png" alt="YouTube tab: subscriptions, the video-per-episode cadence, and per-channel filters" width="420"> |
-| <sub>Movies run whole when they come due. The filters say what each source is — <b>1080p & below</b>, <b>4K SDR</b>, <b>4K HDR10</b>, <b>DV 7</b>, <b>DV 8.1</b> — and a profile 7 movie goes to the <b>Dolby Vision™ 7 → 8.1</b> lane: converted in place with no re-encode, over the Ethernet, one transfer at a time (here 22 of 210 done). A queued movie shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned otherwise (2000-nit is manual-only). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence you set (here <b>4 per TV episode</b>), with per-channel scope and age filters. Channels can be paused individually.</sub> |
+| <sub>Movies run whole when they come due. The filters say what each source is — <b>1080p & below</b>, <b>4K SDR</b>, <b>4K HDR10</b>, <b>DV 7</b>, <b>DV 8.1</b> — and a profile 7 movie goes to the <b>Dolby Vision™ 7 → 8.1</b> lane: converted in place with no re-encode, over the Ethernet, one transfer at a time (here 22 of 210 done). A queued movie shows its <b>resolved</b> output mode rather than "auto" — everything lands on <b>1000 nits</b> unless pinned to SDR (the 2000-nit target is retired). The count is how many of your library's titles still have no DV.</sub> | <sub>Optional. Pulls from your own subscriptions and slots videos in on a cadence you set (here <b>4 per TV episode</b>), with per-channel scope and age filters. Channels can be paused individually.</sub> |
 
 <p align="center">
   <img src="docs/assets/settings.png" alt="Settings: screen control with a pause timer, choosing which display hosts Resolve, and the mouse-takeover notice" width="330">
