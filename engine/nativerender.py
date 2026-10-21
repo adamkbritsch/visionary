@@ -906,8 +906,8 @@ def _encode(p, spec: RenderSpec, rpu: dict, abort, progress, should_pause) -> di
             verdict = "unmeasured"
             break
         if dvcap.peak_ok(peak, cap):
-            logbook.event(f"dvrender {ep}: RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — under the "
-                          f"{cap} Mbps cap")
+            logbook.event(f"dvrender {ep}: RENDER_PEAK {peak:.1f} Mbps at {kbps} kb/s — within the "
+                          f"{cap} Mbps cap's {cap * dvcap.PEAK_TOLERANCE:.1f} gate")
             _rm(best)                    # this one ships; the earlier render is dead weight
             verdict = "under-cap"
             break

@@ -174,6 +174,7 @@ class TracksRetryLadder(unittest.TestCase):
         with mock.patch.object(remux, "atmos_audio_index", return_value=None), \
              mock.patch.object(remux, "subtitle_plan", return_value=plan), \
              mock.patch.object(remux, "tracks_sync_ms", return_value=0), \
+             mock.patch.object(remux, "cut_overlap_packets", return_value=([], 0.0)), \
              mock.patch.object(remux.subprocess, "run", side_effect=run):
             res = remux._prepare_tracks("/c", "/o", "/t.mka")
         return res, calls
@@ -391,7 +392,7 @@ class PeakRepairLadder(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(calls, [])                       # under the gate → no repair rung ran
         self.assertNotIn("repair", res.reason)
-        self.assertIn("peak 45.0 ≤ 50", res.reason)
+        self.assertIn("peak 45.0 ≤ 57.5 Mbps, the 50 cap's gate", res.reason)
 
     def test_over_gate_repairs_offending_segment_then_ships(self):
         import tempfile
@@ -401,7 +402,7 @@ class PeakRepairLadder(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(calls, [([0], 42)])              # only the hot segment, at 85% of 50
         self.assertIn("peak repair: 1 seg(s) re-capped @ 42 Mbps", res.reason)
-        self.assertIn("peak 40.0 ≤ 50", res.reason)
+        self.assertIn("peak 40.0 ≤ 57.5 Mbps, the 50 cap's gate", res.reason)
 
     def test_ladder_exhaustion_ships_nothing(self):
         import tempfile
@@ -622,6 +623,28 @@ class ShipRender(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertTrue(res.reason.startswith("render-over-cap"))
         self.assertIn("81.2", res.reason)
+
+    def test_the_note_names_the_gate_a_render_passed(self):
+        # a 53.7 peak shipped under the 50 cap's 57.5 gate read "53.7 ≤ 50" in the log (2026-10-20)
+        import tempfile, os
+        ran = type("R", (), {"returncode": 0, "stderr": ""})()
+
+        def fake_run(cmd, **kw):
+            if cmd[-1].endswith(".ship.hevc"):
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"es")
+            return ran
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(remux.dvcap, "probe_video", return_value={"frames": 100, "fps": "25"}), \
+             mock.patch.object(remux.dvcap, "video_peak_1s_mbps", return_value=53.7), \
+             mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
+             mock.patch.object(remux, "_mux_verified", side_effect=fake_mux([], reason="DV 8.1")), \
+             mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
+             mock.patch.object(remux.subprocess, "run", side_effect=fake_run):
+            res = remux.remux_ship_render("/r.mov", "/c.mp4", "/o.mp4", os.path.join(tmp, "o.mkv"),
+                                          cap_mbps=50)
+        self.assertTrue(res.ok, res.reason)
+        self.assertIn("peak 53.7 ≤ 57.5 Mbps, the 50 cap's gate", res.reason)
 
     def test_unprobeable_render_fails_without_the_fallback_reason(self):
         import dvcap
@@ -1457,6 +1480,430 @@ class AacAtCannotBeTrustedWithExoticLayouts(unittest.TestCase):
         self.assertEqual(r.count("build_audio_boost_filter(gain_db, src="), 2)
         self.assertEqual(h.count("build_audio_boost_filter(gain, src=work)"), 1)
         self.assertEqual(h.count("boost_keeping_original_args(gain, keep, src=work)"), 1)
+
+
+F = 1024 / 44100            # one AAC frame at 44.1 kHz
+
+
+def _probe_answers(codec, pts):
+    """subprocess.run stand-in for cut_overlap_packets: the codec probe, then the packet stamps."""
+    out = iter([mock.Mock(stdout=codec + "\n"), mock.Mock(stdout="\n".join(f"{t:.6f}" for t in pts))])
+    return lambda *a, **k: next(out)
+
+
+class CutOverlapIsTheSquashOnly(unittest.TestCase):
+    """cut_overlap_runs finds what yt-dlp's stream-copy cut leaves — a pile of packets stamped a tick
+    apart that is MORE AUDIO THAN TIME — and nothing that merely shares a stamp: jitter of any shape
+    nets out. Every shape below was measured on real cuts or real sources (review 2026-10-21): the
+    first fix flagged clean VOB AC3 and every Vorbis track; the second missed 4-12 % of real joins
+    whose chain swallowed a genuine packet at either end, and took mkvmerge's DVD jitter for a cut."""
+    T = 1 / 44100                                   # the MP4 audio timebase tick
+
+    def _check(self, pts, drops_expected):
+        runs, frame = remux.cut_overlap_runs(pts)
+        dropped = [k for a, b in runs for k in range(a, b + 1)]
+        self.assertEqual(len(dropped), drops_expected, runs)
+        kept = [t for k, t in enumerate(pts) if k not in set(dropped)]
+        gaps = [y - x for x, y in zip(kept, kept[1:])]
+        self.assertGreater(min(gaps), frame / 2)    # nothing left packed on top of anything
+        return dropped
+
+    def _shape(self, head_natural, n, u, before=20, after=20):
+        """Stretch 1 ends on packet P; n pre-roll packets piled a tick apart, from one tick past P
+        (head_natural=False) or from P + F (True); the next stretch's first packet at P + F + u."""
+        pts = [i * F for i in range(before)]
+        p = pts[-1]
+        start = p + F if head_natural else p + self.T
+        pts += [start + k * self.T for k in range(n)]
+        pts += [p + F + u + i * F for i in range(after)]
+        return pts
+
+    def test_the_pile_after_the_earlier_stretch(self):
+        d = self._check(self._shape(False, 68, 0.006), 68)
+        self.assertEqual(d[0], 20)                   # starts right after the genuine last packet
+
+    def test_the_pile_starting_a_frame_on(self):
+        self._check(self._shape(True, 68, 0.006), 68)
+
+    def test_a_long_pile_whose_ticks_add_up(self):  # 120 packets: 2.7 ms of ticks
+        self._check(self._shape(False, 120, 0.004), 120)
+
+    def test_the_next_stretch_landing_inside_the_pile(self):   # it chains in; still one join
+        self._check(self._shape(True, 40, 0.0005), 40)
+        self._check(self._shape(True, 40, 0.0011), 40)
+
+    def test_matroska_millisecond_stamps(self):
+        pts = [round(t, 3) for t in self._shape(True, 30, 0.006)]
+        self._check(pts, 30)
+
+    def test_a_cut_heavier_than_what_it_kept(self):  # the median of ALL gaps would be a tick
+        pts = [i * F for i in range(30)]
+        pts += [pts[-1] + F + k * self.T for k in range(200)] + [pts[-1] + F + 0.005 + i * F for i in range(30)]
+        self._check(pts, 200)
+
+    def test_dvd_jitter_nets_out(self):
+        pts = [i * F for i in range(100)]
+        pts[50] = 51 * F                             # one packet a frame late: gaps 2F, 0
+        self.assertEqual(remux.cut_overlap_runs(pts)[0], [])
+
+    def test_mkvmerges_dvd_jitter_nets_out(self):
+        pts = [i * F for i in range(100)]
+        pts[50], pts[51] = 51 * F, 52 * F            # gaps 2F, F, 0, F — the pair mkvmerge makes
+        self.assertEqual(remux.cut_overlap_runs(pts)[0], [])
+        pts = [i * F for i in range(100)]
+        pts[50], pts[51], pts[52] = 51 * F, 52 * F, 53 * F   # three late in a row
+        self.assertEqual(remux.cut_overlap_runs(pts)[0], [])
+
+    def test_a_pair_is_jitter_whatever_surrounds_it(self):
+        # third review (2026-10-21): each of these was taken for a cut by a looser rule
+        step = [i * F for i in range(60)] + [(i - 1) * F for i in range(60, 120)]   # lasting step back
+        late = [i * F for i in range(100)]
+        for k in range(40, 60):                       # a stretch of 20 a frame late, then back
+            late[k] += F
+        alt = [i * F for i in range(100)]
+        for k in range(40, 52, 2):                    # every other packet late, 12 packets
+            alt[k] += F
+        dts = [round(i * 512 / 48000, 3) for i in range(600)]
+        dts[300] = round(301 * 512 / 48000, 3)        # DTS on whole ms, one packet a frame late
+        for pts in (step, late, alt, dts):
+            self.assertEqual(remux.cut_overlap_runs(pts)[0], [])
+
+    def test_the_frame_survives_millisecond_rounding(self):
+        dts = [round(i * 512 / 48000, 3) for i in range(600)]          # median gap 11, mean 10.67
+        self.assertAlmostEqual(remux.cut_overlap_runs(dts)[1], 512 / 48000, delta=5e-5)
+
+    def test_a_pile_that_ends_the_file(self):        # a last piece holding nothing but pre-roll
+        self._check(self._shape(False, 30, 0.0, after=0), 30)
+
+    def test_a_run_at_either_end_is_no_join(self):
+        self.assertEqual(remux.cut_overlap_runs([0.0, 1e-5, 2e-5] + [F * i for i in range(1, 10)])[0], [])
+        self.assertEqual(remux.cut_overlap_runs([F * i for i in range(10)] + [10 * F, 10 * F + 1e-5])[0], [])
+
+
+def _probe_answers(codec, pts):
+    """subprocess.run stand-in for cut_overlap_packets: the codec probe, then the packet stamps."""
+    out = iter([mock.Mock(stdout=codec + "\n"), mock.Mock(stdout="\n".join(f"{t:.6f}" for t in pts))])
+    return lambda *a, **k: next(out)
+
+
+class CutOverlapReadsOnlyWhatItCanJudge(unittest.TestCase):
+    """cut_overlap_packets: codecs whose frames are not uniform (Vorbis block switching, TrueHD's
+    0.83 ms access units) are never judged; a missing stamp or an unreadable probe judges nothing."""
+
+    def test_codecs_without_uniform_frames_are_not_judged(self):
+        for codec in ("vorbis", "truehd", "flac", "pcm_s24le"):
+            with mock.patch.object(remux.subprocess, "run",
+                                   side_effect=_probe_answers(codec, [0.0, 0.0, 0.0, 1.0])):
+                self.assertEqual(remux.cut_overlap_packets("/c.mp4"), ([], 0.0), codec)
+
+    def test_a_judged_codec_is_read(self):
+        pts = [i * F for i in range(20)] + [19 * F + k / 44100 for k in range(1, 9)]
+        pts += [20 * F + 0.006 + i * F for i in range(20)]
+        with mock.patch.object(remux.subprocess, "run", side_effect=_probe_answers("aac", pts)):
+            self.assertEqual(remux.cut_overlap_packets("/c.mp4")[0], [(20, 27)])
+
+    def test_a_missing_stamp_judges_nothing(self):
+        with mock.patch.object(remux.subprocess, "run", side_effect=[
+                mock.Mock(stdout="aac\n"), mock.Mock(stdout="0.0\n0.023\nN/A\n0.046\n")]):
+            self.assertEqual(remux.cut_overlap_packets("/c.mp4"), ([], 0.0))
+
+    def test_an_unreadable_probe_judges_nothing(self):
+        with mock.patch.object(remux.subprocess, "run", side_effect=OSError):
+            self.assertEqual(remux.cut_overlap_packets("/c.mp4"), ([], 0.0))
+
+    def test_the_drop_args_read_the_source(self):
+        self.assertEqual(remux.cut_overlap_bsf_args({1: [(5, 9)], 0: [(1, 2), (7, 8)], 2: []}),
+                         ["-bsf:a:0", "noise=drop=between(n\\,1\\,2)+between(n\\,7\\,8)",
+                          "-bsf:a:1", "noise=drop=between(n\\,5\\,9)"])
+        self.assertEqual(remux.cut_overlap_bsf_args(None), [])
+        c = build_tracks_command("/ff", "/cfr.mp4", "/orig.mp4", "/t.mka", drop={0: [(3, 4)]})
+        self.assertLess(c.index("-bsf:a:0"), c.index("/cfr.mp4"))   # input side: before -i
+
+
+class TracksDropACutOverlap(unittest.TestCase):
+    """_prepare_tracks judges the first track, then the rest only when it found a cut; every build
+    drops what it found; Atmos is never judged; the note says how much went."""
+
+    def _go(self, runs_by_track, atmos=None, n_audio=1):
+        calls, judged = [], []
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stderr="")
+        def judge(path, sel="a:0", ffprobe=None):
+            judged.append(sel)
+            return runs_by_track.get(sel, []), F
+        with mock.patch.object(remux, "atmos_audio_index", return_value=atmos), \
+             mock.patch.object(remux, "audio_track_count", return_value=n_audio), \
+             mock.patch.object(remux, "subtitle_plan", return_value=[]), \
+             mock.patch.object(remux, "tracks_sync_ms", return_value=0), \
+             mock.patch.object(remux, "cut_overlap_packets", side_effect=judge), \
+             mock.patch.object(remux.subprocess, "run", side_effect=run):
+            res = remux._prepare_tracks("/c", "/o", "/t.mka")
+        return res, calls, judged
+
+    def test_a_clean_source_is_copied_as_before(self):
+        res, calls, judged = self._go({}, n_audio=3)
+        self.assertEqual(judged, ["a:0"])                       # the rest only after a cut
+        self.assertFalse([x for x in calls[0] if x.startswith("-bsf")])
+        self.assertNotIn("cut overlap", res[1])
+
+    def test_a_cut_is_dropped_from_every_track(self):
+        res, calls, judged = self._go({"a:0": [(10, 77), (500, 504)], "a:1": [(10, 77)]}, n_audio=2)
+        self.assertEqual(judged, ["a:0", "a:1"])
+        self.assertIn("-bsf:a:0", calls[0])
+        self.assertIn("-bsf:a:1", calls[0])
+        self.assertIn("cut overlap dropped from the audio (2 joins, 1.70 s)", res[1])
+
+    def test_atmos_is_never_judged(self):
+        res, calls, judged = self._go({"a:0": [(10, 77)]}, atmos=0, n_audio=2)
+        self.assertEqual(judged, [])
+        self.assertFalse([x for x in calls[0] if x.startswith("-bsf")])
+
+
+def _beeps(path, player=True, sr=8000):
+    """Onsets (s) of the 20 ms 1 kHz beeps in `path`'s first audio track. `player`: laid on the
+    timestamps the way a player plays it (a gap is silence, an overlap is skipped); otherwise one
+    sample after another, the way mkvmerge stamps a track."""
+    import numpy as np
+    af = ["-af", f"aresample=async=1:min_hard_comp=0.01,aresample={sr}"] if player else ["-ar", str(sr)]
+    raw = subprocess.run([remux.FFMPEG, "-v", "error", "-i", path, "-map", "0:a:0", *af, "-ac", "1",
+                          "-f", "f32le", "-"], capture_output=True, check=True).stdout
+    loud = np.abs(np.frombuffer(raw, np.float32)) > 0.1
+    onsets, last = [], -10 ** 9
+    for i in np.flatnonzero(loud):
+        if i - last > sr // 2:
+            onsets.append(i / sr)
+        last = i
+    return onsets
+
+
+@unittest.skipUnless(all(os.path.exists(t) for t in (remux.FFMPEG, remux.FFPROBE, remux.MKVMERGE)),
+                     "ffmpeg/ffprobe/mkvmerge not installed")
+class ACutsOverlapNeverReachesTheMaster(unittest.TestCase):
+    """For real: a source cut the way yt-dlp's SponsorBlock removal cuts (concat demuxer + stream
+    copy, the kept stretch reaching back to its keyframe), through _prepare_tracks and mkvmerge. Left
+    alone, mkvmerge counts the packed packets in and the rest of the sound plays late by them (what
+    shipped The Epstein Coverup Runs Deep 1.21 s late, 2026-10-21); dropped, the master plays where a
+    player put the download's sound, and every other packet is bit-exact."""
+
+    def _src(self, d, cuts):
+        j = lambda n: os.path.join(d, n)
+        beep = "aevalsrc=0.5*sin(2*PI*1000*t)*between(mod(t\\,3)\\,0.25\\,0.27):s=44100"
+        r = subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24000/1001",
+                            "-f", "lavfi", "-i", beep, "-t", "20", "-c:v", "libx264", "-g", "48",
+                            "-keyint_min", "48", "-sc_threshold", "0", "-c:a", "aac", "-b:a", "128k",
+                            j("src.mp4")], capture_output=True)
+        if r.returncode:
+            self.skipTest("no libx264 here")
+        with open(j("list.txt"), "w") as f:
+            for a, b in cuts:
+                f.write(f"file 'src.mp4'\ninpoint {a}\noutpoint {b}\n")
+        subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat",
+                        "-safe", "0", "-i", j("list.txt"), "-map", "0", "-dn", "-ignore_unknown",
+                        "-c", "copy", "-movflags", "+faststart", j("cut.mp4")],
+                       capture_output=True, check=True)
+        return j("cut.mp4")
+
+    def _mkv(self, d, tracks, name="m.mka"):
+        out = os.path.join(d, name)
+        subprocess.run([remux.MKVMERGE, "-q", "-o", out, tracks], capture_output=True, check=True)
+        return out
+
+    def _md5s(self, path):
+        out = subprocess.run([remux.FFMPEG, "-v", "error", "-i", path, "-map", "0:a:0", "-c", "copy",
+                              "-f", "framemd5", "-"], capture_output=True, text=True).stdout
+        return [ln.split(",")[-1].strip() for ln in out.splitlines() if not ln.startswith("#")]
+
+    def test_the_copy_drops_the_overlap_and_nothing_else(self):
+        d = tempfile.mkdtemp()
+        try:
+            # keep [0, 6) and [9.5, 20): the second stretch reaches back to the keyframe at 8.0
+            src = self._src(d, [(0, 6), (9.5, 20)])
+            runs, _f = remux.cut_overlap_packets(src)
+            self.assertEqual(len(runs), 1)
+            first = _beeps(src)[0]
+            truth = [t - first for t in _beeps(src)]                 # the download, as played
+            self.assertAlmostEqual(truth[2], 8.5, delta=0.01)        # source 12.25 at 6 + 2.75
+
+            plain = os.path.join(d, "plain.mka")                     # the old copy, as mkvmerge took it
+            subprocess.run(build_tracks_command(remux.FFMPEG, src, src, plain, subs=[]),
+                           capture_output=True, check=True)
+            late = _beeps(self._mkv(d, plain, "plain_m.mka"))
+            self.assertGreater(late[-1] - late[0] - truth[-1], 1.0)   # (the cut's own beep plays too)
+            self.assertGreater(remux.master_audio_drift(plain, os.path.join(d, "plain_m.mka")), 1.0)
+
+            t = os.path.join(d, "t.mka")
+            ok, note, why, sync = remux._prepare_tracks(src, src, t)
+            self.assertTrue(ok, why)
+            self.assertIn("cut overlap dropped from the audio (1 join,", note)
+            m = self._mkv(d, t)
+            for player in (True, False):                             # no reader can disagree now
+                got = _beeps(m, player=player)
+                self.assertEqual(len(got), len(truth), player)
+                for g, want in zip(got, truth):
+                    self.assertAlmostEqual(g - got[0], want, delta=0.03, msg=player)
+            self.assertLess(abs(remux.master_audio_drift(t, m)), remux.AUDIO_DRIFT_TOLERANCE)
+            a, b = runs[0]
+            kept = self._md5s(src)
+            self.assertEqual(self._md5s(t), kept[:a] + kept[b + 1:])  # bit-exact, minus the run
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_the_boost_drops_it_too(self):
+        d = tempfile.mkdtemp()
+        try:
+            src = self._src(d, [(0, 6), (9.5, 20)])
+            runs, _f = remux.cut_overlap_packets(src)
+            t = os.path.join(d, "t.mka")
+            subprocess.run(build_tracks_command(remux.FFMPEG, src, src, t, gain_db=3.0, subs=[],
+                                                drop={0: runs}), capture_output=True, check=True)
+            got = _beeps(self._mkv(d, t))
+            self.assertAlmostEqual(got[2] - got[0], 8.5, delta=0.03)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_every_join_is_found_wherever_the_cut_falls(self):
+        # the second review's misses (A: three joins, B: a stretch starting on its keyframe, C: the
+        # 44.1k join at 9.503483), and a cut walked across one audio frame; MP4 and MKV downloads
+        # (the MKV through an MP4 copy, as the CFR step makes it), 44.1 and 48 kHz
+        cases = [[(0, 6.191967), (7.641151, 14.593702), (15.995802, 25.581296), (32.756552, None)],
+                 [(0, 12.0), (20.02, None)], [(0, 6.0), (9.503483, None)]]
+        cases += [[(0, 6.0), (9.5 + k * 0.0047, None)] for k in range(8)]
+        d = tempfile.mkdtemp()
+        try:
+            j = lambda n: os.path.join(d, n)
+            beep = "aevalsrc=0.5*sin(2*PI*1000*t)*between(mod(t\\,3)\\,0.25\\,0.27):s={}"
+            for rate in (44100, 48000):
+                src = j(f"src{rate}.mp4")
+                r = subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                    "-i", "testsrc2=size=96x54:rate=24000/1001", "-f", "lavfi", "-i",
+                                    beep.format(rate), "-t", "40", "-c:v", "libx264", "-g", "48",
+                                    "-keyint_min", "48", "-sc_threshold", "0", "-c:a", "aac", src],
+                                   capture_output=True)
+                if r.returncode:
+                    self.skipTest("no libx264 here")
+                for ci, segs in enumerate(cases):
+                    with open(j("list.txt"), "w") as f:
+                        for a, b in segs:
+                            f.write(f"file '{src}'\ninpoint {a}\n" + (f"outpoint {b}\n" if b else ""))
+                    for kind in ("mp4", "mkv"):
+                        cut = j(f"cut.{kind}")
+                        subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f",
+                                        "concat", "-safe", "0", "-i", j("list.txt"), "-map", "0", "-dn",
+                                        "-c", "copy", cut], capture_output=True, check=True)
+                        if kind == "mkv":                        # the CFR copies it into an MP4
+                            subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                                            "-i", cut, "-map", "0", "-c", "copy", j("cfr.mp4")],
+                                           capture_output=True, check=True)
+                            cut = j("cfr.mp4")
+                        runs, frame = remux.cut_overlap_packets(cut)
+                        pts = [float(x.split(",")[0]) for x in subprocess.run(
+                            [remux.FFPROBE, "-v", "error", "-select_streams", "a:0", "-show_entries",
+                             "packet=pts_time", "-of", "csv=p=0", cut], capture_output=True,
+                            text=True).stdout.split()]
+                        gone = {k for a, b in runs for k in range(a, b + 1)}
+                        kept = [t for k, t in enumerate(pts) if k not in gone]
+                        what = f"{rate} {kind} case {ci}: {runs}"
+                        self.assertEqual(len(runs), len(segs) - 1, what)    # every join, one run each
+                        self.assertGreater(min(b - a for a, b in zip(kept, kept[1:])), frame / 2, what)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_last_piece_of_nothing_but_pre_roll(self):
+        # yt-dlp writes a final piece from YouTube's whole-second length when the file runs longer:
+        # if the sound has already ended there, that piece is keyframe pre-roll piled at the very end
+        d = tempfile.mkdtemp()
+        try:
+            j = lambda n: os.path.join(d, n)
+            beep = "aevalsrc=0.5*sin(2*PI*1000*t)*between(mod(t\\,3)\\,0.25\\,0.27):s=44100:d=39.5"
+            r = subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                "-i", "testsrc2=size=96x54:rate=24000/1001:d=40", "-f", "lavfi", "-i", beep,
+                                "-c:v", "libx264", "-g", "48", "-keyint_min", "48", "-sc_threshold", "0",
+                                "-c:a", "aac", j("src.mp4")], capture_output=True)
+            if r.returncode:
+                self.skipTest("no libx264 here")
+            with open(j("list.txt"), "w") as f:
+                f.write(f"file '{j('src.mp4')}'\ninpoint 0\noutpoint 30\nfile '{j('src.mp4')}'\ninpoint 39.8\n")
+            subprocess.run([remux.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat",
+                            "-safe", "0", "-i", j("list.txt"), "-map", "0", "-dn", "-c", "copy",
+                            j("cut.mp4")], capture_output=True, check=True)
+            runs, frame = remux.cut_overlap_packets(j("cut.mp4"))
+            pts = [float(x.split(",")[0]) for x in subprocess.run(
+                [remux.FFPROBE, "-v", "error", "-select_streams", "a:0", "-show_entries",
+                 "packet=pts_time", "-of", "csv=p=0", j("cut.mp4")], capture_output=True,
+                text=True).stdout.split()]
+            self.assertEqual(len(runs), 1, runs)
+            self.assertEqual(runs[0][1], len(pts) - 1)             # it runs to the end of the file
+            self.assertGreater((runs[0][1] - runs[0][0] + 1) * frame, 1.0)   # ~1.46 s from 38.04
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_dvd_remuxed_by_mkvmerge_is_left_alone(self):
+        # ffmpeg's VOB stamps one AC3 packet a frame late; mkvmerge makes a pair of it (2F, F, 0, F)
+        d = tempfile.mkdtemp()
+        try:
+            j = lambda n: os.path.join(d, n)
+            run = lambda c: subprocess.run(c, capture_output=True, check=True)
+            run([remux.FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=96x54:rate=25",
+                 "-f", "lavfi", "-i", "anoisesrc=d=60:a=0.1", "-t", "60", "-c:v", "mpeg2video",
+                 "-c:a", "ac3", "-b:a", "448k", "-f", "vob", j("dvd.vob")])
+            run([remux.FFMPEG, "-v", "error", "-y", "-fflags", "+genpts", "-i", j("dvd.vob"),
+                 "-map", "0:v", "-map", "0:a", "-c", "copy", j("copy.mkv")])
+            run([remux.MKVMERGE, "-q", "-o", j("remux.mkv"), j("copy.mkv")])
+            run([remux.FFMPEG, "-v", "error", "-y", "-i", j("remux.mkv"), "-map", "0", "-c", "copy",
+                 j("cfr.mp4")])
+            for f in ("dvd.vob", "copy.mkv", "remux.mkv", "cfr.mp4"):
+                self.assertEqual(remux.cut_overlap_packets(j(f))[0], [], f)
+            pts = [float(x.split(",")[0]) for x in subprocess.run(       # the shape is really there
+                [remux.FFPROBE, "-v", "error", "-select_streams", "a:0", "-show_entries",
+                 "packet=pts_time", "-of", "csv=p=0", j("remux.mkv")], capture_output=True,
+                text=True).stdout.split()]
+            self.assertTrue(any(b - a < 0.001 for a, b in zip(pts, pts[1:])))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_clean_source_and_jitter_are_left_alone(self):
+        d = tempfile.mkdtemp()
+        try:
+            src = self._src(d, [(0, 20)])
+            self.assertEqual(remux.cut_overlap_packets(src)[0], [])
+            jit = os.path.join(d, "jit.mp4")                         # one packet a frame late
+            subprocess.run([remux.FFMPEG, "-v", "error", "-y", "-i", src, "-map", "0:a", "-c", "copy",
+                            "-bsf:a", "setts=ts=if(eq(N\\,100)\\,TS+DURATION\\,TS)", jit],
+                           capture_output=True, check=True)
+            self.assertEqual(remux.cut_overlap_packets(jit)[0], [])
+            ps = os.path.join(d, "ps.mpg")                           # DVD-style MPEG-PS with AC3
+            subprocess.run([remux.FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "testsrc2=size=160x90:rate=25", "-f", "lavfi", "-i", "sine=f=440:d=20",
+                            "-t", "20", "-c:v", "mpeg2video", "-c:a", "ac3", "-f", "vob", ps],
+                           capture_output=True, check=True)
+            self.assertEqual(remux.cut_overlap_packets(ps)[0], [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TheMuxSaysWhenTheSoundDrifts(unittest.TestCase):
+    """_mux_verified's backstop: a master whose sound runs longer than its tracks' timestamps span
+    says so in its note — and still ships (it is a report, not a gate)."""
+
+    def _mux(self, drift):
+        res = remux.RemuxResult(True, "/o.mkv", reason="DV 8.1 · 1 audio · 0 sub")
+        with mock.patch.object(remux, "run_mux", return_value=(True, "")), \
+             mock.patch.object(remux.os.path, "exists", return_value=True), \
+             mock.patch.object(remux, "_verify", return_value=res), \
+             mock.patch.object(remux, "master_audio_drift", return_value=drift), \
+             mock.patch.object(remux, "_gate_interleave", side_effect=lambda r, *a, **k: r):
+            return remux._mux_verified("/es", "24000/1001", "/t.mka", "/o.mkv")
+
+    def test_a_drift_is_said(self):
+        r = self._mux(1.21)
+        self.assertTrue(r.ok)
+        self.assertIn("AUDIO DRIFT: the sound runs +1.21 s against its timestamps", r.reason)
+
+    def test_no_drift_says_nothing(self):
+        for d in (0.0, 0.05, None):
+            self.assertNotIn("DRIFT", self._mux(d).reason, d)
 
 
 class TheGapProbeMeasuresInterleavingNotGopLength(unittest.TestCase):

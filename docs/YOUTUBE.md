@@ -54,6 +54,14 @@ same way: an 88-minute 4K interview needs about 80 GB. A 4K fast-path movie meas
   cap is **re-exported at a lower target calculated from the burst it just showed** (up to
   twice, never below 8 Mbps). Only a video that still misses takes the capped x265 pass.
 
+- **SponsorBlock cuts stay in sync.** When youtarr removes SponsorBlock segments, yt-dlp cuts
+  the download without re-encoding, so each kept stretch carries the sound from its keyframe up
+  to the cut, stamped on top of the join. A player follows those stamps; mkvmerge, which muxes
+  every master, would count them in and play the rest of the video late by up to a few seconds.
+  Visionary drops exactly those packed packets as it reads the audio (copy and loudness boost
+  alike, every other packet bit-exact), and the log says how many joins it took out. Only that
+  pattern is touched — jitter in DVD or old AVI audio is left to mkvmerge, which gets it right.
+
 - **Channels.** Subscribe from your own YouTube subscriptions, or paste a channel link.
   Each channel has a **scope** (most popular or all), a **max age**, its own output mode,
   loudness setting and pause. Visionary reads a channel's whole back catalogue — videos and

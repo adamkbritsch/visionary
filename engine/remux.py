@@ -280,6 +280,115 @@ def build_audio_boost_filter(gain_db: float, src=None) -> str:
     return f"{prefix}volume={gain_db:.2f}dB,{AUDIO_LIMITER}"
 
 
+# ---- A STREAM-COPY CUT'S OVERLAP --------------------------------------------------------------
+# Youtarr removes SponsorBlock segments with yt-dlp, which cuts by STREAM COPY through ffmpeg's concat
+# demuxer. A kept stretch can only start at a video keyframe, so the audio from that keyframe up to the
+# cut rides along and the muxer stamps it at the join, one timebase tick apart. A player goes by the
+# stamps and the download plays in sync — but mkvmerge (every master since 2026-10-19) stamps audio by
+# COUNTING SAMPLES, so each join pushed the rest of the sound late by its overlap: 1.21 s by the end of
+# The Epstein Coverup Runs Deep, 2.27 s in Kurzgesagt's Quasars (live-caught 2026-10-21). Those packed
+# packets are dropped as the tracks file reads its source (cut_overlap_packets), copy and boost alike:
+# the rest stays bit-exact and lands within a frame of where a player put it.
+# ONLY that signature is touched. Re-laying all audio on its timestamps (the first fix) put 32 ms holes
+# into DVD-style AC3 whose stamps jitter by a frame, and drifted an AVI whose MP3 stamps never matched
+# its samples — sources mkvmerge's sample count gets right (review-caught 2026-10-21).
+CUT_SQUASH_GAP = 0.0015     # s: packed packets sit a tick apart (or on one ms in Matroska)
+# Codecs with uniform frames of 10-60 ms. Vorbis switches block size (2.7 ms packets beside 23 ms
+# ones) and TrueHD's access units are 0.83 ms, so neither can be judged by its gaps.
+CUT_OVERLAP_CODECS = ("aac", "ac3", "eac3", "mp3", "mp2", "opus", "dts")
+
+
+def cut_overlap_packets(path: str, sel: str = "a:0", ffprobe=FFPROBE) -> tuple:
+    """(runs, frame_s) of audio stream `sel` in `path` — cut_overlap_runs of its packet stamps.
+    ([], 0.0) when the codec is not judged, a stamp is missing (the packet indices could no longer
+    be trusted), or the track cannot be read. Reads packet timestamps only, never decodes (~2 s for
+    a 2-hour AAC track)."""
+    try:
+        codec = (subprocess.run([ffprobe, "-v", "error", "-select_streams", sel, "-show_entries",
+                                 "stream=codec_name", "-of", "csv=p=0", path], capture_output=True,
+                                text=True, timeout=60).stdout.strip().splitlines() or [""])[0]
+        if codec.split(",")[0].strip() not in CUT_OVERLAP_CODECS:
+            return [], 0.0
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", sel, "-show_entries",
+                              "packet=pts_time", "-of", "csv=p=0", path], capture_output=True,
+                             text=True, timeout=600).stdout
+        pts = [float(ln.split(",")[0]) for ln in str(out).split()]
+    except Exception:  # noqa: BLE001 — unreadable or a missing stamp: judge nothing
+        return [], 0.0
+    return cut_overlap_runs(pts)
+
+
+# How many packets either side of a chain its surplus is counted over: enough to take in the frame
+# a jittered stamp lost a packet or two earlier (mkvmerge moves DVD jitter's duplicate one on).
+CUT_WINDOW = 8
+
+
+def cut_overlap_runs(pts: list) -> tuple:
+    """PURE. (runs, frame_s): the packets a stream-copy cut packed at its joins, as inclusive
+    (first, last) packet-index ranges, and the track's frame length (the MEAN of its gaps that are
+    not packed — millisecond stamps make the median 11 ms for DTS's 10.67). A CHAIN is packets
+    linked by gaps under CUT_SQUASH_GAP. It is a cut only when it holds at least THREE packets — a
+    cut piles every pre-roll packet a tick apart, while a PAIR sharing a stamp is how jitter looks
+    (a packet a frame late, DVD-style; mkvmerge's version of it; a late stretch stepping back; ms
+    rounding), so the only real cut a pair can be is a pre-roll of under two frames — and when the
+    stretch around it holds MORE AUDIO THAN TIME, CUT_WINDOW packets either side counted against
+    the time they span, by at least half a frame. Its packets then go through a frame clock from
+    the packet before it: one stamped more than half a frame ahead of the clock is packed and
+    dropped, one on time moves the clock on — keeping the real packets either side whichever of
+    them the chain swallowed (it starts on the earlier stretch's last packet, and the next stretch's
+    first can land inside the pile). A pile that ends the file counts too: yt-dlp can write a last
+    piece that holds nothing but pre-roll. (Each rule here is a review finding, 2026-10-21: a span
+    gate missed 4-12 % of real joins; the pair rule and the mean answer jitter it took for cuts.)"""
+    n = len(pts)
+    if n < 3:
+        return [], 0.0
+    gaps = [b - a for a, b in zip(pts, pts[1:])]
+    steady = [g for g in gaps if g >= CUT_SQUASH_GAP]
+    if not steady:
+        return [], 0.0
+    frame = sum(steady) / len(steady)
+    drops, i = [], 0
+    while i < len(gaps):
+        if gaps[i] >= CUT_SQUASH_GAP:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(gaps) and gaps[j + 1] < CUT_SQUASH_GAP:
+            j += 1
+        first, last = i, j + 1
+        i = j + 1
+        if first == 0 or last - first < 2:
+            continue                                  # nothing before it, or only a pair
+        w0, w1 = max(0, first - CUT_WINDOW), min(n - 1, last + CUT_WINDOW)
+        if (w1 - w0) * frame - (pts[w1] - pts[w0]) < frame / 2:
+            continue                                  # no more audio than time: jitter
+        clock = pts[first - 1] + frame
+        for k in range(first, min(last + 2, n)):      # the chain and the packet after it
+            if pts[k] < clock - frame / 2:
+                drops.append(k)
+            else:
+                clock = pts[k] + frame
+    runs = []
+    for k in drops:
+        if runs and k == runs[-1][1] + 1:
+            runs[-1][1] = k
+        else:
+            runs.append([k, k])
+    return [tuple(r) for r in runs], frame
+
+
+def cut_overlap_bsf_args(drop) -> list:
+    """INPUT-side ffmpeg args that drop `drop` = {audio index: [(first, last), ...]} as the source is
+    read — before a copy or a decode alike (ffmpeg's noise filter counts each stream's packets from 0,
+    the same indices cut_overlap_packets read)."""
+    args = []
+    for i, runs in sorted((drop or {}).items()):
+        if runs:
+            expr = "+".join(f"between(n\\,{a}\\,{b})" for a, b in runs)
+            args += [f"-bsf:a:{i}", f"noise=drop={expr}"]
+    return args
+
+
 def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
     try:
         r = subprocess.run(build_loudness_probe_command(ffmpeg, src),
@@ -291,7 +400,8 @@ def measure_lufs(src: str, ffmpeg=FFMPEG, timeout=300):
 
 def build_tracks_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_out: str,
                          gain_db: float = 0.0, subs=None, keep_original_audio: int = 0,
-                         atmos_lead=None, n_audio: int = 0, fix_sub_duration: bool = False) -> list:
+                         atmos_lead=None, n_audio: int = 0, fix_sub_duration: bool = False,
+                         drop=None) -> list:
     """The master's TRACKS file (Matroska): every audio track from the CFR file (input 0) + the
     subtitles, chapters and font attachments of the ORIGINAL (input 1). mkvmerge then muxes it
     with the capped/injected/render ES (build_master_mux_command). Subtitles come from the
@@ -300,6 +410,8 @@ def build_tracks_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_
     None = no subtitles: the last-resort retry ships the master without them rather than park
     the item over a subtitle track). Font attachments ride along only with subtitles (they exist
     for ASS).
+    `drop` ({audio index: packet ranges}, cut_overlap_packets) takes a stream-copy cut's packed
+    packets out as the CFR is read, whatever then copies or encodes the track.
     With `gain_db` > 0 the audio is loudness-boosted (volume + limiter -> aac_at 384k) instead of
     stream-copied; `keep_original_audio` (the source's audio track count, set when any of it is
     LOSSLESS) makes the boosted copy of track 0 LEAD and every original track follow untouched
@@ -338,6 +450,7 @@ def build_tracks_command(ffmpeg: str, cfr_source: str, orig_source: str, tracks_
     sub_args = subtitle_args(subs or [], input_idx=1)
     return [
         ffmpeg, "-hide_banner", "-nostdin", "-y",
+        *cut_overlap_bsf_args(drop),        # input-side: before the copy or the decode
         "-i", cfr_source, *(["-fix_sub_duration"] if fix_sub_duration else []), "-i", orig_source,
         *amaps,                             # audio from the CFR...
         "-c", "copy", *audio,
@@ -890,6 +1003,9 @@ def _prepare_tracks(cfr_source: str, orig_source: str, tracks: str, *, audio_tar
         sources keep every original track behind the boosted copy (2026-08-21). The landing is
         measured on this cheap file BEFORE the mux; a boost that misses (or that the encoder
         refuses — aac_at and an exotic 7.1 bed) falls back to a bit-exact copy, never a park.
+      CUT OVERLAP: the packets a stream-copy cut packed at its joins (cut_overlap_packets) are
+        dropped from every audio track as the CFR is read, on the copy and the boost alike —
+        mkvmerge would turn them into a delay for the rest of the master. Atmos is never touched.
       SUBTITLES: copied / converted to SRT (subtitle_plan). A build that fails retries with
         -fix_sub_duration when it converts any (corrupt cue durations; that costs each converted
         track its last line, so it is never the default), and only then drops the subtitles
@@ -908,12 +1024,26 @@ def _prepare_tracks(cfr_source: str, orig_source: str, tracks: str, *, audio_tar
                 else boost_gain_db(measured, audio_target_lufs))
         if gain > 0 and has_lossless_audio(cfr_source, ffprobe):
             keep = audio_track_count(cfr_source, ffprobe)
+    # a cut packs every track at the same joins: judge the first, and only then the rest
+    drop, cut_note = {}, ""
+    if atmos_lead is None:
+        runs, frame = cut_overlap_packets(cfr_source, "a:0", ffprobe)
+        if runs:
+            drop[0] = runs
+            for i in range(1, audio_track_count(cfr_source, ffprobe)):
+                more, _f = cut_overlap_packets(cfr_source, f"a:{i}", ffprobe)
+                if more:
+                    drop[i] = more
+            n = sum(b - a + 1 for a, b in runs)
+            cut_note = (f" · cut overlap dropped from the audio ({len(runs)} join"
+                        f"{'s' if len(runs) != 1 else ''}, {n * frame:.2f} s)")
     plan, subs_note = subtitle_plan(orig_source, ffprobe), ""
 
     def build(g, subs, fix=False):
         cmd = build_tracks_command(ffmpeg, cfr_source, orig_source, tracks, gain_db=g, subs=subs,
                                    keep_original_audio=(keep if g > 0 else 0),
-                                   atmos_lead=atmos_lead, n_audio=n_audio, fix_sub_duration=fix)
+                                   atmos_lead=atmos_lead, n_audio=n_audio, fix_sub_duration=fix,
+                                   drop=drop)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired as e:
@@ -963,7 +1093,7 @@ def _prepare_tracks(cfr_source: str, orig_source: str, tracks: str, *, audio_tar
     sync = tracks_sync_ms(cfr_source, tracks, pair, ffprobe) if pair else 0
     if sync:
         note += f" · audio start realigned ({sync:+d} ms)"
-    return True, note + subs_note, "", sync
+    return True, note + cut_note + subs_note, "", sync
 
 
 def _first_pts(path: str, sel: str, ffprobe: str = FFPROBE):
@@ -976,6 +1106,49 @@ def _first_pts(path: str, sel: str, ffprobe: str = FFPROBE):
         return float(tok)
     except (ValueError, OSError, subprocess.SubprocessError):
         return None
+
+
+# How far the master's first audio track may run longer or shorter than its tracks-file timestamps
+# span before the log says so: encoder priming and a last partial frame, with room.
+AUDIO_DRIFT_TOLERANCE = 0.1
+
+
+def _audio_span(path: str, sel: str, ffprobe: str = FFPROBE):
+    """(start, end) in seconds of audio stream `sel` in `path` as its TIMESTAMPS give them — the
+    first packet's pts, and the latest pts + duration over the file's last ~30 s — or None when
+    unreadable. A master without audio cues may be read through to get there (seconds, on SSD)."""
+    first = _first_pts(path, sel, ffprobe)
+    try:
+        box = float(subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                                    "-of", "default=nw=1:nk=1", path], capture_output=True,
+                                   text=True, timeout=60).stdout.strip().splitlines()[0])
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", sel, "-read_intervals",
+                              f"{max(0.0, box - 30):.3f}%", "-show_entries",
+                              "packet=pts_time,duration_time", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=600).stdout
+    except Exception:  # noqa: BLE001 — unreadable: no span
+        return None
+    end = None
+    for ln in str(out).splitlines():
+        p = ln.split(",")
+        try:
+            t = float(p[0]) + (float(p[1]) if len(p) > 1 and p[1].strip() not in ("", "N/A") else 0.0)
+        except ValueError:
+            continue
+        end = t if end is None else max(end, t)
+    return (first, end) if first is not None and end is not None else None
+
+
+def master_audio_drift(tracks: str, master: str, ffprobe: str = FFPROBE):
+    """How much longer (s, signed) the master's first audio track runs than the span its tracks
+    file's timestamps give, or None when either cannot be read. 0 when mkvmerge laid the sound where
+    the stamps put it; packets a stream-copy cut packed on top of what came before (one
+    cut_overlap_packets could not judge — TrueHD, Vorbis) come out as their length, because mkvmerge
+    stamps audio by counting samples. The mux's --sync moves a track without changing its span."""
+    t, m = _audio_span(tracks, "a:0", ffprobe), _audio_span(master, "a:0", ffprobe)
+    if not t or not m:
+        return None
+    return (m[1] - m[0]) - (t[1] - t[0])
 
 
 def tracks_sync_ms(cfr_source: str, tracks: str, pair, ffprobe: str = FFPROBE) -> int:
@@ -1014,6 +1187,11 @@ def _mux_verified(es: str, fps: str, tracks, output: str, *, require_dv: bool = 
     if not res.ok:
         _rm(part)
         return res
+    # BACKSTOP: the sound has to be where the tracks file's timestamps put it (master_audio_drift).
+    # Said, not parked: a cut overlap _prepare_tracks could not judge is the only known cause.
+    drift = master_audio_drift(tracks, part, ffprobe) if tracks else None
+    if drift is not None and abs(drift) > AUDIO_DRIFT_TOLERANCE:
+        res.reason += f" · AUDIO DRIFT: the sound runs {drift:+.2f} s against its timestamps"
     return _gate_interleave(res, part, ffprobe)
 
 
@@ -1264,7 +1442,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                 if releaser is not None and releaser.freed:
                     repair_note += (f" · {len(releaser.freed)} Topaz chunk(s), "
                                     f"{releaser.freed_bytes / 2**30:.0f} GiB, freed during the encode")
-                res.reason += f" · peak {peak:.1f} ≤ {cap_mbps} Mbps cap" + repair_note + audio_note
+                res.reason += (f" · peak {peak:.1f} ≤ {cap_mbps * dvcap.PEAK_TOLERANCE:.1f} Mbps, "
+                               f"the {cap_mbps} cap's gate") + repair_note + audio_note
                 atomic_ship(part, output)
                 shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the segments won't be needed again
                 return res
@@ -2003,7 +2182,9 @@ def remux_ship_render(dv_video: str, cfr_source: str, orig_source: str, output: 
             return RemuxResult(False, output,
                                reason=f"render-over-cap: shipped file measured {shipped:.1f} Mbps "
                                       f"> {cap_mbps} — using the capped re-encode")
-        res.reason += (f" · render shipped as-is (peak {mbps:.1f} ≤ {cap_mbps} Mbps, "
+        # the GATE, not the bare cap: a 53.7 peak under a 50 cap read as a broken gate in the log
+        res.reason += (f" · render shipped as-is (peak {mbps:.1f} ≤ "
+                       f"{cap_mbps * dvcap.PEAK_TOLERANCE:.1f} Mbps, the {cap_mbps} cap's gate, "
                        f"no re-encode)") + audio_note
         atomic_ship(part, output)
         return res
