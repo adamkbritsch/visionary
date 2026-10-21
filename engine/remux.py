@@ -1021,7 +1021,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, audio_target_lufs=None,
           audio_gain_db=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
-          encode_source=None, rpu_mode=None, native=None, sdr=False,
+          encode_source=None, rpu_mode=None, native=None, sdr=False, rpu_book=None,
+          rpu_in_stream=False,
           ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the DV render's video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -1051,7 +1052,11 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     render's own packets — the Rec.709 x265 under the same VBV cap (dvcap dv=False), no DV box
     in the mux, and the verify asks for no DOVI record. The peak gate and its repair ladder, the
     audio and the resume rules are the DV path's; the resume manifest says "sdr" so the two
-    never share segments. Without it every call below is exactly the DV path's."""
+    never share segments. Without it every call below is exactly the DV path's.
+    `rpu_book` (the native render's own generated RPU, sha-checked by the stage) is the RPU, copied
+    rather than extracted back out of the render; `rpu_in_stream` marks `dv_video` as a REAL
+    Dolby Vision donor whose RPUs are read by its own frame order (splice.donor_rpus — dovi_tool's
+    extract misorders RADL groups). x265 takes the list in display order either way."""
     if not is_master_container(output):
         return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
@@ -1104,7 +1109,8 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     # a re-rendered dv_video or changed cap would otherwise concat stale/wrong segments
     dvcap.ensure_segdir(segdir, dvcap.resume_manifest(
         dv_video, cap_mbps, info["frames"], info["fps"], dvcap.SEG_SECONDS, boundaries=boundaries,
-        encode_source=encode_source, rpu_mode=rpu_mode, **nat_kw))
+        encode_source=encode_source, rpu_mode=rpu_mode, **nat_kw,
+        **({"rpu_source": "stream-v1"} if rpu_in_stream else {})))
     rpu = os.path.join(segdir, "rpu.bin")
     hevc = output + ".capped.hevc"          # transient: the concat of the segments, rebuilt each attempt
     tracks = None
@@ -1114,9 +1120,38 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         elif not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):   # resume keeps the extracted RPU
             if native is not None:
                 ok, why = _copy_native_rpu(native["rpu"], rpu)
+            elif rpu_book:
+                ok, why = _copy_native_rpu(rpu_book, rpu)
+            elif rpu_in_stream:
+                import splice
+                try:
+                    units = splice.rpus_from_stream(dv_video, segdir, mode=rpu_mode,
+                                                    ffmpeg=ffmpeg, abort=abort)
+                    splice.write_rpu_file(units, rpu)
+                    ok, why = True, "rpu read from the donor by its own frame order"
+                except InterruptedError:
+                    return RemuxResult(False, output, reason="aborted")
+                except ValueError as e:
+                    ok, why = False, f"RPU: {e}"
             else:
-                ok, why = dvcap.extract_rpu(dv_video, rpu, mode=rpu_mode, ffmpeg=ffmpeg,
+                # extracted to a side file and published as rpu.bin only once its order checked
+                # out: a stop mid-check must not leave an unchecked rpu.bin a retry would trust
+                ext = rpu + ".extract"
+                ok, why = dvcap.extract_rpu(dv_video, ext, mode=rpu_mode, ffmpeg=ffmpeg,
                                             timeout=timeout)
+                if ok:
+                    import splice
+                    try:
+                        splice.check_extract_order(dv_video, ext, segdir, mode=rpu_mode,
+                                                   ffmpeg=ffmpeg, abort=abort)
+                        if os.path.exists(ext):
+                            os.replace(ext, rpu)
+                    except InterruptedError:
+                        _rm(ext)
+                        return RemuxResult(False, output, reason="aborted")
+                    except ValueError as e:
+                        ok, why = False, f"RPU: {e}"
+                _rm(ext)
             if not ok:
                 return RemuxResult(False, output, reason=why)
         # RPU frame count is GROUND TRUTH (one per coded frame). The container nb_frames HEADER
@@ -1307,7 +1342,8 @@ def _fsize(path) -> int:
 
 def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                  audio_target_lufs=None, abort=None, on_step=None, on_stages=None,
-                 rpu_mode=None, skip_inject=False, convert_es=False,
+                 rpu_mode=None, skip_inject=False, convert_es=False, rpu_book=None,
+                 rpu_in_stream=False, audio_gain_db=None,
                  ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """HIGH-BITRATE 4K HDR10 FAST PATH (user-dictated): ship the ORIGINAL video stream
     (orig_source) with a Dolby Vision RPU from `dv_video` injected — no re-encode (the
@@ -1325,7 +1361,16 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
     release's split access units would otherwise reach mkvmerge as picture-less frames).
 
     `on_stages(labels)` (optional) hears the steps this call will report through `on_step`,
-    in order, before the first of them (inject_stages)."""
+    in order, before the first of them (inject_stages).
+
+    EVERY RPU ON ITS OWN FRAME (2026-10-20): dovi_tool's inject-rpu (and extract-rpu) order frames
+    by an unsigned POC and shift every RADL group by two. The RPU is taken from `rpu_book` (the
+    native render's own generated RPU), read from a real donor by its frame order
+    (`rpu_in_stream`), or extracted from a render with no books only where both readings agree
+    (splice.donor_rpus); it is written into each access unit here (splice.place_rpus, which reads
+    the result back and proves every frame's RPU), and the master's timestamps must put every
+    frame in its display slot. dovi_tool's inject stays only for a stream splice.py cannot index.
+    `audio_gain_db`: a TV season's decided gain (stages/audiogain), as remux() takes it."""
     if not is_master_container(output):
         return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
@@ -1344,10 +1389,12 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                                       f"{info['fps']} — RPU cannot align (shipped nothing)")
     except (ValueError, ZeroDivisionError):
         return RemuxResult(False, output, reason="unreadable fps — RPU alignment unverifiable")
+    import splice
     src_es = output + ".src.hevc"           # transient: the source's Annex-B ES (original bits)
     inj_es = output + ".inject.hevc"        # transient: same ES with the RPU interleaved
     tracks = None
     segdir = None
+    placed, rpu_note = None, ""
     try:
         if not skip_inject:
             # Small resume dir: keeps ONLY the extracted RPU (tens of MB). Same name the
@@ -1360,21 +1407,32 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             except OSError:
                 src_id = "missing"
             manifest = {"mode": "inject", "src": src_id,
-                        "frames": n_src, "fps": str(info["fps"])}
+                        "frames": n_src, "fps": str(info["fps"]),
+                        "rpu": "book" if rpu_book else ("stream" if rpu_in_stream else "extract")}
             if rpu_mode is not None:
                 manifest["rpu_mode"] = int(rpu_mode)
             dvcap.ensure_segdir(segdir, manifest)
             rpu = os.path.join(segdir, "rpu.bin")
+            have = os.path.exists(rpu) and os.path.getsize(rpu) > 0
             if on_stages:
-                on_stages(inject_stages(not (os.path.exists(rpu) and os.path.getsize(rpu) > 0)))
-            if not (os.path.exists(rpu) and os.path.getsize(rpu) > 0):
-                if on_step:
+                on_stages(inject_stages(not have and not rpu_book))
+            if have:
+                units = splice.rpu_units(rpu)
+            else:
+                if on_step and not rpu_book:
                     on_step("extracting DV metadata", None)   # reads the whole donor; no
-                ok, why = dvcap.extract_rpu(dv_video, rpu, mode=rpu_mode,        # watchable output
-                                            ffmpeg=ffmpeg, timeout=timeout)
-                if not ok:
-                    return RemuxResult(False, output, reason=why)
-            n_rpu = dvcap.rpu_frame_count(rpu)
+                try:                                          # watchable output
+                    units, _how = splice.donor_rpus(dv_video, segdir, book=rpu_book,
+                                                    in_stream=rpu_in_stream, mode=rpu_mode,
+                                                    cache=rpu + ".extract", ffmpeg=ffmpeg,
+                                                    abort=abort)
+                except InterruptedError:
+                    return RemuxResult(False, output, reason="aborted")
+                except ValueError as e:
+                    return RemuxResult(False, output, reason=f"RPU: {e}")
+                _rm(rpu + ".extract")
+                splice.write_rpu_file(units, rpu)             # the resume keeps this order
+            n_rpu = len(units)
             if n_rpu != n_src:
                 return RemuxResult(False, output,
                                    reason=f"RPU/source frame mismatch: rpu {n_rpu} != source "
@@ -1419,11 +1477,24 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                 inj_es = src_es              # the winner's own bits, RPU already inline
         else:
             with _StepWatch(on_step, "injecting DV metadata", inj_es, _fsize(src_es)):
-                ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu, inj_es),
-                                    capture_output=True, text=True, errors="replace", timeout=timeout)
-            if ij.returncode != 0 or not (os.path.exists(inj_es) and os.path.getsize(inj_es) > 0):
-                return RemuxResult(False, output,
-                                   reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
+                try:
+                    placed = splice.place_rpus(src_es, units, inj_es,
+                                               stop=lambda: abort is not None and abort.is_set())
+                except InterruptedError:
+                    return RemuxResult(False, output, reason="aborted")
+                except splice.Unindexable as e:
+                    placed = None                    # the old way, for a stream splice can't read
+                    rpu_note = f" · RPU by dovi_tool (stream not indexable: {e})"
+                    ij = subprocess.run(dvcap.build_inject_command(dvcap.DOVI_TOOL, src_es, rpu,
+                                                                   inj_es),
+                                        capture_output=True, text=True, errors="replace",
+                                        timeout=timeout)
+                    if ij.returncode != 0 or not (os.path.exists(inj_es)
+                                                  and os.path.getsize(inj_es) > 0):
+                        return RemuxResult(False, output,
+                                           reason="RPU inject failed: " + _tail(ij.stderr or ij.stdout))
+                except ValueError as e:
+                    return RemuxResult(False, output, reason=f"RPU placement failed: {e}")
         n_inj = dvcap.count_hevc_frames(inj_es, ffprobe)    # AUDs → 1 packet/frame
         if n_inj != n_src:
             return RemuxResult(False, output,
@@ -1435,7 +1506,8 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
             on_step("preparing audio", None)
         tracks = output + ".tracks.mka"
         ok, audio_note, why, sync = _prepare_tracks(cfr_source, orig_source, tracks,
-                                              audio_target_lufs=audio_target_lufs, ffmpeg=ffmpeg,
+                                              audio_target_lufs=audio_target_lufs,
+                                              audio_gain_db=audio_gain_db, ffmpeg=ffmpeg,
                                               ffprobe=ffprobe, timeout=timeout)
         if not ok:
             return RemuxResult(False, output, reason=why)
@@ -1447,13 +1519,22 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
                             on_step=on_step, step_size=_fsize(inj_es), sync_ms=sync)
         if not res.ok:
             return res
+        if placed is not None:
+            # every frame's RPU went in by its display slot; the master must show it there
+            ranks = splice.container_ranks(part_path(output), ffprobe)
+            if ranks is None or ranks != list(placed.rank):
+                _rm(part_path(output))
+                return RemuxResult(False, output,
+                                   reason="the master's timestamps do not put every frame in its "
+                                          "display slot (shipped nothing)")
         # NO peak gate here: the caller gated the source's peaks before choosing this path.
         if skip_inject and convert_es:
             note = " · original stream, DV converted to 8.1 (no re-encode)"
         elif skip_inject:
             note = " · original DV stream shipped as-is (no re-encode)"
         else:
-            note = " · original stream + injected RPU (no re-encode)"
+            note = " · original stream + injected RPU (no re-encode)" + (
+                " · every frame's RPU checked" if placed is not None else rpu_note)
         res.reason += note + audio_note + vui_note
         atomic_ship(part_path(output), output)
         if segdir:
@@ -1465,8 +1546,344 @@ def remux_inject(dv_video: str, cfr_source: str, orig_source: str, output: str, 
         _rm(src_es); _rm(inj_es); _rm(tracks); _rm(part_path(output))
 
 
+SPLICE_STAGES = ("indexing the original video", "re-encoding the busiest stretches",
+                 "splicing them into the original", "checking every splice")
+
+
+def splice_stages(extract: bool) -> list:
+    """PURE. The labelled steps remux_splice runs, in order (what its `on_stages` announces)."""
+    return ((["extracting DV metadata"] if extract else []) + ["copying the original video"]
+            + list(SPLICE_STAGES) + list(MUX_STAGES))
+
+
+SPLICE_FALLBACK = "splice-fallback: "
+SPLICE_SKIP = "splice-skip: "      # this attempt only (no room): the capped path runs, nothing booked
+
+
+def _quick_video_info(path: str, ffprobe: str = FFPROBE) -> dict:
+    """{fps, master_display, max_cll} from the stream header and the first frame — none of
+    probe_video's whole-file packet count, which a Matroska source pays (49 GB) on every call."""
+    try:
+        r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=r_frame_rate", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=120)
+        fps = dvcap.snap_fps(((r.stdout or "").strip().splitlines() or [""])[0].strip(","))
+    except (OSError, subprocess.SubprocessError):
+        fps = None
+    md, cll = dvcap.first_frame_hdr10(path, ffprobe)
+    return {"fps": fps, "master_display": md, "max_cll": cll}
+
+
+def master_probe(path: str, ffprobe: str = FFPROBE, abort=None):
+    """ONE packet pass over a muxed master -> (pts list in decode order, sizes in display order,
+    {second: Mbps} fixed buckets), or None when unreadable (a probe that fails is retried, never
+    taken for a wrong master)."""
+    import splice
+    try:
+        rc, out, _err = splice.run_cmd([ffprobe, "-v", "error", "-select_streams", "v:0",
+                                        "-show_entries", "packet=pts_time,pts,size", "-of",
+                                        "csv=p=0", path], abort=abort)
+    except TimeoutError:
+        return None
+    if rc != 0:
+        return None
+    rows = []
+    for ln in (out or "").splitlines():
+        parts = ln.strip().strip(",").split(",")
+        try:
+            rows.append((int(parts[0]), float(parts[1]), int(parts[2])))
+        except (ValueError, IndexError):
+            continue
+    if not rows:
+        return None
+    pts = [r[0] for r in rows]
+    by_rank = [sz for _p, _t, sz in sorted(rows)]
+    buckets = {}
+    for _p, t, sz in rows:
+        buckets[int(t)] = buckets.get(int(t), 0) + sz
+    return pts, by_rank, {k: v * 8 / 1e6 for k, v in buckets.items()}
+
+
+def remux_splice(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
+                 cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS,
+                 gate_mbps: float = dvcap.RPU_SHIP_VIDEO_GATE_MBPS, rpu_mode=None,
+                 rpu_book=None, rpu_in_stream=False,
+                 audio_target_lufs=None, audio_gain_db=None, abort=None, should_pause=None,
+                 on_step=None, on_stages=None, on_pieces=None, log=None, ffmpeg=FFMPEG,
+                 mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
+    """OVER-GATE FAST PATH (user-dictated 2026-10-20): ship `orig_source`'s ORIGINAL video with only
+    its over-gate stretches re-encoded (splice.py), every frame given its own RPU, audio from
+    `cfr_source` — remux_inject's arguments, for the sources remux_inject's peak gate turns away.
+
+    The RPU, display order: `rpu_book` (the native render's own generated RPU,
+    <render>.dvrender/rpu.bin) when given; a REAL Dolby Vision donor (`rpu_in_stream`: a combine's
+    real RPU) read out of its own access units by their POCs (splice.rpus_from_stream — never
+    dovi_tool extract-rpu, which misorders RADL groups); otherwise dovi_tool's extract from the
+    render with no books (splice.donor_rpus: only where dovi_tool's extract and the frame-order read
+    agree).
+
+    A reason starting with SPLICE_FALLBACK: this source cannot be spliced (booked:
+    splice.remember_fallback) and the caller takes the whole-file capped re-encode — so does a
+    source whose splice failed SPLICE_MAX_FAILURES times, or that raised (a deterministic fault in
+    new code must not park an item). "paused: ..." / "aborted" keep every finished piece for the
+    retry; a disk, I/O or tool failure is retried as is.
+
+    Gates on top of splice.run's (display order, every frame's own RPU, structure, every seam
+    pixel-exact and each piece on its own frames, predicted peaks): the RPU frame count is the
+    stream's picture count; the master is DV 8.1 with every frame (_mux_verified), mkvmerge stamped
+    every access unit at its display slot, and every 1-second window and bucket is <= the gate."""
+    import splice
+    import traceback
+    if not is_master_container(output):
+        return _not_mkv(output)
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    say = log or (lambda m: None)
+    segdir = output + ".splicesegs"
+
+    def fallback(why):
+        splice.remember_fallback(output, orig_source, why)
+        shutil.rmtree(segdir, ignore_errors=True)
+        return RemuxResult(False, output, reason=SPLICE_FALLBACK + str(why))
+
+    def retry(why):
+        if splice.note_failure(output, orig_source, why) >= splice.SPLICE_MAX_FAILURES:
+            return fallback(f"failed {splice.SPLICE_MAX_FAILURES} times (last: {why})")
+        return RemuxResult(False, output, reason=f"splice failed: {why} — retried, pieces kept")
+
+    try:
+        return _remux_splice(dv_video, cfr_source, orig_source, output, segdir, cap_mbps, gate_mbps,
+                             rpu_mode, rpu_book, rpu_in_stream, audio_target_lufs, audio_gain_db,
+                             abort, should_pause, on_step, on_stages, on_pieces, say, fallback,
+                             retry, ffmpeg, mkvmerge, ffprobe, timeout)
+    except InterruptedError as e:
+        return RemuxResult(False, output, reason=str(e) or "aborted")
+    except OSError as e:
+        return RemuxResult(False, output, reason=f"splice I/O failure: {e} — retried, pieces kept")
+    except Exception as e:  # noqa: BLE001 — a fault in the splice itself: never park the item on it
+        if abort is not None and abort.is_set():
+            return RemuxResult(False, output, reason="aborted")
+        say("splice raised: " + "".join(traceback.format_exception_only(type(e), e)).strip())
+        return fallback(f"the splice raised {type(e).__name__}: {e}")
+
+
+def _proved(proved: str, spl_es: str):
+    """The record of a splice an earlier attempt finished and proved (splice.run's result, its
+    output index reloaded), when the spliced stream it describes is still the one on disk; else
+    None."""
+    import splice
+    try:
+        with open(proved) as f:
+            d = json.load(f)
+        if d.get("identity") != splice._identity(spl_es):
+            return None
+        ox = splice.Index.load(proved + ".index", d["identity"])
+        if ox is None:
+            return None
+        d["index"] = ox
+        d["marks"] = [tuple(m) for m in d["marks"]]
+        d["ids"] = tuple(d["ids"])
+        return d
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_proved(proved: str, spl_es: str, res: dict) -> None:
+    import splice
+    ident = splice._identity(spl_es)
+    res["index"].save(proved + ".index", ident)
+    keep = {k: res[k] for k in ("expect", "marks", "ids", "pieces", "frames", "share")}
+    keep["identity"] = ident
+    tmp = proved + ".part"
+    with open(tmp, "w") as f:
+        json.dump(keep, f)
+    os.replace(tmp, proved)
+
+
+def _remux_splice(dv_video, cfr_source, orig_source, output, segdir, cap_mbps, gate_mbps,
+                  rpu_mode, rpu_book, rpu_in_stream, audio_target_lufs, audio_gain_db, abort,
+                  should_pause, on_step, on_stages, on_pieces, say, fallback, retry, ffmpeg,
+                  mkvmerge, ffprobe, timeout) -> RemuxResult:
+    import splice
+    info = _quick_video_info(dv_video, ffprobe)
+    src_info = _quick_video_info(orig_source, ffprobe)
+    if not info["fps"] or not src_info["fps"]:
+        return RemuxResult(False, output, reason="could not probe the frame rates — resume state "
+                                                 "left intact")
+    try:
+        if Fraction(str(src_info["fps"])) != Fraction(str(info["fps"])):
+            return RemuxResult(False, output,
+                               reason=f"fps mismatch: source {src_info['fps']} vs RPU donor "
+                                      f"{info['fps']} — RPU cannot align (shipped nothing)")
+    except (ValueError, ZeroDivisionError):
+        return RemuxResult(False, output, reason="unreadable fps — RPU alignment unverifiable")
+    fps = str(info["fps"])
+    tracks = output + ".tracks.mka"
+    base_es = os.path.join(segdir, "base.hevc")   # the source's own bits, no DV NALs: KEPT across
+                                                  # attempts with the pieces (the manifest guards it)
+    spl_es = os.path.join(segdir, "splice.hevc")  # the PROVEN spliced stream (RPU in every frame),
+    proved = os.path.join(segdir, "proved.json")  # kept with its proof record until the ship: a mux
+                                                  # or probe that fails retries from the mux
+    # this master's own leftovers of a killed attempt first: they must not count against the room
+    for f in (tracks, part_path(output), output + ".src.hevc", output + ".src.hevc.vui",
+              output + ".splice.hevc", base_es + ".part", base_es + ".part.vui"):
+        _rm(f)
+    if os.path.isdir(segdir):
+        for f in os.listdir(segdir):
+            if f.startswith(("donor.", "seam", "piece_in.")) or f.endswith((".in.hevc", ".part")):
+                _rm(os.path.join(segdir, f))
+    manifest = {"mode": "splice", "src": splice._identity(dv_video),
+                "base": splice._identity(orig_source), "fps": fps, "cap": int(cap_mbps),
+                "gate": float(gate_mbps), "crf": float(splice.PIECE_CRF),
+                "preset": dvcap.X265_PRESET, "v": splice.PIECE_SETTINGS_VERSION,
+                "rpu": "book" if rpu_book else ("stream" if rpu_in_stream else "extract")}
+    if rpu_mode is not None:
+        manifest["rpu_mode"] = int(rpu_mode)
+    dvcap.ensure_segdir(segdir, manifest)
+    rpu = os.path.join(segdir, "rpu.bin")
+    have = os.path.exists(rpu) and os.path.getsize(rpu) > 0
+    have_base = os.path.exists(base_es) and os.path.getsize(base_es) > 0
+    ready = _proved(proved, spl_es)
+    # the base ES and the spliced ES on disk together (the base goes before the mux); a real
+    # donor is copied twice over while its RPUs are read
+    size = os.path.getsize(orig_source)
+    need = (int(size * 1.1) if (ready or have_base) else int(size * 2.15)) + (20 << 30)
+    if rpu_in_stream and not have and not ready:
+        need += 2 * os.path.getsize(dv_video)
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(output))).free
+    if free < need:
+        shutil.rmtree(segdir, ignore_errors=True)   # no room: the capped path needs what is here
+        return RemuxResult(False, output,
+                           reason=SPLICE_SKIP + f"not enough scratch space for the splice: "
+                                  f"{free / 2**30:.0f} GiB free, ~{need / 2**30:.0f} GiB needed")
+    if on_stages:
+        on_stages(list(MUX_STAGES) if ready else splice_stages(not have and not rpu_book))
+    try:
+        if ready:
+            res = ready
+            say(f"splice: a proven splice from an earlier attempt goes straight to the mux")
+        else:
+            if rpu_book:
+                units = splice.rpu_units(rpu_book)
+            elif have:
+                units = splice.rpu_units(rpu)      # a resume: the RPU this splice's order came from
+            else:
+                if on_step:
+                    on_step("extracting DV metadata", None)
+                try:
+                    units, _how = splice.donor_rpus(dv_video, segdir, in_stream=rpu_in_stream,
+                                                    mode=rpu_mode, cache=rpu + ".extract",
+                                                    ffmpeg=ffmpeg, abort=abort)
+                except ValueError as e:
+                    return retry(f"RPU: {e}")
+                _rm(rpu + ".extract")
+                splice.write_rpu_file(units, rpu)
+            if not have_base:
+                tmp_base = base_es + ".part"
+                with _StepWatch(on_step, "copying the original video", tmp_base, _fsize(orig_source)):
+                    rc, _o, err = splice.run_cmd(splice.build_base_es_command(ffmpeg, orig_source,
+                                                                              tmp_base), abort=abort)
+                if rc != 0 or not (os.path.exists(tmp_base) and os.path.getsize(tmp_base) > 0):
+                    _rm(tmp_base)
+                    return retry("source ES extract failed: " + _tail(err))
+                ok, vui_note = dvcap.ensure_pq_vui(tmp_base, ffmpeg, ffprobe, timeout=timeout)
+                if not ok:
+                    _rm(tmp_base)
+                    return retry(vui_note)
+                os.replace(tmp_base, base_es)
+            extra = [len(u) + 13 for u in units]      # + the RPU NAL's start code and header, an AUD
+            try:
+                res = splice.run(base_es, orig_source, fps, int(cap_mbps), float(gate_mbps), segdir,
+                                 spl_es, rpus=units, extra_by_rank=extra, expect_frames=len(units),
+                                 abort=abort, should_pause=should_pause, on_step=on_step,
+                                 on_pieces=on_pieces, log=say, ffmpeg=ffmpeg, ffprobe=ffprobe)
+            except splice.NotSpliceable as e:
+                return fallback(e)
+            except RuntimeError as e:
+                if str(e).startswith("RPU/source frame mismatch"):
+                    return RemuxResult(False, output, reason=str(e))
+                return retry(str(e))
+            _write_proved(proved, spl_es, res)
+            _rm(base_es)                               # 49 GB back before the mux; a retry now
+                                                       # starts from the proven splice
+        expect = res["expect"]
+        if on_step:
+            on_step("preparing audio", None)
+        ok, audio_note, why, sync = _prepare_tracks(cfr_source, orig_source, tracks,
+                                                    audio_target_lufs=audio_target_lufs,
+                                                    audio_gain_db=audio_gain_db, ffmpeg=ffmpeg,
+                                                    ffprobe=ffprobe, timeout=timeout)
+        if not ok:
+            return RemuxResult(False, output, reason=why)
+        mres = _mux_verified(spl_es, fps, tracks, output, frames=len(expect),
+                             colour=mkv_colour_args(False, src_info.get("master_display"),
+                                                    src_info.get("max_cll")),
+                             mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout,
+                             on_step=on_step, step_size=_fsize(spl_es), sync_ms=sync)
+        if not mres.ok:
+            return mres
+        part = part_path(output)
+        probe = master_probe(part, ffprobe, abort=abort)
+        cp = splice.codec_private(part, ffprobe)
+        if probe is None or not cp:
+            _rm(part)
+            return retry("could not read the muxed master back")
+        pts, by_rank, peaks = probe
+        order = sorted(range(len(pts)), key=lambda i: pts[i])
+        ranks = [0] * len(pts)
+        for r, i in enumerate(order):
+            ranks[i] = r
+        if len(set(pts)) != len(pts) or ranks != list(expect):
+            _rm(part)
+            return fallback("the master's timestamps do not put every frame in its display slot")
+        try:
+            splice.check_codec_private(cp, spl_es, res["index"], res["ids"], res["marks"])
+        except ValueError as e:
+            _rm(part)
+            return fallback(str(e))
+        worst = max(peaks.values()) if peaks else 0.0
+        sliding = splice.window_peak_mbps_ranked(by_rank, Fraction(fps))
+        if worst > float(gate_mbps) or sliding > float(gate_mbps):
+            _rm(part)
+            return fallback(f"the master still peaks at {max(worst, sliding):.1f} Mbps "
+                            f"(gate {gate_mbps:g})")
+        mres.reason += (f" · original stream, {res['pieces']} over-gate stretch(es) re-encoded "
+                        f"({res['frames']} frames, {res['share']:.1%}), peak {sliding:.1f} Mbps"
+                        + audio_note)
+        atomic_ship(part, output)
+        shutil.rmtree(segdir, ignore_errors=True)
+        splice.forget(output)
+        return mres
+    finally:
+        _rm(tracks); _rm(part_path(output))
+
+
+def combine_audio_gate(winner: str, rpu_source: str, audio_source: str, ffprobe=FFPROBE):
+    """None when the combine's audio donor is provably the winner's cut, else the reason it is not
+    (or cannot be told). Audio from the winner itself is trivially in sync, and audio from the RPU
+    donor is proven by the RPU-vs-winner frame gate; audio from the third configuration must
+    match the winner frame for frame and in rate, else it would drift."""
+    if audio_source in (winner, rpu_source):
+        return None
+    nw = dvcap.count_hevc_frames(winner, ffprobe)
+    na = dvcap.count_hevc_frames(audio_source, ffprobe)
+    if nw <= 0 or na <= 0:
+        return "could not count frames to verify the audio donor — resume state intact"
+    if na != nw:
+        return (f"audio donor is a different cut: {na} != {nw} frames "
+                f"— its audio would drift (shipped nothing)")
+    try:
+        fa = dvcap.probe_video(audio_source, ffprobe)["fps"]
+        fw = dvcap.probe_video(winner, ffprobe)["fps"]
+        if Fraction(str(fa)) != Fraction(str(fw)):
+            return (f"audio donor is a different cut: fps {fa} vs {fw} "
+                    f"— its audio would drift (shipped nothing)")
+    except (ValueError, ZeroDivisionError):
+        return "unreadable fps — audio-donor alignment unverifiable"
+    return None
+
+
 def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
-            rpu_inline=False, rpu_profile="", capped=False,
+            rpu_inline=False, rpu_profile="", capped=False, real_rpu=False, rpu_book=None,
             cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, boundaries=None,
             audio_target_lufs=None, abort=None, on_step=None, on_stages=None, on_progress=None,
             on_plan=None, should_pause=None, on_repair=None,
@@ -1496,38 +1913,23 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
     donor's video must match the winner frame-for-frame, else its audio would drift."""
     p7 = str(rpu_profile).startswith("7")
     mode = 2 if p7 else None
-    if audio_source not in (winner, rpu_source):
-        nw = dvcap.count_hevc_frames(winner, ffprobe)
-        na = dvcap.count_hevc_frames(audio_source, ffprobe)
-        if nw <= 0 or na <= 0:
-            return RemuxResult(False, output,
-                               reason="could not count frames to verify the audio donor "
-                                      "— resume state intact")
-        if na != nw:
-            return RemuxResult(False, output,
-                               reason=f"audio donor is a different cut: {na} != {nw} frames "
-                                      f"— its audio would drift (shipped nothing)")
-        try:
-            fa = dvcap.probe_video(audio_source, ffprobe)["fps"]
-            fw = dvcap.probe_video(winner, ffprobe)["fps"]
-            if Fraction(str(fa)) != Fraction(str(fw)):
-                return RemuxResult(False, output,
-                                   reason=f"audio donor is a different cut: fps {fa} vs {fw} "
-                                          f"— its audio would drift (shipped nothing)")
-        except (ValueError, ZeroDivisionError):
-            return RemuxResult(False, output,
-                               reason="unreadable fps — audio-donor alignment unverifiable")
+    gate = combine_audio_gate(winner, rpu_source, audio_source, ffprobe)
+    if gate is not None:
+        return RemuxResult(False, output, reason=gate)
+    # the RPU, display order: a real donor's by its own frames, a generated one from the render's
+    # books (dovi_tool's extract misorders RADL groups — see splice.donor_rpus)
+    rkw = {"rpu_in_stream": True} if real_rpu else ({"rpu_book": rpu_book} if rpu_book else {})
     if capped:
         return remux(rpu_source, audio_source, winner, output,
                      cap_mbps=cap_mbps, audio_target_lufs=audio_target_lufs,
                      boundaries=boundaries, abort=abort, on_progress=on_progress,
                      on_plan=on_plan, should_pause=should_pause, on_repair=on_repair,
-                     encode_source=winner, rpu_mode=mode,
+                     encode_source=winner, rpu_mode=mode, **rkw,
                      ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
     return remux_inject(rpu_source, audio_source, winner, output,
                         audio_target_lufs=audio_target_lufs, abort=abort, on_step=on_step,
                         on_stages=on_stages, rpu_mode=mode, skip_inject=rpu_inline,
-                        convert_es=(rpu_inline and p7),
+                        convert_es=(rpu_inline and p7), **({} if rpu_inline else rkw),
                         ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
 
 

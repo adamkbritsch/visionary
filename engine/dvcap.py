@@ -510,7 +510,7 @@ def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
                     seg_seconds: int, crf: float = X265_CRF, preset: str = X265_PRESET,
                     boundaries: list | None = None, encode_source: str | None = None,
                     rpu_mode: int | None = None, native_id: str | None = None,
-                    sdr: bool = False) -> dict:
+                    sdr: bool = False, rpu_source: str | None = None) -> dict:
     """Identity of a segmented-encode run. If ANY of this changes between attempts, the
     persisted segments/RPU describe a DIFFERENT encode and must not be resumed: a re-rendered
     dv_video would pass the frame-count check yet concat WRONG CONTENT into the master. `segb`
@@ -541,6 +541,9 @@ def resume_manifest(dv_video: str, cap_mbps: int, total_frames: int, fps: str,
         m["rpu_mode"] = int(rpu_mode)       # modes must wipe the persisted rpu.bin + segments
     if sdr:                                 # an SDR master's segments carry no RPU and no PQ: never
         m["sdr"] = True                     # resumed into a DV encode, nor the reverse (2026-10-18)
+    if rpu_source:                          # a real donor read by its frame order (2026-10-20): a
+        m["rpu"] = rpu_source               # segdir from before holds dovi_tool's extract, which
+                                            # misorders RADL groups — never resumed into this one
     return m                                # and resumes instead of wiping on the schema change
 
 
@@ -816,9 +819,12 @@ def encoders_suspended() -> bool:
     return _ENCODERS_SUSPENDED
 
 
-def _encode_pipe(dec_cmd, enc_cmd, out_hevc, abort, on_frame):
-    """Decode|x265 pipe for ONE segment. Returns (frames|None, reason, tail)."""
-    dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def _encode_pipe(dec_cmd, enc_cmd, out_hevc, abort, on_frame, dec_stderr=None):
+    """Decode|x265 pipe for ONE segment. Returns (frames|None, reason, tail). `dec_stderr`: an
+    open file the decoder's messages go to (splice.py reads it: a missing reference is only a
+    log line, and the frames it conceals must not be encoded); None discards them."""
+    dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE,
+                           stderr=dec_stderr if dec_stderr is not None else subprocess.DEVNULL)
     enc = subprocess.Popen(enc_cmd, stdin=dec.stdout, stderr=subprocess.PIPE, text=True)
     dec.stdout.close()
     pair = (dec, enc)

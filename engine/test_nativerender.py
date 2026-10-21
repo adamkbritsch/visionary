@@ -336,8 +336,10 @@ class Render(_Base):
         elif what == "HDR10 metadata":
             self.assertEqual(_kw.get("cwd"), dvnative.ENGINE_DIR)
             shutil.copyfile(cmd[3], cmd[4])
-        elif what == "RPU inject":
-            shutil.copyfile(cmd[cmd.index("-i") + 1], cmd[cmd.index("-o") + 1])
+        elif what == "RPU inject":                         # python -m splice inject SRC RPU OUT
+            self.assertEqual(_kw.get("cwd"), dvnative.ENGINE_DIR)
+            self.assertEqual(cmd[1:4], ["-m", "splice", "inject"])
+            shutil.copyfile(cmd[4], cmd[6])
         elif what == "DV mux":                             # mkvmerge: the ES (last) -> -o
             shutil.copyfile(cmd[-1], cmd[cmd.index("-o") + 1])
         return 0, "", 0.5
@@ -433,8 +435,10 @@ class Render(_Base):
         enc, sei = os.path.join(books, "encode.hevc"), os.path.join(books, "encode.sei.hevc")
         es_dv, part = (self.p.dv_render + s for s in (".dv.hevc", ".part"))
         self.assertEqual(cmds["HDR10 metadata"], NR.build_sei_command(sys.executable, enc, sei, *self.HDR))
+        # every frame's own RPU, by its display slot (splice.place_rpus) — not dovi_tool's inject,
+        # which shifts RADL groups by two
         self.assertEqual(cmds["RPU inject"],
-                         dvcap.build_inject_command(NR.DOVI_TOOL, enc, os.path.join(books, "rpu.bin"), es_dv))
+                         NR.build_rpu_place_command(sys.executable, enc, os.path.join(books, "rpu.bin"), es_dv))
         # the container's HDR10 description is read off the injected ES's own first frame
         self.assertEqual(cmds["DV mux"], remux.build_master_mux_command(
             NR.MKVMERGE, es_dv, FPS, part, colour=remux.mkv_colour_args(False, *self.HDR)))

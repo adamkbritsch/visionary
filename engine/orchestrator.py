@@ -520,7 +520,7 @@ def discard_workfiles(source_basename: str) -> None:
     names |= {m + sfx for m in masters
               for sfx in (".part", ".tracks.mka", ".tracks.mp4", ".dv.mp4", ".capped.hevc",
                           ".src.hevc", ".inject.hevc", ".ship.hevc", ".fix.hevc",
-                          ".src.hevc.vui", ".ship.hevc.vui")}
+                          ".src.hevc.vui", ".ship.hevc.vui", ".splice.hevc")}
     main = scratch.default_scratch()
     for d in (main, scratch.prefetch_dir()):
         for n in names:
@@ -530,6 +530,7 @@ def discard_workfiles(source_basename: str) -> None:
                 pass
     for m in masters:
         shutil.rmtree(os.path.join(main, m + ".remuxsegs"), ignore_errors=True)
+        shutil.rmtree(os.path.join(main, m + ".splicesegs"), ignore_errors=True)   # splice pieces
     shutil.rmtree(os.path.join(main, stem + "_prob4_upscaled.segments"), ignore_errors=True)
     # A NATIVE render's books (<render>.dvrender/: analysis ranges, encode, RPU) and its finish
     # transients (<render>.part, .dv.hevc) beside the render — a withdrawn item's are as orphaned
@@ -2953,6 +2954,7 @@ class Orchestrator:
         # nativerender.BOOKS_SUFFIX; absent for every item that never rendered natively).
         legacy_master = legacy_master_names(p)[0]     # pre-Matroska name (2026-10-18)
         for d in (p.segdir, str(p.final) + ".remuxsegs", legacy_master + ".remuxsegs",
+                  str(p.final) + ".splicesegs",
                   (str(p.source_wide) + ".segments") if getattr(p, "source_wide", "") else "",
                   str(p.dv_render) + ".dvrender"):
             if d and d != stamp and os.path.isdir(d):
@@ -4484,6 +4486,11 @@ class Orchestrator:
         # no-op on a running process, so this is safe to fire unconditionally.
         try:
             subprocess.run(["pkill", "-CONT", "-x", "x265"], check=False,
+                           capture_output=True, timeout=5)
+            # ...and the splice's own children (seam decodes, probes, dovi_tool convert), which
+            # dvcap's suspend freezes too: they run in a session of their own, so no kernel
+            # SIGCONT reaches them when their parent dies (review, 2026-10-20)
+            subprocess.run(["pkill", "-CONT", "-f", r"\.splicesegs/|\.mkv\.part"], check=False,
                            capture_output=True, timeout=5)
         except Exception:
             pass

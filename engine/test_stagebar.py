@@ -81,6 +81,7 @@ class EveryStageSaysWhatItIs(unittest.TestCase):
             for skip, conv in ((False, False), (True, False), (True, True)):
                 labels |= set(remux.inject_stages(extract, skip_inject=skip, convert_es=conv))
         labels |= set(remux.SHIP_STAGES) | set(remux.MUX_STAGES)
+        labels |= set(remux.splice_stages(True)) | set(remux.splice_stages(False))
         missing = sorted(l for l in labels if not stagebar.ABOUT.get(l))
         self.assertEqual(missing, [])
 

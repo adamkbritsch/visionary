@@ -18,7 +18,7 @@ HOW, render(p, spec):
               p010le at the attempt's bitrate, tagged BT.2020 / PQ, every frame once
               (-fps_mode passthrough), straight to an Annex B ES (no container to copy out of)
   3. finish   hdr10sei puts the HDR10 mastering-display + content-light-level SEI into every
-              keyframe, exactly as the x265 path writes them -> dovi_tool inject-rpu -> mkvmerge
+              keyframe, exactly as the x265 path writes them -> every frame's own RPU (splice.place_rpus) -> mkvmerge
               (`--default-duration 0:<fps>p`; it writes the DV 8.1 record from the RPU itself)
               into <dv_render>.part: the file that ships, video for video. The render is
               MATROSKA under its long-standing `.mov` name (renders and their books already on
@@ -475,6 +475,14 @@ def build_encode_command(ffmpeg: str, spec: RenderSpec, out: str, kbps: int, *,
                   "-color_range", "tv", "-f", "hevc", out]
 
 
+def build_rpu_place_command(python: str, src_es: str, rpu: str, out_es: str) -> list:
+    """`python3 -m splice inject SRC RPU OUT` (cwd = ENGINE_DIR): every access unit gets the RPU of
+    its own display slot, read back and checked frame by frame (splice.place_rpus). Replaces
+    dovi_tool inject-rpu, which orders frames by an unsigned POC and shifts every RADL group by
+    two (measured 2026-10-20); a stream splice cannot index still takes dovi_tool's inject."""
+    return [python, "-m", "splice", "inject", src_es, rpu, out_es]
+
+
 def build_sei_command(python: str, src_es: str, out_es: str, master_display: str, max_cll) -> list:
     """`python3 -m hdr10sei SRC DST --mdcv ... --cll A,B` (run with cwd = ENGINE_DIR): the HDR10
     mastering-display and content-light-level SEI into every keyframe of `src_es`, the way the
@@ -808,8 +816,8 @@ def _finish_attempt(p, spec: RenderSpec, hdr: tuple, attempt: int, abort, progre
                     "HDR10 metadata", cwd=dvnative.ENGINE_DIR)
         os.replace(sei, enc)
     _report(progress, ep, spec, "finish", 0.3, step="inject", attempt=attempt)
-    cpu += _run(dvcap.build_inject_command(DOVI_TOOL, enc, _book(p, RPU), es_dv), tmo, abort, None,
-                "RPU inject")
+    cpu += _run(build_rpu_place_command(sys.executable, enc, _book(p, RPU), es_dv), tmo, abort,
+                None, "RPU inject", cwd=dvnative.ENGINE_DIR)
     _rm(enc)
     _report(progress, ep, spec, "finish", 0.6, step="mux", attempt=attempt)
     # the container's HDR10 description = the SEI this very stream carries (the finish's own, or

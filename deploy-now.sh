@@ -80,15 +80,21 @@ is_num(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 # the FINISHER thread's stage (remux/upload run OVERLAPPED with topaz — state.stage alone can NOT see
 # them); both topaz and the remux now report seg_done, so we can deploy at whichever hits a segment
 # boundary FIRST. `phase` = the native render's (analysis/encode/finish; 'none' for every other stage).
+# The 9th field: a remux lane is in the over-gate splice's TAIL (its pieces are done: the splice
+# write, its proofs, the mux) — one pass that a stop throws away whole, so it is waited out like a
+# render's encode/finish. The splice publishes seg_total on every tick; the plain inject shares the
+# mux labels but has none.
 snap(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
+TAIL=('splicing them into the original','checking every splice','preparing audio','muxing the master','verifying the master')
 try:
  d=json.load(sys.stdin);o=d.get('orchestrator') or {};p=o.get('progress') or {}
  fi=o.get('finishing') or {};f2=o.get('finishing2') or {}
- print('%s|%s|%s|%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'),
+ tail=any(x.get('stage')=='remux' and x.get('step') in TAIL and x.get('seg_total') is not None for x in (fi,f2))
+ print('%s|%s|%s|%s|%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'),
        fi.get('stage') or 'none', fi.get('seg_done'), f2.get('stage') or 'none', f2.get('seg_done'),
-       p.get('phase') or 'none'))
+       p.get('phase') or 'none', 1 if tail else 0))
 except Exception:
- print('down|None|down|none|None|none|None|none')" 2>/dev/null; }
+ print('down|None|down|none|None|none|None|none|0')" 2>/dev/null; }
 running_now(){ curl -s --max-time 4 "$API/api/state" | python3 -c "import sys,json
 try: print((json.load(sys.stdin).get('orchestrator') or {}).get('running'))
 except Exception: print('down')" 2>/dev/null; }
@@ -105,7 +111,7 @@ deadline=$(( $(date +%s) + 10800 ))  # 3 h ceiling. Rarely bites now — only ou
                                      # encode/upload the deploy is briefly waiting out.
 tseg0=""; rseg0=""; rseg20=""; aseg0=""; gseg0=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase <<< "$s"
+  s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase stail <<< "$s"
   # The chunk baseline belongs to ONE analysis pass: a later pass (another item, or this one
   # resumed) counts from its own start. The native render's range baseline too.
   [ "$stage" = "dvnative" ] || aseg0=""
@@ -125,6 +131,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     dvrender:encode|dvrender:finish) say "waiting: stage=dvrender phase=$phase (never interrupt — the encode is not resumable)"
                                      tseg0=""; rseg0=""; sleep 5; continue ;;
   esac
+  if [ "$stail" = "1" ]; then
+    say "waiting: a splice is writing and proving its master (not resumable)"; rseg0=""; rseg20=""; sleep 5; continue
+  fi
   # Run thread is topaz/download/idle; finisher is remux/none. Deploy at the FIRST segment boundary of
   # EITHER encoder that's actually running — the other stage, if mid-segment, resumes from its own last.
   tenc=$(pgrep -f tvai_up | wc -l | tr -d ' ')      # topaz (Video AI)
@@ -153,14 +162,16 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   if [ "$fin" = "remux" ] && [ "$xenc" != "0" ] && is_num "$rseg"; then
     watching=1
-    if [ -z "$rseg0" ]; then rseg0="$rseg"; say "watching remux lane 1 at segment_done=$rseg"
+    # a count that went DOWN is another plan (a splice that fell back to the whole-file encode
+    # counts its segments from 0): re-baseline, as the analysis watchers do
+    if [ -z "$rseg0" ] || [ "$rseg" -lt "$rseg0" ]; then rseg0="$rseg"; say "watching remux lane 1 at segment_done=$rseg"
     elif [ "$rseg" -gt "$rseg0" ]; then say "REMUX lane 1 boundary ($rseg0 -> $rseg) — deploying"; break; fi
   fi
   # LANE 2 counts too. Watching only lane 1 idled for a whole ~7-minute segment while the
   # other lane crossed a boundary that is exactly as safe to deploy at.
   if [ "$fin2" = "remux" ] && [ "$xenc" != "0" ] && is_num "$rseg2"; then
     watching=1
-    if [ -z "$rseg20" ]; then rseg20="$rseg2"; say "watching remux lane 2 at segment_done=$rseg2"
+    if [ -z "$rseg20" ] || [ "$rseg2" -lt "$rseg20" ]; then rseg20="$rseg2"; say "watching remux lane 2 at segment_done=$rseg2"
     elif [ "$rseg2" -gt "$rseg20" ]; then say "REMUX lane 2 boundary ($rseg20 -> $rseg2) — deploying"; break; fi
   fi
   if [ "$watching" = "0" ]; then say "stage=$stage finisher=$fin — nothing segmenting; safe to deploy"; break; fi
@@ -170,8 +181,9 @@ done
 # deadline fall-through guard (review-caught): if we got here by TIMEOUT while the pipeline is
 # still in an un-interruptible stage, GIVE UP instead of deploying into it — the built app stays
 # on disk and deploys on the next natural relaunch or re-run of this script.
-s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase <<< "$s"
+s=$(snap); IFS='|' read -r stage tseg running fin rseg fin2 rseg2 phase stail <<< "$s"
 case "$fin" in upload|cleanup) say "GAVE UP: deadline hit but finisher=$fin — NOT deploying"; exit 2 ;; esac
+[ "$stail" = "1" ] && { say "GAVE UP: deadline hit but a splice is finishing its master — NOT deploying"; exit 2; }
 case "$stage" in resolve|upload) say "GAVE UP: deadline hit but stage=$stage — NOT deploying"; exit 2 ;; esac
 case "$stage:$phase" in dvrender:encode|dvrender:finish) say "GAVE UP: deadline hit but stage=dvrender phase=$phase — NOT deploying"; exit 2 ;; esac
 

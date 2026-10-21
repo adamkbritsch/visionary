@@ -511,6 +511,9 @@ class FastPathDispatch(unittest.TestCase):
              mock.patch.object(stages, "_read_topaz_bounds", return_value=[100, 200]), \
              mock.patch.object(remux, "remux_inject",
                                side_effect=AssertionError("over-ceiling must NOT stream-copy")), \
+             mock.patch.object(remux, "remux_splice",
+                               return_value=remux.RemuxResult(
+                                   False, p.final, reason=remux.SPLICE_FALLBACK + "test")), \
              mock.patch.object(remux, "remux",
                                return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as rm:
             ok, _msg = stages.run_stage("remux", p)
@@ -518,6 +521,58 @@ class FastPathDispatch(unittest.TestCase):
         pb.assert_called_once()
         self.assertEqual(rm.call_args.kwargs.get("encode_source"), p.source_cfr)
         self.assertEqual(rm.call_args.kwargs.get("boundaries"), [100, 200])
+
+    def test_remux_rpu_only_over_the_gate_splices_first(self):
+        # user, 2026-10-20: only the over-gate stretches are re-encoded; the original ships
+        import plan, remux
+        p = _paths(tempfile.mkdtemp())
+        with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=96.4), \
+             mock.patch.object(remux, "remux_splice",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as sp, \
+             mock.patch.object(remux, "remux", side_effect=AssertionError("splice shipped")):
+            ok, _msg = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        a = sp.call_args
+        self.assertEqual(a.args[:4], (p.dv_render, p.source_cfr, p.source, p.final))
+        self.assertIsNone(a.kwargs.get("rpu_mode"))
+
+    def test_a_splice_failure_or_pause_is_not_a_fallback(self):
+        # only a "splice-fallback:" result takes the whole-file encode; a pause or a plain failure
+        # comes back as it is (the retry resumes from the finished pieces)
+        import plan, remux
+        for reason in ("paused: another stage has the machine", "aborted", "RPU inject failed: x"):
+            p = _paths(tempfile.mkdtemp())
+            with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+                 mock.patch.object(stages, "_source_peak_mbps", return_value=96.4), \
+                 mock.patch.object(remux, "remux_splice",
+                                   return_value=remux.RemuxResult(False, p.final, reason=reason)), \
+                 mock.patch.object(remux, "remux", side_effect=AssertionError("no fallback")):
+                ok, msg = stages.run_stage("remux", p)
+            self.assertFalse(ok)
+            self.assertEqual(msg, reason)
+
+    def test_a_booked_fallback_or_started_capped_encode_skips_the_splice(self):
+        import plan, remux, splice
+        for how in ("booked", "segments"):
+            p = _paths(tempfile.mkdtemp())
+            if how == "booked":
+                os.makedirs(os.path.dirname(p.source) or ".", exist_ok=True)
+                open(p.source, "wb").close()
+                splice.remember_fallback(p.final, p.source, "open GOP without cut points")
+            else:
+                os.makedirs(p.final + ".remuxsegs", exist_ok=True)
+                open(os.path.join(p.final + ".remuxsegs", "seg_0000.hevc"), "wb").close()
+            with mock.patch.object(plan, "plan_for", return_value=self.RPU_PLAN), \
+                 mock.patch.object(stages, "_source_peak_mbps", return_value=96.4), \
+                 mock.patch.object(stages, "_plan_fast_path_bounds"), \
+                 mock.patch.object(remux, "remux_splice",
+                                   side_effect=AssertionError("must not splice")), \
+                 mock.patch.object(remux, "remux",
+                                   return_value=remux.RemuxResult(True, p.final, "8.1", 1, 1, "ok")) as rm:
+                ok, _msg = stages.run_stage("remux", p)
+            self.assertTrue(ok, how)
+            rm.assert_called_once()
 
     def test_remux_rpu_only_gate_boundary_still_ships_the_copy(self):
         # exactly AT the gate = allowed (the gate already reserves the TrueHD headroom)
@@ -918,7 +973,7 @@ class FastRemuxStepProgress(unittest.TestCase):
         p = _paths(tempfile.mkdtemp())
         emitted = []
         def fake_inject(dv, cfr, orig, out, *, audio_target_lufs, abort, on_step=None,
-                        on_stages=None):
+                        on_stages=None, **kw):
             on_stages(remux.inject_stages(True))
             on_step("extracting DV metadata", None)
             on_step("copying the original video", 41.5)
@@ -943,13 +998,31 @@ class FastRemuxStepProgress(unittest.TestCase):
         self.assertEqual(emitted[2]["stage_pct"], 41.5)
         self.assertNotIn("stage_pct", emitted[1])          # label-only: no number, no bar
 
+    def test_the_inject_takes_the_renders_own_rpu_book(self):
+        # 2026-10-20: never dovi_tool's extract back out of the render (it misorders RADL groups)
+        import types, plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        seen = {}
+        def fake_inject(*a, **kw):
+            seen.update(kw)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        with mock.patch.object(plan, "plan_for", return_value={"topaz": "rpu-only"}), \
+             mock.patch.object(stages, "_source_peak_mbps", return_value=15.0), \
+             mock.patch.object(stages, "_render_rpu_book", return_value="/books/rpu.bin"), \
+             mock.patch.object(remux, "remux_inject", side_effect=fake_inject), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
+            ok, _ = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        self.assertEqual(seen.get("rpu_book"), "/books/rpu.bin")
+
     def test_a_resumed_inject_letters_from_its_real_plan(self):
         # the RPU already extracted: remux_inject's plan has no extraction, so copying is B
         import types, plan, remux, settings
         p = _paths(tempfile.mkdtemp())
         emitted = []
         def fake_inject(dv, cfr, orig, out, *, audio_target_lufs, abort, on_step=None,
-                        on_stages=None):
+                        on_stages=None, **kw):
             on_stages(remux.inject_stages(False))
             on_step("copying the original video", 10.0)
             return types.SimpleNamespace(ok=True, reason="ok")
@@ -978,6 +1051,9 @@ class FastRemuxStepProgress(unittest.TestCase):
              mock.patch.object(stages, "_source_peak_mbps", return_value=95.0), \
              mock.patch.object(stages, "_plan_fast_path_bounds"), \
              mock.patch.object(remux, "remux", side_effect=fake_remux), \
+             mock.patch.object(remux, "remux_splice",
+                               return_value=remux.RemuxResult(
+                                   False, p.final, reason=remux.SPLICE_FALLBACK + "test")), \
              mock.patch.object(settings, "get_settings",
                                return_value={"max_peak_mbps": 50, "audio_target_lufs": -16}):
             ok, _ = stages.run_stage("remux", p, progress=lambda d: emitted.append(d))
@@ -1142,6 +1218,9 @@ class CombineStages(unittest.TestCase):
              mock.patch.object(stages, "_peak_of", return_value=96.0), \
              mock.patch.object(stages, "_plan_fast_path_bounds", return_value=" planned") as pb, \
              mock.patch.object(stages, "_read_topaz_bounds", return_value=[100, 200]), \
+             mock.patch.object(remux, "remux_splice",
+                               return_value=remux.RemuxResult(
+                                   False, p.final, reason=remux.SPLICE_FALLBACK + "test")), \
              mock.patch.object(remux, "combine",
                                return_value=remux.RemuxResult(True, p.final, "8.1", 2, 1,
                                                               "ok")) as cb:
@@ -1151,6 +1230,20 @@ class CombineStages(unittest.TestCase):
         kw = cb.call_args.kwargs
         self.assertTrue(kw["capped"])
         self.assertEqual(kw["boundaries"], [100, 200])
+
+    def test_remux_over_gate_combine_splices_the_winner(self):
+        import companion, remux
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(stages, "_peak_of", return_value=96.0), \
+             mock.patch.object(remux, "combine_audio_gate", return_value=None), \
+             mock.patch.object(remux, "remux_splice",
+                               return_value=remux.RemuxResult(True, p.final, "8.1", 2, 1, "ok")) as sp, \
+             mock.patch.object(remux, "combine", side_effect=AssertionError("splice shipped")):
+            ok, _ = stages.run_stage("remux", p)
+        self.assertTrue(ok)
+        self.assertEqual(sp.call_args.args[3], p.final)
 
     def test_remux_cut_mismatch_with_a_real_donor_is_permanent(self):
         import companion, remux

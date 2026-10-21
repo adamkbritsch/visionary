@@ -68,6 +68,17 @@ ABOUT = {
     "measuring the render's peaks": "The render's busiest moments are measured to see whether "
                                     "it can ship as is, with no re-encode.",
     "copying the render's video": "The render's video is copied out as it is, with no re-encode.",
+    # the over-gate splice (remux.splice_stages)
+    "indexing the original video": "Every frame of the original video is listed with its place "
+                                   "on screen and the points where it can be cut cleanly.",
+    "re-encoding the busiest stretches": "Only the seconds over the bitrate limit, and a moment "
+                                         "either side, are re-encoded under the cap; the rest of "
+                                         "the video stays the original.",
+    "splicing them into the original": "The re-encoded stretches are put into the original video "
+                                       "in place of the frames they replace.",
+    "checking every splice": "Each join is decoded and compared frame by frame with the original "
+                             "and the re-encoded stretch, and every frame is checked to carry its "
+                             "own Dolby Vision metadata.",
 }
 
 

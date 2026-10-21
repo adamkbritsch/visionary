@@ -42,14 +42,14 @@ flowchart TD
     RPU -->|yes| INJ["rpu-only"]
     RPU -->|no| CONV["dv-only"]
 
-    INJ --> INJ2["Topaz skipped<br/>DV analysis of the original only<br/>peaks &le; 72 Mbps: video stream-copied,<br/>RPU injected, no re-encode<br/>over: capped x265 of the source"]
+    INJ --> INJ2["Topaz skipped<br/>DV analysis of the original only<br/>peaks &le; 72 Mbps: video stream-copied,<br/>RPU injected, no re-encode<br/>over: only the hot stretches re-encoded<br/>and spliced into the original"]
     CONV --> CONV2["Topaz skipped<br/>converted, DV added<br/>capped x265 remux"]
     UPS --> UPS2["Topaz upscales to 4K<br/>converted, DV added<br/>capped x265 remux"]
 ```
 
 | source | Topaz | Dolby Vision™ step | remux | video re-encoded? |
 |---|---|---|---|---|
-| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 1000 nits | RPU injected onto the original | **no — bit-identical** (video peaks ≤ 72 Mbps; hotter sources take the capped x265 instead — see below) |
+| 4K HDR10 · HEVC · 10-bit | skipped | DV analysis only, 1000 nits | RPU injected onto the original | **no — bit-identical** (video peaks ≤ 72 Mbps; a hotter source re-encodes only its over-limit stretches — see below) |
 | 4K HDR · HLG/AV1/H.264/8-bit | skipped | converts + DV, 1000 nits | capped x265 | yes — DV 8.1 needs an HEVC PQ base |
 | 4K SDR | skipped | adds HDR + DV, 1000 nits | capped x265 | yes |
 | 4K, variable frame rate | skipped — only re-timed to a constant rate | adds (HDR+)DV | capped x265 | yes |
@@ -103,9 +103,20 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   file that plays fine bare can be pushed over purely by injecting the RPU and muxing
   Atmos in). The remux therefore measures the source's 1-second video peaks first: at or
   under **72 Mbps** (80 minus TrueHD headroom — every output is budgeted as if it carries
-  TrueHD) the stream ships untouched; over it, the source video takes the same
-  enforced-VBV capped x265 native-DV re-encode as every other path, scene-cut segmented
-  and resumable.
+  TrueHD) the stream ships untouched. Over it, only the **stretches that pass the limit** are
+  re-encoded: every 1-second window over 72 Mbps, plus a second either side, goes through the
+  capped x265 (a few percent of a typical film — about 11% of Deadpool 2), and those pieces are
+  spliced back into the original stream between its own keyframes. Every other frame stays the
+  original, bit for bit. Before anything ships, the splice is proven frame by frame: each join
+  decodes exactly as the original followed by the re-encoded piece, each piece was made from the
+  very frames it replaces, every frame keeps its own HDR10, HDR10+ and Dolby Vision metadata, and
+  no 1-second window anywhere is over the limit. A source the splice cannot prove takes the
+  capped x265 re-encode of the whole video instead, scene-cut segmented and resumable.
+
+  Every Dolby Vision RPU Visionary writes goes onto its frame by that frame's own place in the
+  picture order (worked out from the stream itself and checked against the decoder), not by
+  `dovi_tool inject-rpu`, which puts RPUs on the wrong frames in streams whose keyframes have
+  leading pictures (RADL).
 
   **Everything else 4K** ships its HDR+DV conversion through the normal capped remux,
   whatever its bitrate (there is no minimum). Nothing is excluded by provenance, so a
@@ -130,7 +141,8 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   choice is shown on a **verdict card** you approve before anything runs; the seedbox copy
   streams straight through the relay (never staged on the NAS, never modified — it keeps
   seeding), and the combined master obeys the same playback peak budget as every other
-  output, taking the capped re-encode (real RPU preserved) when the winner's peaks bust it.
+  output: when the winner's peaks pass it, only its over-limit stretches are re-encoded (the
+  real RPU preserved), as above.
 
 - **Dolby Vision™ profile 7 → 8.1, in place** (it
   reaches the NAS over Visionary's own FTP, so it works away from home too, over Tailscale): Blu-ray remuxes carry Dolby Vision™ as **profile 7**, which most

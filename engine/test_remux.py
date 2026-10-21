@@ -483,6 +483,37 @@ class EncodeSourceRouting(unittest.TestCase):
         self.assertEqual(seen["enc"], [render])
 
 
+def splice_mocks(n=100, units=None):
+    """The inject path's RPU seams (splice.donor_rpus / place_rpus / container_ranks) as a test of
+    the orchestration sees them: n distinct RPUs, a placement that writes the injected ES, a
+    master whose timestamps put every frame in its slot."""
+    import splice
+    units = units if units is not None else [bytes([0x19, 1 + i % 250, i // 250]) for i in range(n)]
+
+    def place(src, rpus, out, **kw):
+        with open(out, "wb") as f:
+            f.write(b"INJECTED")
+        return type("Ix", (), {"rank": list(range(len(rpus)))})()
+    return [mock.patch.object(splice, "donor_rpus", return_value=(units, "test")),
+            mock.patch.object(splice, "place_rpus", side_effect=place),
+            mock.patch.object(splice, "container_ranks", return_value=list(range(n)))]
+
+
+class _Patches:
+    def __init__(self, patches):
+        self.p = patches
+
+    def __enter__(self):
+        for x in self.p:
+            x.start()
+        return self
+
+    def __exit__(self, *exc):
+        for x in self.p:
+            x.stop()
+        return False
+
+
 class InjectPath(unittest.TestCase):
     """FAST-PATH remux (rpu-only): the ORIGINAL stream ships with Resolve's RPU injected —
     no re-encode, no peak gate; strict frame/fps alignment gates ship-nothing on mismatch."""
@@ -515,10 +546,12 @@ class InjectPath(unittest.TestCase):
                  mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
                  mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="DV 8.1 · 2 audio · 1 sub")), \
              mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
-                 mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run):
+                 mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run), \
+                 _Patches(splice_mocks()):
                 res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
             self.assertTrue(res.ok)
             self.assertIn("original stream + injected RPU", res.reason)
+            self.assertIn("every frame's RPU checked", res.reason)
             peak.assert_not_called()                        # NO peak measurement in this mode
             self.assertFalse(os.path.exists(out + ".remuxsegs"))   # success → RPU dir gone
             self.assertFalse(os.path.exists(out + ".src.hevc"))    # transients swept
@@ -533,6 +566,7 @@ class InjectPath(unittest.TestCase):
                  mock.patch.object(remux.dvcap, "count_hevc_frames", return_value=100), \
                  mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
                  mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=99), \
+                 _Patches(splice_mocks(99)), \
                  mock.patch.object(remux.subprocess, "run",
                                    side_effect=AssertionError("must fail BEFORE any mux work")):
                 res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
@@ -563,6 +597,7 @@ class InjectPath(unittest.TestCase):
                  mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
                  mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")), \
                  mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
+                 _Patches(splice_mocks()), \
                  mock.patch.object(remux.subprocess, "run", side_effect=self._fake_run):
                 res = remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out)
             self.assertFalse(res.ok)
@@ -612,7 +647,8 @@ class StagePlans(unittest.TestCase):
              mock.patch.object(remux.dvcap, "ensure_pq_vui", return_value=(True, "")), \
              mock.patch.object(remux, "_mux_verified", side_effect=fake_mux(reason="DV 8.1")), \
              mock.patch.object(remux, "_prepare_tracks", return_value=TRACKS_OK), \
-             mock.patch.object(remux.subprocess, "run", side_effect=InjectPath()._fake_run):
+             mock.patch.object(remux.subprocess, "run", side_effect=InjectPath()._fake_run), \
+             _Patches(splice_mocks()):
             return remux.remux_inject(os.path.join(tmp, "dv.mov"), "cfr.mkv", "orig.mkv", out,
                                       on_step=lambda l, p: steps.append(l),
                                       on_stages=lambda ls: plans.append(list(ls)), **kw)
@@ -637,8 +673,9 @@ class StagePlans(unittest.TestCase):
             seg = os.path.join(tmp, "master.mkv.remuxsegs")
             with mock.patch.object(remux.dvcap, "ensure_segdir"):
                 os.makedirs(seg)
-                with open(os.path.join(seg, "rpu.bin"), "wb") as f:
-                    f.write(b"RPU")
+                import splice
+                splice.write_rpu_file([bytes([0x19, 1 + i % 250, i // 250]) for i in range(100)],
+                                      os.path.join(seg, "rpu.bin"))
                 self.assertTrue(self._inject(tmp, steps, plans).ok)
         self.assertEqual(plans, [remux.inject_stages(False)])
         self.assertNotIn("extracting DV metadata", plans[0] + steps)
@@ -1745,7 +1782,9 @@ class ResolvePathPinned(unittest.TestCase):
             render, 50, 100, fps, remux.dvcap.SEG_SECONDS, boundaries=[50, 100],
             encode_source=None, rpu_mode=None)])
         self.assertEqual(calls["ensure"], [mock.call(segdir, {"m": 1})])
-        self.assertEqual(calls["extract"], [mock.call(render, rpu, mode=None, ffmpeg=ff, timeout=None)])
+        # extracted to a side file, published as rpu.bin only once its frame order checked out
+        self.assertEqual(calls["extract"], [mock.call(render, rpu + ".extract", mode=None, ffmpeg=ff,
+                                                      timeout=None)])
         self.assertEqual(calls["encode"], [
             mock.call(render, rpu, hevc, 50, segdir=segdir, total_frames=100, fps=fps,
                       boundaries=[50, 100], master_display=self.MD, max_cll="900,300",

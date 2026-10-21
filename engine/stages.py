@@ -1714,6 +1714,90 @@ def youtube_render_kbps(height) -> int:
             else YOUTUBE_RENDER_KBPS)
 
 
+def _capped_segments_started(p) -> bool:
+    """The whole-file capped re-encode already has finished segments for this master (an attempt
+    from before the splice existed, or one the splice fell back to): never abandon hours of x265."""
+    try:
+        return any(f.startswith("seg_") and f.endswith(".hevc")
+                   for f in os.listdir(str(p.final) + ".remuxsegs"))
+    except OSError:
+        return False
+
+
+def _render_rpu_book(dv_video):
+    """The native render's own generated RPU (<render>.dvrender/rpu.bin, display order) when its
+    sha256 still matches the one the render recorded, else None. The splice reads RPUs from it
+    rather than back out of the render (dovi_tool's extract follows its own frame order)."""
+    try:
+        import nativelane
+        import nativerender
+        books = str(dv_video) + nativerender.BOOKS_SUFFIX
+        rpu = os.path.join(books, nativerender.RPU)
+        with open(os.path.join(books, nativerender.SPEC_BOOK)) as f:
+            want = ((json.load(f) or {}).get("rpu") or {}).get("sha256")
+        if want and os.path.isfile(rpu) and nativelane.sha256_file(rpu) == want:
+            return rpu
+    except (OSError, ValueError, AttributeError, ImportError):
+        pass
+    return None
+
+
+def _try_splice(p, steps, on_step, dv_video, audio_source, base, *, cap, lufs, abort,
+                should_pause, audio_gain=None, rpu_mode=None, audio_check=None,
+                rpu_in_stream=False, progress=None):
+    """The over-gate source's splice (remux.remux_splice). -> (ok, reason) when it decided the
+    attempt — shipped, failed (retried as is), paused, aborted — or None when the source cannot
+    be spliced and the caller's whole-file capped re-encode must run. Pieces are published as
+    seg_done / seg_total on every tick (deploy-now waits for a piece boundary while x265 runs)."""
+    import remux
+    import splice
+    why = splice.fallback_reason(p.final, base)
+    if why:
+        logbook.event(f"remux {p.ep}: no splice ({why}) — whole-file capped re-encode")
+        return None
+    if _capped_segments_started(p):
+        logbook.event(f"remux {p.ep}: the whole-file capped re-encode has finished segments — "
+                      "it carries on (no splice)")
+        return None
+    if audio_check is not None:
+        # a combine's audio donor must be the winner's cut (remux.combine gates the same thing
+        # before either of its paths): the frame gate the splice runs is against the RPU only
+        gate = remux.combine_audio_gate(base, audio_check["rpu_source"], audio_source)
+        if gate is not None:
+            return False, gate
+    pieces = {}
+
+    def on_pieces(done, total):
+        pieces.update(seg_done=done, seg_total=total)
+
+    def step(label, pct):
+        if progress and pieces:
+            progress(dict({"stage": "remux", "ep": p.ep,
+                           "pct": (round(pct, 1) if pct is not None else None), "step": label},
+                          **pieces, **steps.at(label, pct)))
+        else:
+            on_step(label, pct)
+    book = None if rpu_in_stream else _render_rpu_book(dv_video)
+    try:
+        res = remux.remux_splice(dv_video, audio_source, base, p.final, cap_mbps=cap,
+                                 rpu_mode=rpu_mode, rpu_book=book, rpu_in_stream=rpu_in_stream,
+                                 audio_target_lufs=lufs, audio_gain_db=audio_gain, abort=abort,
+                                 should_pause=should_pause, on_step=step, on_pieces=on_pieces,
+                                 on_stages=lambda labels: steps.plan([PEAKS_STAGE] + list(labels)),
+                                 log=lambda m: logbook.event(f"remux {p.ep}: {m}"))
+    except Exception as e:  # noqa: BLE001 — remux_splice catches its own; this is the last net
+        if abort is not None and abort.is_set():
+            return False, "aborted"
+        splice.remember_fallback(p.final, base, f"the splice raised {type(e).__name__}: {e}")
+        logbook.event(f"remux {p.ep}: the splice raised {type(e).__name__}: {e} — whole-file "
+                      "capped re-encode instead")
+        return None
+    if res.ok or not str(res.reason).startswith((remux.SPLICE_FALLBACK, remux.SPLICE_SKIP)):
+        return res.ok, res.reason
+    logbook.event(f"remux {p.ep}: {res.reason} — whole-file capped re-encode instead")
+    return None
+
+
 def _remux(p, abort, progress=None, should_pause=None):
     """mute DV video -> PEAK-CAPPED DV video (dvcap x265 re-encode, hard `max_peak_mbps`
     ceiling — see remux.py; NO uncapped fallback) + audio (CFR file) + subtitles (ORIGINAL
@@ -1818,6 +1902,8 @@ def _remux(p, abort, progress=None, should_pause=None):
             "rpu_profile": (v.get("rpu_profile") or "") if real_rpu else "",
             "real_rpu": real_rpu,
         }
+        # a generated RPU comes from the render's own books, never back out of the render
+        combine_book = None if real_rpu else _render_rpu_book(p.dv_render)
         steps.plan([PEAKS_STAGE] + remux.inject_stages(True))   # remux_inject corrects the tail
         _on_step(PEAKS_STAGE, None)
         peak = _peak_of(winner, os.path.basename(winner))
@@ -1828,12 +1914,22 @@ def _remux(p, abort, progress=None, should_pause=None):
                                 combine_call["audio_source"], p.final,
                                 rpu_inline=combine_call["rpu_inline"],
                                 rpu_profile=combine_call["rpu_profile"], capped=False,
+                                real_rpu=combine_call["real_rpu"], rpu_book=combine_book,
                                 cap_mbps=cap, audio_target_lufs=lufs, abort=abort,
                                 on_step=_on_step, on_stages=steps.plan)
             return _combine_result(res, combine_call["real_rpu"])
         logbook.event(f"remux {p.ep}: winner peaks {peak:.1f} Mbps — over the "
-                      f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate; combine takes "
-                      "the capped re-encode (real DV preserved)")
+                      f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate; re-encoding only "
+                      "the over-gate stretches (real DV preserved)")
+        res = _try_splice(p, steps, _on_step, combine_call["rpu_source"],
+                          combine_call["audio_source"], winner, cap=cap, lufs=lufs,
+                          abort=abort, should_pause=should_pause,
+                          rpu_mode=(2 if str(combine_call["rpu_profile"]).startswith("7") else None),
+                          audio_check=combine_call, rpu_in_stream=combine_call["real_rpu"],
+                          progress=progress)
+        if res is not None:
+            return _combine_result(remux.RemuxResult(res[0], p.final, reason=res[1]),
+                                   combine_call["real_rpu"])
         steps.plan([PLAN_STAGE, CAPPED_STAGE])
         _on_step(PLAN_STAGE, None)
         _plan_fast_path_bounds(p, src=winner)   # cached in the bounds book — retries free
@@ -1854,13 +1950,22 @@ def _remux(p, abort, progress=None, should_pause=None):
             return False, "could not measure source peaks — retrying (never ship unverified)"
         if peak <= dvcap.RPU_SHIP_VIDEO_GATE_MBPS:
             res = remux.remux_inject(p.dv_render, p.source_cfr, p.source, p.final,
-                                     audio_target_lufs=lufs, abort=abort, on_step=_on_step,
-                                     on_stages=steps.plan)
+                                     audio_target_lufs=lufs, audio_gain_db=audio_gain,
+                                     abort=abort, on_step=_on_step, on_stages=steps.plan,
+                                     rpu_book=_render_rpu_book(p.dv_render))
             return res.ok, res.reason
         logbook.event(f"remux {p.ep}: source peaks {peak:.1f} Mbps — over the "
                       f"{dvcap.RPU_SHIP_VIDEO_GATE_MBPS} Mbps DV ship gate "
                       f"({dvcap.DV_STREAM_CEILING_MBPS} ceiling - TrueHD headroom); "
-                      "stream copy revoked, capped re-encode of the source instead")
+                      "re-encoding only the over-gate stretches")
+        # SPLICE FIRST (user-dictated 2026-10-20): only the over-gate stretches are re-encoded and
+        # the rest of the original stream ships as it is; a source splice.py cannot do (booked)
+        # falls through to the whole-file capped re-encode below, exactly as before.
+        res = _try_splice(p, steps, _on_step, p.dv_render, p.source_cfr, p.source, cap=cap,
+                          lufs=lufs, audio_gain=audio_gain, abort=abort, should_pause=should_pause,
+                          progress=progress)
+        if res is not None:
+            return res
         steps.plan([PLAN_STAGE, CAPPED_STAGE])
         _on_step(PLAN_STAGE, None)
         _plan_fast_path_bounds(p)      # cached in the bounds book — retries are free
@@ -1917,6 +2022,7 @@ def _remux(p, abort, progress=None, should_pause=None):
                             combine_call["audio_source"], p.final,
                             rpu_inline=combine_call["rpu_inline"],
                             rpu_profile=combine_call["rpu_profile"], capped=True,
+                            real_rpu=combine_call["real_rpu"], rpu_book=combine_book,
                             cap_mbps=cap, boundaries=bounds, audio_target_lufs=lufs,
                             abort=abort, on_progress=_prog, on_plan=_on_plan,
                             should_pause=should_pause, on_repair=_on_repair)
@@ -1962,7 +2068,10 @@ def _remux(p, abort, progress=None, should_pause=None):
                       boundaries=bounds, abort=abort,
                       on_progress=on_prog, on_plan=on_plan, should_pause=should_pause,
                       on_repair=on_repair, encode_source=encode_source,
-                      **({"native": native} if native is not None else {}), **sdr_kw)
+                      **({"native": native} if native is not None else {}), **sdr_kw,
+                      **({"rpu_book": book} if (native is None and not sdr_out
+                                                and (book := _render_rpu_book(p.dv_render)))
+                         else {}))
     if wall is not None:
         _never_raise(wall.finish)
     if res.ok and native is not None:
@@ -2088,6 +2197,7 @@ def _cleanup(p, abort, progress=None):
         if os.path.exists(other):
             os.remove(other)
         shutil.rmtree(other + ".remuxsegs", ignore_errors=True)
+        shutil.rmtree(other + ".splicesegs", ignore_errors=True)
         for base in (p.final, other):
             for sfx in (".part",            # the mkvmerge mux, before it passed its gates
                         ".tracks.mka",      # remux temp: audio + subtitles for the mux
@@ -2096,6 +2206,7 @@ def _cleanup(p, abort, progress=None):
                         ".src.hevc.vui",    # ...its VUI rewrite (dvcap.ensure_pq_vui)
                         ".ship.hevc.vui",
                         ".inject.hevc",     # inject temp: RPU-injected ES
+                        ".splice.hevc",     # splice temp: the original with its pieces in
                         ".fix.hevc",        # inject temp: an inline-P7 winner through nalfix
                         ".ship.hevc",       # ship-render temp: the render's ES
                         ".tracks.mp4",      # the pre-Matroska build's (2026-10-18) temps, left
@@ -2119,6 +2230,7 @@ def _cleanup(p, abort, progress=None):
         pass
     shutil.rmtree(p.segdir, ignore_errors=True)          # the resumable-encode chunks (topaz output)
     shutil.rmtree(p.final + ".remuxsegs", ignore_errors=True)   # the resumable REMUX segments + rpu
+    shutil.rmtree(p.final + ".splicesegs", ignore_errors=True)  # the splice's re-encoded pieces + rpu
     if getattr(p, "source_wide", ""):                    # the extend stage's resumable chunk dir
         shutil.rmtree(p.source_wide + ".segments", ignore_errors=True)
     deleted, failed = 0, []
