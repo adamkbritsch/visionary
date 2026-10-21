@@ -239,7 +239,7 @@ struct StageBar: View {
     var body: some View {
         if expanded {
             HStack(alignment: .top, spacing: 4) {
-                ForEach(Array(plan.labels.enumerated()), id: \.offset) { i, label in
+                ForEach(Array(plan.labels.enumerated()), id: \.offset) { i, _ in
                     VStack(spacing: 3) {
                         section(i)
                         Text(StagePlan.letter(i))
@@ -249,14 +249,14 @@ struct StageBar: View {
                                              : (i < plan.idx ? DS.steel : DS.steelDim))
                     }
                     .frame(maxWidth: .infinity)
-                    .help("Stage \(StagePlan.letter(i)) · \(StagePlan.label(label))"
-                          + (i < plan.idx ? " · done" : (i == plan.idx ? " · running now" : "")))
+                    .help(plan.tip(i))
                 }
             }
         } else if let p = plan.pct {
             SteelBar(completed: plan.completed, live: p / 100, notches: plan.notches,
                      flashKey: plan.segDone, repairLo: repairLo, repairHi: repairHi,
                      repairFrac: repairFrac)
+                .help(plan.tip(plan.idx))
         }
     }
 

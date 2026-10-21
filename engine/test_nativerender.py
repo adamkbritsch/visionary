@@ -456,7 +456,8 @@ class Render(_Base):
         self.assertEqual(phases[-1], "finish")
         stages = ["Measuring every shot", "Encoding the picture", "Finishing the render"]
         self.assertIn({"stage": "dvrender", "ep": "S01E01", "phase": "encode", "pct": 72.5, "attempt": 1,
-                       "kbps": 14000, "stages": stages, "stage_idx": 1, "stage_pct": 50.0},
+                       "kbps": 14000, "stages": stages, "stage_idx": 1, "stage_pct": 50.0,
+                       "stage_about": [NR.stagebar.ABOUT[s] for s in stages]},
                       self.events)                       # frame 24 of 48, from -progress
         self.assertEqual(self.events[-1]["pct"], 100)
 

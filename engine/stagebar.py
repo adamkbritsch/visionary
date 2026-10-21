@@ -16,16 +16,66 @@ numbers, which the ETA clocks, the header readout and the Dock icon read.
     stage_notches   [float] that stage's segment boundaries as 0..1 fractions of the stage
     stage_seg_done  int     how many of those segments are finished
     stage_sub       str     what the stage is doing right now ("attempt 2", "muxing")
+    stage_about     [str]   one sentence per stage on what it is (ABOUT) — the app's tooltip
 """
 from __future__ import annotations
 
-FIELDS = ("stages", "stage_idx", "stage_pct", "stage_notches", "stage_seg_done", "stage_sub")
+FIELDS = ("stages", "stage_idx", "stage_pct", "stage_notches", "stage_seg_done", "stage_sub",
+          "stage_about")
+
+# What each stage IS, in a sentence — the tooltip on its section of the bar (user, 2026-10-20).
+# Keyed by the exact label the step publishes; test_stagebar checks every label has one.
+ABOUT = {
+    # the Dolby Vision step (nativelane.LANE_STAGES, nativerender.render_stages)
+    "Measuring every shot": "hdr-analyze measures how bright every shot of the picture is; the "
+                            "Dolby Vision metadata is written from these measurements.",
+    "Writing the Dolby Vision metadata": "dovi_tool turns the shot measurements into the Dolby "
+                                         "Vision 8.1 metadata that goes into the master.",
+    "Encoding the picture": "The picture is encoded at 4K on the Mac's media engine. A re-encode "
+                            "under the peak cap starts this bar over.",
+    "Copying the source's picture": "The source's own video is copied as it is, with no "
+                                    "re-encode, so the Dolby Vision metadata can be added to it.",
+    "Finishing the render": "The HDR10 and Dolby Vision metadata are added, the render is "
+                            "packaged, and it is checked before it is handed on.",
+    # download (stages.DOWNLOAD_STAGES, COMBINE_STAGES)
+    "Copying the source from the NAS": "The episode or movie is copied from your NAS to the "
+                                       "Mac's scratch disk.",
+    "Making the constant-frame-rate copy": "A copy at one steady frame rate is made, so every "
+                                           "later step counts exactly the same frames.",
+    "Copying the NAS copy": "This movie's copy on your NAS is copied to the scratch disk.",
+    "Fetching the companion from the seedbox": "The movie's second copy is streamed from the "
+                                               "seedbox, so the best of both can be combined.",
+    # the fast remuxes (stages.PEAKS_STAGE, PLAN_STAGE, CAPPED_STAGE; remux.inject_stages,
+    # SHIP_STAGES, MUX_STAGES)
+    "measuring source peaks": "The source's busiest moments are measured to decide whether its "
+                              "own video can ship as is or must be re-encoded under the cap.",
+    "planning scene-cut segments": "The video is split at scene cuts into segments that are "
+                                   "encoded, and resumed, one at a time.",
+    "re-encoding under the peak cap": "x265 re-encodes the video under a hard bitrate cap so it "
+                                      "plays without stutter, keeping the Dolby Vision metadata.",
+    "extracting DV metadata": "The Dolby Vision metadata is read out of the copy that carries it.",
+    "copying the original video": "The original video is copied out bit for bit, with no "
+                                  "re-encode.",
+    "injecting DV metadata": "The Dolby Vision metadata is added to the original video, frame "
+                             "by frame.",
+    "converting DV to profile 8.1": "The video's Dolby Vision is converted to profile 8.1, which "
+                                    "every player supports, with no re-encode.",
+    "preparing audio": "The audio is prepared with its loudness adjustment, and the subtitles "
+                       "and chapters are gathered.",
+    "muxing the master": "The video, audio and subtitles are combined into the final MKV master.",
+    "verifying the master": "The master is checked: Dolby Vision 8.1, every frame present, and "
+                            "the bitrate under the cap.",
+    "measuring the render's peaks": "The render's busiest moments are measured to see whether "
+                                    "it can ship as is, with no re-encode.",
+    "copying the render's video": "The render's video is copied out as it is, with no re-encode.",
+}
 
 
 def fields(stages, idx: int, pct=None, *, notches=None, seg_done=None, sub=None) -> dict:
     """PURE. The stage fields for a progress dict: stage `idx` of `stages`, at `pct` of its own
     work (None = no number), with its own segment `notches` / `seg_done` and a `sub` line."""
-    d = {"stages": list(stages), "stage_idx": int(idx)}
+    d = {"stages": list(stages), "stage_idx": int(idx),
+         "stage_about": [ABOUT.get(s, "") for s in stages]}
     if pct is not None:
         d["stage_pct"] = round(max(0.0, min(100.0, float(pct))), 1)
     if notches:

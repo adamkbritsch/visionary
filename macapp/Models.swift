@@ -49,6 +49,7 @@ struct ProgressDTO: Codable {
     var stage_notches: [Double]?  // its own segment boundaries, 0...1 of the stage
     var stage_seg_done: Int?    // ...and how many of those segments are finished
     var stage_sub: String?      // what it is doing right now ("attempt 2, under the peak cap")
+    var stage_about: [String]?  // one sentence per stage on what it is — the bar's tooltips
 }
 
 struct HoldDTO: Codable {
@@ -114,6 +115,7 @@ struct FinishingDTO: Codable {
     var stage_notches: [Double]?  // its own segment boundaries, 0...1 of the stage
     var stage_seg_done: Int?    // ...and how many of those segments are finished
     var stage_sub: String?      // what it is doing right now ("attempt 2, under the peak cap")
+    var stage_about: [String]?  // one sentence per stage on what it is — the bar's tooltips
     // Identity — `abandon_series` matches lanes on exactly these, and the puck labels with them.
     var series: String?
     var movie: Bool?
@@ -139,13 +141,15 @@ enum EpisodeOrdinal {
 extension FinishingDTO {
     var episodeOrdinal: (season: Int, episode: Int)? { EpisodeOrdinal.parse(ep) }
     var stagePlan: StagePlan? {
-        StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub)
+        StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub,
+                  stage_about)
     }
 }
 
 extension ProgressDTO {
     var stagePlan: StagePlan? {
-        StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub)
+        StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub,
+                  stage_about)
     }
 }
 
@@ -159,10 +163,13 @@ struct StagePlan: Equatable {
     let segDone: Int
     let sub: String?
 
+    let about: [String]         // what each stage is, a sentence each ("" when the engine has none)
+
     init?(_ stages: [String]?, _ idx: Int?, _ pct: Double?, _ notches: [Double]?,
-          _ segDone: Int?, _ sub: String?) {
+          _ segDone: Int?, _ sub: String?, _ about: [String]? = nil) {
         guard let stages, let idx, stages.indices.contains(idx) else { return nil }
         labels = stages
+        self.about = stages.indices.map { ($0 < (about?.count ?? 0)) ? about![$0] : "" }
         self.idx = idx
         self.pct = pct
         self.notches = notches ?? []
@@ -183,6 +190,12 @@ struct StagePlan: Equatable {
     var current: String { Self.label(labels[idx]) }
     /// "Stage B · Encoding the picture"
     var title: String { "Stage \(Self.letter(idx)) · \(current)" }
+    /// The tooltip on stage `i`'s section of the bar: "Stage B · Encoding the picture", then
+    /// what that stage is.
+    func tip(_ i: Int) -> String {
+        let head = "Stage \(Self.letter(i)) · \(Self.label(labels[i]))"
+        return about[i].isEmpty ? head : head + "\n" + about[i]
+    }
     /// The current stage's finished part: the bar's bright fill (its last finished segment).
     var completed: Double {
         let live = min(1, max(0, (pct ?? 0) / 100))
