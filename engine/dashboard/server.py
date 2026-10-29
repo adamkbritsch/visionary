@@ -1302,6 +1302,20 @@ def _up_next_cadence(limit=10, current=None, inflight=None):
     return out
 
 
+def helper_info():
+    """The helper's one-line status for the remux lane (engine/helper.py status_summary: the
+    last cached verdicts, never an ssh or a route check of its own — a background refresher
+    keeps them fresh while the helper is switched on). None when anything about it fails, and
+    the state then simply carries no "helper" key: a helper problem must never cost the
+    /api/state poll."""
+    try:
+        import helper
+        summary = helper.status_summary()
+    except Exception:  # noqa: BLE001
+        return None
+    return summary if isinstance(summary, dict) else None
+
+
 def current_state():
     orch = orchestrator.ORCH.snapshot()
     state = build_state(
@@ -1324,6 +1338,9 @@ def current_state():
     state["settings"] = settings.get_settings()
     state["show_profile"] = show_profile_info()
     state["log"] = logbook.tail(6)            # recent failures/errors for the UI
+    h = helper_info()
+    if h is not None:
+        state["helper"] = h
     return state
 
 

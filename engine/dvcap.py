@@ -21,6 +21,7 @@ Quality: CRF-driven (quality-first) with the VBV ceiling only clipping the spike
 default (50 Mbps) is ~2x the measured average, so only the pathological seconds change.
 """
 from __future__ import annotations
+import collections
 import json
 import math
 import os
@@ -29,6 +30,7 @@ import shutil
 import signal
 import threading
 import subprocess
+import time
 from fractions import Fraction
 
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
@@ -783,6 +785,12 @@ def count_hevc_frames(path: str, ffprobe: str = FFPROBE) -> int:
 _LIVE_ENCODERS = set()                  # {(dec, enc)} currently encoding
 _ENCODER_LOCK = threading.Lock()
 _ENCODERS_SUSPENDED = False             # so a pair spawned DURING a suspension starts stopped
+_RESUMED_AT = 0.0                       # time.monotonic() of the last resume_encoders()
+# THE HELPER's in-flight REMOTE pipelines (helper.py), kept apart: they are never
+# SIGSTOPped. A suspension KILLS them instead — each hook kills its own local processes and
+# marks its segment "suspended", which the scheduler requeues without counting or cooling down
+# (the helper's own stall timer stays the safety net) — and no new one may start until resumed.
+_LIVE_REMOTE = set()                    # {hook()} — called under _ENCODER_LOCK, must not block
 
 
 def _signal_pair(pair, sig):
@@ -794,22 +802,44 @@ def _signal_pair(pair, sig):
             pass
 
 
+def register_remote(hook) -> bool:
+    """Register a remote pipeline's kill hook. False (NOT registered) while encoders are
+    suspended: the caller must kill its pipeline at once, as a suspension would have."""
+    with _ENCODER_LOCK:
+        if _ENCODERS_SUSPENDED:
+            return False
+        _LIVE_REMOTE.add(hook)
+        return True
+
+
+def unregister_remote(hook) -> None:
+    with _ENCODER_LOCK:
+        _LIVE_REMOTE.discard(hook)
+
+
 def suspend_encoders() -> int:
-    """Freeze every in-flight remux encode. Returns how many pairs were stopped."""
+    """Freeze every in-flight local remux encode and KILL every remote (helper) one.
+    Returns how many pipelines were stopped or killed."""
     global _ENCODERS_SUSPENDED
     with _ENCODER_LOCK:
         _ENCODERS_SUSPENDED = True
         for pair in _LIVE_ENCODERS:
             _signal_pair(pair, signal.SIGSTOP)
-        return len(_LIVE_ENCODERS)
+        for hook in list(_LIVE_REMOTE):
+            try:
+                hook()
+            except Exception:
+                pass
+        return len(_LIVE_ENCODERS) + len(_LIVE_REMOTE)
 
 
 def resume_encoders() -> int:
     """Unfreeze them. MUST be called from a finally — a stopped x265 left behind would
     stall its lane forever, and nothing else would ever resume it."""
-    global _ENCODERS_SUSPENDED
+    global _ENCODERS_SUSPENDED, _RESUMED_AT
     with _ENCODER_LOCK:
         _ENCODERS_SUSPENDED = False
+        _RESUMED_AT = time.monotonic()
         for pair in _LIVE_ENCODERS:
             _signal_pair(pair, signal.SIGCONT)
         return len(_LIVE_ENCODERS)
@@ -883,8 +913,15 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
                             boundaries: list | None = None,
                             abort=None, on_progress=None, on_plan=None, should_pause=None,
                             decode: dict | None = None, dv: bool = True, on_segment=None,
+                            helper=None, on_segments=None,
                             ffmpeg=FFMPEG, x265=X265, ffprobe=FFPROBE, dovi_tool=DOVI_TOOL):
     """Resumable peak-cap encode: per-segment native-DV x265 (own RPU slice) → concat.
+    `helper` (2026-10-28; helper.for_remux(), None = exactly the encode below): the helper takes
+    segments from the BACK of the plan while this thread takes them from the front — see
+    _encode_shared. `on_segments(info)` (only heard with a helper) is the segment bar's live
+    state on every progress tick and every segment publish: {"done": [finished indices, either
+    machine], "helper_done": [those the helper made], "mac": [i, frac] | None, "helper": [i,
+    frac, fps] | None} (frac 0..1 within that segment).
     `on_segment(i, path)` hears each segment that is complete on disk — encoded now or found
     complete on a resume — in plan order (the chunk lane frees its Topaz chunks from it).
     `dv=False` (2026-10-18, an item pinned to SDR output): the TRUE SDR x265 (build_x265_command's
@@ -893,7 +930,9 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
     Segments persist in `segdir`; a completed segment is skipped on the next attempt.
     Returns (ok, frames_encoded, reason). Reports cumulative frames via on_progress, and fires
     on_plan([segment_end_frame, ...], total_frames) ONCE after planning so the dashboard can draw
-    the same notched segment bar Topaz uses (seg_done is derived from cumulative frames ≥ each end).
+    the same notched segment bar Topaz uses (seg_done is derived from cumulative frames ≥ each end;
+    with a helper the frames run ahead of plan order, so _encode_shared passes the plan-order
+    prefix as on_progress's `seg_done` keyword to a callback that takes one).
     `should_pause` (like topaz's): polled between segments — a True yields cleanly with a benign
     "paused:" reason (every finished segment kept; the next attempt resumes right here). Used to
     give a sibling app's lease or AI outpainting the whole machine."""
@@ -907,6 +946,13 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
     if on_plan:
         on_plan([b for (_a, b) in segs], total_frames)
     tights = read_tight_caps(segdir)   # repair-tightened segments resume at THEIR cap, not the global
+    if helper is not None:
+        return _encode_shared(segs, helper, tights, dv_video=dv_video, rpu=rpu, out_hevc=out_hevc,
+                              cap_mbps=cap_mbps, segdir=segdir, total_frames=total_frames, fps=fps,
+                              master_display=master_display, max_cll=max_cll, abort=abort,
+                              on_progress=on_progress, should_pause=should_pause, decode=decode,
+                              dv=dv, on_segment=on_segment, on_segments=on_segments,
+                              ffmpeg=ffmpeg, x265=x265, ffprobe=ffprobe, dovi_tool=dovi_tool)
     base, seg_files = 0, []
     for i, (a, b) in enumerate(segs):
         n = b - a
@@ -964,6 +1010,469 @@ def encode_capped_segmented(dv_video: str, rpu: str, out_hevc: str, cap_mbps: in
     if not ok:
         return False, base, why
     return True, base, "encoded %d frames in %d segments" % (base, len(segs))
+
+
+# ---- THE HELPER: two workers over one segment plan (2026-10-28) -------------------------------
+# With a helper (helper.py) the plan's pending segments form ONE queue: this thread (the Mac)
+# takes from the FRONT, a remote worker thread hands segments from the BACK to the helper, only
+# while helper.available() says so. The helper gets the SAME decode (the Mac decodes and applies
+# the colour step — the helper's is not bit-identical) and the SAME x265 arguments, and its
+# segment is published exactly like a local one once verified here: got == n AND the received
+# file's own packet count == n, then os.replace. Anything else hands the segment back to the Mac.
+# The helper can never fail or park an item — only the Mac's own segments can, exactly as without it.
+HELPER_WAIT_SECONDS = 30        # an unavailable helper is re-checked this often
+HELPER_SUSPEND_POLL = 2.0       # while encoders are suspended, how often the remote worker looks again
+HELPER_MAX_FAILURES = 2         # "error"/"disconnected" remote results in one call before the helper
+                                # sits it out ("yielded"/"refused" cool the helper down instead;
+                                # "suspended"/"aborted" are nobody's fault and count for nothing)
+HELPER_COUNTED = ("error", "disconnected")
+HELPER_JOIN_SECONDS = 120       # the remote worker is joined before every return (bounded)
+HELPER_RESERVE_SECONDS = 120    # a segment a suspension took off the helper stays the helper's this
+                                # long after the resume (the Mac takes it only if the helper does not
+                                # reclaim it by then, or the moment the helper is unavailable)
+_IDLE_POLL_SECONDS = 1.0        # the Mac's poll while only the helper has (or holds) a segment
+_PAUSED_REASON = "paused: another stage has the machine — this remux resumes when it finishes"
+
+
+def _hosts_path(segdir: str) -> str:
+    return os.path.join(segdir, "hosts.json")
+
+
+def read_hosts(segdir: str) -> dict:
+    """{"<segment index>": "mac"|"ally"} — who encoded each segment published with a helper
+    ("ally" = the helper, whatever machine it is). Missing/corrupt -> {}. Lives in segdir, so a
+    resume-identity wipe takes it along."""
+    try:
+        with open(_hosts_path(segdir)) as f:
+            d = json.load(f)
+        return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_hosts(segdir: str, hosts: dict) -> None:
+    try:
+        tmp = _hosts_path(segdir) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({k: hosts[k] for k in sorted(hosts, key=lambda s: int(s) if s.isdigit() else -1)}, f)
+        os.replace(tmp, _hosts_path(segdir))
+    except Exception:  # noqa: BLE001 — bookkeeping only
+        pass
+
+
+def _remote_leftovers(segdir: str, i: int) -> tuple:
+    """The files a remote encode of segment i writes in segdir (the received HEVC and the RPU
+    slice it uploads) — stale whenever no remote encode of i is in flight."""
+    return (os.path.join(segdir, f"seg_{i:04d}.hevc.remote.part"),
+            os.path.join(segdir, f"seg_{i:04d}.remote.rpu"))
+
+
+def _rm_remote_leftovers(segdir: str, i: int) -> None:
+    for path in _remote_leftovers(segdir, i):
+        _rm(path)
+
+
+def _takes_kw(fn, name: str) -> bool:
+    """Whether the callable `fn` accepts the keyword `name` (by name or through **kwargs)."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is p.VAR_KEYWORD or (p.name == name and p.kind in (p.KEYWORD_ONLY,
+                                                                         p.POSITIONAL_OR_KEYWORD))
+               for p in params)
+
+
+def _segments_word(k: int) -> str:
+    return f"{k} segment" if k == 1 else f"{k} segments"
+
+
+_HELPER_NOTE_RE = re.compile(r" \((\d+) segments? on the helper\)$")
+
+
+def helper_note(why) -> str:
+    """PURE. The " (K segment(s) on the helper)" suffix _encode_shared's success reason ends
+    with (K > 0), or "" — what remux carries into its success note."""
+    m = _HELPER_NOTE_RE.search(str(why or ""))
+    return m.group(0) if m and int(m.group(1)) > 0 else ""
+
+
+class _EitherSet:
+    """`is_set()` of any of the events: the remote worker's abort is the caller's abort OR this
+    call stopping it (a pause, a Mac-side failure, the end)."""
+
+    def __init__(self, *events):
+        self._events = [e for e in events if e is not None]
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self._events)
+
+
+def _encode_shared(segs, helper, tights, *, dv_video, rpu, out_hevc, cap_mbps, segdir,
+                   total_frames, fps, master_display, max_cll, abort, on_progress, should_pause,
+                   decode, dv, on_segment, ffmpeg, x265, ffprobe, dovi_tool, on_segments=None):
+    """encode_capped_segmented's body with a helper. Same returns and reasons as the Mac-only
+    loop; differences, all deliberate:
+      - on_segment still fires in PLAN ORDER — the longest finished prefix — because the chunk
+        releaser frees a chunk only once a segment's neighbours are known;
+      - on_progress = finished + both in-flight segments, never moving backwards (a segment
+        the helper drops takes its in-flight frames with it; the bar holds instead of falling).
+        The frame count runs AHEAD of plan order (the helper works from the back), so a callback
+        that takes a `seg_done` keyword (stages' remux bar does) also hears the finished
+        plan-order PREFIX as seg_done — what the notched bar, its ETA and deploy-now's segment
+        boundary must count, not "how many ends the frame total has passed";
+      - on_segments(info) (C1) hears the bar's live state on every progress tick and every
+        publish: {"done", "helper_done", "mac": [i, frac] | None, "helper": [i, frac, fps] |
+        None}. It, on_progress and the helper's own note_segments (status_summary) are called
+        from both threads, serialised under one lock — on_segments BEFORE on_progress within
+        one report, so a listener publishing on the progress tick is never one report stale;
+        on_segments/note_segments failing never touches the encode;
+      - should_pause/abort stop the remote worker (its in-flight pipeline killed) and join it
+        before returning; the Mac also polls them while it waits on the helper's last segment;
+      - dvcap.suspend_encoders() KILLS the helper's in-flight segment ("suspended": requeued at
+        the back for the helper, never counted, no cooldown) and no remote segment is claimed
+        while encoders_suspended(). That segment stays RESERVED for the helper until
+        HELPER_RESERVE_SECONDS after the resume: the Mac takes it only when the helper has not
+        reclaimed it by then, or at once when the helper turns out unavailable (or its worker
+        is gone);
+      - a segment the helper finished and that verified here is kept even when a stop lands
+        after it (published while this call is still joining the worker);
+      - only "error"/"disconnected" remote results count toward HELPER_MAX_FAILURES;
+      - stale remote leftovers (seg_NNNN.hevc.remote.part / seg_NNNN.remote.rpu) are deleted
+        on the resume and whenever the Mac takes a segment;
+      - segdir/hosts.json records who encoded each segment; the success reason appends
+        " (K segment(s) on the helper)" when K > 0."""
+    nseg = len(segs)
+    seg_files = [os.path.join(segdir, f"seg_{i:04d}.hevc") for i in range(nseg)]
+    cond = threading.Condition()            # guards st, pending, done, reserved
+    out_lock = threading.Lock()             # serializes on_progress / on_segments / on_segment /
+                                            # hosts.json; taken BEFORE cond, never inside it
+    stop = threading.Event()
+    st = {"finished": 0, "mac": 0, "mac_seg": None, "ally": 0, "ally_seg": None, "ally_done": 0,
+          "ally_fps": None, "ally_t0": 0.0, "reported": 0, "emitted": 0, "closed": False}
+    done = [False] * nseg
+    reserved = {}                           # i -> when a suspension handed it back to the helper
+    hosts = read_hosts(segdir)
+    pending = collections.deque()
+    prog_seg_done = on_progress is not None and _takes_kw(on_progress, "seg_done")
+    note = getattr(helper, "note_segments", None)
+    note = note if callable(note) else None
+
+    def frac(f, i):
+        a, b = segs[i]
+        return max(0.0, min(1.0, f / float(b - a))) if b > a else 0.0
+
+    def snapshot():
+        # under cond (and out_lock): the segment bar's live state
+        mac = [st["mac_seg"], frac(st["mac"], st["mac_seg"])] if st["mac_seg"] is not None else None
+        hlp = None
+        j = st["ally_seg"]
+        if j is not None:
+            rate = st["ally_fps"]
+            if rate is None:
+                el = time.monotonic() - st["ally_t0"]
+                rate = st["ally"] / el if st["ally"] > 0 and el > 0 else 0.0
+            hlp = [j, frac(st["ally"], j), round(float(rate), 2)]
+        finished = [k for k in range(nseg) if done[k]]
+        return {"done": finished, "helper_done": [k for k in finished if hosts.get(str(k)) == "ally"],
+                "mac": mac, "helper": hlp}
+
+    def report():
+        if on_progress is None and on_segments is None and note is None:
+            return
+        with out_lock:
+            with cond:
+                v = st["finished"] + st["mac"] + st["ally"]
+                info = snapshot() if (on_segments is not None or note is not None) else None
+            # the segments info FIRST: a listener that publishes on on_progress (stages' remux
+            # bar) then carries this report's in-flight positions and fps, not the last report's
+            for fn in (on_segments, note):
+                if fn is not None:
+                    try:
+                        fn(info)
+                    except Exception:  # noqa: BLE001 — a status listener never touches the encode
+                        pass
+            if on_progress is not None:
+                v = max(st["reported"], min(v, total_frames))
+                st["reported"] = v
+                if prog_seg_done:
+                    on_progress(v, total_frames, seg_done=st["emitted"])
+                else:
+                    on_progress(v, total_frames)
+
+    def emit():
+        # the plan-order prefix moves on whether or not anyone listens: seg_done is derived from it
+        with out_lock:
+            while st["emitted"] < nseg and done[st["emitted"]]:
+                k = st["emitted"]
+                st["emitted"] = k + 1
+                if on_segment is not None:
+                    on_segment(k, seg_files[k])
+
+    def published(i, host):
+        with out_lock:
+            hosts[str(i)] = host
+            _write_hosts(segdir, hosts)
+        emit()
+        report()
+
+    # resume: every segment already complete on disk counts (and is heard) before any encode;
+    # no remote encode is in flight yet, so every remote leftover is stale
+    for i, (a, b) in enumerate(segs):
+        if abort is not None and abort.is_set():
+            return False, st["finished"], "aborted"
+        if should_pause is not None and should_pause():
+            return False, st["finished"], _PAUSED_REASON
+        _rm_remote_leftovers(segdir, i)
+        if count_hevc_frames(seg_files[i], ffprobe) == b - a:
+            done[i] = True
+            st["finished"] += b - a
+            emit()
+            report()
+        else:
+            pending.append(i)
+
+    either = _EitherSet(abort, stop)
+
+    def held_for_helper(i, now):
+        # under cond: a suspended segment the Mac must leave to the helper for now
+        t = reserved.get(i)
+        if t is None:
+            return False
+        if encoders_suspended():
+            return True
+        return now < max(t, _RESUMED_AT) + HELPER_RESERVE_SECONDS
+
+    def unreserve():
+        with cond:
+            if reserved:
+                reserved.clear()
+                cond.notify_all()
+
+    def remote_one(i):
+        a, b = segs[i]
+        n = b - a
+        sf = seg_files[i]
+        part, rslice = _remote_leftovers(segdir, i)
+        try:
+            dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps, decode)
+        except ValueError:
+            return "error"
+        _rm(sf)
+        _rm(part)
+        try:
+            cap = tights.get(i, cap_mbps)          # the same (repair-tightened) cap as locally
+            if dv:
+                ok, _why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
+                if not ok:
+                    return "error"
+                args = build_x265_command("X265", "{rpu}", "{out}", cap, master_display, max_cll)[1:]
+            else:
+                args = build_x265_command("X265", None, "{out}", cap, dv=False)[1:]
+
+            def on_frame(f, fps=None):
+                with cond:
+                    st["ally"] = max(0, min(int(f), n))
+                    if fps is not None:
+                        st["ally_fps"] = float(fps)
+                report()
+            got, _why, kind = helper.encode_segment(dec, args, rslice if dv else None, n, part,
+                                                    either, on_frame)
+        finally:
+            _rm(rslice)
+        # the helper finished; a stop landing from here on does not throw its verified work away
+        if kind == "ok" and got == n and count_hevc_frames(part, ffprobe) == n:
+            with cond:
+                if st["closed"]:                   # the call already returned: publish nothing
+                    _rm(part)
+                    return "aborted"
+                os.replace(part, sf)               # atomic publish, exactly like a Mac segment
+                done[i] = True
+                st["finished"] += n
+                st["ally"], st["ally_seg"], st["ally_fps"] = 0, None, None
+                st["ally_done"] += 1
+            published(i, "ally")
+            return "ok"
+        _rm(part)
+        return "error" if kind == "ok" else kind  # "ok" that failed the check here is an error
+
+    def remote_main():
+        fails = 0
+        claim = getattr(helper, "claim", None)
+        release = getattr(helper, "release", None)
+        try:
+            while not either.is_set():
+                with cond:
+                    if not pending:
+                        return                     # nothing left to take: done for this item
+                if encoders_suspended():
+                    # another stage has the machine: claim nothing until it is given back
+                    with cond:
+                        cond.wait_for(lambda: stop.is_set() or not pending,
+                                      timeout=HELPER_SUSPEND_POLL)
+                    continue
+                paused, held = False, False
+                try:
+                    paused = should_pause is not None and should_pause()
+                    ok = not paused and bool(helper.available()[0])
+                    held = ok and (claim() if claim else True)
+                except Exception:  # noqa: BLE001
+                    held = False
+                if not held:
+                    if not paused:
+                        unreserve()                # unavailable: the Mac may take its segment now
+                    with cond:
+                        cond.wait_for(lambda: stop.is_set() or not pending,
+                                      timeout=HELPER_WAIT_SECONDS)
+                    continue
+                i, kind = None, "error"
+                try:
+                    with cond:
+                        if stop.is_set() or not pending:
+                            return
+                        i = pending.pop()          # from the BACK; the Mac takes the front
+                        reserved.pop(i, None)
+                        st["ally_seg"], st["ally"], st["ally_fps"] = i, 0, None
+                        st["ally_t0"] = time.monotonic()
+                    report()
+                    try:
+                        kind = remote_one(i)
+                    except Exception:  # noqa: BLE001 — the Mac takes the segment back
+                        kind = "error"
+                finally:
+                    try:
+                        if release:
+                            release()
+                    except Exception:  # noqa: BLE001 — the bookkeeping below must still run
+                        pass
+                    if i is not None:
+                        with cond:
+                            if st["ally_seg"] == i:
+                                st["ally_seg"], st["ally"], st["ally_fps"] = None, 0, None
+                            if not done[i]:
+                                if kind == "suspended":
+                                    pending.append(i)       # nobody's fault: the helper's again,
+                                    reserved[i] = time.monotonic()   # held for it past the resume
+                                else:
+                                    pending.appendleft(i)   # back to the Mac, next in its line
+                            cond.notify_all()
+                        if not done[i]:
+                            report()                        # the dropped segment's live fill goes
+                if kind in HELPER_COUNTED:
+                    fails += 1
+                    if fails >= HELPER_MAX_FAILURES:
+                        return                     # the helper sits the rest of this item out
+        except Exception:  # noqa: BLE001 — the remote worker never takes the item down
+            return
+        finally:
+            unreserve()                            # nobody left to reclaim a reserved segment
+
+    th = None
+    if pending:
+        th = threading.Thread(target=remote_main, name="ally-helper", daemon=True)
+        th.start()
+    try:
+        while True:
+            if abort is not None and abort.is_set():
+                return False, st["finished"], "aborted"
+            if should_pause is not None and should_pause():
+                return False, st["finished"], _PAUSED_REASON
+            with cond:
+                i, now = None, time.monotonic()
+                for k, j in enumerate(pending):    # the front, skipping the helper's reserved one
+                    if not held_for_helper(j, now):
+                        i = j
+                        del pending[k]
+                        reserved.pop(j, None)
+                        break
+                if i is None:
+                    if not pending and st["ally_seg"] is None:
+                        break                      # nothing pending, nothing in flight: done
+                    if th is not None and not th.is_alive():
+                        # the remote worker died holding a segment: it is the Mac's now
+                        j, st["ally_seg"], st["ally"] = st["ally_seg"], None, 0
+                        if j is not None and not done[j]:
+                            pending.appendleft(j)
+                        reserved.clear()
+                        continue
+                    cond.wait(_IDLE_POLL_SECONDS)  # the helper's segment is running or reserved
+                else:
+                    st["mac_seg"], st["mac"] = i, 0
+            if i is None:
+                continue
+            report()
+            a, b = segs[i]
+            n = b - a
+            sf = seg_files[i]
+
+            def mac_lost():
+                with cond:
+                    st["mac_seg"], st["mac"] = None, 0
+            try:
+                dec = build_seg_decode_command(ffmpeg, dv_video, a, n, fps, decode)
+            except ValueError as e:
+                mac_lost()
+                return False, st["finished"], "segment %d/%d: %s" % (i + 1, nseg, e)
+            _rm(sf)
+            _rm_remote_leftovers(segdir, i)        # the helper is not on it: anything there is stale
+            stmp = sf + ".part"
+            _rm(stmp)
+            rslice = os.path.join(segdir, f"seg_{i:04d}.rpu")
+            if dv:
+                ok, why = slice_rpu(rpu, a, b, total_frames, rslice, dovi_tool=dovi_tool)
+                if not ok:
+                    mac_lost()
+                    return False, st["finished"], why
+                enc = build_x265_command(x265, rslice, stmp, tights.get(i, cap_mbps),
+                                         master_display, max_cll)
+            else:
+                enc = build_x265_command(x265, None, stmp, tights.get(i, cap_mbps), dv=False)
+
+            def mac_frame(f, _n=n):
+                with cond:
+                    st["mac"] = max(0, min(int(f), _n))
+                report()
+            listening = on_progress is not None or on_segments is not None or note is not None
+            got, why, _tail = _encode_pipe(dec, enc, stmp, abort,
+                                           mac_frame if listening else None)
+            _rm(rslice)
+            if why == "aborted":
+                mac_lost()
+                _rm(stmp)
+                return False, st["finished"], "aborted"
+            if got is None:
+                mac_lost()
+                _rm(stmp)
+                return False, st["finished"], "segment %d/%d: %s" % (i + 1, nseg, why)
+            if got != n:
+                mac_lost()
+                _rm(stmp)
+                return False, st["finished"], "segment %d/%d frame mismatch: %d != %d" % (
+                    i + 1, nseg, got, n)
+            with cond:
+                os.replace(stmp, sf)
+                done[i] = True
+                st["finished"] += n
+                st["mac_seg"], st["mac"] = None, 0
+            published(i, "mac")
+    finally:
+        stop.set()
+        with cond:
+            cond.notify_all()
+        if th is not None:
+            th.join(HELPER_JOIN_SECONDS)
+        with cond:
+            st["closed"] = True
+    if not all(done):                              # defensive: the queue can't lose a segment
+        missing = [i + 1 for i, d in enumerate(done) if not d]
+        return False, st["finished"], "segments never encoded: %s" % missing[:5]
+    ok, why = concat_segments(seg_files, out_hevc)
+    if not ok:
+        return False, st["finished"], why
+    k = st["ally_done"]
+    return True, st["finished"], "encoded %d frames in %d segments%s" % (
+        st["finished"], nseg, f" ({_segments_word(k)} on the helper)" if k else "")
 
 
 def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: list,
@@ -1051,4 +1560,8 @@ def reencode_segments_tighter(dv_video: str, rpu: str, segdir: str, indices: lis
         os.replace(stmp, sf)                             # atomic publish, like the main encode
         if from_own:
             _rm(own)
+        if os.path.exists(_hosts_path(segdir)):          # a helper-run segdir: the Mac made it now
+            hosts = read_hosts(segdir)
+            hosts[str(i)] = "mac"
+            _write_hosts(segdir, hosts)
     return True, "re-capped %d segment(s) @ %d Mbps" % (len(indices), tight_cap_mbps)

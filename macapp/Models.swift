@@ -104,6 +104,13 @@ struct FinishingDTO: Codable {
     var repair_of: Int?         // ...how many segments were flagged over the cap
     var repair_done: Int?       // ...frames re-encoded so far within that segment
     var repair_total: Int?      // ...the segment's frame count (drives the cut-out's refill)
+    // THE HELPER (2026-10-28): a helper-shared remux reports WHERE its segments stand — the Mac
+    // fills from the front, the helper from the back. All nil without the helper.
+    var segs_done: [Int]?       // 0-based indices of every finished segment (either machine)
+    var helper_segs: [Int]?     // ...the ones the helper finished
+    var mac_seg: [Double]?      // [index, frac 0...1] of the Mac's in-flight segment
+    var helper_seg: [Double]?   // [index, frac 0...1] of the helper's in-flight segment
+    var helper_fps: Double?     // the helper's live encode rate
     var step: String?           // fast remux (inject/ship): the labeled step running now —
                                 // one bar at a time, pct = that step's own progress (nil =
                                 // a label-only phase with no watchable output)
@@ -138,8 +145,66 @@ enum EpisodeOrdinal {
     }
 }
 
+/// A helper-shared remux's segments, positioned (SteelBar draws them on the notch plan). nil
+/// unless the engine reported segs_done.
+struct SegLayout: Equatable {
+    struct Live: Equatable { let index: Int; let frac: Double }
+    let done: [Int]             // finished segments, 0-based, any machine
+    let mac: Live?              // the Mac's in-flight segment
+    let helper: Live?           // the helper's in-flight segment
+
+    init?(done: [Int]?, mac: [Double]?, helper: [Double]?) {
+        guard let done else { return nil }
+        self.done = done
+        self.mac = Self.live(mac)
+        self.helper = Self.live(helper)
+    }
+
+    private static func live(_ v: [Double]?) -> Live? {
+        guard let v, v.count >= 2, v[0].isFinite, v[1].isFinite, abs(v[0]) < 1e6 else { return nil }
+        return Live(index: Int(v[0]), frac: min(1, max(0, v[1])))
+    }
+
+    /// Segment z spans notch z-1 ... notch z (the first starts at 0).
+    static func span(_ z: Int, _ notches: [Double]) -> (lo: Double, hi: Double)? {
+        guard z >= 0, z < notches.count else { return nil }
+        return (z == 0 ? 0 : notches[z - 1], notches[z])
+    }
+
+    /// Every CONTIGUOUS run of finished segments as a (first, last) index pair, in order.
+    static func runs(_ indices: [Int]) -> [(first: Int, last: Int)] {
+        var out: [(first: Int, last: Int)] = []
+        for i in Set(indices).sorted() {
+            if let l = out.last, l.last + 1 == i { out[out.count - 1].last = i }
+            else { out.append((i, i)) }
+        }
+        return out
+    }
+
+    /// A finished run with an identity that stays put while the bar fills: the run holding
+    /// segment 0 is keyed by its first index, the run holding the LAST segment by its last
+    /// index, any other by its first. A run appearing to the left of another (the Mac landing
+    /// segment 0 after the helper landed the last one) then never takes over that run's view.
+    struct Run: Identifiable, Equatable { let first: Int; let last: Int; let id: Int }
+
+    static func keyedRuns(_ indices: [Int], count n: Int) -> [Run] {
+        runs(indices).map { r in
+            Run(first: r.first, last: r.last,
+                id: r.first == 0 ? r.first : (r.last == n - 1 ? r.last : r.first))
+        }
+    }
+
+    /// 1-based segment numbers with runs collapsed: [2, 9, 10] -> "3, 10–11".
+    static func runsText(_ indices: [Int]) -> String {
+        runs(indices).map { $0.first == $0.last ? "\($0.first + 1)"
+                                                : "\($0.first + 1)\u{2013}\($0.last + 1)" }
+            .joined(separator: ", ")
+    }
+}
+
 extension FinishingDTO {
     var episodeOrdinal: (season: Int, episode: Int)? { EpisodeOrdinal.parse(ep) }
+    var segLayout: SegLayout? { SegLayout(done: segs_done, mac: mac_seg, helper: helper_seg) }
     var stagePlan: StagePlan? {
         StagePlan(stages, stage_idx, stage_pct, stage_notches, stage_seg_done, stage_sub,
                   stage_about)
@@ -554,6 +619,7 @@ struct SettingsDTO: Codable {
     var plex_throttle: Bool?              // ease off the NAS while anyone has Plex open (default on)
     var nas_network: String?              // which link big NAS transfers take: "ethernet" (first,
                                           // the default) / "wifi" (first) / "ethernet_only"
+    var helper_enabled: Bool?             // a Linux machine on Ethernet shares the remux (default off)
 
     // Scheduling / capacity — universal, and none of them change how a file is encoded.
     var max_active_shows: Int?            // how many shows share the round-robin
@@ -746,6 +812,15 @@ struct UpNextDTO: Codable, Identifiable {
     var id: String { [kind, series, channel, ep, title, source_name, name].compactMap { $0 }.joined(separator: "|") }
 }
 
+/// The helper's one-line status (engine helper.status_summary(); /api/state "helper").
+struct HelperDTO: Codable {
+    var enabled: Bool?
+    var state: String?          // "connected" | "ready" | "paused" | "off" | "not_connected"
+    var detail: String?         // the text after the dot ("waiting for the next segment")
+    var host: String?           // the machine's own name — tooltip only, never on the line
+    var tooltip: String?        // "hostname · IPv4 over Ethernet"
+}
+
 struct StateDTO: Codable {
     var automation_enabled: Bool?
     var status: String?
@@ -762,6 +837,7 @@ struct StateDTO: Codable {
     var youtube: YouTubeStateDTO?
     var orchestrator: OrchestratorDTO?
     var settings: SettingsDTO?
+    var helper: HelperDTO?             // the helper's status line (absent on an older engine)
     var show_profile: ShowProfileDTO?
     var log: [String]?          // Recent failures. Surfaced ONLY inside Settings > Advanced --
                                 // never on the main page, where it was an unwanted banner.

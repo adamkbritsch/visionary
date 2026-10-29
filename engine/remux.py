@@ -1200,7 +1200,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
           audio_gain_db=None, boundaries=None,
           abort=None, on_progress=None, on_plan=None, should_pause=None, on_repair=None,
           encode_source=None, rpu_mode=None, native=None, sdr=False, rpu_book=None,
-          rpu_in_stream=False,
+          rpu_in_stream=False, on_segments=None,
           ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """Peak-cap the DV render's video (dvcap: RPU extract -> x265 native-DV VBV re-encode), then
     put the original audio + subtitles back onto it. HARD GATE, no uncapped fallback: any
@@ -1234,7 +1234,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
     `rpu_book` (the native render's own generated RPU, sha-checked by the stage) is the RPU, copied
     rather than extracted back out of the render; `rpu_in_stream` marks `dv_video` as a REAL
     Dolby Vision donor whose RPUs are read by its own frame order (splice.donor_rpus — dovi_tool's
-    extract misorders RADL groups). x265 takes the list in display order either way."""
+    extract misorders RADL groups). x265 takes the list in display order either way.
+    `on_segments` (2026-10-28): handed to the main encode only when the helper is on
+    (dvcap.encode_capped_segmented's on_segments: the segment bar's two-machine state)."""
     if not is_master_container(output):
         return _not_mkv(output)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
@@ -1368,12 +1370,24 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     info["fps"], cap_mbps, ffprobe, freed=dec_kw["decode"]["freed"])
             except ValueError:
                 releaser = None                   # a plan off the chunks fails below, as before
+        # THE HELPER (2026-10-28): passed only when switched on, so with it off every call
+        # below is exactly the pre-helper call. It can only speed the encode up — a segment the
+        # helper drops goes back to the Mac; it never fails or parks the item. The import is
+        # inside the try too: nothing about the helper (not even a broken module) can fail a remux.
+        try:
+            import helper as helper_mod
+            ally = helper_mod.for_remux()
+        except Exception:  # noqa: BLE001
+            ally = None
+        help_kw = {"helper": ally} if ally is not None else {}
+        # on_segments (the segment bar's two-machine state) only means anything with a helper
+        seg_kw = {"on_segments": on_segments} if ally is not None and on_segments is not None else {}
         ok, frames, why = dvcap.encode_capped_segmented(
             enc, rpu, hevc, cap_mbps, segdir=segdir,
             total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
             master_display=info["master_display"], max_cll=info["max_cll"],
             abort=abort, on_progress=on_progress, on_plan=on_plan,
-            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw, **sdr_kw,
+            should_pause=should_pause, ffmpeg=ffmpeg, **dec_kw, **sdr_kw, **help_kw, **seg_kw,
             **({"on_segment": releaser.on_segment} if releaser else {}))
         if not ok:
             if why.startswith("paused:"):
@@ -1382,6 +1396,9 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
         if frames != real_frames:
             return RemuxResult(False, output,
                                reason=f"frame count changed by cap encode: {frames} != {real_frames}")
+        # " (K segment(s) on the helper)" when the helper encoded any of them (K > 0): it goes
+        # into the success note next to repair_note — `why` itself is reused just below
+        helper_note = dvcap.helper_note(why) if ally is not None else ""
         # The TRACKS file (audio from the CFR + the original's subtitles), built ONCE — it is
         # video-independent, so every peak-repair rung below muxes against the same file.
         # SMART LOUDNESS BOOST, Atmos, lossless and the subtitle retry: _prepare_tracks.
@@ -1426,7 +1443,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     enc, rpu, hevc, cap_mbps, segdir=segdir,
                     total_frames=real_frames, fps=info["fps"], boundaries=boundaries,
                     master_display=info["master_display"], max_cll=info["max_cll"],
-                    abort=abort, ffmpeg=ffmpeg, **dec_kw, **sdr_kw)
+                    abort=abort, ffmpeg=ffmpeg, **dec_kw, **sdr_kw, **help_kw)
                 if not ok or frames != real_frames:
                     return RemuxResult(False, output, reason="peak repair concat: " + why)
                 repair_note = f" · peak repair: {len(offenders)} seg(s) re-capped @ {tight} Mbps"
@@ -1443,7 +1460,7 @@ def remux(dv_video: str, cfr_source: str, orig_source: str, output: str, *,
                     repair_note += (f" · {len(releaser.freed)} Topaz chunk(s), "
                                     f"{releaser.freed_bytes / 2**30:.0f} GiB, freed during the encode")
                 res.reason += (f" · peak {peak:.1f} ≤ {cap_mbps * dvcap.PEAK_TOLERANCE:.1f} Mbps, "
-                               f"the {cap_mbps} cap's gate") + repair_note + audio_note
+                               f"the {cap_mbps} cap's gate") + helper_note + repair_note + audio_note
                 atomic_ship(part, output)
                 shutil.rmtree(segdir, ignore_errors=True)  # SUCCESS: the segments won't be needed again
                 return res
@@ -2065,7 +2082,7 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
             rpu_inline=False, rpu_profile="", capped=False, real_rpu=False, rpu_book=None,
             cap_mbps: int = dvcap.DEFAULT_PEAK_MBPS, boundaries=None,
             audio_target_lufs=None, abort=None, on_step=None, on_stages=None, on_progress=None,
-            on_plan=None, should_pause=None, on_repair=None,
+            on_plan=None, should_pause=None, on_repair=None, on_segments=None,
             ffmpeg=FFMPEG, mkvmerge=MKVMERGE, ffprobe=FFPROBE, timeout=None) -> RemuxResult:
     """COMPANION COMBINE (user-dictated): one best-of master from two copies of a film.
     `winner` = the video that ships (the genuinely better HDR10 base, or the real-DV file
@@ -2104,6 +2121,7 @@ def combine(winner: str, rpu_source: str, audio_source: str, output: str, *,
                      boundaries=boundaries, abort=abort, on_progress=on_progress,
                      on_plan=on_plan, should_pause=should_pause, on_repair=on_repair,
                      encode_source=winner, rpu_mode=mode, **rkw,
+                     **({"on_segments": on_segments} if on_segments is not None else {}),
                      ffmpeg=ffmpeg, mkvmerge=mkvmerge, ffprobe=ffprobe, timeout=timeout)
     return remux_inject(rpu_source, audio_source, winner, output,
                         audio_target_lufs=audio_target_lufs, abort=abort, on_step=on_step,

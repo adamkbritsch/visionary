@@ -1406,3 +1406,799 @@ class RepairFromItsOwnEncode(unittest.TestCase):
                     decode={"chunks": [[0, chunk], [100, None]], "vf": "lut3d=x"})
             self.assertTrue(ok)
             self.assertIn(chunk, seen["dec"])
+
+
+# ---- THE HELPER: encode_capped_segmented(helper=...) (2026-10-28) ------------------------------
+
+def _seg_idx(path):
+    return int(os.path.basename(path).split("_")[1].split(".")[0])
+
+
+def _size_count(path, ffprobe=None):
+    return os.path.getsize(path) if path and os.path.exists(path) else 0
+
+
+def _fake_slice(rpu_in, a, b, total, out, dovi_tool=None):
+    with open(out, "wb") as f:
+        f.write(b"R" * (b - a))
+    return True, "sliced"
+
+
+def _ally_threads():
+    import threading
+    return [t for t in threading.enumerate() if t.name == "ally-helper" and t.is_alive()]
+
+
+def _wait_for(pred, timeout=10.0):
+    import time
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not pred():
+        time.sleep(0.01)
+    return pred()
+
+
+_SUSP = "suspended: another stage has the machine — the segment goes back in the queue"
+
+
+class FakeAlly:
+    """A helper object with no processes: `script` lists the kinds its encodes return, in order
+    (then "ok"); "short" claims ok but sends one byte (= frame) too few. Writes b"A" per frame."""
+
+    def __init__(self, script=(), available=True, delay=0.0, hook=None):
+        self.script, self.avail, self.delay, self.hook = list(script), available, delay, hook
+        self.calls = []
+
+    def available(self):
+        ok = self.avail() if callable(self.avail) else self.avail
+        return (True, "ready") if ok else (False, "test: not available")
+
+    def encode_segment(self, dec, args, rpu, n, part, abort, on_frame):
+        import time
+        rpu_bytes = None
+        if rpu and os.path.exists(rpu):
+            with open(rpu, "rb") as f:
+                rpu_bytes = f.read()
+        rec = {"i": _seg_idx(part), "dec": dec, "args": args, "rpu": rpu, "n": n, "part": part,
+               "rpu_bytes": rpu_bytes}
+        self.calls.append(rec)
+        if self.hook:
+            r = self.hook(rec, abort, on_frame)
+            if r is not None:
+                return r
+        kind = self.script.pop(0) if self.script else "ok"
+        if self.delay:
+            time.sleep(self.delay)
+        if kind in ("ok", "short"):
+            with open(part, "wb") as f:
+                f.write(b"A" * (n if kind == "ok" else n - 1))
+            if on_frame:
+                on_frame(n)
+            return n, "ok", "ok"
+        return None, kind, kind
+
+
+class AllyHelperScheduler(unittest.TestCase):
+    """The Mac takes segments from the FRONT, the Ally from the BACK; a dropped segment goes back
+    to the Mac; on_segment stays in plan order; pause/abort stop and join the remote worker."""
+    N, FPS = 100, "24/1"
+
+    def setUp(self):
+        import tempfile
+        self.td = tempfile.mkdtemp()
+        self.segdir = os.path.join(self.td, "segs")
+        os.makedirs(self.segdir)
+        self.out = os.path.join(self.td, "out.hevc")
+        self.mac, self.mac_delay, self.mac_hook = [], 0.0, None
+        self.patches = [mock.patch.object(dvcap, "count_hevc_frames", side_effect=_size_count),
+                        mock.patch.object(dvcap, "slice_rpu", side_effect=_fake_slice),
+                        mock.patch.object(dvcap, "_encode_pipe", side_effect=self._mac_pipe)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+        dvcap.resume_encoders()                            # a failed suspension test leaves none
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _mac_pipe(self, dec, enc, out, abort, on_frame):
+        import time
+        i = _seg_idx(out)
+        self.mac.append(i)
+        if self.mac_hook:
+            r = self.mac_hook(i, out, abort, on_frame)
+            if r is not None:
+                return r
+        time.sleep(self.mac_delay)
+        with open(out, "wb") as f:
+            f.write(b"M" * self.N)
+        if on_frame:
+            on_frame(self.N)
+        return self.N, "ok", []
+
+    def seg(self, i):
+        return os.path.join(self.segdir, f"seg_{i:04d}.hevc")
+
+    def run_enc(self, h, segs=6, **kw):
+        kw.setdefault("boundaries", [self.N * (k + 1) for k in range(segs)])
+        return dvcap.encode_capped_segmented("/r.mov", "/rpu.bin", self.out, 50, segdir=self.segdir,
+                                             total_frames=self.N * segs, fps=self.FPS, helper=h, **kw)
+
+    def hosts(self):
+        return dvcap.read_hosts(self.segdir)
+
+    def test_the_mac_takes_the_front_and_the_ally_the_back(self):
+        self.mac_delay = 0.05
+        ally = FakeAlly(delay=0.12)
+        ok, frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertEqual(frames, 600)
+        took = [c["i"] for c in ally.calls]
+        self.assertEqual(self.mac[0], 0)
+        self.assertEqual(took[0], 5)
+        self.assertEqual(self.mac, sorted(self.mac))
+        self.assertEqual(took, sorted(took, reverse=True))
+        self.assertEqual(sorted(self.mac + took), list(range(6)))
+        self.assertEqual(self.hosts(), {str(i): ("ally" if i in took else "mac") for i in range(6)})
+        self.assertEqual(len(took), 2)
+        self.assertEqual(why, "encoded 600 frames in 6 segments (2 segments on the helper)")
+        with open(self.out, "rb") as f:                    # concatenated in PLAN order
+            self.assertEqual(f.read(), b"".join((b"A" if i in took else b"M") * self.N
+                                                for i in range(6)))
+        self.assertEqual(_ally_threads(), [])
+
+    def test_a_dropped_segment_goes_back_to_the_mac_next(self):
+        self.mac_delay = 0.1
+        ally = FakeAlly(script=["disconnected"], delay=0.05)
+        ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertEqual(ally.calls[0]["i"], 5)
+        self.assertEqual(self.mac[:2], [0, 5])             # the Mac's very next segment
+        self.assertEqual(self.hosts()["5"], "mac")
+        self.assertFalse(os.path.exists(self.seg(5) + ".remote.part"))
+
+    def test_two_failures_retire_the_ally_for_the_item(self):
+        # D4: only "error" and "disconnected" count toward HELPER_MAX_FAILURES
+        self.assertEqual(dvcap.HELPER_COUNTED, ("error", "disconnected"))
+        self.mac_delay = 0.05
+        ally = FakeAlly(script=["error", "disconnected"])
+        ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertEqual(len(ally.calls), 2)
+        self.assertEqual(set(self.hosts().values()), {"mac"})
+        self.assertEqual(sorted(self.mac), list(range(6)))
+        self.assertEqual(why, "encoded 600 frames in 6 segments")
+
+    def test_yields_do_not_count_as_failures(self):
+        self.mac_delay = 0.1
+        ally = FakeAlly(script=["yielded"] * 3)
+        ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertGreaterEqual(len(ally.calls), 4)
+        self.assertIn("ally", self.hosts().values())
+
+    def test_refusals_suspensions_and_aborts_do_not_count_either(self):
+        # "refused" cools the helper down (helper.py) like a yield; "suspended" and "aborted" are
+        # nobody's fault. Five of them in a row still leave the Ally in the item.
+        self.mac_delay = 0.1
+        ally = FakeAlly(script=["refused", "suspended", "aborted", "refused", "yielded"])
+        ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertGreaterEqual(len(ally.calls), 6)
+        self.assertIn("ally", self.hosts().values())
+        self.assertEqual(sorted(int(k) for k in self.hosts()), list(range(6)))
+
+    def test_a_suspended_segment_goes_back_to_the_ally(self):
+        # D3: requeued at the BACK (the Ally's end), not handed to the Mac
+        self.mac_delay = 0.2
+        ally = FakeAlly(script=["suspended"])
+        ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertEqual([c["i"] for c in ally.calls[:2]], [5, 5])
+        self.assertEqual(self.hosts()["5"], "ally")
+        self.assertNotIn(5, self.mac)
+
+    def test_nothing_is_claimed_while_encoders_are_suspended(self):
+        asked = []
+        ally = FakeAlly(available=lambda: asked.append(1) or True)
+        self.mac_delay = 0.05
+        dvcap.suspend_encoders()
+        try:
+            with mock.patch.object(dvcap, "HELPER_SUSPEND_POLL", 0.02):
+                ok, frames, why = self.run_enc(ally)
+        finally:
+            dvcap.resume_encoders()
+        self.assertEqual((ok, frames, why), (True, 600, "encoded 600 frames in 6 segments"))
+        self.assertEqual(ally.calls, [])
+        self.assertEqual(asked, [])                        # not even asked: no ssh probe either
+        self.assertEqual(self.mac, list(range(6)))
+        self.assertEqual(_ally_threads(), [])
+
+    def test_a_suspension_mid_item_pauses_the_ally_until_resumed(self):
+        events = []
+
+        def ally_hook(rec, abort, on_frame):
+            events.append(("ally", rec["i"], dvcap.encoders_suspended()))
+            if len(events) == 1:                           # the suspension lands on its first one
+                dvcap.suspend_encoders()
+                return None, "suspended", "suspended"
+            return None
+
+        def mac_hook(i, out, abort, on_frame):
+            import time
+            time.sleep(0.1)
+            if len([e for e in events if e[0] == "mac"]) == 1 and dvcap.encoders_suspended():
+                events.append(("resume",))
+                dvcap.resume_encoders()
+            events.append(("mac", i))
+            return None
+        self.mac_hook = mac_hook
+        ally = FakeAlly(hook=ally_hook)
+        with mock.patch.object(dvcap, "HELPER_SUSPEND_POLL", 0.02):
+            ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertIn(("resume",), events)
+        r = events.index(("resume",))
+        self.assertEqual([e for e in events[:r] if e[0] == "ally"], [("ally", 5, False)])
+        later = [e for e in events[r:] if e[0] == "ally"]
+        self.assertTrue(later)
+        self.assertEqual(later[0][1], 5)                   # the suspended segment, the Ally's again
+        self.assertTrue(all(not e[2] for e in later))      # never called while suspended
+        self.assertEqual(self.hosts()["5"], "ally")
+
+    def test_the_mac_takes_back_a_segment_a_dead_ally_thread_held(self):
+        # 7: the remote worker died holding a segment (here: its release raises SystemExit, which
+        # skips the requeue); the Mac's idle loop must take it back instead of waiting forever
+        import threading
+
+        class DyingAlly(FakeAlly):
+            def claim(self):
+                return True
+
+            def release(self):
+                raise SystemExit
+
+        self.mac_delay = 0.05
+        ally = DyingAlly(script=["disconnected"], delay=0.02)
+        box = {}
+        th = threading.Thread(target=lambda: box.update(res=self.run_enc(ally)), daemon=True)
+        th.start()
+        th.join(20)
+        self.assertFalse(th.is_alive(), "the Mac waited forever on a dead Ally thread")
+        ok, frames, why = box["res"]
+        self.assertTrue(ok, why)
+        self.assertEqual(frames, 600)
+        self.assertEqual([c["i"] for c in ally.calls], [5])
+        self.assertIn(5, self.mac)
+        self.assertEqual(self.hosts()["5"], "mac")
+        self.assertEqual(_ally_threads(), [])
+
+    def test_stale_remote_leftovers_go_on_the_resume(self):
+        stale = [os.path.join(self.segdir, n) for n in
+                 ("seg_0002.hevc.remote.part", "seg_0002.remote.rpu", "seg_0004.remote.rpu")]
+        for p in stale:
+            with open(p, "wb") as f:
+                f.write(b"stale")
+        seen = {}
+
+        def mac_hook(i, out, abort, on_frame):
+            if i == 0:
+                seen["left"] = [p for p in stale if os.path.exists(p)]
+            return None
+        self.mac_hook = mac_hook
+        ok, _frames, why = self.run_enc(FakeAlly(available=False))
+        self.assertTrue(ok, why)
+        self.assertEqual(seen["left"], [])                 # gone before the first encode
+        self.assertEqual([p for p in stale if os.path.exists(p)], [])
+
+    def test_stale_remote_leftovers_go_when_the_mac_takes_the_segment(self):
+        stale = [os.path.join(self.segdir, n) for n in ("seg_0003.hevc.remote.part",
+                                                          "seg_0003.remote.rpu")]
+        seen = {}
+
+        def mac_hook(i, out, abort, on_frame):
+            if i == 0:                                     # appears mid-run (a dead remote's)
+                for p in stale:
+                    with open(p, "wb") as f:
+                        f.write(b"stale")
+            if i == 3:
+                seen["left"] = [p for p in stale if os.path.exists(p)]
+            return None
+        self.mac_hook = mac_hook
+        ok, _frames, why = self.run_enc(FakeAlly(available=False))
+        self.assertTrue(ok, why)
+        self.assertEqual(seen["left"], [])
+
+    def test_seg_done_is_the_plan_order_prefix(self):
+        # 9: the Ally runs ahead from the back, so "frames passed each end" over-counts finished
+        # segments; a callback that takes seg_done hears the plan-order prefix instead
+        self.mac_delay = 0.3
+        seen, extra = [], []
+        ok, _frames, why = self.run_enc(
+            FakeAlly(delay=0.02),
+            on_progress=lambda f, total, seg_done: seen.append((f, seg_done)))
+        self.assertTrue(ok, why)
+        done = [d for _f, d in seen]
+        self.assertEqual(done, sorted(done))               # never backwards
+        self.assertEqual(seen[-1], (600, 6))
+        self.assertTrue(any(f >= 200 and d == 0 for f, d in seen), seen)   # seg 0 still running
+        ends = [self.N * (k + 1) for k in range(6)]
+        for f, d in seen:                                   # never more than the frames allow
+            self.assertLessEqual(d, sum(1 for e in ends if f >= e))
+        ok, _frames, why = self.run_enc(FakeAlly(), on_progress=lambda f, t, **kw: extra.append(kw))
+        self.assertTrue(ok, why)
+        self.assertTrue(extra and all("seg_done" in kw for kw in extra))
+
+    def test_a_peak_repair_records_the_mac_as_the_segments_host(self):
+        # 9: reencode_segments_tighter re-encodes on the Mac: hosts.json must say so
+        self.mac_delay = 0.05
+        ok, _frames, why = self.run_enc(FakeAlly(delay=0.1))
+        self.assertTrue(ok, why)
+        ally_segs = sorted(int(k) for k, v in self.hosts().items() if v == "ally")
+        self.assertTrue(ally_segs)
+        j = ally_segs[0]
+        ok, why = dvcap.reencode_segments_tighter(
+            "/r.mov", "/rpu.bin", self.segdir, [j], 40, total_frames=600, fps=self.FPS,
+            boundaries=[self.N * (k + 1) for k in range(6)])
+        self.assertTrue(ok, why)
+        hosts = self.hosts()
+        self.assertEqual(hosts[str(j)], "mac")
+        self.assertEqual(len(hosts), 6)                    # the others untouched
+
+    def test_a_peak_repair_without_a_helper_writes_no_hosts_file(self):
+        ok, why = dvcap.reencode_segments_tighter(
+            "/r.mov", "/rpu.bin", self.segdir, [1], 40, total_frames=600, fps=self.FPS,
+            boundaries=[self.N * (k + 1) for k in range(6)])
+        self.assertTrue(ok, why)
+        self.assertFalse(os.path.exists(os.path.join(self.segdir, "hosts.json")))
+
+    def test_an_unavailable_ally_gets_nothing_and_holds_nothing_up(self):
+        import time
+        ally = FakeAlly(available=False)
+        t0 = time.monotonic()
+        ok, frames, why = self.run_enc(ally)
+        self.assertLess(time.monotonic() - t0, 5.0)        # not one HELPER_WAIT_SECONDS
+        self.assertEqual((ok, frames, why), (True, 600, "encoded 600 frames in 6 segments"))
+        self.assertEqual(ally.calls, [])
+        self.assertEqual(self.mac, list(range(6)))
+        self.assertEqual(_ally_threads(), [])
+
+    def test_on_segment_fires_in_plan_order(self):
+        self.mac_delay = 0.1
+        ally = FakeAlly()
+        heard = []
+        ok, _frames, why = self.run_enc(
+            ally, on_segment=lambda i, p: heard.append((i, p, os.path.exists(self.seg(5)))))
+        self.assertTrue(ok, why)
+        self.assertEqual([(i, p) for i, p, _ in heard], [(i, self.seg(i)) for i in range(6)])
+        self.assertTrue(heard[0][2])                        # the Ally's seg 5 was done first, held back
+
+    def test_progress_counts_both_in_flight_segments(self):
+        import threading
+        ally_half, mac_done = threading.Event(), threading.Event()
+
+        def ally_hook(rec, abort, on_frame):
+            on_frame(50)
+            ally_half.set()
+            mac_done.wait(5)
+            with open(rec["part"], "wb") as f:
+                f.write(b"A" * rec["n"])
+            on_frame(100)
+            return rec["n"], "ok", "ok"
+
+        def mac_hook(i, out, abort, on_frame):
+            ally_half.wait(5)
+            on_frame(30)                                    # 0 finished + 30 (Mac) + 50 (Ally)
+            with open(out, "wb") as f:
+                f.write(b"M" * self.N)
+            on_frame(100)
+            mac_done.set()
+            return self.N, "ok", []
+        self.mac_hook = mac_hook
+        seen = []
+        ok, frames, why = self.run_enc(FakeAlly(hook=ally_hook), segs=2,
+                                       on_progress=lambda f, total: seen.append((f, total)))
+        self.assertTrue(ok, why)
+        values = [f for f, _t in seen]
+        self.assertIn(80, values)
+        self.assertEqual(values, sorted(values))            # never backwards
+        self.assertEqual(seen[-1], (200, 200))
+        self.assertEqual(why, "encoded 200 frames in 2 segments (1 segment on the helper)")
+
+    def _blocking_ally(self, saw):
+        def hook(rec, abort, on_frame):
+            on_frame(10)
+            saw["abort"] = _wait_for(abort.is_set)
+            return None, "aborted", "aborted"
+        return FakeAlly(hook=hook)
+
+    def test_a_pause_mid_remote_segment_stops_and_joins_the_ally(self):
+        self.mac_delay = 0.2
+        saw = {}
+        ally = self._blocking_ally(saw)
+        ok, frames, why = self.run_enc(ally, segs=3, should_pause=lambda: os.path.exists(self.seg(0)))
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("paused:"), why)
+        self.assertEqual(frames, 100)
+        self.assertEqual(ally.calls[0]["i"], 2)
+        self.assertTrue(saw["abort"])
+        self.assertEqual(_ally_threads(), [])               # joined before the return
+        self.assertEqual(self.mac, [0])
+        self.assertFalse(os.path.exists(self.seg(2)))
+        self.assertFalse(os.path.exists(self.seg(2) + ".remote.part"))
+
+    def test_an_abort_mid_remote_segment_stops_and_joins_the_ally(self):
+        import threading, time
+        abort, saw = threading.Event(), {}
+
+        def mac_hook(i, out, ab, on_frame):
+            time.sleep(0.2)
+            with open(out, "wb") as f:
+                f.write(b"M" * self.N)
+            abort.set()
+            return self.N, "ok", []
+        self.mac_hook = mac_hook
+        ok, frames, why = self.run_enc(self._blocking_ally(saw), segs=3, abort=abort)
+        self.assertEqual((ok, frames, why), (False, 100, "aborted"))
+        self.assertTrue(saw["abort"])
+        self.assertEqual(_ally_threads(), [])
+
+    def test_a_mac_failure_stops_the_ally_and_fails_as_before(self):
+        import time
+
+        def mac_hook(i, out, ab, on_frame):
+            time.sleep(0.1)
+            with open(out, "wb") as f:
+                f.write(b"M" * 5)
+            return 5, "ok", []
+        self.mac_hook = mac_hook
+        saw = {}
+        ok, frames, why = self.run_enc(self._blocking_ally(saw), segs=3)
+        self.assertEqual((ok, frames, why), (False, 0, "segment 1/3 frame mismatch: 5 != 100"))
+        self.assertTrue(saw["abort"])
+        self.assertEqual(_ally_threads(), [])
+
+    def test_the_ally_gets_the_same_decode_args_and_cap(self):
+        self.mac_delay = 0.3
+        with open(os.path.join(self.segdir, "tight_caps.json"), "w") as f:
+            json.dump({"5": 40}, f)
+        md, cll = "G(1,2)B(3,4)R(5,6)WP(7,8)L(9,10)", "1000,400"
+        ally = FakeAlly()
+        ok, _frames, why = self.run_enc(ally, master_display=md, max_cll=cll)
+        self.assertTrue(ok, why)
+        by = {c["i"]: c for c in ally.calls}
+        self.assertEqual(by[5]["dec"], dvcap.build_seg_decode_command(dvcap.FFMPEG, "/r.mov", 500,
+                                                                       100, self.FPS, None))
+        self.assertEqual(by[5]["args"], dvcap.build_x265_command("X265", "{rpu}", "{out}", 40, md, cll)[1:])
+        self.assertEqual(by[4]["args"], dvcap.build_x265_command("X265", "{rpu}", "{out}", 50, md, cll)[1:])
+        self.assertEqual(by[5]["rpu"], os.path.join(self.segdir, "seg_0005.remote.rpu"))
+        self.assertEqual(by[5]["rpu_bytes"], b"R" * 100)    # its own slice, [500, 600)
+        self.assertFalse(os.path.exists(by[5]["rpu"]))      # and tidied away
+        self.assertEqual(by[5]["n"], 100)
+
+    def test_an_sdr_item_sends_no_rpu(self):
+        self.mac_delay = 0.2
+        ally = FakeAlly()
+        ok, _frames, why = self.run_enc(ally, dv=False)
+        self.assertTrue(ok, why)
+        rec = ally.calls[0]
+        self.assertIsNone(rec["rpu"])
+        self.assertEqual(rec["args"], dvcap.build_x265_command("X265", None, "{out}", 50, dv=False)[1:])
+        self.assertNotIn("{rpu}", rec["args"])
+
+    def test_an_ok_that_fails_the_local_count_goes_back_to_the_mac(self):
+        self.mac_delay = 0.1
+        ally = FakeAlly(script=["short"], delay=0.05)
+        ok, _frames, why = self.run_enc(ally)
+        self.assertTrue(ok, why)
+        self.assertEqual(ally.calls[0]["i"], 5)
+        self.assertEqual(self.hosts()["5"], "mac")
+        self.assertFalse(os.path.exists(self.seg(5) + ".remote.part"))
+
+    def test_a_resume_skips_finished_segments_and_keeps_their_host(self):
+        for i, b in ((0, b"M"), (5, b"A")):
+            with open(self.seg(i), "wb") as f:
+                f.write(b * self.N)
+        with open(os.path.join(self.segdir, "hosts.json"), "w") as f:
+            json.dump({"5": "ally"}, f)
+        self.mac_delay = 0.05
+        ally, heard = FakeAlly(delay=0.08), []
+        ok, frames, why = self.run_enc(ally, on_segment=lambda i, p: heard.append(i))
+        self.assertTrue(ok, why)
+        self.assertEqual(frames, 600)
+        self.assertEqual(ally.calls[0]["i"], 4)
+        self.assertNotIn(0, self.mac)
+        self.assertNotIn(5, [c["i"] for c in ally.calls])
+        self.assertEqual(heard, list(range(6)))
+        self.assertEqual(self.hosts()["5"], "ally")
+        self.assertNotIn("0", self.hosts())
+
+    def test_no_helper_is_the_mac_only_encode(self):
+        ok, frames, why = self.run_enc(None)
+        self.assertEqual((ok, frames, why), (True, 600, "encoded 600 frames in 6 segments"))
+        self.assertEqual(self.mac, list(range(6)))
+        self.assertFalse(os.path.exists(os.path.join(self.segdir, "hosts.json")))
+
+    # -- C1: on_segments ------------------------------------------------------------------------
+    def test_on_segments_is_the_bars_live_state_from_both_machines(self):
+        import threading
+        ally_half, mac_half = threading.Event(), threading.Event()
+        infos, overlap, gate = [], [], threading.Lock()
+
+        def serial(fn):
+            def call(*a, **kw):
+                if not gate.acquire(blocking=False):        # one lock: never two at once
+                    overlap.append(fn.__name__)
+                    gate.acquire()
+                try:
+                    fn(*a, **kw)
+                finally:
+                    gate.release()
+            return call
+
+        @serial
+        def on_segments(info):
+            infos.append(json.loads(json.dumps(info)))      # JSON-able, copied as heard
+
+        @serial
+        def on_progress(f, total, **_kw):
+            pass
+
+        def ally_hook(rec, abort, on_frame):
+            on_frame(50, fps=7.94)
+            ally_half.set()
+            mac_half.wait(5)
+            time.sleep(0.05)
+            with open(rec["part"], "wb") as f:
+                f.write(b"A" * rec["n"])
+            on_frame(100, fps=8.0)
+            return rec["n"], "ok", "ok"
+
+        def mac_hook(i, out, abort, on_frame):
+            ally_half.wait(5)
+            on_frame(30)
+            mac_half.set()
+            time.sleep(0.2)
+            with open(out, "wb") as f:
+                f.write(b"M" * self.N)
+            on_frame(100)
+            return self.N, "ok", []
+        import time
+        self.mac_hook = mac_hook
+        noted = []
+        ally = FakeAlly(hook=ally_hook)
+        ally.note_segments = noted.append
+        ok, _frames, why = self.run_enc(ally, segs=2, on_progress=on_progress,
+                                        on_segments=on_segments)
+        self.assertTrue(ok, why)
+        self.assertEqual(overlap, [])
+        self.assertTrue(infos)
+        for info in infos:
+            self.assertEqual(set(info), {"done", "helper_done", "mac", "helper"})
+            self.assertEqual(info["done"], sorted(info["done"]))
+            for who in ("mac", "helper"):
+                if info[who] is not None:
+                    self.assertTrue(0.0 <= info[who][1] <= 1.0, info)
+        both = [x for x in infos if x["mac"] == [0, 0.3] and x["helper"] == [1, 0.5, 7.94]]
+        self.assertTrue(both, infos)                        # each in its own slot, live
+        self.assertIn({"done": [1], "helper_done": [1], "mac": [0, 0.3], "helper": None}, infos)
+        self.assertEqual(infos[-1], {"done": [0, 1], "helper_done": [1], "mac": None, "helper": None})
+        self.assertEqual(noted, infos)                      # the helper's status hears the same
+
+    def test_each_report_hands_on_segments_its_info_before_on_progress(self):
+        # 1: a listener that publishes on the progress tick (stages' remux bar) must already
+        # hold THIS report's positions and fps — never the previous report's
+        import threading
+        import time
+        ally_half, mac_half = threading.Event(), threading.Event()
+        events, last, stale = [], {}, []
+
+        def on_segments(info):
+            events.append("seg")
+            last["info"] = json.loads(json.dumps(info))
+
+        def on_progress(v, total, seg_done=None):
+            # (recorded, not asserted here: the remote thread swallows a raising callback)
+            events.append("prog")
+            info = last.get("info")
+            if info is None:
+                stale.append(("no info yet", v))
+                return
+            frames = self.N * len(info["done"])
+            for who in ("mac", "helper"):
+                if info[who] is not None:
+                    frames += round(info[who][1] * self.N)
+            if v != frames:                                 # the info must BE this report's
+                stale.append((v, info))
+
+        def ally_hook(rec, abort, on_frame):
+            on_frame(50, fps=7.94)
+            ally_half.set()
+            mac_half.wait(5)
+            with open(rec["part"], "wb") as f:
+                f.write(b"A" * rec["n"])
+            on_frame(100, fps=8.0)
+            return rec["n"], "ok", "ok"
+
+        def mac_hook(i, out, abort, on_frame):
+            ally_half.wait(5)
+            on_frame(30)
+            mac_half.set()
+            time.sleep(0.1)
+            with open(out, "wb") as f:
+                f.write(b"M" * self.N)
+            on_frame(100)
+            return self.N, "ok", []
+        self.mac_hook = mac_hook
+        ok, _frames, why = self.run_enc(FakeAlly(hook=ally_hook), segs=2, on_progress=on_progress,
+                                        on_segments=on_segments)
+        self.assertTrue(ok, why)
+        self.assertEqual(stale, [])
+        self.assertGreaterEqual(events.count("prog"), 4)
+        for k, ev in enumerate(events):                     # seg, prog, seg, prog, ...
+            self.assertEqual(ev, "seg" if k % 2 == 0 else "prog", events)
+
+    def test_helper_note_is_the_success_suffix(self):
+        n = dvcap.helper_note
+        self.assertEqual(n("encoded 600 frames in 6 segments (2 segments on the helper)"),
+                         " (2 segments on the helper)")
+        self.assertEqual(n("encoded 100 frames in 2 segments (1 segment on the helper)"),
+                         " (1 segment on the helper)")
+        for why in ("encoded 600 frames in 6 segments", "", None, "ok",
+                    "encoded 6 frames in 1 segment (0 segments on the helper)"):
+            self.assertEqual(n(why), "", why)
+
+    def test_on_segments_without_fps_estimates_one_and_a_broken_listener_is_harmless(self):
+        self.mac_delay = 0.2
+        heard = []
+
+        def on_segments(info):
+            heard.append(info)
+            raise RuntimeError("UI went away")
+        ok, frames, why = self.run_enc(FakeAlly(delay=0.05), segs=3, on_segments=on_segments)
+        self.assertEqual((ok, frames), (True, 300), why)
+        rates = [x["helper"][2] for x in heard if x["helper"] is not None]
+        self.assertTrue(rates and all(isinstance(r, float) and r >= 0 for r in rates), heard)
+        self.assertEqual(heard[-1]["done"], [0, 1, 2])
+
+    def test_no_on_segments_without_a_helper(self):
+        heard = []
+        ok, _frames, why = self.run_enc(None, segs=2, on_segments=heard.append)
+        self.assertTrue(ok, why)
+        self.assertEqual(heard, [])
+
+    # -- 4: a stop after the helper finished ---------------------------------------------------
+    def test_a_stop_after_the_helper_finished_keeps_its_segment(self):
+        import threading
+        stop_now = threading.Event()
+
+        def ally_hook(rec, abort, on_frame):
+            with open(rec["part"], "wb") as f:
+                f.write(b"A" * rec["n"])
+            stop_now.set()                                  # the pause lands now ...
+            saw = _wait_for(abort.is_set, 5)                # ... and reaches this call first
+            return (rec["n"], "ok", "ok") if saw else (None, "error", "error")
+        self.mac_delay = 0.3
+        ok, frames, why = self.run_enc(FakeAlly(hook=ally_hook), segs=3,
+                                       should_pause=stop_now.is_set)
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("paused:"), why)
+        self.assertEqual(os.path.getsize(self.seg(2)), self.N)   # verified, published, kept
+        self.assertEqual(self.hosts()["2"], "ally")
+        self.assertEqual(_ally_threads(), [])
+        self.mac = []
+        ok, frames, why = self.run_enc(FakeAlly(available=False), segs=3)   # the next attempt
+        self.assertEqual((ok, frames), (True, 300), why)
+        self.assertEqual(self.mac, [1])                     # 0 (the Mac's) and 2 (the helper's) kept
+
+    # -- 5: a suspended segment stays the helper's past the resume -----------------------------
+    def _suspend_once(self, resume_after=0.3):
+        import threading
+        calls = []
+
+        def ally_hook(rec, abort, on_frame):
+            calls.append(rec["i"])
+            if len(calls) == 1:
+                dvcap.suspend_encoders()
+                threading.Timer(resume_after, dvcap.resume_encoders).start()
+                return None, _SUSP, "suspended"
+            return None
+        return calls, ally_hook
+
+    def _mac_waits_for_the_first_remote_call(self, calls):
+        def mac_hook(i, out, abort, on_frame):
+            if i == 0:
+                _wait_for(lambda: calls, 5)
+            return None
+        return mac_hook
+
+    def test_a_suspended_segment_waits_for_the_helper_after_the_resume(self):
+        calls, hook = self._suspend_once()
+        self.mac_hook = self._mac_waits_for_the_first_remote_call(calls)
+        with mock.patch.object(dvcap, "HELPER_SUSPEND_POLL", 0.02):
+            ok, frames, why = self.run_enc(FakeAlly(hook=hook), segs=2)
+        self.assertEqual((ok, frames), (True, 200), why)
+        self.assertEqual(calls, [1, 1])                     # the helper reclaimed it
+        self.assertEqual(self.mac, [0])                     # the idle Mac left it alone
+        self.assertEqual(self.hosts(), {"0": "mac", "1": "ally"})
+
+    def test_the_mac_takes_it_when_the_helper_does_not_reclaim_it_in_time(self):
+        import time
+        calls, hook = self._suspend_once(resume_after=0.1)
+        self.mac_hook = self._mac_waits_for_the_first_remote_call(calls)
+        slow = lambda: (not calls) or (time.sleep(2.0) or True)   # its check hangs after the resume
+        with mock.patch.object(dvcap, "HELPER_SUSPEND_POLL", 0.02), \
+                mock.patch.object(dvcap, "HELPER_RESERVE_SECONDS", 0.3):
+            ok, frames, why = self.run_enc(FakeAlly(hook=hook, available=slow), segs=2)
+        self.assertEqual((ok, frames), (True, 200), why)
+        self.assertEqual(calls, [1])
+        self.assertEqual(self.mac, [0, 1])
+        self.assertEqual(self.hosts(), {"0": "mac", "1": "mac"})
+
+    def test_the_mac_takes_it_at_once_when_the_helper_is_unavailable(self):
+        import threading, time
+        self.assertEqual(dvcap.HELPER_RESERVE_SECONDS, 120)
+        calls, hook = self._suspend_once(resume_after=0.1)
+        self.mac_hook = self._mac_waits_for_the_first_remote_call(calls)
+        box = {}
+
+        def go():
+            with mock.patch.object(dvcap, "HELPER_SUSPEND_POLL", 0.02):
+                box["r"] = self.run_enc(FakeAlly(hook=hook, available=lambda: not calls), segs=2)
+        t0 = time.monotonic()
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        th.join(15)
+        self.assertFalse(th.is_alive(), "the Mac sat out the whole reservation")
+        self.assertLess(time.monotonic() - t0, 10)
+        ok, frames, why = box["r"]
+        self.assertEqual((ok, frames), (True, 200), why)
+        self.assertEqual(self.mac, [0, 1])
+        self.assertEqual(self.hosts()["1"], "mac")
+
+    def test_end_to_end_over_the_fake_wire(self):
+        # the real Helper: y4m from a fake decoder -> real zstd -> a fake vworker (real zstd -d)
+        # -> HEVC back into the part; the Mac's own segments run a fake x265 through _encode_pipe
+        import test_helper
+        import helper
+        if not test_helper.ZSTD_OK:
+            self.skipTest("needs /opt/homebrew/bin/zstd")
+        self.patches[2].stop()                              # the REAL _encode_pipe for the Mac
+        self.patches.pop(2)
+        aud = test_helper.AUD                               # the fake helper's frame; the Mac's is b"F"
+
+        def frames_in(path, ffprobe=None):
+            if not (path and os.path.exists(path)):
+                return 0
+            with open(path, "rb") as f:
+                data = f.read()
+            return data.count(aud) if data.startswith(aud) else len(data)
+        self.patches[0].stop()
+        self.patches[0] = mock.patch.object(dvcap, "count_hevc_frames", side_effect=frames_in)
+        self.patches[0].start()
+        fakes = test_helper.write_fakes(self.td)
+        root = os.path.join(self.td, "ally")
+        os.makedirs(root)
+        helper.reset_state()
+        h = test_helper.fake_helper(fakes["vworker"], root)
+        env = {"FAKE_W": "4", "FAKE_H": "2", "FAKE_DEC_SLEEP": "0.003", "FAKE_DEC_FAIL_AT": "-1"}
+        try:
+            with mock.patch.dict(os.environ, env):
+                ok, frames, why = self.run_enc(h, segs=4, ffmpeg=fakes["ffmpeg"], x265=fakes["x265"])
+        finally:
+            helper.reset_state()
+        self.assertTrue(ok, why)
+        self.assertEqual(frames, 400)
+        hosts = self.hosts()
+        self.assertEqual(sorted(hosts), ["0", "1", "2", "3"])
+        self.assertIn("ally", hosts.values())
+        self.assertIn("mac", hosts.values())
+        k = list(hosts.values()).count("ally")
+        with open(self.out, "rb") as f:                     # plan order, no stream marker anywhere
+            self.assertEqual(f.read(), b"".join((aud if hosts[str(i)] == "ally" else b"F") * self.N
+                                                for i in range(4)))
+        self.assertTrue(why.endswith(" on the helper)"), why)
+        self.assertIn(f"({k} segment", why)
+        self.assertEqual([x for x in os.listdir(self.segdir) if "remote" in x or x.endswith(".part")], [])
+        self.assertEqual(len(dvcap._LIVE_ENCODERS), 0)

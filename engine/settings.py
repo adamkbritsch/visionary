@@ -114,6 +114,14 @@ DEFAULT_SETTINGS = {
                                 # mid-stage, wait this long for the power to come back before abandoning
                                 # the stage. 0 = abandon immediately.
 
+    # --- the helper (2026-10-28; engine/helper.py) ---
+    "helper_enabled": False,    # OPTIONAL x265 HELPER: a Linux machine on Ethernet encodes some of an
+                                # item's capped-remux segments in parallel with the Mac. Used only
+                                # while it is on mains, wired, idle and reached over a WIRED route;
+                                # the Mac takes back any segment it drops. Off = exactly the old remux.
+    "helper_host": "bazzite.local",            # the helper's host name or IPv4 address
+    "helper_user": "bazzite",                  # its ssh login
+    "helper_key": "~/.ssh/id_ed25519_ally_claude",   # the ssh private key the Mac logs in with
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -284,8 +292,46 @@ def _valid_nas_network(v):
     return v if v in ("ethernet", "wifi", "ethernet_only") else "ethernet"
 
 
+def _valid_helper_enabled(v):
+    """The helper is OFF unless clearly switched on: anything unreadable is off (the
+    opposite default of _valid_plex_throttle — this one adds a machine, that one protects)."""
+    if isinstance(v, bool):
+        return v
+    return v in (1, "1", "true", "True", "on")
+
+
+_HELPER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")   # never a leading "-": ssh would read
+                                                               # the value as an option
+
+
+def _helper_name_ok(v) -> bool:
+    return isinstance(v, str) and bool(_HELPER_NAME_RE.fullmatch(v))
+
+
+def _helper_key_ok(v) -> bool:
+    """A path string: one line, no NUL, not an option."""
+    return (isinstance(v, str) and bool(v) and v.strip() == v and not v.startswith("-")
+            and not any(c in v for c in "\0\n\r"))
+
+
+# helper_host / helper_user / helper_key are NOT in VALIDATORS (2026-10-28): a malformed value is
+# SAVED AS TYPED — never silently swapped for a default, which would quietly ssh somewhere else.
+# helper.for_remux() / helper.status_summary() judge them at use time and report the helper off,
+# "settings: bad host" (etc.), until the value is fixed. key -> (short name, check).
+HELPER_FIELDS = {"helper_host": ("host", _helper_name_ok),
+                 "helper_user": ("user", _helper_name_ok),
+                 "helper_key": ("key", _helper_key_ok)}
+
+
+def helper_field_ok(key: str, v) -> bool:
+    """Is `v` a usable value for the helper field `key` (helper_host / helper_user / helper_key)?"""
+    entry = HELPER_FIELDS.get(key)
+    return bool(entry) and entry[1](v)
+
+
 VALIDATORS = {"nas_network": _valid_nas_network,
-              "plex_throttle": _valid_plex_throttle}
+              "plex_throttle": _valid_plex_throttle,
+              "helper_enabled": _valid_helper_enabled}
 
 
 def set_settings(updates: dict) -> dict:

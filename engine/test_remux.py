@@ -11,6 +11,23 @@ from remux import (build_tracks_command, build_master_mux_command,
                    parse_streams, has_dolby_vision, dolby_vision_profile, verify_remux,
                    needs_mkv, cfr_container_ext)
 
+import helper
+
+# HERMETIC (2026-10-28): remux() asks helper.for_remux() for the helper, which reads the REAL
+# settings file. Pinned off for this whole module, so a user who switched the helper on still
+# gets the exact pre-helper dvcap calls these tests compare — and no test can reach a helper.
+# HelperCallSite below patches it back on, inside the test.
+_NO_HELPER = mock.patch.object(helper, "for_remux", return_value=None)
+
+
+def setUpModule():
+    _NO_HELPER.start()
+
+
+def tearDownModule():
+    _NO_HELPER.stop()
+
+
 # Real ffprobe shape (captured from a dovi_tool-built Profile 8.1 file).
 DOVI = {"side_data_type": "DOVI configuration record", "dv_profile": 8,
         "dv_bl_signal_compatibility_id": 1, "rpu_present_flag": 1,
@@ -770,6 +787,16 @@ class CombineDispatcher(unittest.TestCase):
 
     def tearDown(self):
         self.g1.stop(); self.g2.stop()
+
+    def test_the_capped_path_passes_on_segments_through_only_when_given(self):
+        ok = remux.RemuxResult(True, "o.mkv", "8.1", 2, 1, "ok")
+        listener = lambda info: None
+        with mock.patch.object(remux, "remux", return_value=ok) as rx:
+            remux.combine("winner.mkv", "winner.mkv", "audio.mkv", "o.mkv", capped=True,
+                          on_segments=listener)
+            remux.combine("winner.mkv", "winner.mkv", "audio.mkv", "o.mkv", capped=True)
+        self.assertIs(rx.call_args_list[0].kwargs["on_segments"], listener)
+        self.assertNotIn("on_segments", rx.call_args_list[1].kwargs)
 
     def test_stream_path_grafts_from_the_donor(self):
         with mock.patch.object(remux, "remux_inject",
@@ -2189,7 +2216,7 @@ class ResolvePathPinned(unittest.TestCase):
 
     MD = "G(1,2)B(3,4)R(5,6)WP(7,8)L(9,10)"
 
-    def _run(self, tmp, **kw):
+    def _run(self, tmp, encode_why="ok", **kw):
         import os
         out = os.path.join(tmp, "master.mkv")
         render = os.path.join(tmp, "render.mov")
@@ -2202,7 +2229,7 @@ class ResolvePathPinned(unittest.TestCase):
              mock.patch.object(remux.dvcap, "extract_rpu", return_value=(True, "ok")) as ext, \
              mock.patch.object(remux.dvcap, "rpu_frame_count", return_value=100), \
              mock.patch.object(remux.dvcap, "encode_capped_segmented",
-                               return_value=(True, 100, "ok")) as enc, \
+                               return_value=(True, 100, encode_why)) as enc, \
              mock.patch.object(remux.dvcap, "reencode_segments_tighter",
                                return_value=(True, "ok")) as rep, \
              mock.patch.object(remux.dvcap, "video_peak_buckets",
@@ -2251,6 +2278,88 @@ class ResolvePathPinned(unittest.TestCase):
             res_b, calls_b, _r, _o = self._run(tmp, native=None)
         self.assertEqual((res_a.ok, res_a.reason), (res_b.ok, res_b.reason))
         self.assertEqual(calls_a, calls_b)
+
+
+class HelperCallSite(unittest.TestCase):
+    """remux() hands helper.for_remux()'s helper to BOTH encode_capped_segmented calls (the main
+    encode and the repair rung's re-verify/re-concat) — and nothing when it is None, so those
+    calls stay exactly ResolvePathPinned's. The repair re-encode itself stays Mac-only."""
+
+    MD = ResolvePathPinned.MD
+
+    def test_the_helper_reaches_both_encode_calls(self):
+        import tempfile
+        ally = object()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(helper, "for_remux", return_value=ally):
+            res, calls, _render, _out = ResolvePathPinned._run(self, tmp)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(len(calls["encode"]), 2)
+        for c in calls["encode"]:
+            self.assertIs(c.kwargs["helper"], ally)
+        self.assertNotIn("helper", calls["repair"][0].kwargs)
+
+    def test_off_or_broken_passes_nothing(self):
+        import tempfile
+        for patch in (dict(return_value=None), dict(side_effect=RuntimeError("settings"))):
+            with self.subTest(**{k: str(v) for k, v in patch.items()}), \
+                    tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(helper, "for_remux", **patch):
+                res, calls, _render, _out = ResolvePathPinned._run(self, tmp)
+            self.assertTrue(res.ok, res.reason)
+            for c in calls["encode"]:
+                self.assertNotIn("helper", c.kwargs)
+
+    def test_a_helper_module_that_will_not_even_import_passes_nothing(self):
+        # 6: the import is inside the try too — nothing about the helper can fail a remux
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"helper": None}):
+            res, calls, _render, _out = ResolvePathPinned._run(self, tmp)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(len(calls["encode"]), 2)
+        for c in calls["encode"]:
+            self.assertNotIn("helper", c.kwargs)
+
+    def test_the_success_note_says_how_many_segments_the_helper_did(self):
+        # 7: dvcap's " (K segment(s) on the helper)" reaches the shipped note, next to the repair
+        import tempfile
+        for word in ("1 segment", "2 segments"):
+            why = f"encoded 100 frames in 2 segments ({word} on the helper)"
+            with tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(helper, "for_remux", return_value=object()):
+                res, _calls, _render, _out = ResolvePathPinned._run(self, tmp, encode_why=why)
+            self.assertTrue(res.ok, res.reason)
+            self.assertEqual(res.reason.count("on the helper"), 1, res.reason)
+            self.assertIn(f"the 50 cap's gate ({word} on the helper) · peak repair: 1 seg(s)",
+                          res.reason)
+
+    def test_no_helper_segments_no_note(self):
+        import tempfile
+        for ally, why in ((object(), "encoded 100 frames in 2 segments"),
+                          (None, "encoded 100 frames in 2 segments (1 segment on the helper)")):
+            with tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(helper, "for_remux", return_value=ally):
+                res, _calls, _render, _out = ResolvePathPinned._run(self, tmp, encode_why=why)
+            self.assertTrue(res.ok, res.reason)
+            self.assertNotIn("helper", res.reason)
+
+    def test_on_segments_reaches_the_main_encode_only_with_a_helper(self):
+        import tempfile
+        ally, listener = object(), (lambda info: None)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(helper, "for_remux", return_value=ally):
+            res, calls, _render, _out = ResolvePathPinned._run(self, tmp, on_segments=listener)
+        self.assertTrue(res.ok, res.reason)
+        main, reconcat = calls["encode"]
+        self.assertIs(main.kwargs["on_segments"], listener)
+        self.assertNotIn("on_segments", reconcat.kwargs)    # the re-verify/re-concat: no bar
+        with tempfile.TemporaryDirectory() as tmp:          # helper off: the pre-helper calls
+            res, calls, _render, _out = ResolvePathPinned._run(self, tmp, on_segments=listener)
+        self.assertTrue(res.ok, res.reason)
+        for c in calls["encode"]:
+            self.assertNotIn("on_segments", c.kwargs)
+            self.assertNotIn("helper", c.kwargs)
 
 
 class SdrMaster(unittest.TestCase):

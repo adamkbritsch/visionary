@@ -164,6 +164,10 @@ struct SteelBar: View {
     var repairLo: Double? = nil
     var repairHi: Double? = nil
     var repairFrac: Double = 0
+    // THE HELPER (2026-10-28): a helper-shared remux, laid out by WHERE its segments stand —
+    // the Mac's run fills from the left, the helper's from the right. nil = the bar above,
+    // exactly as it always was (`completed` / `live` then drive it).
+    var segments: SegLayout? = nil
     @State private var flash = false
     var body: some View {
         let bright = min(max(completed, 0), 1)
@@ -171,6 +175,9 @@ struct SteelBar: View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.white.opacity(0.08))                 // track
+                if let seg = segments, !notches.isEmpty {
+                    shared(seg, width: geo.size.width)
+                } else {
                 Capsule().fill(DS.steel.opacity(0.28))                    // shadow: live progress
                     .frame(width: max(6, geo.size.width * ahead))
                 ForEach(Array(notches.filter { $0 > bright + 0.001 && $0 < 0.999 }.prefix(1).enumerated()),
@@ -184,6 +191,7 @@ struct SteelBar: View {
                     .frame(width: max(6, geo.size.width * bright))
                     .overlay(Capsule().fill(Color.white).opacity(flash ? 0.4 : 0))
                     .animation(.easeOut(duration: 0.55), value: bright)   // the completion sweep
+                }
                 if let lo = repairLo, let hi = repairHi, hi > lo {
                     let span = geo.size.width * (hi - lo)
                     Rectangle().fill(Color.black.opacity(0.6))            // the cut-out: back to track
@@ -203,6 +211,54 @@ struct SteelBar: View {
             flash = true
             withAnimation(.easeOut(duration: 0.7)) { flash = false }
         }
+    }
+
+    /// The helper-shared layout, in the same three layers as the bar above. DIM: each machine's
+    /// in-flight segment, live inside its own slot (lo + frac × (hi − lo)); it starts under the
+    /// finished run just before the slot, if there is one, so it meets that run exactly as the
+    /// plain bar's shadow meets its bright fill. TICK: only the Mac's next boundary. BRIGHT:
+    /// every finished CONTIGUOUS run at its real place, the same fill whichever machine did it.
+    @ViewBuilder private func shared(_ seg: SegLayout, width w: CGFloat) -> some View {
+        let runs = SegLayout.runs(seg.done)
+        let lives = [seg.mac, seg.helper].compactMap { $0 }
+        ForEach(Array(lives.enumerated()), id: \.offset) { _, l in
+            if let s = SegLayout.span(l.index, notches) {
+                let from = runs.first(where: { $0.last + 1 == l.index })
+                    .flatMap { SegLayout.span($0.first, notches)?.lo } ?? s.lo
+                let to = s.lo + l.frac * (s.hi - s.lo)
+                Capsule().fill(DS.steel.opacity(0.28))
+                    .frame(width: max(6, w * (to - from)))
+                    .offset(x: w * from)
+            }
+        }
+        if let n = macNextTick(seg), n < 0.999 {
+            Rectangle().fill(Color.black.opacity(0.55))
+                .frame(width: 1.5)
+                .offset(x: w * n)
+        }
+        // keyed by a STABLE identity (SegLayout.keyedRuns), never by array position: a run that
+        // appears to the left of another must not take over its view and sweep across the bar
+        ForEach(SegLayout.keyedRuns(seg.done, count: notches.count)) { r in
+            if let a = SegLayout.span(r.first, notches), let b = SegLayout.span(r.last, notches) {
+                Capsule().fill(LinearGradient(colors: [DS.steelBright, .brand],
+                                              startPoint: .top, endPoint: .bottom))
+                    .frame(width: max(6, w * (b.hi - a.lo)))
+                    .overlay(Capsule().fill(Color.white).opacity(flash ? 0.4 : 0))
+                    .offset(x: w * a.lo)
+                    .animation(.easeOut(duration: 0.55), value: seg.done)   // the completion sweep
+            }
+        }
+    }
+
+    /// The end of the Mac's in-flight segment — or, between segments, of the first one nobody
+    /// has — unless a finished run already starts right there (its bright edge marks it).
+    private func macNextTick(_ seg: SegLayout) -> Double? {
+        let done = Set(seg.done)
+        let z = seg.mac?.index ?? (0..<notches.count).first {
+            !done.contains($0) && $0 != seg.helper?.index
+        }
+        guard let z, z >= 0, z < notches.count, !done.contains(z + 1) else { return nil }
+        return notches[z]
     }
 }
 
@@ -235,6 +291,8 @@ struct StageBar: View {
     var repairLo: Double? = nil
     var repairHi: Double? = nil
     var repairFrac: Double = 0
+    var segments: SegLayout? = nil     // the current stage's helper-shared layout (SteelBar)
+    var segCount: Int? = nil           // ...and its finished-segment count (the flash); nil = plan's
 
     var body: some View {
         if expanded {
@@ -254,8 +312,8 @@ struct StageBar: View {
             }
         } else if let p = plan.pct {
             SteelBar(completed: plan.completed, live: p / 100, notches: plan.notches,
-                     flashKey: plan.segDone, repairLo: repairLo, repairHi: repairHi,
-                     repairFrac: repairFrac)
+                     flashKey: segCount ?? plan.segDone, repairLo: repairLo, repairHi: repairHi,
+                     repairFrac: repairFrac, segments: segments)
                 .help(plan.tip(plan.idx))
         }
     }
@@ -265,8 +323,8 @@ struct StageBar: View {
             SteelBar(completed: 1, live: 1)
         } else if i == plan.idx, let p = plan.pct {
             SteelBar(completed: plan.completed, live: p / 100, notches: plan.notches,
-                     flashKey: plan.segDone, repairLo: repairLo, repairHi: repairHi,
-                     repairFrac: repairFrac)
+                     flashKey: segCount ?? plan.segDone, repairLo: repairLo, repairHi: repairHi,
+                     repairFrac: repairFrac, segments: segments)
         } else if i == plan.idx {
             // running, with no number to give: the track is lit and outlined, never filled
             Capsule().fill(Color.white.opacity(0.14))
@@ -1129,9 +1187,16 @@ struct FinisherProgress: View {
         // then, so it can no longer carry the first one's — which left it anonymous while the
         // second was labelled.
         let dual = mine.count > 1
+        // THE HELPER's status line: remux card only, only while it is switched on, and on ONE
+        // row — the one it is encoding for, else the one sharing with it, else the first.
+        let helperRow: Int? = (stageKey == "remux" && store.state?.settings?.helper_enabled == true)
+            ? (mine.firstIndex(where: { $0.helper_seg != nil })
+               ?? mine.firstIndex(where: { $0.segs_done != nil }) ?? (mine.isEmpty ? nil : 0))
+            : nil
         VStack(alignment: .leading, spacing: 7) {
             ForEach(Array(mine.enumerated()), id: \.offset) { i, f in
-                LaneProgress(f: f, primary: i == 0, showEpisode: dual, expanded: expanded)
+                LaneProgress(f: f, primary: i == 0, showEpisode: dual, expanded: expanded,
+                             showHelper: i == helperRow, helper: store.state?.helper)
             }
         }
         .padding(.top, 3)
@@ -1155,6 +1220,10 @@ private struct LaneProgress: View {
     var showEpisode: Bool = false
     /// The card is hovered: a staged lane lays out all its stages (StageBar).
     var expanded: Bool = false
+    /// This row carries the helper's status line (FinisherProgress picks ONE remux row, and
+    /// only while the helper is switched on) — and the engine's status for it.
+    var showHelper: Bool = false
+    var helper: HelperDTO? = nil
 
     // Fixed slots, sized to their worst cases ("100%", "~12h 59m left"), so a changing
     // digit never moves the container edge and lane 2's eta sits directly under lane 1's —
@@ -1188,6 +1257,16 @@ private struct LaneProgress: View {
             return Double(d) / Double(t)
         }()
         let plan = f.stagePlan
+        // A helper-shared remux: finished segments drawn where they are (the Mac's from the
+        // left, the helper's from the right). nil without the helper → the bar as it always was.
+        let seg = notches.isEmpty ? nil : f.segLayout
+        // ...and it COUNTS (and flashes on) every finished segment, whichever machine did it.
+        // seg_done stays the engine's plan-order prefix (deploy-now's segment boundary), which
+        // lags behind while the helper fills the back of the bar.
+        let finished = f.segs_done?.count ?? done
+        // a staged lane's capped stage carries the remux's own ticks: the same count there
+        let stageDone: Int? = (plan.map { $0.notches == notches } ?? false) && seg != nil
+            ? finished : nil
         VStack(alignment: .leading, spacing: 4) {
             if showEpisode, let ep = f.ep, !ep.isEmpty {
                 Text(ep).font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -1211,10 +1290,11 @@ private struct LaneProgress: View {
                 // the repair cut-out belongs to the stage whose ticks are the remux's own
                 let own = plan.notches == notches
                 StageBar(plan: plan, expanded: expanded, repairLo: own ? rLo : nil,
-                         repairHi: own ? rHi : nil, repairFrac: rFrac)
+                         repairHi: own ? rHi : nil, repairFrac: rFrac,
+                         segments: own ? seg : nil, segCount: stageDone)
             } else if !stepOnly {
-                SteelBar(completed: completed, live: live, notches: notches, flashKey: done,
-                         repairLo: rLo, repairHi: rHi, repairFrac: rFrac)
+                SteelBar(completed: completed, live: live, notches: notches, flashKey: finished,
+                         repairLo: rLo, repairHi: rHi, repairFrac: rFrac, segments: seg)
             }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(plan.map(StageBar.pctText) ?? (stepOnly ? "—" : String(format: "%.0f%%", pct)))
@@ -1252,17 +1332,73 @@ private struct LaneProgress: View {
                     // a staged lane counts the CURRENT stage's segments, when it has any
                     if !plan.notches.isEmpty {
                         Spacer()
-                        Text("\(min(plan.segDone + 1, plan.notches.count))/\(plan.notches.count)")
+                        Text("\(min((stageDone ?? plan.segDone) + 1, plan.notches.count))/\(plan.notches.count)")
                             .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
                     }
-                } else if let d = f.seg_done, let t = f.seg_total, t > 0 {
+                } else if let d = f.segs_done?.count ?? f.seg_done, let t = f.seg_total, t > 0 {
                     Spacer()
                     Text("\(min(d + 1, t))/\(t)")
                         .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
                 }
             }
+            if showHelper && (helper != nil || f.helper_seg != nil) {
+                HelperLine(f: f, status: helper)
+            }
         }
         .opacity(held == nil ? 1 : 0.65)
+    }
+}
+
+/// The helper's ONE status line under the remux lane's bar, only while it is switched on:
+/// "Helper connected · on seg 9 · 7.9 fps · did 10–11" while it encodes this lane's segment,
+/// otherwise the engine's own reason ("Helper paused · a game is running on it"). The line is
+/// the same for anyone's Linux box; the machine's own name is in the tooltip only.
+private struct HelperLine: View {
+    let f: FinishingDTO
+    let status: HelperDTO?
+
+    private var working: Bool { f.helper_seg?.first.map { $0.isFinite } ?? false }
+
+    private var stateWord: String {
+        if working { return "connected" }
+        switch status?.state {
+        case "connected": return "connected"
+        case "ready":     return "ready"
+        case "paused":    return "paused"
+        case "off":       return "off"
+        default:          return "not connected"
+        }
+    }
+
+    /// "on seg 9 · 7.9 fps · did 10–11" (1-based) while it works here; the engine's text otherwise.
+    private var detail: String {
+        guard working, let i = f.helper_seg?.first, i.isFinite, abs(i) < 1e6 else {
+            return status?.detail ?? ""
+        }
+        var parts = ["on seg \(Int(i) + 1)"]
+        if let fps = f.helper_fps, fps.isFinite, fps > 0 { parts.append(String(format: "%.1f fps", fps)) }
+        if let did = f.helper_segs, !did.isEmpty { parts.append("did " + SegLayout.runsText(did)) }
+        return parts.joined(separator: " \u{00B7} ")
+    }
+
+    var body: some View {
+        // state is BRIGHTNESS, never hue: working bright, ready steel, everything else dim
+        let tint: Color = stateWord == "connected" ? DS.steelBright
+            : (stateWord == "ready" ? DS.steel : DS.steelDim)
+        let tip = [status?.tooltip, status?.host].compactMap { $0 }.first { !$0.isEmpty } ?? ""
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Image(systemName: "display")
+                .font(.system(size: 10, weight: .medium)).foregroundStyle(tint)
+            Text("Helper \(stateWord)")
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(tint)
+                .fixedSize()
+            if !detail.isEmpty {
+                Text("\u{00B7} " + detail)
+                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+        }
+        .help(tip)
     }
 }
 
@@ -3902,6 +4038,28 @@ private struct PlexThrottleRow: View {
     }
 }
 
+/// The helper (2026-10-28; engine/helper.py): a Linux machine on Ethernet takes some of the
+/// remux's segments. Built like PlexThrottleRow.
+private struct HelperRow: View {
+    @EnvironmentObject var store: AppStore
+    private var on: Bool { store.state?.settings?.helper_enabled ?? false }
+
+    var body: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Helper").font(.system(size: 13, weight: .medium))
+                Text("A Linux machine on Ethernet encodes some segments alongside the Mac. It stops and deletes its work the moment a game or anything heavy starts on it.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 10)
+            Toggle("", isOn: Binding(get: { on },
+                                     set: { v in Task { await store.saveSettings(["helper_enabled": v]) } }))
+                .labelsHidden().toggleStyle(.switch).controlSize(.small)
+        }
+    }
+}
+
 /// Which of the Mac's links the big NAS transfers take — the upscale pipeline's downloads and
 /// uploads and the Dolby Vision 7 -> 8.1 lane (engine/nas_link.py; user-dictated 2026-09-30).
 private struct NasNetworkRow: View {
@@ -3983,6 +4141,7 @@ struct SettingsPopover: View {
                            range: 0...240, step: 5, unit: "min", zeroLabel: "Off")
                 NasNetworkRow()
                 PlexThrottleRow()
+                HelperRow()
 
                 Divider()
 

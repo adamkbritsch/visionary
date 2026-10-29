@@ -54,6 +54,9 @@ STAGES = ["download", "extend", "topaz", "dv", "remux", "upload", "cleanup"]
 # whose show OPTED IN and whose source actually probes 4:3 — see borders.extend_gate.
 RUN_STAGES = ["download", "extend", "topaz", "dv"]
 FINISH_STAGES = ["remux", "upload", "cleanup"]
+# A helper-shared remux's segment layout (stages.SegmentLayout.fields), carried into BOTH remux
+# lanes' state for the app's two-ended segment bar and the helper's status line.
+HELPER_LANE_KEYS = ("segs_done", "helper_segs", "mac_seg", "helper_seg", "helper_fps")
 # THE DV SLOT is never run under its own name. An eligible TV episode fills it with the run-only
 # stage 'dvnative' (the chunk lane, _native_slot), with no doorstep gate; every other item with
 # 'dvrender' (the native render, _dvrender_route), which writes p.dv_render and keeps the
@@ -4905,6 +4908,9 @@ class Orchestrator:
                   # fast-remux labeled step (inject/ship) — self-clears like the notches
                   "step": info.get("step"),
                   "elapsed_secs": round(self._fin_elapsed_value(), 1)})
+        # THE HELPER's segment layout (stages.SegmentLayout) — explicit like the notches, so a
+        # tick without the helper (or the next item) CLEARS them instead of inheriting them
+        f.update({k: info.get(k) for k in HELPER_LANE_KEYS})
         # the lettered stages (stagebar) — explicit too, so a stage-less tick clears them
         f.update({k: info.get(k) for k in stagebar.FIELDS})
         # ETA from THIS attempt's live rate. The elapsed stopwatch deliberately ACCUMULATES
@@ -4940,6 +4946,7 @@ class Orchestrator:
                   "repair_of": info.get("repair_of"), "repair_done": info.get("repair_done"),
                   "repair_total": info.get("repair_total"),
                   "step": info.get("step")})
+        f.update({k: info.get(k) for k in HELPER_LANE_KEYS})
         f.update({k: info.get(k) for k in stagebar.FIELDS})
         e = self._lane_eta(2, info, f.get("stage"))
         if e is None:

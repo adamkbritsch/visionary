@@ -90,6 +90,8 @@ try:
  d=json.load(sys.stdin);o=d.get('orchestrator') or {};p=o.get('progress') or {}
  fi=o.get('finishing') or {};f2=o.get('finishing2') or {}
  tail=any(x.get('stage')=='remux' and x.get('step') in TAIL and x.get('seg_total') is not None for x in (fi,f2))
+ # the HELPER's in-flight segment: a stop throws its work away, and the Mac may be idle waiting on it
+ tail=tail or any(x.get('stage')=='remux' and x.get('helper_seg') for x in (fi,f2))
  print('%s|%s|%s|%s|%s|%s|%s|%s|%s'%(o.get('stage') or 'idle', p.get('seg_done'), o.get('running'),
        fi.get('stage') or 'none', fi.get('seg_done'), f2.get('stage') or 'none', f2.get('seg_done'),
        p.get('phase') or 'none', 1 if tail else 0))
@@ -132,7 +134,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
                                      tseg0=""; rseg0=""; sleep 5; continue ;;
   esac
   if [ "$stail" = "1" ]; then
-    say "waiting: a splice is writing and proving its master (not resumable)"; rseg0=""; rseg20=""; sleep 5; continue
+    say "waiting: a splice is writing its master, or the helper has a segment in flight (not resumable)"; rseg0=""; rseg20=""; sleep 5; continue
   fi
   # Run thread is topaz/download/idle; finisher is remux/none. Deploy at the FIRST segment boundary of
   # EITHER encoder that's actually running — the other stage, if mid-segment, resumes from its own last.

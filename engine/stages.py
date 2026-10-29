@@ -1544,6 +1544,76 @@ def _never_raise(fn, *a, **k) -> None:
         pass
 
 
+def _takes_kw(fn, name: str) -> bool:
+    """Whether `fn` accepts the keyword `name` (by name or through **kwargs). A callee that
+    cannot be inspected is treated as NOT taking it — the call then stays exactly as it was."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is p.VAR_KEYWORD or (p.name == name and p.kind in (p.KEYWORD_ONLY,
+                                                                         p.POSITIONAL_OR_KEYWORD))
+               for p in params)
+
+
+def _seg_slot(v, with_fps: bool = False):
+    """One machine's in-flight segment from dvcap's on_segments info: [i, frac] (the helper's
+    is [i, frac, fps]) -> (i, frac clamped 0..1, fps or None); None when there is none."""
+    import math
+    if not v:
+        return None
+    i, frac = int(v[0]), float(v[1])
+    frac = min(1.0, max(0.0, frac)) if math.isfinite(frac) else 0.0
+    fps = float(v[2]) if with_fps and len(v) > 2 and v[2] is not None else None
+    if fps is not None and not math.isfinite(fps):
+        fps = None                         # a NaN would make /api/state invalid JSON
+    return i, frac, fps
+
+
+class SegmentLayout:
+    """WHERE each segment of a helper-shared capped remux stands, for the lane's bar
+    (dvcap.encode_capped_segmented's on_segments; 2026-10-28). The helper works from the BACK of
+    the plan while the Mac works from the front, so the cumulative frame total runs ahead of
+    plan order: the bar needs the finished segments themselves (segs_done; the app counts and
+    flashes on len(segs_done)). It does NOT touch seg_done, which stays dvcap's plan-order
+    PREFIX: deploy-now.sh deploys the moment a lane's seg_done rises, and only the prefix rises
+    exactly when the Mac finishes a segment (a count of every finished segment also rose when
+    the helper landed one, with the Mac mid-segment). `reported` stays False until dvcap first
+    reports — without the helper it never does, and the lane's progress keeps exactly its old
+    keys."""
+
+    def __init__(self):
+        self.reported = False
+        self.done, self.helper_done = [], []
+        self.mac = self.helper = None      # (i, frac, fps|None) or None
+
+    def update(self, info) -> bool:
+        """Take one report; True when the finished set changed (a segment landed). A
+        malformed report changes nothing (it is called from dvcap's encode threads)."""
+        try:
+            done = sorted({int(i) for i in (info.get("done") or [])})
+            helper_done = sorted({int(i) for i in (info.get("helper_done") or [])})
+            mac = _seg_slot(info.get("mac"))
+            helper = _seg_slot(info.get("helper"), with_fps=True)
+        except (AttributeError, TypeError, ValueError, LookupError, OverflowError):
+            return False
+        changed = not self.reported or done != self.done or helper_done != self.helper_done
+        self.reported = True
+        self.done, self.helper_done, self.mac, self.helper = done, helper_done, mac, helper
+        return changed
+
+    def fields(self) -> dict:
+        """The lane's progress keys (empty until dvcap has reported)."""
+        if not self.reported:
+            return {}
+        return {"segs_done": list(self.done), "helper_segs": list(self.helper_done),
+                "mac_seg": [self.mac[0], round(self.mac[1], 4)] if self.mac else None,
+                "helper_seg": [self.helper[0], round(self.helper[1], 4)] if self.helper else None,
+                "helper_fps": (round(self.helper[2], 1)
+                               if self.helper and self.helper[2] is not None else None)}
+
+
 class _NativeRemuxClock:
     """Wall time per LIVE-encoded segment of a native item's remux, booked into
     segdir/native/cpu.json beside the analysis CPU (design §4 'Measure'). Fed by the remux's own callbacks — nothing in
@@ -1553,6 +1623,12 @@ class _NativeRemuxClock:
                                     an in-segment frame was seen before its end was reached —
                                     a resumed segment jumps straight to its end and is never
                                     booked (it cost this attempt nothing).
+      segments(info)                on_segments, a HELPER-SHARED encode (dvcap's C1 info): the
+                                    cumulative frames then include the helper's, so progress()
+                                    books nothing once this has been heard. Only a segment the
+                                    MAC encoded is booked: wall from the report that put the Mac
+                                    on it to the one that has it finished, and only when a frame
+                                    of it was seen first; a segment the helper finished never is.
       repair(seg, done, n)          the peak repair's per-frame callback: wall from its first
                                     frame report to its last, per re-capped segment ('remux_repair').
     Rows are {key: {"wall_s", "frames"}} under phases "remux" and "remux_repair"; a segment
@@ -1561,6 +1637,8 @@ class _NativeRemuxClock:
     def __init__(self, p, clock=None):
         self.p, self._now = p, (clock or time.monotonic)
         self.ends, self.mark, self.done, self.live = None, None, 0, False
+        self.shared = False       # this attempt is helper-shared (on_segments has reported)
+        self._mac = None          # [index, started, live] of the Mac's in-flight segment
         self._rep = None          # [seg (1-based), started, last, frames, max done] of a repair
         self._rep_sum = {}        # seg -> wall booked by the repairs of this call (rungs add up)
 
@@ -1570,9 +1648,11 @@ class _NativeRemuxClock:
         except (TypeError, ValueError):
             self.ends = None
         self.mark, self.done, self.live = self._now(), 0, False
+        self.shared, self._mac = False, None
 
     def progress(self, frames, _total=None, **extra):
-        if extra.get("repair_seg") is not None or not self.ends or self.mark is None:
+        if (extra.get("repair_seg") is not None or not self.ends or self.mark is None
+                or self.shared):
             return
         try:
             frames = int(frames)
@@ -1589,6 +1669,32 @@ class _NativeRemuxClock:
             n = self.ends[k] - (self.ends[k - 1] if k else 0)
             self._book("remux", f"seg_{k:04d}", now - self.mark, n)
         self.done, self.mark, self.live = crossed, now, False
+
+    def segments(self, info):
+        """One on_segments report of a helper-shared encode (see the class doc)."""
+        self.shared = True
+        if not self.ends or not isinstance(info, dict):
+            return
+        try:
+            done = {int(i) for i in (info.get("done") or [])}
+            by_helper = {int(i) for i in (info.get("helper_done") or [])}
+            mac = info.get("mac")
+            mac = (int(mac[0]), float(mac[1])) if mac else None
+        except (TypeError, ValueError, LookupError, OverflowError):
+            return
+        now, cur = self._now(), self._mac
+        if cur is not None and cur[0] in done:
+            k = cur[0]
+            if cur[2] and k not in by_helper and 0 <= k < len(self.ends):
+                n = self.ends[k] - (self.ends[k - 1] if k else 0)
+                self._book("remux", f"seg_{k:04d}", now - cur[1], n)
+            self._mac = cur = None
+        if mac is None or mac[0] in done:
+            self._mac = None                        # between segments, or the Mac lost it
+        elif cur is None or cur[0] != mac[0]:
+            self._mac = [mac[0], now, mac[1] > 0]   # the Mac just started this one
+        elif mac[1] > 0:
+            cur[2] = True                           # real x265 progress inside it
 
     def repair(self, seg, done, n):
         now = self._now()
@@ -1986,13 +2092,27 @@ def _remux(p, abort, progress=None, should_pause=None):
     # Same notched segment bar as Topaz: on_plan gives the cumulative segment-end frames once,
     # then each progress tick derives notches (each end as a 0..1 fraction) + seg_done (how many
     # ends the cumulative frame count has passed — drives the little flash) + seg_total.
-    seg_plan = {"ends": None, "total": None}
+    seg_plan = {"ends": None, "total": None, "last": None, "told": None}
     def _on_plan(ends, exact_total):
-        seg_plan["ends"], seg_plan["total"] = ends, exact_total
+        seg_plan["ends"], seg_plan["total"], seg_plan["told"] = ends, exact_total, None
+
+    # THE HELPER'S SEGMENTS (2026-10-28): with the helper switched on, dvcap also reports which
+    # segments are finished and where each machine's in-flight one is (on_segments). The helper
+    # takes segments from the BACK, so "how many ends the frame total has passed" over-counts
+    # the front; seg_done is then dvcap's own plan-order PREFIX count (its `seg_done` keyword,
+    # kept for the re-publish when a segment lands) — deploy-now's segment boundary. Without
+    # the helper nothing is passed, nothing reports, and every tick below is exactly the old one.
+    segs = SegmentLayout()
 
     def _prog(frames, total, **extra):
         if not progress:
             return
+        seg_plan["last"] = (frames, total)
+        told = extra.pop("seg_done", None)   # dvcap's plan-order count (a helper-shared encode)
+        if told is None:
+            told = seg_plan["told"]          # a landed segment's re-publish: the last one told
+        else:
+            seg_plan["told"] = told
         t = seg_plan["total"] or total
         d = {"stage": "remux", "ep": p.ep, "frames": frames, "total": t,
              "pct": round(100.0 * frames / t, 1) if t else None}
@@ -2001,11 +2121,34 @@ def _remux(p, abort, progress=None, should_pause=None):
             d["notches"] = [round(e / t, 4) for e in ends]
             d["seg_done"] = sum(1 for e in ends if frames >= e)
             d["seg_total"] = len(ends)
+        if told is not None:
+            d["seg_done"] = told
+        d.update(segs.fields())            # {} unless the helper path reported
         if steps.active:       # a fast path that turned into the capped re-encode: its last stage
             d.update(steps.at(CAPPED_STAGE, d["pct"], notches=d.get("notches"),
                               seg_done=d.get("seg_done")))
         d.update(extra)
         progress(d)
+
+    def _on_segments(info):
+        # Called from both of dvcap's encode threads, serialised under its lock (as _prog is).
+        # A landed segment re-publishes the last tick at once, so the bar never waits a tick to
+        # light it; an in-flight move just rides along on the next ordinary tick.
+        if segs.update(info) and seg_plan["last"] is not None:
+            _prog(*seg_plan["last"])
+
+    def _seg_kw(fn, wall=None) -> dict:
+        # passed only while the helper is switched on AND the callee takes it, so a remux with
+        # the helper off (or an engine without the keyword) makes exactly the old call. A native
+        # call's wall clock hears it too: a shared encode books only the Mac's own segments.
+        if not _st.get("helper_enabled") or not _takes_kw(fn, "on_segments"):
+            return {}
+
+        def hear(info):
+            if wall is not None:
+                _never_raise(wall.segments, info)
+            _never_raise(_on_segments, info)
+        return {"on_segments": hear}
 
     def _on_repair(k, of, seg_index, done, seg_frames):
         # The peak-repair pass runs AFTER the bar hit 100% — without its own tick the
@@ -2025,7 +2168,8 @@ def _remux(p, abort, progress=None, should_pause=None):
                             real_rpu=combine_call["real_rpu"], rpu_book=combine_book,
                             cap_mbps=cap, boundaries=bounds, audio_target_lufs=lufs,
                             abort=abort, on_progress=_prog, on_plan=_on_plan,
-                            should_pause=should_pause, on_repair=_on_repair)
+                            should_pause=should_pause, on_repair=_on_repair,
+                            **_seg_kw(remux.combine))
         return _combine_result(res, combine_call["real_rpu"])
     # THE CHUNK LANE (the item carries a native marker and no fallback.json): this item never
     # rendered. Its RPU is the lane's, and x265 reads Topaz's ProRes chunks through the LUT (remux.remux(
@@ -2069,6 +2213,7 @@ def _remux(p, abort, progress=None, should_pause=None):
                       on_progress=on_prog, on_plan=on_plan, should_pause=should_pause,
                       on_repair=on_repair, encode_source=encode_source,
                       **({"native": native} if native is not None else {}), **sdr_kw,
+                      **_seg_kw(remux.remux, wall),
                       **({"rpu_book": book} if (native is None and not sdr_out
                                                 and (book := _render_rpu_book(p.dv_render)))
                          else {}))

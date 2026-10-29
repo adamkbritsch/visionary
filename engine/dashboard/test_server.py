@@ -1254,3 +1254,84 @@ class DvToolchainInstall(unittest.TestCase):
                                 server.RESOURCES_DIR])
         self.assertEqual(sent["code"], 200)
         self.assertIn("dv_toolchain", setup_jobs.TARGETS)
+
+
+class HelperStatusInState(unittest.TestCase):
+    """/api/state carries "helper": helper.status_summary() — the cached one-line status the
+    remux lane shows while the helper is switched on. Anything wrong with the helper (an import
+    failure, a raise, a non-dict) omits the key; the state request itself never fails or waits
+    on it."""
+
+    SUMMARY = {"enabled": True, "state": "ready", "detail": "waiting for the next segment",
+               "host": "box", "tooltip": "box · 192.168.1.20 over Ethernet"}
+
+    def _fake_helper(self, **kw):
+        import types
+        return types.SimpleNamespace(**kw)
+
+    def _state(self, helper_mod, o=None):
+        import sys
+        if o is None:
+            o = mock.MagicMock()
+            o.snapshot.return_value = {"enabled": False, "current": None}
+            o.finisher_views.return_value = []
+        with mock.patch.dict(sys.modules, {"helper": helper_mod}), \
+             mock.patch.object(server.orchestrator, "ORCH", o), \
+             mock.patch.object(server.power, "read_power",
+                               return_value=PowerReading(True, False, 100, 0)), \
+             mock.patch.object(server, "collect_scratch", return_value=SCRATCH), \
+             mock.patch.object(server, "read_adapter_watts", return_value=140), \
+             mock.patch.object(server.scratch, "folder_preview", return_value=[]), \
+             mock.patch.object(server.series, "get_mode", return_value="tv"), \
+             mock.patch.object(server, "series_info", return_value={}), \
+             mock.patch.object(server, "movies_info", return_value={}), \
+             mock.patch.object(server, "dv_convert_info", return_value={}), \
+             mock.patch.object(server, "youtube_info", return_value={}), \
+             mock.patch.object(server, "up_next", return_value=[]), \
+             mock.patch.object(server, "show_profile_info", return_value={}), \
+             mock.patch.object(server.logbook, "tail", return_value=[]):
+            return server.current_state()
+
+    def test_the_summary_rides_in_the_state(self):
+        st = self._state(self._fake_helper(status_summary=lambda: dict(self.SUMMARY)))
+        self.assertEqual(st["helper"], self.SUMMARY)
+        self.assertIn("orchestrator", st)                 # the rest of the state is intact
+
+    def test_a_raising_summary_omits_the_key(self):
+        def boom():
+            raise RuntimeError("no route")
+        st = self._state(self._fake_helper(status_summary=boom))
+        self.assertNotIn("helper", st)
+        self.assertIn("settings", st)
+
+    def test_an_engine_without_the_helper_omits_the_key(self):
+        st = self._state(None)                            # sys.modules None -> ImportError
+        self.assertNotIn("helper", st)
+        st = self._state(self._fake_helper())             # a helper without status_summary
+        self.assertNotIn("helper", st)
+
+    def test_a_non_dict_summary_omits_the_key(self):
+        st = self._state(self._fake_helper(status_summary=lambda: "ready"))
+        self.assertNotIn("helper", st)
+
+    def test_the_lanes_helper_layout_reaches_the_served_json(self):
+        # The orchestrator's lane keys (orchestrator.HELPER_LANE_KEYS, carried by both
+        # _set_finishing*_progress setters) pass through /api/state untouched, as strict JSON.
+        import json
+        import types
+        lane = {"stage": "remux", "pct": 40.0, "notches": [0.25, 0.5, 0.75, 1.0],
+                "seg_done": 1, "seg_total": 4, "segs_done": [0, 3], "helper_segs": [3],
+                "mac_seg": [1, 0.25], "helper_seg": [2, 0.5], "helper_fps": 7.9}
+        o = mock.MagicMock()
+        o.snapshot.return_value = {"enabled": True, "current": None, "finishing": dict(lane),
+                                   "finishing2": dict(lane)}
+        o.finisher_views.return_value = []
+        o._yield_lease.state.return_value = None
+        st = self._state(types.SimpleNamespace(status_summary=lambda: dict(self.SUMMARY)), o)
+        served = json.loads(json.dumps(st, allow_nan=False))
+        for key in ("finishing", "finishing2"):
+            got = served["orchestrator"][key]
+            self.assertEqual({k: got.get(k) for k in server.orchestrator.HELPER_LANE_KEYS},
+                             {k: lane[k] for k in server.orchestrator.HELPER_LANE_KEYS})
+            self.assertEqual(got["seg_done"], 1)
+        self.assertEqual(served["helper"], self.SUMMARY)

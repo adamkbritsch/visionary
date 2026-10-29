@@ -3138,6 +3138,36 @@ class StepReachesTheLane(unittest.TestCase):
             self.assertTrue(all(o.state[key][k] is None for k in stagebar.FIELDS))
 
 
+class HelperSegmentsReachTheLanes(unittest.TestCase):
+    """A helper-shared remux's segment layout (stages.SegmentLayout: segs_done / helper_segs /
+    mac_seg / helper_seg / helper_fps) survives BOTH lanes' setters into the state the dashboard
+    serves (snapshot() is /api/state's "orchestrator"), as strict JSON; a tick without the
+    helper clears it, like the notches. seg_done passes through untouched: it stays dvcap's
+    plan-order prefix, deploy-now's segment boundary."""
+
+    LAYOUT = {"segs_done": [0, 3], "helper_segs": [3], "mac_seg": [1, 0.25],
+              "helper_seg": [2, 0.5], "helper_fps": 7.9}
+
+    def test_the_layout_rides_both_lanes_into_the_served_state_and_clears(self):
+        import json
+        self.assertEqual(set(orch.HELPER_LANE_KEYS), set(self.LAYOUT))
+        o = orch.Orchestrator()
+        tick = dict({"stage": "remux", "pct": 40.0, "frames": 400, "total": 1000,
+                     "notches": [0.25, 0.5, 0.75, 1.0], "seg_done": 1, "seg_total": 4},
+                    **self.LAYOUT)
+        for setter, key in ((o._set_finishing_progress, "finishing"),
+                            (o._set_finishing2_progress, "finishing2")):
+            setter(dict(tick))
+            served = json.loads(json.dumps(o.snapshot(), allow_nan=False))[key]
+            self.assertEqual({k: served[k] for k in self.LAYOUT}, self.LAYOUT)
+            self.assertEqual((served["seg_done"], served["seg_total"]), (1, 4))
+            setter({"stage": "remux", "pct": 41.0, "frames": 410, "total": 1000,
+                    "notches": [0.25, 0.5, 0.75, 1.0], "seg_done": 1, "seg_total": 4})
+            served = o.snapshot()[key]
+            self.assertTrue(all(served[k] is None for k in self.LAYOUT), served)
+            self.assertEqual(served["seg_done"], 1)
+
+
 class CombinePaths(unittest.TestCase):
     """movie_paths(combine=True): companion coordinates from the book, container FORCED
     to .mkv, apply_container bypassed, descriptor round-trip, prefetch exclusion."""

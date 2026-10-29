@@ -143,6 +143,210 @@ class RemuxProgress(unittest.TestCase):
         self.assertEqual([e["pct"] for e in emitted], [0.0, 50.0, 100.0])
 
 
+class RemuxHelperSegments(unittest.TestCase):
+    """With the helper switched on, _remux passes dvcap an on_segments callback and the lane's
+    progress carries WHERE the segments stand (segs_done / helper_segs / mac_seg / helper_seg /
+    helper_fps); seg_done is then dvcap's plan-order PREFIX count, not the ends the cumulative
+    frame total passed (the helper works from the back, so the total runs ahead of plan order)
+    and not len(segs_done) either: deploy-now deploys when it rises, so it must rise only at a
+    Mac segment boundary. With it off the call and every tick are exactly the old ones."""
+
+    NEW_KEYS = ("segs_done", "helper_segs", "mac_seg", "helper_seg", "helper_fps")
+
+    def _run(self, fake_remux, *, helper=True, rpu_only=False):
+        import plan, remux, settings
+        p = _paths(tempfile.mkdtemp())
+        emitted = []
+        st = {"max_peak_mbps": 50, "audio_target_lufs": -16}
+        if helper:
+            st["helper_enabled"] = True
+        # new= a plain function (not a Mock, whose signature takes **kwargs): the gate reads
+        # the callee's own signature, exactly as it reads the real remux.remux's
+        patches = [mock.patch.object(remux, "remux", new=fake_remux),
+                   mock.patch.object(settings, "get_settings", return_value=st)]
+        if rpu_only:
+            patches += [mock.patch.object(plan, "plan_for", return_value={"topaz": "rpu-only"}),
+                        mock.patch.object(stages, "_source_peak_mbps", return_value=95.0),
+                        mock.patch.object(stages, "_plan_fast_path_bounds"),
+                        mock.patch.object(remux, "remux_splice",
+                                          return_value=remux.RemuxResult(
+                                              False, p.final,
+                                              reason=remux.SPLICE_FALLBACK + "test"))]
+        for pt in patches:
+            pt.start()
+            self.addCleanup(pt.stop)
+        ok, _ = stages.run_stage("remux", p, progress=emitted.append)
+        self.assertTrue(ok)
+        return emitted
+
+    def test_helper_off_passes_nothing_and_ticks_are_unchanged(self):
+        import types
+        seen = {}
+
+        def fake_remux(*a, on_progress=None, on_plan=None, **kw):
+            seen.update(kw)
+            on_plan([100, 200, 300], 300)
+            on_progress(150, 300)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux, helper=False)
+        self.assertNotIn("on_segments", seen)
+        self.assertEqual(emitted[0]["seg_done"], 1)
+        for k in self.NEW_KEYS:
+            self.assertNotIn(k, emitted[0])
+
+    def test_helper_on_with_a_callee_that_lacks_the_keyword_makes_the_old_call(self):
+        import types
+
+        def fake_remux(dv, cfr, orig, out, *, cap_mbps, audio_target_lufs, boundaries, abort,
+                       on_progress, on_plan, should_pause=None, on_repair=None,
+                       encode_source=None, audio_gain_db=None):
+            on_plan([100, 200, 300], 300)
+            on_progress(150, 300)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux)          # no TypeError: the keyword was not passed
+        self.assertEqual(emitted[0]["seg_done"], 1)
+        self.assertNotIn("segs_done", emitted[0])
+
+    def test_takes_kw_reads_the_signature(self):
+        def named(a, *, on_segments=None):
+            pass
+
+        def anykw(a, **kw):
+            pass
+
+        def neither(a, *, on_plan=None):
+            pass
+        self.assertTrue(stages._takes_kw(named, "on_segments"))
+        self.assertTrue(stages._takes_kw(anykw, "on_segments"))
+        self.assertFalse(stages._takes_kw(neither, "on_segments"))
+        self.assertFalse(stages._takes_kw(42, "on_segments"))       # not inspectable: old call
+
+    def test_positions_follow_on_segments_and_seg_done_stays_the_plan_order_prefix(self):
+        import types
+
+        # dvcap's own order: each report is on_progress (seg_done = the plan-order PREFIX),
+        # then on_segments, under one lock
+        def fake_remux(*a, on_progress=None, on_plan=None, on_segments=None, **kw):
+            on_plan([100, 200, 300, 400], 400)
+            on_progress(0, 400)                                     # before any report
+            on_segments({"done": [], "helper_done": [], "mac": [0, 0.0],
+                         "helper": [3, 0.0, None]})                 # first report: published
+            on_progress(110, 400, seg_done=0)                       # 110 >= end 100, yet 0 done
+            on_segments({"done": [], "helper_done": [], "mac": [0, 0.5],
+                         "helper": [3, 0.6, 7.94]})                 # in-flight only: rides along
+            on_progress(190, 400, seg_done=0)
+            on_segments({"done": [3], "helper_done": [3], "mac": [0, 0.9],
+                         "helper": None})                           # the helper's lands
+            on_progress(200, 400, seg_done=1)                       # the Mac's lands: prefix 1
+            on_segments({"done": [0, 3], "helper_done": [3], "mac": [1, 0.0],
+                         "helper": [2, 0.0, 8.0]})
+            on_progress(400, 400, seg_done=4)
+            on_segments({"done": [0, 1, 2, 3], "helper_done": [2, 3], "mac": None,
+                         "helper": None})
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux)
+        self.assertEqual(len(emitted), 9)
+        before, first, tick, tick2, helper_lands, mac_tick, mac_lands, last, all_in = emitted
+        for k in self.NEW_KEYS:
+            self.assertNotIn(k, before)
+        self.assertEqual(first["segs_done"], [])
+        self.assertEqual((first["mac_seg"], first["helper_seg"], first["helper_fps"]),
+                         ([0, 0.0], [3, 0.0], None))
+        self.assertEqual(tick["seg_done"], 0)                       # NOT 1 (frames ran ahead)
+        self.assertEqual(tick["notches"], [0.25, 0.5, 0.75, 1.0])
+        self.assertEqual(tick["seg_total"], 4)
+        self.assertEqual((tick2["mac_seg"], tick2["helper_seg"], tick2["helper_fps"]),
+                         ([0, 0.5], [3, 0.6], 7.9))
+        # the helper landing its segment lights it at once, but never moves seg_done: the Mac
+        # is still mid-segment, and deploy-now deploys the moment a lane's seg_done rises
+        self.assertEqual((helper_lands["seg_done"], helper_lands["segs_done"],
+                          helper_lands["helper_segs"]), (0, [3], [3]))
+        self.assertEqual((helper_lands["helper_seg"], helper_lands["helper_fps"]), (None, None))
+        self.assertEqual(helper_lands["frames"], 190)               # the last tick, re-published
+        self.assertEqual(helper_lands["pct"], 47.5)
+        self.assertEqual((mac_tick["seg_done"], mac_tick["segs_done"]), (1, [3]))
+        self.assertEqual((mac_lands["seg_done"], mac_lands["segs_done"]), (1, [0, 3]))
+        self.assertEqual((mac_lands["mac_seg"], mac_lands["helper_seg"]), ([1, 0.0], [2, 0.0]))
+        self.assertEqual((last["seg_done"], last["pct"]), (4, 100.0))
+        self.assertEqual((all_in["seg_done"], all_in["segs_done"], all_in["helper_segs"]),
+                         (4, [0, 1, 2, 3], [2, 3]))
+        self.assertEqual((all_in["mac_seg"], all_in["helper_seg"]), (None, None))
+        # seg_done only ever rose with the prefix, never with a helper's segment
+        self.assertEqual([e["seg_done"] for e in emitted], [0, 0, 0, 0, 0, 1, 1, 4, 4])
+
+    def test_a_new_plan_forgets_the_last_told_count(self):
+        import types
+
+        def fake_remux(*a, on_progress=None, on_plan=None, on_segments=None, **kw):
+            on_plan([100, 200], 200)
+            on_progress(200, 200, seg_done=2)
+            on_segments({"done": [0, 1], "helper_done": [1], "mac": None, "helper": None})
+            on_plan([100, 200, 300], 300)                       # another plan (a fallback encode)
+            on_progress(150, 300)                               # no keyword: counted by frames
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux)
+        self.assertEqual(emitted[-1]["seg_done"], 1)
+
+    def test_a_malformed_report_changes_nothing_and_never_raises(self):
+        import types
+
+        def fake_remux(*a, on_progress=None, on_plan=None, on_segments=None, **kw):
+            on_plan([100, 200], 200)
+            on_progress(50, 200)
+            on_segments("not a dict")
+            on_segments({"done": ["x"]})
+            on_segments({"mac": [1]})
+            on_segments({"mac": {"i": 1}})
+            on_segments({"done": [float("inf")]})
+            on_progress(60, 200)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux)
+        self.assertEqual(len(emitted), 2)
+        self.assertNotIn("segs_done", emitted[-1])
+        self.assertEqual(emitted[-1]["seg_done"], 0)
+
+    def test_a_non_finite_rate_or_fraction_never_reaches_the_state(self):
+        import json, types
+
+        def fake_remux(*a, on_progress=None, on_plan=None, on_segments=None, **kw):
+            on_plan([100, 200], 200)
+            on_progress(50, 200)
+            on_segments({"done": [], "helper_done": [], "mac": [0, float("nan")],
+                         "helper": [1, float("inf"), float("nan")]})
+            return types.SimpleNamespace(ok=True, reason="ok")
+        last = self._run(fake_remux)[-1]
+        self.assertEqual((last["mac_seg"], last["helper_seg"], last["helper_fps"]),
+                         ([0, 0.0], [1, 0.0], None))
+        json.dumps(last, allow_nan=False)            # strict JSON: the app's decoder never chokes
+
+    def test_the_plan_order_count_wins_over_the_frame_total_before_a_report(self):
+        import types
+
+        def fake_remux(*a, on_progress=None, on_plan=None, on_segments=None, **kw):
+            on_plan([100, 200, 300], 300)
+            on_progress(150, 300, seg_done=0)       # dvcap's own count, no positions yet
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux)
+        self.assertEqual(emitted[0]["seg_done"], 0)
+        self.assertNotIn("segs_done", emitted[0])
+
+    def test_a_revoked_fast_path_keeps_the_plan_order_count_for_the_capped_stage(self):
+        import types
+
+        def fake_remux(*a, on_progress=None, on_plan=None, on_segments=None, **kw):
+            on_plan([100, 200, 300], 300)
+            on_segments({"done": [2], "helper_done": [2], "mac": [0, 0.4], "helper": None})
+            on_progress(140, 300, seg_done=0)
+            return types.SimpleNamespace(ok=True, reason="ok")
+        emitted = self._run(fake_remux, rpu_only=True)
+        last = emitted[-1]
+        self.assertEqual(last["stage_idx"], 2)
+        # the prefix (the Mac is still on segment 0); the app counts len(segs_done) itself
+        self.assertEqual((last["seg_done"], last["stage_seg_done"]), (0, 0))
+        self.assertEqual(last["segs_done"], [2])
+        self.assertEqual(last["stage_notches"], last["notches"])   # the app's "own" test
+
+
 class TopazSegBounds(unittest.TestCase):
     """The remux re-encodes at the SAME scene-cut segment BOUNDARIES as this episode's topaz — the
     cumulative segment-end frames are stashed when topaz plans and read back when the remux runs
@@ -1231,6 +1435,37 @@ class CombineStages(unittest.TestCase):
         self.assertTrue(kw["capped"])
         self.assertEqual(kw["boundaries"], [100, 200])
 
+    def test_the_capped_combine_hears_the_helpers_segments_too(self):
+        import companion, remux, settings
+        d = tempfile.mkdtemp()
+        p = self._p(d)
+        emitted = []
+
+        def fake_combine(*a, capped=False, on_progress=None, on_plan=None, on_segments=None,
+                         **kw):
+            self.assertTrue(capped)
+            on_plan([100, 200], 200)
+            on_segments({"done": [1], "helper_done": [1], "mac": [0, 0.5], "helper": None})
+            on_progress(150, 200, seg_done=0)
+            return remux.RemuxResult(True, p.final, "8.1", 2, 1, "ok")
+        with mock.patch.object(companion, "confirmed_verdict", return_value=dict(self.CV)), \
+             mock.patch.object(settings, "get_settings",
+                               return_value={"max_peak_mbps": 50, "audio_target_lufs": -16,
+                                             "helper_enabled": True}), \
+             mock.patch.object(stages, "_peak_of", return_value=96.0), \
+             mock.patch.object(stages, "_plan_fast_path_bounds", return_value=" planned"), \
+             mock.patch.object(stages, "_read_topaz_bounds", return_value=[100, 200]), \
+             mock.patch.object(remux, "remux_splice",
+                               return_value=remux.RemuxResult(
+                                   False, p.final, reason=remux.SPLICE_FALLBACK + "test")), \
+             mock.patch.object(remux, "combine", new=fake_combine):
+            ok, _ = stages.run_stage("remux", p, progress=emitted.append)
+        self.assertTrue(ok)
+        last = emitted[-1]
+        # seg_done stays dvcap's plan-order prefix (the Mac is still on segment 0)
+        self.assertEqual((last["seg_done"], last["segs_done"], last["mac_seg"]),
+                         (0, [1], [0, 0.5]))
+
     def test_remux_over_gate_combine_splices_the_winner(self):
         import companion, remux
         d = tempfile.mkdtemp()
@@ -2068,9 +2303,12 @@ class NativeRemuxBranch(_NativeItem):
     PRE_NATIVE_KWARGS = {"cap_mbps", "audio_target_lufs", "audio_gain_db", "boundaries", "abort",
                          "on_progress", "on_plan", "should_pause", "on_repair", "encode_source"}
 
-    def _remux(self, ok=True, *, write_final=True, drive=None):
+    def _remux(self, ok=True, *, write_final=True, drive=None, helper=False):
         import types, remux, settings
         got = {}
+        st = {"max_peak_mbps": 50, "audio_target_lufs": 0}
+        if helper:
+            st["helper_enabled"] = True
 
         def fake_remux(dv, cfr, orig, out, **kw):
             got.update(kw)
@@ -2082,8 +2320,7 @@ class NativeRemuxBranch(_NativeItem):
                     f.write(b"master" * 10)
             return types.SimpleNamespace(ok=ok, reason="shipped" if ok else "peak gate failed")
         with mock.patch.object(remux, "remux", side_effect=fake_remux) as rm, \
-             mock.patch.object(settings, "get_settings",
-                               return_value={"max_peak_mbps": 50, "audio_target_lufs": 0}):
+             mock.patch.object(settings, "get_settings", return_value=st):
             res = stages.run_stage("remux", self.p, progress=lambda d: None)
         return res, got, rm
 
@@ -2170,6 +2407,39 @@ class NativeRemuxBranch(_NativeItem):
                                          "seg_0002": {"wall_s": 100.0, "frames": 10}})
         self.assertEqual(book["remux_repair"], {"seg_0001": {"wall_s": 80.0, "frames": 10}})
         self.assertEqual(book["analysis"]["chunk_0000"]["cpu_s"], 42.0)   # survives the pass
+
+    def test_a_helper_shared_native_remux_times_only_the_macs_segments(self):
+        import nativelane
+        self.make_ready(self.p)
+        now = [100.0]
+
+        def drive(kw):                       # dvcap's order: on_progress, then on_segments
+            def report(t, frames, prefix, info):
+                now[0] = t
+                kw["on_progress"](frames, 30, seg_done=prefix)
+                kw["on_segments"](info)
+            kw["on_plan"]([10, 20, 30], 30)
+            report(100.0, 0, 0, {"done": [], "helper_done": [], "mac": [0, 0.0],
+                                 "helper": [2, 0.0, 5.0]})
+            report(150.0, 12, 0, {"done": [], "helper_done": [], "mac": [0, 0.6],
+                                  "helper": [2, 0.6, 5.0]})
+            report(170.0, 20, 0, {"done": [2], "helper_done": [2], "mac": [0, 0.9],
+                                  "helper": None})               # the helper's: never booked
+            report(180.0, 20, 1, {"done": [0, 2], "helper_done": [2], "mac": None,
+                                  "helper": None})               # the Mac's: 80 s
+            report(180.0, 20, 1, {"done": [0, 2], "helper_done": [2], "mac": [1, 0.0],
+                                  "helper": None})
+            report(200.0, 25, 1, {"done": [0, 2], "helper_done": [2], "mac": [1, 0.5],
+                                  "helper": None})
+            report(240.0, 30, 3, {"done": [0, 1, 2], "helper_done": [2], "mac": None,
+                                  "helper": None})               # 60 s
+        with mock.patch.object(stages.time, "monotonic", side_effect=lambda: now[0]):
+            (ok, msg), got, _rm = self._remux(ok=True, drive=drive, helper=True)
+        self.assertTrue(ok, msg)
+        self.assertIn("on_segments", got)
+        book = nativelane._read_json(nativelane.cpu_path(self.p))
+        self.assertEqual(book["remux"], {"seg_0000": {"wall_s": 80.0, "frames": 10},
+                                         "seg_0001": {"wall_s": 60.0, "frames": 10}})
 
     def test_the_resolve_call_gets_the_original_callbacks(self):
         (ok, _msg), got, _rm = self._remux(ok=True)
@@ -2280,6 +2550,59 @@ class NativeRemuxClock(unittest.TestCase):
         with mock.patch.object(stages.logbook, "exception") as logged:
             self._at(9, 10)
         logged.assert_called_once()
+
+    def _report(self, t, frames, info, total=40):
+        # one report of a helper-shared encode, in dvcap's order: on_progress, then on_segments
+        self.now[0] = t
+        self.c.progress(frames, total, seg_done=0)
+        self.c.segments(info)
+
+    def test_a_helper_shared_encode_books_only_the_macs_segments(self):
+        # the Mac on segment 0, the helper on the last, both at the same rate: the frame total
+        # crosses the first two ends long before the Mac finishes anything (the bug this pins
+        # booked seg_0000 AND seg_0001 at half the Mac's real time)
+        self.c.plan([10, 20, 30, 40], 40)
+        self._report(0, 0, {"done": [], "helper_done": [], "mac": [0, 0.0], "helper": [3, 0.0, 5.0]})
+        self._report(5, 10, {"done": [], "helper_done": [], "mac": [0, 0.5], "helper": [3, 0.5, 1.0]})
+        self._report(9, 18, {"done": [], "helper_done": [], "mac": [0, 0.9], "helper": [3, 0.9, 1.0]})
+        self._report(10, 20, {"done": [3], "helper_done": [3], "mac": [0, 0.9], "helper": None})
+        self.assertEqual(self._book(), {})                     # the helper's: never Mac time
+        self._report(12, 21, {"done": [0, 3], "helper_done": [3], "mac": None, "helper": None})
+        self._report(12, 21, {"done": [0, 3], "helper_done": [3], "mac": [1, 0.0],
+                              "helper": [2, 0.0, 1.0]})
+        self._report(20, 30, {"done": [0, 3], "helper_done": [3], "mac": [1, 0.5],
+                              "helper": [2, 0.4, 1.0]})
+        self._report(28, 39, {"done": [0, 2, 3], "helper_done": [2, 3], "mac": [1, 0.9],
+                              "helper": None})
+        self._report(32, 40, {"done": [0, 1, 2, 3], "helper_done": [2, 3], "mac": None,
+                              "helper": None})
+        self.assertEqual(self._book(), {"remux": {"seg_0000": {"wall_s": 12.0, "frames": 10},
+                                                  "seg_0001": {"wall_s": 20.0, "frames": 10}}})
+
+    def test_a_shared_segment_with_no_live_frame_or_lost_by_the_mac_is_never_booked(self):
+        self.c.plan([10, 20, 30], 30)
+        self._report(0, 10, {"done": [0], "helper_done": [], "mac": None, "helper": None},
+                     total=30)                                 # resumed from disk
+        self._report(1, 10, {"done": [0], "helper_done": [], "mac": [1, 0.0], "helper": None},
+                     total=30)
+        self._report(9, 10, {"done": [0], "helper_done": [], "mac": None, "helper": None},
+                     total=30)                                 # the Mac lost it (an error)
+        self._report(10, 10, {"done": [0], "helper_done": [], "mac": [1, 0.0], "helper": None},
+                     total=30)
+        self._report(11, 20, {"done": [0, 1], "helper_done": [], "mac": None, "helper": None},
+                     total=30)                                 # done with no frame seen first
+        self.assertEqual(self._book(), {})
+        self.c.plan([10, 20, 30], 30)                          # a later attempt without the helper
+        self._at(20, 20)                                       # ...resumed to segment 3,
+        self._at(25, 25)                                       # which it encodes live
+        self._at(30, 30)
+        self.assertEqual(self._book(), {"remux": {"seg_0002": {"wall_s": 10.0, "frames": 10}}})
+
+    def test_a_malformed_shared_report_never_raises(self):
+        self.c.plan([10, 20], 20)
+        for bad in ("x", {"done": ["x"]}, {"mac": [1]}, {"mac": {"i": 1}}, None):
+            self.c.segments(bad)
+        self.assertEqual(self._book(), {})
 
     def test_the_log_line_sums_the_ledger(self):
         self.c.plan([10, 20], 20)
