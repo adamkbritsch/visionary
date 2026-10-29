@@ -4,8 +4,8 @@ import AppKit
 // The in-app onboarding: every setup step (docs/SETUP.md) as a live row inside Settings —
 // connection fields (writing ~/.topaz-pipeline/config.json through the redacted
 // /api/config), one-click dependency installs with live output, version and
-// toolchain checks, and the optional NAS helper. Auto-expanded until every preflight
-// check passes, collapsed after.
+// toolchain checks, the optional NAS DV probe and the optional Helper (a Linux PC).
+// Auto-expanded until every preflight check passes, collapsed after.
 
 private struct SetupGroupLabel: View {
     let text: String
@@ -64,6 +64,7 @@ struct SetupSection: View {
                     OptionalConnectionsGroup()
                     YoutarrSettingsGroup()
                     NASExtrasGroup()
+                    HelperSetupGroup()
                     HStack {
                         Button("Recheck everything") { Task { await store.recheckSetup() } }
                             .buttonStyle(SteelButtonStyle(lit: false))
@@ -684,7 +685,7 @@ private struct ApplicationsGroup: View {
     }
 }
 
-// MARK: - NAS extras (optional helper)
+// MARK: - NAS extras (the optional DV probe)
 
 private struct NASExtrasGroup: View {
     @EnvironmentObject var store: AppStore
@@ -720,6 +721,163 @@ private struct NASExtrasGroup: View {
                     }
                 }
             }
+        }
+    }
+}
+
+// MARK: - the helper (optional)
+// A Linux PC on Ethernet encodes some of the remux's segments (engine/helper.py). Its address,
+// login and key are saved SETTINGS (settings.json, not config.json). The rows below are the
+// engine's setup checks (GET /api/helper/setup): asked for when this opens, on Test, after a
+// save and after a helper job, never on the poll. Each failing row carries the one thing that
+// fixes it: a job button with its live tail, or the Terminal command that authorises the key.
+// Optional: never part of setup_complete.
+private struct HelperSetupGroup: View {
+    @EnvironmentObject var store: AppStore
+    @State private var host = ""
+    @State private var user = ""
+    @State private var key = ""
+    @State private var seeded = false
+
+    static let defaultKey = "~/.ssh/id_ed25519_visionary_helper"   // engine/settings.py's default
+    private static let order = ["login", "wired", "worker", "x265", "helper"]
+    private static let titles = ["login": "Signs in", "wired": "Ethernet", "worker": "Worker",
+                                 "x265": "x265", "helper": "Status"]
+
+    private var configured: Bool { store.state?.settings?.helperConfigured ?? false }
+    private var switchedOn: Bool { store.state?.settings?.helper_enabled ?? false }
+    private var h: HelperSetupDTO? { store.helperSetup }
+
+    private func job(_ what: String) -> InstallJobDTO? { store.installStatus?.jobs?[what] }
+    private func running(_ what: String) -> Bool {
+        store.installStatus?.active == what && job(what)?.state == "running"
+    }
+
+    private func field(_ label: String, _ text: Binding<String>, hint: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.system(size: 12)).frame(width: 92, alignment: .leading)
+            TextField(hint, text: text).textFieldStyle(.roundedBorder).font(.system(size: 12))
+        }
+    }
+
+    /// The job a row can start and its button word. The engine names it in `action`, except the
+    /// key: "Create key" sits on the sign-in row whenever the key file is missing.
+    private func jobFor(_ c: HelperCheckDTO) -> (what: String, label: String)? {
+        if c.id == "login", h?.key_exists == false { return ("helper_key", "Create key") }
+        switch c.action {
+        case "helper_worker": return ("helper_worker", "Install")
+        case "helper_x265":   return ("helper_x265", "Build")
+        default:              return nil
+        }
+    }
+
+    private func tail(_ j: InstallJobDTO) -> some View {
+        // the live tail (or the failure's last lines), as in Dependencies
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array((j.tail ?? []).suffix(8).enumerated()), id: \.offset) { _, line in
+                Text(line).font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(j.state == "failed" ? DS.fault : .secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.25)))
+    }
+
+    private func checkRow(_ c: HelperCheckDTO) -> some View {
+        let j = jobFor(c)
+        // Switched off, the status is just that, not a fault: its dot stays neutral until it is on.
+        let dot: Bool? = c.id == "helper" && !switchedOn ? (c.ok == true ? true : nil) : c.ok
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                CheckDot(ok: dot)
+                Text(Self.titles[c.id ?? ""] ?? (c.id ?? "")).font(.system(size: 12, weight: .medium))
+                Spacer()
+                if let j {
+                    Button {
+                        Task { await store.startInstall(j.what) }
+                    } label: {
+                        if running(j.what) { ProgressView().controlSize(.small) }
+                        else { Text(j.label) }
+                    }.buttonStyle(SteelButtonStyle(lit: true))
+                        .disabled(store.installStatus?.active != nil && !running(j.what))
+                }
+            }
+            if let d = c.detail, !d.isEmpty {
+                Text(d).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let j, let t = job(j.what), running(j.what) || t.state == "failed" {
+                tail(t)
+            }
+            if c.action == "authorize", h?.key_exists != false,
+               let cmd = h?.authorize_cmd, !cmd.isEmpty {
+                Text("Run this once in Terminal; it asks for the helper's password.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                CopyValueRow(value: cmd)
+            }
+        }
+    }
+
+    /// Every check passes. Switched off, the status is the one exception: "off" is then a choice,
+    /// not something left to set up.
+    private func ready(_ checks: [HelperCheckDTO]) -> Bool {
+        !checks.isEmpty && checks.allSatisfy { $0.ok == true || ($0.id == "helper" && !switchedOn) }
+    }
+
+    private func seed() {
+        guard !seeded, let s = store.state?.settings else { return }
+        host = s.helper_host ?? ""
+        user = s.helper_user ?? ""
+        key = s.helper_key ?? ""
+        seeded = true
+    }
+
+    private func save() {
+        let trim = { (v: String) in v.trimmingCharacters(in: .whitespacesAndNewlines) }
+        host = trim(host)
+        user = trim(user)
+        key = trim(key).isEmpty ? Self.defaultKey : trim(key)   // an empty key field means the hint
+        let body: [String: Any] = ["helper_host": host, "helper_user": user, "helper_key": key]
+        Task { await store.saveSettings(body) }   // saving re-runs the checks (AppStore)
+    }
+
+    var body: some View {
+        // the checks only once the address and login are saved, and only for a set-up answer
+        let checks = configured && h?.configured == true
+            ? Self.order.compactMap { h?[check: $0] } : []
+        VStack(alignment: .leading, spacing: 8) {
+            SetupGroupLabel(text: "Helper (optional)")
+            Text("A Linux PC on Ethernet can encode some segments alongside this Mac.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 7) {
+                field("Address", $host, hint: "my-pc.local or 192.168.1.50")
+                field("Login", $user, hint: "your user name on it")
+                field("SSH key", $key, hint: Self.defaultKey)
+                HStack(spacing: 8) {
+                    Button("Save") { save() }.buttonStyle(SteelButtonStyle(lit: true))
+                    if configured {
+                        Button {
+                            Task { await store.fetchHelperSetup(fresh: true) }
+                        } label: {
+                            if store.helperChecking { ProgressView().controlSize(.small) }
+                            else { Text("Test") }
+                        }.buttonStyle(SteelButtonStyle(lit: false))
+                            .disabled(store.helperChecking)
+                    }
+                    Spacer()
+                }
+            }
+            ForEach(Array(checks.enumerated()), id: \.offset) { _, c in checkRow(c) }
+            if ready(checks) {
+                Text(switchedOn ? "Ready. It joins the next remux." : "Ready. Switch the Helper on below.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { seed() }
+        .onChange(of: store.state?.settings?.helper_host) { seed() }   // state landed after open
+        .task {
+            if configured { await store.fetchHelperSetup(fresh: false) }
         }
     }
 }

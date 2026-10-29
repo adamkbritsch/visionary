@@ -4078,7 +4078,8 @@ private struct PlexThrottleRow: View {
 }
 
 /// The helper (2026-10-28; engine/helper.py): a Linux machine on Ethernet takes some of the
-/// remux's segments. Built like PlexThrottleRow.
+/// remux's segments. Built like PlexThrottleRow. Shown only once Setup → Helper has its address
+/// and login saved: before that the switch would point at no machine.
 private struct HelperRow: View {
     @EnvironmentObject var store: AppStore
     private var on: Bool { store.state?.settings?.helper_enabled ?? false }
@@ -4180,7 +4181,7 @@ struct SettingsPopover: View {
                            range: 0...240, step: 5, unit: "min", zeroLabel: "Off")
                 NasNetworkRow()
                 PlexThrottleRow()
-                HelperRow()
+                if store.state?.settings?.helperConfigured == true { HelperRow() }   // set up in Setup
 
                 Divider()
 
