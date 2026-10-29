@@ -53,3 +53,23 @@ With no Plex — or while it is unreachable — the built-in layout applies unch
 variants for TV and Movies). `TOPAZ_NAS_FTP_TV`, `TOPAZ_NAS_FTP_MOVIES`,
 `TOPAZ_NAS_FTP_YOUTUBE` (TV/Movies also take `..._ROOTS` comma-lists) still override
 everything, including Plex detection.
+
+## settings.json — the Helper
+
+The app's own settings live beside `config.json` in `~/.topaz-pipeline/settings.json` (the
+app writes them; no env override). The optional [Helper](HELPER.md) uses four of
+them, all set from the app: the address, login and key from **Settings → Setup → Helper**, the
+switch from **Settings → Helper**.
+
+| settings key | default | what |
+|---|---|---|
+| `helper_enabled` | `false` | the **Helper** switch; off = the remux runs exactly as without a helper |
+| `helper_host` | `""` | the helper's address: a host name (`helper.local`) or an IPv4 address (`192.168.1.50`) |
+| `helper_user` | `""` | your login on the helper |
+| `helper_key` | `"~/.ssh/id_ed25519_visionary_helper"` | the ssh private key the Mac logs in with (no passphrase; `~` is allowed) |
+
+With `helper_host` or `helper_user` empty the helper is *not set up*: it stays off and its
+status reads *off · not set up*. An address or login may hold letters, digits, `.`, `_` and
+`-`, starting with a letter or digit; a key path must be one line and not start with `-`. A
+value that breaks those rules is kept exactly as typed, never swapped for a default, and the
+helper stays off with *settings: bad host* (or user, or key) until it is fixed.

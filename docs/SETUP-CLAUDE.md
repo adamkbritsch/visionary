@@ -1,6 +1,6 @@
 # SETUP-CLAUDE — the guided-install runbook
 
-This mirrors [docs/SETUP.md](SETUP.md)'s steps 1-12 **exactly**
+This mirrors [docs/SETUP.md](SETUP.md)'s steps 1-13 **exactly**
 (same numbering — SETUP.md is the canonical source; if they ever disagree, SETUP.md
 wins). It adds what Claude needs: per-step checks, expected preflight output, and
 secrets etiquette.
@@ -154,6 +154,19 @@ the user wants a MacBook to keep running with its lid closed. Relay its `fix` ve
 their password; never run it for them or ask for the password. Verify with
 `python3 engine/lidsleep.py --status` (`"allowed": true`). The engine holds it only while
 activated on AC and releases it on deactivate, unplug, a power pause, or its own death.
+
+### Step 13 — Helper (OPTIONAL, skip by default)
+Only if the user has a spare Linux machine on Ethernet and asks for it. Preflight never checks
+it and it is not part of the arm gate. Point them at Settings → Setup → *Helper* (Address,
+Login, SSH key, then Create key / Install / Build, then the **Helper** switch in Settings); the
+full guide is [docs/HELPER.md](HELPER.md). The readiness probe is read-only:
+`curl -s 'http://127.0.0.1:8765/api/helper/setup?fresh=1'` — `checks[]` in the order login,
+wired, worker, x265, helper, each with `ok` (true / false / null = not checked yet or not applicable) and the
+`action` that fixes it (`authorize`, `helper_worker`, `helper_x265`). Those jobs are
+`POST /api/setup/install` with `{"what": "helper_key" | "helper_worker" | "helper_x265"}`, one
+at a time, like step 11. **The USER runs `authorize_cmd`** (`ssh-copy-id ...`) in their own
+Terminal: it asks for their password on the helper — never run it for them or ask for that
+password.
 
 ---
 

@@ -194,14 +194,27 @@ or crashes, so the Mac can't end up awake in a bag. A desktop Mac has no lid and
 this. `python3 engine/lidsleep.py --status` shows where it stands. To remove it:
 `sudo rm /etc/sudoers.d/visionary-lidsleep`.
 
+## 13. Helper — OPTIONAL, a Linux machine on Ethernet
+
+Skip this unless you have a spare Linux machine (a desktop, or a laptop or handheld on its
+charger) wired to the same network as the Mac. Preflight never checks it and it is not part of
+the arm gate; with no helper, the remux runs exactly as before.
+
+Set it up in **Settings → Setup → Helper**: enter its Address, Login and SSH key, press
+*Create key* if you have none, run the `ssh-copy-id` command it shows once in Terminal, then
+*Install* and *Build*. Switch **Helper** on in Settings when the checks are green.
+Requirements, what each check and status means, and the same steps by hand (the scripts are in
+`engine/helper_worker/`): [Helper](HELPER.md).
+
 # Repo map
 
 | path | what |
 |---|---|
 | `engine/` | the Python pipeline (orchestrator, stages, preflight, dashboard server) |
+| `engine/helper_worker/` | the optional [Helper](HELPER.md)'s worker, and the scripts that install it and build its x265 |
 | `macapp/` | the SwiftUI app + build/signing scripts |
 | `dv/` | the pinned Dolby Vision toolchain files: the hdr_analyzer_mvp build, the SDR→PQ LUT and dovi_tool 2.3.0 |
 | `bundle/` | Topaz presets (reference only) |
-| `nas/` | optional NAS-side helper (`dv_probe.py`) |
+| `nas/` | optional NAS-side probe (`dv_probe.py`) |
 | `tools/` | maintainer-only checks (end-to-end route runs, CPU measurements) |
 | `deploy-now.sh` | redeploy the app at a safe pipeline boundary |
