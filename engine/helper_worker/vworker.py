@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """vworker -- Visionary's optional x265 helper, running on a Linux machine on Ethernet ("the
-helper"; first measured on a docked ROG Ally under Bazzite).
+helper"; first measured on a docked handheld PC).
 
 The Mac decodes + colour-converts a segment itself (its SDR->PQ step is the only bit-exact one)
 and streams the raw y4m to us, zstd-compressed, over ssh. We only run x265 on it and stream the
@@ -10,7 +10,9 @@ ever owns is its RPU slice, and the job directory is deleted on every exit path.
 Wire protocol v1 (the Mac half lives in engine/helper.py):
     vworker status                 one JSON line on stdout, exit 0 always, answers in < 3 s;
                                    "x265" is the full version token (e.g. "4.1+1-1d117be");
-                                   "code" is the reason as one word (REASON_CODES) next to "why"
+                                   "code" is the reason as one word (REASON_CODES) next to "why";
+                                   "sha256" is this script's own sha256 (the Mac compares it with
+                                   its copy); "ipv4" lists the IPv4 addresses on the wired links
     vworker put <job> <name> <bytes>
                                    exactly <bytes> of stdin -> jobs/<job>/<name> (the RPU slice,
                                    "rpu.bin"); a short or long read, SIGHUP/SIGTERM/SIGINT, or
@@ -45,14 +47,21 @@ the Mac goes away (parent gone, stdout broken, input truncated, no data for STAL
 menus) are below those thresholds and do not stop it. A Steam launch is a game when its AppId
 is a real Steam app (< 2^31) or Wine/Proton runs under it; a non-Steam shortcut (AppId >= 2^31)
 running a native Linux program (Firefox, Dolphin, ...) is judged by the CPU/GPU rule only.
-zstd and x265 run under SCHED_IDLE (nice 19 where that is unavailable): sched_autogroup is on,
-so nice alone would not let the desktop win.
+The GPU share is counted per process and leaves out the desktop's own drawing (compositor,
+Xwayland, shell) and the Steam client (GPU_EXCLUDED_NAMES): an idle desktop alone can keep a
+GPU 30-40 % busy. Where no per-process reading exists, the whole-device one stands in.
+On mains: a Mains supply online, or no system battery at all (a desktop, a mini PC, a VM); a
+laptop or handheld on battery is refused. Ethernet: any wired link that is up, told by /sys and
+not by its name (eth0, eno1, enp*, enx*, or a bridge or bond over one).
+zstd and x265 run under SCHED_IDLE (nice 19 where that is unavailable): most desktop distros
+turn sched_autogroup on, so nice alone would not let the desktop win. While they run, a logind
+sleep/idle block is held (systemd-inhibit, where it exists) so an idle helper does not suspend
+mid-segment.
 
-Stdlib only. Runs on Python 3.8+ (the measured helper has 3.14; the Mac's tests run it too).
-Paths and timings can be overridden through VWORKER_* environment variables (tests use them).
+Stdlib only. Runs on Python 3.8 or newer (no annotations, nothing newer from the stdlib; the
+Mac's tests run it too). Paths and timings can be overridden through VWORKER_* environment
+variables (tests use them).
 """
-from __future__ import annotations
-
 import base64
 import binascii
 import contextlib
@@ -96,7 +105,16 @@ CPU_CORES_LIMIT = 1.5                  # others' CPU, in cores
 GPU_BUSY_LIMIT = 30.0                  # percent, any GPU
 CHILD_NICE = 19                        # only where SCHED_IDLE is unavailable
 PUT_MAX_BYTES = 256 << 20              # an RPU slice is KBs; refuse anything absurd
+# free disk an encode needs: jobs stream (only the RPU slice and a FIFO are ever stored), so
+# this is headroom, not room for a segment
+MIN_FREE_GB = 5.0
 PF_KTHREAD = 0x00200000
+
+# where zstd lives when it is not on the login shell's PATH (the first is named when missing)
+ZSTD_PATHS = ("/usr/bin/zstd", "/usr/local/bin/zstd")
+# held while an encode runs: logind then blocks suspend and the idle action until it exits
+INHIBIT_ARGS = ["--what=sleep:idle", "--who=visionary-helper", "--why=encoding a segment",
+                "--mode=block", "sleep", "infinity"]
 
 # processes that are never a game even if their arguments look like one
 NOT_GAMES = {"steam", "steamwebhelper"}
@@ -113,6 +131,17 @@ GAME_LAUNCHERS = {"legendary", "gogdl", "nile"}
 _WIN_PATH = re.compile(r"[A-Za-z]:\\")
 _APPID = re.compile(r"AppId=(\d+)")
 
+# the desktop's own drawing: compositors, shells and X servers keep a GPU busy on an idle
+# desktop, so their GPU use (and the Steam client's) is never "anything heavy"
+DESKTOP_PROCESS_NAMES = {"kwin_wayland", "kwin_x11", "Xwayland", "Xorg", "X", "gnome-shell",
+                         "mutter", "plasmashell", "xwaylandvideobridge", "sway", "Hyprland",
+                         "weston", "labwc", "wayfire", "gamescope", "gamescope-wl"}
+GPU_EXCLUDED_NAMES = DESKTOP_PROCESS_NAMES | NOT_GAMES
+_COMM_LEN = 15                         # the kernel cuts /proc/<pid>/comm to 15 characters
+_GPU_EXCLUDED_CUT = {n[:_COMM_LEN] for n in GPU_EXCLUDED_NAMES if len(n) > _COMM_LEN}
+PMON_ARGV = ["nvidia-smi", "pmon", "-c", "1", "-s", "u"]   # one ~1 s sample, sm % per process
+PMON_TIMEOUT = 2.5
+
 
 # ---- configuration --------------------------------------------------------------------------
 
@@ -123,6 +152,29 @@ def _env_float(env, name, default):
         return default
 
 
+def _executable(path):
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def find_zstd(path=None):
+    """zstd on PATH, else in ZSTD_PATHS; ZSTD_PATHS[0] when there is none (status names it)."""
+    found = shutil.which("zstd", path=path)
+    if found:
+        return found
+    for p in ZSTD_PATHS:
+        if _executable(p):
+            return p
+    return ZSTD_PATHS[0]
+
+
+def find_inhibit(path=None):
+    """systemd-inhibit, or "" where there is none (then no sleep block is taken)."""
+    found = shutil.which("systemd-inhibit", path=path)
+    if found:
+        return found
+    return "/usr/bin/systemd-inhibit" if _executable("/usr/bin/systemd-inhibit") else ""
+
+
 class Config:
     """Paths and timings. Everything is overridable from the environment (VWORKER_*)."""
 
@@ -130,7 +182,8 @@ class Config:
         env = os.environ if env is None else env
         home = os.path.expanduser("~")
         self.x265 = env.get("VWORKER_X265") or os.path.join(home, "visionary-worker", "bin", "x265")
-        self.zstd = env.get("VWORKER_ZSTD") or "/usr/bin/zstd"
+        self.zstd = env.get("VWORKER_ZSTD") or find_zstd(env.get("PATH"))
+        self.inhibit = env.get("VWORKER_INHIBIT") or find_inhibit(env.get("PATH"))
         self.jobs = env.get("VWORKER_JOBS") or os.path.join(home, "visionary-scratch", "jobs")
         self.proc = env.get("VWORKER_PROC") or "/proc"
         self.sys = env.get("VWORKER_SYS") or "/sys"
@@ -138,7 +191,7 @@ class Config:
         self.heavy_secs = _env_float(env, "VWORKER_HEAVY_SECS", 10.0)
         self.status_sample = _env_float(env, "VWORKER_STATUS_SAMPLE", 1.0)
         self.stall_secs = _env_float(env, "VWORKER_STALL_SECS", 300.0)
-        self.min_free_gb = _env_float(env, "VWORKER_MIN_FREE_GB", 30.0)
+        self.min_free_gb = _env_float(env, "VWORKER_MIN_FREE_GB", MIN_FREE_GB)
         self.stage_ttl = _env_float(env, "VWORKER_STAGE_TTL", 60.0)     # put -> encode gap
         self.put_deadline = _env_float(env, "VWORKER_PUT_DEADLINE", 60.0)   # a whole put
         self.orphan_ttl = _env_float(env, "VWORKER_ORPHAN_TTL", 60.0)   # dir without marker
@@ -187,21 +240,119 @@ def _clk_tck():
 
 # ---- /sys: power and network ----------------------------------------------------------------
 
+# a system battery's status while the charger is in (with no Mains supply to ask)
+ON_AC_BATTERY_STATUS = {"Charging", "Full", "Not charging"}
+
+
 def ac_online(sys_root):
-    """Docked on mains: any power_supply of type Mains that is online."""
+    """On mains power. A Mains supply that is online says yes. A machine with no system battery
+    is mains-powered (a desktop, a mini PC, a VM; a controller's or a mouse's battery has scope
+    "Device" and does not count). With a system battery: a Mains supply that exists but is not
+    online says no (a USB-C source alone does not count); with no Mains supply at all, the
+    batteries' status decides -- "Charging", "Full" or "Not charging" is on AC, "Discharging"
+    (or nothing known) is on battery. A laptop or handheld on battery is refused."""
+    mains, batteries = [], []
     for d in sorted(glob.glob(os.path.join(sys_root, "class", "power_supply", "*"))):
-        if _read(os.path.join(d, "type")) == "Mains" and _read(os.path.join(d, "online")) == "1":
-            return True
-    return False
+        kind = _read(os.path.join(d, "type"))
+        if kind == "Mains":
+            mains.append(_read(os.path.join(d, "online")) == "1")
+        elif kind == "Battery" and _read(os.path.join(d, "scope")) != "Device":
+            batteries.append(_read(os.path.join(d, "status")))
+    if any(mains):
+        return True
+    if not batteries:
+        return True
+    if mains:
+        return False
+    return "Discharging" not in batteries and any(s in ON_AC_BATTERY_STATUS for s in batteries)
+
+
+ARPHRD_ETHER = "1"                     # /sys/class/net/<if>/type of Ethernet (and its bridges)
+
+
+def _link_up(d):
+    """operstate "up", or "unknown" (a driver that does not track it) with carrier 1."""
+    carrier = _read(os.path.join(d, "carrier"))
+    if carrier == "0":
+        return False
+    state = _read(os.path.join(d, "operstate"))
+    return state == "up" or (state == "unknown" and carrier == "1")
+
+
+def _lower_links(d):
+    """A bridge's, bond's or VLAN's member interfaces: brif/*, bonding/slaves and lower_*."""
+    names = set()
+    try:
+        names.update(os.listdir(os.path.join(d, "brif")))
+    except OSError:
+        pass
+    names.update((_read(os.path.join(d, "bonding", "slaves")) or "").split())
+    try:
+        names.update(n[len("lower_"):] for n in os.listdir(d) if n.startswith("lower_"))
+    except OSError:
+        pass
+    return sorted(names)
+
+
+def is_wired(sys_root, name, _depth=0):
+    """Is interface `name` an Ethernet link that is up? Told by /sys, never by the name: type 1
+    (ARPHRD_ETHER), no wireless/ or phy80211, up (_link_up), and either a physical device (its
+    /sys/class/net entry does not resolve under devices/virtual) or a bridge, bond or VLAN with
+    such a member that is up. Loopback, tun, WireGuard and Tailscale are not type 1; docker,
+    veth, virbr and tap are virtual with no physical member."""
+    if _depth > 4 or not name or "/" in name or name.startswith("."):
+        return False
+    d = os.path.join(sys_root, "class", "net", name)
+    if _read(os.path.join(d, "type")) != ARPHRD_ETHER:
+        return False
+    if os.path.lexists(os.path.join(d, "wireless")) or os.path.lexists(os.path.join(d, "phy80211")):
+        return False
+    if not _link_up(d):
+        return False
+    virtual = os.path.realpath(os.path.join(sys_root, "devices", "virtual")) + os.sep
+    if not os.path.realpath(d).startswith(virtual):
+        return True
+    return any(is_wired(sys_root, m, _depth + 1) for m in _lower_links(d))
 
 
 def ethernet_links(sys_root):
-    """Names of en* interfaces whose link is up with carrier."""
-    up = []
-    for d in sorted(glob.glob(os.path.join(sys_root, "class", "net", "en*"))):
-        if _read(os.path.join(d, "operstate")) == "up" and _read(os.path.join(d, "carrier")) == "1":
-            up.append(os.path.basename(d))
-    return up
+    """Names of the wired interfaces that are up (is_wired), in name order."""
+    try:
+        names = sorted(os.listdir(os.path.join(sys_root, "class", "net")))
+    except OSError:
+        return []
+    return [n for n in names if is_wired(sys_root, n)]
+
+
+_IPV4 = re.compile(r"\d{1,3}(\.\d{1,3}){3}")
+
+
+def wired_ipv4(links, runner):
+    """The IPv4 addresses (no prefix) on the interfaces in `links`, in that order, from
+    `ip -4 -o addr show`; [] when there are none or `ip` cannot tell."""
+    if not links:
+        return []
+    try:
+        argv = ["-4", "-o", "addr", "show"]
+        r = runner(["ip"] + argv, 1.0) or runner(["/usr/sbin/ip"] + argv, 1.0)
+        if not r or r[0] != 0:
+            return []
+        by_link = {}
+        for line in (r[1] or "").splitlines():
+            f = line.split()
+            if len(f) < 4 or f[2] != "inet":
+                continue
+            addr = f[3].split("/")[0]
+            if _IPV4.fullmatch(addr):
+                by_link.setdefault(f[1].rstrip(":").split("@")[0], []).append(addr)
+        out = []
+        for link in links:
+            for addr in by_link.get(link, ()):
+                if addr not in out:
+                    out.append(addr)
+        return out
+    except Exception:
+        return []
 
 
 def ssh_arrival_iface(ssh_connection, runner):
@@ -462,33 +613,270 @@ class CpuSampler:
         return cores, "%s %.1f cores" % (top, by_name[top] / self.clk / dt)
 
 
-def gpu_busy(sys_root, runner):
-    """(highest busy percent of any GPU, label). AMD/Intel: drm gpu_busy_percent. NVIDIA:
-    nvidia-smi, only when the nvidia module is loaded and nvidia-smi exists."""
+def _best(readings):
+    """The highest of [(percent, label)] -> (percent, label); (0.0, "") when none is above 0."""
     best, label = 0.0, ""
+    for pct, what in readings:
+        if pct > best:
+            best, label = pct, what
+    return best, label
+
+
+def _drm_cards(sys_root):
+    """[(card name, device id)] for /sys/class/drm/card<N>; the id is the basename of its
+    device link (a PCI address such as 0000:03:00.0), which is what fdinfo's drm-pdev names."""
+    out = []
     for card in sorted(glob.glob(os.path.join(sys_root, "class", "drm", "card*"))):
         name = os.path.basename(card)
-        if not re.fullmatch(r"card\d+", name):
+        if re.fullmatch(r"card\d+", name):
+            out.append((name, os.path.basename(os.path.realpath(os.path.join(card, "device")))))
+    return out
+
+
+def _drm_device_busy(sys_root, skip=()):
+    """[(percent, label)] of the whole device, for the cards not in `skip`: drm
+    gpu_busy_percent, which only amdgpu provides (i915, xe and nouveau give no reading)."""
+    out = []
+    for name, _dev in _drm_cards(sys_root):
+        if name in skip:
             continue
-        v = _read(os.path.join(card, "device", "gpu_busy_percent"))
+        v = _read(os.path.join(sys_root, "class", "drm", name, "device", "gpu_busy_percent"))
         try:
             pct = float(v) if v else None
         except ValueError:
             pct = None
-        if pct is not None and pct > best:
-            best, label = pct, "GPU %s %.0f%% busy" % (name, pct)
+        if pct is not None:
+            out.append((pct, "GPU %s %.0f%% busy" % (name, pct)))
+    return out
+
+
+def _nvidia_device_busy(runner):
+    """[(percent, label)] of each whole NVIDIA GPU from nvidia-smi; [] when it gives none."""
+    r = runner(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], 1.0)
+    out = []
+    if r and r[0] == 0:
+        for i, line in enumerate((r[1] or "").splitlines()):
+            try:
+                pct = float(line.strip())
+            except ValueError:
+                continue
+            out.append((pct, "NVIDIA GPU %d %.0f%% busy" % (i, pct)))
+    return out
+
+
+def gpu_busy(sys_root, runner):
+    """(highest busy percent of any whole GPU, label): drm gpu_busy_percent (amdgpu), and
+    nvidia-smi only when the nvidia module is loaded and nvidia-smi exists. Counts everything
+    on the GPU, the desktop's own drawing included; GpuSampler falls back to it."""
+    readings = _drm_device_busy(sys_root)
     if os.path.isdir(os.path.join(sys_root, "module", "nvidia")):
-        r = runner(["nvidia-smi", "--query-gpu=utilization.gpu",
-                    "--format=csv,noheader,nounits"], 1.0)
-        if r and r[0] == 0:
-            for i, line in enumerate(r[1].splitlines()):
-                try:
-                    pct = float(line.strip())
-                except ValueError:
+        readings += _nvidia_device_busy(runner)
+    return _best(readings)
+
+
+def _gpu_excluded(pid, procs, exclude, command=""):
+    """Is this process's GPU use left out: ours, the desktop's own drawing, or Steam's client?"""
+    if pid in exclude:
+        return True
+    p = procs.get(pid)
+    names = {p.comm, p.name} if p is not None else set()
+    if command:
+        names.add(os.path.basename(command))
+    return any(n in GPU_EXCLUDED_NAMES or (len(n) == _COMM_LEN and n in _GPU_EXCLUDED_CUT)
+               for n in names if n)
+
+
+def parse_drm_fdinfo(text):
+    """One /proc/<pid>/fdinfo/<fd> of a DRM fd -> ((device, client id), {engine: ns},
+    {engine: capacity}), or None when it carries no per-client engine time. The device is
+    drm-pdev (else drm-driver); engine time is "drm-engine-<name>: <ns> ns"."""
+    fields = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            fields[k.strip()] = v.strip()
+    client = fields.get("drm-client-id")
+    if not client:
+        return None
+    engines, capacity = {}, {}
+    for k, v in fields.items():
+        if k.startswith("drm-engine-capacity-"):
+            try:
+                capacity[k[len("drm-engine-capacity-"):]] = max(1, int(v))
+            except ValueError:
+                pass
+        elif k.startswith("drm-engine-"):
+            tok = v.split()
+            if tok and tok[0].isdigit() and tok[1:] in ([], ["ns"]):
+                engines[k[len("drm-engine-"):]] = int(tok[0])
+    if not engines:
+        return None
+    return (fields.get("drm-pdev") or fields.get("drm-driver") or "?", client), engines, capacity
+
+
+def drm_clients(proc_root, pids):
+    """{(device, client id): {"pids", "engines", "capacity"}} from the fdinfo of every DRM fd
+    (fd -> /dev/dri/*) of `pids` that this user can read. A client open in several fds or
+    processes is one client: its time counts once."""
+    out = {}
+    for pid in pids:
+        base = os.path.join(proc_root, str(pid))
+        try:
+            fds = os.listdir(os.path.join(base, "fdinfo"))
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if not os.readlink(os.path.join(base, "fd", fd)).startswith("/dev/dri/"):
                     continue
-                if pct > best:
-                    best, label = pct, "NVIDIA GPU %d %.0f%% busy" % (i, pct)
-    return best, label
+            except OSError:
+                continue
+            info = parse_drm_fdinfo(_read(os.path.join(base, "fdinfo", fd)) or "")
+            if info is None:
+                continue
+            key, engines, capacity = info
+            c = out.setdefault(key, {"pids": set(), "engines": engines, "capacity": capacity})
+            c["pids"].add(pid)
+    return out
+
+
+def parse_pmon(text):
+    """`nvidia-smi pmon -c 1 -s u` -> {gpu index: {pid: (sm percent, command)}}, or None when
+    it holds no GPU row. Columns are read from its header (newer drivers add jpg/ofa); a "-"
+    is 0; a GPU with nothing running shows one row of dashes (an empty dict)."""
+    cols = ["gpu", "pid", "type", "sm", "mem", "enc", "dec", "command"]
+    out = {}
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            head = [c.lower() for c in s[1:].split()]
+            if "gpu" in head and "pid" in head and "sm" in head:
+                cols = head
+            continue
+        f = s.split()
+        gi, pi, si = cols.index("gpu"), cols.index("pid"), cols.index("sm")
+        if len(f) <= max(gi, pi, si):
+            continue
+        try:
+            gpu = int(f[gi])
+        except ValueError:
+            continue
+        procs = out.setdefault(gpu, {})
+        try:
+            pid = int(f[pi])
+        except ValueError:
+            continue                              # "-": nothing running on this GPU
+        try:
+            sm = float(f[si])
+        except ValueError:
+            sm = 0.0
+        ci = cols.index("command") if "command" in cols else len(f)
+        command = " ".join(f[ci:])
+        if pid not in procs or sm > procs[pid][0]:
+            procs[pid] = (sm, command)
+    return out or None
+
+
+class GpuSampler:
+    """Others' GPU use, per process: (highest busy percent of any GPU, label). Leaves out our
+    own processes and GPU_EXCLUDED_NAMES (the desktop's own drawing, the Steam client).
+    NVIDIA (nvidia module loaded): `nvidia-smi pmon -c 1 -s u`, the sm % of the others summed
+    per GPU. Any other DRM driver (amdgpu, i915, ...): each client's engine time from
+    /proc/<pid>/fdinfo (drm-engine-<name>, deduplicated by drm-client-id), as busy % of the
+    GPU's busiest engine between two samples -- so it needs a baseline: begin(), or the first
+    sample() reads 0 for those GPUs. Where no per-process reading exists (pmon fails, no
+    readable client on a card), the whole-device reading stands in (gpu_busy's parts)."""
+
+    def __init__(self, sys_root, proc_root, runner):
+        self.sys_root, self.proc_root, self.runner = sys_root, proc_root, runner
+        self.nvidia = os.path.isdir(os.path.join(sys_root, "module", "nvidia"))
+        self.prev = None                     # (t, drm_clients) of the last sample
+        self.pmon = None                     # (thread, result box) of a pmon still sampling
+
+    def begin(self, procs, now):
+        """Baseline: the DRM clients' engine time now, and a pmon started in the background
+        (it samples for ~1 s, so status overlaps it with its CPU sample)."""
+        self.prev = (now, self._clients(procs))
+        self._start_pmon()
+
+    def _clients(self, procs):
+        return drm_clients(self.proc_root, [pid for pid, p in procs.items() if not p.kthread])
+
+    def _start_pmon(self):
+        if not self.nvidia or self.pmon is not None:
+            return
+        box = {}
+
+        def run():
+            try:
+                box["r"] = self.runner(PMON_ARGV, PMON_TIMEOUT)
+            except Exception:
+                box["r"] = None
+        t = threading.Thread(target=run, name="pmon", daemon=True)
+        self.pmon = (t, box)
+        t.start()
+
+    def _take_pmon(self):
+        if self.pmon is None:
+            return self.runner(PMON_ARGV, PMON_TIMEOUT)
+        t, box = self.pmon
+        t.join(PMON_TIMEOUT)
+        if t.is_alive():
+            return None                      # still sampling: the whole-device reading this time
+        self.pmon = None
+        return box.get("r")
+
+    def _drm(self, procs, exclude, now):
+        """[(percent, label)] per device with readable clients, and the cards they cover."""
+        cur = self._clients(procs)
+        prev, self.prev = self.prev, (now, cur)
+        names = {dev: name for name, dev in _drm_cards(self.sys_root)}
+        busy, caps = {}, {}                  # device -> {engine: ns of others}, {engine: capacity}
+        for (dev, _client), c in cur.items():
+            busy.setdefault(dev, {})
+            caps.setdefault(dev, {}).update(c["capacity"])
+        dt_ns = (now - prev[0]) * 1e9 if prev is not None else 0.0
+        if dt_ns > 0:
+            for key, c in cur.items():
+                if any(_gpu_excluded(pid, procs, exclude) for pid in c["pids"]):
+                    continue
+                old = prev[1].get(key)             # None: opened since, its time is all new
+                for eng, ns in c["engines"].items():
+                    d = ns - old["engines"].get(eng, 0) if old is not None else ns
+                    cap = caps[key[0]].get(eng, 1)
+                    d = min(max(d, 0), dt_ns * cap)          # one client fills an engine at most
+                    busy[key[0]][eng] = busy[key[0]].get(eng, 0) + d
+        out = []
+        for dev, engs in busy.items():
+            pct = 0.0
+            for eng, ns in engs.items():
+                pct = max(pct, min(100.0, ns * 100.0 / (dt_ns * caps[dev].get(eng, 1))))
+            out.append((pct, "GPU %s %.0f%% busy" % (names.get(dev, dev), pct)))
+        return out, {names[dev] for dev in busy if dev in names}
+
+    def _nvidia(self, procs, exclude):
+        r = self._take_pmon()
+        got = parse_pmon(r[1]) if r and r[0] == 0 else None
+        if not got:
+            return _nvidia_device_busy(self.runner)
+        out = []
+        for gpu in sorted(got):
+            pct = sum(sm for pid, (sm, command) in got[gpu].items()
+                      if not _gpu_excluded(pid, procs, exclude, command))
+            pct = min(100.0, pct)
+            out.append((pct, "NVIDIA GPU %d %.0f%% busy" % (gpu, pct)))
+        return out
+
+    def sample(self, procs, exclude, now, prefetch=False):
+        """-> (percent, label) of the busiest GPU. `prefetch` starts the next pmon at once, so
+        the watchdog's next sample does not wait for one."""
+        readings, covered = self._drm(procs, exclude, now)
+        readings += _drm_device_busy(self.sys_root, covered)
+        if self.nvidia:
+            readings += self._nvidia(procs, exclude)
+            if prefetch:
+                self._start_pmon()
+        return _best(readings)
 
 
 class HeavyTracker:
@@ -733,7 +1121,21 @@ def x265_version(x265, runner):
 
 
 def _zstd_ok(cfg):
-    return os.path.isfile(cfg.zstd) and os.access(cfg.zstd, os.X_OK)
+    return _executable(cfg.zstd)
+
+
+_SELF_SHA256 = []
+
+
+def self_sha256():
+    """sha256 of this script's own bytes (the file that is running), "" when unreadable."""
+    if not _SELF_SHA256:
+        try:
+            with open(os.path.abspath(__file__), "rb") as f:
+                _SELF_SHA256.append(hashlib.sha256(f.read()).hexdigest())
+        except (OSError, NameError):
+            return ""
+    return _SELF_SHA256[0]
 
 
 def heavy_only(st, cfg):
@@ -756,21 +1158,27 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
     ethernet, eth_why = bool(links), "no Ethernet"
     if ethernet and ssh_connection:
         via = ssh_arrival_iface(ssh_connection, runner)
-        if via and not via.startswith("en"):
+        if via and via not in links:
             ethernet, eth_why = False, "no Ethernet: ssh arrives on %s" % via
     procs = list_procs(cfg.proc)
     own = own_tree(procs, self_pid, parent_pid)
     game = detect_game(procs, own)
     cpu = None
+    gpus = GpuSampler(cfg.sys, cfg.proc, runner)
     if cfg.status_sample > 0:
         sampler = CpuSampler(cfg.proc)
-        sampler.sample(procs, own, clock())
+        t0 = clock()
+        sampler.sample(procs, own, t0)
+        gpus.begin(procs, t0)
         sleep(cfg.status_sample)
+        t1 = clock()
         procs = list_procs(cfg.proc)
         own = own_tree(procs, self_pid, parent_pid)
         game = game or detect_game(procs, own)
-        cpu = sampler.sample(procs, own, clock())
-    gpu = gpu_busy(cfg.sys, runner)
+        cpu = sampler.sample(procs, own, t1)
+        gpu = gpus.sample(procs, own, t1)
+    else:
+        gpu = gpus.sample(procs, own, clock())
     heavy = None
     if cpu is not None and cpu[0] > CPU_CORES_LIMIT:
         heavy = cpu[1]
@@ -802,7 +1210,8 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
               and ver and zstd_ok and not busy_jobs)
     return {"ok": ok, "why": why, "code": code, "ac": ac, "ethernet": ethernet, "game": game,
             "heavy": heavy, "free_gb": round(free, 1), "busy": bool(busy_jobs),
-            "x265": ver, "version": PROTOCOL_VERSION}
+            "x265": ver, "version": PROTOCOL_VERSION, "sha256": self_sha256(),
+            "ipv4": wired_ipv4(links, runner)}
 
 
 # ---- x265 argument allow-list ---------------------------------------------------------------
@@ -950,8 +1359,8 @@ def _rc_text(rc):
 
 
 def _set_idle_priority():
-    """In the child: SCHED_IDLE (Bazzite runs sched_autogroup, so nice alone does not let the
-    desktop win), else nice 19. -> "idle" or "nice"."""
+    """In the child: SCHED_IDLE (most desktop distros turn sched_autogroup on, so nice alone
+    does not let the desktop win), else nice 19. -> "idle" or "nice"."""
     try:
         os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
         return "idle"
@@ -993,6 +1402,7 @@ class EncodeJob:
         self.code = None                           # REASON_CODES word of a yield or a refusal
         self.owns_dir = False
         self.zstd = self.x265 = None
+        self.inhibitor = None                      # systemd-inhibit holding off sleep, if any
         self.zstd_killed = False
         self.rfd = self.dummy_w = None
         self.err_lock = threading.Lock()
@@ -1095,9 +1505,12 @@ class EncodeJob:
         kids = lambda: [p.pid for p in (self.zstd, self.x265) if p is not None]
         try:
             sampler = CpuSampler(cfg.proc)
+            gpus = GpuSampler(cfg.sys, cfg.proc, runner)
             heavy = HeavyTracker(cfg.heavy_secs)
             procs = list_procs(cfg.proc)
-            sampler.sample(procs, own_tree(procs, me, self.ppid0, kids()), time.monotonic())
+            t0 = time.monotonic()
+            sampler.sample(procs, own_tree(procs, me, self.ppid0, kids()), t0)
+            gpus.begin(procs, t0)
             last = time.monotonic()
             while not self.stop.wait(cfg.watch_interval):
                 now = time.monotonic()
@@ -1113,7 +1526,7 @@ class EncodeJob:
                 if not ac_online(cfg.sys):
                     return self.abort("yielded", "on battery", "battery")
                 cpu = sampler.sample(procs, own, now)
-                what = heavy.update(now, last, cpu, gpu_busy(cfg.sys, runner))
+                what = heavy.update(now, last, cpu, gpus.sample(procs, own, now, prefetch=True))
                 if what:
                     return self.abort("yielded", "heavy: %s" % what, "heavy")
                 if now - self.last_activity > cfg.stall_secs:
@@ -1145,6 +1558,40 @@ class EncodeJob:
                 except subprocess.TimeoutExpired:
                     pass
         self._close_dummy()
+        self._stop_inhibitor()
+
+    def _start_inhibitor(self):
+        """Hold logind's sleep/idle block for the encode (`systemd-inhibit ... sleep infinity`
+        in its own process group), so an idle helper does not suspend mid-segment. Only where
+        systemd-inhibit exists; one that cannot start, or exits at once (polkit said no), never
+        fails the job. It dies with us (PDEATHSIG), and logind lifts the block the moment
+        systemd-inhibit exits."""
+        if not self.cfg.inhibit:
+            return
+        try:
+            self.inhibitor = subprocess.Popen(
+                [self.cfg.inhibit] + INHIBIT_ARGS, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=_make_child_setup(os.getpid()), start_new_session=True)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.inhibitor = None
+
+    def _stop_inhibitor(self):
+        """Release the sleep block: kill systemd-inhibit and its sleep (their process group)."""
+        p, self.inhibitor = self.inhibitor, None
+        if p is None:
+            return
+        try:
+            os.killpg(p.pid, signal.SIGKILL)       # not reaped yet, so the group is still ours
+        except OSError:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
     def _close_dummy(self):
         if self.dummy_w is not None:
@@ -1214,6 +1661,7 @@ class EncodeJob:
         os.set_blocking(self.rfd, True)
         argv = [cfg.x265] + substitute(self.args, self.rpu, self.fifo)
         setup = _make_child_setup(os.getpid())
+        self._start_inhibitor()
         try:
             self.zstd = subprocess.Popen([cfg.zstd, "-d", "-q", "-c"], stdin=None,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1350,6 +1798,10 @@ class EncodeJob:
         """Cleanup common to every exit: children dead, job dir gone, VWORKER line last."""
         try:
             self._kill_children()
+        except Exception:
+            pass
+        try:
+            self._stop_inhibitor()                # already gone unless _kill_children failed
         except Exception:
             pass
         t = self.threads.get("x265err")
@@ -1530,7 +1982,7 @@ def main(argv=None, cfg=None):
         except Exception as e:
             st = {"ok": False, "why": "status error: %s" % e, "code": "error", "ac": False,
                   "ethernet": False, "game": None, "heavy": None, "free_gb": 0.0, "busy": False,
-                  "x265": "", "version": PROTOCOL_VERSION}
+                  "x265": "", "version": PROTOCOL_VERSION, "sha256": self_sha256(), "ipv4": []}
         if _EARLY:
             return 1
         print(json.dumps(st, separators=(",", ":")), flush=True)
