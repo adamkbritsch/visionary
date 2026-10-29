@@ -480,10 +480,10 @@ def _ts_sample(cli, ts_ip, ifaces):
 def tailscale_lan_ip(ts_ip: str, wait: bool = True):
     """The NAS's LAN address as Tailscale proves it, or None. A `tailscale ping` is answered
     by the peer's own tailscaled and sealed with its key, and says which path the answer took:
-    "pong from adamsnas-tailscale (100.101.182.68) via 192.168.1.195:41691" means the NAS itself
-    answered from that address, on a network this Mac reaches directly, a moment ago. That is as
-    strong as a fresh mDNS answer — stronger: a stranger on a café's 192.168.1.x cannot forge it
-    — and it still works when the NAS's mDNS responder has died (live 2026-10-06: avahi silent,
+    "pong from nas (100.64.0.10) via 192.0.2.10:41691" means the NAS itself answered from that
+    address, on a network this Mac reaches directly, a moment ago. That is as strong as a fresh
+    mDNS answer — stronger: a stranger on a café LAN numbered like home cannot forge it — and
+    it still works when the NAS's mDNS responder has died (live 2026-10-06: avahi silent,
     so every transfer of the day went over Tailscale at ~7 MB/s instead of the 2.5 GbE cable).
 
     A proof is used only on the attachment it was made on (the Mac's interface on that subnet)
@@ -529,12 +529,12 @@ def tailscale_lan_ip(ts_ip: str, wait: bool = True):
 #
 # Visionary's rule is stricter about LEARNING than Expurgate's. Expurgate records the hardware
 # address after any successful login to a configured literal, and lists the literal first in its
-# plain host order — so at a café whose 192.168.1.195 runs an FTP server that accepts any login, it
+# plain host order — so at a café whose 192.0.2.10 runs an FTP server that accepts any login, it
 # would first send the NAS credentials there and then learn the stranger. Here an address is learned
 # only after a login over a LAN route that was ALREADY PROVEN (a fresh mDNS answer or a direct
 # Tailscale pong): the hardware address then belongs to the box those proofs vouched for. Later the
 # literal is proven again when ARP shows exactly that one address and an active interface is on its
-# subnet — a café's 192.168.1.195 is a different box with a different address. No literal needs to be
+# subnet — a café's 192.0.2.10 is a different box with a different address. No literal needs to be
 # added to the configured hosts for any of this.
 ARP = "/usr/sbin/arp"
 MAC_BOOK = os.path.expanduser("~/.topaz-pipeline/nas_macs.json")
@@ -659,8 +659,8 @@ def lan_link(hosts, wait: bool = True):
     the address is PROVEN to be the NAS's, else None. Never None because of ethernet_only: that
     choice only makes the Dolby Vision lane wait.
 
-    Proof is one of two things, never a bare address: a bare 192.168.1.x matches half the networks
-    in the world, and trying it first on someone else's would send the FTP login to whatever
+    Proof is one of two things, never a bare address: a bare home-router address matches half the
+    networks in the world, and trying it first on someone else's would send the FTP login to whatever
     answered there (review 2026-09-30).
       1. a configured NAME that resolves FRESHLY on the local link (mDNS) — a kept answer could be
          a stranger's on another network (review 2026-09-30);

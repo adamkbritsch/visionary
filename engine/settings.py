@@ -119,9 +119,13 @@ DEFAULT_SETTINGS = {
                                 # item's capped-remux segments in parallel with the Mac. Used only
                                 # while it is on mains, wired, idle and reached over a WIRED route;
                                 # the Mac takes back any segment it drops. Off = exactly the old remux.
-    "helper_host": "bazzite.local",            # the helper's host name or IPv4 address
-    "helper_user": "bazzite",                  # its ssh login
-    "helper_key": "~/.ssh/id_ed25519_ally_claude",   # the ssh private key the Mac logs in with
+                                # Settings > Setup > Helper fills the three below; while the host
+                                # or the user is empty the helper reads "not set up".
+    "helper_host": "",          # the helper's host name or IPv4 address
+    "helper_user": "",          # its ssh login
+    "helper_key": "~/.ssh/id_ed25519_visionary_helper",   # the ssh private key the Mac logs in
+                                # with (Setup's Create key makes it; an existing one is never
+                                # overwritten)
 }
 
 # Clamp table — the ONE source of truth for every numeric setting's range, used on write
@@ -317,7 +321,8 @@ def _helper_key_ok(v) -> bool:
 # helper_host / helper_user / helper_key are NOT in VALIDATORS (2026-10-28): a malformed value is
 # SAVED AS TYPED — never silently swapped for a default, which would quietly ssh somewhere else.
 # helper.for_remux() / helper.status_summary() judge them at use time and report the helper off,
-# "settings: bad host" (etc.), until the value is fixed. key -> (short name, check).
+# "settings: bad host" (etc.), until the value is fixed — or "not set up" while the host or the
+# user is still empty (helper_set_up). key -> (short name, check).
 HELPER_FIELDS = {"helper_host": ("host", _helper_name_ok),
                  "helper_user": ("user", _helper_name_ok),
                  "helper_key": ("key", _helper_key_ok)}
@@ -327,6 +332,12 @@ def helper_field_ok(key: str, v) -> bool:
     """Is `v` a usable value for the helper field `key` (helper_host / helper_user / helper_key)?"""
     entry = HELPER_FIELDS.get(key)
     return bool(entry) and entry[1](v)
+
+
+def helper_set_up(s: dict) -> bool:
+    """Has the helper been set up at all — a host AND a user filled in? Empty is "not set up"
+    (the shipped defaults), not "bad host": nothing was typed wrong, nothing was typed yet."""
+    return all((s or {}).get(k) not in (None, "") for k in ("helper_host", "helper_user"))
 
 
 VALIDATORS = {"nas_network": _valid_nas_network,

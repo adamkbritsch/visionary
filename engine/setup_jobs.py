@@ -39,6 +39,14 @@ TARGETS = {
     "borders_umt5": {"cmd": None},
     "borders_causvid": {"cmd": None},
     "borders_vae": {"cmd": None},
+    # The optional helper (Settings > Setup > Helper): argv computed by the caller from the SAVED
+    # helper settings (engine/helper.py setup_job_argv — host, user and key judged first, each
+    # passed as its own argv word): a new ssh key (never over an existing one), the worker
+    # install (helper_worker/install.sh), and x265 built ON the helper to this Mac's exact
+    # version (helper_worker/build-x265.sh over ssh).
+    "helper_key": {"cmd": None},
+    "helper_worker": {"cmd": None},
+    "helper_x265": {"cmd": None},
 }
 
 TAIL_LINES = 200
@@ -48,9 +56,10 @@ _JOBS: dict = {}          # what -> job dict (latest attempt only)
 _ACTIVE: list = [None]    # the running `what`, if any
 
 
-def start(what: str, argv: list | None = None) -> dict:
+def start(what: str, argv: list | None = None, on_done=None) -> dict:
     """Kick a job. Refusals: unknown target, another job running, brew missing for a
-    brew-backed target. Returns the job snapshot (state=running) or {"error": ...}."""
+    brew-backed target. Returns the job snapshot (state=running) or {"error": ...}.
+    `on_done()` (optional) runs once the job has finished, whatever its result."""
     t = TARGETS.get(what)
     if t is None:
         return {"error": "unknown", "detail": f"no such install target {what!r}"}
@@ -66,20 +75,23 @@ def start(what: str, argv: list | None = None) -> dict:
                "tail": collections.deque(maxlen=TAIL_LINES)}
         _JOBS[what] = job
         _ACTIVE[0] = what
-    threading.Thread(target=_run, args=(job, t["cmd"], argv), daemon=True,
+    threading.Thread(target=_run, args=(job, t["cmd"], argv, on_done), daemon=True,
                      name=f"setup-job-{what}").start()
     return _snapshot(job)
 
 
-def _run(job, cmd, argv):
+def _run(job, cmd, argv, on_done=None):
     try:
         # brew's auto-update makes a 5-second install take minutes — skip it
         env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_INSTALL_UPGRADE": "1"}
         spec = argv if argv else ["/bin/sh", "-c", cmd]
-        p = subprocess.Popen(spec, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, env=env)
-        for line in p.stdout:
-            job["tail"].append(line.rstrip("\n"))
+        # stdin is /dev/null: no job can ever sit waiting on a prompt nobody sees (ssh-keygen's
+        # "Overwrite?", a script's `read`) — it gets end-of-input and says why in its tail
+        p = subprocess.Popen(spec, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=env)
+        with p.stdout:
+            for line in p.stdout:
+                job["tail"].append(line.rstrip("\n"))
         rc = p.wait()
         job["rc"] = rc
         job["state"] = "ok" if rc == 0 else "failed"
@@ -91,6 +103,11 @@ def _run(job, cmd, argv):
         job["finished"] = time.time()
         with _LOCK:
             _ACTIVE[0] = None
+        if on_done is not None:
+            try:
+                on_done()
+            except Exception:  # noqa: BLE001 — a follow-up never fails the job
+                pass
 
 
 def status() -> dict:
