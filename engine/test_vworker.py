@@ -10,7 +10,9 @@ no test here proves that zstd and x265 die with a SIGKILLed vworker. On the help
 encode, `kill -9` the vworker python process, and confirm with `pgrep -a 'zstd|x265'` that both
 children are gone within a second (and that the next `vworker sweep` removes the job dir).
 Likewise SCHED_IDLE: `chrt -p <x265 pid>` during an encode must say SCHED_IDLE."""
+import ast
 import base64
+import hashlib
 import json
 import os
 import random
@@ -72,18 +74,75 @@ def write(path, text):
         f.write(text)
 
 
+def add_net(root, name, kind=1, state="up", carrier="1", virtual=False, wireless=False,
+            lower=(), brif=(), slaves=()):
+    """/sys/class/net/<name> laid out as the kernel does it: a link into devices/, under
+    devices/virtual for a virtual interface (bridge, bond, VLAN, veth, tun, ...). kind is
+    the ARPHRD type (1 Ethernet, 772 loopback, 65534 none: tun, WireGuard, Tailscale)."""
+    where = "devices/virtual/net" if virtual else "devices/pci0000:00/%s-nic/net" % name
+    d = os.path.join(root, where, name)
+    write(os.path.join(d, "type"), "%d\n" % kind)
+    write(os.path.join(d, "operstate"), state + "\n")
+    if carrier is not None:
+        write(os.path.join(d, "carrier"), carrier + "\n")
+    if wireless:
+        os.makedirs(os.path.join(d, "wireless"))
+    for m in lower:
+        os.symlink("../" + m, os.path.join(d, "lower_" + m))
+    if brif:
+        os.makedirs(os.path.join(d, "brif"))
+        for m in brif:
+            os.symlink("../../" + m, os.path.join(d, "brif", m))
+    if slaves:
+        write(os.path.join(d, "bonding/slaves"), " ".join(slaves) + "\n")
+    link = os.path.join(root, "class/net", name)
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    os.symlink(os.path.relpath(d, os.path.dirname(link)), link)
+    return d
+
+
+def add_supply(root, name, kind, **files):
+    """/sys/class/power_supply/<name>: type plus any of online, scope, status."""
+    write(os.path.join(root, "class/power_supply", name, "type"), kind + "\n")
+    for k, v in files.items():
+        write(os.path.join(root, "class/power_supply", name, k), "%s\n" % v)
+
+
 def make_sys(root, ac=True, eth=True, gpu=3, wifi=True):
-    write(os.path.join(root, "class/power_supply/ACAD/type"), "Mains\n")
-    write(os.path.join(root, "class/power_supply/ACAD/online"), "1\n" if ac else "0\n")
-    write(os.path.join(root, "class/power_supply/BAT0/type"), "Battery\n")
-    write(os.path.join(root, "class/power_supply/BAT0/online"), "1\n")
-    write(os.path.join(root, "class/net/enp4s0/operstate"), "up\n" if eth else "down\n")
-    write(os.path.join(root, "class/net/enp4s0/carrier"), "1\n" if eth else "0\n")
+    add_supply(root, "ACAD", "Mains", online=1 if ac else 0)
+    add_supply(root, "BAT0", "Battery", online=1)
+    add_net(root, "enp4s0", state="up" if eth else "down", carrier="1" if eth else "0")
     if wifi:
-        write(os.path.join(root, "class/net/wlan0/operstate"), "up\n")
-        write(os.path.join(root, "class/net/wlan0/carrier"), "1\n")
+        add_net(root, "wlan0", wireless=True)
     write(os.path.join(root, "class/drm/card0/device/gpu_busy_percent"), "%d\n" % gpu)
     os.makedirs(os.path.join(root, "class/drm/card0-DP-1"), exist_ok=True)
+
+
+def add_card(root, card, pdev, busy=None):
+    """/sys/class/drm/<card> whose device link names the PCI address fdinfo's drm-pdev gives."""
+    dev = os.path.join(root, "devices/pci0000:00", pdev)
+    os.makedirs(dev, exist_ok=True)
+    if busy is not None:
+        write(os.path.join(dev, "gpu_busy_percent"), "%d\n" % busy)
+    d = os.path.join(root, "class/drm", card)
+    os.makedirs(d, exist_ok=True)
+    os.symlink(os.path.relpath(dev, d), os.path.join(d, "device"))
+
+
+def add_drm_fd(proc_root, pid, fd, client, engines, pdev="0000:03:00.0", driver="amdgpu",
+               capacity=None, node="/dev/dri/renderD128"):
+    """A DRM fd of /proc/<pid> and its fdinfo as amdgpu / i915 write it (engine time in ns)."""
+    base = os.path.join(proc_root, str(pid))
+    os.makedirs(os.path.join(base, "fd"), exist_ok=True)
+    link = os.path.join(base, "fd", str(fd))
+    if not os.path.lexists(link):
+        os.symlink(node, link)
+    lines = ["pos:\t0", "flags:\t02100002", "mnt_id:\t26", "ino:\t1063",
+             "drm-driver:\t%s" % driver, "drm-pdev:\t%s" % pdev, "drm-client-id:\t%d" % client]
+    lines += ["drm-engine-%s:\t%d ns" % kv for kv in sorted(engines.items())]
+    lines += ["drm-engine-capacity-%s:\t%d" % kv for kv in sorted((capacity or {}).items())]
+    lines += ["drm-memory-vram:\t1024 KiB"]
+    write(os.path.join(base, "fdinfo", str(fd)), "\n".join(lines) + "\n")
 
 
 FAKE_X265 = r'''#!{python}
@@ -164,6 +223,20 @@ sys.exit(int(os.environ.get("FAKE_X265_RC", "0")))
 '''
 
 
+# a stand-in for systemd-inhibit: notes its pid and arguments, then holds on like the real one
+# (which runs `sleep infinity` under its block)
+FAKE_INHIBIT = r'''#!{python}
+import os, sys, time
+log = os.environ["FAKE_INHIBIT_LOG"]
+with open(log + ".tmp", "w") as f:
+    f.write("\n".join([str(os.getpid())] + sys.argv[1:]))
+os.rename(log + ".tmp", log)
+if os.environ.get("FAKE_INHIBIT_FAIL"):
+    sys.exit(1)
+time.sleep(600)
+'''
+
+
 def y4m(frames):
     return Y4M_HEADER + b"".join(b"FRAME\n" + bytes([i % 200 + 1]) * FRAME for i in range(frames))
 
@@ -188,8 +261,10 @@ def b64spec(args, frames):
 
 
 class FakeRunner:
-    def __init__(self, x265=None, ip_out="", smi=None):
-        self.x265, self.ip_out, self.smi, self.calls = x265, ip_out, smi, []
+    """smi: `nvidia-smi --query-gpu` output; pmon: `nvidia-smi pmon` output, or (rc, output)."""
+
+    def __init__(self, x265=None, ip_out="", smi=None, pmon=None):
+        self.x265, self.ip_out, self.smi, self.pmon, self.calls = x265, ip_out, smi, pmon, []
 
     def __call__(self, argv, timeout=2.0):
         self.calls.append(argv)
@@ -197,6 +272,10 @@ class FakeRunner:
             return (0, "", "x265 [info]: HEVC encoder version 4.1+1-1d117be\n")
         if argv[0] == "ip":
             return (0, self.ip_out, "")
+        if argv[:2] == ["nvidia-smi", "pmon"]:
+            if isinstance(self.pmon, tuple):
+                return (self.pmon[0], self.pmon[1], "")
+            return None if self.pmon is None else (0, self.pmon, "")
         if argv[0] == "nvidia-smi":
             return None if self.smi is None else (0, self.smi, "")
         return None
@@ -268,7 +347,7 @@ class ArgValidation(unittest.TestCase):
             a = list(base)
             a[a.index(flag) + 1] = value
             return a
-        self.reject(swap("--output", "/home/bazzite/out.hevc"))
+        self.reject(swap("--output", "/home/user/out.hevc"))
         self.reject(swap("--output", "{rpu}"))
         self.reject(swap("--dolby-vision-rpu", "/etc/passwd"))
         self.reject(swap("--dolby-vision-rpu", "../rpu.bin"))
@@ -322,11 +401,11 @@ def procs(*ps):
     return {p.pid: p for p in ps}
 
 
-STEAM_DIR = "/var/home/bazzite/.local/share/Steam"
+STEAM_DIR = "/home/user/.local/share/Steam"
 
 
 def shortcut_tree(app, base=50):
-    """Steam (gamepadui) launching a non-Steam shortcut, as `ps` shows it on the Ally:
+    """Steam (gamepadui) launching a non-Steam shortcut, as `ps` shows it on a handheld:
     steam -> reaper SteamLaunch AppId=<2^31 + n> -> steam-launch-wrapper -> the program.
     app: "firefox" / "dolphin" (native programs) or "proton" (a Windows game via Proton)."""
     wrap = STEAM_DIR + "/ubuntu12_32/steam-launch-wrapper"
@@ -335,7 +414,7 @@ def shortcut_tree(app, base=50):
            "proton": [STEAM_DIR + "/ubuntu12_32/steam-runtime/..sniper/_v2-entry-point",
                       "--verb=waitforexitandrun", "--",
                       STEAM_DIR + "/steamapps/common/Proton 9.0 (Beta)/proton",
-                      "waitforexitandrun", "/var/home/bazzite/Games/Celeste/Celeste.exe"]}[app]
+                      "waitforexitandrun", "/home/user/Games/Celeste/Celeste.exe"]}[app]
     appid = {"firefox": 3141592653, "dolphin": 2898765432, "proton": 3000000001}[app]
     tree = [P(base, "steam", [STEAM_DIR + "/ubuntu12_32/steam", "-gamepadui", "-steamos3"]),
             P(base + 1, "reaper", [STEAM_DIR + "/ubuntu12_32/reaper", "SteamLaunch",
@@ -352,7 +431,7 @@ def shortcut_tree(app, base=50):
         tree += [P(base + 3, "python3", ["python3", cmd[3], "waitforexitandrun", cmd[5]],
                    ppid=base + 2),
                  P(base + 4, "wineserver", ["wineserver"], ppid=base + 3),
-                 P(base + 5, "Celeste.exe", ["Z:\\var\\home\\bazzite\\Games\\Celeste\\Celeste.exe"],
+                 P(base + 5, "Celeste.exe", ["Z:\\home\\user\\Games\\Celeste\\Celeste.exe"],
                    ppid=base + 3)]
     return tree
 
@@ -454,8 +533,8 @@ class OwnTree(unittest.TestCase):
     def test_us_children_and_session_ancestors_only(self):
         ps = procs(P(1, "systemd", ["/sbin/init"], ppid=0),
                    P(100, "sshd", ["sshd: /usr/sbin/sshd -D"]),
-                   P(200, "sshd-session", ["sshd-session: bazzite [priv]"], ppid=100),
-                   P(201, "sshd-session", ["sshd-session: bazzite@notty"], ppid=200),
+                   P(200, "sshd-session", ["sshd-session: user [priv]"], ppid=100),
+                   P(201, "sshd-session", ["sshd-session: user@notty"], ppid=200),
                    P(300, "bash", ["bash", "-c", "vworker encode"], ppid=201),
                    P(400, "python3", ["python3", "vworker", "encode"], ppid=300),
                    P(401, "zstd", ["zstd", "-d"], ppid=400),
@@ -553,12 +632,301 @@ class Gpu(unittest.TestCase):
         self.assertEqual(vworker.gpu_busy(root, FakeRunner(smi=None))[0], 47.0)   # no nvidia-smi
 
 
+# `nvidia-smi pmon -c 1 -s u` on a helper with nothing but its desktop and Steam open: the
+# compositor, Xwayland and Steam's web helper keep the GPU 33-38 % busy (as measured on a test
+# helper; kwin_wayland 12-15, Xwayland 20-26, steamwebhelper 0-9), and none of it is heavy
+PMON_IDLE = (
+    "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command \n"
+    "# Idx           #    C/G      %      %      %      %      %      %    name \n"
+    "    0       1520     G     14      3      -      -      -      -    kwin_wayland   \n"
+    "    0       1588     G     24      5      -      -      -      -    Xwayland       \n"
+    "    0       2310     G      0      0      -      -      -      -    steamwebhelper \n"
+    "    0       2311     G      -      -      -      -      -      -    xwaylandvideobr\n")
+PMON_GAME = PMON_IDLE + (
+    "    0       3001     C+G   45     20      -      -      -      -    game.x86_64    \n"
+    "    1          -     -      -      -      -      -      -      -    -              \n")
+DESKTOP = procs(P(1520, "kwin_wayland", ["/usr/bin/kwin_wayland", "--xwayland"]),
+                P(1588, "Xwayland", ["/usr/bin/Xwayland", ":0"], ppid=1520),
+                P(2310, "steamwebhelper", ["./steamwebhelper", "--type=gpu-process"]),
+                P(3001, "game.x86_64", ["./game.x86_64"]))
+
+
+class GpuPerProcess(unittest.TestCase):
+    """The GPU share leaves out the desktop's own drawing and the Steam client."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vworker-gpu-")
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sys = os.path.join(self.tmp, "sys")
+        self.proc = os.path.join(self.tmp, "proc")
+        os.makedirs(self.proc)
+
+    def nvidia(self):
+        os.makedirs(os.path.join(self.sys, "module/nvidia"))
+
+    def test_an_idle_desktop_on_nvidia_is_not_heavy(self):
+        self.nvidia()
+        r = FakeRunner(smi="38\n", pmon=PMON_IDLE)
+        self.assertEqual(vworker.gpu_busy(self.sys, r), (38.0, "NVIDIA GPU 0 38% busy"))  # whole
+        s = vworker.GpuSampler(self.sys, self.proc, r)
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0), (0.0, ""))
+        self.assertNotIn(["nvidia-smi", "--query-gpu=utilization.gpu",
+                          "--format=csv,noheader,nounits"], r.calls[1:])
+
+    def test_a_game_on_nvidia_counts(self):
+        self.nvidia()
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner(smi="83\n", pmon=PMON_GAME))
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0), (45.0, "NVIDIA GPU 0 45% busy"))
+        self.assertEqual(s.sample(DESKTOP, {3001}, 2.0), (0.0, ""))       # our own: never
+        # a process we cannot see in /proc is judged by pmon's own name for it
+        self.assertEqual(s.sample({}, set(), 3.0), (45.0, "NVIDIA GPU 0 45% busy"))
+        old = ("# gpu        pid  type    sm   mem   enc   dec   command\n"
+               "# Idx          #   C/G     %     %     %     %   name\n"
+               "    0       1564     G    20     5     -     -   Xorg\n"
+               "    0       4100     C    61     9     -     -   blender\n")
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner(pmon=old))
+        self.assertEqual(s.sample({}, set(), 1.0), (61.0, "NVIDIA GPU 0 61% busy"))
+
+    def test_pmon_parsing(self):
+        got = vworker.parse_pmon(PMON_GAME)
+        self.assertEqual(sorted(got), [0, 1])
+        self.assertEqual(got[1], {})                                     # nothing running on it
+        self.assertEqual(got[0][1588], (24.0, "Xwayland"))
+        self.assertEqual(got[0][2311], (0.0, "xwaylandvideobr"))         # "-" is 0
+        self.assertIsNone(vworker.parse_pmon(""))
+        self.assertIsNone(vworker.parse_pmon("Failed to initialize NVML: Driver Not Loaded\n"))
+
+    def test_without_pmon_the_whole_device_stands_in(self):
+        self.nvidia()
+        for pmon in (None, (6, "Not supported\n"), (0, "garbage\n")):
+            s = vworker.GpuSampler(self.sys, self.proc, FakeRunner(smi="38\n", pmon=pmon))
+            self.assertEqual(s.sample(DESKTOP, set(), 1.0), (38.0, "NVIDIA GPU 0 38% busy"), pmon)
+
+    def test_pmon_runs_in_the_background_between_samples(self):
+        self.nvidia()
+        r = FakeRunner(smi="38\n", pmon=PMON_GAME)
+        s = vworker.GpuSampler(self.sys, self.proc, r)
+        s.begin(DESKTOP, 0.0)                   # status: started before its 1 s CPU sample
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0, prefetch=True)[0], 45.0)
+        self.assertEqual(s.sample(DESKTOP, set(), 2.0)[0], 45.0)
+        self.assertEqual([c[:2] for c in r.calls], [["nvidia-smi", "pmon"]] * 2)
+        self.assertIsNone(s.pmon)
+
+    def drm_desktop(self, card_busy=40):
+        """amdgpu card1 at 0000:03:00.0: kwin, Xwayland, Steam's web helper and a game, each
+        with its own DRM client (the game's open in two fds)."""
+        add_card(self.sys, "card1", "0000:03:00.0", busy=card_busy)
+        os.makedirs(os.path.join(self.sys, "class/drm/card1-eDP-1"))
+        self.set_drm(0, 0, 0, 0)
+
+    def set_drm(self, kwin, xwayland, steam, game):
+        add_drm_fd(self.proc, 1520, 12, 1, {"gfx": kwin, "compute": 0})
+        add_drm_fd(self.proc, 1588, 7, 2, {"gfx": xwayland})
+        add_drm_fd(self.proc, 2310, 30, 3, {"gfx": steam})
+        for fd in (5, 6):                       # one client open twice counts once
+            add_drm_fd(self.proc, 3001, fd, 4, {"gfx": game, "dec": 0})
+
+    def test_an_idle_desktop_on_amd_is_not_heavy(self):
+        self.drm_desktop(card_busy=40)
+        r = FakeRunner()
+        self.assertEqual(vworker.gpu_busy(self.sys, r), (40.0, "GPU card1 40% busy"))   # whole
+        s = vworker.GpuSampler(self.sys, self.proc, r)
+        s.begin(DESKTOP, 10.0)
+        self.set_drm(int(0.15e9), int(0.25e9), int(0.05e9), 0)
+        self.assertEqual(s.sample(DESKTOP, set(), 11.0), (0.0, ""))
+        self.set_drm(int(0.30e9), int(0.50e9), int(0.10e9), int(0.45e9))   # the game: 0.45 s
+        self.assertEqual(s.sample(DESKTOP, set(), 12.0), (45.0, "GPU card1 45% busy"))
+        self.set_drm(int(0.45e9), int(0.75e9), int(0.15e9), int(0.90e9))
+        self.assertEqual(s.sample(DESKTOP, {3001}, 13.0), (0.0, ""))       # our own: never
+        self.assertEqual(r.calls, [])                                     # no nvidia: no smi
+
+    def test_the_first_drm_sample_only_seeds(self):
+        self.drm_desktop(card_busy=90)
+        self.set_drm(0, 0, 0, int(5e9))
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner())
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0), (0.0, ""))         # not the card's 90
+        self.set_drm(0, 0, 0, int(5.6e9))
+        self.assertEqual(s.sample(DESKTOP, set(), 2.0), (60.0, "GPU card1 60% busy"))
+
+    def test_clients_opened_mid_interval_and_runaway_counters(self):
+        self.drm_desktop()
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner())
+        s.begin(DESKTOP, 0.0)
+        add_drm_fd(self.proc, 3001, 9, 5, {"gfx": int(0.3e9)})            # opened since begin
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0)[0], 30.0)
+        add_drm_fd(self.proc, 3001, 9, 5, {"gfx": int(50e9)})             # one client: <= 100 %
+        self.assertEqual(s.sample(DESKTOP, set(), 2.0)[0], 100.0)
+
+    def test_engine_capacity_and_intel_cards(self):
+        add_card(self.sys, "card0", "0000:00:02.0")         # i915: no gpu_busy_percent
+        game = procs(P(4100, "blender", ["blender"]))
+        add_drm_fd(self.proc, 4100, 4, 1, {"render": 0, "video": 0}, pdev="0000:00:02.0",
+                   driver="i915", capacity={"video": 2}, node="/dev/dri/card0")
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner())
+        s.begin(game, 0.0)
+        add_drm_fd(self.proc, 4100, 4, 1, {"render": int(0.2e9), "video": int(1.0e9)},
+                   pdev="0000:00:02.0", driver="i915", capacity={"video": 2})
+        self.assertEqual(s.sample(game, set(), 1.0), (50.0, "GPU card0 50% busy"))   # 2 engines
+
+    def test_no_readable_clients_falls_back_to_the_device(self):
+        add_card(self.sys, "card1", "0000:03:00.0", busy=40)
+        add_drm_fd(self.proc, 1520, 3, 1, {}, node="/dev/dri/card1")       # no engine time
+        os.makedirs(os.path.join(self.proc, "1588", "fdinfo"))             # no fd/ to read
+        write(os.path.join(self.proc, "1588", "fdinfo", "4"), "drm-client-id:\t2\n")
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner())
+        s.begin(DESKTOP, 0.0)
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0), (40.0, "GPU card1 40% busy"))
+
+    def test_non_drm_fds_are_not_read(self):
+        add_card(self.sys, "card1", "0000:03:00.0", busy=40)
+        add_drm_fd(self.proc, 3001, 5, 4, {"gfx": 0}, node="socket:[12345]")
+        s = vworker.GpuSampler(self.sys, self.proc, FakeRunner())
+        s.begin(DESKTOP, 0.0)
+        add_drm_fd(self.proc, 3001, 5, 4, {"gfx": int(0.9e9)}, node="socket:[12345]")
+        self.assertEqual(s.sample(DESKTOP, set(), 1.0), (40.0, "GPU card1 40% busy"))
+
+    def test_fdinfo_parsing(self):
+        key, engines, cap = vworker.parse_drm_fdinfo(
+            "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t7\n"
+            "drm-engine-render:\t12 ns\ndrm-engine-video:\t3 ns\n"
+            "drm-engine-capacity-video:\t2\ndrm-engine-bogus:\tlots\n")
+        self.assertEqual((key, engines, cap), (("0000:00:02.0", "7"),
+                                               {"render": 12, "video": 3}, {"video": 2}))
+        self.assertIsNone(vworker.parse_drm_fdinfo("pos:\t0\nflags:\t0\n"))
+        self.assertIsNone(vworker.parse_drm_fdinfo("drm-client-id:\t1\ndrm-memory-vram:\t1 KiB\n"))
+
+    def test_the_desktop_names(self):
+        for name in ("kwin_wayland", "kwin_x11", "Xwayland", "Xorg", "X", "gnome-shell", "mutter",
+                     "plasmashell", "xwaylandvideobridge", "sway", "Hyprland", "weston", "labwc",
+                     "wayfire", "gamescope", "gamescope-wl", "steam", "steamwebhelper"):
+            self.assertIn(name, vworker.GPU_EXCLUDED_NAMES)
+            self.assertTrue(vworker._gpu_excluded(9, procs(P(9, name[:15], [name])), set()), name)
+            self.assertTrue(vworker._gpu_excluded(9, {}, set(), name[:15]), name)
+        for name in ("game.x86_64", "blender", "firefox", "Xwaylandish", "kwin"):
+            self.assertFalse(vworker._gpu_excluded(9, procs(P(9, name, [name])), set()), name)
+
+
+class Power(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="vworker-power-")
+        self.addCleanup(shutil.rmtree, self.root)
+
+    def test_a_machine_without_a_system_battery_is_on_mains(self):
+        self.assertTrue(vworker.ac_online(self.root))                      # no power_supply at all
+        os.makedirs(os.path.join(self.root, "class/power_supply"))
+        self.assertTrue(vworker.ac_online(self.root))                      # empty: a desktop or VM
+        add_supply(self.root, "hid-00:11:22:33:44:55-battery", "Battery", scope="Device",
+                   status="Discharging")                                   # a wireless controller
+        add_supply(self.root, "ucsi-source-psy-USBC000:001", "USB", online=0)
+        self.assertTrue(vworker.ac_online(self.root))
+        add_supply(self.root, "ADP0", "Mains", online=0)    # odd firmware, no battery
+        self.assertTrue(vworker.ac_online(self.root))
+
+    def test_mains_decides_when_there_is_one(self):
+        add_supply(self.root, "BAT0", "Battery", status="Charging")
+        add_supply(self.root, "AC0", "Mains", online=1)
+        self.assertTrue(vworker.ac_online(self.root))
+        add_supply(self.root, "AC0", "Mains", online=0)
+        self.assertFalse(vworker.ac_online(self.root))                     # a USB-C source alone
+
+    def test_a_battery_without_a_mains_supply_tells_by_its_status(self):
+        add_supply(self.root, "BAT1", "Battery", scope="System")
+        for status, ac in (("Charging", True), ("Full", True), ("Not charging", True),
+                           ("Discharging", False), ("Unknown", False)):
+            write(os.path.join(self.root, "class/power_supply/BAT1/status"), status + "\n")
+            self.assertEqual(vworker.ac_online(self.root), ac, status)
+        os.unlink(os.path.join(self.root, "class/power_supply/BAT1/status"))
+        self.assertFalse(vworker.ac_online(self.root))                     # nothing known
+        write(os.path.join(self.root, "class/power_supply/BAT1/status"), "Not charging\n")
+        add_supply(self.root, "BAT2", "Battery", status="Discharging")     # two batteries
+        self.assertFalse(vworker.ac_online(self.root))
+
+
+class Ethernet(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="vworker-net-")
+        self.addCleanup(shutil.rmtree, self.root)
+
+    def links(self):
+        return vworker.ethernet_links(self.root)
+
+    def test_any_name_counts(self):
+        for name in ("eth0", "eno1", "enp3s0", "enx00e04c680001", "ens18"):
+            add_net(self.root, name)
+        self.assertEqual(self.links(), ["eno1", "enp3s0", "ens18", "enx00e04c680001", "eth0"])
+
+    def test_not_ethernet(self):
+        add_net(self.root, "lo", kind=772, state="unknown", virtual=True)
+        add_net(self.root, "wlan0", wireless=True)
+        add_net(self.root, "wlp6s0", carrier=None)
+        os.makedirs(os.path.join(self.root, "class/net/wlp6s0/phy80211"))
+        add_net(self.root, "tailscale0", kind=65534, state="unknown", virtual=True)
+        add_net(self.root, "wg0", kind=65534, state="unknown", virtual=True)
+        add_net(self.root, "tun0", kind=65534, state="unknown", virtual=True)
+        add_net(self.root, "veth1a2b3c", virtual=True)
+        add_net(self.root, "vnet0", state="unknown", virtual=True)          # a VM's tap
+        add_net(self.root, "docker0", virtual=True, brif=["veth1a2b3c"], lower=["veth1a2b3c"])
+        add_net(self.root, "virbr0", virtual=True, brif=["vnet0"], lower=["vnet0"])
+        add_net(self.root, "br-wifi", virtual=True, brif=["wlan0"], lower=["wlan0"])
+        add_net(self.root, "enp9s0", state="down", carrier="0")             # unplugged
+        add_net(self.root, "enp8s0", state="dormant")                       # 802.1X not done
+        add_net(self.root, "enp7s0", state="up", carrier="0")
+        os.makedirs(os.path.join(self.root, "class/net/bonding_masters"))   # not an interface
+        self.assertEqual(self.links(), [])
+        self.assertFalse(vworker.is_wired(self.root, "../net/eth0"))
+        self.assertFalse(vworker.is_wired(self.root, "nope"))
+
+    def test_a_driver_that_does_not_track_operstate(self):
+        add_net(self.root, "eth0", state="unknown", carrier="1")
+        add_net(self.root, "eth1", state="unknown", carrier="0")
+        self.assertEqual(self.links(), ["eth0"])
+
+    def test_bridges_bonds_and_vlans_over_a_wired_link(self):
+        add_net(self.root, "enp3s0")
+        add_net(self.root, "br0", virtual=True, brif=["enp3s0", "vnet0"], lower=["enp3s0", "vnet0"])
+        add_net(self.root, "vnet0", state="unknown", virtual=True)
+        add_net(self.root, "enp1s0", state="down", carrier="0")
+        add_net(self.root, "enp2s0")
+        add_net(self.root, "bond0", virtual=True, slaves=["enp1s0", "enp2s0"])
+        add_net(self.root, "enp3s0.10", virtual=True, lower=["enp3s0"])
+        add_net(self.root, "vmbr0", virtual=True, brif=["bond0"])          # a bond in a bridge
+        self.assertEqual(self.links(), ["bond0", "br0", "enp2s0", "enp3s0", "enp3s0.10", "vmbr0"])
+        # the wired member goes down: the bridge is not Ethernet any more
+        write(os.path.join(self.root, "class/net/enp3s0/carrier"), "0\n")
+        write(os.path.join(self.root, "class/net/enp3s0/operstate"), "down\n")
+        self.assertEqual(self.links(), ["bond0", "enp2s0", "vmbr0"])
+
+    def test_a_bridge_must_be_up_itself(self):
+        add_net(self.root, "enp3s0")
+        add_net(self.root, "br0", state="down", carrier="0", virtual=True, brif=["enp3s0"])
+        self.assertEqual(self.links(), ["enp3s0"])
+
+    def test_wired_ipv4(self):
+        out = ("1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
+               "3: wlan0    inet 192.0.2.30/24 brd 192.0.2.255 scope global wlan0\\  x\n"
+               "5: br0    inet 192.0.2.20/24 brd 192.0.2.255 scope global br0\\  x\n"
+               "5: br0    inet 192.0.2.21/24 scope global secondary br0:1\\  x\n"
+               "6: eth1@if7    inet 198.51.100.4/24 scope global eth1\\  x\n")
+        r = FakeRunner(ip_out=out)
+        self.assertEqual(vworker.wired_ipv4(["br0", "enp3s0", "eth1"], r),
+                         ["192.0.2.20", "192.0.2.21", "198.51.100.4"])
+        self.assertEqual(r.calls, [["ip", "-4", "-o", "addr", "show"]])
+        self.assertEqual(vworker.wired_ipv4([], r), [])
+        self.assertEqual(len(r.calls), 1)                                  # no links: no ip run
+        self.assertEqual(vworker.wired_ipv4(["br0"], lambda argv, t: None), [])
+        self.assertEqual(vworker.wired_ipv4(["br0"], lambda argv, t: (1, out, "")), [])
+
+        def boom(argv, t):
+            raise RuntimeError("no")
+        self.assertEqual(vworker.wired_ipv4(["br0"], boom), [])
+
+
 # ---- status ---------------------------------------------------------------------------------
 
 class Status(Tmp):
     IP_OUT = ("1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
-              "2: enp4s0    inet 192.168.1.20/24 brd 192.168.1.255 scope global enp4s0\\  x\n"
-              "3: wlan0    inet 192.168.1.30/24 brd 192.168.1.255 scope global wlan0\\  x\n"
+              "2: enp4s0    inet 192.0.2.20/24 brd 192.0.2.255 scope global enp4s0\\  x\n"
+              "3: wlan0    inet 192.0.2.30/24 brd 192.0.2.255 scope global wlan0\\  x\n"
               "3: wlan0    inet6 fe80::1234/64 scope link \\       valid_lft forever\n")
 
     def status(self, cfg=None, sleep=None, **kw):
@@ -573,12 +941,95 @@ class Status(Tmp):
     def test_ready(self):
         st = self.status()
         self.assertEqual(set(st), {"ok", "why", "code", "ac", "ethernet", "game", "heavy",
-                                   "free_gb", "busy", "x265", "version"})
+                                   "free_gb", "busy", "x265", "version", "sha256", "ipv4"})
         self.assertEqual(st, dict(st, ok=True, why="ready", code="ready", ac=True, ethernet=True,
                                   game=None, heavy=None, busy=False, x265="4.1+1-1d117be",
                                   version=1))
         self.assertIsInstance(st["free_gb"], float)
         json.dumps(st)
+
+    def test_sha256_and_wired_ipv4(self):
+        st = self.status()
+        with open(VWORKER, "rb") as f:
+            self.assertEqual(st["sha256"], hashlib.sha256(f.read()).hexdigest())
+        self.assertEqual(st["ipv4"], ["192.0.2.20"])                      # not wlan0's
+        self.assertEqual(self.status(runner=FakeRunner(self.x265))["ipv4"], [])   # ip says nothing
+        write(os.path.join(self.sys, "class/net/enp4s0/carrier"), "0\n")
+        self.assertEqual(self.status()["ipv4"], [])                         # no wired link up
+        add_net(self.sys, "br0", virtual=True, brif=["enp4s0", "enp5s0"])
+        add_net(self.sys, "enp5s0")
+        out = self.IP_OUT + "6: br0    inet 192.0.2.40/24 scope global br0\\  x\n"
+        self.assertEqual(self.status(runner=FakeRunner(self.x265, out))["ipv4"], ["192.0.2.40"])
+
+    def test_the_status_cli_prints_sha256_and_ipv4(self):
+        env = dict(os.environ, VWORKER_X265=self.x265, VWORKER_JOBS=self.jobs,
+                   VWORKER_PROC=self.proc, VWORKER_SYS=self.sys, VWORKER_STATUS_SAMPLE="0",
+                   VWORKER_ZSTD=ZSTD or "/nonexistent")
+        r = subprocess.run([sys.executable, VWORKER, "status"], env=env, capture_output=True,
+                           timeout=10)
+        st = json.loads(r.stdout)
+        with open(VWORKER, "rb") as f:
+            self.assertEqual(st["sha256"], hashlib.sha256(f.read()).hexdigest())
+        self.assertIsInstance(st["ipv4"], list)
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_a_desktop_with_no_battery_and_eth0_is_ready(self):
+        root = os.path.join(self.tmp, "desktop-sys")
+        os.makedirs(os.path.join(root, "class/power_supply"))
+        add_supply(root, "hidpp_battery_0", "Battery", scope="Device", status="Discharging")
+        add_net(root, "eth0")
+        add_net(root, "docker0", virtual=True)
+        out = ("2: eth0    inet 192.0.2.7/24 brd 192.0.2.255 scope global eth0\\  x\n"
+               "4: docker0    inet 172.17.0.1/16 scope global docker0\\  x\n")
+        st = self.status(self.cfg(sys=root), runner=FakeRunner(self.x265, out),
+                         ssh_connection="192.0.2.50 52000 192.0.2.7 22")
+        self.assertEqual((st["ok"], st["why"], st["ac"], st["ethernet"], st["ipv4"]),
+                         (True, "ready", True, True, ["192.0.2.7"]))
+        st = self.status(self.cfg(sys=root), runner=FakeRunner(self.x265, out),
+                         ssh_connection="172.17.0.2 52000 172.17.0.1 22")
+        self.assertEqual(st["why"], "no Ethernet: ssh arrives on docker0")
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_ssh_over_a_bridge_on_a_wired_link_is_ethernet(self):
+        add_net(self.sys, "br0", virtual=True, brif=["enp4s0"], lower=["enp4s0"])
+        out = self.IP_OUT + "5: br0    inet 192.0.2.40/24 scope global br0\\  x\n"
+        st = self.status(runner=FakeRunner(self.x265, out),
+                         ssh_connection="192.0.2.5 50000 192.0.2.40 22")
+        self.assertEqual((st["ok"], st["ethernet"]), (True, True), st)
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_an_idle_desktop_gpu_is_not_heavy(self):
+        # NVIDIA: the whole GPU reads 38 %, all of it the desktop's own drawing and Steam
+        os.makedirs(os.path.join(self.sys, "module/nvidia"))
+        for pid, p in DESKTOP.items():
+            add_proc(self.proc, pid, p.comm, p.argv, ppid=p.ppid)
+        st = self.status(runner=FakeRunner(self.x265, self.IP_OUT, smi="38\n", pmon=PMON_IDLE))
+        self.assertEqual((st["ok"], st["heavy"]), (True, None), st)
+        st = self.status(runner=FakeRunner(self.x265, self.IP_OUT, smi="83\n", pmon=PMON_GAME))
+        self.assertEqual((st["ok"], st["heavy"], st["code"]),
+                         (False, "NVIDIA GPU 0 45% busy", "heavy"))
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_an_idle_desktop_gpu_is_not_heavy_on_amd(self):
+        add_card(self.sys, "card1", "0000:03:00.0", busy=85)
+        add_proc(self.proc, 1520, "kwin_wayland", ["/usr/bin/kwin_wayland"])
+        add_proc(self.proc, 4100, "blender", ["blender"])
+        add_drm_fd(self.proc, 1520, 12, 1, {"gfx": 0})
+        add_drm_fd(self.proc, 4100, 5, 2, {"gfx": 0})
+        st = self.status(sleep=lambda _: add_drm_fd(self.proc, 1520, 12, 1, {"gfx": int(0.85e9)}))
+        self.assertEqual((st["ok"], st["heavy"]), (True, None), st)       # the card says 85 %
+        st = self.status(sleep=lambda _: add_drm_fd(self.proc, 4100, 5, 2, {"gfx": int(0.5e9)}))
+        self.assertEqual((st["ok"], st["heavy"]), (False, "GPU card1 50% busy"))
+
+    def test_disk_floor_is_headroom(self):
+        self.assertEqual(vworker.MIN_FREE_GB, 5.0)
+        self.assertEqual(vworker.Config({}).min_free_gb, 5.0)
+        self.assertEqual(vworker.Config({"VWORKER_MIN_FREE_GB": "12"}).min_free_gb, 12.0)
+        with mock.patch.object(vworker, "free_gb", return_value=4.9):
+            st = self.status(self.cfg(min_free_gb=5))
+        self.assertEqual((st["code"], st["why"]), ("low_disk", "low disk: 4.9 GB free, need 5"))
+        with mock.patch.object(vworker, "free_gb", return_value=5.1):
+            self.assertNotEqual(self.status(self.cfg(min_free_gb=5))["code"], "low_disk")
 
     def test_on_battery(self):
         write(os.path.join(self.sys, "class/power_supply/ACAD/online"), "0\n")
@@ -598,48 +1049,47 @@ class Status(Tmp):
         self.assertFalse(self.status()["ethernet"])
 
     def test_ssh_must_arrive_on_ethernet(self):
-        st = self.status(ssh_connection="192.168.1.5 50000 192.168.1.30 22")
+        st = self.status(ssh_connection="192.0.2.5 50000 192.0.2.30 22")
         self.assertEqual((st["ok"], st["ethernet"]), (False, False))
         self.assertIn("wlan0", st["why"])
         self.assertEqual(st["code"], "no_ethernet")
-        self.assertTrue(self.status(ssh_connection="192.168.1.5 50000 192.168.1.20 22")["ok"])
+        self.assertTrue(self.status(ssh_connection="192.0.2.5 50000 192.0.2.20 22")["ok"])
         self.assertFalse(self.status(ssh_connection="fe80::9 50000 fe80::1234 22")["ok"])
         self.assertTrue(self.status(ssh_connection="10.9.9.9 1 10.9.9.8 22")["ok"])  # unknown
 
-    # the Ally's /sys as measured on it (2026-10-28): AC0 Mains online=1, the dock's USB
-    # Ethernet enp11s0f3u1u2, Wi-Fi wlp6s0, tailscale0
-    ALLY_IP_OUT = (
+    # a docked handheld's /sys as measured on one: AC0 Mains online=1, the dock's USB Ethernet
+    # enp11s0f3u1u2, Wi-Fi wlp6s0, tailscale0
+    HANDHELD_IP_OUT = (
         "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
-        "2: enp11s0f3u1u2    inet 192.168.1.133/24 brd 192.168.1.255 scope global dynamic "
+        "2: enp11s0f3u1u2    inet 192.0.2.133/24 brd 192.0.2.255 scope global dynamic "
         "noprefixroute enp11s0f3u1u2\\       valid_lft 85000sec\n"
-        "3: wlp6s0    inet 192.168.1.134/24 brd 192.168.1.255 scope global dynamic wlp6s0\\  x\n"
+        "3: wlp6s0    inet 192.0.2.134/24 brd 192.0.2.255 scope global dynamic wlp6s0\\  x\n"
         "3: wlp6s0    inet6 fe80::aa:bb/64 scope link noprefixroute \\       valid_lft forever\n"
-        "4: tailscale0    inet 100.101.102.103/32 scope global tailscale0\\       x\n")
+        "4: tailscale0    inet 100.64.0.7/32 scope global tailscale0\\       x\n")
 
-    def ally_sys(self):
-        root = os.path.join(self.tmp, "ally-sys")
-        write(os.path.join(root, "class/power_supply/AC0/type"), "Mains\n")
-        write(os.path.join(root, "class/power_supply/AC0/online"), "1\n")
-        write(os.path.join(root, "class/power_supply/BAT0/type"), "Battery\n")
-        write(os.path.join(root, "class/power_supply/BAT0/online"), "1\n")
-        for name, state in (("enp11s0f3u1u2", "up"), ("wlp6s0", "up"), ("tailscale0", "unknown"),
-                            ("lo", "unknown")):
-            write(os.path.join(root, "class/net", name, "operstate"), state + "\n")
-            write(os.path.join(root, "class/net", name, "carrier"), "1\n")
+    def handheld_sys(self):
+        root = os.path.join(self.tmp, "handheld-sys")
+        add_supply(root, "AC0", "Mains", online=1)
+        add_supply(root, "BAT0", "Battery", online=1, scope="System", status="Not charging")
+        add_net(root, "enp11s0f3u1u2")
+        add_net(root, "wlp6s0", wireless=True)
+        add_net(root, "tailscale0", kind=65534, state="unknown", virtual=True)
+        add_net(root, "lo", kind=772, state="unknown", virtual=True)
         write(os.path.join(root, "class/drm/card1/device/gpu_busy_percent"), "2\n")
         return root
 
     @unittest.skipUnless(ZSTD, "zstd not installed")
-    def test_measured_ally_layout(self):
-        root = self.ally_sys()
+    def test_measured_handheld_layout(self):
+        root = self.handheld_sys()
         cfg = self.cfg(sys=root)
-        run = FakeRunner(self.x265, self.ALLY_IP_OUT)
+        run = FakeRunner(self.x265, self.HANDHELD_IP_OUT)
         self.assertEqual(vworker.ethernet_links(root), ["enp11s0f3u1u2"])
-        st = self.status(cfg, runner=run, ssh_connection="192.168.1.50 52000 192.168.1.133 22")
+        st = self.status(cfg, runner=run, ssh_connection="192.0.2.50 52000 192.0.2.133 22")
         self.assertEqual((st["ok"], st["why"], st["ac"], st["ethernet"], st["x265"],
-                          st["version"]), (True, "ready", True, True, "4.1+1-1d117be", 1))
-        for addr, iface in (("192.168.1.134", "wlp6s0"), ("fe80::aa:bb", "wlp6s0"),
-                            ("100.101.102.103", "tailscale0")):
+                          st["version"], st["ipv4"]),
+                         (True, "ready", True, True, "4.1+1-1d117be", 1, ["192.0.2.133"]))
+        for addr, iface in (("192.0.2.134", "wlp6s0"), ("fe80::aa:bb", "wlp6s0"),
+                            ("100.64.0.7", "tailscale0")):
             st = self.status(cfg, runner=run, ssh_connection="10.0.0.1 52000 %s 22" % addr)
             self.assertEqual((st["ok"], st["ethernet"], st["why"]),
                              (False, False, "no Ethernet: ssh arrives on %s" % iface), addr)
@@ -740,6 +1190,52 @@ class Status(Tmp):
                            timeout=10)
         self.assertEqual(r.returncode, 0)                    # exit 0 even when not ok
         self.assertFalse(json.loads(r.stdout)["ok"])
+
+
+class ConfigLookup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vworker-cfg-")
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.bin = os.path.join(self.tmp, "bin")
+        self.empty = os.path.join(self.tmp, "empty")
+        os.makedirs(self.empty)
+
+    def tool(self, *parts):
+        path = os.path.join(self.tmp, *parts)
+        write(path, "#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_zstd_on_path_then_the_usual_places(self):
+        self.assertEqual(vworker.ZSTD_PATHS, ("/usr/bin/zstd", "/usr/local/bin/zstd"))
+        on_path = self.tool("bin", "zstd")
+        self.assertEqual(vworker.Config({"PATH": self.bin}).zstd, on_path)
+        self.assertEqual(vworker.Config({"PATH": self.bin, "VWORKER_ZSTD": "/x/zstd"}).zstd,
+                         "/x/zstd")
+        missing, local = os.path.join(self.tmp, "no-zstd"), self.tool("local", "zstd")
+        with mock.patch.object(vworker, "ZSTD_PATHS", (missing, local)):
+            self.assertEqual(vworker.Config({"PATH": self.empty}).zstd, local)
+        with mock.patch.object(vworker, "ZSTD_PATHS", (missing, missing + "2")):
+            self.assertEqual(vworker.Config({"PATH": self.empty}).zstd, missing)   # named, missing
+
+    def test_systemd_inhibit_only_where_it_exists(self):
+        found = self.tool("bin", "systemd-inhibit")
+        self.assertEqual(vworker.Config({"PATH": self.bin}).inhibit, found)
+        self.assertEqual(vworker.Config({"VWORKER_INHIBIT": "/x/inhibit"}).inhibit, "/x/inhibit")
+        if not os.path.exists("/usr/bin/systemd-inhibit"):
+            self.assertEqual(vworker.Config({"PATH": self.empty}).inhibit, "")
+        self.assertEqual(vworker.INHIBIT_ARGS,
+                         ["--what=sleep:idle", "--who=visionary-helper",
+                          "--why=encoding a segment", "--mode=block", "sleep", "infinity"])
+
+
+class PythonVersion(unittest.TestCase):
+    def test_runs_on_python_3_8(self):
+        with open(VWORKER) as f:
+            src = f.read()
+        ast.parse(src, feature_version=(3, 8))
+        self.assertNotIn("from __future__", src)
+        self.assertIn("Python 3.8 or newer", src)
 
 
 # ---- sweep / put / kill ---------------------------------------------------------------------
@@ -1091,8 +1587,8 @@ class EarlySignals(Tmp):
 
 
 class IdlePriority(unittest.TestCase):
-    """zstd and x265 run under SCHED_IDLE (the Ally has sched_autogroup on, so nice alone does
-    not let the desktop win), with nice 19 only where SCHED_IDLE is unavailable."""
+    """zstd and x265 run under SCHED_IDLE (most desktop distros turn sched_autogroup on, so nice
+    alone does not let the desktop win), with nice 19 only where SCHED_IDLE is unavailable."""
 
     def test_prefers_sched_idle(self):
         with mock.patch.object(vworker.os, "SCHED_IDLE", 5, create=True), \
@@ -1266,6 +1762,89 @@ class EncodeEndToEnd(EncodeBase):
         self.assertEqual(run.stdout, expected_hevc(40))
         self.assertEqual(run.vline()["result"], "ok")
         self.assert_cleaned("seg_sdr")
+
+    # -- the sleep block: held while x265 runs, gone on every way out
+    def inhibitor(self, fail=False):
+        path = os.path.join(self.tmp, "systemd-inhibit")
+        with open(path, "w") as f:
+            f.write(FAKE_INHIBIT.replace("{python}", sys.executable))
+        os.chmod(path, 0o755)
+        log = os.path.join(self.tmp, "inhibit.log")
+        env = {"VWORKER_INHIBIT": path, "FAKE_INHIBIT_LOG": log}
+        if fail:
+            env["FAKE_INHIBIT_FAIL"] = "1"
+        return env, log
+
+    def held(self, log, timeout=10):
+        """-> (pid, argv) of the fake systemd-inhibit once it has started."""
+        deadline = time.monotonic() + timeout
+        while not os.path.exists(log):
+            if time.monotonic() > deadline:
+                self.fail("systemd-inhibit never started")
+            time.sleep(0.02)
+        with open(log) as f:
+            pid, *argv = f.read().split("\n")
+        return int(pid), argv
+
+    def assert_released(self, pid):
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() > deadline:
+                self.fail("systemd-inhibit still running after vworker exited")
+            time.sleep(0.02)
+
+    def test_sleep_is_blocked_while_encoding(self):
+        env, log = self.inhibitor()
+        run = self.start("seg_awake", 6, dv=False, **env)
+        pid, argv = self.held(log)
+        self.assertEqual(argv, vworker.INHIBIT_ARGS)
+        os.kill(pid, 0)                                       # held while x265 waits for input
+        run.feed(zstd_compress(y4m(6)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(6))
+        self.assert_released(pid)
+        self.assert_cleaned("seg_awake")
+
+    def test_the_sleep_block_goes_on_a_yield_and_an_error(self):
+        env, log = self.inhibitor()
+        run = self.start("seg_awake_y", 50, dv=False, **env)
+        pid, _ = self.held(log)
+        self.wait_started()
+        add_proc(self.proc, FAKE_PID, "reaper", ["reaper", "SteamLaunch", "AppId=1145360"])
+        self.assertEqual(run.wait(), 75, run.stderr[-800:])
+        self.assert_released(pid)
+        shutil.rmtree(os.path.join(self.proc, str(FAKE_PID)))
+        os.unlink(log)
+        run = self.start("seg_awake_e", 3, dv=False, FAKE_X265_RC=4, **env)
+        pid, _ = self.held(log)
+        run.feed(zstd_compress(y4m(3)))
+        self.assertEqual(run.wait(), 1)
+        self.assert_released(pid)
+        self.assert_cleaned("seg_awake_e")
+
+    def test_no_sleep_block_never_fails_a_job(self):
+        env, log = self.inhibitor(fail=True)                  # polkit said no: it exits at once
+        run = self.start("seg_noblock", 4, dv=False, **env)
+        self.held(log)                                        # it ran (and gave up) first
+        run.feed(zstd_compress(y4m(4)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(4))
+        run = self.start("seg_noblock2", 4, dv=False,
+                         VWORKER_INHIBIT=os.path.join(self.tmp, "no-such-inhibit"))
+        run.feed(zstd_compress(y4m(4)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+
+    def test_a_refusal_takes_no_sleep_block(self):
+        env, log = self.inhibitor()
+        write(os.path.join(self.sys, "class/power_supply/ACAD/online"), "0\n")
+        run = self.start("seg_refused", 4, dv=False, **env)
+        run.feed(b"")
+        self.assertEqual(run.wait(), 77)
+        self.assertFalse(os.path.exists(log))
 
     # -- yields
     def test_game_mid_encode_yields_within_3_seconds(self):
@@ -1903,7 +2482,7 @@ class Scripts(unittest.TestCase):
                 f.write(body)
             os.chmod(os.path.join(fakebin, name), 0o755)
         os.symlink(sys.executable, os.path.join(fakebin, "python3"))
-        key = os.path.join(tmp, "id_ally")
+        key = os.path.join(tmp, "id_helper")
         with open(key, "w") as f:
             f.write("not a real key\n")
         log = os.path.join(tmp, "ssh.log")
@@ -1911,7 +2490,7 @@ class Scripts(unittest.TestCase):
                "VWORKER_STATUS_SAMPLE": "0", "HOME": tmp}
         for _ in range(2):
             r = subprocess.run(["bash", os.path.join(WORKER_DIR, "install.sh"), "--host",
-                                "ally.local", "--user", "bazzite", "--key", key],
+                                "helper.local", "--user", "user", "--key", key],
                                env=env, capture_output=True, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr.decode())
         installed = os.path.join(home, "visionary-worker", "bin", "vworker")
@@ -1930,7 +2509,7 @@ class Scripts(unittest.TestCase):
         with open(log) as f:
             calls = f.read()
         self.assertIn("-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 "
-                      "-o ServerAliveCountMax=3 bazzite@ally.local", calls)
+                      "-o ServerAliveCountMax=3 user@helper.local", calls)
         self.assertEqual(calls.count("systemctl --user enable --now visionary-worker-sweep.timer"), 2)
         self.assertIn(b'"version":1', r.stdout)               # it printed the helper's status
 
