@@ -9,12 +9,15 @@
 #   1. cat vworker.py -> ~/visionary-worker/bin/vworker on the helper, checked by sha256,
 #      chmod 755; creates ~/visionary-scratch/jobs (mode 700).
 #   2. installs a systemd --user timer that runs "vworker sweep" every 5 minutes
-#      (visionary-worker-sweep.timer / .service) and enables it.
+#      (visionary-worker-sweep.timer / .service) and enables it. The timer is only a backstop
+#      (every vworker call sweeps first), so a helper without a systemd user manager goes
+#      without it: a warning, and the install still succeeds.
 #   3. prints "vworker status" so you can see what the helper reports.
 # Safe to run again: every step overwrites or is a no-op.
 #
-# x265 is built separately, on the helper itself, by build-x265.sh:
-#   ssh -i <key> <user>@<host> 'bash -s' < engine/helper_worker/build-x265.sh
+# x265 is built separately, on the helper itself, by build-x265.sh, at the version this Mac's
+# `x265 --version` prints after "HEVC encoder version" (Setup's Build button does this):
+#   ssh -i <key> <user>@<host> 'bash -s -- --version <token>' < engine/helper_worker/build-x265.sh
 #
 # This script runs on macOS's bash 3.2, so it avoids bash 4 features.
 set -euo pipefail
@@ -56,20 +59,29 @@ sha256_of() {
   python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
 }
 
+# only the given key is offered (IdentitiesOnly), as the app's own ssh does: an agent holding
+# many keys could otherwise use up the helper's MaxAuthTries before this one is tried
 ssh_helper() {
-  ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 \
-      -o ServerAliveCountMax=3 "$user@$host" "$@"
+  ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$user@$host" "$@"
 }
 
 echo "install.sh: copying vworker to $user@$host" >&2
 want=$(sha256_of "$src")
-got=$(ssh_helper 'set -e; umask 077
+# the helper's shell may print rc-file noise around the hash, so look for the hash in what
+# comes back instead of comparing all of it
+out=$(ssh_helper 'set -e; umask 077
   mkdir -p "$HOME/visionary-worker/bin" "$HOME/visionary-scratch/jobs"
   cat > "$HOME/visionary-worker/bin/.vworker.new"
   python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest())" \
-    "$HOME/visionary-worker/bin/.vworker.new"' < "$src")
-if [ "$got" != "$want" ]; then
-  echo "install.sh: copy is corrupt (sha256 $got, want $want); nothing installed" >&2
+    "$HOME/visionary-worker/bin/.vworker.new"' < "$src" | tr -d '\r')
+case "$out" in
+  *"$want"*) ok=1 ;;
+  *) ok=0 ;;
+esac
+if [ "$ok" != 1 ]; then
+  got=$(printf '%s\n' "$out" | grep -Eo '[0-9a-f]{64}' | tail -n 1 || true)
+  echo "install.sh: copy is corrupt (sha256 ${got:-missing}, want $want); nothing installed" >&2
   ssh_helper 'rm -f "$HOME/visionary-worker/bin/.vworker.new"' </dev/null || true
   exit 1
 fi
@@ -81,9 +93,12 @@ bin="$HOME/visionary-worker/bin"
 chmod 755 "$bin/.vworker.new"
 mv -f "$bin/.vworker.new" "$bin/vworker"
 chmod 700 "$HOME/visionary-scratch" "$HOME/visionary-scratch/jobs"
-units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-mkdir -p "$units"
-cat > "$units/visionary-worker-sweep.service" <<'EOF'
+timer=0
+if command -v systemctl >/dev/null 2>&1 &&
+   systemctl --user show-environment >/dev/null 2>&1 </dev/null; then
+  units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$units"
+  cat > "$units/visionary-worker-sweep.service" <<'EOF'
 [Unit]
 Description=Visionary helper worker: delete abandoned job scratch
 
@@ -92,7 +107,7 @@ Type=oneshot
 ExecStart=%h/visionary-worker/bin/vworker sweep
 Nice=10
 EOF
-cat > "$units/visionary-worker-sweep.timer" <<'EOF'
+  cat > "$units/visionary-worker-sweep.timer" <<'EOF'
 [Unit]
 Description=Visionary helper worker: sweep abandoned job scratch every 5 minutes
 
@@ -104,8 +119,13 @@ AccuracySec=30s
 [Install]
 WantedBy=timers.target
 EOF
-systemctl --user daemon-reload
-systemctl --user enable --now visionary-worker-sweep.timer
+  if systemctl --user daemon-reload </dev/null &&
+     systemctl --user enable --now visionary-worker-sweep.timer </dev/null; then
+    timer=1
+  fi
+fi
+[ "$timer" = 1 ] || echo "install.sh: warning: the 5-minute cleanup timer was not installed;" \
+  "vworker still deletes its job files itself (this helper has no working systemd user manager)" >&2
 echo "installed: $bin/vworker"
-"$bin/vworker" status || true
+"$bin/vworker" status </dev/null || true
 REMOTE
