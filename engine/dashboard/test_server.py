@@ -784,7 +784,7 @@ class RemoteAccess(unittest.TestCase):
 
     def test_remote_without_a_token_is_refused(self):
         self.assertFalse(_req("100.64.0.9")._authorized())
-        self.assertFalse(_req("192.168.1.50")._authorized())
+        self.assertFalse(_req("192.0.2.50")._authorized())
 
     def test_remote_with_a_wrong_token_is_refused(self):
         self.assertFalse(_req("100.64.0.9", Authorization="Bearer nope")._authorized())
@@ -1256,6 +1256,89 @@ class DvToolchainInstall(unittest.TestCase):
         self.assertIn("dv_toolchain", setup_jobs.TARGETS)
 
 
+class HelperSetupEndpoints(unittest.TestCase):
+    """Settings > Setup > Helper: GET /api/helper/setup is helper.setup_status (fresh only on
+    ?fresh=1); POST /api/setup/install {what: helper_key|helper_worker|helper_x265} runs the
+    argv helper.setup_job_argv computed from the SAVED settings, or answers its refusal in
+    plain words — and either way the helper's next setup check cannot serve a stale answer."""
+
+    def _get(self, path):
+        sent = {}
+        h = _req("127.0.0.1", path=path)
+        h._json = lambda out, code=200: sent.update(out=out, code=code)
+        h.do_GET()
+        return sent
+
+    def _install(self, what):
+        import io, json
+        body = json.dumps({"what": what}).encode()
+        h = _req("127.0.0.1", path="/api/setup/install", **{"Content-Length": str(len(body))})
+        h.rfile = io.BytesIO(body)
+        sent = {}
+        h._json = lambda out, code=200: sent.update(out=out, code=code)
+        h.do_POST()
+        return sent
+
+    def test_get_setup_is_setup_status_and_passes_fresh(self):
+        import helper
+        for path, fresh in (("/api/helper/setup", False), ("/api/helper/setup?fresh=1", True),
+                            ("/api/helper/setup?fresh=0", False)):
+            with mock.patch.object(helper, "setup_status", return_value={"configured": False}) as st:
+                sent = self._get(path)
+            st.assert_called_once_with(fresh=fresh)
+            self.assertEqual(sent, {"out": {"configured": False}, "code": 200})
+
+    def test_get_setup_needs_the_token_off_this_mac(self):
+        import helper
+        h = _req("100.64.0.9", path="/api/helper/setup")
+        denied = []
+        h._deny = lambda: denied.append(True)
+        with mock.patch.object(server, "remote_token", return_value="tok"), \
+             mock.patch.object(helper, "setup_status") as st:
+            h.do_GET()
+        self.assertEqual(denied, [True])
+        st.assert_not_called()
+
+    def test_a_helper_job_runs_the_engine_argv_and_invalidates_the_setup_check(self):
+        import helper, setup_jobs
+        for what in ("helper_key", "helper_worker", "helper_x265"):
+            with mock.patch.object(helper, "setup_job_argv", return_value=(["/bin/true", what], "")) as ja, \
+                 mock.patch.object(helper, "invalidate_setup") as inv, \
+                 mock.patch.object(setup_jobs, "start", return_value={"state": "running"}) as start:
+                sent = self._install(what)
+            ja.assert_called_once_with(what)
+            self.assertEqual(start.call_args.args, (what,))
+            self.assertEqual(start.call_args.kwargs["argv"], ["/bin/true", what])
+            self.assertIs(start.call_args.kwargs["on_done"], inv)    # ...when it finishes
+            inv.assert_called_once_with()                            # ...and as it starts
+            self.assertEqual(sent, {"out": {"state": "running"}, "code": 200})
+            self.assertIn(what, setup_jobs.TARGETS)
+
+    def test_a_refusal_is_plain_words_and_starts_nothing(self):
+        import helper, setup_jobs
+        why = "no SSH key yet - Create key first"
+        with mock.patch.object(helper, "setup_job_argv", return_value=(None, why)), \
+             mock.patch.object(setup_jobs, "start") as start:
+            sent = self._install("helper_worker")
+        start.assert_not_called()
+        self.assertEqual(sent["out"], {"error": why, "detail": why})
+        self.assertEqual(sent["code"], 200)
+
+    def test_other_jobs_get_no_on_done(self):
+        import setup_jobs
+        with mock.patch.object(setup_jobs, "start", return_value={"state": "running"}) as start:
+            self._install("brew_tools")
+        self.assertIsNone(start.call_args.kwargs["on_done"])
+
+    def test_the_real_refusal_when_not_set_up(self):
+        # the shipped defaults: no host, no user — the worker job is refused, nothing runs
+        import setup_jobs
+        with mock.patch.object(setup_jobs, "start") as start:
+            sent = self._install("helper_worker")
+        start.assert_not_called()
+        self.assertIn("isn't set up yet", sent["out"]["error"])
+
+
 class HelperStatusInState(unittest.TestCase):
     """/api/state carries "helper": helper.status_summary() — the cached one-line status the
     remux lane shows while the helper is switched on. Anything wrong with the helper (an import
@@ -1263,7 +1346,7 @@ class HelperStatusInState(unittest.TestCase):
     on it."""
 
     SUMMARY = {"enabled": True, "state": "ready", "detail": "waiting for the next segment",
-               "host": "box", "tooltip": "box · 192.168.1.20 over Ethernet"}
+               "host": "box", "tooltip": "box · 192.0.2.20 over Ethernet"}
 
     def _fake_helper(self, **kw):
         import types

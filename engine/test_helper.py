@@ -86,7 +86,7 @@ def final(result, why, frames, rc, code=None):
 if verb == "status":
     log("calls.log", {"verb": "status"})
     p = os.path.join(root, "status.json")
-    print("Welcome to Bazzite")          # a login banner line before the JSON
+    print("Welcome to Linux")          # a login banner line before the JSON
     print(open(p).read().strip() if os.path.exists(p) else json.dumps(
         {"ok": True, "why": "", "ac": True, "ethernet": True, "game": None, "heavy": None,
          "free_gb": 400.0, "busy": False, "x265": "4.1+1-1d117be", "version": 1}))
@@ -181,12 +181,12 @@ def write_fakes(dirpath: str) -> dict:
 
 
 X265_TOKEN = "4.1+1-1d117be"            # the fakes' x265 build, injected as "this Mac's" too
-ROUTE = (True, "wired via en12 (192.168.1.133)", "192.168.1.133", "en12")
+ROUTE = (True, "wired via en7 (192.0.2.133)", "192.0.2.133", "en7")
 
 
 # what a chatty login shell prints before running the command: a motd, a near-miss of the
 # stream marker and bytes that look like the start of an HEVC stream — all of it on STDOUT
-SHELL_JUNK = "Last login: Tue Oct 28\\nWelcome to Bazzite\\n\\000\\000\\000\\001\\106\\001VWHEVC0\\nVWHEV"
+SHELL_JUNK = "Last login: Tue Oct 28\\nWelcome to Linux\\n\\000\\000\\000\\001\\106\\001VWHEVC0\\nVWHEV"
 
 
 def fake_argv(vworker: str, root: str, mode: str = "ok", junk: str | None = None):
@@ -205,7 +205,7 @@ def fake_helper(vworker: str, root: str, mode: str = "ok", junk: str | None = No
     kw.setdefault("enabled", lambda: True)
     kw.setdefault("route_ok", lambda host: ROUTE)
     kw.setdefault("local_x265", lambda: X265_TOKEN)
-    return helper.Helper("ally.test", "bazzite", "/nonexistent/key",
+    return helper.Helper("helper.test", "user", "/nonexistent/key",
                          argv=fake_argv(vworker, root, mode, junk), **kw)
 
 
@@ -251,16 +251,16 @@ class SshArgv(unittest.TestCase):
     def test_the_protocol_command_line(self):
         # D1: the CHECKED IPv4 (-4), the host only as the known_hosts alias, bound to the wired
         # interface, only the configured key, and nothing from ssh_config can multiplex/jump/tty
-        argv = helper.ssh_argv("bazzite.local", "bazzite", "~/.ssh/id_ed25519_ally_claude",
-                               "192.168.1.133", "en12", "encode", "abc123", "eyJ4Ijox+/=")
+        argv = helper.ssh_argv("helper.local", "user", "~/.ssh/helper_key",
+                               "192.0.2.133", "en7", "encode", "abc123", "eyJ4Ijox+/=")
         self.assertEqual(argv, [
-            "/usr/bin/ssh", "-4", "-i", os.path.expanduser("~/.ssh/id_ed25519_ally_claude"),
+            "/usr/bin/ssh", "-4", "-i", os.path.expanduser("~/.ssh/helper_key"),
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
-            "-o", "HostKeyAlias=bazzite.local", "-o", "BindInterface=en12",
+            "-o", "HostKeyAlias=helper.local", "-o", "BindInterface=en7",
             "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
             "-o", "ProxyJump=none", "-o", "RequestTTY=no",
-            "bazzite@192.168.1.133",
+            "user@192.0.2.133",
             "~/visionary-worker/bin/vworker", "encode", "abc123", "eyJ4Ijox+/="])
 
     def test_the_put_command_carries_the_byte_count(self):
@@ -271,20 +271,20 @@ class SshArgv(unittest.TestCase):
         self.assertEqual(helper.ssh_argv("h", "u", "/k", "10.0.0.2", "en5", "a b;rm")[-1], "'a b;rm'")
 
     def test_argv_is_none_until_a_route_was_checked_and_follows_the_check(self):
-        verdict = [(True, "wired via en12 (192.168.1.133)", "192.168.1.133", "en12")]
-        h = helper.Helper("bazzite.local", "bazzite", "~/.ssh/k", route_ok=lambda host: verdict[0])
+        verdict = [(True, "wired via en7 (192.0.2.133)", "192.0.2.133", "en7")]
+        h = helper.Helper("helper.local", "user", "~/.ssh/k", route_ok=lambda host: verdict[0])
         self.assertIsNone(h.argv("status"))                # nothing over an unchecked route
-        self.assertEqual(h.check_route(), (True, "wired via en12 (192.168.1.133)"))
+        self.assertEqual(h.check_route(), (True, "wired via en7 (192.0.2.133)"))
         argv = h.argv("status")
-        self.assertIn("bazzite@192.168.1.133", argv)
-        self.assertIn("BindInterface=en12", argv)
-        self.assertIn("HostKeyAlias=bazzite.local", argv)
-        verdict[0] = (False, "the route to bazzite.local is Wi-Fi (en0)", "192.168.1.133", "en0")
+        self.assertIn("user@192.0.2.133", argv)
+        self.assertIn("BindInterface=en7", argv)
+        self.assertIn("HostKeyAlias=helper.local", argv)
+        verdict[0] = (False, "the route to helper.local is Wi-Fi (en0)", "192.0.2.133", "en0")
         self.assertFalse(h.check_route()[0])
         self.assertIsNone(h.argv("status"))                # a failed check leaves no route
 
     def test_an_ok_verdict_without_address_or_interface_is_refused(self):
-        for r in ((True, "wired"), (True, "wired", None, "en12"), (True, "wired", "10.0.0.2", "")):
+        for r in ((True, "wired"), (True, "wired", None, "en7"), (True, "wired", "10.0.0.2", "")):
             h = helper.Helper("h", "u", "/k", route_ok=lambda host, _r=r: _r)
             ok, why = h.check_route()
             self.assertFalse(ok, r)
@@ -294,71 +294,178 @@ class SshArgv(unittest.TestCase):
 
 # ---- is the route wired? ----------------------------------------------------------------------
 
-ROUTE_EN12 = """   route to: 192.168.1.20
-destination: 192.168.1.20
-  interface: en12
+ROUTE_EN7 = """   route to: 192.0.2.20
+destination: 192.0.2.20
+  interface: en7
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
 """
-ROUTE_EN0 = ROUTE_EN12.replace("en12", "en0")
-ROUTE_UTUN = ROUTE_EN12.replace("en12", "utun4")
+ROUTE_EN0 = ROUTE_EN7.replace("en7", "en0")
+ROUTE_UTUN = ROUTE_EN7.replace("en7", "utun4")
 PORTS = """
 Hardware Port: Ethernet Adapter (en4)
 Device: en4
-Ethernet Address: ba:da:d1:5f:f4:27
+Ethernet Address: 02:00:00:00:00:04
 
 Hardware Port: USB 10/100/1G/2.5G/5G LAN
-Device: en12
-Ethernet Address: 6c:1f:f7:26:b4:3a
+Device: en7
+Ethernet Address: 02:00:00:00:00:07
 
 Hardware Port: Wi-Fi
 Device: en0
-Ethernet Address: 3c:a6:f6:00:00:01
+Ethernet Address: 02:00:00:00:00:01
 
 Hardware Port: Thunderbolt Bridge
 Device: bridge0
-Ethernet Address: 36:dd:81:74:6b:80
+Ethernet Address: 02:00:00:00:00:b0
 
 VLAN Configurations
 ===================
 """
+# `networksetup -listnetworkserviceorder` with Wi-Fi ranked ABOVE the USB Ethernet
+SERVICE_ORDER = """An asterisk (*) denotes that a network service is disabled.
+(1) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(2) USB 10/100/1G/2.5G/5G LAN
+(Hardware Port: USB 10/100/1G/2.5G/5G LAN, Device: en7)
+
+(3) Thunderbolt Bridge
+(Hardware Port: Thunderbolt Bridge, Device: bridge0)
+"""
+# `ifconfig`: Wi-Fi AND the cable both up, both on the helper's 192.0.2.0/24
+IFCONFIG_BOTH = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether 02:00:00:00:00:01
+\tinet 192.0.2.30 netmask 0xffffff00 broadcast 192.0.2.255
+\tmedia: autoselect
+\tstatus: active
+en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether 02:00:00:00:00:07
+\tinet 192.0.2.31 netmask 0xffffff00 broadcast 192.0.2.255
+\tmedia: autoselect (1000baseT <full-duplex>)
+\tstatus: active
+"""
+
+
+def mac_runner(route_out="", ports_out=PORTS, route_rc=0, ports_rc=0, ifconfig_out="",
+               order_out=SERVICE_ORDER, ssh=None):
+    """A fake `run` for the Mac-side commands (ifconfig, networksetup, route) — and, with
+    `ssh` = (rc, out, err), setup's login probe. Records every command in `calls`."""
+    calls = []
+
+    def run(cmd, timeout):
+        calls.append(cmd)
+        if cmd[0] == helper.IFCONFIG:
+            return 0, ifconfig_out, ""
+        if cmd[0] == helper.ROUTE:
+            return route_rc, route_out, ""
+        if cmd[:2] == [helper.NETWORKSETUP, "-listallhardwareports"]:
+            return ports_rc, ports_out, ""
+        if cmd[:2] == [helper.NETWORKSETUP, "-listnetworkserviceorder"]:
+            return 0, order_out, ""
+        if cmd[0] == helper.SSH and ssh is not None:
+            return ssh
+        raise AssertionError(f"unexpected command {cmd}")
+    return run, calls
 
 
 class WiredRoute(unittest.TestCase):
     def setUp(self):
         helper.reset_state()
 
-    def _runner(self, route_out, ports_out=PORTS, route_rc=0, ports_rc=0):
-        calls = []
-
-        def run(cmd, timeout):
-            calls.append(cmd)
-            if cmd[0] == helper.ROUTE:
-                return route_rc, route_out, ""
-            if cmd[0] == helper.NETWORKSETUP:
-                return ports_rc, ports_out, ""
-            raise AssertionError(f"unexpected command {cmd}")
-        return run, calls
+    def _runner(self, route_out, ports_out=PORTS, route_rc=0, ports_rc=0, ifconfig_out=""):
+        # no interface on the helper's subnet unless a test says so: the route table decides
+        return mac_runner(route_out, ports_out, route_rc, ports_rc, ifconfig_out)
 
     def test_parsers(self):
-        self.assertEqual(helper.parse_route_interface(ROUTE_EN12), "en12")
+        self.assertEqual(helper.parse_route_interface(ROUTE_EN7), "en7")
         self.assertIsNone(helper.parse_route_interface("route: writing to routing socket: not in table"))
-        self.assertEqual(helper.parse_wifi_device(PORTS), "en0")
-        self.assertIsNone(helper.parse_wifi_device(PORTS.replace("Wi-Fi", "Wi-Fo")))
 
     def test_a_wired_usb_ethernet_route_is_ok(self):
-        run, calls = self._runner(ROUTE_EN12)
-        ok, why, ip, iface, code = helper.wired_route_ok("bazzite.local", run=run,
-                                                         resolve=lambda h: "192.168.1.20")
+        run, calls = self._runner(ROUTE_EN7)
+        ok, why, ip, iface, code = helper.wired_route_ok("helper.local", run=run,
+                                                         resolve=lambda h: "192.0.2.20")
         self.assertTrue(ok, why)
-        self.assertIn("en12", why)
-        self.assertEqual((ip, iface), ("192.168.1.20", "en12"))   # what the ssh connects over
+        self.assertIn("en7", why)
+        self.assertEqual((ip, iface), ("192.0.2.20", "en7"))   # what the ssh connects over
         self.assertEqual(code, "wired")
-        self.assertEqual(calls[0], [helper.ROUTE, "-n", "get", "192.168.1.20"])
+        self.assertIn([helper.ROUTE, "-n", "get", "192.0.2.20"], calls)
+
+    # -- H8: the wired interface is picked the way nas_link picks one for the NAS --------------
+
+    def test_a_cable_on_the_helpers_subnet_wins_over_wifi_ranked_first(self):
+        # Wi-Fi is FIRST in the service order and the route table says en0 — the old check
+        # refused ("the Mac is on Wi-Fi") although the cable reaches the helper
+        self.assertEqual([d for _n, d in helper.nas_link.parse_service_order(SERVICE_ORDER)][:2],
+                         ["en0", "en7"])                   # the fixture really ranks Wi-Fi first
+        run, calls = self._runner(ROUTE_EN0, ifconfig_out=IFCONFIG_BOTH)
+        ok, why, ip, iface, code = helper.wired_route_ok("helper.local", run=run,
+                                                         resolve=lambda h: "192.0.2.20")
+        self.assertEqual((ok, ip, iface, code), (True, "192.0.2.20", "en7", "wired"), why)
+        self.assertNotIn(helper.ROUTE, [c[0] for c in calls])     # picked; no route lookup
+        argv = helper.ssh_argv("helper.local", "user", "~/.ssh/k", ip, iface, "status")
+        self.assertIn("BindInterface=en7", argv)                    # bound to the cable
+
+    def test_only_with_no_cable_on_its_subnet_is_it_wifi(self):
+        on_another_subnet = IFCONFIG_BOTH.replace("inet 192.0.2.31", "inet 198.51.100.31")
+        unplugged = IFCONFIG_BOTH.replace("(1000baseT <full-duplex>)\n\tstatus: active",
+                                          "(none)\n\tstatus: inactive")
+        self.assertNotEqual(unplugged, IFCONFIG_BOTH)
+        for ifc in (on_another_subnet, unplugged):
+            helper.reset_state()
+            run, _c = self._runner(ROUTE_EN0, ifconfig_out=ifc)
+            ok, why, _ip, iface, code = helper.wired_route_ok("helper.local", run=run,
+                                                              resolve=lambda h: "192.0.2.20")
+            self.assertEqual((ok, iface, code), (False, "en0", "wifi"), why)
+
+    def test_a_wifi_address_on_the_subnet_is_never_picked(self):
+        wifi_only = IFCONFIG_BOTH.split("en7:")[0]
+        run, _c = self._runner(ROUTE_EN0, ifconfig_out=wifi_only)
+        r = helper.wired_route_ok("h", run=run, resolve=lambda h: "192.0.2.20")
+        self.assertEqual((r[0], r[4]), (False, "wifi"))
+
+    def test_without_the_port_list_nothing_is_picked(self):
+        # nothing could tell the Wi-Fi from the cable: no pick, and the route alone cannot pass
+        run, _c = self._runner(ROUTE_EN7, ports_rc=1, ifconfig_out=IFCONFIG_BOTH)
+        r = helper.wired_route_ok("h", run=run, resolve=lambda h: "192.0.2.20")
+        self.assertEqual((r[0], r[4]), (False, "route_check"))
+
+    def test_a_tethered_phone_route_is_not_wired(self):
+        ports = PORTS + "\nHardware Port: iPhone USB\nDevice: en9\nEthernet Address: 02:00:00:00:00:09\n"
+        run, _c = self._runner(ROUTE_EN7.replace("en7", "en9"), ports_out=ports)
+        r = helper.wired_route_ok("h", run=run, resolve=lambda h: "192.0.2.20")
+        self.assertEqual((r[0], r[3], r[4]), (False, "en9", "not_wired"))
+
+    def test_a_helper_beyond_a_router_over_the_cable_is_wired(self):
+        # not on any of the Mac's subnets: the route's own interface, when it is a cable
+        run, _c = self._runner(ROUTE_EN7, ifconfig_out=IFCONFIG_BOTH)
+        r = helper.wired_route_ok("h", run=run, resolve=lambda h: "203.0.113.9")
+        self.assertEqual((r[0], r[3], r[4]), (True, "en7", "wired"))
+
+    # -- H9: once the helper has listed its own wired addresses, only those are tried ---------
+
+    def test_prefer_tries_only_the_listed_addresses_and_never_resolves(self):
+        def no_resolve(h):
+            raise AssertionError("resolved although the helper listed its addresses")
+        run, calls = self._runner(ROUTE_EN0, ifconfig_out=IFCONFIG_BOTH)
+        ok, why, ip, iface, code = helper.wired_route_ok(
+            "helper.local", run=run, resolve=no_resolve, prefer=["198.51.100.7", "192.0.2.44"])
+        self.assertEqual((ok, ip, iface), (True, "192.0.2.44", "en7"), why)   # the wired one
+        self.assertEqual(sum(1 for c in calls if c[0] == helper.IFCONFIG), 1)  # read once
+        run, _c = self._runner(ROUTE_EN0, ifconfig_out=IFCONFIG_BOTH)
+        r = helper.wired_route_ok("helper.local", run=run, resolve=no_resolve,
+                                  prefer=["198.51.100.7"])
+        self.assertEqual((r[0], r[2], r[4]), (False, "198.51.100.7", "wifi"))  # never another
+        run, _c = self._runner(ROUTE_EN0, ifconfig_out=IFCONFIG_BOTH)
+        r = helper.wired_route_ok("helper.local", run=run, resolve=lambda h: "192.0.2.20",
+                                  prefer=[])
+        self.assertEqual((r[0], r[2]), (True, "192.0.2.20"))     # an empty list: the name
 
     def test_a_wifi_route_is_refused(self):
         run, _calls = self._runner(ROUTE_EN0)
-        ok, why, _ip, _iface, code = helper.wired_route_ok("bazzite.local", run=run,
-                                                           resolve=lambda h: "192.168.1.20")
+        ok, why, _ip, _iface, code = helper.wired_route_ok("helper.local", run=run,
+                                                           resolve=lambda h: "192.0.2.20")
         self.assertFalse(ok)
         self.assertIn("Wi-Fi", why)
         self.assertEqual(code, "wifi")
@@ -373,7 +480,7 @@ class WiredRoute(unittest.TestCase):
             self.assertEqual(code, "not_wired" if rc == 0 else "unreachable", route_out)
 
     def test_unlisted_ports_or_no_address_is_refused(self):
-        run, _c = self._runner(ROUTE_EN12, ports_rc=1)
+        run, _c = self._runner(ROUTE_EN7, ports_rc=1)
         r = helper.wired_route_ok("h", run=run, resolve=lambda h: "10.0.0.2")
         self.assertEqual((r[0], r[4]), (False, "route_check"))
         helper.reset_state()
@@ -381,16 +488,18 @@ class WiredRoute(unittest.TestCase):
         self.assertEqual((r[0], r[4]), (False, "unreachable"))
 
     def test_a_mac_without_wifi_is_judged_by_the_interface(self):
-        run, _c = self._runner(ROUTE_EN12, ports_out=PORTS.replace("Wi-Fi", "Ethernet X"))
+        run, _c = self._runner(ROUTE_EN7, ports_out=PORTS.replace("Wi-Fi", "Ethernet X"))
         self.assertTrue(helper.wired_route_ok("h", run=run, resolve=lambda h: "10.0.0.2")[0])
 
     def test_the_verdict_is_never_cached(self):
         # D2: a cached verdict could outlive a pulled cable — every call runs the check again
-        out = [ROUTE_EN12]
+        out = [ROUTE_EN7]
         calls = []
 
         def run(cmd, timeout):
             calls.append(cmd)
+            if cmd[0] == helper.IFCONFIG:
+                return 0, "", ""
             return 0, (out[0] if cmd[0] == helper.ROUTE else PORTS), ""
         self.assertTrue(helper.wired_route_ok("h", run=run, resolve=lambda h: "10.0.0.2")[0])
         n = len(calls)
@@ -400,22 +509,22 @@ class WiredRoute(unittest.TestCase):
         self.assertFalse(helper.wired_route_ok("h", run=run, resolve=lambda h: "10.0.0.2")[0])
 
     def test_an_ip_literal_is_not_resolved(self):
-        self.assertEqual(helper._resolve_ipv4("192.168.1.20"), "192.168.1.20")
+        self.assertEqual(helper._resolve_ipv4("192.0.2.20"), "192.0.2.20")
 
     def test_resolution_asks_for_ipv4_only(self):
-        # bazzite.local resolved to an IPv6 link-local that rode Wi-Fi (55 Mbps): AF_INET only
+        # a .local name resolved to an IPv6 link-local that rode Wi-Fi (55 Mbps): AF_INET only
         with mock.patch.object(helper.socket, "getaddrinfo",
-                               return_value=[(2, 1, 6, "", ("192.168.1.133", 0))]) as gai:
-            self.assertEqual(helper._resolve_ipv4("bazzite.local"), "192.168.1.133")
-        self.assertEqual(gai.call_args[0][:3], ("bazzite.local", None, helper.socket.AF_INET))
+                               return_value=[(2, 1, 6, "", ("192.0.2.133", 0))]) as gai:
+            self.assertEqual(helper._resolve_ipv4("helper.local"), "192.0.2.133")
+        self.assertEqual(gai.call_args[0][:3], ("helper.local", None, helper.socket.AF_INET))
         with mock.patch.object(helper.socket, "getaddrinfo", side_effect=OSError("nope")):
-            self.assertIsNone(helper._resolve_ipv4("bazzite.local"))
+            self.assertIsNone(helper._resolve_ipv4("helper.local"))
 
     def test_a_hanging_resolver_is_bounded(self):
         gate = threading.Event()
         with mock.patch.object(helper.socket, "getaddrinfo", side_effect=lambda *a: gate.wait(5)):
             t0 = time.monotonic()
-            self.assertIsNone(helper._resolve_ipv4("bazzite.local", timeout=0.2))
+            self.assertIsNone(helper._resolve_ipv4("helper.local", timeout=0.2))
             self.assertLess(time.monotonic() - t0, 2.0)
         gate.set()
 
@@ -480,7 +589,7 @@ class FakeRemoteCase(unittest.TestCase):
         helper.reset_state()
         self.td = tempfile.mkdtemp()
         self.fakes = write_fakes(self.td)
-        self.root = os.path.join(self.td, "ally")
+        self.root = os.path.join(self.td, "helper")
         os.makedirs(self.root)
         self.env = mock.patch.dict(os.environ, {"FAKE_W": "4", "FAKE_H": "2", "FAKE_DEC_SLEEP": "0",
                                                 "FAKE_DEC_FAIL_AT": "-1"})
@@ -554,7 +663,7 @@ class StatusAndAvailability(FakeRemoteCase):
             self.assertEqual(h.available(), (True, "ready"))
         self.assertEqual(box["n"], 3)
         self.assertEqual(len(self.calls()), 1)             # one status ssh for all three
-        box["v"] = (False, "the route to ally.test is Wi-Fi (en0)", "192.168.1.133", "en0")
+        box["v"] = (False, "the route to helper.test is Wi-Fi (en0)", "192.0.2.133", "en0")
         ok, why = h.available()                            # the cached ok does not outlive it
         self.assertFalse(ok)
         self.assertIn("Wi-Fi", why)
@@ -593,7 +702,7 @@ class StatusAndAvailability(FakeRemoteCase):
                 return 0, "", "x265 [info]: HEVC encoder version 4.1+1-1d117be\n"
             return _real_run(cmd, timeout)
         _real_run = helper._run
-        h = helper.Helper("ally.test", "bazzite", "/nonexistent/key",
+        h = helper.Helper("helper.test", "user", "/nonexistent/key",
                           argv=fake_argv(self.fakes["vworker"], self.root), enabled=lambda: True,
                           route_ok=lambda host: ROUTE)
         with mock.patch.object(helper, "_run", side_effect=fake_run):
@@ -636,7 +745,7 @@ class StatusAndAvailability(FakeRemoteCase):
         self.assertEqual(len(self.calls()), 1)             # a real refusal: cached
 
     def test_this_process_holding_the_slot_is_busy_without_a_probe(self):
-        a, b = self.helper(), self.helper()                # two lanes, one Ally
+        a, b = self.helper(), self.helper()                # two lanes, one helper
         self.assertTrue(a.claim())
         try:
             self.assertEqual(b.available(), (False, "busy: another remux is using the helper"))
@@ -714,12 +823,12 @@ class StatusAndAvailability(FakeRemoteCase):
             self.assertEqual(h.available(), (True, "ready"))
         self.assertEqual(len(self.calls()), 1)             # still the cached answer, no cooldown
 
-    def test_the_cache_is_shared_by_every_helper_for_the_same_ally(self):
+    def test_the_cache_is_shared_by_every_helper_for_the_same_machine(self):
         self.helper().available()
         self.helper().available()                          # a second lane's helper
         self.assertEqual(len(self.calls()), 1)
 
-    def test_one_job_slot_per_ally(self):
+    def test_one_job_slot_per_machine(self):
         a, b = self.helper(), self.helper()
         self.assertTrue(a.claim())
         self.assertFalse(b.claim())
@@ -817,7 +926,7 @@ class EncodeSegment(FakeRemoteCase):
         self.assertEqual(self.kills()[0], self.calls("encode.log")[0]["job"])
 
     def test_an_answered_failure_needs_no_kill(self):
-        # the VWORKER line arrived: the Ally already stopped and deleted the job itself
+        # the VWORKER line arrived: the helper already stopped and deleted the job itself
         for mode in ("refuse", "yield:3", "disconnect:3", "error:3"):
             helper.reset_state()
             (got, _why, _kind), _part = self.run_seg(mode)
@@ -837,7 +946,7 @@ class EncodeSegment(FakeRemoteCase):
         t = [100.0]
         h = self.helper(route_ok=route_ok, clock=lambda: t[0])
         self.assertTrue(h.available()[0])
-        box["v"] = (False, "the route to ally.test is Wi-Fi (en0)", "192.168.1.133", "en0")
+        box["v"] = (False, "the route to helper.test is Wi-Fi (en0)", "192.0.2.133", "en0")
         (got, why, kind), part = self.run_seg(h=h)
         self.assertEqual((got, kind), (None, "refused"))
         self.assertIn("Wi-Fi", why)
@@ -853,7 +962,7 @@ class EncodeSegment(FakeRemoteCase):
 
     def test_a_route_gone_between_the_check_and_the_send_does_not_cool_down(self):
         real = fake_argv(self.fakes["vworker"], self.root)
-        h = helper.Helper("ally.test", "bazzite", "/nonexistent/key", enabled=lambda: True,
+        h = helper.Helper("helper.test", "user", "/nonexistent/key", enabled=lambda: True,
                           route_ok=lambda host: ROUTE, local_x265=lambda: X265_TOKEN,
                           argv=lambda *remote: None if remote[0] == "encode" else real(*remote))
         self.assertTrue(h.available()[0])
@@ -881,15 +990,15 @@ class EncodeSegment(FakeRemoteCase):
         def fake_popen(cmd, **kw):
             seen.append(cmd)
             raise OSError("not in a test")
-        h = helper.Helper("ally.test", "bazzite", "/k", enabled=lambda: True,
+        h = helper.Helper("helper.test", "user", "/k", enabled=lambda: True,
                           route_ok=lambda host: ROUTE, local_x265=lambda: X265_TOKEN)
         with mock.patch.object(helper.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch.object(helper, "_run", return_value=(255, "", "")):
             (got, _why, kind), _part = self.run_seg(h=h)
         self.assertEqual((got, kind), (None, "error"))
         self.assertEqual(seen[0][-5:-1], [helper.VWORKER, "put", seen[0][-3], "rpu.bin"])
-        self.assertIn("bazzite@192.168.1.133", seen[0])
-        self.assertIn("BindInterface=en12", seen[0])
+        self.assertIn("user@192.0.2.133", seen[0])
+        self.assertIn("BindInterface=en7", seen[0])
 
     def test_errors_are_errors(self):
         for mode in ("error:3", "short"):                  # rc 1; rc 0 but the wrong frame count
@@ -992,7 +1101,7 @@ class EncodeSegment(FakeRemoteCase):
         self.assertIn("decoder rc=1", why)
         self.assert_clean()
 
-    def test_abort_kills_everything_and_cleans_the_ally(self):
+    def test_abort_kills_everything_and_cleans_the_helper(self):
         abort, seen = threading.Event(), {}
 
         def tick(n):
@@ -1023,7 +1132,7 @@ class EncodeSegment(FakeRemoteCase):
         return next(iter(dvcap._LIVE_REMOTE), None)
 
     def test_a_suspension_kills_the_remote_pipe_as_suspended(self):
-        # D3: never SIGSTOPped — killed at once, "suspended", the Ally's job killed, no cooldown
+        # D3: never SIGSTOPped — killed at once, "suspended", the helper's job killed, no cooldown
         ticks, box = [], {}
         h = self.helper()
         self.assertEqual(h.available(), (True, "ready"))
@@ -1258,7 +1367,7 @@ class ResultMapping(unittest.TestCase):
         self.assertEqual(self.kind(77), "refused")
         self.assertEqual(self.kind(1), "error")
         self.assertEqual(self.kind(-9), "error")
-        # ffmpeg exits 1 on the broken pipe a stopped Ally leaves, too: local codes never re-kind
+        # ffmpeg exits 1 on the broken pipe a stopped helper leaves, too: local codes never re-kind
         self.assertEqual(self.kind(76, dec_rc=1), "disconnected")
         self.assertEqual(self.kind(75, dec_rc=1), "yielded")
         why = helper.Helper._result(76, {"why": "stdin ended"}, [], 4, self.part, 1, 0)[1]
@@ -1267,7 +1376,7 @@ class ResultMapping(unittest.TestCase):
 
 # ---- C2: status_summary ----------------------------------------------------------------------
 
-ON = {"helper_enabled": True, "helper_host": "ally.test", "helper_user": "bazzite",
+ON = {"helper_enabled": True, "helper_host": "helper.test", "helper_user": "user",
       "helper_key": "/nonexistent/key"}
 WORD = {"connected": "connected", "ready": "ready", "paused": "paused", "off": "off",
         "not_connected": "not connected"}
@@ -1323,7 +1432,7 @@ class StatusSummaryPure(unittest.TestCase):
             ((False, ""), "Helper not connected"),
             # free text is never read, whatever words it holds
             ((False, "game running: Hades.exe"), "Helper not connected"),
-            ((False, "the route to ally.test is Wi-Fi (en0)"), "Helper not connected"),
+            ((False, "the route to helper.test is Wi-Fi (en0)"), "Helper not connected"),
         ]
         for (ok, code), want in cases:
             state, detail = helper.summarize_verdict(ok, code)
@@ -1432,7 +1541,7 @@ class StatusSummary(FakeRemoteCase):
         self.fields["helper_enabled"] = False
         st = helper.status_summary()
         self.assertEqual(st, {"enabled": False, "state": "off", "detail": "switched off",
-                              "host": "ally.test", "tooltip": "ally.test"})
+                              "host": "helper.test", "tooltip": "helper.test"})
         time.sleep(0.1)
         self.assertEqual(fake.calls, 0)
         self.assertIsNone(helper._REFRESH["thread"])        # no refresher at all
@@ -1444,10 +1553,10 @@ class StatusSummary(FakeRemoteCase):
         self.assertIn(first["state"], ("not_connected", "ready"))
         st = self.settle(lambda s: s["state"] == "ready")
         self.assertEqual(ui_line(st), "Helper ready · waiting for the next segment")
-        self.assertEqual(st["host"], "ally.test")
-        self.assertNotIn("ally.test", st["detail"])         # the host name only in the tooltip
-        self.helper().check_route()                          # the last wired verdict: en12's IPv4
-        self.assertEqual(helper.status_summary()["tooltip"], "ally.test · 192.168.1.133 over Ethernet")
+        self.assertEqual(st["host"], "helper.test")
+        self.assertNotIn("helper.test", st["detail"])         # the host name only in the tooltip
+        self.helper().check_route()                          # the last wired verdict: en7's IPv4
+        self.assertEqual(helper.status_summary()["tooltip"], "helper.test · 192.0.2.133 over Ethernet")
 
     def test_never_blocks_even_while_the_probe_hangs(self):
         fake = self.probe(delay=2.0)
@@ -1466,7 +1575,7 @@ class StatusSummary(FakeRemoteCase):
         with mock.patch.object(helper, "REFRESH_SECS", 0.1):
             st = self.settle(lambda s: s["state"] == "off")
             self.assertEqual(ui_line(st), "Helper off · it's on battery")
-            self.assertEqual(st["tooltip"], "ally.test · on battery")
+            self.assertEqual(st["tooltip"], "helper.test · on battery")
             answers.append((False, "game running: Hades.exe", "game"))
             st = self.settle(lambda s: s["detail"] == "a game is running on it")
             self.assertEqual(ui_line(st), "Helper paused · a game is running on it")
@@ -1493,7 +1602,7 @@ class StatusSummary(FakeRemoteCase):
                                  "helper": [8, 0.3, 7.94]})
                 st = helper.status_summary()
                 self.assertEqual(ui_line(st), "Helper connected · on seg 9 · 7.9 fps · did 10–11")
-                self.assertEqual(st["tooltip"], "ally.test · 192.168.1.133 over Ethernet")
+                self.assertEqual(st["tooltip"], "helper.test · 192.0.2.133 over Ethernet")
             finally:
                 th.join(20)
         self.assertEqual(box["r"][0][2], "ok")
@@ -1553,8 +1662,26 @@ class StatusSummary(FakeRemoteCase):
         self.assertIn("helper_key='-i'", logged[0])
         time.sleep(0.1)
         self.assertEqual(fake.calls, 0)                       # nothing is ever asked
-        self.fields.update(helper_host="ally.test", helper_key="/nonexistent/key")
+        self.fields.update(helper_host="helper.test", helper_key="/nonexistent/key")
         self.settle(lambda s: s["state"] == "ready")         # fixed: the line follows
+
+    def test_not_set_up_reads_off_whatever_the_switch_says_and_runs_nothing(self):
+        fake = self.probe()
+        for enabled in (True, False):
+            self.fields.update(helper_enabled=enabled, helper_host="", helper_user="")
+            st = helper.status_summary()
+            self.assertEqual((st["enabled"], st["state"], st["detail"]), (enabled, "off", "not set up"))
+            self.assertEqual(ui_line(st), "Helper off · not set up")
+            self.assertIsNone(helper.for_remux())
+        for host, user in (("helper.test", ""), ("", "user")):   # either one empty
+            self.fields.update(helper_enabled=True, helper_host=host, helper_user=user)
+            self.assertEqual(helper.status_summary()["detail"], "not set up")
+        time.sleep(0.1)
+        self.assertEqual(fake.calls, 0)
+        self.assertIsNone(helper._REFRESH["thread"])            # no refresher at all
+        self.assertEqual(helper._log.call_args_list, [])        # nothing was typed wrong: no log
+        self.fields.update(helper_host="helper.test", helper_user="user")
+        self.settle(lambda s: s["state"] == "ready")            # set up: the line follows
 
     def test_unreadable_settings_are_off(self):
         self.patches[0].stop()
@@ -1570,9 +1697,13 @@ class HelperSettings(unittest.TestCase):
     def test_defaults(self):
         d = settings.DEFAULT_SETTINGS
         self.assertIs(d["helper_enabled"], False)
-        self.assertEqual(d["helper_host"], "bazzite.local")
-        self.assertEqual(d["helper_user"], "bazzite")
-        self.assertEqual(d["helper_key"], "~/.ssh/id_ed25519_ally_claude")
+        # nothing of anyone's own machine ships: no host, no user — "not set up" — and a key
+        # path Setup's Create key makes
+        self.assertEqual(d["helper_host"], "")
+        self.assertEqual(d["helper_user"], "")
+        self.assertEqual(d["helper_key"], "~/.ssh/id_ed25519_visionary_helper")
+        self.assertFalse(settings.helper_set_up(d))
+        self.assertTrue(settings.helper_field_ok("helper_key", d["helper_key"]))
         self.assertIn("helper_enabled", settings.VALIDATORS)
         for k in ("helper_host", "helper_user", "helper_key"):
             self.assertNotIn(k, settings.VALIDATORS)        # 3: never replaced on write
@@ -1589,7 +1720,7 @@ class HelperSettings(unittest.TestCase):
 
     def test_host_and_user_are_plain_names(self):
         ok = settings.helper_field_ok
-        for good in ("bazzite.local", "192.168.1.20", "ally_2", "rog-ally"):
+        for good in ("helper.local", "192.0.2.20", "box_2", "my-helper"):
             self.assertTrue(ok("helper_host", good), good)
             self.assertTrue(ok("helper_user", good), good)
         for bad in ("-oProxyCommand=x", "a b", "a;b", "", None, "h@x", "../x", 5):
@@ -1624,11 +1755,11 @@ class HelperSettings(unittest.TestCase):
         for got in (s, again):
             self.assertEqual((got["helper_enabled"], got["helper_host"], got["helper_user"],
                               got["helper_key"]), (True, "bad host", "deck", "-i"))
-        s, _ = self._saved({"helper_host": "ally.lan"}, before={"helper_host": "bad host"})
-        self.assertEqual(s["helper_host"], "ally.lan")     # and fixing it is just saving again
-        s, _ = self._saved({"plex_throttle": False})
+        s, _ = self._saved({"helper_host": "helper.lan"}, before={"helper_host": "bad host"})
+        self.assertEqual(s["helper_host"], "helper.lan")     # and fixing it is just saving again
+        s, _ = self._saved({"plex_throttle": False})        # any write saves the defaults too
         self.assertEqual((s["helper_host"], s["helper_user"], s["helper_key"]),
-                         ("bazzite.local", "bazzite", "~/.ssh/id_ed25519_ally_claude"))
+                         ("", "", "~/.ssh/id_ed25519_visionary_helper"))
 
     def setUp(self):
         helper.reset_state()
@@ -1642,27 +1773,25 @@ class HelperSettings(unittest.TestCase):
         with mock.patch.object(settings, "get_settings", return_value={}):
             self.assertIsNone(helper.for_remux())          # absent = the default, off
         with mock.patch.object(settings, "get_settings",
-                               return_value={"helper_enabled": True, "helper_host": "ally.lan",
+                               return_value={"helper_enabled": True, "helper_host": "helper.lan",
                                              "helper_user": "deck", "helper_key": "~/.ssh/k"}):
             h = helper.for_remux()
         self.assertIsInstance(h, helper.Helper)
-        self.assertEqual((h.host, h.user, h.key), ("ally.lan", "deck", "~/.ssh/k"))
+        self.assertEqual((h.host, h.user, h.key), ("helper.lan", "deck", "~/.ssh/k"))
         self.assertIsNone(h.argv("status"))                # nothing until a route is checked
         with mock.patch.object(settings, "get_settings", return_value={"helper_enabled": True}):
-            h = helper.for_remux()                         # absent fields = the shipped defaults
-        self.assertEqual((h.host, h.user, h.key),
-                         ("bazzite.local", "bazzite", "~/.ssh/id_ed25519_ally_claude"))
+            self.assertIsNone(helper.for_remux())          # absent fields = the defaults: not set up
         with mock.patch.object(settings, "get_settings", side_effect=OSError("unreadable")):
             self.assertIsNone(helper.for_remux())
 
     def test_a_malformed_field_is_no_helper_and_says_why_once(self):
         # 10: never a silent fallback to the defaults — a typo must not quietly ssh elsewhere
         logged = []
-        bad = {"helper_enabled": True, "helper_host": "ally.lan", "helper_user": "-x",
+        bad = {"helper_enabled": True, "helper_host": "helper.lan", "helper_user": "-x",
                "helper_key": "~/.ssh/k"}
         with mock.patch.object(helper, "_log", side_effect=logged.append):
-            for fields in (bad, bad, dict(bad, helper_host="a b"), {"helper_enabled": True,
-                                                                     "helper_key": "-i"}):
+            for fields in (bad, bad, dict(bad, helper_host="a b"),
+                           dict(bad, helper_user="deck", helper_key="-i")):
                 with mock.patch.object(settings, "get_settings", return_value=fields):
                     self.assertIsNone(helper.for_remux(), fields)
         self.assertEqual(len(logged), 3)                   # once per distinct problem
@@ -1672,7 +1801,7 @@ class HelperSettings(unittest.TestCase):
         self.assertIn("helper_key='-i'", logged[2])
         for msg in logged:
             self.assertTrue(msg.startswith("Helper not used"), msg)
-            self.assertNotIn("Ally", msg)
+            self.assertTrue(msg.endswith("fix it in Settings > Setup > Helper"), msg)
 
     def test_a_disabled_helper_never_judges_its_fields(self):
         logged = []
@@ -1681,6 +1810,619 @@ class HelperSettings(unittest.TestCase):
                                   return_value={"helper_enabled": False, "helper_host": "a b"}):
             self.assertIsNone(helper.for_remux())
         self.assertEqual(logged, [])
+
+
+# ---- H6: an ssh that did not log in, in plain words ------------------------------------------
+
+class SshFailureWords(unittest.TestCase):
+    CASES = [
+        # (rc, ssh's stderr) -> (kind, detail, action)
+        ((255, "Host key verification failed.\n"),
+         ("host_key", "this Mac hasn't met the helper yet - run the command below once", "authorize")),
+        ((255, "No ED25519 host key is known for helper.local and you have requested strict "
+               "checking.\nHost key verification failed.\n"),
+         ("host_key", "this Mac hasn't met the helper yet - run the command below once", "authorize")),
+        ((255, "user@helper.local: Permission denied (publickey,password).\n"),
+         ("auth", "the key isn't authorised on the helper - run the command below", "authorize")),
+        ((255, "ssh: Could not resolve hostname helper.local: nodename nor servname provided, "
+               "or not known\n"), ("network", "no answer from helper.local", "")),
+        ((255, "ssh: connect to host helper.local port 22: Operation timed out\n"),
+         ("network", "no answer from helper.local", "")),
+        ((255, "ssh: connect to host 192.0.2.20 port 22: No route to host\n"),
+         ("network", "no answer from helper.local", "")),
+        ((None, "Command '['/usr/bin/ssh']' timed out after 15 seconds"),
+         ("network", "no answer from helper.local", "")),
+        ((None, ""), ("network", "no answer from helper.local", "")),
+        ((255, "ssh: connect to host helper.local port 22: Connection refused\n"),
+         ("refused", "helper.local answered, but its SSH server is off - turn on sshd there", "")),
+        ((255, "Warning: Identity file /x/k not accessible: No such file or directory.\n"
+               "user@helper.local: Permission denied (publickey).\n"),
+         ("key_missing", "no SSH key yet - Create key", "")),
+        ((255, "kex_exchange_identification: Connection closed by remote host\n"),
+         ("other", "the login failed: kex_exchange_identification: Connection closed by remote host",
+          "")),
+    ]
+
+    def test_the_words(self):
+        for (rc, err), want in self.CASES:
+            self.assertEqual(helper.ssh_failure(rc, err, "helper.local"), want, err)
+
+    def test_a_changed_host_key_names_the_fix_and_is_not_authorize(self):
+        err = ("@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+               "Host key verification failed.\n")
+        kind, detail, action = helper.ssh_failure(255, err, "helper.local")
+        self.assertEqual((kind, action), ("host_key_changed", ""))
+        self.assertIn("ssh-keygen -R helper.local", detail)
+
+    def test_an_open_key_file_says_chmod(self):
+        err = ("@ WARNING: UNPROTECTED PRIVATE KEY FILE! @\nPermissions 0644 for '/x/k' are too "
+               "open.\nLoad key \"/x/k\": bad permissions\nuser@h: Permission denied (publickey).\n")
+        kind, detail, _a = helper.ssh_failure(255, err, "h", "~/.ssh/k")
+        self.assertEqual(kind, "key_perms")
+        self.assertIn("chmod 600 ~/.ssh/k", detail)
+
+    def test_the_tooltip_words(self):
+        w = helper._no_answer_why
+        see = " - see Settings > Setup > Helper"
+        self.assertEqual(w("h", 255, "Host key verification failed.\n"),
+                         "this Mac hasn't met the helper yet" + see)
+        self.assertEqual(w("h", 255, "u@h: Permission denied (publickey).\n"),
+                         "the key isn't authorised on the helper" + see)
+        self.assertEqual(w("h", 255, "ssh: connect to host h port 22: Operation timed out\n"),
+                         "no answer from h")
+        self.assertEqual(w("h", None, ""), "no answer from h")
+        self.assertEqual(w("h", 255, "kex: weird\n"), "the login failed: kex: weird")
+        # logged in (the shell's 127, or any exit but ssh's 255) and still no status: the worker
+        self.assertEqual(w("h", 127, "bash: vworker: command not found\n"),
+                         "the helper's worker did not answer" + see)
+        self.assertEqual(w("h", 0, ""), "the helper's worker did not answer" + see)
+
+
+class StatusProbeFailures(FakeRemoteCase):
+    def test_a_login_failure_reads_not_connected_with_its_reason_in_the_tooltip(self):
+        for (rc, err), want in (((255, "Host key verification failed.\n"),
+                                 "this Mac hasn't met the helper yet"),
+                                ((127, "vworker: No such file or directory\n"),
+                                 "the helper's worker did not answer"),
+                                ((255, ""), "no answer from helper.test")):
+            helper.reset_state()
+            with mock.patch.object(helper, "_run", return_value=(rc, "", err)):
+                ok, why, code = self.helper().availability()
+            self.assertEqual((ok, code), (False, "unreachable"), err)   # the UI line: unchanged
+            self.assertTrue(why.startswith(want), why)
+            self.assertEqual(helper.summarize_verdict(ok, code), ("not_connected", ""))
+
+
+# ---- H9: the helper's own wired addresses ------------------------------------------------------
+
+class ReportedIPv4(unittest.TestCase):
+    def test_the_list(self):
+        r = helper.reported_ipv4
+        self.assertIsNone(r({"ok": True}))                       # an older vworker
+        self.assertIsNone(r({"ipv4": "192.0.2.5"}))              # not a list
+        self.assertIsNone(r(None))
+        self.assertEqual(r({"ipv4": []}), [])
+        self.assertEqual(r({"ipv4": ["192.0.2.5", "192.0.2.5", "10.0.0.2"]}), ["192.0.2.5", "10.0.0.2"])
+        self.assertEqual(r({"ipv4": ["127.0.0.1", "0.0.0.0", "224.0.0.1", "999.1.1.1",
+                                     "192.0.2.5/24", "-o", 5, None, "169.254.3.4"]}),
+                         ["169.254.3.4"])                         # a direct cable's link-local stays
+
+
+class WiredAddressPreference(FakeRemoteCase):
+    WIFI_IP, WIRED_IP = "192.0.2.77", "192.0.2.133"
+
+    def route(self, on_prefer=None):
+        """A route_ok that takes `prefer`: without it the name resolves to the helper's Wi-Fi
+        address; with it, the first listed address. Its calls' `prefer` go in `seen`."""
+        seen = []
+
+        def route_ok(host, prefer=None):
+            seen.append(list(prefer) if prefer else None)
+            if prefer and on_prefer:
+                on_prefer()
+            ip = prefer[0] if prefer else self.WIFI_IP
+            return True, f"wired via en7 ({ip})", ip, "en7", "wired"
+        return seen, route_ok
+
+    def test_a_first_contact_over_an_unlisted_address_asks_again_over_a_listed_one(self):
+        # the name resolved to the helper's Wi-Fi: vworker refuses (ssh arrives on its wlan),
+        # but lists its cable's address — the very same check goes again over that one
+        self.set_status(ok=False, why="no Ethernet: ssh arrives on wlan0", ethernet=False,
+                        code="no_ethernet", ipv4=[self.WIRED_IP])
+        seen, route_ok = self.route(on_prefer=lambda: self.set_status(ipv4=[self.WIRED_IP]))
+        h = self.helper(route_ok=route_ok)
+        self.assertEqual(h.available(), (True, "ready"))
+        self.assertEqual(seen, [None, [self.WIRED_IP]])
+        self.assertEqual(h._route, (self.WIRED_IP, "en7"))
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(h.available(), (True, "ready"))         # cached, and over the cable only
+        self.assertEqual(seen[-1], [self.WIRED_IP])
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(helper._known_ipv4(h._id), [self.WIRED_IP])
+
+    def test_never_an_unlisted_address_once_a_list_is_known(self):
+        h = self.helper(route_ok=lambda host: (True, "wired via en7 (192.0.2.77)", self.WIFI_IP, "en7"))
+        helper._WIRED_IPS[h._id] = [self.WIRED_IP]
+        ok, why = h.check_route()                    # a route_ok that cannot take the list
+        self.assertFalse(ok)
+        self.assertIn("not one of the helper's wired addresses", why)
+        self.assertIsNone(h.argv("status"))
+        self.assertEqual(h.availability()[2], "not_wired")
+        self.assertEqual(self.calls(), [])           # nothing was sent there
+
+    def test_an_empty_list_or_an_older_vworker_keeps_the_resolved_address(self):
+        for fields in ({"ipv4": []}, {}):
+            helper.reset_state()
+            self.set_status(**fields)
+            seen, route_ok = self.route()
+            h = self.helper(route_ok=route_ok)
+            self.assertEqual(h.available(), (True, "ready"))
+            helper._AVAIL.clear()
+            self.assertEqual(h.available(), (True, "ready"))
+            self.assertEqual(seen, [None, None], fields)
+            self.assertEqual(h._route[0], self.WIFI_IP)
+
+    def test_no_answer_over_the_listed_address_forgets_the_list(self):
+        seen, route_ok = self.route()
+        h = self.helper(route_ok=route_ok)
+        helper._WIRED_IPS[h._id] = [self.WIRED_IP]       # say, a lease that has moved since
+        with mock.patch.object(helper, "_run", return_value=(255, "", "")):
+            self.assertEqual(h.availability()[2], "unreachable")
+        self.assertEqual(seen, [[self.WIRED_IP]])
+        self.assertEqual(helper._known_ipv4(h._id), [])  # the next check starts from the name
+        helper._AVAIL.clear()
+        self.assertEqual(h.available(), (True, "ready"))
+        self.assertEqual(seen[-1], None)
+
+    def test_the_real_check_binds_to_the_cable_for_a_listed_address(self):
+        run, _calls = mac_runner(ROUTE_EN0, ifconfig_out=IFCONFIG_BOTH)
+        h = helper.Helper("helper.local", "user", "~/.ssh/k", enabled=lambda: True,
+                          route_ok=lambda host, prefer=None: helper.wired_route_ok(
+                              host, run=run, resolve=lambda _h: "198.51.100.9", prefer=prefer))
+        helper._WIRED_IPS[h._id] = ["192.0.2.44"]
+        self.assertTrue(h.check_route()[0])
+        argv = h.argv("status")
+        self.assertIn("user@192.0.2.44", argv)
+        self.assertIn("BindInterface=en7", argv)
+
+
+# ---- C3: setup_status ----------------------------------------------------------------------------
+
+class SetupStatus(unittest.TestCase):
+    def setUp(self):
+        helper.reset_state()
+        self.td = tempfile.mkdtemp()
+        self.key = os.path.join(self.td, "k")
+        for p in (self.key, self.key + ".pub"):
+            with open(p, "w") as f:
+                f.write("test key\n")
+        self.fields = {"helper_enabled": True, "helper_host": "helper.local",
+                       "helper_user": "user", "helper_key": self.key}
+        self.status = {"ok": True, "why": "ready", "code": "ready", "ac": True, "ethernet": True,
+                       "game": None, "heavy": None, "free_gb": 400.0, "busy": False,
+                       "x265": X265_TOKEN, "version": 1, "sha256": helper.worker_sha256(),
+                       "ipv4": ["192.0.2.20"]}
+        self.patches = [mock.patch.object(settings, "get_settings", side_effect=lambda: dict(self.fields)),
+                        mock.patch.object(helper, "_log"),
+                        mock.patch.object(helper, "_resolve_ipv4", lambda h, timeout=None: "192.0.2.20")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        helper.reset_state()
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def ready_probe(self):
+        fake = FakeProbe()
+        p = mock.patch.object(helper, "_summary_helper", fake)
+        p.start()
+        self.addCleanup(p.stop)
+        return fake
+
+    def check(self, ssh=None, route_out=ROUTE_EN7, ifconfig_out=IFCONFIG_BOTH, fresh=True,
+              mac=X265_TOKEN):
+        if ssh is None:
+            ssh = (0, "Last login: today\n" + json.dumps(self.status) + "\n", "")
+        run, calls = mac_runner(route_out, ifconfig_out=ifconfig_out, ssh=ssh)
+        out = helper.setup_status(fresh, run=run, local_x265=lambda: mac)
+        self.calls = calls
+        return out, {c["id"]: c for c in out["checks"]}
+
+    def sshs(self):
+        return [c for c in self.calls if c[0] == helper.SSH]
+
+    def test_the_shape_and_order(self):
+        self.ready_probe()
+        out, _c = self.check()
+        self.assertEqual(set(out), {"configured", "host", "user", "key", "key_exists", "pubkey",
+                                    "authorize_cmd", "mac_x265", "helper_x265", "checks",
+                                    "checked_at"})
+        self.assertEqual([c["id"] for c in out["checks"]], ["login", "wired", "worker", "x265", "helper"])
+        for c in out["checks"]:
+            self.assertEqual(set(c), {"id", "ok", "detail", "action"})
+        self.assertEqual((out["host"], out["user"], out["key"]), ("helper.local", "user", self.key))
+        self.assertTrue(out["key_exists"])
+        self.assertEqual(out["pubkey"], os.path.abspath(self.key + ".pub"))
+        self.assertEqual(out["authorize_cmd"], f"ssh-copy-id -i {self.key}.pub user@helper.local")
+        self.assertGreater(out["checked_at"], 0)
+        json.dumps(out, allow_nan=False)                     # strict JSON
+
+    def test_the_login_probe_is_vworker_status_with_the_key_over_the_normal_route(self):
+        self.ready_probe()
+        self.check()
+        argv = self.sshs()[0]
+        self.assertEqual(argv, helper.login_argv("helper.local", "user", self.key, "status"))
+        for opt in ("BatchMode=yes", "IdentitiesOnly=yes", "ConnectTimeout=8"):
+            self.assertIn(opt, argv)
+        self.assertNotIn("-4", argv)
+        self.assertFalse(any(a.startswith("BindInterface") for a in argv))
+        self.assertEqual(argv[-3:], ["user@helper.local", helper.VWORKER, "status"])
+
+    def test_everything_ready(self):
+        self.ready_probe()
+        out, c = self.check()
+        self.assertTrue(out["configured"])
+        self.assertEqual({k: (v["ok"], v["detail"], v["action"]) for k, v in c.items()}, {
+            "login": (True, "logged in as user", ""),
+            "wired": (True, "over Ethernet (en7)", ""),
+            "worker": (True, "installed", ""),
+            "x265": (True, f"x265 {X265_TOKEN}, the same as this Mac", ""),
+            "helper": (True, "ready - waiting for the next segment", "")})
+        self.assertEqual((out["mac_x265"], out["helper_x265"]), (X265_TOKEN, X265_TOKEN))
+        # the first contact told the remux the helper's own wired address
+        self.assertEqual(helper._known_ipv4(("helper.local", "user", self.key)), ["192.0.2.20"])
+
+    def test_not_set_up_or_bad_fields_run_nothing(self):
+        for fields, want in (({"helper_host": ""}, "not set up"), ({"helper_user": ""}, "not set up"),
+                             ({"helper_host": "a b"}, "settings: bad host"),
+                             ({"helper_user": "-x", "helper_key": ""}, "settings: bad user, key")):
+            helper.reset_state()
+            self.fields.update(helper_host="helper.local", helper_user="user", helper_key=self.key)
+            self.fields.update(fields)
+            out = helper.setup_status(True, run=lambda cmd, t: self.fail(cmd), local_x265=lambda: "")
+            self.assertFalse(out["configured"], fields)
+            self.assertEqual(out["authorize_cmd"], "")
+            self.assertEqual([(c["id"], c["ok"]) for c in out["checks"]],
+                             [(i, None) for i in ("login", "wired", "worker", "x265", "helper")])
+            self.assertEqual(out["checks"][0]["detail"], want)
+
+    def test_no_key_yet(self):
+        os.remove(self.key)
+        os.remove(self.key + ".pub")
+        out, c = self.check()
+        self.assertEqual((c["login"]["ok"], c["login"]["detail"]), (False, "no SSH key yet - Create key"))
+        self.assertEqual((out["key_exists"], out["pubkey"]), (False, ""))
+        self.assertEqual(self.sshs(), [])                    # no ssh without a key
+        self.assertTrue(c["wired"]["ok"])                     # the route is judged anyway
+        for k in ("worker", "x265", "helper"):
+            self.assertIsNone(c[k]["ok"], k)
+
+    def test_login_failures_in_plain_words(self):
+        for (rc, err), (_kind, detail, action) in SshFailureWords.CASES:
+            helper.reset_state()
+            _out, c = self.check(ssh=(rc, "", err))
+            self.assertEqual((c["login"]["ok"], c["login"]["detail"], c["login"]["action"]),
+                             (False, detail, action), err)
+            for k in ("worker", "x265", "helper"):
+                self.assertIsNone(c[k]["ok"], (k, err))
+
+    def test_logged_in_without_a_worker(self):
+        out, c = self.check(ssh=(127, "", "bash: line 1: /home/user/visionary-worker/bin/vworker: "
+                                           "No such file or directory\n"))
+        self.assertEqual((c["login"]["ok"], c["login"]["detail"]), (True, "logged in as user"))
+        self.assertEqual((c["worker"]["ok"], c["worker"]["detail"], c["worker"]["action"]),
+                         (False, "not installed", "helper_worker"))
+        self.assertEqual((c["x265"]["ok"], c["x265"]["detail"]), (None, "install the worker first"))
+        self.assertEqual(out["helper_x265"], "")
+        self.assertFalse(c["helper"]["ok"])                    # the refresher's refusing fake
+        self.assertTrue(c["helper"]["detail"].startswith("not connected"))
+
+    def test_an_older_worker_and_other_x265_builds(self):
+        cases = [(dict(sha256="0" * 64), "worker", (False, "an older worker - Install updates it",
+                                                    "helper_worker")),
+                 (dict(sha256=None), "worker", (False, "an older worker - Install updates it",
+                                                "helper_worker")),
+                 (dict(x265=""), "x265", (False, "not built yet", "helper_x265")),
+                 (dict(x265="4.3"), "x265", (False, f"x265 4.3 on the helper, {X265_TOKEN} on this "
+                                                    f"Mac - Build replaces it", "helper_x265"))]
+        for fields, cid, want in cases:
+            helper.reset_state()
+            st = dict(self.status, **fields)
+            out, c = self.check(ssh=(0, json.dumps(st) + "\n", ""))
+            self.assertEqual((c[cid]["ok"], c[cid]["detail"], c[cid]["action"]), want, fields)
+        self.assertEqual(out["helper_x265"], "4.3")
+
+    def test_no_x265_on_this_mac(self):
+        out, c = self.check(mac="")
+        self.assertEqual((c["x265"]["ok"], c["x265"]["detail"]),
+                         (None, "install the command-line tools first"))
+        self.assertEqual(out["mac_x265"], "")
+
+    def test_switched_off_the_helper_line_is_not_applicable(self):
+        fake = self.ready_probe()
+        self.fields["helper_enabled"] = False
+        _out, c = self.check()
+        self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]), (None, "off - switched off"))
+        self.assertTrue(c["login"]["ok"])                      # Setup works before the switch
+        self.assertEqual(fake.calls, 0)
+
+    def test_the_helper_line_uses_the_status_lines_words(self):
+        self.ready_probe().answer = (False, "game running: Test Game", "game")
+        _out, c = self.check()
+        self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]),
+                         (False, "paused - a game is running on it"))
+
+    def test_the_wired_words(self):
+        self.ready_probe()
+        no_cable = IFCONFIG_BOTH.split("en7:")[0]
+        _out, c = self.check(route_out=ROUTE_EN0, ifconfig_out=no_cable,
+                             ssh=(0, json.dumps(dict(self.status, ipv4=[])) + "\n", ""))
+        self.assertEqual((c["wired"]["ok"], c["wired"]["detail"]),
+                         (False, "the Mac reaches it over Wi-Fi - plug both into Ethernet"))
+        helper.reset_state()
+        _out, c = self.check(route_out="", ifconfig_out="",
+                             ssh=(0, json.dumps(dict(self.status, ipv4=[])) + "\n", ""))
+        self.assertEqual((c["wired"]["ok"], c["wired"]["detail"]),
+                         (False, "no route to helper.local (192.0.2.20)"))
+
+    def test_cached_until_fresh_ttl_or_a_helper_job(self):
+        import setup_jobs
+        self.ready_probe()
+        saved = dict(setup_jobs._JOBS)
+        self.addCleanup(lambda: (setup_jobs._JOBS.clear(), setup_jobs._JOBS.update(saved)))
+        setup_jobs._JOBS.pop("helper_x265", None)
+        run, calls = mac_runner(ROUTE_EN7, ifconfig_out=IFCONFIG_BOTH,
+                                ssh=(0, json.dumps(self.status) + "\n", ""))
+
+        def n():
+            return sum(1 for c in calls if c[0] == helper.SSH)
+        first = helper.setup_status(run=run, local_x265=lambda: X265_TOKEN)
+        self.assertEqual(helper.setup_status(run=run, local_x265=lambda: X265_TOKEN), first)
+        self.assertEqual(n(), 1)                                  # reused
+        helper.setup_status(True, run=run, local_x265=lambda: X265_TOKEN)
+        self.assertEqual(n(), 2)                                  # ?fresh=1
+        hid = ("helper.local", "user", self.key)
+        helper._AVAIL[hid] = {"res": (False, "x265 builds differ", "mismatch"), "t": time.monotonic()}
+        setup_jobs._JOBS["helper_x265"] = {"what": "helper_x265", "state": "ok", "rc": 0,
+                                           "started": 1.0, "finished": 2.0, "tail": []}
+        helper.setup_status(run=run, local_x265=lambda: X265_TOKEN)
+        self.assertEqual(n(), 3)                                  # a job finished since: again
+        helper.setup_status(run=run, local_x265=lambda: X265_TOKEN)
+        self.assertEqual(n(), 3)
+        helper.invalidate_setup()                                 # the server, on a job's start
+        helper.setup_status(run=run, local_x265=lambda: X265_TOKEN)
+        self.assertEqual(n(), 4)
+        with mock.patch.object(helper, "SETUP_TTL", 0):
+            helper.setup_status(run=run, local_x265=lambda: X265_TOKEN)
+        self.assertEqual(n(), 5)                                  # stale after SETUP_TTL
+
+    def test_invalidate_drops_cached_verdicts_but_not_a_cooldown(self):
+        hid = ("helper.local", "user", self.key)
+        helper._AVAIL[hid] = {"res": (True, "ready", "ready"), "t": time.monotonic(), "cool": 9e9}
+        helper._SETUP["res"] = {"x": 1}
+        helper.invalidate_setup()
+        self.assertIsNone(helper._AVAIL[hid]["res"])
+        self.assertEqual(helper._AVAIL[hid]["cool"], 9e9)
+        self.assertIsNone(helper._SETUP["res"])
+
+    def test_never_raises(self):
+        self.patches[0].stop()
+        try:
+            with mock.patch.object(settings, "get_settings", side_effect=OSError("unreadable")):
+                out = helper.setup_status(True)
+        finally:
+            self.patches[0].start()
+        self.assertFalse(out["configured"])
+        self.assertEqual(out["checked_at"], 0)
+        self.assertEqual([c["ok"] for c in out["checks"]], [None] * 5)
+        self.assertIn("unreadable", out["checks"][0]["detail"])
+
+    def test_the_worker_sha_is_this_apps_own_file(self):
+        with open(os.path.join(helper.ENGINE_DIR, "helper_worker", "vworker.py"), "rb") as f:
+            import hashlib
+            self.assertEqual(helper.worker_sha256(), hashlib.sha256(f.read()).hexdigest())
+        self.assertEqual(helper.worker_sha256(os.path.join(self.td, "missing")), "")
+
+    def test_the_authorize_command_quotes_only_when_it_must(self):
+        a = helper.authorize_command
+        self.assertEqual(a("helper.local", "user", "~/.ssh/id_ed25519_visionary_helper"),
+                         "ssh-copy-id -i ~/.ssh/id_ed25519_visionary_helper.pub user@helper.local")
+        self.assertEqual(a("192.0.2.20", "u", "/keys/my key"),
+                         "ssh-copy-id -i '/keys/my key.pub' u@192.0.2.20")
+
+
+# ---- C4: Setup's helper jobs -------------------------------------------------------------------
+
+FAKE_SSH = r'''
+import hashlib, json, sys
+data = sys.stdin.buffer.read()
+print(json.dumps({"argv": sys.argv[1:], "stdin_sha": hashlib.sha256(data).hexdigest()}))
+'''
+
+
+class SetupJobArgv(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.key = os.path.join(self.td, "dot-ssh", "id_test")     # its folder does not exist yet
+        self.fields = {"helper_enabled": False, "helper_host": "helper.local", "helper_user": "user",
+                       "helper_key": self.key}
+        p = mock.patch.object(settings, "get_settings", side_effect=lambda: dict(self.fields))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def make_key(self):
+        os.makedirs(os.path.dirname(self.key), exist_ok=True)
+        with open(self.key, "w") as f:
+            f.write("k\n")
+
+    def test_helper_key_is_ssh_keygen_and_makes_the_folder_private(self):
+        argv, why = helper.setup_job_argv("helper_key")
+        self.assertEqual(why, "")
+        self.assertEqual(argv, ["/usr/bin/ssh-keygen", "-t", "ed25519", "-N", "", "-C",
+                                "visionary-helper", "-f", self.key])
+        self.assertEqual(os.stat(os.path.dirname(self.key)).st_mode & 0o777, 0o700)
+        if os.path.exists(helper.SSH_KEYGEN):                 # and it really makes the key
+            import subprocess
+            r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(self.key + ".pub") as f:
+                pub = f.read()
+            self.assertTrue(pub.startswith("ssh-ed25519 "))
+            self.assertIn("visionary-helper", pub)
+
+    def test_an_existing_key_is_never_overwritten(self):
+        self.make_key()
+        argv, why = helper.setup_job_argv("helper_key")
+        self.assertIsNone(argv)
+        self.assertIn("already exists", why)
+        os.remove(self.key)
+        with open(self.key + ".pub", "w") as f:                # a lone .pub counts too
+            f.write("ssh-ed25519 x\n")
+        self.assertIsNone(helper.setup_job_argv("helper_key")[0])
+
+    def test_a_key_needs_no_host_but_a_usable_path(self):
+        self.fields.update(helper_host="", helper_user="")
+        self.assertIsNotNone(helper.setup_job_argv("helper_key")[0])
+        for bad in ("-i", "", "a\nb"):
+            self.fields["helper_key"] = bad
+            argv, why = helper.setup_job_argv("helper_key")
+            self.assertIsNone(argv, bad)
+            self.assertIn("not usable", why)
+
+    def test_helper_worker_is_install_sh_with_the_saved_values(self):
+        self.make_key()
+        argv, why = helper.setup_job_argv("helper_worker")
+        self.assertEqual(why, "")
+        self.assertEqual(argv, ["/bin/bash", os.path.join(helper.ENGINE_DIR, "helper_worker", "install.sh"),
+                                "--host", "helper.local", "--user", "user", "--key", self.key])
+
+    def test_the_key_path_is_expanded_for_the_scripts(self):
+        self.make_key()
+        with mock.patch.dict(os.environ, {"HOME": self.td}):
+            self.fields["helper_key"] = "~/dot-ssh/id_test"
+            argv, _why = helper.setup_job_argv("helper_worker")
+        self.assertEqual(argv[-1], self.key)
+
+    def test_the_remote_jobs_refuse_in_plain_words(self):
+        cases = [({"helper_host": ""}, "isn't set up yet"), ({"helper_user": ""}, "isn't set up yet"),
+                 ({"helper_host": "a;b"}, "settings: bad host - fix it first"),
+                 ({"helper_user": "-oProxyCommand=x"}, "settings: bad user - fix it first"),
+                 ({}, "no SSH key yet - Create key first")]
+        for what in ("helper_worker", "helper_x265"):
+            for fields, want in cases:
+                f = {"helper_host": "helper.local", "helper_user": "user", "helper_key": self.key}
+                f.update(fields)
+                self.fields.update(f)
+                argv, why = helper.setup_job_argv(what, local_x265=lambda: X265_TOKEN)
+                self.assertIsNone(argv, (what, fields))
+                self.assertIn(want, why, (what, fields))
+        self.assertIn("no such helper job", helper.setup_job_argv("helper_rm")[1])
+
+    def test_helper_x265_builds_this_macs_version_on_the_helper(self):
+        self.make_key()
+        argv, why = helper.setup_job_argv("helper_x265", local_x265=lambda: "4.1+1-1d117be")
+        self.assertEqual(why, "")
+        script = os.path.join(helper.ENGINE_DIR, "helper_worker", "build-x265.sh")
+        self.assertEqual(argv, [
+            "/bin/bash", "-c",
+            'exec /usr/bin/ssh -i "$1" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 '
+            '-o ServerAliveInterval=15 -- "$2@$3" "bash -s -- --version $5" < "$4"',
+            "_", self.key, "user", "helper.local", script, "4.1+1-1d117be"])
+        for tag in ("4.3", "4.1+1-1d117be", "3.5+20-f0c1022b6"):
+            self.assertTrue(helper.X265_TOKEN_RE.fullmatch(tag), tag)
+
+    def test_the_x265_token_is_checked_first(self):
+        self.make_key()
+        for token, want in (("", "install the command-line tools first"),
+                            ("4.1; rm -rf ~", "is not one the build can make"),
+                            ("$(id)", "is not one the build can make"),
+                            ("-4.1", "is not one the build can make")):
+            argv, why = helper.setup_job_argv("helper_x265", local_x265=lambda t=token: t)
+            self.assertIsNone(argv, token)
+            self.assertIn(want, why, token)
+
+    def test_the_x265_command_runs_the_script_through_ssh_as_written(self):
+        # the real bash -c line, with a fake ssh: its words and stdin are what ssh would get
+        self.make_key()
+        fake = os.path.join(self.td, "fake_ssh.py")
+        with open(fake, "w") as f:
+            f.write(f"#!{sys.executable}\n" + FAKE_SSH)
+        os.chmod(fake, 0o755)
+        with mock.patch.object(helper, "SSH", fake):
+            argv, _why = helper.setup_job_argv("helper_x265", local_x265=lambda: "4.1+1-1d117be")
+        import hashlib
+        import subprocess
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual(got["argv"], ["-i", self.key, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                                       "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15", "--",
+                                       "user@helper.local", "bash -s -- --version 4.1+1-1d117be"])
+        with open(argv[-2], "rb") as f:
+            self.assertEqual(got["stdin_sha"], hashlib.sha256(f.read()).hexdigest())
+
+    def test_unreadable_settings_refuse(self):
+        with mock.patch.object(settings, "get_settings", side_effect=OSError("unreadable")):
+            argv, why = helper.setup_job_argv("helper_key")
+        self.assertIsNone(argv)
+        self.assertIn("unreadable", why)
+
+
+class SetupJobTargets(unittest.TestCase):
+    def setUp(self):
+        import setup_jobs
+        self.sj = setup_jobs
+        self.saved = dict(setup_jobs._JOBS), setup_jobs._ACTIVE[0]
+        setup_jobs._JOBS.clear()
+        setup_jobs._ACTIVE[0] = None
+
+    def tearDown(self):
+        self.sj._JOBS.clear()
+        self.sj._JOBS.update(self.saved[0])
+        self.sj._ACTIVE[0] = self.saved[1]
+
+    def _wait(self, what):
+        self.assertTrue(_wait(lambda: (self.sj.status()["jobs"].get(what) or {}).get("state")
+                              not in (None, "running") and self.sj._ACTIVE[0] is None, 10))
+        return self.sj.status()["jobs"][what]
+
+    def test_the_three_are_argv_targets(self):
+        for what in helper.HELPER_JOBS:
+            self.assertIn(what, self.sj.TARGETS)
+            self.assertIsNone(self.sj.TARGETS[what]["cmd"])
+            self.assertFalse(self.sj.TARGETS[what].get("needs_brew"))
+            self.assertEqual(self.sj.start(what)["error"], "argv-required")
+
+    def test_on_done_runs_after_the_job_whatever_it_returns(self):
+        done = threading.Event()
+        out = self.sj.start("helper_key", argv=["/bin/sh", "-c", "echo made; exit 3"],
+                            on_done=done.set)
+        self.assertEqual(out["state"], "running")
+        self.assertTrue(done.wait(10))
+        j = self._wait("helper_key")
+        self.assertEqual((j["state"], j["rc"], j["tail"]), ("failed", 3, ["made"]))
+
+    def test_a_raising_on_done_never_fails_the_job(self):
+        def boom():
+            raise RuntimeError("no")
+        self.sj.start("helper_worker", argv=["/bin/sh", "-c", "echo ok"], on_done=boom)
+        j = self._wait("helper_worker")
+        self.assertEqual(j["state"], "ok")
+        self.assertIsNone(self.sj._ACTIVE[0])
+
+    def test_a_job_never_waits_on_a_prompt(self):
+        # stdin is /dev/null: a `read` (ssh-keygen's "Overwrite?", say) gets EOF at once
+        import subprocess
+        with mock.patch.object(self.sj.subprocess, "Popen", wraps=subprocess.Popen) as popen:
+            self.sj.start("helper_x265", argv=["/bin/sh", "-c", 'read x; echo "got:$x"'])
+            j = self._wait("helper_x265")
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(j["tail"], ["got:"])
 
 
 if __name__ == "__main__":

@@ -1,27 +1,34 @@
 """THE HELPER — the Mac's half (2026-10-28).
 
 The capped x265 remux is the pipeline's bottleneck (~2.9 fps on the Mac). An OPTIONAL helper — any
-Linux machine on Ethernet running the SAME x265 build (4.1, commit 1d117be; measured: a docked ROG
-Ally under Bazzite at ~8 fps with bit-identical slices) — can take some of an item's segments while
-the Mac takes others (dvcap.encode_capped_segmented's helper scheduler). Its SDR->PQ colour step is
-NOT bit-identical, so the MAC always decodes + colour-converts and streams raw y4m (zstd -1, ~2.4x
-lossless) to the helper, which only runs x265 and streams the HEVC straight back over the same ssh.
-Everything the user sees calls it "the helper"; its own host name appears only in a tooltip.
+Linux machine on Ethernet running the SAME x265 build as this Mac (measured on a test helper, a
+handheld PC on a wired dock: ~8 fps with bit-identical slices) — can take some of an item's
+segments while the Mac takes others (dvcap.encode_capped_segmented's helper scheduler). Its SDR->PQ
+colour step is NOT bit-identical, so the MAC always decodes + colour-converts and streams raw y4m
+(zstd -1, ~2.4x lossless) to the helper, which only runs x265 and streams the HEVC straight back
+over the same ssh. Everything the user sees calls it "the helper"; its own host name appears only
+in a tooltip.
 
 User rules this side enforces (the helper polices itself too, independently):
-  - used only when switched on (settings helper_enabled, default OFF; a malformed host, user or
-    key is SAVED AS TYPED and switches the helper off with "settings: bad host" (etc.), logged
-    once — never a silent fallback to the defaults);
+  - used only when switched on (settings helper_enabled, default OFF) and set up: an empty host
+    or user (the shipped defaults) reads "not set up", with nothing logged; a malformed host,
+    user or key is SAVED AS TYPED and switches the helper off with "settings: bad host" (etc.),
+    logged once — never a silent fallback to the defaults;
   - only over a WIRED route (not Wi-Fi), checked on EVERY availability check and again right
-    before every encode. The ssh goes to the IPv4 that check resolved, bound to its wired
-    interface (BindInterface): a pulled cable ends the session instead of moving it to Wi-Fi
-    (measured: bazzite.local resolved to an IPv6 link-local on Wi-Fi at 55 Mbps; the IPv4 over
-    en12 gives 777 Mbps);
+    before every encode. The Mac's interface is chosen the way nas_link chooses one for the NAS:
+    an active, non-Wi-Fi interface on the helper's subnet, in the Mac's service order — so a
+    Wi-Fi service ranked above the cable does not matter; only with no such interface does the
+    route table decide. The ssh goes to the IPv4 that check used, bound to that interface
+    (BindInterface): a pulled cable ends the session instead of moving it to Wi-Fi (measured:
+    a helper's .local name resolved to an IPv6 link-local on Wi-Fi at 55 Mbps; its IPv4 over a
+    USB Ethernet adapter gives 777 Mbps). Once the helper has reported its own wired IPv4
+    addresses (status "ipv4") only those are used — a name that also resolves to the helper's
+    Wi-Fi address can no longer pick that one;
   - only when the helper's own `vworker status` says ok (mains, Ethernet, no game, nothing
     heavy, disk, not busy), speaks protocol PROTOCOL_VERSION and runs the SAME x265 build as
     this Mac;
   - a segment the helper drops goes back to the Mac; the helper never parks or fails an item,
-    and with it off or unreachable the pipeline behaves exactly as before;
+    and with it off, not set up or unreachable the pipeline behaves exactly as before;
   - after the helper YIELDS or REFUSES (a game or a heavy app appeared) it sits out for COOLDOWN
     seconds;
   - another stage taking the machine (dvcap.suspend_encoders: AI outpainting, a sibling app's
@@ -41,11 +48,20 @@ best-effort `vworker kill <job>`. Nothing here raises: every failure is a (False
 
 status_summary() is the UI's one line ("Helper connected · on seg 9 · 7.9 fps · did 10–11"); it
 never blocks — a background refresher (started lazily while helper_enabled) keeps its verdict fresh.
+
+SETUP (Settings > Setup > Helper): setup_status() is GET /api/helper/setup — the login, the wired
+route, the installed worker, the x265 build and the helper's own verdict, each in plain words
+with the one action that fixes it; it runs only when asked (cached SETUP_TTL seconds). The fixes
+are setup_jobs targets whose argv setup_job_argv() builds from the SAVED settings only: a new ssh
+key (never over an existing one), helper_worker/install.sh, and build-x265.sh run on the helper
+for exactly this Mac's x265 version.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -57,11 +73,16 @@ import time
 import uuid
 
 import dvcap
+import nas_link
 
 SSH = "/usr/bin/ssh"
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
 ZSTD = "/opt/homebrew/bin/zstd"
 ROUTE = "/sbin/route"
+IFCONFIG = "/sbin/ifconfig"
 NETWORKSETUP = "/usr/sbin/networksetup"
+ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))   # the bundle's engine (the repo's in a checkout)
+WORKER_DIR = os.path.join(ENGINE_DIR, "helper_worker")    # vworker.py, install.sh, build-x265.sh
 VWORKER = "~/visionary-worker/bin/vworker"   # on the helper; its login shell expands the ~
 PROTOCOL_VERSION = 1                          # the `vworker status` "version" this side speaks
 RPU_NAME = "rpu.bin"
@@ -80,6 +101,8 @@ STREAM_MAGIC = b"VWHEVC1\n"     # `vworker encode` writes this on stdout before 
 JUNK_LIMIT = 1 << 20            # shell noise tolerated before STREAM_MAGIC; more is an error
 REFRESH_SECS = 60               # status_summary's background refresher calls available() this often
 NOTE_TTL = 30                   # a note_segments record older than this no longer reads as live
+SETUP_TTL = 30                  # setup_status's checks are reused this long (fresh=1 runs them again)
+LOGIN_TIMEOUT = 15              # setup's login probe: ssh's 8-s connect plus `vworker status`
 
 KINDS = ("ok", "yielded", "disconnected", "refused", "error", "aborted", "suspended")
 _EXIT_KIND = {75: "yielded", 76: "disconnected", 255: "disconnected", 77: "refused"}
@@ -132,6 +155,66 @@ def _run(cmd: list, timeout: float, stdin=None) -> tuple:
 def _last_line(text: str) -> str:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     return lines[-1] if lines else ""
+
+
+# what an ssh that did not log in printed -> (kind, the words Setup shows, Setup's action). Checked
+# in this order: a missing/unusable key file is warned about before the "Permission denied" it
+# causes, and a host key problem stops ssh before it tries any key.
+_SSH_FAILURES = (
+    ("host_key_changed", ("remote host identification has changed",),
+     "the helper's host key has changed since this Mac last met it - if it was reinstalled, "
+     "run: ssh-keygen -R {host}", ""),
+    ("host_key", ("host key verification failed", "host key is known"),
+     "this Mac hasn't met the helper yet - run the command below once", "authorize"),
+    ("key_missing", ("no such identity", "not accessible"), "no SSH key yet - Create key", ""),
+    ("key_perms", ("unprotected private key", "bad permissions"),
+     "the SSH key file can be read by others, so ssh ignores it - make it private: "
+     "chmod 600 {key}", ""),
+    ("key_bad", ("invalid format", "load key"), "the SSH key file can't be used: {last}", ""),
+    ("auth", ("permission denied", "too many authentication failures"),
+     "the key isn't authorised on the helper - run the command below", "authorize"),
+    ("refused", ("connection refused",),
+     "{host} answered, but its SSH server is off - turn on sshd there", ""),
+    ("network", ("could not resolve", "name or service not known", "nodename nor servname",
+                 "no route to host", "network is unreachable", "host is down", "timed out",
+                 "host is unreachable"),
+     "no answer from {host}", ""),
+)
+# the same failures in the remux line's tooltip (Setup has the fix)
+_SEE_SETUP = " - see Settings > Setup > Helper"
+_SSH_TIPS = {"host_key": "this Mac hasn't met the helper yet" + _SEE_SETUP,
+             "host_key_changed": "the helper's host key has changed" + _SEE_SETUP,
+             "auth": "the key isn't authorised on the helper" + _SEE_SETUP,
+             "key_missing": "no SSH key yet" + _SEE_SETUP,
+             "refused": "{host} answered, but its SSH server is off"}
+
+
+def ssh_failure(rc, err: str, host: str, key: str = "") -> tuple:
+    """PURE. (kind, detail, action) for an ssh that did NOT log in (rc 255, or None: it could not
+    run or timed out), classified from its stderr into plain words; `action` is Setup's fix
+    ("authorize" = the ssh-copy-id command, else ""). Anything unrecognised is "no answer from
+    <host>" when ssh printed nothing, else "the login failed: <its last line>"."""
+    e = (err or "").lower()
+    last = _last_line(err)
+    for kind, needles, words, action in _SSH_FAILURES:
+        if any(n in e for n in needles):
+            return kind, words.format(host=host, key=key, last=last), action
+    if rc is None or not last:
+        return "network", f"no answer from {host}", ""
+    return "other", f"the login failed: {last}", ""
+
+
+def _no_answer_why(host: str, rc, err: str) -> str:
+    """availability()'s `why` when a status probe got no answer: "no answer from <host>", or —
+    when ssh's stderr says the login itself failed — that, in words (the tooltip shows it). An
+    ssh that DID log in (any exit but 255) and still got no status: the worker is missing."""
+    if rc is not None and rc != 255:
+        return "the helper's worker did not answer" + _SEE_SETUP
+    kind, detail, _action = ssh_failure(rc, err, host)
+    tip = _SSH_TIPS.get(kind)
+    if tip:
+        return tip.format(host=host)
+    return detail if kind == "other" else f"no answer from {host}"
 
 
 def _last_json(text: str):
@@ -267,51 +350,97 @@ def parse_route_interface(text: str):
     return m.group(1) if m else None
 
 
-def parse_wifi_device(text: str):
-    """PURE. The device of the port named Wi-Fi (AirPort on old macOS) in
-    `networksetup -listallhardwareports`, or None when the Mac has no such port."""
-    port = None
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if line.startswith("Hardware Port:"):
-            port = line.split(":", 1)[1].strip()
-        elif line.startswith("Device:") and port in ("Wi-Fi", "AirPort"):
-            dev = line.split(":", 1)[1].strip()
-            return dev or None
-    return None
+def _mac_links(run) -> tuple:
+    """(ifaces, ports, order, ports_ok): this Mac's interfaces, hardware ports and network service
+    order through nas_link's PURE parsers (`ifconfig`, `networksetup -listallhardwareports`,
+    `networksetup -listnetworkserviceorder`), read once per check. `ports_ok` = the port list was
+    read: without it nothing can tell the Wi-Fi from a cable."""
+    rc, out, _err = run([IFCONFIG], CMD_TIMEOUT)
+    ifaces = nas_link.parse_ifconfig(out or "") if rc == 0 else {}
+    rc, out, _err = run([NETWORKSETUP, "-listallhardwareports"], CMD_TIMEOUT)
+    ports_ok = rc == 0
+    ports = nas_link.parse_hardware_ports(out or "") if ports_ok else {}
+    rc, out, _err = run([NETWORKSETUP, "-listnetworkserviceorder"], CMD_TIMEOUT)
+    order = nas_link.parse_service_order(out or "") if rc == 0 else []
+    return ifaces, ports, order, ports_ok
 
 
-def _route_verdict(host: str, run, resolve) -> tuple:
-    ip = resolve(host)
-    if not ip:
-        return False, f"cannot resolve {host} to an IPv4 address", None, None, "unreachable"
+def _route_verdict(host: str, ip: str, run, links) -> tuple:
+    """One address's verdict. A wired interface on the helper's subnet is chosen exactly as
+    nas_link chooses one for the NAS (pick_wired: active, not Wi-Fi, not a tunnel/phone, in the
+    Mac's service order) and bound to — so Wi-Fi ranked above the cable is no refusal. Only
+    with no such interface does the route table decide: Wi-Fi there is "the Mac is on Wi-Fi"."""
+    ifaces, ports, order, ports_ok = links
+    dev = nas_link.pick_wired(ip, ifaces, ports, order) if ports_ok else None
+    if dev:
+        return True, f"wired via {dev} ({ip})", ip, dev, "wired"
     rc, out, _err = run([ROUTE, "-n", "get", ip], CMD_TIMEOUT)
     iface = parse_route_interface(out) if rc == 0 else None
     if not iface:
         return False, f"no route to {host} ({ip})", ip, None, "unreachable"
-    rc, out, _err = run([NETWORKSETUP, "-listallhardwareports"], CMD_TIMEOUT)
-    if rc != 0:
+    if not ports_ok:
         return False, "cannot list this Mac's network ports", ip, iface, "route_check"
-    wifi = parse_wifi_device(out)
-    if wifi and iface == wifi:
+    if nas_link.is_wifi(iface, ports):
         return False, f"the route to {host} is Wi-Fi ({iface})", ip, iface, "wifi"
-    if not (iface.startswith("en") or iface.startswith("bridge")):
+    # a helper on another subnet, reached through a router over the cable: the route's own
+    # interface, when it is a wired one (never a tethered phone or a tunnel)
+    wired = iface.startswith("bridge") or (iface.startswith("en")
+                                            and nas_link.is_ethernet_like(iface, ports))
+    if not wired:
         return False, f"the route to {host} is not wired ({iface})", ip, iface, "not_wired"
     return True, f"wired via {iface} ({ip})", ip, iface, "wired"
 
 
-def wired_route_ok(host: str, *, run=None, resolve=None) -> tuple:
+def wired_route_ok(host: str, *, run=None, resolve=None, prefer=None) -> tuple:
     """(ok, why, ip, iface, code): the Mac reaches `host`'s IPv4 `ip` over a wired interface
-    `iface` — the route's interface is an en*/bridge* device that is NOT the Wi-Fi port's.
-    `code` is the verdict as one word ("wired", "wifi", "not_wired", "unreachable",
-    "route_check") — what status_summary classifies on; `why` (which names the host) is for
-    logs and the tooltip only. Never cached: it is a few milliseconds, and a cached verdict
-    could outlive a pulled cable. The ssh then goes to exactly this `ip` over exactly this
-    `iface` (ssh_argv). Never raises."""
+    `iface` (_route_verdict). `prefer` = the IPv4s the helper itself reported as wired: when it
+    holds any, ONLY those are tried (in order, the first wired one wins) and the name is not
+    resolved at all; otherwise the name's first IPv4. `code` is the verdict as one word
+    ("wired", "wifi", "not_wired", "unreachable", "route_check") — what status_summary
+    classifies on; `why` (which names the host) is for logs and the tooltip only. Never cached:
+    it is a few milliseconds, and a cached verdict could outlive a pulled cable. The ssh then
+    goes to exactly this `ip` over exactly this `iface` (ssh_argv). Never raises."""
     try:
-        return _route_verdict(host, run or _run, resolve or _resolve_ipv4)
+        run = run or _run
+        ips = [ip for ip in (prefer or ()) if isinstance(ip, str) and ip]
+        if not ips:
+            ip = (resolve or _resolve_ipv4)(host)
+            if not ip:
+                return False, f"cannot resolve {host} to an IPv4 address", None, None, "unreachable"
+            ips = [ip]
+        links = _mac_links(run)
+        first = None
+        for ip in ips:
+            verdict = _route_verdict(host, ip, run, links)
+            if verdict[0]:
+                return verdict
+            first = first or verdict
+        return first
     except Exception as e:  # noqa: BLE001
         return False, f"route check failed: {e}", None, None, "route_check"
+
+
+# ---- the helper's own wired addresses --------------------------------------------------------
+
+def reported_ipv4(s):
+    """PURE. The IPv4 addresses a status answer says the helper's WIRED interfaces carry
+    ("ipv4", in its order, duplicates and junk dropped), or None when it sends no such list (an
+    older vworker). [] = it reported none."""
+    v = s.get("ipv4") if isinstance(s, dict) else None
+    if not isinstance(v, list):
+        return None
+    out = []
+    for a in v[:16]:
+        if not (isinstance(a, str) and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", a)):
+            continue
+        try:
+            ip = ipaddress.IPv4Address(a)
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_unspecified or ip.is_multicast or a in out:
+            continue
+        out.append(a)
+    return out
 
 
 # ---- this Mac's x265 -------------------------------------------------------------------------
@@ -393,6 +522,10 @@ _LIVE: dict = {}                 # (host, user, key) -> how many encode_segment 
 _NOTES: dict = {}                # (host, user, key) -> (monotonic, the scheduler's last segments info)
 _VERDICT: dict = {}              # (host, user, key) -> the refresher's last {"ok", "why", "code", "t"}
 _LAST_ROUTE: dict = {}           # (host, user, key) -> (ip, iface) of the last wired-route verdict
+_WIRED_IPS: dict = {}            # (host, user, key) -> the IPv4s the helper last reported as wired
+                                 #   (status "ipv4"); the route check uses only these once known
+_SETUP: dict = {"t": 0.0, "res": None, "jobs": None}   # setup_status's last result
+_SETUP_LOCK = threading.Lock()   # one setup check at a time (it runs an ssh: never under _STATE_LOCK)
 
 
 def reset_state() -> None:
@@ -408,6 +541,8 @@ def reset_state() -> None:
         _NOTES.clear()
         _VERDICT.clear()
         _LAST_ROUTE.clear()
+        _WIRED_IPS.clear()
+        _SETUP.update(t=0.0, res=None, jobs=None)
 
 
 def _settings():
@@ -437,6 +572,28 @@ def _enabled_setting() -> bool:
         return st._valid_helper_enabled(st.get_settings().get("helper_enabled", False))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _known_ipv4(hid) -> list:
+    """The helper's last reported wired IPv4s ([] while none are known)."""
+    with _STATE_LOCK:
+        return list(_WIRED_IPS.get(hid) or ())
+
+
+def _learn_ipv4(hid, s) -> None:
+    """Remember the wired IPv4s a status answer reports (an answer without the list changes
+    nothing: an older vworker)."""
+    ips = reported_ipv4(s)
+    if ips is not None:
+        with _STATE_LOCK:
+            _WIRED_IPS[hid] = ips
+
+
+def _forget_ipv4(hid) -> None:
+    """No answer over the remembered addresses (a new DHCP lease, say): the next check starts
+    from the resolved name again, and learns the list afresh from that first answer."""
+    with _STATE_LOCK:
+        _WIRED_IPS.pop(hid, None)
 
 
 class _RemotePipe:
@@ -482,6 +639,7 @@ class Helper:
         self._id = (host, user, key)
         self._route = None                       # (ip, iface) of the last wired verdict
         self._codes = {}                         # job -> the "code" of its VWORKER line
+        self._last_err = (None, "")              # (rc, ssh's stderr) of the last status probe
 
     def argv(self, *remote):
         if self._route is None:
@@ -501,8 +659,12 @@ class Helper:
     def _check_route(self) -> tuple:
         """check_route's (ok, why) plus the verdict's reason code (wired_route_ok's; a route_ok
         that names none reads "wired" / "unreachable")."""
+        known = _known_ipv4(self._id)            # the helper's own wired IPv4s, once reported
         try:
-            r = tuple(self._route_ok(self.host))
+            if known and dvcap._takes_kw(self._route_ok, "prefer"):
+                r = tuple(self._route_ok(self.host, prefer=known))
+            else:
+                r = tuple(self._route_ok(self.host))
             ok, why = bool(r[0]), str(r[1])
             ip, iface = (r[2], r[3]) if len(r) >= 4 else (None, None)
             code = r[4] if len(r) >= 5 and isinstance(r[4], str) else ""
@@ -511,6 +673,10 @@ class Helper:
         if ok and not (ip and iface):
             ok, why = False, f"the route check named no address and interface for {self.host}"
             code = "route_check"
+        if ok and known and str(ip) not in known:
+            # never an address the helper does not list as wired, once it has listed any
+            ok, why = False, f"{ip} is not one of the helper's wired addresses ({', '.join(known)})"
+            code = "not_wired"
         code = "wired" if ok else (code if code and code != "wired" else "unreachable")
         self._route = (str(ip), str(iface)) if ok else None
         with _STATE_LOCK:                       # status_summary's tooltip: "<host> · <ip> over Ethernet"
@@ -521,14 +687,27 @@ class Helper:
         return ok, why, code
 
     def status(self):
-        """The helper's `vworker status` JSON (its last JSON line), or None. Never raises."""
+        """The helper's `vworker status` JSON (its last JSON line), or None (ssh's stderr kept
+        in _last_err for the tooltip). The wired IPv4s it reports are remembered (_learn_ipv4).
+        Never raises."""
+        self._last_err = (None, "")
         cmd = self.argv("status")
         if cmd is None:
             return None
-        rc, out, _err = _run(cmd, STATUS_TIMEOUT)
+        rc, out, err = _run(cmd, STATUS_TIMEOUT)
+        self._last_err = (rc, err or "")
         if rc is None:
             return None
-        return _last_json(out)
+        s = _last_json(out)
+        if isinstance(s, dict):
+            _learn_ipv4(self._id, s)
+        return s
+
+    def _off_list(self) -> bool:
+        """The last checked route's address is not one the helper reports as wired — the first
+        contact's resolved address (the helper's Wi-Fi, say), before its list was known."""
+        known = _known_ipv4(self._id)
+        return bool(known) and self._route is not None and self._route[0] not in known
 
     def _judge(self, s: dict) -> tuple:
         """(ok, why, code) of one status answer: protocol PROTOCOL_VERSION, the helper's own ok
@@ -578,8 +757,16 @@ class Helper:
                 if st.get("res") is not None and now - st.get("t", 0.0) < AVAIL_TTL:
                     return st["res"]
             s = self.status()
+            if s is not None and self._off_list():
+                # the answer came over an address the helper does not list as wired: check the
+                # route again over one it does list, and ask once more (nothing cached before)
+                ok, why, code = self._check_route()
+                if not ok:
+                    return False, why, code
+                s = self.status()
             if s is None:
-                res, keep = (False, f"no answer from {self.host}", "unreachable"), True
+                _forget_ipv4(self._id)
+                res, keep = (False, _no_answer_why(self.host, *self._last_err), "unreachable"), True
             else:
                 res = self._judge(s)
                 keep = not (s.get("busy") is True or heavy_only(s))
@@ -974,29 +1161,36 @@ class Helper:
 
 
 _FIELD_ORDER = ("helper_host", "helper_user", "helper_key")
+NOT_SET_UP = "not set up"        # _configured's problem while the host or the user is still empty
 
 
 def _configured() -> tuple:
-    """(enabled, {field: value}, problem) from the settings, read once. `problem` is "" or what
-    status_summary shows after "settings:" ("bad host", "bad user, key", ...); a problem is
-    logged once (per distinct one) and never replaced by a default. May raise (unreadable)."""
+    """(enabled, {field: value}, problem) from the settings, read once. `problem` is "",
+    NOT_SET_UP (no host or no user yet — the shipped defaults; judged even while switched off,
+    and never logged: nothing was typed wrong) or what status_summary shows after "settings:"
+    ("bad host", "bad user, key", ...); a bad value is logged once (per distinct one) and never
+    replaced by a default. May raise (unreadable)."""
     st = _settings()
     s = st.get_settings()
     vals = {k: s.get(k, st.DEFAULT_SETTINGS[k]) for k in _FIELD_ORDER}
-    if not st._valid_helper_enabled(s.get("helper_enabled", False)):
+    enabled = st._valid_helper_enabled(s.get("helper_enabled", False))
+    if not st.helper_set_up(vals):
+        return enabled, vals, NOT_SET_UP
+    if not enabled:
         return False, vals, ""
     bad = [k for k in _FIELD_ORDER if not st.helper_field_ok(k, vals[k])]
     if bad:
         _log_once("Helper not used: invalid " + ", ".join(f"{k}={vals[k]!r}" for k in bad)
-                  + " in settings — fix it in Settings")
+                  + " in settings — fix it in Settings > Setup > Helper")
         return True, vals, "bad " + ", ".join(st.HELPER_FIELDS[k][0] for k in bad)
     return True, vals, ""
 
 
 def for_remux():
-    """The configured helper for one remux, or None: helper_enabled off, settings
-    unreadable, or a malformed helper_host / helper_user / helper_key — which is logged once
-    (per distinct problem) and never silently replaced by a default. Never raises."""
+    """The configured helper for one remux, or None: helper_enabled off, not set up (no host
+    or no user yet), settings unreadable, or a malformed helper_host / helper_user / helper_key —
+    which is logged once (per distinct problem) and never silently replaced by a default. Never
+    raises."""
     try:
         enabled, vals, problem = _configured()
         if not enabled or problem:
@@ -1024,7 +1218,7 @@ def _slot_held(hid) -> bool:
 
 def _refresh_loop(stop: threading.Event, wake: threading.Event) -> None:
     """Keeps _VERDICT fresh: available() now, then every REFRESH_SECS (sooner on a wake), until
-    the helper is switched off, its settings go bad, or `stop`. available() itself never asks
+    the helper is switched off, its settings go bad or empty, or `stop`. available() itself never asks
     the helper while it is cooling down or this process holds its job slot."""
     try:
         while not stop.is_set():
@@ -1157,8 +1351,9 @@ def status_summary() -> dict:
     polls available() every REFRESH_SECS and stops when switched off) and the live remux last
     recorded. {"enabled", "state": connected|ready|paused|off|not_connected, "detail": the words
     after the dot, "host": the configured host name, "tooltip": "<host> · <IPv4> over Ethernet"
-    (or "<host> · <the technical reason>")}. "connected" while a remote segment is in flight.
-    Never raises."""
+    (or "<host> · <the technical reason>")}. "connected" while a remote segment is in flight;
+    "off · not set up" while the host or the user is empty, whatever the switch says. Never
+    raises."""
     try:
         enabled, vals, problem = _configured()
     except Exception:  # noqa: BLE001
@@ -1169,6 +1364,8 @@ def status_summary() -> dict:
         return {"enabled": bool(enabled), "state": state, "detail": detail, "host": host,
                 "tooltip": tooltip if tooltip is not None else host}
     try:
+        if problem == NOT_SET_UP:
+            return line("off", NOT_SET_UP)
         if not enabled:
             return line("off", "switched off")
         if problem:
@@ -1199,3 +1396,302 @@ def status_summary() -> dict:
         return line(state, detail, f"{host} · {why}" if why else host)
     except Exception:  # noqa: BLE001
         return line("not_connected", "")
+
+
+# ---- SETUP: Settings > Setup > Helper ----------------------------------------------------------
+# setup_status() answers GET /api/helper/setup; setup_job_argv() builds the argv of the three
+# setup_jobs targets that fix what it finds. Both read the SAVED settings only, judged by
+# settings.helper_field_ok, so nothing typed reaches a shell — and neither ever raises.
+
+HELPER_JOBS = ("helper_key", "helper_worker", "helper_x265")   # setup_jobs targets (argv here)
+X265_TOKEN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]*")     # `build-x265.sh --version` takes it
+_CHECK_IDS = ("login", "wired", "worker", "x265", "helper")
+_STATE_WORDS = {"connected": "connected", "ready": "ready", "paused": "paused", "off": "off",
+                "not_connected": "not connected"}
+
+
+def login_argv(host: str, user: str, key: str, *remote) -> list:
+    """PURE. Setup's login probe, `vworker <remote...>` with the configured key only, over the
+    Mac's NORMAL route — no -4, no BindInterface: this proves the login (key, host key, sshd);
+    wired_route_ok judges the route on its own. The host is the destination itself, so its key
+    is looked up under exactly the name the remux's HostKeyAlias uses. Never asks anything
+    (BatchMode), and nothing from the user's ssh config can multiplex, jump or allocate a tty."""
+    return [SSH, "-i", os.path.expanduser(key),
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=8",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ProxyJump=none",
+            "-o", "RequestTTY=no", "--", f"{user}@{host}", VWORKER] + \
+        [shlex.quote(str(a)) for a in remote]
+
+
+def worker_sha256(path=None) -> str:
+    """sha256 hex of this app's own helper_worker/vworker.py — what an up-to-date worker
+    reports as its status "sha256" — or '' when it cannot be read."""
+    try:
+        with open(path or os.path.join(WORKER_DIR, "vworker.py"), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def authorize_command(host: str, user: str, key: str) -> str:
+    """PURE. The one command the user runs in Terminal so the helper takes the key: ssh-copy-id
+    asks for the helper's password once, and on first contact records its host key under the
+    host name as typed — the name the remux looks it up by. The key path stays as typed (a
+    leading ~ still expands) unless it needs quoting."""
+    pub = f"{key}.pub"
+    word = pub if re.fullmatch(r"[A-Za-z0-9_./~+-]+", pub) else shlex.quote(os.path.expanduser(pub))
+    return f"ssh-copy-id -i {word} {user}@{host}"
+
+
+def _check(cid: str, ok, detail: str = "", action: str = "") -> dict:
+    return {"id": cid, "ok": ok, "detail": detail, "action": action}
+
+
+def _wired_check(host: str, r) -> dict:
+    """The "wired" check's words from a wired_route_ok verdict."""
+    ok, _why, ip, iface, code = (tuple(r) + (None,) * 5)[:5]
+    if ok:
+        return _check("wired", True, f"over Ethernet ({iface})")
+    if code == "wifi":
+        return _check("wired", False, "the Mac reaches it over Wi-Fi - plug both into Ethernet")
+    if code == "not_wired":
+        return _check("wired", False, f"the Mac reaches it over {iface}, not Ethernet")
+    if code == "route_check":
+        return _check("wired", False, "couldn't read this Mac's network ports - try again")
+    if not ip:
+        return _check("wired", False, f"can't find {host} on the network - check the host name")
+    return _check("wired", False, f"no route to {host} ({ip})")
+
+
+def _login(host: str, user: str, key: str, run) -> tuple:
+    """(check, status|None): setup's login probe runs `vworker status`. Logged in = ssh exited
+    with anything but 255 (a missing vworker is the shell's 127 — the login itself worked);
+    `status` is its answer when one came back."""
+    if not os.path.isfile(os.path.expanduser(key)):
+        return _check("login", False, "no SSH key yet - Create key"), None
+    rc, out, err = run(login_argv(host, user, key, "status"), LOGIN_TIMEOUT)
+    if rc is None or rc == 255:
+        _kind, detail, action = ssh_failure(rc, err, host, key)
+        return _check("login", False, detail, action), None
+    s = _last_json(out)
+    return _check("login", True, f"logged in as {user}"), (s if isinstance(s, dict) and "version" in s
+                                                          else None)
+
+
+def _worker_check(s) -> dict:
+    mine = worker_sha256()
+    if s is None:
+        return _check("worker", False, "not installed", "helper_worker")
+    if not mine:
+        return _check("worker", None, "this app's own copy of the worker is missing")
+    if s.get("sha256") == mine:
+        return _check("worker", True, "installed")
+    return _check("worker", False, "an older worker - Install updates it", "helper_worker")
+
+
+def _x265_check(s, mac: str) -> dict:
+    theirs = str((s or {}).get("x265") or "")
+    if not mac:
+        return _check("x265", None, "install the command-line tools first")
+    if s is None:
+        return _check("x265", None, "install the worker first")
+    if not theirs:
+        return _check("x265", False, "not built yet", "helper_x265")
+    if theirs == mac:
+        return _check("x265", True, f"x265 {mac}, the same as this Mac")
+    return _check("x265", False, f"x265 {theirs} on the helper, {mac} on this Mac - Build replaces it",
+                  "helper_x265")
+
+
+def _helper_check(vals: dict, enabled: bool) -> dict:
+    """The status line's own words for the helper, from a verdict taken NOW: the refresher's
+    Helper asked afresh (a cooldown and this process's job slot still count), then
+    status_summary() read exactly as the remux line reads it. Switched off: not applicable."""
+    if not enabled:
+        return _check("helper", None, "off - switched off")
+    h = _summary_helper(vals)
+    if not _slot_held(h._id):
+        with _STATE_LOCK:
+            _AVAIL.setdefault(h._id, {})["res"] = None
+        try:
+            ok, why, code = h.availability()
+        except Exception as e:  # noqa: BLE001
+            ok, why, code = False, f"helper check failed: {e}", "error"
+        with _STATE_LOCK:
+            _VERDICT[h._id] = {"ok": bool(ok), "why": str(why), "code": str(code or ""),
+                               "t": time.monotonic()}
+    st = status_summary()
+    state, detail = str(st.get("state") or ""), str(st.get("detail") or "")
+    words = _STATE_WORDS.get(state, state) + (f" - {detail}" if detail else "")
+    if state == "not_connected" and not detail:
+        with _STATE_LOCK:
+            why = str((_VERDICT.get(h._id) or {}).get("why") or "").replace(_SEE_SETUP, "")
+        words += f" - {why}" if why else ""
+    return _check("helper", state in ("ready", "connected"), words)
+
+
+def _setup_compute(run, mac_x265) -> dict:
+    st = _settings()
+    s = st.get_settings()
+    vals = {k: s.get(k, st.DEFAULT_SETTINGS[k]) for k in _FIELD_ORDER}
+    enabled = st._valid_helper_enabled(s.get("helper_enabled", False))
+    host, user, key = (vals[k] for k in _FIELD_ORDER)
+    as_str = {k: (v if isinstance(v, str) else "" if v is None else str(v)) for k, v in vals.items()}
+    set_up = st.helper_set_up(vals)
+    bad = [st.HELPER_FIELDS[k][0] for k in _FIELD_ORDER if not st.helper_field_ok(k, vals[k])]
+    configured = set_up and not bad
+    key_ok = st.helper_field_ok("helper_key", key)
+    path = os.path.expanduser(key) if key_ok else ""
+    pub = os.path.abspath(path + ".pub") if key_ok and os.path.isfile(path + ".pub") else ""
+    mac = mac_x265() or ""
+    out = {"configured": configured, "host": as_str["helper_host"], "user": as_str["helper_user"],
+           "key": as_str["helper_key"], "key_exists": bool(key_ok and os.path.isfile(path)),
+           "pubkey": pub, "authorize_cmd": authorize_command(host, user, key) if configured else "",
+           "mac_x265": mac, "helper_x265": "", "checks": [], "checked_at": time.time()}
+    if not configured:
+        why = NOT_SET_UP if not set_up else "settings: bad " + ", ".join(bad)
+        out["checks"] = [_check(c, None, why if c == "login" else "") for c in _CHECK_IDS]
+        return out
+    hid = (host, user, key)
+    login, status = _login(host, user, key, run)
+    if status is not None:
+        _learn_ipv4(hid, status)        # the first contact may tell the remux its wired address
+        out["helper_x265"] = str(status.get("x265") or "")
+    checks = [login, _wired_check(host, wired_route_ok(host, run=run, prefer=_known_ipv4(hid)))]
+    if login["ok"]:
+        checks += [_worker_check(status), _x265_check(status, mac), _helper_check(vals, enabled)]
+    else:
+        checks += [_check("worker", None),               # not checked: nothing logged in
+                   _check("x265", None, "" if mac else "install the command-line tools first"),
+                   _check("helper", None)]
+    out["checks"] = checks
+    return out
+
+
+def _helper_jobs_sig():
+    """What setup_jobs says about the helper's three jobs (the running one, each one's state and
+    finish time): a different answer than the cached result's = a job started or finished."""
+    try:
+        import setup_jobs
+        st = setup_jobs.status()
+    except Exception:  # noqa: BLE001
+        return None
+    jobs = st.get("jobs") or {}
+    active = st.get("active")
+    return (active if active in HELPER_JOBS else None,
+            tuple((w, (jobs.get(w) or {}).get("state"), (jobs.get(w) or {}).get("finished"))
+                  for w in HELPER_JOBS))
+
+
+def invalidate_setup() -> None:
+    """A helper job started or finished: setup_status's next call checks again, and the status
+    line's cached verdicts go too (the refresher asks at once), so neither keeps saying what the
+    job just changed. Never blocks on a running setup check."""
+    with _STATE_LOCK:
+        _SETUP["res"] = None
+        for st in _AVAIL.values():
+            st["res"] = None
+    _wake_refresher()
+
+
+def _setup_unavailable(why: str) -> dict:
+    return {"configured": False, "host": "", "user": "", "key": "", "key_exists": False,
+            "pubkey": "", "authorize_cmd": "", "mac_x265": "", "helper_x265": "",
+            "checks": [_check(c, None, f"the check failed: {why}" if c == "login" else "")
+                       for c in _CHECK_IDS],
+            "checked_at": 0}
+
+
+def setup_status(fresh: bool = False, *, run=None, local_x265=None) -> dict:
+    """GET /api/helper/setup: {"configured", "host", "user", "key" (as saved), "key_exists",
+    "pubkey" (absolute path of <key>.pub, "" if missing), "authorize_cmd" (the ssh-copy-id line,
+    "" until set up), "mac_x265", "helper_x265" ("" if unknown), "checks": [{"id", "ok"
+    (True/False, None = not checked / not applicable), "detail" (plain words), "action" (""|
+    "authorize"|"helper_worker"|"helper_x265")} for login, wired, worker, x265, helper — in that
+    order], "checked_at" (epoch, 0 = never)}.
+
+    Runs only when asked (the app: Setup opening, Test, after a job): one login ssh over the
+    normal route, the wired-route check, and the helper's verdict afresh. The result is reused
+    for SETUP_TTL seconds unless `fresh`, and never once a helper job has started or finished
+    since (invalidate_setup). It never touches /api/state's path (status_summary reads caches
+    only) and never raises. `run`/`local_x265` are for tests."""
+    try:
+        asked = time.monotonic()
+        jobs = _helper_jobs_sig()
+        with _SETUP_LOCK:
+            with _STATE_LOCK:
+                hit, t, sig = _SETUP.get("res"), _SETUP.get("t", 0.0), _SETUP.get("jobs")
+            if hit is not None and sig == jobs and (t >= asked or (not fresh and
+                                                                    asked - t < SETUP_TTL)):
+                return json.loads(json.dumps(hit))
+            if hit is not None and sig != jobs:
+                invalidate_setup()
+            t0 = time.monotonic()
+            res = _setup_compute(run or _run, local_x265 or local_x265_version)
+            with _STATE_LOCK:
+                _SETUP.update(t=t0, res=res, jobs=jobs)
+            return json.loads(json.dumps(res))
+    except Exception as e:  # noqa: BLE001
+        return _setup_unavailable(str(e))
+
+
+def setup_job_argv(what: str, *, local_x265=None) -> tuple:
+    """(argv, "") for one of Setup's helper jobs, or (None, why in plain words). Every value
+    comes from the SAVED settings, judged by settings.helper_field_ok, and reaches the job as
+    its own argv word (never through a shell unquoted):
+      helper_key     ssh-keygen -t ed25519 -N "" -C visionary-helper -f <key, expanded>; refused
+                     when the key (or its .pub) already exists — never overwritten. The key's
+                     folder (~/.ssh) is made, mode 700, when missing.
+      helper_worker  /bin/bash <engine>/helper_worker/install.sh --host H --user U --key K
+      helper_x265    <engine>/helper_worker/build-x265.sh run ON THE HELPER over ssh (the script
+                     is ssh's stdin) with "--version <this Mac's x265 token>", the token checked
+                     against X265_TOKEN_RE first.
+    The worker and x265 jobs need a host, a user and an existing key. Never raises."""
+    try:
+        st = _settings()
+        s = st.get_settings()
+        vals = {k: s.get(k, st.DEFAULT_SETTINGS[k]) for k in _FIELD_ORDER}
+        return _job_argv(what, vals, st, local_x265 or local_x265_version)
+    except Exception as e:  # noqa: BLE001
+        return None, f"cannot prepare {what}: {e}"
+
+
+def _job_argv(what: str, vals: dict, st, mac_x265) -> tuple:
+    if what not in HELPER_JOBS:
+        return None, f"no such helper job {what!r}"
+    host, user, key = (vals[k] for k in _FIELD_ORDER)
+    if not st.helper_field_ok("helper_key", key):
+        return None, "the SSH key path in Settings > Setup > Helper is not usable - fix it first"
+    path = os.path.expanduser(key)
+    if what == "helper_key":
+        if os.path.lexists(path) or os.path.lexists(path + ".pub"):
+            return None, f"{key} already exists - Visionary never replaces a key"
+        folder = os.path.dirname(path)
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder, mode=0o700)
+            os.chmod(folder, 0o700)
+        return [SSH_KEYGEN, "-t", "ed25519", "-N", "", "-C", "visionary-helper", "-f", path], ""
+    if not st.helper_set_up(vals):
+        return None, "the helper isn't set up yet - fill in its host and user first"
+    bad = [st.HELPER_FIELDS[k][0] for k in ("helper_host", "helper_user")
+           if not st.helper_field_ok(k, vals[k])]
+    if bad:
+        return None, "settings: bad " + ", ".join(bad) + " - fix it first"
+    if not os.path.isfile(path):
+        return None, "no SSH key yet - Create key first"
+    if what == "helper_worker":
+        script = os.path.join(WORKER_DIR, "install.sh")
+        if not os.path.isfile(script):
+            return None, "this app's helper installer is missing"
+        return ["/bin/bash", script, "--host", host, "--user", user, "--key", path], ""
+    script = os.path.join(WORKER_DIR, "build-x265.sh")
+    if not os.path.isfile(script):
+        return None, "this app's x265 build script is missing"
+    token = mac_x265() or ""
+    if not token:
+        return None, "this Mac has no x265 yet - install the command-line tools first"
+    if not X265_TOKEN_RE.fullmatch(token):
+        return None, f"this Mac's x265 version {token!r} is not one the build can make"
+    remote = (f'exec {SSH} -i "$1" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 '
+              f'-o ServerAliveInterval=15 -- "$2@$3" "bash -s -- --version $5" < "$4"')
+    return ["/bin/bash", "-c", remote, "_", path, user, host, script, token], ""

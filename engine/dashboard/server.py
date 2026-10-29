@@ -1450,6 +1450,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/setup/install-status":
             import setup_jobs
             self._json(setup_jobs.status())
+        elif path == "/api/helper/setup":
+            # Settings > Setup > Helper: login, wired route, worker, x265 and the helper's own
+            # verdict in plain words (engine/helper.py setup_status). It runs an ssh, so only
+            # here, on request — cached 30 s unless ?fresh=1 — and never on /api/state's path.
+            import helper
+            fresh = (parse_qs(urlparse(self.path).query).get("fresh") or ["0"])[0] == "1"
+            self._json(helper.setup_status(fresh=fresh))
         elif path == "/api/borders/status":
             self._json(api_borders_status())
         elif path == "/api/media-libraries":
@@ -1595,7 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/setup/install":
             import setup_jobs
             what = (body or {}).get("what") or ""
-            argv = None
+            argv, on_done = None, None
             if what == "brew_tools":
                 # x265 + mkvtoolnix + ffmpeg 8 (engine/brewdeps.py): argv ENGINE-computed
                 argv = [sys.executable, os.path.join(ENGINE_DIR, "brewdeps.py")]
@@ -1616,7 +1623,19 @@ class Handler(BaseHTTPRequestHandler):
                                 "detail": "Comfy Desktop's models directory not found — "
                                           "install and run Comfy Desktop once"})
                     return
-            out = setup_jobs.start(what, argv=argv)
+            if what in ("helper_key", "helper_worker", "helper_x265"):
+                # The optional helper's Setup jobs (key, worker, x265): argv ENGINE-computed from
+                # the SAVED helper settings only (helper.setup_job_argv). A refusal is plain words,
+                # in "error" too — the app shows that field for a reason it doesn't know.
+                import helper
+                argv, why = helper.setup_job_argv(what)
+                if not argv:
+                    self._json({"error": why, "detail": why})
+                    return
+                on_done = helper.invalidate_setup     # its next check must see what the job did
+            out = setup_jobs.start(what, argv=argv, on_done=on_done)
+            if on_done is not None:
+                on_done()                            # ...and what it is doing
             _invalidate_preflight()          # a finished job re-detects on next preflight
             self._json(out, code=(409 if out.get("error") == "busy" else 200))
         elif path == "/api/media-libraries":

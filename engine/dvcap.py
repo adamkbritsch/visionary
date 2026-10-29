@@ -1040,8 +1040,9 @@ def _hosts_path(segdir: str) -> str:
 
 def read_hosts(segdir: str) -> dict:
     """{"<segment index>": "mac"|"ally"} — who encoded each segment published with a helper
-    ("ally" = the helper, whatever machine it is). Missing/corrupt -> {}. Lives in segdir, so a
-    resume-identity wipe takes it along."""
+    ("ally" = the helper, whatever machine it is: the word is only historical, and stays as is
+    so a half-done item's hosts.json still resumes). Missing/corrupt -> {}. Lives in segdir, so
+    a resume-identity wipe takes it along."""
     try:
         with open(_hosts_path(segdir)) as f:
             d = json.load(f)
