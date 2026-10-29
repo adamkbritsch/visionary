@@ -1353,18 +1353,23 @@ private struct LaneProgress: View {
 /// The helper at a glance, in the header beside the power pill (user-dictated 2026-10-28: "a little
 /// icon in the header saying whether the helper is ready or not"). A bare glyph read as "display off",
 /// so it is the power pill's kind of readout: a small glyph welded to "Helper ready" (steel) or
-/// "Helper working" (bright). Shown ONLY while the helper can take work (user-dictated: "just have
-/// it not there when the helper isn't ready") — switched off, paused, off or offline, it is gone.
-/// The tooltip is the full status line plus the machine's own name, which never appears on screen.
+/// "Helper working" (bright). Shown only while the helper answers over Ethernet (user-dictated: "just
+/// have it not there when the helper isn't ready", then "when it's connected but not able to do
+/// things, show the icon in a darker gray, like it's disabled"): "Helper paused" — a game, busy,
+/// low on disk — reads in a darker, disabled gray. Switched off, off (Wi-Fi, no Ethernet, battery)
+/// or offline, it is gone. The tooltip is the full status line plus the machine's own name.
 private struct HelperHeaderIcon: View {
     @EnvironmentObject var store: AppStore
+    /// Connected but refusing work: the steel ramp's idle tone pushed back to read as a disabled
+    /// control (brightness, never hue — the header's rule).
+    private static let disabled = DS.steelDim.opacity(0.55)
 
     var body: some View {
         if let h = store.state?.helper, h.enabled == true,
-           h.state == "ready" || h.state == "connected" {
-            let working = h.state == "connected"
-            let word = working ? "working" : "ready"
-            let tint: Color = working ? DS.steelBright : DS.steel
+           h.state == "ready" || h.state == "connected" || h.state == "paused" {
+            let word = h.state == "connected" ? "working" : (h.state == "ready" ? "ready" : "paused")
+            let tint: Color = h.state == "connected" ? DS.steelBright
+                            : h.state == "ready" ? DS.steel : Self.disabled
             let detail = h.detail ?? ""
             let line = "Helper \(word)" + (detail.isEmpty ? "" : " \u{00B7} " + detail)
             let machine = [h.tooltip, h.host].compactMap { $0 }.first { !$0.isEmpty } ?? ""
