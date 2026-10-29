@@ -620,6 +620,9 @@ struct SettingsDTO: Codable {
     var nas_network: String?              // which link big NAS transfers take: "ethernet" (first,
                                           // the default) / "wifi" (first) / "ethernet_only"
     var helper_enabled: Bool?             // a Linux machine on Ethernet shares the remux (default off)
+    var helper_host: String?              // its name or IPv4 address ("" = not set up)
+    var helper_user: String?              // its ssh login ("" = not set up)
+    var helper_key: String?               // the ssh key the Mac signs in with, as saved ("~/...")
 
     // Scheduling / capacity — universal, and none of them change how a file is encoded.
     var max_active_shows: Int?            // how many shows share the round-robin
@@ -660,6 +663,10 @@ extension SettingsDTO {
         default:                          return nil
         }
     }
+
+    /// The helper is set up once its address and login are saved (the engine's "not set up" is
+    /// either one empty). Until then Settings shows no Helper switch and Setup no check rows.
+    var helperConfigured: Bool { !(helper_host ?? "").isEmpty && !(helper_user ?? "").isEmpty }
 }
 
 struct PresetDTO: Codable, Identifiable {
@@ -918,6 +925,32 @@ struct DvProbeDTO: Codable {
     var detail: String?
     var uploaded_to: String?
     var cron: String?
+}
+
+/// GET /api/helper/setup — the helper's setup checks (engine helper.setup_status). All optional,
+/// so an engine without them (or with a field more) still decodes.
+struct HelperCheckDTO: Codable {
+    var id: String?                    // "login" | "wired" | "worker" | "x265" | "helper"
+    var ok: Bool?                      // nil = not checked yet / not applicable
+    var detail: String?                // plain words for the row
+    var action: String?                // "" | "authorize" | "helper_worker" | "helper_x265"
+}
+
+struct HelperSetupDTO: Codable {
+    var configured: Bool?              // host and login saved
+    var host: String?
+    var user: String?
+    var key: String?                   // as saved, unexpanded
+    var key_exists: Bool?              // false → "Create key"
+    var pubkey: String?                // absolute path of <key>.pub, "" when missing
+    var authorize_cmd: String?         // "ssh-copy-id -i <key>.pub user@host", "" when not set up
+    var mac_x265: String?              // this Mac's x265 version token, "" when none
+    var helper_x265: String?           // the helper's, "" when unknown
+    var checks: [HelperCheckDTO]?      // in that order: login, wired, worker, x265, helper
+    var checked_at: Double?            // epoch, 0 = never
+    subscript(check id: String) -> HelperCheckDTO? {
+        checks?.first { $0.id == id }
+    }
 }
 
 struct ApiErrorDTO: Codable {          // 4xx bodies (the arm-gate 409 carries `checks`)

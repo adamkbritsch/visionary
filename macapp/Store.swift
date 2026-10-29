@@ -50,6 +50,9 @@ final class AppStore: ObservableObject {
     @Published var mediaLibs: MediaLibrariesDTO?
     @Published var youtarrConfig: YoutarrConfigDTO?
     @Published var autoConnected: AutoConnectDTO?  // tokenless NAS-host service sweep
+    @Published var helperSetup: HelperSetupDTO?    // the helper's setup checks (GET /api/helper/setup)
+    @Published var helperChecks = 0                // helper check fetches in flight (Test's spinner)
+    var helperChecking: Bool { helperChecks > 0 }
 
     @Published var modeOverride: String? = nil    // optimistic nav VIEW → the selector chip slides on
                                                   // click, before the server round-trip lands
@@ -143,6 +146,10 @@ final class AppStore: ObservableObject {
     }
     func saveSettings(_ body: [String: Any]) async {
         await post("/api/settings", body); await refresh()
+        // a new helper address, login or key: check the helper against what was just saved
+        if body.keys.contains(where: { ["helper_host", "helper_user", "helper_key"].contains($0) }) {
+            await fetchHelperSetup(fresh: true)
+        }
     }
     // YouTube cadence: serve 1 YouTube video per `n` TV episodes (engine clamps 1…50).
     func setYoutubeEveryTv(_ n: Int) async {
@@ -478,6 +485,16 @@ final class AppStore: ObservableObject {
     func fetchBordersStatus() async {
         if let b: BordersStatusDTO = await get("/api/borders/status") { bordersStatus = b }
     }
+    /// The helper's setup checks: signs in, Ethernet, worker, x265, status. Asked for only when
+    /// Setup opens, on Test, after a save and after a helper job, never on the poll. The engine
+    /// keeps an answer 30 s; `fresh` checks again now, an ssh round trip of a few seconds.
+    func fetchHelperSetup(fresh: Bool) async {
+        helperChecks += 1
+        defer { helperChecks -= 1 }
+        if let h: HelperSetupDTO = await get("/api/helper/setup" + (fresh ? "?fresh=1" : "")) {
+            helperSetup = h
+        }
+    }
     func recheckSetup() async {
         if let p: PreflightDTO = await get("/api/preflight?fresh=1") { preflight = p }
         await runSelftest()
@@ -524,25 +541,30 @@ final class AppStore: ObservableObject {
         let (_, data) = await postResult("/api/setup/install", ["what": what])
         if let data, let e = try? JSONDecoder().decode(ApiErrorDTO.self, from: data),
            let err = e.error {
+            // a refusal's own words when it has them (the helper jobs explain theirs)
             lastError = err == "homebrew-missing"
                 ? "Homebrew isn't installed — run its installer in Terminal first (command in the row)."
-                : err == "busy" ? "Another install is still running." : err
+                : err == "busy" ? "Another install is still running." : (e.detail ?? err)
             return
         }
-        await followInstalls()
+        await followInstalls(what)
     }
     /// Poll the job registry once a second until the active job finishes, then recheck.
-    private func followInstalls() async {
+    private func followInstalls(_ started: String) async {
+        var helperJob = started.hasPrefix("helper_")
         for _ in 0..<10800 {         // model downloads are GB-class — outlive the old 15 min
             await fetchInstallStatus()
             if installStatus?.active?.hasPrefix("borders_") == true {
                 await fetchBordersStatus()   // the row's live progress IS the on-disk byte count
             }
+            if installStatus?.active?.hasPrefix("helper_") == true { helperJob = true }
             if installStatus?.active == nil { break }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         await recheckSetup()
         await fetchBordersStatus()      // a finished borders_* download flips its row
+        // a new key, worker or x265 changes what the helper's checks find: check it again now
+        if helperJob { await fetchHelperSetup(fresh: true) }
     }
     func uploadDvProbe() async -> DvProbeDTO? {
         let (_, data) = await postResult("/api/setup/install-dv-probe", [:])
