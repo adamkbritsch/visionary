@@ -16,6 +16,7 @@ NAS (FTP) ──download──▶ local scratch
                         remux — x265 re-encode under a hard peak-bitrate cap (native DV RPU),
                           │  original audio + subtitles folded back + smart loudness boost,
                           │  muxed by mkvmerge into a Dolby Vision 8.1 MKV
+                          │  [optional] a Linux helper on Ethernet encodes some of its segments
                           ▼
 NAS (FTP) ◀──upload─── finished 4K DV master REPLACES the source (default) or lands
                        NEXT TO it — per-show/movie "Replaces source" setting; keeping
@@ -217,15 +218,17 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   > episode, on top of the normal ~1h35m. It is chunked and resumable (a stop or a deploy
   > costs at most the chunk in flight), and **it takes the whole machine**: the moment
   > outpainting starts, in-flight remuxes are suspended outright (SIGSTOP — no CPU, no lost
-  > work), the finisher stops taking on remux, upload *or* cleanup work, and the background
-  > prefetcher stands down. Nothing else runs until the episode's borders are done. Turn it
+  > work; a [helper](HELPER.md)'s segment in flight is stopped and redone instead), the
+  > finisher stops taking on remux, upload *or* cleanup work, and the background prefetcher
+  > stands down. Nothing else runs until the episode's borders are done. Turn it
   > on per show, deliberately.
 
 - **Two things at once**: the heavy stages overlap — episode N's remux runs while episode
   N+1 is already in Topaz (both segmented + resumable; a deploy or power loss costs at
-  most one ~5-minute segment). Measured on real episodes, the overlap cuts a finished
-  episode from ~3h12m to ~2h20m — **~27% faster (≈52 minutes saved per episode)**. Those are
-  the ~30-minute extended-cut episodes in the test library; that's about **4.9 minutes of
+  most one ~5-minute segment per machine encoding: the Mac, plus the helper when it's on).
+  Measured on real episodes, the overlap cuts a finished episode from ~3h12m to ~2h20m —
+  **~27% faster (≈52 minutes saved per episode)**. Those are the ~30-minute extended-cut
+  episodes in the test library; that's about **4.9 minutes of
   wall-clock per minute of content**, so a standard **20-minute 1080p episode** comes out a
   finished 4K Dolby Vision™ master in **roughly 1h35m** (measured median across 65 finished
   episodes). And if two finished upscales are ever waiting at once, **both remux in
@@ -234,8 +237,9 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   remuxing, the next item starts — its Dolby Vision™ step included. Simultaneous remuxes
   stay capped at two. The AI border extension takes the whole machine: the in-flight remuxes
   are **suspended outright** the instant it starts (SIGSTOP, so they use no CPU) and resume
-  exactly where they were, and it also halts uploads, cleanup and the prefetcher, so nothing
-  whatsoever overlaps it.
+  exactly where they were (a helper's segment in flight is the exception: it is stopped and
+  redone), and it also halts uploads, cleanup and the prefetcher, so nothing whatsoever
+  overlaps it.
 
 <p align="center">
   <img src="assets/dual-remux.png" alt="The pipeline card with two remux lanes running at once" width="900">
@@ -245,13 +249,34 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
 - **Storage-smart output**: the remux stage re-encodes the multi-gigabyte Dolby Vision™ render
   under a hard peak-bitrate cap (x265 with a 50 Mbps ceiling on any one second), so a finished 4K
   Dolby Vision™ master averages **~1.4 GB — only ~1.7× the ~0.8 GB 1080p source**
-  (measured across 48 upscaled episodes). A per-show/movie **"Replaces source"** setting
-  decides the source's fate: replace (default — deleted only after the master
-  size-verifies on the NAS) or keep it beside the master, where Plex serves both as one
-  item with two versions and the source stays re-runnable by future, better models.
-  If a master still measures over the cap, the remux **repairs itself**: it localizes the
+  (measured across 48 upscaled episodes). The finished file's measured peak passes up to
+  1.15× the cap — 57.5 Mbps at the default, which allows for container framing — and the log
+  names that gate: *peak 53.7 ≤ 57.5 Mbps, the 50 cap's gate*. A per-show/movie
+  **"Replaces source"** setting decides the source's fate: replace (default — deleted only
+  after the master size-verifies on the NAS) or keep it beside the master, where Plex serves
+  both as one item with two versions and the source stays re-runnable by future, better models.
+  If a master still measures over that gate, the remux **repairs itself**: it localizes the
   offending second(s), re-encodes only those segments at a tighter cap (85%, then 70%),
   and re-gates — instead of failing on identical retries.
+
+- **A Linux helper can share the remux** (optional, off by default; see [Helper](HELPER.md)):
+  a Linux machine on Ethernet (a desktop, or a laptop or handheld on its charger) encodes some
+  of an item's ~5-minute segments while the Mac encodes the rest. The Mac works from the front
+  of the item and the helper from the back, so the remux bar fills from both ends. The Mac
+  still decodes every segment and applies the colour step (the helper's colour conversion
+  isn't bit-identical), then streams the picture, compressed, over ssh; the helper runs only
+  x265 — the same version as the Mac's, with the same settings — and streams the encoded
+  picture straight back, where its frame count is checked before the segment is used. Only
+  this capped re-encode is shared: Topaz, the Dolby Vision™ analysis and render, the over-gate
+  splice's pieces and the peak repair stay on the Mac. The helper takes work only while it is
+  on mains, wired, idle and has 5 GB free, and while the Mac reaches it over Ethernet. It
+  stops at once for a game, and after about 10 seconds of anything heavy (more than 1.5 cores
+  of CPU, or 30 % of the GPU, by programs other than the desktop itself and the Steam client),
+  deleting its job files whenever it stops; the Mac takes that segment back, so the helper can
+  never fail an item. Measured on the same frames, a handheld PC with an AMD Z1 Extreme encoded
+  **8.06 fps** against the Mac's **2.99 fps** while the Mac also ran Topaz. Setup does the
+  installing (**Settings → Setup → Helper**), and the header shows *Helper ready*, *working*
+  or *paused* while one is connected.
 
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
   pauses on battery and dims the screen after idle. Nothing it does needs the screen or

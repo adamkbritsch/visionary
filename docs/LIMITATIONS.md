@@ -6,8 +6,9 @@
   build and the Dolby Vision™ toolchain are pinned because the output was judged on them.
 
 - **AI border extension is slow and exclusive.** Hours per episode on top of the normal
-  run, and while it works nothing else does — remuxes are suspended, uploads and cleanup
-  wait, the prefetcher stands down. It is chunked and resumable, off by default, and only
+  run, and while it works nothing else does — remuxes are suspended (a [helper](HELPER.md)'s
+  segment in flight is stopped and redone instead), uploads and cleanup wait, the prefetcher
+  stands down. It is chunked and resumable, off by default, and only
   offered on shows that measure 4:3. SDR only. For continuity, chunk boundaries **snap to
   scene cuts** (a wing reset at an edit is invisible) and every chunk within a scene shares
   its seed — but a boundary that must land mid-scene can still shift the generated borders
@@ -39,6 +40,17 @@
   ~550 GB peak of an upscaled feature film — so plan for a fast SSD with ~1 TB free if you
   queue movies (a 2 TB SSD is comfortable). Estimated peaks for each kind of item are in
   the [YouTube](YOUTUBE.md) section's table.
+
+- **The Helper has firm limits.** The optional [Linux helper](HELPER.md) is one machine, and
+  its x265 must report **exactly** the Mac's version: after Homebrew upgrades the Mac's x265,
+  the helper sits idle until Setup's **Build** makes it match again. It needs **Ethernet at both
+  ends** and an IPv4 address (Wi-Fi is refused, however good). Its GPU rule counts programs one
+  by one and leaves out the desktop itself and the Steam client, so their own GPU use never
+  pauses it (a game is caught by the game rule instead). Only the capped x265 re-encode is
+  shared: Topaz, the Dolby Vision™ analysis and render, the over-gate splice's pieces and the
+  peak repair's re-encodes always run on the Mac, which also still decodes and colour-converts
+  every segment the helper encodes. At the end of an item the Mac waits for the helper's last
+  segment rather than redoing it, so a helper much slower than the Mac can cost time there.
 
 - Replaces originals **by default**: once the uploaded 4K DV master size-verifies on the
   NAS, the superseded 1080p source is deleted — but the per-show/movie **"Replaces
