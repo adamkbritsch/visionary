@@ -1352,40 +1352,40 @@ private struct LaneProgress: View {
 
 /// The helper at a glance, in the header beside the power pill (user-dictated 2026-10-28: "a little
 /// icon in the header saying whether the helper is ready or not"). Only while the helper is switched
-/// on — off, it is not there at all. Ready reads steel, working reads bright; anything else (paused,
-/// off, not connected) is dimmed and struck through. The tooltip is the full status line plus the
-/// machine's own name, which never appears on screen.
+/// on — off, it is not there at all. A bare glyph read as "display off", so it is the power pill's
+/// kind of readout instead: a small glyph welded to "Helper <state>". Working reads bright, ready
+/// steel, anything else (paused, off, offline) dim — brightness, never hue. The tooltip is the full
+/// status line plus the machine's own name, which never appears on screen.
 private struct HelperHeaderIcon: View {
     @EnvironmentObject var store: AppStore
 
     var body: some View {
         if let h = store.state?.helper, h.enabled == true {
-            let ready = h.state == "ready" || h.state == "connected"
             let word: String = {
                 switch h.state {
-                case "connected": return "connected"
+                case "connected": return "working"
                 case "ready":     return "ready"
                 case "paused":    return "paused"
                 case "off":       return "off"
-                default:          return "not connected"
+                default:          return "offline"
                 }
             }()
+            let tint: Color = h.state == "connected" ? DS.steelBright
+                            : h.state == "ready" ? DS.steel : DS.steelDim
             let detail = h.detail ?? ""
             let line = "Helper \(word)" + (detail.isEmpty ? "" : " \u{00B7} " + detail)
             let machine = [h.tooltip, h.host].compactMap { $0 }.first { !$0.isEmpty } ?? ""
-            Image(systemName: "display")
-                .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(h.state == "connected" ? DS.steelBright : (ready ? DS.steel : DS.steelDim))
-                .overlay {
-                    if !ready {
-                        Rectangle().fill(DS.steelDim)
-                            .frame(width: 1.5, height: 18)
-                            .rotationEffect(.degrees(-45))
-                    }
-                }
-                .contentShape(Rectangle())
-                .help(machine.isEmpty ? line : line + "\n" + machine)
-                .accessibilityLabel(line)
+            HStack(spacing: 3) {
+                Image(systemName: "pc").font(.system(size: 11))
+                Text("Helper \(word)")
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .fixedSize()
+            .help(machine.isEmpty ? line : line + "\n" + machine)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(line)
         }
     }
 }
