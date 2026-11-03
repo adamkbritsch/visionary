@@ -200,9 +200,11 @@ Skip this unless you have a spare Linux machine (a desktop, or a laptop or handh
 charger) wired to the same network as the Mac. Preflight never checks it and it is not part of
 the arm gate; with no helper, the remux runs exactly as before.
 
-Set it up in **Settings → Setup → Helper**: enter its Address, Login and SSH key, press
-*Create key* if you have none, run the `ssh-copy-id` command it shows once in Terminal, then
-*Install* and *Build*. Switch **Helper** on in Settings when the checks are green.
+Set it up in **Settings → Setup → Helper**: enter its Address, Login and SSH key and press
+*Save* (the checks, *Test* and *Create key* appear once they are saved), press *Create key* if
+you have none, run the `ssh-copy-id` command it shows once in Terminal, then *Install* and
+*Build*. Switch **Helper** on in Settings when the checks are green. If the *Sleep* row says
+the helper can't keep itself awake, turn off its automatic sleep while it's plugged in.
 Requirements, what each check and status means, and the same steps by hand (the scripts are in
 `engine/helper_worker/`): [Helper](HELPER.md).
 

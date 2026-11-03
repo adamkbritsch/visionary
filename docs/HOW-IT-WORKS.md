@@ -269,14 +269,16 @@ YouTube video that isn't 3840×2160** (its render would need an HDR fit). A 4K s
   picture straight back, where its frame count is checked before the segment is used. Only
   this capped re-encode is shared: Topaz, the Dolby Vision™ analysis and render, the over-gate
   splice's pieces and the peak repair stay on the Mac. The helper takes work only while it is
-  on mains, wired, idle and has 5 GB free, and while the Mac reaches it over Ethernet. It
-  stops at once for a game, and after about 10 seconds of anything heavy (more than 1.5 cores
-  of CPU, or 30 % of the GPU, by programs other than the desktop itself and the Steam client),
-  deleting its job files whenever it stops; the Mac takes that segment back, so the helper can
-  never fail an item. Measured on the same frames, a handheld PC with an AMD Z1 Extreme encoded
-  **8.06 fps** against the Mac's **2.99 fps** while the Mac also ran Topaz. Setup does the
-  installing (**Settings → Setup → Helper**), and the header shows *Helper ready*, *working*
-  or *paused* while one is connected.
+  on mains, wired, idle and has 5 GB free, and while the stream runs over Ethernet at both
+  ends. It stops at once for a game, and after about 10 seconds of anything heavy (more than
+  1.5 cores of CPU, or 30 % of the GPU; where the driver reports GPU use per program, the
+  desktop itself and the Steam client are left out, and elsewhere the whole GPU counts),
+  deleting its job files whenever it stops; the Mac takes that segment back, as it does when
+  the helper sleeps mid-segment, so the helper can never fail an item. Measured on the same
+  frames, a handheld PC with an AMD Z1 Extreme encoded **8.06 fps** against the Mac's
+  **2.99 fps** while the Mac also ran Topaz. Setup does the installing (**Settings → Setup →
+  Helper**), and the header shows *Helper ready*, *working* or *paused* while one is
+  connected.
 
 - **Appliance mode**: once Activated it re-arms itself across launches and stops; it
   pauses on battery and dims the screen after idle. Nothing it does needs the screen or

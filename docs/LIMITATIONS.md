@@ -43,12 +43,18 @@
 
 - **The Helper has firm limits.** The optional [Linux helper](HELPER.md) is one machine, and
   its x265 must report **exactly** the Mac's version: after Homebrew upgrades the Mac's x265,
-  the helper sits idle until Setup's **Build** makes it match again. It needs **Ethernet at both
-  ends** and an IPv4 address (Wi-Fi is refused, however good). Its GPU rule counts programs one
-  by one and leaves out the desktop itself and the Steam client, so their own GPU use never
-  pauses it (a game is caught by the game rule instead). Only the capped x265 re-encode is
-  shared: Topaz, the Dolby Vision™ analysis and render, the over-gate splice's pieces and the
-  peak repair's re-encodes always run on the Mac, which also still decodes and colour-converts
+  the helper sits out until Setup's **Build** makes the matching version (the Mac notices the
+  new x265 without a restart). It needs **Ethernet at both ends** and an IPv4 address (Wi-Fi
+  is refused, however good, including a stream that arrives over the helper's Wi-Fi). Its GPU
+  rule counts programs one by one on NVIDIA (`nvidia-smi pmon`) and on AMD and Intel i915/xe
+  (the kernel's per-program counters), and there it leaves out the desktop itself and the
+  Steam client. Where there is no per-program reading (nouveau, an older kernel, or `pmon`
+  failing), the whole GPU counts, desktop included, so a busy desktop alone can pause it; a
+  game is caught by the game rule either way. Over ssh most desktops won't let the worker
+  hold off sleep, so turn off the helper's automatic sleep while it's plugged in; one that
+  sleeps mid-segment just hands that segment back. Only the capped x265 re-encode is shared:
+  Topaz, the Dolby Vision™ analysis and render, the over-gate splice's pieces and the peak
+  repair's re-encodes always run on the Mac, which also still decodes and colour-converts
   every segment the helper encodes. At the end of an item the Mac waits for the helper's last
   segment rather than redoing it, so a helper much slower than the Mac can cost time there.
 

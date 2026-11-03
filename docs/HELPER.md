@@ -71,6 +71,8 @@ Before you start, on the helper:
   called `ssh` there.
 - Check that `python3 --version` and `zstd --version` both answer. If not, install them with
   the helper's package manager.
+- Turn off its automatic sleep while it's plugged in. Setup's *Sleep* check later tells you
+  whether it can stay awake by itself (see [Keeping it awake](#keeping-it-awake)).
 - Note its address: a name such as `helper.local`, or its IPv4 address such as
   `192.168.1.50` (`ip -4 addr` on the helper shows it). The Mac connects over IPv4 only.
 
@@ -81,9 +83,14 @@ check beside it, and **Test** runs the checks again.
 
 1. **Address, Login and SSH key.** Enter the helper's address (`helper.local` or
    `192.168.1.50`) and your login on it. Leave the key at its default,
-   `~/.ssh/id_ed25519_visionary_helper`, unless you already made one for this.
-2. **Create key**, if there is no key yet. It makes a new key with no passphrase, because
-   Visionary logs in unattended. It never overwrites a file that already exists.
+   `~/.ssh/id_ed25519_visionary_helper`, unless you already made one for this. Then press
+   **Save**: the check rows, **Test**, **Create key** and the **Helper** switch in Settings
+   appear once an address and a login are saved. A saved value that can't be used shows its
+   reason in the *Signs in* row, for example *settings: bad host*; fix it and press **Save**
+   again.
+2. **Create key**, on the *Signs in* row, if there is no key yet. It makes a new key with no
+   passphrase, because Visionary logs in unattended. It never overwrites a file that already
+   exists.
 3. **Authorise the key, once.** Setup shows a command such as
 
    ```bash
@@ -92,7 +99,7 @@ check beside it, and **Test** runs the checks again.
 
    Run it in Terminal. It asks you to accept the helper's host key (type `yes`) and then for
    your password on the helper. This is the only time a password is used: from then on the
-   Mac logs in with the key. Press **Test** and the *Login* check turns green.
+   Mac logs in with the key. Press **Test** and the *Signs in* check turns green.
 4. **Install** puts the worker on the helper (`~/visionary-worker/bin/vworker`, checked by
    sha256 after the copy) and makes its job folder (`~/visionary-scratch/jobs`). Where the
    helper runs systemd for your user, it also adds a timer that clears abandoned job files
@@ -112,11 +119,12 @@ check beside it, and **Test** runs the checks again.
 
 | Check | Green | Otherwise |
 |---|---|---|
-| **Login** | The Mac logs in with the key, unattended. | *this Mac hasn't met the helper yet* or *the key isn't authorised*: run the command Setup shows. *no answer from helper.local*: is it on, is the address right, is its ssh server running? *no SSH key yet*: press **Create key**. |
-| **Wired** | The Mac reaches it over Ethernet, and names the port. | *the Mac reaches it over Wi-Fi*: plug both into Ethernet (see [Troubleshooting](#troubleshooting)). |
+| **Signs in** | The Mac logs in with the key, unattended (*logged in as you*). | *this Mac hasn't met the helper yet* or *the key isn't authorised*: run the command Setup shows. *no answer from helper.local*: is it on, is the address right, is its ssh server running? *no SSH key yet*: press **Create key**. *settings: bad host* (or user, or key): the saved value can't be used; fix it and press **Save**. |
+| **Ethernet** | The Mac reaches it over Ethernet, and names the port. | *the Mac reaches it over Wi-Fi*: plug both into Ethernet (see [Troubleshooting](#troubleshooting)). |
 | **Worker** | *installed*, and the same worker as this app's. | *not installed*, or *an older worker* after you update Visionary: press **Install**. |
-| **x265** | The same version as this Mac's. | *not built yet*, or two different versions named: press **Build**. *install the command-line tools first*: this Mac has no x265 yet. |
-| **Helper** | *ready - waiting for the next segment* | The same words as the status line below, for example *paused - a game is running on it*. |
+| **x265** | The same version as this Mac's. | *not built yet*, or two different versions named (after Homebrew upgrades the Mac's x265): press **Build**. *install the command-line tools first*: this Mac has no x265 yet. |
+| **Sleep** | *it stays awake while it encodes* | A gray dot: never a failure, and it never holds back *Ready*. *it can't keep itself awake over ssh · turn off automatic sleep while it's plugged in*: see [Keeping it awake](#keeping-it-awake). No words when it can't be told (no systemd-inhibit on the helper, no up-to-date worker yet, or no answer). |
+| **Status** | *ready · waiting for the next segment* | The same words as the status line below, for example *paused · a game is running on it*. Switched off, it reads *off · switched off* with a gray dot. |
 
 ## What the app shows
 
@@ -139,11 +147,11 @@ check beside it, and **Test** runs the checks again.
 | Helper paused · it's busy | Something heavy is running on it, or it already has a job. |
 | Helper paused · it's low on disk space | Less than 5 GB free. |
 | Helper off · the Mac is on Wi-Fi | The Mac's route to it is Wi-Fi, not Ethernet. |
-| Helper off · it's not on Ethernet | The helper has no Ethernet link up, or the Mac's connection reaches it over its Wi-Fi. |
+| Helper off · it's not on Ethernet | The helper has no Ethernet link up, or its Wi-Fi is on the same network and the stream arrives over it (the tooltip then says *the stream is arriving over its Wi-Fi · turn its Wi-Fi off*). |
 | Helper off · it's on battery | A laptop or handheld off its charger. |
 | Helper off · switched off | The Settings switch is off. |
 | Helper off · not set up | No address or login saved in Setup. |
-| Helper off · settings: bad host | A saved address (or login, or key path) that can't be used. Fix it in Setup. |
+| Helper off · settings: bad host | A saved address (or login, or key path) that can't be used. Fix it in Setup, where the *Signs in* row says the same. |
 | Helper not connected | Anything else: no answer, a name that doesn't resolve, a missing or different x265, a missing worker, no zstd on the helper. The tooltip and Setup's checks say which. |
 
 ## When it steps aside, and what it deletes
@@ -157,8 +165,14 @@ The helper polices itself, whatever the Mac thinks.
   the charger is unplugged, when Ethernet goes down, or when the Mac goes away (the connection
   breaks, or no data arrives for 5 minutes).
 - **It stops after about 10 seconds of anything heavy:** other programs using more than 1.5
-  cores of CPU, or more than 30 % of the GPU (the desktop itself and the Steam client are not
-  counted). A browser, a file manager or Steam's menus stay below that.
+  cores of CPU, or more than 30 % of the GPU. A browser, a file manager or Steam's menus stay
+  below that.
+- **The GPU is read program by program** on NVIDIA (`nvidia-smi pmon`) and on AMD and Intel
+  (i915, xe) from the kernel's per-program counters. There the desktop's own drawing and the
+  Steam client are not counted: GNOME, KDE, Cinnamon, COSMIC, Pantheon, Budgie, Xfce, MATE and
+  the wlroots compositors such as Sway. Where there is no per-program reading (the nouveau
+  driver, an older kernel, or `nvidia-smi pmon` failing), the whole GPU counts, desktop
+  included, so a busy desktop alone can pause it.
 - **A game** is any Steam game (Proton included), any Windows program under Wine or Proton,
   and a launch from Lutris or Heroic. A non-Steam shortcut running a native Linux program is
   judged by the CPU and GPU rule only.
@@ -175,9 +189,22 @@ The helper polices itself, whatever the Mac thinks.
 - Switching the helper off stops new segments; one already in flight finishes.
 
 Visionary logs in with the configured key only, never a password. For its work it connects to
-the IPv4 address its wired check found, bound to the Mac's Ethernet port, so a pulled cable
+the IPv4 address its Ethernet check found, bound to the Mac's Ethernet port, so a pulled cable
 ends the session instead of moving it to Wi-Fi. Apart from Setup's Install and Build, it runs
 nothing on the helper but its worker.
+
+### Keeping it awake
+
+While it encodes, the worker asks the system to hold off sleep (`systemd-inhibit`). Over ssh
+most desktops won't allow that, and Setup's *Sleep* row says so. Then turn off automatic sleep
+while it's plugged in:
+
+- **GNOME**: Settings → Power.
+- **KDE**: System Settings → Power Management.
+- Or add a polkit rule that allows `org.freedesktop.login1.inhibit-block-sleep` for your user.
+  That needs root, so it is up to you; Visionary never changes it.
+
+A helper that sleeps mid-segment just hands that segment back to the Mac.
 
 ## Troubleshooting
 
@@ -196,15 +223,24 @@ press **Test**.
 - **Helper off · the Mac is on Wi-Fi**: plug the Mac into Ethernet. With both connected, put
   Ethernet above Wi-Fi (System Settings → Network → the **…** menu → *Set Service Order*), or
   turn Wi-Fi off.
-- **Helper off · it's not on Ethernet**: plug the helper into Ethernet. If it is also on Wi-Fi
-  and the Mac's connection arrives that way, turn its Wi-Fi off.
+- **Helper off · it's not on Ethernet**: plug the helper into Ethernet. If the tooltip says
+  *the stream is arriving over its Wi-Fi · turn its Wi-Fi off*, its Wi-Fi is on the same
+  network as its Ethernet and the stream comes in that way: turn its Wi-Fi off.
 - **Two different x265 versions** in the x265 check: this happens after Homebrew upgrades the
-  Mac's x265, because the helper must match it exactly. Quit and reopen Visionary so it picks
-  up the Mac's new version, then press **Build**.
+  Mac's x265 (a `brew upgrade`), because the helper must match it exactly. Visionary notices
+  the new x265 without a restart, and the helper sits out until you press **Build**, which
+  makes the matching version.
 - **"an older worker"**: press **Install** after updating Visionary.
 - **Helper not connected, with *zstd missing* in the tooltip**: install zstd on the helper.
 - **Helper paused · it's busy, all the time**: something on the helper keeps using more than
-  1.5 cores or 30 % of the GPU. `top` on the helper shows what.
+  1.5 cores or 30 % of the GPU. `vworker status` (below) names it in its `why` field, for
+  example *busy: GPU card0 35% busy*. `top` shows CPU use; for the GPU, `nvidia-smi` on
+  NVIDIA, or `cat /sys/class/drm/card*/device/gpu_busy_percent` on AMD. Where the GPU has no
+  per-program reading, the desktop's own drawing counts too (see
+  [When it steps aside](#when-it-steps-aside-and-what-it-deletes)).
+- **It falls asleep overnight**, or the *Sleep* row says *it can't keep itself awake over
+  ssh*: turn off its automatic sleep while it's plugged in (see
+  [Keeping it awake](#keeping-it-awake)). In `vworker status`, `sleep_block` is then `false`.
 - **Build fails**: Setup shows the build's output. The usual causes are no build tools and no
   distrobox, a distribution without a box, or no internet connection on the helper.
 
@@ -213,7 +249,7 @@ To read the status by hand (all read-only):
 ```bash
 curl -s 'http://127.0.0.1:8765/api/helper/setup?fresh=1' | python3 -m json.tool      # Setup's checks
 curl -s http://127.0.0.1:8765/api/state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("helper"))'
-ssh -i ~/.ssh/id_ed25519_visionary_helper you@helper.local '~/visionary-worker/bin/vworker status'
+ssh -T -i ~/.ssh/id_ed25519_visionary_helper you@helper.local '~/visionary-worker/bin/vworker status'
 ```
 
 ## Setting it up by hand
@@ -233,7 +269,7 @@ KEY=~/.ssh/id_ed25519_visionary_helper
    worker, checks it by sha256, adds the cleanup timer where it can, and ends by printing the
    helper's `vworker status`.
 3. **x265**, see below.
-4. **Settings:** enter the address, login and key in Setup → Helper (or see
+4. **Settings:** enter the address, login and key in Setup → Helper and press **Save** (or see
    [Configuration](CONFIGURATION.md#settingsjson--the-helper)), then switch **Helper** on.
 
 ### Building x265 by hand
@@ -246,10 +282,11 @@ installed (`--force` rebuilds it). From the Mac:
 
 ```bash
 tok=$(/opt/homebrew/bin/x265 --version 2>&1 | sed -n 's/.*HEVC encoder version \([^ ]*\).*/\1/p' | head -n 1)
-ssh -i "$KEY" you@helper.local "bash -s -- --version $tok" < "$H/build-x265.sh"
+ssh -T -i "$KEY" you@helper.local "bash -s -- --version $tok" < "$H/build-x265.sh"
 ```
 
-Without distrobox, install the build tools on the helper first:
+Without distrobox, install the build tools on the helper first. CMake 4 works too, for every
+x265 version the script builds.
 
 | Distribution | Command |
 |---|---|
@@ -259,8 +296,8 @@ Without distrobox, install the build tools on the helper first:
 
 ## Removing it
 
-On the Mac, switch **Helper** off and clear the address and login in Setup. Then, on the
-helper:
+On the Mac, switch **Helper** off, then clear the address and login in Setup and press
+**Save**. Then, on the helper:
 
 ```bash
 systemctl --user disable --now visionary-worker-sweep.timer     # if Install added the timer
