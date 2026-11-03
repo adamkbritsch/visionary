@@ -3,7 +3,7 @@
 # (the Linux machine itself, not inside a container):
 #     bash build-x265.sh --version <token> [--force]
 # or from the Mac (Setup's Build button runs this one, with this Mac's own token):
-#     ssh -i <key> <user>@<host> 'bash -s -- --version <token>' < engine/helper_worker/build-x265.sh
+#     ssh -T -i <key> <user>@<host> 'bash -s -- --version <token>' < engine/helper_worker/build-x265.sh
 #
 # <token> is what the Mac's `x265 --version` prints after "HEVC encoder version": "<tag>"
 # (e.g. 4.3) or "<tag>+<distance>-<changeset>" (e.g. 4.1+1-1d117be). The helper must run the
@@ -33,7 +33,9 @@
 #
 # Everything runs from one function, main, called on the last line: when the script arrives on
 # stdin (`bash -s`) bash has then read every line before anything runs, so a child that reads
-# stdin cannot swallow the rest of the script. Every such child gets </dev/null as well.
+# stdin cannot swallow the rest of the script. Every such child gets </dev/null as well. The
+# exit on that line stops bash reading on after main, so a stdin that never ends (a tty an ssh
+# config forces on the session) cannot keep it waiting.
 #
 # Env overrides: X265_GIT_URL (source repo), X265_BOX_IMAGE (build in a box from this image,
 # even when the machine has the tools).
@@ -250,6 +252,13 @@ esac
 # Version.cmake would `git describe`; without .git it reads x265Version.txt instead
 rm -rf "$src/.git"
 version_txt "$tag" "$distance" "$changeset" > "$src/x265Version.txt"
+# CMake 4 refuses cmake_policy(SET ... OLD) for CMP0025 and CMP0054, which sources from before
+# upstream's CMake 4 fix (1d117be among them) still set; that fix leaves both NEW as well.
+# CMAKE_POLICY_VERSION_MINIMUM below covers their cmake_minimum_required 2.8.8, not an explicit
+# OLD. CMake logic only: the version and the bitstream are untouched, and on a fixed source it
+# changes nothing.
+run sed -i -E 's/cmake_policy\(SET (CMP0025|CMP0054) OLD\)/cmake_policy(SET \1 NEW)/' \
+    "$src/source/CMakeLists.txt"
 
 jobs=$(nproc)
 common=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_LIBNUMA=OFF)
@@ -372,4 +381,4 @@ main() {
   say "installed $DEST"
 }
 
-main "$@"
+main "$@"; exit
