@@ -162,26 +162,26 @@ def _last_line(text: str) -> str:
 # causes, and a host key problem stops ssh before it tries any key.
 _SSH_FAILURES = (
     ("host_key_changed", ("remote host identification has changed",),
-     "the helper's host key has changed since this Mac last met it - if it was reinstalled, "
+     "the helper's host key has changed since this Mac last met it · if it was reinstalled, "
      "run: ssh-keygen -R {host}", ""),
     ("host_key", ("host key verification failed", "host key is known"),
-     "this Mac hasn't met the helper yet - run the command below once", "authorize"),
-    ("key_missing", ("no such identity", "not accessible"), "no SSH key yet - Create key", ""),
+     "this Mac hasn't met the helper yet", "authorize"),
+    ("key_missing", ("no such identity", "not accessible"), "no SSH key yet · Create key makes one", ""),
     ("key_perms", ("unprotected private key", "bad permissions"),
-     "the SSH key file can be read by others, so ssh ignores it - make it private: "
+     "the SSH key file can be read by others, so ssh ignores it · make it private: "
      "chmod 600 {key}", ""),
     ("key_bad", ("invalid format", "load key"), "the SSH key file can't be used: {last}", ""),
     ("auth", ("permission denied", "too many authentication failures"),
-     "the key isn't authorised on the helper - run the command below", "authorize"),
+     "the key isn't authorised on the helper yet", "authorize"),
     ("refused", ("connection refused",),
-     "{host} answered, but its SSH server is off - turn on sshd there", ""),
+     "{host} answered, but its SSH server is off · turn on sshd there", ""),
     ("network", ("could not resolve", "name or service not known", "nodename nor servname",
                  "no route to host", "network is unreachable", "host is down", "timed out",
                  "host is unreachable"),
      "no answer from {host}", ""),
 )
 # the same failures in the remux line's tooltip (Setup has the fix)
-_SEE_SETUP = " - see Settings > Setup > Helper"
+_SEE_SETUP = " · see Settings > Setup > Helper"
 _SSH_TIPS = {"host_key": "this Mac hasn't met the helper yet" + _SEE_SETUP,
              "host_key_changed": "the helper's host key has changed" + _SEE_SETUP,
              "auth": "the key isn't authorised on the helper" + _SEE_SETUP,
@@ -1453,13 +1453,13 @@ def _wired_check(host: str, r) -> dict:
     if ok:
         return _check("wired", True, f"over Ethernet ({iface})")
     if code == "wifi":
-        return _check("wired", False, "the Mac reaches it over Wi-Fi - plug both into Ethernet")
+        return _check("wired", False, "the Mac reaches it over Wi-Fi · plug both into Ethernet")
     if code == "not_wired":
         return _check("wired", False, f"the Mac reaches it over {iface}, not Ethernet")
     if code == "route_check":
-        return _check("wired", False, "couldn't read this Mac's network ports - try again")
+        return _check("wired", False, "couldn't read this Mac's network ports · try again")
     if not ip:
-        return _check("wired", False, f"can't find {host} on the network - check the host name")
+        return _check("wired", False, f"can't find {host} on the network · check the address")
     return _check("wired", False, f"no route to {host} ({ip})")
 
 
@@ -1468,7 +1468,7 @@ def _login(host: str, user: str, key: str, run) -> tuple:
     with anything but 255 (a missing vworker is the shell's 127 — the login itself worked);
     `status` is its answer when one came back."""
     if not os.path.isfile(os.path.expanduser(key)):
-        return _check("login", False, "no SSH key yet - Create key"), None
+        return _check("login", False, "no SSH key yet · Create key makes one"), None
     rc, out, err = run(login_argv(host, user, key, "status"), LOGIN_TIMEOUT)
     if rc is None or rc == 255:
         _kind, detail, action = ssh_failure(rc, err, host, key)
@@ -1486,7 +1486,7 @@ def _worker_check(s) -> dict:
         return _check("worker", None, "this app's own copy of the worker is missing")
     if s.get("sha256") == mine:
         return _check("worker", True, "installed")
-    return _check("worker", False, "an older worker - Install updates it", "helper_worker")
+    return _check("worker", False, "an older worker · Install updates it", "helper_worker")
 
 
 def _x265_check(s, mac: str) -> dict:
@@ -1499,7 +1499,7 @@ def _x265_check(s, mac: str) -> dict:
         return _check("x265", False, "not built yet", "helper_x265")
     if theirs == mac:
         return _check("x265", True, f"x265 {mac}, the same as this Mac")
-    return _check("x265", False, f"x265 {theirs} on the helper, {mac} on this Mac - Build replaces it",
+    return _check("x265", False, f"x265 {theirs} on the helper, {mac} on this Mac · Build replaces it",
                   "helper_x265")
 
 
@@ -1508,7 +1508,7 @@ def _helper_check(vals: dict, enabled: bool) -> dict:
     Helper asked afresh (a cooldown and this process's job slot still count), then
     status_summary() read exactly as the remux line reads it. Switched off: not applicable."""
     if not enabled:
-        return _check("helper", None, "off - switched off")
+        return _check("helper", None, "off · switched off")
     h = _summary_helper(vals)
     if not _slot_held(h._id):
         with _STATE_LOCK:
@@ -1522,11 +1522,11 @@ def _helper_check(vals: dict, enabled: bool) -> dict:
                                "t": time.monotonic()}
     st = status_summary()
     state, detail = str(st.get("state") or ""), str(st.get("detail") or "")
-    words = _STATE_WORDS.get(state, state) + (f" - {detail}" if detail else "")
+    words = _STATE_WORDS.get(state, state) + (f" · {detail}" if detail else "")
     if state == "not_connected" and not detail:
         with _STATE_LOCK:
             why = str((_VERDICT.get(h._id) or {}).get("why") or "").replace(_SEE_SETUP, "")
-        words += f" - {why}" if why else ""
+        words += f" · {why}" if why else ""
     return _check("helper", state in ("ready", "connected"), words)
 
 
@@ -1661,7 +1661,7 @@ def _job_argv(what: str, vals: dict, st, mac_x265) -> tuple:
         return None, f"no such helper job {what!r}"
     host, user, key = (vals[k] for k in _FIELD_ORDER)
     if not st.helper_field_ok("helper_key", key):
-        return None, "the SSH key path in Settings > Setup > Helper is not usable - fix it first"
+        return None, "the SSH key path in Settings > Setup > Helper is not usable · fix it first"
     path = os.path.expanduser(key)
     if what == "helper_key":
         if os.path.lexists(path) or os.path.lexists(path + ".pub"):
@@ -1672,13 +1672,13 @@ def _job_argv(what: str, vals: dict, st, mac_x265) -> tuple:
             os.chmod(folder, 0o700)
         return [SSH_KEYGEN, "-t", "ed25519", "-N", "", "-C", "visionary-helper", "-f", path], ""
     if not st.helper_set_up(vals):
-        return None, "the helper isn't set up yet - fill in its host and user first"
+        return None, "the helper isn't set up yet · fill in its address and login first"
     bad = [st.HELPER_FIELDS[k][0] for k in ("helper_host", "helper_user")
            if not st.helper_field_ok(k, vals[k])]
     if bad:
-        return None, "settings: bad " + ", ".join(bad) + " - fix it first"
+        return None, "settings: bad " + ", ".join(bad) + " · fix it first"
     if not os.path.isfile(path):
-        return None, "no SSH key yet - Create key first"
+        return None, "no SSH key yet · Create key makes one first"
     if what == "helper_worker":
         script = os.path.join(WORKER_DIR, "install.sh")
         if not os.path.isfile(script):
@@ -1689,7 +1689,7 @@ def _job_argv(what: str, vals: dict, st, mac_x265) -> tuple:
         return None, "this app's x265 build script is missing"
     token = mac_x265() or ""
     if not token:
-        return None, "this Mac has no x265 yet - install the command-line tools first"
+        return None, "this Mac has no x265 yet · install the command-line tools first"
     if not X265_TOKEN_RE.fullmatch(token):
         return None, f"this Mac's x265 version {token!r} is not one the build can make"
     remote = (f'exec {SSH} -i "$1" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 '

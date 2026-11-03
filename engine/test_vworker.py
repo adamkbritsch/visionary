@@ -2462,13 +2462,15 @@ class Scripts(unittest.TestCase):
                                capture_output=True)
             self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_build_script_pins_commit_and_version_file(self):
+    def test_build_script_keeps_the_multilib_recipe(self):
+        # The version is no longer pinned here: the script builds whatever the Mac's x265
+        # reports (`--version <token>`; test_helper_scripts covers the token and the
+        # x265Version.txt it writes). The 8/10/12-bit recipe and the install path stay.
         with open(os.path.join(WORKER_DIR, "build-x265.sh")) as f:
             text = f.read()
-        for needle in ("COMMIT=1d117be", 'WANT_VERSION="4.1+1-1d117be"', "BOX=visionary-worker",
-                       "releasetagdistance: 1", "releasetag: 4.1", "repositorychangeset: 1d117be",
-                       'rm -rf "$src/.git"', "-DLINKED_10BIT=ON", "-DLINKED_12BIT=ON",
-                       "-DMAIN12=ON", "8bit+10bit+12bit", '"$ROOT/bin/x265"'):
+        for needle in ("BOX=visionary-worker", 'rm -rf "$src/.git"', "-DLINKED_10BIT=ON",
+                       "-DLINKED_12BIT=ON", "-DMAIN12=ON", "8bit+10bit+12bit",
+                       '"$ROOT/bin/x265"', 'main "$@"'):
             self.assertIn(needle, text)
 
     def test_install_over_fake_ssh_is_idempotent(self):

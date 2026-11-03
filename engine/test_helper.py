@@ -1818,12 +1818,12 @@ class SshFailureWords(unittest.TestCase):
     CASES = [
         # (rc, ssh's stderr) -> (kind, detail, action)
         ((255, "Host key verification failed.\n"),
-         ("host_key", "this Mac hasn't met the helper yet - run the command below once", "authorize")),
+         ("host_key", "this Mac hasn't met the helper yet", "authorize")),
         ((255, "No ED25519 host key is known for helper.local and you have requested strict "
                "checking.\nHost key verification failed.\n"),
-         ("host_key", "this Mac hasn't met the helper yet - run the command below once", "authorize")),
+         ("host_key", "this Mac hasn't met the helper yet", "authorize")),
         ((255, "user@helper.local: Permission denied (publickey,password).\n"),
-         ("auth", "the key isn't authorised on the helper - run the command below", "authorize")),
+         ("auth", "the key isn't authorised on the helper yet", "authorize")),
         ((255, "ssh: Could not resolve hostname helper.local: nodename nor servname provided, "
                "or not known\n"), ("network", "no answer from helper.local", "")),
         ((255, "ssh: connect to host helper.local port 22: Operation timed out\n"),
@@ -1834,10 +1834,10 @@ class SshFailureWords(unittest.TestCase):
          ("network", "no answer from helper.local", "")),
         ((None, ""), ("network", "no answer from helper.local", "")),
         ((255, "ssh: connect to host helper.local port 22: Connection refused\n"),
-         ("refused", "helper.local answered, but its SSH server is off - turn on sshd there", "")),
+         ("refused", "helper.local answered, but its SSH server is off · turn on sshd there", "")),
         ((255, "Warning: Identity file /x/k not accessible: No such file or directory.\n"
                "user@helper.local: Permission denied (publickey).\n"),
-         ("key_missing", "no SSH key yet - Create key", "")),
+         ("key_missing", "no SSH key yet · Create key makes one", "")),
         ((255, "kex_exchange_identification: Connection closed by remote host\n"),
          ("other", "the login failed: kex_exchange_identification: Connection closed by remote host",
           "")),
@@ -1863,7 +1863,7 @@ class SshFailureWords(unittest.TestCase):
 
     def test_the_tooltip_words(self):
         w = helper._no_answer_why
-        see = " - see Settings > Setup > Helper"
+        see = " · see Settings > Setup > Helper"
         self.assertEqual(w("h", 255, "Host key verification failed.\n"),
                          "this Mac hasn't met the helper yet" + see)
         self.assertEqual(w("h", 255, "u@h: Permission denied (publickey).\n"),
@@ -2069,7 +2069,7 @@ class SetupStatus(unittest.TestCase):
             "wired": (True, "over Ethernet (en7)", ""),
             "worker": (True, "installed", ""),
             "x265": (True, f"x265 {X265_TOKEN}, the same as this Mac", ""),
-            "helper": (True, "ready - waiting for the next segment", "")})
+            "helper": (True, "ready · waiting for the next segment", "")})
         self.assertEqual((out["mac_x265"], out["helper_x265"]), (X265_TOKEN, X265_TOKEN))
         # the first contact told the remux the helper's own wired address
         self.assertEqual(helper._known_ipv4(("helper.local", "user", self.key)), ["192.0.2.20"])
@@ -2092,7 +2092,7 @@ class SetupStatus(unittest.TestCase):
         os.remove(self.key)
         os.remove(self.key + ".pub")
         out, c = self.check()
-        self.assertEqual((c["login"]["ok"], c["login"]["detail"]), (False, "no SSH key yet - Create key"))
+        self.assertEqual((c["login"]["ok"], c["login"]["detail"]), (False, "no SSH key yet · Create key makes one"))
         self.assertEqual((out["key_exists"], out["pubkey"]), (False, ""))
         self.assertEqual(self.sshs(), [])                    # no ssh without a key
         self.assertTrue(c["wired"]["ok"])                     # the route is judged anyway
@@ -2120,13 +2120,13 @@ class SetupStatus(unittest.TestCase):
         self.assertTrue(c["helper"]["detail"].startswith("not connected"))
 
     def test_an_older_worker_and_other_x265_builds(self):
-        cases = [(dict(sha256="0" * 64), "worker", (False, "an older worker - Install updates it",
+        cases = [(dict(sha256="0" * 64), "worker", (False, "an older worker · Install updates it",
                                                     "helper_worker")),
-                 (dict(sha256=None), "worker", (False, "an older worker - Install updates it",
+                 (dict(sha256=None), "worker", (False, "an older worker · Install updates it",
                                                 "helper_worker")),
                  (dict(x265=""), "x265", (False, "not built yet", "helper_x265")),
                  (dict(x265="4.3"), "x265", (False, f"x265 4.3 on the helper, {X265_TOKEN} on this "
-                                                    f"Mac - Build replaces it", "helper_x265"))]
+                                                    f"Mac · Build replaces it", "helper_x265"))]
         for fields, cid, want in cases:
             helper.reset_state()
             st = dict(self.status, **fields)
@@ -2144,7 +2144,7 @@ class SetupStatus(unittest.TestCase):
         fake = self.ready_probe()
         self.fields["helper_enabled"] = False
         _out, c = self.check()
-        self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]), (None, "off - switched off"))
+        self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]), (None, "off · switched off"))
         self.assertTrue(c["login"]["ok"])                      # Setup works before the switch
         self.assertEqual(fake.calls, 0)
 
@@ -2152,7 +2152,7 @@ class SetupStatus(unittest.TestCase):
         self.ready_probe().answer = (False, "game running: Test Game", "game")
         _out, c = self.check()
         self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]),
-                         (False, "paused - a game is running on it"))
+                         (False, "paused · a game is running on it"))
 
     def test_the_wired_words(self):
         self.ready_probe()
@@ -2160,7 +2160,7 @@ class SetupStatus(unittest.TestCase):
         _out, c = self.check(route_out=ROUTE_EN0, ifconfig_out=no_cable,
                              ssh=(0, json.dumps(dict(self.status, ipv4=[])) + "\n", ""))
         self.assertEqual((c["wired"]["ok"], c["wired"]["detail"]),
-                         (False, "the Mac reaches it over Wi-Fi - plug both into Ethernet"))
+                         (False, "the Mac reaches it over Wi-Fi · plug both into Ethernet"))
         helper.reset_state()
         _out, c = self.check(route_out="", ifconfig_out="",
                              ssh=(0, json.dumps(dict(self.status, ipv4=[])) + "\n", ""))
@@ -2310,9 +2310,9 @@ class SetupJobArgv(unittest.TestCase):
 
     def test_the_remote_jobs_refuse_in_plain_words(self):
         cases = [({"helper_host": ""}, "isn't set up yet"), ({"helper_user": ""}, "isn't set up yet"),
-                 ({"helper_host": "a;b"}, "settings: bad host - fix it first"),
-                 ({"helper_user": "-oProxyCommand=x"}, "settings: bad user - fix it first"),
-                 ({}, "no SSH key yet - Create key first")]
+                 ({"helper_host": "a;b"}, "settings: bad host · fix it first"),
+                 ({"helper_user": "-oProxyCommand=x"}, "settings: bad user · fix it first"),
+                 ({}, "no SSH key yet · Create key makes one first")]
         for what in ("helper_worker", "helper_x265"):
             for fields, want in cases:
                 f = {"helper_host": "helper.local", "helper_user": "user", "helper_key": self.key}

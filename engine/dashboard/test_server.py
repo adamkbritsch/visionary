@@ -1316,7 +1316,7 @@ class HelperSetupEndpoints(unittest.TestCase):
 
     def test_a_refusal_is_plain_words_and_starts_nothing(self):
         import helper, setup_jobs
-        why = "no SSH key yet - Create key first"
+        why = "no SSH key yet · Create key makes one first"
         with mock.patch.object(helper, "setup_job_argv", return_value=(None, why)), \
              mock.patch.object(setup_jobs, "start") as start:
             sent = self._install("helper_worker")
