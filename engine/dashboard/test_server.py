@@ -1397,6 +1397,37 @@ class HelperStatusInState(unittest.TestCase):
         st = self._state(self._fake_helper(status_summary=lambda: "ready"))
         self.assertNotIn("helper", st)
 
+    def test_the_helper_fields_are_always_text(self):
+        # H-UI-3: the app decodes helper_host / helper_user / helper_key as text, so one other
+        # type would cost it the WHOLE state: the state, GET /api/settings and the POST's answer
+        # carry strings for them, and a POST of another type is not saved
+        import json
+        import os
+        import settings
+        path = settings.SETTINGS_FILE
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with open(path, "w") as f:
+            json.dump({"helper_host": 5, "helper_user": None, "helper_key": ["k"]}, f)
+        fields = ("helper_host", "helper_user", "helper_key")
+        st = self._state(self._fake_helper(status_summary=lambda: dict(self.SUMMARY)))
+        self.assertEqual({k: st["settings"][k] for k in fields}, dict.fromkeys(fields, ""))
+        sent = {}
+        h = _req("127.0.0.1", path="/api/settings")
+        h._json = lambda out, code=200: sent.update(out=out, code=code)
+        h.do_GET()
+        self.assertEqual({k: sent["out"]["settings"][k] for k in fields}, dict.fromkeys(fields, ""))
+        with mock.patch.object(settings, "_log") as log:
+            out, code = server.api_save_settings({"helper_host": 192, "helper_user": "deck"})
+        self.assertEqual(code, 200)
+        self.assertEqual((out["settings"]["helper_host"], out["settings"]["helper_user"]),
+                         ("", "deck"))
+        self.assertTrue(log.called)
+        with open(path) as f:
+            saved = json.load(f)
+        self.assertEqual({k: saved[k] for k in fields},
+                         {"helper_host": "", "helper_user": "deck", "helper_key": ""})
+        json.dumps(st["settings"], allow_nan=False)
+
     def test_the_lanes_helper_layout_reaches_the_served_json(self):
         # The orchestrator's lane keys (orchestrator.HELPER_LANE_KEYS, carried by both
         # _set_finishing*_progress setters) pass through /api/state untouched, as strict JSON.

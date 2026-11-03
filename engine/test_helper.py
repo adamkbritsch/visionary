@@ -580,6 +580,56 @@ class LocalX265(unittest.TestCase):
         helper.local_x265_version(run=lambda cmd, timeout: seen.append(cmd) or (0, "", X265_VERSION_OUT))
         self.assertEqual(seen, [[dvcap.X265, "--version"]])
 
+    def _fake_x265(self, path, version):
+        """A real program at `path` that logs `version` on stderr like x265 --version."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".new"
+        with open(tmp, "w") as f:
+            f.write(f"#!/bin/sh\necho 'x265 [info]: HEVC encoder version {version}' >&2\n")
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
+
+    def test_a_replaced_binary_is_read_again(self):
+        # F1: the engine outlives a `brew upgrade` — the next check must see the new build, or
+        # the helper keeps encoding with the old one beside the Mac's new one
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        calls = []
+
+        def run(cmd, timeout):
+            calls.append(cmd)
+            return helper._run(cmd, timeout)
+        cellar = os.path.join(td, "Cellar", "x265")
+        x265 = os.path.join(td, "bin", "x265")             # Homebrew's symlink into the Cellar
+        self._fake_x265(os.path.join(cellar, "4.1", "x265"), "4.1+1-1d117be")
+        os.makedirs(os.path.dirname(x265))
+        os.symlink(os.path.join(cellar, "4.1", "x265"), x265)
+        self.assertEqual(helper.local_x265_version(x265, run=run), "4.1+1-1d117be")
+        self.assertEqual(helper.local_x265_version(x265, run=run), "4.1+1-1d117be")
+        self.assertEqual(len(calls), 1)                        # the same file: one stat, no run
+        # brew upgrade: bin/x265 now leads into a new Cellar folder
+        self._fake_x265(os.path.join(cellar, "4.2", "x265"), "4.2+0-abcdef1")
+        os.remove(x265)
+        os.symlink(os.path.join(cellar, "4.2", "x265"), x265)
+        self.assertEqual(helper.local_x265_version(x265, run=run), "4.2+0-abcdef1")
+        self.assertEqual(len(calls), 2)
+        # a rebuild in place: the same path, a new file
+        self._fake_x265(os.path.join(cellar, "4.2", "x265"), "4.2+1-0123456")
+        self.assertEqual(helper.local_x265_version(x265, run=run), "4.2+1-0123456")
+        self.assertEqual(helper.local_x265_version(x265, run=run), "4.2+1-0123456")
+        self.assertEqual(len(calls), 3)
+
+    def test_the_gate_refuses_a_helper_left_on_the_old_build(self):
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        x265 = os.path.join(td, "x265")
+        self._fake_x265(x265, "4.1+1-1d117be")
+        h = helper.Helper("h", "u", "/k", local_x265=lambda: helper.local_x265_version(x265))
+        theirs = {"version": 1, "ok": True, "x265": "4.1+1-1d117be"}
+        self.assertEqual(h._judge(theirs), (True, "ready", "ready"))
+        self._fake_x265(x265, "4.2+0-abcdef1")
+        self.assertEqual(h._judge(theirs)[2], "mismatch")
+
 
 # ---- status / availability -----------------------------------------------------------------
 
@@ -1729,10 +1779,66 @@ class HelperSettings(unittest.TestCase):
 
     def test_key_is_a_path_string(self):
         ok = settings.helper_field_ok
-        self.assertTrue(ok("helper_key", "~/.ssh/k"))
-        for bad in ("", None, "-i", "a\nb", " ~/.ssh/k", 3):
+        for good in ("~/.ssh/k", "/Users/me/.ssh/k", "~/My Keys/id"):
+            self.assertTrue(ok("helper_key", good), good)
+        for bad in ("", None, "-i", "a\nb", " ~/.ssh/k", 3, "/k\0", "~/k\r"):
             self.assertFalse(ok("helper_key", bad), bad)
+        # F3: only a full path — a bare name would resolve against the engine's folder, inside
+        # the app bundle, not ~/.ssh
+        for rel in ("id_ed25519", "./id", ".ssh/id", "../id", "~", "~id", "~user/.ssh/id"):
+            self.assertFalse(ok("helper_key", rel), rel)
         self.assertFalse(ok("helper_port", "22"))           # not a helper field at all
+
+    def test_a_relative_key_is_saved_as_typed_and_reported(self):
+        s, again = self._saved({"helper_key": "id_ed25519"})
+        self.assertEqual((s["helper_key"], again["helper_key"]), ("id_ed25519", "id_ed25519"))
+        logged = []
+        with mock.patch.object(helper, "_log", side_effect=logged.append), \
+                mock.patch.object(settings, "get_settings",
+                                  return_value={"helper_enabled": True, "helper_host": "box",
+                                                "helper_user": "deck", "helper_key": "id_ed25519"}):
+            self.assertIsNone(helper.for_remux())
+        self.assertIn("helper_key='id_ed25519'", logged[0])
+
+    def test_set_settings_never_stores_a_non_string_helper_field(self):
+        # H-UI-3: the app decodes these three as text — a number, a list or a null POSTed to
+        # /api/settings is ignored (the saved value stays) and logged once
+        logged = []
+        settings._LOGGED.clear()
+        self.addCleanup(settings._LOGGED.clear)
+        before = {"helper_host": "box", "helper_user": "deck", "helper_key": "~/.ssh/k"}
+        with mock.patch.object(settings, "_log", side_effect=logged.append):
+            s, again = self._saved({"helper_host": 192, "helper_user": ["x"], "helper_key": None,
+                                    "plex_throttle": False}, before=before)
+            s2, _ = self._saved({"helper_host": 5}, before=before)
+        for got in (s, again, s2):
+            self.assertEqual({k: got[k] for k in before}, before)
+        self.assertIs(s["plex_throttle"], False)           # the rest of the save still lands
+        self.assertEqual(len(logged), 3)                   # once per key, not per save
+        for k in before:
+            self.assertIn(f"Settings: {k} not saved · it must be text, so the saved value stays",
+                          logged)
+        self.assertNotIn("192", " ".join(logged))
+        s, _ = self._saved({"helper_host": "a b"}, before=before)
+        self.assertEqual(s["helper_host"], "a b")           # a malformed STRING is still kept
+
+    def test_get_settings_gives_text_for_a_hand_edited_non_string(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "settings.json")
+        with open(path, "w") as f:
+            json.dump({"helper_host": 5, "helper_user": None, "helper_key": ["k"],
+                       "helper_enabled": True}, f)
+        with mock.patch.multiple(settings, CONFIG_DIR=d, SETTINGS_FILE=path):
+            got = settings.get_settings()
+            self.assertEqual((got["helper_host"], got["helper_user"], got["helper_key"]), ("", "", ""))
+            self.assertIs(got["helper_enabled"], True)
+            self.assertFalse(settings.helper_set_up(got))   # reads "not set up"
+            with open(path, "w") as f:
+                json.dump({"helper_host": "box"}, f)
+            got = settings.get_settings()
+            self.assertEqual((got["helper_host"], got["helper_key"]),
+                             ("box", "~/.ssh/id_ed25519_visionary_helper"))
 
     def _saved(self, updates, before=None):
         d = tempfile.mkdtemp()
@@ -1860,6 +1966,12 @@ class SshFailureWords(unittest.TestCase):
         kind, detail, _a = helper.ssh_failure(255, err, "h", "~/.ssh/k")
         self.assertEqual(kind, "key_perms")
         self.assertIn("chmod 600 ~/.ssh/k", detail)
+        # F4: a path that needs quoting is ONE shell word, its ~ expanded (as authorize_command)
+        import shlex
+        for key in ("~/My Keys/id", "~/Adam's keys/id", "/k/a;b", "/k/$(id)"):
+            _k, detail, _a = helper.ssh_failure(255, err, "h", key)
+            cmd = detail.split("make it private: ", 1)[1]
+            self.assertEqual(shlex.split(cmd), ["chmod", "600", os.path.expanduser(key)], key)
 
     def test_the_tooltip_words(self):
         w = helper._no_answer_why
@@ -1947,8 +2059,55 @@ class WiredAddressPreference(FakeRemoteCase):
         self.assertFalse(ok)
         self.assertIn("not one of the helper's wired addresses", why)
         self.assertIsNone(h.argv("status"))
-        self.assertEqual(h.availability()[2], "not_wired")
         self.assertEqual(self.calls(), [])           # nothing was sent there
+        # availability() forgets a list whose route check fails (F2) and starts from the name, as
+        # at first contact: one status probe, which lists the wired address again — and the
+        # resolved one is still refused
+        self.set_status(ipv4=[self.WIRED_IP])
+        self.assertEqual(h.availability()[2], "not_wired")
+        self.assertEqual([c["verb"] for c in self.calls()], ["status"])
+        self.assertEqual(helper._known_ipv4(h._id), [self.WIRED_IP])
+        self.assertIsNone(h.argv("status"))
+
+    def test_a_stale_list_that_routes_over_wifi_is_learned_again(self):
+        # F2: the LAN was renumbered while the engine ran — the remembered address is on no
+        # cable's subnet now, so it routes over Wi-Fi, and no probe would ever replace it
+        old, new = "192.168.1.50", "10.0.0.50"
+        seen = []
+
+        def route_ok(host, prefer=None):
+            seen.append(list(prefer) if prefer else None)
+            ip = prefer[0] if prefer else new         # the name resolves on the cable's subnet
+            if ip == old:
+                return False, f"the route to {host} is Wi-Fi (en0)", ip, "en0", "wifi"
+            return True, f"wired via en7 ({ip})", ip, "en7", "wired"
+        self.set_status(ipv4=[new])
+        h = self.helper(route_ok=route_ok)
+        helper._WIRED_IPS[h._id] = [old]
+        self.assertEqual(h.available(), (True, "ready"))
+        self.assertEqual(seen, [[old], None])
+        self.assertEqual(h._route, (new, "en7"))
+        self.assertEqual(helper._known_ipv4(h._id), [new])
+        helper._AVAIL.clear()
+        self.assertEqual(h.available(), (True, "ready"))
+        self.assertEqual(seen[-1], [new])             # the new list from here on
+
+    def test_a_failed_route_by_name_too_sends_nothing(self):
+        # the cable is out: the list's route fails, and so does the name's — no probe at all
+        seen = []
+
+        def route_ok(host, prefer=None):
+            seen.append(list(prefer) if prefer else None)
+            ip = prefer[0] if prefer else self.WIFI_IP
+            return False, f"the route to {host} is Wi-Fi (en0)", ip, "en0", "wifi"
+        h = self.helper(route_ok=route_ok)
+        helper._WIRED_IPS[h._id] = [self.WIRED_IP]
+        self.assertEqual(h.availability()[2], "wifi")
+        self.assertEqual(seen, [[self.WIRED_IP], None])
+        self.assertEqual(self.calls(), [])
+        self.assertIsNone(h.argv("status"))
+        h.availability()                              # no list left: the name only, once
+        self.assertEqual(seen[2:], [None])
 
     def test_an_empty_list_or_an_older_vworker_keeps_the_resolved_address(self):
         for fields in ({"ipv4": []}, {}):
@@ -2039,7 +2198,8 @@ class SetupStatus(unittest.TestCase):
         self.assertEqual(set(out), {"configured", "host", "user", "key", "key_exists", "pubkey",
                                     "authorize_cmd", "mac_x265", "helper_x265", "checks",
                                     "checked_at"})
-        self.assertEqual([c["id"] for c in out["checks"]], ["login", "wired", "worker", "x265", "helper"])
+        self.assertEqual([c["id"] for c in out["checks"]],
+                         ["login", "wired", "worker", "x265", "sleep", "helper"])
         for c in out["checks"]:
             self.assertEqual(set(c), {"id", "ok", "detail", "action"})
         self.assertEqual((out["host"], out["user"], out["key"]), ("helper.local", "user", self.key))
@@ -2069,6 +2229,7 @@ class SetupStatus(unittest.TestCase):
             "wired": (True, "over Ethernet (en7)", ""),
             "worker": (True, "installed", ""),
             "x265": (True, f"x265 {X265_TOKEN}, the same as this Mac", ""),
+            "sleep": (None, "", ""),                      # this worker sends no sleep_block
             "helper": (True, "ready · waiting for the next segment", "")})
         self.assertEqual((out["mac_x265"], out["helper_x265"]), (X265_TOKEN, X265_TOKEN))
         # the first contact told the remux the helper's own wired address
@@ -2085,7 +2246,8 @@ class SetupStatus(unittest.TestCase):
             self.assertFalse(out["configured"], fields)
             self.assertEqual(out["authorize_cmd"], "")
             self.assertEqual([(c["id"], c["ok"]) for c in out["checks"]],
-                             [(i, None) for i in ("login", "wired", "worker", "x265", "helper")])
+                             [(i, None) for i in ("login", "wired", "worker", "x265", "sleep",
+                                                  "helper")])
             self.assertEqual(out["checks"][0]["detail"], want)
 
     def test_no_key_yet(self):
@@ -2096,7 +2258,7 @@ class SetupStatus(unittest.TestCase):
         self.assertEqual((out["key_exists"], out["pubkey"]), (False, ""))
         self.assertEqual(self.sshs(), [])                    # no ssh without a key
         self.assertTrue(c["wired"]["ok"])                     # the route is judged anyway
-        for k in ("worker", "x265", "helper"):
+        for k in ("worker", "x265", "sleep", "helper"):
             self.assertIsNone(c[k]["ok"], k)
 
     def test_login_failures_in_plain_words(self):
@@ -2105,8 +2267,9 @@ class SetupStatus(unittest.TestCase):
             _out, c = self.check(ssh=(rc, "", err))
             self.assertEqual((c["login"]["ok"], c["login"]["detail"], c["login"]["action"]),
                              (False, detail, action), err)
-            for k in ("worker", "x265", "helper"):
+            for k in ("worker", "x265", "sleep", "helper"):
                 self.assertIsNone(c[k]["ok"], (k, err))
+            self.assertEqual(c["sleep"]["detail"], "")
 
     def test_logged_in_without_a_worker(self):
         out, c = self.check(ssh=(127, "", "bash: line 1: /home/user/visionary-worker/bin/vworker: "
@@ -2115,6 +2278,7 @@ class SetupStatus(unittest.TestCase):
         self.assertEqual((c["worker"]["ok"], c["worker"]["detail"], c["worker"]["action"]),
                          (False, "not installed", "helper_worker"))
         self.assertEqual((c["x265"]["ok"], c["x265"]["detail"]), (None, "install the worker first"))
+        self.assertEqual((c["sleep"]["ok"], c["sleep"]["detail"]), (None, ""))
         self.assertEqual(out["helper_x265"], "")
         self.assertFalse(c["helper"]["ok"])                    # the refresher's refusing fake
         self.assertTrue(c["helper"]["detail"].startswith("not connected"))
@@ -2133,6 +2297,37 @@ class SetupStatus(unittest.TestCase):
             out, c = self.check(ssh=(0, json.dumps(st) + "\n", ""))
             self.assertEqual((c[cid]["ok"], c[cid]["detail"], c[cid]["action"]), want, fields)
         self.assertEqual(out["helper_x265"], "4.3")
+
+    def test_the_sleep_words(self):
+        # K2: the worker's systemd-inhibit probe — never a failure, so never in Ready's way
+        self.ready_probe()
+        cases = [(True, (True, "it stays awake while it encodes", "")),
+                 (False, (None, "it can't keep itself awake over ssh · turn off automatic sleep "
+                                "while it's plugged in", "")),
+                 (None, (None, "", "")),                 # no systemd-inhibit there
+                 ("yes", (None, "", "")),                # junk is unknown, not a yes
+                 (1, (None, "", ""))]
+        for v, want in cases:
+            helper.reset_state()
+            _out, c = self.check(ssh=(0, json.dumps(dict(self.status, sleep_block=v)) + "\n", ""))
+            self.assertEqual((c["sleep"]["ok"], c["sleep"]["detail"], c["sleep"]["action"]), want, v)
+            self.assertTrue(c["helper"]["ok"], v)        # the rest is untouched
+            self.assertNotIn(False, [x["ok"] for x in _out["checks"]], v)
+        helper.reset_state()                             # an older worker: no field at all
+        _out, c = self.check(ssh=(0, json.dumps(dict(self.status, sha256="0" * 64)) + "\n", ""))
+        self.assertEqual((c["sleep"]["ok"], c["sleep"]["detail"], c["sleep"]["action"]),
+                         (None, "", ""))
+        self.assertEqual(helper._sleep_check(None), {"id": "sleep", "ok": None, "detail": "",
+                                                     "action": ""})
+
+    def test_a_relative_key_is_a_bad_key(self):
+        # F3: a bare name would resolve inside the app bundle — reported, never run
+        self.fields["helper_key"] = "id_ed25519"
+        out = helper.setup_status(True, run=lambda cmd, t: self.fail(cmd), local_x265=lambda: "")
+        self.assertFalse(out["configured"])
+        self.assertEqual(out["key"], "id_ed25519")             # shown as saved
+        self.assertFalse(out["key_exists"])
+        self.assertEqual(out["checks"][0]["detail"], "settings: bad key")
 
     def test_no_x265_on_this_mac(self):
         out, c = self.check(mac="")
@@ -2216,7 +2411,9 @@ class SetupStatus(unittest.TestCase):
             self.patches[0].start()
         self.assertFalse(out["configured"])
         self.assertEqual(out["checked_at"], 0)
-        self.assertEqual([c["ok"] for c in out["checks"]], [None] * 5)
+        self.assertEqual([c["id"] for c in out["checks"]], ["login", "wired", "worker", "x265",
+                                                           "sleep", "helper"])
+        self.assertEqual([c["ok"] for c in out["checks"]], [None] * 6)
         self.assertIn("unreadable", out["checks"][0]["detail"])
 
     def test_the_worker_sha_is_this_apps_own_file(self):
@@ -2279,7 +2476,7 @@ class SetupJobArgv(unittest.TestCase):
         self.make_key()
         argv, why = helper.setup_job_argv("helper_key")
         self.assertIsNone(argv)
-        self.assertIn("already exists", why)
+        self.assertEqual(why, f"{self.key} already exists · Visionary never replaces a key")
         os.remove(self.key)
         with open(self.key + ".pub", "w") as f:                # a lone .pub counts too
             f.write("ssh-ed25519 x\n")
@@ -2288,7 +2485,7 @@ class SetupJobArgv(unittest.TestCase):
     def test_a_key_needs_no_host_but_a_usable_path(self):
         self.fields.update(helper_host="", helper_user="")
         self.assertIsNotNone(helper.setup_job_argv("helper_key")[0])
-        for bad in ("-i", "", "a\nb"):
+        for bad in ("-i", "", "a\nb", "id_ed25519", "./id", ".ssh/id", "~id", "~user/id"):
             self.fields["helper_key"] = bad
             argv, why = helper.setup_job_argv("helper_key")
             self.assertIsNone(argv, bad)
@@ -2331,7 +2528,8 @@ class SetupJobArgv(unittest.TestCase):
         self.assertEqual(argv, [
             "/bin/bash", "-c",
             'exec /usr/bin/ssh -i "$1" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 '
-            '-o ServerAliveInterval=15 -- "$2@$3" "bash -s -- --version $5" < "$4"',
+            '-o ServerAliveInterval=15 -o ControlMaster=no -o ControlPath=none -o ProxyJump=none '
+            '-o RequestTTY=no -- "$2@$3" "bash -s -- --version $5" < "$4"',
             "_", self.key, "user", "helper.local", script, "4.1+1-1d117be"])
         for tag in ("4.3", "4.1+1-1d117be", "3.5+20-f0c1022b6"):
             self.assertTrue(helper.X265_TOKEN_RE.fullmatch(tag), tag)
@@ -2361,8 +2559,15 @@ class SetupJobArgv(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         got = json.loads(r.stdout)
         self.assertEqual(got["argv"], ["-i", self.key, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
-                                       "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15", "--",
+                                       "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
+                                       "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                                       "-o", "ProxyJump=none", "-o", "RequestTTY=no", "--",
                                        "user@helper.local", "bash -s -- --version 4.1+1-1d117be"])
+        # the same overrides as Setup's login probe: nothing from ~/.ssh/config can force a tty
+        login = helper.login_argv("h", "u", "/k")
+        for opt in ("ControlMaster=no", "ControlPath=none", "ProxyJump=none", "RequestTTY=no"):
+            self.assertIn(opt, login)
+            self.assertIn(opt, got["argv"])
         with open(argv[-2], "rb") as f:
             self.assertEqual(got["stdin_sha"], hashlib.sha256(f.read()).hexdigest())
 

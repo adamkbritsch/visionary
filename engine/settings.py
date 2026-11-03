@@ -243,7 +243,13 @@ def _save(path: str, data) -> None:
 # ---- global settings ------------------------------------------------------
 
 def get_settings() -> dict:
-    return _load(SETTINGS_FILE, DEFAULT_SETTINGS)
+    s = _load(SETTINGS_FILE, DEFAULT_SETTINGS)
+    # the helper's three fields are always TEXT here: the app decodes the whole state around
+    # them, so a hand-edited 5 or null reads "" (not set up) instead of costing it everything
+    for k in HELPER_FIELDS:
+        if not isinstance(s.get(k), str):
+            s[k] = ""
+    return s
 
 
 def _clamp(v, lo, hi, default):
@@ -313,8 +319,9 @@ def _helper_name_ok(v) -> bool:
 
 
 def _helper_key_ok(v) -> bool:
-    """A path string: one line, no NUL, not an option."""
-    return (isinstance(v, str) and bool(v) and v.strip() == v and not v.startswith("-")
+    """A full path string: one line, no NUL, absolute or under "~/" (so never an option). A bare
+    name would resolve against the engine's own folder, inside the app bundle — not ~/.ssh."""
+    return (isinstance(v, str) and v.strip() == v and v.startswith(("/", "~/"))
             and not any(c in v for c in "\0\n\r"))
 
 
@@ -322,7 +329,8 @@ def _helper_key_ok(v) -> bool:
 # SAVED AS TYPED — never silently swapped for a default, which would quietly ssh somewhere else.
 # helper.for_remux() / helper.status_summary() judge them at use time and report the helper off,
 # "settings: bad host" (etc.), until the value is fixed — or "not set up" while the host or the
-# user is still empty (helper_set_up). key -> (short name, check).
+# user is still empty (helper_set_up). Only TEXT is saved: set_settings ignores a number, a list
+# or a null for them (the app could not decode the state around it). key -> (short name, check).
 HELPER_FIELDS = {"helper_host": ("host", _helper_name_ok),
                  "helper_user": ("user", _helper_name_ok),
                  "helper_key": ("key", _helper_key_ok)}
@@ -345,10 +353,28 @@ VALIDATORS = {"nas_network": _valid_nas_network,
               "helper_enabled": _valid_helper_enabled}
 
 
+_LOGGED: set = set()             # set_settings' messages already logged (once each, per process)
+
+
+def _log(msg: str) -> None:
+    try:
+        import logbook
+        logbook.event(msg)
+    except Exception:  # noqa: BLE001 — logging never fails a save
+        pass
+
+
 def set_settings(updates: dict) -> dict:
     with _WRITE_LOCK:                    # atomic read-modify-write (see _WRITE_LOCK)
         s = get_settings()
         for k, v in (updates or {}).items():
+            if k in HELPER_FIELDS and not isinstance(v, str):
+                # never stored: the saved value stays (a malformed STRING is still saved as typed)
+                msg = f"Settings: {k} not saved · it must be text, so the saved value stays"
+                if msg not in _LOGGED:
+                    _LOGGED.add(msg)
+                    _log(msg)
+                continue
             if k in DEFAULT_SETTINGS:
                 s[k] = v
         for k in LIMITS:                 # one table, applied on write and on read (tunable)
