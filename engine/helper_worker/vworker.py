@@ -12,7 +12,9 @@ Wire protocol v1 (the Mac half lives in engine/helper.py):
                                    "x265" is the full version token (e.g. "4.1+1-1d117be");
                                    "code" is the reason as one word (REASON_CODES) next to "why";
                                    "sha256" is this script's own sha256 (the Mac compares it with
-                                   its copy); "ipv4" lists the IPv4 addresses on the wired links
+                                   its copy); "ipv4" lists the IPv4 addresses on the wired links;
+                                   "sleep_block" says whether this session may hold off sleep
+                                   (true / false, null without systemd-inhibit)
     vworker put <job> <name> <bytes>
                                    exactly <bytes> of stdin -> jobs/<job>/<name> (the RPU slice,
                                    "rpu.bin"); a short or long read, SIGHUP/SIGTERM/SIGINT, or
@@ -42,21 +44,25 @@ a heavy CPU/GPU reading alone is re-sampled (HEAVY_SAMPLES in all, ~1 s each) an
 when every sample is heavy; a game, battery, no Ethernet, another job or low disk refuse at once.
 While encoding, a watchdog checks every 2 s and stops at once -- killing zstd and x265 and
 deleting the job dir -- when a game starts, when any other app uses a real share of CPU
-(> 1.5 cores) or GPU (> 30 %) for 10 s, when the machine leaves mains power or Ethernet, or when
-the Mac goes away (parent gone, stdout broken, input truncated, no data for STALL_SECS). Ordinary apps (browser, file manager, Steam's own
-menus) are below those thresholds and do not stop it. A Steam launch is a game when its AppId
-is a real Steam app (< 2^31) or Wine/Proton runs under it; a non-Steam shortcut (AppId >= 2^31)
-running a native Linux program (Firefox, Dolphin, ...) is judged by the CPU/GPU rule only.
-The GPU share is counted per process and leaves out the desktop's own drawing (compositor,
-Xwayland, shell) and the Steam client (GPU_EXCLUDED_NAMES): an idle desktop alone can keep a
-GPU 30-40 % busy. Where no per-process reading exists, the whole-device one stands in.
+(> 1.5 cores) or GPU (> 30 %) for 10 s, when the machine leaves mains power or Ethernet, when
+the stream turns out to arrive over its Wi-Fi (WifiStream), or when the Mac goes away (parent
+gone, stdout broken, input truncated, no data for STALL_SECS). Ordinary apps (browser, file
+manager, Steam's own menus) are below those thresholds and do not stop it. A Steam launch is a
+game when its AppId is a real Steam app (< 2^31) or Wine/Proton runs under it; a non-Steam
+shortcut (AppId >= 2^31) running a native Linux program (Firefox, Dolphin, ...) is judged by the
+CPU/GPU rule only. The GPU share is counted per process (nvidia-smi pmon, or DRM fdinfo: engine
+time, or Intel xe's busy cycles) and leaves out the desktop's own drawing (compositor, Xwayland,
+shell) and the Steam client (GPU_EXCLUDED_NAMES): an idle desktop alone can keep a GPU 30-40 %
+busy. Where no per-process reading exists, the whole-device one stands in (amdgpu's
+gpu_busy_percent, nvidia-smi); nouveau has neither, so the GPU rule has no reading there.
 On mains: a Mains supply online, or no system battery at all (a desktop, a mini PC, a VM); a
 laptop or handheld on battery is refused. Ethernet: any wired link that is up, told by /sys and
 not by its name (eth0, eno1, enp*, enx*, or a bridge or bond over one).
 zstd and x265 run under SCHED_IDLE (nice 19 where that is unavailable): most desktop distros
-turn sched_autogroup on, so nice alone would not let the desktop win. While they run, a logind
-sleep/idle block is held (systemd-inhibit, where it exists) so an idle helper does not suspend
-mid-segment.
+turn sched_autogroup on, so nice alone would not let the desktop win. While they run, logind
+sleep and idle blocks are asked for (systemd-inhibit, where it exists). polkit decides: over ssh
+a stock setup usually refuses the sleep block (no seat, no agent), and then an idle helper on
+automatic suspend can still sleep mid-segment. Status reports which it is as "sleep_block".
 
 Stdlib only. Runs on Python 3.8 or newer (no annotations, nothing newer from the stdlib; the
 Mac's tests run it too). Paths and timings can be overridden through VWORKER_* environment
@@ -112,9 +118,18 @@ PF_KTHREAD = 0x00200000
 
 # where zstd lives when it is not on the login shell's PATH (the first is named when missing)
 ZSTD_PATHS = ("/usr/bin/zstd", "/usr/local/bin/zstd")
-# held while an encode runs: logind then blocks suspend and the idle action until it exits
-INHIBIT_ARGS = ["--what=sleep:idle", "--who=visionary-helper", "--why=encoding a segment",
+# held while an encode runs: logind then blocks suspend (and, beside it, the idle action) until
+# they exit. Two blocks, not one "sleep:idle": polkit judges each kind on its own (older logind
+# checked a combined mask as the lid-switch action), and over ssh it often allows idle, not sleep
+INHIBIT_ARGS = ["--what=sleep", "--who=visionary-helper", "--why=encoding a segment",
                 "--mode=block", "sleep", "infinity"]
+IDLE_INHIBIT_ARGS = ["--what=idle", "--who=visionary-helper", "--why=encoding a segment",
+                     "--mode=block", "sleep", "infinity"]
+# status's probe: may this session take the sleep block? (taken and let go at once by `true`)
+SLEEP_PROBE_ARGS = ["--what=sleep", "--mode=block", "--who=visionary-helper", "--why=probe",
+                    "true"]
+SLEEP_PROBE_TIMEOUT = 1.0
+SLEEP_PROBE_TTL = 60.0                 # one probe a minute per process (an encode asks 1-3 times)
 
 # processes that are never a game even if their arguments look like one
 NOT_GAMES = {"steam", "steamwebhelper"}
@@ -131,11 +146,16 @@ GAME_LAUNCHERS = {"legendary", "gogdl", "nile"}
 _WIN_PATH = re.compile(r"[A-Za-z]:\\")
 _APPID = re.compile(r"AppId=(\d+)")
 
-# the desktop's own drawing: compositors, shells and X servers keep a GPU busy on an idle
-# desktop, so their GPU use (and the Steam client's) is never "anything heavy"
-DESKTOP_PROCESS_NAMES = {"kwin_wayland", "kwin_x11", "Xwayland", "Xorg", "X", "gnome-shell",
-                         "mutter", "plasmashell", "xwaylandvideobridge", "sway", "Hyprland",
-                         "weston", "labwc", "wayfire", "gamescope", "gamescope-wl"}
+# the desktop's own drawing: compositors, window managers, shells and X servers keep a GPU busy
+# on an idle desktop, so their GPU use (and the Steam client's) is never "anything heavy".
+# Cinnamon composites in its `cinnamon` process (muffin), COSMIC in cosmic-comp, Pantheon in
+# gala; a name over 15 characters is also matched as the kernel cuts it (_GPU_EXCLUDED_CUT)
+DESKTOP_PROCESS_NAMES = {"kwin_wayland", "kwin_x11", "kwin", "Xwayland", "Xorg", "X",
+                         "gnome-shell", "mutter", "mutter-x11-frames", "plasmashell",
+                         "xwaylandvideobridge", "sway", "Hyprland", "weston", "labwc", "wayfire",
+                         "gamescope", "gamescope-wl", "cinnamon", "muffin", "cosmic-comp", "gala",
+                         "budgie-wm", "xfwm4", "picom", "compton", "marco", "metacity",
+                         "openbox", "compiz", "enlightenment", "niri", "river"}
 GPU_EXCLUDED_NAMES = DESKTOP_PROCESS_NAMES | NOT_GAMES
 _COMM_LEN = 15                         # the kernel cuts /proc/<pid>/comm to 15 characters
 _GPU_EXCLUDED_CUT = {n[:_COMM_LEN] for n in GPU_EXCLUDED_NAMES if len(n) > _COMM_LEN}
@@ -173,6 +193,48 @@ def find_inhibit(path=None):
     if found:
         return found
     return "/usr/bin/systemd-inhibit" if _executable("/usr/bin/systemd-inhibit") else ""
+
+
+_SLEEP_PROBE = {}                      # systemd-inhibit path -> (monotonic time, answer)
+
+
+def sleep_block(inhibit, clock=time.monotonic):
+    """May this session hold off sleep? Runs `systemd-inhibit --what=sleep --mode=block ...
+    true` (SLEEP_PROBE_ARGS; stdin, stdout and stderr on /dev/null, so polkit has no agent to
+    ask, as in an encode) -> True when it exits 0, False when it fails or takes longer than
+    SLEEP_PROBE_TIMEOUT (polkit said no: over ssh a stock setup has no seat to allow it), None
+    when there is no systemd-inhibit. The answer is kept SLEEP_PROBE_TTL s in this process."""
+    if not inhibit:
+        return None
+    now = clock()
+    hit = _SLEEP_PROBE.get(inhibit)
+    if hit is not None and now - hit[0] < SLEEP_PROBE_TTL:
+        return hit[1]
+    try:
+        r = subprocess.run([inhibit] + SLEEP_PROBE_ARGS, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=SLEEP_PROBE_TIMEOUT)
+        got = r.returncode == 0
+    except (FileNotFoundError, NotADirectoryError):
+        got = None
+    except (subprocess.SubprocessError, OSError, ValueError):     # a timeout included
+        got = False
+    _SLEEP_PROBE[inhibit] = (now, got)
+    return got
+
+
+def _start_sleep_probe(inhibit):
+    """sleep_block() in a thread, so it runs beside status's 1 s sample. -> a function that
+    waits for its answer (None if it never came)."""
+    box = {}
+    t = threading.Thread(target=lambda: box.update(v=sleep_block(inhibit)), name="sleep-probe",
+                         daemon=True)
+    t.start()
+
+    def answer():
+        t.join(SLEEP_PROBE_TIMEOUT + 2.0)
+        return box.get("v")
+    return answer
 
 
 class Config:
@@ -279,6 +341,12 @@ def _link_up(d):
     return state == "up" or (state == "unknown" and carrier == "1")
 
 
+def _wireless(d):
+    """Is /sys/class/net/<if> `d` a Wi-Fi interface (wireless/ or phy80211)?"""
+    return (os.path.lexists(os.path.join(d, "wireless"))
+            or os.path.lexists(os.path.join(d, "phy80211")))
+
+
 def _lower_links(d):
     """A bridge's, bond's or VLAN's member interfaces: brif/*, bonding/slaves and lower_*."""
     names = set()
@@ -305,7 +373,7 @@ def is_wired(sys_root, name, _depth=0):
     d = os.path.join(sys_root, "class", "net", name)
     if _read(os.path.join(d, "type")) != ARPHRD_ETHER:
         return False
-    if os.path.lexists(os.path.join(d, "wireless")) or os.path.lexists(os.path.join(d, "phy80211")):
+    if _wireless(d):
         return False
     if not _link_up(d):
         return False
@@ -374,6 +442,89 @@ def ssh_arrival_iface(ssh_connection, runner):
         if f[3].split("/")[0].split("%")[0].lower() == local:
             return f[1].rstrip(":").split("@")[0]
     return None
+
+
+def wireless_links(sys_root):
+    """Names of the Wi-Fi interfaces that are up (_wireless, _link_up), in name order."""
+    try:
+        names = sorted(os.listdir(os.path.join(sys_root, "class", "net")))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        d = os.path.join(sys_root, "class", "net", n)
+        if _wireless(d) and _link_up(d):
+            out.append(n)
+    return out
+
+
+def rx_bytes(sys_root, name):
+    """Bytes interface `name` has received (statistics/rx_bytes), or None when unreadable."""
+    v = _read(os.path.join(sys_root, "class", "net", name, "statistics", "rx_bytes"))
+    return int(v) if v and v.isdigit() else None
+
+
+def read_rchar(proc_root, pid):
+    """Bytes process `pid` has read (rchar of /proc/<pid>/io, pipes included), or None."""
+    for line in (_read(os.path.join(proc_root, str(pid), "io")) or "").splitlines():
+        k, _sep, v = line.partition(":")
+        if k.strip() == "rchar" and v.strip().isdigit():
+            return int(v)
+    return None
+
+
+# the stream is on Wi-Fi when, WIFI_TICKS watchdog ticks in a row, the job read at least
+# WIFI_MIN_BYTES of it, one Wi-Fi link received at least WIFI_SHARE of that, and no wired link did
+WIFI_SHARE = 0.5
+WIFI_MIN_BYTES = 8 << 20
+WIFI_TICKS = 2
+# the why of that stop (written as an escape: this file stays ASCII)
+WIFI_WHY = "the stream is arriving over its Wi-Fi (%s) \u00b7 turn its Wi-Fi off"
+
+
+class WifiStream:
+    """Is the Mac's stream reaching us over Wi-Fi? ssh arrives at a wired address, but Linux
+    answers ARP for any of its addresses on every interface, so the Mac can end up sending the
+    stream to the Wi-Fi's MAC. Each watchdog tick compares the bytes the job itself read (rchar
+    of zstd, which reads the ssh session's stdin directly) with what every up Wi-Fi link and
+    every wired link received (statistics/rx_bytes) over the same tick. Traffic beside the
+    stream never counts: a stream on the cable puts all of itself on a wired link, whatever the
+    Wi-Fi receives meanwhile (a download). In a tick the job can read more than arrived only by
+    what ssh's flow-control window held (a few MB), so two ticks of >= 8 MB each where no wired
+    link received half of it cannot come from the cable."""
+
+    def __init__(self, sys_root, proc_root):
+        self.sys_root, self.proc_root = sys_root, proc_root
+        self.prev = None                     # (job's rchar, {wifi: rx}, {wired: rx})
+        self.runs = {}                       # Wi-Fi link -> ticks in a row it carried the stream
+
+    def update(self, pid, wired):
+        """One tick: `pid` reads the stream, `wired` are the wired links that are up. -> the
+        Wi-Fi interface the stream arrives on once that held WIFI_TICKS ticks in a row, else
+        None. The first call is a baseline only, and so is any tick with a counter unreadable
+        or gone back (a link reset) where the answer depends on it."""
+        job = read_rchar(self.proc_root, pid) if pid else None
+        wifi = {n: rx_bytes(self.sys_root, n) for n in wireless_links(self.sys_root)}
+        cable = {n: rx_bytes(self.sys_root, n) for n in wired}
+        prev, self.prev = self.prev, (job, wifi, cable)
+        runs, self.runs = self.runs, {}
+        if prev is None or job is None or prev[0] is None:
+            return None
+        got = job - prev[0]
+        if got < WIFI_MIN_BYTES:
+            return None
+        for n, v in cable.items():
+            then = prev[2].get(n)
+            if v is None or then is None or v < then or v - then >= WIFI_SHARE * got:
+                return None                  # the cable carried it (or it cannot be told)
+        for n in sorted(wifi):
+            v, then = wifi[n], prev[1].get(n)
+            if v is None or then is None or v - then < WIFI_SHARE * got:
+                continue
+            self.runs[n] = runs.get(n, 0) + 1
+            if self.runs[n] >= WIFI_TICKS:
+                return n
+        return None
 
 
 # ---- /proc: processes -----------------------------------------------------------------------
@@ -688,8 +839,11 @@ def _gpu_excluded(pid, procs, exclude, command=""):
 
 def parse_drm_fdinfo(text):
     """One /proc/<pid>/fdinfo/<fd> of a DRM fd -> ((device, client id), {engine: ns},
-    {engine: capacity}), or None when it carries no per-client engine time. The device is
-    drm-pdev (else drm-driver); engine time is "drm-engine-<name>: <ns> ns"."""
+    {engine: capacity}, {engine: (cycles, total cycles)}), or None when it carries no
+    per-client engine reading. The device is drm-pdev (else drm-driver). Engine time is
+    "drm-engine-<name>: <ns> ns" (amdgpu, i915, ...); Intel xe gives busy cycles instead,
+    "drm-cycles-<name>" against the GPU's own clock "drm-total-cycles-<name>" (an engine with
+    only one of the two is left out). nouveau gives neither."""
     fields = {}
     for line in text.splitlines():
         k, sep, v = line.partition(":")
@@ -698,7 +852,7 @@ def parse_drm_fdinfo(text):
     client = fields.get("drm-client-id")
     if not client:
         return None
-    engines, capacity = {}, {}
+    engines, capacity, cycles, totals = {}, {}, {}, {}
     for k, v in fields.items():
         if k.startswith("drm-engine-capacity-"):
             try:
@@ -709,15 +863,21 @@ def parse_drm_fdinfo(text):
             tok = v.split()
             if tok and tok[0].isdigit() and tok[1:] in ([], ["ns"]):
                 engines[k[len("drm-engine-"):]] = int(tok[0])
-    if not engines:
+        elif k.startswith("drm-cycles-") and v.isdigit():
+            cycles[k[len("drm-cycles-"):]] = int(v)
+        elif k.startswith("drm-total-cycles-") and v.isdigit():
+            totals[k[len("drm-total-cycles-"):]] = int(v)
+    clocked = {e: (n, totals[e]) for e, n in cycles.items() if e in totals}
+    if not engines and not clocked:
         return None
-    return (fields.get("drm-pdev") or fields.get("drm-driver") or "?", client), engines, capacity
+    key = (fields.get("drm-pdev") or fields.get("drm-driver") or "?", client)
+    return key, engines, capacity, clocked
 
 
 def drm_clients(proc_root, pids):
-    """{(device, client id): {"pids", "engines", "capacity"}} from the fdinfo of every DRM fd
-    (fd -> /dev/dri/*) of `pids` that this user can read. A client open in several fds or
-    processes is one client: its time counts once."""
+    """{(device, client id): {"pids", "engines", "capacity", "cycles"}} from the fdinfo of every
+    DRM fd (fd -> /dev/dri/*) of `pids` that this user can read. A client open in several fds
+    or processes is one client: its time counts once."""
     out = {}
     for pid in pids:
         base = os.path.join(proc_root, str(pid))
@@ -734,8 +894,9 @@ def drm_clients(proc_root, pids):
             info = parse_drm_fdinfo(_read(os.path.join(base, "fdinfo", fd)) or "")
             if info is None:
                 continue
-            key, engines, capacity = info
-            c = out.setdefault(key, {"pids": set(), "engines": engines, "capacity": capacity})
+            key, engines, capacity, cycles = info
+            c = out.setdefault(key, {"pids": set(), "engines": engines, "capacity": capacity,
+                                     "cycles": cycles})
             c["pids"].add(pid)
     return out
 
@@ -781,11 +942,12 @@ class GpuSampler:
     """Others' GPU use, per process: (highest busy percent of any GPU, label). Leaves out our
     own processes and GPU_EXCLUDED_NAMES (the desktop's own drawing, the Steam client).
     NVIDIA (nvidia module loaded): `nvidia-smi pmon -c 1 -s u`, the sm % of the others summed
-    per GPU. Any other DRM driver (amdgpu, i915, ...): each client's engine time from
-    /proc/<pid>/fdinfo (drm-engine-<name>, deduplicated by drm-client-id), as busy % of the
-    GPU's busiest engine between two samples -- so it needs a baseline: begin(), or the first
+    per GPU. Any other DRM driver (amdgpu, i915, xe, ...): each client's engine time or busy
+    cycles from /proc/<pid>/fdinfo (deduplicated by drm-client-id), as busy % of the GPU's
+    busiest engine between two samples -- so it needs a baseline: begin(), or the first
     sample() reads 0 for those GPUs. Where no per-process reading exists (pmon fails, no
-    readable client on a card), the whole-device reading stands in (gpu_busy's parts)."""
+    readable client on a card, nouveau), the whole-device reading stands in (gpu_busy's parts;
+    none on nouveau)."""
 
     def __init__(self, sys_root, proc_root, runner):
         self.sys_root, self.proc_root, self.runner = sys_root, proc_root, runner
@@ -827,13 +989,23 @@ class GpuSampler:
         return box.get("r")
 
     def _drm(self, procs, exclude, now):
-        """[(percent, label)] per device with readable clients, and the cards they cover."""
+        """[(percent, label)] per device with readable clients, and the cards they cover.
+        Engine time (ns) is a share of the wall time between the samples. Busy cycles (xe)
+        are not: drm-usage-stats defines a client's use of an engine as the growth of its
+        drm-cycles over the growth of its OWN drm-total-cycles (the GPU clock read with them, so
+        CPU-side timing does not enter), and the clients' shares of one engine add up. A common
+        denominator (the largest total-cycles growth of any client) would match that only when
+        every client was read at the same instants. A client seen for the first time gives a
+        baseline only (its total-cycles is the GPU clock, not its age), and a counter that went
+        back keeps its larger reading until it catches up, as the documentation asks."""
         cur = self._clients(procs)
         prev, self.prev = self.prev, (now, cur)
         names = {dev: name for name, dev in _drm_cards(self.sys_root)}
         busy, caps = {}, {}                  # device -> {engine: ns of others}, {engine: capacity}
+        shares = {}                          # device -> {engine: engines' worth busy, from cycles}
         for (dev, _client), c in cur.items():
             busy.setdefault(dev, {})
+            shares.setdefault(dev, {})
             caps.setdefault(dev, {}).update(c["capacity"])
         dt_ns = (now - prev[0]) * 1e9 if prev is not None else 0.0
         if dt_ns > 0:
@@ -846,11 +1018,25 @@ class GpuSampler:
                     cap = caps[key[0]].get(eng, 1)
                     d = min(max(d, 0), dt_ns * cap)          # one client fills an engine at most
                     busy[key[0]][eng] = busy[key[0]].get(eng, 0) + d
+                for eng, (cyc, total) in c["cycles"].items():
+                    then = old["cycles"].get(eng) if old is not None else None
+                    if then is None or eng in c["engines"]:
+                        continue                 # a baseline only; ns time wins where both exist
+                    if cyc < then[0] or total < then[1]:
+                        c["cycles"][eng] = then  # went back: measure from the larger reading
+                        continue
+                    if total == then[1]:
+                        continue
+                    cap = caps[key[0]].get(eng, 1)
+                    share = min(float(cyc - then[0]) / (total - then[1]), cap)
+                    shares[key[0]][eng] = shares[key[0]].get(eng, 0.0) + share
         out = []
         for dev, engs in busy.items():
             pct = 0.0
             for eng, ns in engs.items():
                 pct = max(pct, min(100.0, ns * 100.0 / (dt_ns * caps[dev].get(eng, 1))))
+            for eng, share in shares[dev].items():
+                pct = max(pct, min(100.0, share * 100.0 / caps[dev].get(eng, 1)))
             out.append((pct, "GPU %s %.0f%% busy" % (names.get(dev, dev), pct)))
         return out, {names[dev] for dev in busy if dev in names}
 
@@ -1149,10 +1335,12 @@ def heavy_only(st, cfg):
 def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self_pid=None,
                    parent_pid=None, clock=time.monotonic, sleep=time.sleep):
     """The status dict. `exclude_job` is the job an encode is about to claim (its own staged
-    dir must not read as busy)."""
+    dir must not read as busy). "sleep_block" is sleep_block()'s answer, for Setup only: it
+    never makes the status not ok."""
     runner = runner or default_runner
     self_pid = os.getpid() if self_pid is None else self_pid
     parent_pid = os.getppid() if parent_pid is None else parent_pid
+    sleep_answer = _start_sleep_probe(cfg.inhibit)
     ac = ac_online(cfg.sys)
     links = ethernet_links(cfg.sys)
     ethernet, eth_why = bool(links), "no Ethernet"
@@ -1211,7 +1399,7 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
     return {"ok": ok, "why": why, "code": code, "ac": ac, "ethernet": ethernet, "game": game,
             "heavy": heavy, "free_gb": round(free, 1), "busy": bool(busy_jobs),
             "x265": ver, "version": PROTOCOL_VERSION, "sha256": self_sha256(),
-            "ipv4": wired_ipv4(links, runner)}
+            "ipv4": wired_ipv4(links, runner), "sleep_block": sleep_answer()}
 
 
 # ---- x265 argument allow-list ---------------------------------------------------------------
@@ -1402,7 +1590,7 @@ class EncodeJob:
         self.code = None                           # REASON_CODES word of a yield or a refusal
         self.owns_dir = False
         self.zstd = self.x265 = None
-        self.inhibitor = None                      # systemd-inhibit holding off sleep, if any
+        self.inhibitors = []                       # systemd-inhibits holding off sleep and idle
         self.zstd_killed = False
         self.rfd = self.dummy_w = None
         self.err_lock = threading.Lock()
@@ -1507,10 +1695,13 @@ class EncodeJob:
             sampler = CpuSampler(cfg.proc)
             gpus = GpuSampler(cfg.sys, cfg.proc, runner)
             heavy = HeavyTracker(cfg.heavy_secs)
+            wifi = WifiStream(cfg.sys, cfg.proc)
+            reader = self.zstd.pid if self.zstd is not None else None   # reads the ssh stdin
             procs = list_procs(cfg.proc)
             t0 = time.monotonic()
             sampler.sample(procs, own_tree(procs, me, self.ppid0, kids()), t0)
             gpus.begin(procs, t0)
+            wifi.update(reader, ethernet_links(cfg.sys))
             last = time.monotonic()
             while not self.stop.wait(cfg.watch_interval):
                 now = time.monotonic()
@@ -1521,8 +1712,12 @@ class EncodeJob:
                 game = detect_game(procs, own)
                 if game:
                     return self.abort("yielded", "game running: %s" % game, "game")
-                if not ethernet_links(cfg.sys):
+                links = ethernet_links(cfg.sys)
+                if not links:
                     return self.abort("disconnected", "Ethernet down")
+                via = wifi.update(reader, links)
+                if via:
+                    return self.abort("yielded", WIFI_WHY % via, "no_ethernet")
                 if not ac_online(cfg.sys):
                     return self.abort("yielded", "on battery", "battery")
                 cpu = sampler.sample(procs, own, now)
@@ -1561,37 +1756,41 @@ class EncodeJob:
         self._stop_inhibitor()
 
     def _start_inhibitor(self):
-        """Hold logind's sleep/idle block for the encode (`systemd-inhibit ... sleep infinity`
-        in its own process group), so an idle helper does not suspend mid-segment. Only where
-        systemd-inhibit exists; one that cannot start, or exits at once (polkit said no), never
-        fails the job. It dies with us (PDEATHSIG), and logind lifts the block the moment
-        systemd-inhibit exits."""
+        """Ask logind for a sleep block and, beside it, an idle block for the encode (each a
+        `systemd-inhibit ... sleep infinity` in its own process group), so the helper does not
+        suspend mid-segment. Two, because polkit judges each kind on its own: over ssh a stock
+        setup usually refuses sleep (status reports it as sleep_block) but allows idle, which
+        covers the desktops and logind's IdleAction that honour it. Only where systemd-inhibit
+        exists; one that cannot start, or exits at once (polkit said no), never fails the job.
+        They die with us (PDEATHSIG), and logind lifts a block the moment its systemd-inhibit
+        exits."""
         if not self.cfg.inhibit:
             return
-        try:
-            self.inhibitor = subprocess.Popen(
-                [self.cfg.inhibit] + INHIBIT_ARGS, stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                preexec_fn=_make_child_setup(os.getpid()), start_new_session=True)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            self.inhibitor = None
+        for args in (INHIBIT_ARGS, IDLE_INHIBIT_ARGS):
+            try:
+                self.inhibitors.append(subprocess.Popen(
+                    [self.cfg.inhibit] + args, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    preexec_fn=_make_child_setup(os.getpid()), start_new_session=True))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
 
     def _stop_inhibitor(self):
-        """Release the sleep block: kill systemd-inhibit and its sleep (their process group)."""
-        p, self.inhibitor = self.inhibitor, None
-        if p is None:
-            return
-        try:
-            os.killpg(p.pid, signal.SIGKILL)       # not reaped yet, so the group is still ours
-        except OSError:
+        """Release the blocks: kill each systemd-inhibit and its sleep (their process group)."""
+        held, self.inhibitors = self.inhibitors, []
+        for p in held:
             try:
-                p.kill()
+                os.killpg(p.pid, signal.SIGKILL)   # not reaped yet, so the group is still ours
             except OSError:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+        for p in held:
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
                 pass
-        try:
-            p.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
 
     def _close_dummy(self):
         if self.dummy_w is not None:
@@ -1982,7 +2181,8 @@ def main(argv=None, cfg=None):
         except Exception as e:
             st = {"ok": False, "why": "status error: %s" % e, "code": "error", "ac": False,
                   "ethernet": False, "game": None, "heavy": None, "free_gb": 0.0, "busy": False,
-                  "x265": "", "version": PROTOCOL_VERSION, "sha256": self_sha256(), "ipv4": []}
+                  "x265": "", "version": PROTOCOL_VERSION, "sha256": self_sha256(), "ipv4": [],
+                  "sleep_block": None}
         if _EARLY:
             return 1
         print(json.dumps(st, separators=(",", ":")), flush=True)
