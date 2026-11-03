@@ -666,6 +666,8 @@ extension SettingsDTO {
 
     /// The helper is set up once its address and login are saved (the engine's "not set up" is
     /// either one empty). Until then Settings shows no Helper switch and Setup no check rows.
+    /// After it, Setup shows every row the engine sends, even when a saved field can't be used:
+    /// the engine's own `configured` is false then, and its sign-in row says which field.
     var helperConfigured: Bool { !(helper_host ?? "").isEmpty && !(helper_user ?? "").isEmpty }
 }
 
@@ -930,14 +932,14 @@ struct DvProbeDTO: Codable {
 /// GET /api/helper/setup — the helper's setup checks (engine helper.setup_status). All optional,
 /// so an engine without them (or with a field more) still decodes.
 struct HelperCheckDTO: Codable {
-    var id: String?                    // "login" | "wired" | "worker" | "x265" | "helper"
-    var ok: Bool?                      // nil = not checked yet / not applicable
+    var id: String?                    // "login" | "wired" | "worker" | "x265" | "sleep" | "helper"
+    var ok: Bool?                      // nil = not checked yet / not applicable (sleep: never false)
     var detail: String?                // plain words for the row
     var action: String?                // "" | "authorize" | "helper_worker" | "helper_x265"
 }
 
 struct HelperSetupDTO: Codable {
-    var configured: Bool?              // host and login saved
+    var configured: Bool?              // set up and every field usable (false: the login row says why)
     var host: String?
     var user: String?
     var key: String?                   // as saved, unexpanded
@@ -946,10 +948,48 @@ struct HelperSetupDTO: Codable {
     var authorize_cmd: String?         // "ssh-copy-id -i <key>.pub user@host", "" when not set up
     var mac_x265: String?              // this Mac's x265 version token, "" when none
     var helper_x265: String?           // the helper's, "" when unknown
-    var checks: [HelperCheckDTO]?      // in that order: login, wired, worker, x265, helper
+    var checks: [HelperCheckDTO]?      // in that order: login, wired, worker, x265, sleep, helper
+                                       // (an older engine has no sleep)
     var checked_at: Double?            // epoch, 0 = never
     subscript(check id: String) -> HelperCheckDTO? {
         checks?.first { $0.id == id }
+    }
+}
+
+/// What Setup's Helper group shows, decided here with no SwiftUI so engine/test_helper_setup_rows.py
+/// can compile and run it (the MovieRoutes pattern). SetupViews only draws it.
+extension HelperSetupDTO {
+    static let rowOrder = ["login", "wired", "worker", "x265", "sleep", "helper"]
+    static let rowTitles = ["login": "Signs in", "wired": "Ethernet", "worker": "Worker",
+                            "x265": "x265", "sleep": "Sleep", "helper": "Status"]
+    /// The settings whose save checks the helper again, fresh: what it signs in with, and the
+    /// Helper switch (its Status row and the Ready line follow it).
+    static let recheckKeys: Set<String> = ["helper_host", "helper_user", "helper_key", "helper_enabled"]
+
+    /// The rows, once the app has an address and login saved. An answer the engine calls not set
+    /// up still shows: its sign-in row says which saved field can't be used (or why the check
+    /// failed), and all its rows are nil, so it is never Ready.
+    static func rows(_ h: HelperSetupDTO?, appConfigured: Bool) -> [HelperCheckDTO] {
+        appConfigured ? rowOrder.compactMap { h?[check: $0] } : []
+    }
+
+    /// A row's dot. Switched off, the status is just that, not a fault: neutral until it is on.
+    static func dot(_ c: HelperCheckDTO, switchedOn: Bool) -> Bool? {
+        c.id == "helper" && !switchedOn ? (c.ok == true ? true : nil) : c.ok
+    }
+
+    /// Every check passes. Two exceptions: switched off, the status ("off" is then a choice, not
+    /// something left to set up), and sleep, which only ever informs (nil: grey, never a fault).
+    static func ready(_ checks: [HelperCheckDTO], switchedOn: Bool) -> Bool {
+        !checks.isEmpty && checks.allSatisfy {
+            $0.ok == true || ($0.id == "sleep" && $0.ok == nil) || ($0.id == "helper" && !switchedOn)
+        }
+    }
+
+    /// A row's job button waits while another job runs, and while a check runs: the row may still
+    /// show the verdict from before the job that just finished.
+    static func jobButtonDisabled(active: String?, runningThis: Bool, checking: Bool) -> Bool {
+        (active != nil && !runningThis) || checking
     }
 }
 

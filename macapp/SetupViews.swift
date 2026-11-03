@@ -728,9 +728,10 @@ private struct NASExtrasGroup: View {
 // MARK: - the helper (optional)
 // A Linux PC on Ethernet encodes some of the remux's segments (engine/helper.py). Its address,
 // login and key are saved SETTINGS (settings.json, not config.json). The rows below are the
-// engine's setup checks (GET /api/helper/setup): asked for when this opens, on Test, after a
-// save and after a helper job, never on the poll. Each failing row carries the one thing that
-// fixes it: a job button with its live tail, or the Terminal command that authorises the key.
+// engine's setup checks (GET /api/helper/setup): asked for when this opens or it becomes set up,
+// on Test, after a save (the Helper switch's too) and after a helper job, never on the poll.
+// Each failing row carries the one thing that fixes it: a job button with its live tail, or the
+// Terminal command that authorises the key.
 // Optional: never part of setup_complete.
 private struct HelperSetupGroup: View {
     @EnvironmentObject var store: AppStore
@@ -740,9 +741,7 @@ private struct HelperSetupGroup: View {
     @State private var seeded = false
 
     static let defaultKey = "~/.ssh/id_ed25519_visionary_helper"   // engine/settings.py's default
-    private static let order = ["login", "wired", "worker", "x265", "helper"]
-    private static let titles = ["login": "Signs in", "wired": "Ethernet", "worker": "Worker",
-                                 "x265": "x265", "helper": "Status"]
+    // the rows' order, titles, dots and Ready line: HelperSetupDTO's extension (Models.swift)
 
     private var configured: Bool { store.state?.settings?.helperConfigured ?? false }
     private var switchedOn: Bool { store.state?.settings?.helper_enabled ?? false }
@@ -786,12 +785,11 @@ private struct HelperSetupGroup: View {
 
     private func checkRow(_ c: HelperCheckDTO) -> some View {
         let j = jobFor(c)
-        // Switched off, the status is just that, not a fault: its dot stays neutral until it is on.
-        let dot: Bool? = c.id == "helper" && !switchedOn ? (c.ok == true ? true : nil) : c.ok
         return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                CheckDot(ok: dot)
-                Text(Self.titles[c.id ?? ""] ?? (c.id ?? "")).font(.system(size: 12, weight: .medium))
+                CheckDot(ok: HelperSetupDTO.dot(c, switchedOn: switchedOn))
+                Text(HelperSetupDTO.rowTitles[c.id ?? ""] ?? (c.id ?? ""))
+                    .font(.system(size: 12, weight: .medium))
                 Spacer()
                 if let j {
                     Button {
@@ -800,7 +798,9 @@ private struct HelperSetupGroup: View {
                         if running(j.what) { ProgressView().controlSize(.small) }
                         else { Text(j.label) }
                     }.buttonStyle(SteelButtonStyle(lit: true))
-                        .disabled(store.installStatus?.active != nil && !running(j.what))
+                        .disabled(HelperSetupDTO.jobButtonDisabled(
+                            active: store.installStatus?.active, runningThis: running(j.what),
+                            checking: store.helperChecking))
                 }
             }
             if let d = c.detail, !d.isEmpty {
@@ -817,12 +817,6 @@ private struct HelperSetupGroup: View {
                 CopyValueRow(value: cmd)
             }
         }
-    }
-
-    /// Every check passes. Switched off, the status is the one exception: "off" is then a choice,
-    /// not something left to set up.
-    private func ready(_ checks: [HelperCheckDTO]) -> Bool {
-        !checks.isEmpty && checks.allSatisfy { $0.ok == true || ($0.id == "helper" && !switchedOn) }
     }
 
     private func seed() {
@@ -843,9 +837,9 @@ private struct HelperSetupGroup: View {
     }
 
     var body: some View {
-        // the checks only once the address and login are saved, and only for a set-up answer
-        let checks = configured && h?.configured == true
-            ? Self.order.compactMap { h?[check: $0] } : []
+        // the checks once the address and login are saved, even an answer the engine calls not
+        // set up (its sign-in row says which saved field can't be used)
+        let checks = HelperSetupDTO.rows(h, appConfigured: configured)
         VStack(alignment: .leading, spacing: 8) {
             SetupGroupLabel(text: "Helper (optional)")
             Text("A Linux PC on Ethernet can encode some segments alongside this Mac.")
@@ -869,14 +863,16 @@ private struct HelperSetupGroup: View {
                 }
             }
             ForEach(Array(checks.enumerated()), id: \.offset) { _, c in checkRow(c) }
-            if ready(checks) {
+            if HelperSetupDTO.ready(checks, switchedOn: switchedOn) {
                 Text(switchedOn ? "Ready. It joins the next remux." : "Ready. Switch the Helper on below.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
         .onAppear { seed() }
         .onChange(of: store.state?.settings?.helper_host) { seed() }   // state landed after open
-        .task {
+        // on open, and again whenever it becomes set up: the first state landing after open, or a
+        // first Save (whose own fresh check then lands last; the engine runs one at a time)
+        .task(id: configured) {
             if configured { await store.fetchHelperSetup(fresh: false) }
         }
     }

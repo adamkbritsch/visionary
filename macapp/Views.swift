@@ -4088,7 +4088,7 @@ private struct HelperRow: View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Helper").font(.system(size: 13, weight: .medium))
-                Text("A Linux machine on Ethernet encodes some segments alongside the Mac. It stops and deletes its work the moment a game or anything heavy starts on it.")
+                Text("A Linux PC on Ethernet encodes some segments alongside the Mac. It steps aside and deletes its work as soon as a game starts, or after about 10 seconds of anything heavy.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
