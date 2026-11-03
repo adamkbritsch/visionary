@@ -48,9 +48,10 @@
   is refused, however good, including a stream that arrives over the helper's Wi-Fi). Its GPU
   rule counts programs one by one on NVIDIA (`nvidia-smi pmon`) and on AMD and Intel i915/xe
   (the kernel's per-program counters), and there it leaves out the desktop itself and the
-  Steam client. Where there is no per-program reading (nouveau, an older kernel, or `pmon`
-  failing), the whole GPU counts, desktop included, so a busy desktop alone can pause it; a
-  game is caught by the game rule either way. Over ssh most desktops won't let the worker
+  Steam client. Where there is no per-program reading (an older kernel, or `pmon` failing),
+  the whole GPU counts, desktop included, so a busy desktop alone can pause it; the nouveau
+  driver gives no GPU reading at all, so there only the CPU rule applies. A game is caught by
+  the game rule either way. Over ssh most desktops won't let the worker
   hold off sleep, so turn off the helper's automatic sleep while it's plugged in; one that
   sleeps mid-segment just hands that segment back. Only the capped x265 re-encode is shared:
   Topaz, the Dolby Vision™ analysis and render, the over-gate splice's pieces and the peak

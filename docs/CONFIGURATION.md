@@ -66,11 +66,11 @@ switch from **Settings → Helper**.
 | `helper_enabled` | `false` | the **Helper** switch; off = the remux runs exactly as without a helper |
 | `helper_host` | `""` | the helper's address: a host name (`helper.local`) or an IPv4 address (`192.168.1.50`) |
 | `helper_user` | `""` | your login on the helper |
-| `helper_key` | `"~/.ssh/id_ed25519_visionary_helper"` | the ssh private key the Mac logs in with (no passphrase; `~` is allowed) |
+| `helper_key` | `"~/.ssh/id_ed25519_visionary_helper"` | the ssh private key the Mac logs in with (no passphrase); a full path, or one starting with `~/` |
 
 With `helper_host` or `helper_user` empty the helper is *not set up*: it stays off and its
 status reads *off · not set up*. An address or login may hold letters, digits, `.`, `_` and
-`-`, starting with a letter or digit; a key path must be one line and not start with `-`. A
+`-`, starting with a letter or digit; a key path must be one line and start with `/` or `~/`. A
 value that breaks those rules is kept exactly as typed, never swapped for a default, and the
 helper stays off with *settings: bad host* (or user, or key) until it is fixed. Setup's
 *Signs in* row shows the same reason.

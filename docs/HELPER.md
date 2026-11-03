@@ -170,9 +170,10 @@ The helper polices itself, whatever the Mac thinks.
 - **The GPU is read program by program** on NVIDIA (`nvidia-smi pmon`) and on AMD and Intel
   (i915, xe) from the kernel's per-program counters. There the desktop's own drawing and the
   Steam client are not counted: GNOME, KDE, Cinnamon, COSMIC, Pantheon, Budgie, Xfce, MATE and
-  the wlroots compositors such as Sway. Where there is no per-program reading (the nouveau
-  driver, an older kernel, or `nvidia-smi pmon` failing), the whole GPU counts, desktop
-  included, so a busy desktop alone can pause it.
+  the wlroots compositors such as Sway. Where there is no per-program reading (an older
+  kernel, or `nvidia-smi pmon` failing), the whole GPU counts, desktop included, so a busy
+  desktop alone can pause it. The open-source **nouveau** driver gives no GPU reading at all,
+  so on it only the CPU rule and the game rule apply.
 - **A game** is any Steam game (Proton included), any Windows program under Wine or Proton,
   and a launch from Lutris or Heroic. A non-Steam shortcut running a native Linux program is
   judged by the CPU and GPU rule only.
