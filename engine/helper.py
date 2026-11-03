@@ -189,6 +189,12 @@ _SSH_TIPS = {"host_key": "this Mac hasn't met the helper yet" + _SEE_SETUP,
              "refused": "{host} answered, but its SSH server is off"}
 
 
+def _shell_word(path: str) -> str:
+    """PURE. A path as ONE shell word in a command Setup shows the user: as typed (a leading ~
+    still expands) unless it needs quoting, then shell-quoted with the ~ expanded."""
+    return path if re.fullmatch(r"[A-Za-z0-9_./~+-]+", path) else shlex.quote(os.path.expanduser(path))
+
+
 def ssh_failure(rc, err: str, host: str, key: str = "") -> tuple:
     """PURE. (kind, detail, action) for an ssh that did NOT log in (rc 255, or None: it could not
     run or timed out), classified from its stderr into plain words; `action` is Setup's fix
@@ -198,7 +204,8 @@ def ssh_failure(rc, err: str, host: str, key: str = "") -> tuple:
     last = _last_line(err)
     for kind, needles, words, action in _SSH_FAILURES:
         if any(n in e for n in needles):
-            return kind, words.format(host=host, key=key, last=last), action
+            return kind, words.format(host=host, key=_shell_word(key) if key else key,
+                                      last=last), action
     if rc is None or not last:
         return "network", f"no answer from {host}", ""
     return "other", f"the login failed: {last}", ""
@@ -445,7 +452,8 @@ def reported_ipv4(s):
 
 # ---- this Mac's x265 -------------------------------------------------------------------------
 
-_LOCAL_X265: dict = {}           # x265 path -> version token, once read (per process)
+_LOCAL_X265: dict = {}           # x265 path -> (_binary_identity, version token): re-read
+                                 #   whenever the file behind the path changes
 
 
 def parse_x265_version(text: str) -> str:
@@ -456,14 +464,30 @@ def parse_x265_version(text: str) -> str:
     return m.group(1) if m else ""
 
 
+def _binary_identity(path: str):
+    """(resolved path, st_ino, st_size, st_mtime_ns) of the file `path` leads to, or None when it
+    cannot be read. A `brew upgrade` relinks bin/x265 into a new Cellar folder; a rebuild in place
+    changes the inode, the size or the mtime. One stat: cheap enough for every call."""
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return None
+    return real, st.st_ino, st.st_size, st.st_mtime_ns
+
+
 def local_x265_version(x265: str | None = None, *, run=None) -> str:
     """This Mac's x265 version token (the helper must run the SAME build), or '' when it cannot be
-    read. A token, once read, is cached for the process. Never raises."""
+    read. A token is reused only while the binary behind the path is the same file
+    (_binary_identity, checked on every call): after a `brew upgrade` the next call reads the new
+    version, so the helper is refused (and Setup shows both) until Build makes it match. Never
+    raises."""
     x265 = x265 or dvcap.X265
+    ident = _binary_identity(x265)
     with _STATE_LOCK:
         hit = _LOCAL_X265.get(x265)
-    if hit:
-        return hit
+    if hit and hit[0] == ident:
+        return hit[1]
     try:
         rc, out, err = (run or _run)([x265, "--version"], CMD_TIMEOUT)
     except Exception:  # noqa: BLE001
@@ -472,7 +496,7 @@ def local_x265_version(x265: str | None = None, *, run=None) -> str:
     tok = parse_x265_version((out or "") + "\n" + (err or "")) if rc == 0 else ""
     if tok:
         with _STATE_LOCK:
-            _LOCAL_X265[x265] = tok
+            _LOCAL_X265[x265] = (ident, tok)
     return tok
 
 
@@ -741,7 +765,15 @@ class Helper:
         try:
             if not self._enabled():
                 return False, "helper is off", "switched_off"
+            known = _known_ipv4(self._id)
             ok, why, code = self._check_route()
+            if not ok and known:
+                # the remembered wired addresses may be stale (the LAN was renumbered: they now
+                # route over Wi-Fi), and no probe would ever re-learn them — forget them and check
+                # by name once more; the status probe learns the list afresh, and _off_list still
+                # keeps an address the helper does not list as wired from being used
+                _forget_ipv4(self._id)
+                ok, why, code = self._check_route()
             if not ok:
                 return False, why, code
             now = self._clock()
@@ -1405,7 +1437,7 @@ def status_summary() -> dict:
 
 HELPER_JOBS = ("helper_key", "helper_worker", "helper_x265")   # setup_jobs targets (argv here)
 X265_TOKEN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]*")     # `build-x265.sh --version` takes it
-_CHECK_IDS = ("login", "wired", "worker", "x265", "helper")
+_CHECK_IDS = ("login", "wired", "worker", "x265", "sleep", "helper")
 _STATE_WORDS = {"connected": "connected", "ready": "ready", "paused": "paused", "off": "off",
                 "not_connected": "not connected"}
 
@@ -1437,10 +1469,8 @@ def authorize_command(host: str, user: str, key: str) -> str:
     """PURE. The one command the user runs in Terminal so the helper takes the key: ssh-copy-id
     asks for the helper's password once, and on first contact records its host key under the
     host name as typed — the name the remux looks it up by. The key path stays as typed (a
-    leading ~ still expands) unless it needs quoting."""
-    pub = f"{key}.pub"
-    word = pub if re.fullmatch(r"[A-Za-z0-9_./~+-]+", pub) else shlex.quote(os.path.expanduser(pub))
-    return f"ssh-copy-id -i {word} {user}@{host}"
+    leading ~ still expands) unless it needs quoting (_shell_word)."""
+    return f"ssh-copy-id -i {_shell_word(f'{key}.pub')} {user}@{host}"
 
 
 def _check(cid: str, ok, detail: str = "", action: str = "") -> dict:
@@ -1503,6 +1533,20 @@ def _x265_check(s, mac: str) -> dict:
                   "helper_x265")
 
 
+def _sleep_check(s) -> dict:
+    """The worker's "sleep_block": can it hold off the helper's sleep while it encodes (its
+    systemd-inhibit probe)? Never a failure — a helper that can't still works while it is awake
+    — so "can't" is neutral (None) with the fix in words, and an older worker (no field), an
+    unknown answer or no answer at all is neutral with no words."""
+    v = (s or {}).get("sleep_block")
+    if v is True:
+        return _check("sleep", True, "it stays awake while it encodes")
+    if v is False:
+        return _check("sleep", None, "it can't keep itself awake over ssh · turn off automatic "
+                                     "sleep while it's plugged in")
+    return _check("sleep", None)
+
+
 def _helper_check(vals: dict, enabled: bool) -> dict:
     """The status line's own words for the helper, from a verdict taken NOW: the refresher's
     Helper asked afresh (a cooldown and this process's job slot still count), then
@@ -1559,11 +1603,12 @@ def _setup_compute(run, mac_x265) -> dict:
         out["helper_x265"] = str(status.get("x265") or "")
     checks = [login, _wired_check(host, wired_route_ok(host, run=run, prefer=_known_ipv4(hid)))]
     if login["ok"]:
-        checks += [_worker_check(status), _x265_check(status, mac), _helper_check(vals, enabled)]
+        checks += [_worker_check(status), _x265_check(status, mac), _sleep_check(status),
+                   _helper_check(vals, enabled)]
     else:
         checks += [_check("worker", None),               # not checked: nothing logged in
                    _check("x265", None, "" if mac else "install the command-line tools first"),
-                   _check("helper", None)]
+                   _check("sleep", None), _check("helper", None)]
     out["checks"] = checks
     return out
 
@@ -1607,8 +1652,9 @@ def setup_status(fresh: bool = False, *, run=None, local_x265=None) -> dict:
     "pubkey" (absolute path of <key>.pub, "" if missing), "authorize_cmd" (the ssh-copy-id line,
     "" until set up), "mac_x265", "helper_x265" ("" if unknown), "checks": [{"id", "ok"
     (True/False, None = not checked / not applicable), "detail" (plain words), "action" (""|
-    "authorize"|"helper_worker"|"helper_x265")} for login, wired, worker, x265, helper — in that
-    order], "checked_at" (epoch, 0 = never)}.
+    "authorize"|"helper_worker"|"helper_x265")} for login, wired, worker, x265, sleep, helper — in
+    that order; "sleep" is never False, so it never stands between Setup and Ready], "checked_at"
+    (epoch, 0 = never)}.
 
     Runs only when asked (the app: Setup opening, Test, after a job): one login ssh over the
     normal route, the wired-route check, and the helper's verdict afresh. The result is reused
@@ -1665,7 +1711,7 @@ def _job_argv(what: str, vals: dict, st, mac_x265) -> tuple:
     path = os.path.expanduser(key)
     if what == "helper_key":
         if os.path.lexists(path) or os.path.lexists(path + ".pub"):
-            return None, f"{key} already exists - Visionary never replaces a key"
+            return None, f"{key} already exists · Visionary never replaces a key"
         folder = os.path.dirname(path)
         if folder and not os.path.isdir(folder):
             os.makedirs(folder, mode=0o700)
@@ -1692,6 +1738,9 @@ def _job_argv(what: str, vals: dict, st, mac_x265) -> tuple:
         return None, "this Mac has no x265 yet · install the command-line tools first"
     if not X265_TOKEN_RE.fullmatch(token):
         return None, f"this Mac's x265 version {token!r} is not one the build can make"
+    # as login_argv: nothing from the user's ssh config can multiplex, jump or allocate a tty (a
+    # `RequestTTY force` would leave `bash -s` reading the pty for good once the script ended)
     remote = (f'exec {SSH} -i "$1" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 '
-              f'-o ServerAliveInterval=15 -- "$2@$3" "bash -s -- --version $5" < "$4"')
+              f'-o ServerAliveInterval=15 -o ControlMaster=no -o ControlPath=none '
+              f'-o ProxyJump=none -o RequestTTY=no -- "$2@$3" "bash -s -- --version $5" < "$4"')
     return ["/bin/bash", "-c", remote, "_", path, user, host, script, token], ""
