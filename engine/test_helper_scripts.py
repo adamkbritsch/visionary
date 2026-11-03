@@ -6,11 +6,14 @@ source/cmake/Version.cmake, so a build "produces" a fake x265 that reports what 
 would.
 
 build-x265.sh's functions are tested on their own by sourcing a copy without its last line
-(`main "$@"`); the whole script is tested the way the Mac runs it on the helper, piped into
+(`main "$@"; exit`); the whole script is tested the way the Mac runs it on the helper, piped into
 `bash -s -- --version <token>`, where a child that reads stdin used to swallow the rest of the
-script (the build finished, the install step never ran, and it exited 0)."""
+script (the build finished, the install step never ran, and it exited 0). The fake cmake refuses
+what CMake 4 refuses, so a build only passes when the script has neutralised x265's old policy
+lines first."""
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +30,39 @@ SYS_PATH = "/usr/bin:/bin"
 
 FULL_1D117BE = "1d117bed4747758b51bd2c124d738527e30392cb"
 FULL_43 = "e9b88125dc21393b3fd8d68e98083bdfb89778a8"
+
+# The policy lines at the head of x265 1d117be's source/CMakeLists.txt: two policies set OLD,
+# which CMake 4 refuses outright, and a cmake_minimum_required that CMAKE_POLICY_VERSION_MINIMUM
+# covers. CMAKELISTS_FIXED is a head after upstream's CMake 4 fix (no OLD lines).
+CMAKELISTS_1D117BE = """\
+# vim: syntax=cmake
+message(STATUS "cmake version ${CMAKE_VERSION}")
+if(POLICY CMP0025)
+    cmake_policy(SET CMP0025 OLD) # report Apple's Clang as just Clang
+endif()
+if(POLICY CMP0042)
+    cmake_policy(SET CMP0042 NEW) # MACOSX_RPATH
+endif()
+if(POLICY CMP0054)
+    cmake_policy(SET CMP0054 OLD) # Only interpret if() arguments as variables or keywords when unquoted
+endif()
+
+project (x265)
+cmake_minimum_required (VERSION 2.8.8) # OBJECT libraries require 2.8.8
+"""
+CMAKELISTS_PATCHED = (CMAKELISTS_1D117BE
+                      .replace("cmake_policy(SET CMP0025 OLD)", "cmake_policy(SET CMP0025 NEW)")
+                      .replace("cmake_policy(SET CMP0054 OLD)", "cmake_policy(SET CMP0054 NEW)"))
+CMAKELISTS_FIXED = """\
+# vim: syntax=cmake
+cmake_minimum_required (VERSION 3.10)
+message(STATUS "cmake version ${CMAKE_VERSION}")
+if(POLICY CMP0042)
+    cmake_policy(SET CMP0042 NEW) # MACOSX_RPATH
+endif()
+
+project (x265)
+"""
 
 
 def render_version(txt):
@@ -84,7 +120,8 @@ if [ "$1" = clone ]; then
   mkdir -p "$3/.git" "$3/source"
   exit 0
 fi
-[ "$1" = -C ] && shift 2
+dir=.
+[ "$1" = -C ] && { dir=$2; shift 2; }
 [ "$1" = -c ] && shift 2
 case "$1" in
   rev-parse)
@@ -97,13 +134,16 @@ case "$1" in
       4.3) echo "''' + FULL_43 + r'''" ;;
       *) exit 1 ;;
     esac ;;
-  checkout) exit 0 ;;
+  checkout)                    # the commit's own source/CMakeLists.txt (from FAKE_STATE)
+    for a; do last=$a; done
+    cp "$FAKE_STATE/CMakeLists-$last.txt" "$dir/source/CMakeLists.txt" ;;
   *) exit 1 ;;
 esac
 '''
 
-# configure (-S src -B dir ...) records what Version.cmake would print; --build makes
-# libx265.a, and in the 8-bit tree (the one linking 10 + 12 bit) also the CLI
+# configure (-S src -B dir ...) fails, as CMake 4 does, on a CMakeLists.txt that sets CMP0025 or
+# CMP0054 OLD, and otherwise records what Version.cmake would print; --build makes libx265.a,
+# and in the 8-bit tree (the one linking 10 + 12 bit) also the CLI
 FAKE_CMAKE = r'''#!/bin/bash
 echo "cmake $*" >> "$FAKE_LOG"
 cat > /dev/null
@@ -121,6 +161,11 @@ if [ "$1" = --build ]; then
   exit 0
 fi
 s=$2 b=$4
+if grep -Eq 'cmake_policy\(SET CMP00(25|54) OLD\)' "$s/CMakeLists.txt"; then
+  echo "CMake Error at CMakeLists.txt: Policy CMP0025 may not be set to OLD behavior" \
+       "because this version of CMake no longer supports it." >&2
+  exit 1
+fi
 mkdir -p "$b"
 txt="$s/../x265Version.txt"
 if [ -d "$s/../.git" ]; then
@@ -138,6 +183,19 @@ exit 0
 
 FAKE_NPROC = "#!/bin/bash\necho 4\n"
 
+# The inner build script runs on Linux, where GNU sed's -i takes no suffix. The Mac's BSD sed
+# wants `-i ''` (it would take the -E after -i as a backup suffix and read the script as a basic
+# regex), so on a Mac this goes in front of it; where sed is GNU's it changes nothing.
+FAKE_GNU_SED = r'''#!/bin/bash
+for real in /usr/bin/sed /bin/sed; do [ -x "$real" ] && break; done
+"$real" --version >/dev/null 2>&1 </dev/null && exec "$real" "$@"
+args=()
+for a; do
+  if [ "$a" = -i ]; then args+=(-i ""); else args+=("$a"); fi
+done
+exec "$real" "${args[@]}"
+'''
+
 
 def fake_cxx(static_lib):
     """A C++ compiler whose -print-file-name=libstdc++.a names `static_lib` (or only the bare
@@ -150,6 +208,20 @@ def write_exe(path, body):
     with open(path, "w") as f:
         f.write(body)
     os.chmod(path, 0o755)
+
+
+def cmake_major():
+    """The major version of the cmake on PATH (0 when there is none)."""
+    exe = shutil.which("cmake")
+    if not exe:
+        return 0
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    m = re.match(r"cmake version (\d+)\.", out)
+    return int(m.group(1)) if m else 0
 
 
 class Base(unittest.TestCase):
@@ -185,7 +257,7 @@ class BuildParts(Base):
         super().setUp()
         with open(BUILD) as f:
             lines = f.read().rstrip("\n").split("\n")
-        self.assertEqual(lines[-1], 'main "$@"')            # nothing runs before all is read
+        self.assertEqual(lines[-1], 'main "$@"; exit')      # nothing runs before all is read
         self.lib = os.path.join(self.tmp, "build-x265-functions.sh")
         with open(self.lib, "w") as f:
             f.write("\n".join(lines[:-1]) + "\n")
@@ -315,6 +387,90 @@ class BuildParts(Base):
         self.assertEqual(out, "4.1+1-1d117be\n")
         self.assertEqual(self.sh('x265_token "$1"', "garbage\n")[1], "")
 
+    # -- CMake 4 and x265's old policy lines
+
+    def inner(self):
+        """The build script write_inner writes, as text."""
+        path = os.path.join(self.tmp, "build-inside.sh")
+        rc, _, err = self.sh('write_inner "$1"', path)
+        self.assertEqual(rc, 0, err)
+        with open(path) as f:
+            return f.read()
+
+    def policy_sed(self):
+        """(line number, text) of the inner script's `run sed` that rewrites the policies, with
+        its continuation lines."""
+        lines = self.inner().split("\n")
+        start = end = next(n for n, line in enumerate(lines) if line.startswith("run sed "))
+        while lines[end].endswith("\\"):
+            end += 1
+        return start, "\n".join(lines[start:end + 1])
+
+    def source(self, text):
+        """A checkout whose source/CMakeLists.txt is `text`: (its root, the file)."""
+        src = os.path.join(self.tmp, "x265")
+        os.makedirs(os.path.join(src, "source"), exist_ok=True)
+        cml = os.path.join(src, "source", "CMakeLists.txt")
+        with open(cml, "w") as f:
+            f.write(text)
+        return src, cml
+
+    def run_policy_sed(self, text):
+        """The inner script's own sed line, run on a checkout whose CMakeLists.txt is `text`;
+        what the file holds afterwards."""
+        src, cml = self.source(text)
+        self.fake("sed", FAKE_GNU_SED)
+        r = subprocess.run([BASH, "-c", 'set -euo pipefail; run() { "$@" </dev/null; }; src=$1\n'
+                            + self.policy_sed()[1], "_", src],
+                           env=self.env(), capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.listdir(os.path.dirname(cml)), ["CMakeLists.txt"])   # no backup
+        with open(cml) as f:
+            return f.read()
+
+    def test_the_old_policies_are_rewritten_after_the_version_file_and_before_any_cmake(self):
+        text = self.inner()
+        lines = text.split("\n")
+        at, cmd = self.policy_sed()
+        # the quoted heredoc passes the backslashes through as written
+        expr = r"'s/cmake_policy\(SET (CMP0025|CMP0054) OLD\)/cmake_policy(SET \1 NEW)/'"
+        self.assertIn("run sed -i -E " + expr + " \\", cmd)
+        self.assertTrue(cmd.endswith('"$src/source/CMakeLists.txt"'), cmd)
+        version = next(n for n, line in enumerate(lines) if line.startswith("version_txt "))
+        cmake = next(n for n, line in enumerate(lines) if line.startswith("run cmake "))
+        self.assertLess(version, at)
+        self.assertLess(at, cmake)
+        self.assertIn("-DCMAKE_POLICY_VERSION_MINIMUM=3.5", text)      # still needed for 2.8.8
+
+    def test_the_policy_sed_turns_1d117bes_old_policies_new(self):
+        self.assertEqual(self.run_policy_sed(CMAKELISTS_1D117BE), CMAKELISTS_PATCHED)
+        self.assertNotIn(" OLD)", CMAKELISTS_PATCHED)
+        self.assertIn("cmake_policy(SET CMP0042 NEW) # MACOSX_RPATH", CMAKELISTS_PATCHED)
+
+    def test_the_policy_sed_changes_nothing_on_a_fixed_source(self):
+        self.assertEqual(self.run_policy_sed(CMAKELISTS_FIXED), CMAKELISTS_FIXED)
+        self.assertEqual(self.run_policy_sed(CMAKELISTS_PATCHED), CMAKELISTS_PATCHED)
+
+    @unittest.skipUnless(cmake_major() >= 4, "needs CMake 4 or newer on PATH")
+    def test_real_cmake_4_configures_1d117bes_head_only_after_the_policy_sed(self):
+        # NONE: no compiler is needed to judge the policy lines, which come before project()
+        head = CMAKELISTS_1D117BE.replace("project (x265)", "project (x265 NONE)")
+        src, _ = self.source(head)
+
+        def configure(build):
+            r = subprocess.run([shutil.which("cmake"), "-S", os.path.join(src, "source"),
+                                "-B", os.path.join(self.tmp, build),
+                                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"],
+                               capture_output=True, text=True, timeout=60)
+            return r.returncode, r.stdout + r.stderr
+
+        rc, out = configure("before")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("may not be set to OLD behavior", out)
+        self.run_policy_sed(head)
+        rc, out = configure("after")
+        self.assertEqual(rc, 0, out)
+
 
 # ---- build-x265.sh: the whole script, the way the Mac runs it ----------------------------------
 
@@ -323,9 +479,16 @@ class BuildRun(Base):
         super().setUp()
         for name, body in (("distrobox", FAKE_DISTROBOX), ("sudo", FAKE_SUDO), ("dnf", FAKE_PKG),
                            ("git", FAKE_GIT), ("cmake", FAKE_CMAKE), ("nproc", FAKE_NPROC),
-                           ("cc", "#!/bin/bash\nexit 0\n"), ("nasm", "#!/bin/bash\nexit 0\n")):
+                           ("cc", "#!/bin/bash\nexit 0\n"), ("nasm", "#!/bin/bash\nexit 0\n"),
+                           ("sed", FAKE_GNU_SED)):
             self.fake(name, body)
+        # what each commit's checkout holds (the fake 4.3 has upstream's CMake 4 fix)
+        for full, text in ((FULL_1D117BE, CMAKELISTS_1D117BE), (FULL_43, CMAKELISTS_FIXED)):
+            with open(os.path.join(self.state, "CMakeLists-%s.txt" % full), "w") as f:
+                f.write(text)
         self.dest = os.path.join(self.home, "visionary-worker", "bin", "x265")
+        self.cmakelists = os.path.join(self.home, "visionary-worker", "build", "x265", "source",
+                                       "CMakeLists.txt")
         with open(BUILD, "rb") as f:
             self.script = f.read()
 
@@ -366,6 +529,48 @@ class BuildRun(Base):
         self.assertIn("-DLINKED_10BIT=ON -DLINKED_12BIT=ON", calls)
         self.assertIn("-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc", calls)
         self.assertIn("-DMAIN12=ON", calls)
+        with open(self.cmakelists) as f:                     # what the fake CMake 4 accepted
+            self.assertEqual(f.read(), CMAKELISTS_PATCHED)
+
+    def test_without_the_policy_rewrite_cmake_4_stops_the_build(self):
+        # the fake cmake is CMake 4 here: the same script minus its sed line fails at once
+        lines = self.script.decode().split("\n")
+        at = next(n for n, line in enumerate(lines) if line.startswith("run sed "))
+        self.assertTrue(lines[at].endswith("\\"))
+        self.script = "\n".join(lines[:at] + lines[at + 2:]).encode()
+        self.native_tools(ok=True)
+        rc, _, err = self.piped("--version", "4.1+1-1d117be")
+        self.assertEqual(rc, 1)
+        self.assertIn("FAILED: cmake -S ", err)
+        self.assertIn("may not be set to OLD behavior", err)
+        self.assertIn("the build failed", err)
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_bash_s_stops_after_main_even_when_stdin_never_ends(self):
+        """A tty forced on the ssh session (RequestTTY force in the user's ssh config) never
+        passes on the end of the script, so bash -s must not read on once main is done: after a
+        build, and when the build is already there."""
+        self.native_tools(ok=True)
+        for want in ("installed " + self.dest, "already installed"):
+            err_path = os.path.join(self.tmp, "stderr")
+            with open(os.devnull, "wb") as out, open(err_path, "wb") as err:
+                p = subprocess.Popen([BASH, "-s", "--", "--version", "4.3"],
+                                     stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                     env=self.env())
+                try:
+                    p.stdin.write(self.script)
+                    p.stdin.flush()                          # and never closed while it runs
+                    rc = p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+                    self.fail("bash -s kept waiting for input after main (%s)" % want)
+                finally:
+                    p.stdin.close()
+            with open(err_path) as f:
+                text = f.read()
+            self.assertEqual(rc, 0, text)
+            self.assertIn(want, text)
 
     def test_piped_into_bash_s_the_native_build_installs_a_tag_only_version(self):
         self.native_tools(ok=True)
@@ -384,6 +589,8 @@ class BuildRun(Base):
         self.assertIn("releasetagdistance: 0\n", text)
         self.assertIn("repositorychangeset: e9b8812\n", text)
         self.assertEqual(render_version(text), "4.3")
+        with open(self.cmakelists) as f:                     # a fixed source is left alone
+            self.assertEqual(f.read(), CMAKELISTS_FIXED)
 
     def test_an_installed_matching_build_is_kept_unless_forced(self):
         self.native_tools(ok=True)
@@ -476,17 +683,26 @@ class BuildRun(Base):
 # fake ssh: record the call, drop the options, run the command locally in FAKE_HOME. It prints
 # rc-file noise first, as a helper whose ~/.bashrc echoes for non-interactive shells does (a
 # 64-hex string among it, so only the right hash may pass); FAKE_SSH_CORRUPT drops the last
-# byte of what it is sent.
+# byte of what it is sent. FAKE_SSH_CONFIG_TTY=force plays a user ssh config with `RequestTTY
+# force`, which the command line overrides as the real ssh lets it; left in force, the session
+# fails at once where the real one would never see the end of its stdin and hang for good.
 FAKE_SSH = r'''#!/bin/bash
 echo "ssh $*" >> "$FAKE_LOG"
+tty=${FAKE_SSH_CONFIG_TTY:-}
 while [ $# -gt 0 ]; do
   case "$1" in
-    -i|-o) shift 2 ;;
+    -o) case "$2" in RequestTTY=*) tty=${2#RequestTTY=} ;; esac; shift 2 ;;
+    -i) shift 2 ;;
+    -T) tty=no; shift ;;
     -*) shift ;;
     *) break ;;
   esac
 done
 shift
+if [ "$tty" = force ]; then
+  echo "fake ssh: a tty was forced on the session; its stdin would never end" >&2
+  exit 99
+fi
 cd "$FAKE_HOME"
 printf 'Welcome to the helper\r\nnoise %s\n' "$(printf 'ab%.0s' $(seq 32))"
 printf 'no newline after this: '
@@ -526,6 +742,18 @@ class Install(Base):
         self.assertTrue(os.access(self.installed, os.X_OK))
         self.assertFalse(os.path.exists(self.installed.replace("vworker", ".vworker.new")))
 
+    def assert_ssh_ignores_the_users_config(self, count):
+        """Every ssh call install.sh made offers only the given key, never asks, and lets
+        nothing from the user's ssh config multiplex, jump or allocate a tty, as login_argv."""
+        calls = [line for line in self.calls().splitlines() if line.startswith("ssh ")]
+        self.assertEqual(len(calls), count, calls)
+        for line in calls:
+            opts = line.split(" worker@helper.local ")[0]
+            for opt in ("-i " + self.key, "-o IdentitiesOnly=yes", "-o BatchMode=yes",
+                        "-o ControlMaster=no", "-o ControlPath=none", "-o ProxyJump=none",
+                        "-o RequestTTY=no"):
+                self.assertIn(opt, opts)
+
     def test_rc_file_noise_around_the_hash_does_not_fail_the_check(self):
         self.fake("systemctl", '#!/bin/bash\necho "systemctl $*" >> "$FAKE_LOG"\n')
         rc, out, err = self.install()
@@ -534,7 +762,9 @@ class Install(Base):
         self.assertIn('"version":1', out)                    # it printed the helper's status
         self.assertNotIn("warning", err)
         calls = self.calls()
-        self.assertIn("ssh -i %s -o IdentitiesOnly=yes -o BatchMode=yes" % self.key, calls)
+        self.assertIn("ssh -i %s -o IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none "
+                      "-o ProxyJump=none -o RequestTTY=no -o BatchMode=yes" % self.key, calls)
+        self.assert_ssh_ignores_the_users_config(2)          # the copy, then the install
         self.assertIn("systemctl --user enable --now visionary-worker-sweep.timer", calls)
         self.assertTrue(os.path.exists(os.path.join(self.units, "visionary-worker-sweep.timer")))
 
@@ -548,6 +778,16 @@ class Install(Base):
         self.assertFalse(os.path.exists(self.installed))
         self.assertFalse(os.path.exists(self.installed.replace("vworker", ".vworker.new")))
         self.assertNotIn("systemctl", self.calls())
+        self.assert_ssh_ignores_the_users_config(2)          # the copy, then its cleanup
+
+    def test_a_tty_forced_by_the_users_ssh_config_cannot_hang_the_install(self):
+        self.fake("systemctl", '#!/bin/bash\necho "systemctl $*" >> "$FAKE_LOG"\n')
+        rc, out, err = self.install(FAKE_SSH_CONFIG_TTY="force")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("a tty was forced", err)
+        self.assert_installed()
+        self.assertIn('"version":1', out)
+        self.assertIn("systemctl --user enable --now visionary-worker-sweep.timer", self.calls())
 
     def test_a_helper_without_systemctl_installs_without_the_timer(self):
         rc, out, err = self.install()                        # the Mac has no systemctl

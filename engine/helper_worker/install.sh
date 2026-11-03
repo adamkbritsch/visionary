@@ -17,7 +17,7 @@
 #
 # x265 is built separately, on the helper itself, by build-x265.sh, at the version this Mac's
 # `x265 --version` prints after "HEVC encoder version" (Setup's Build button does this):
-#   ssh -i <key> <user>@<host> 'bash -s -- --version <token>' < engine/helper_worker/build-x265.sh
+#   ssh -T -i <key> <user>@<host> 'bash -s -- --version <token>' < engine/helper_worker/build-x265.sh
 #
 # This script runs on macOS's bash 3.2, so it avoids bash 4 features.
 set -euo pipefail
@@ -60,9 +60,13 @@ sha256_of() {
 }
 
 # only the given key is offered (IdentitiesOnly), as the app's own ssh does: an agent holding
-# many keys could otherwise use up the helper's MaxAuthTries before this one is tried
+# many keys could otherwise use up the helper's MaxAuthTries before this one is tried. Nothing
+# from the user's ssh config can multiplex, jump or allocate a tty either: with a tty forced
+# (RequestTTY force) the remote end never sees the end of what is sent, so the copy's `cat` and
+# the install's `bash -s` would wait for good.
 ssh_helper() {
-  ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8 \
+  ssh -i "$key" -o IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none \
+      -o ProxyJump=none -o RequestTTY=no -o BatchMode=yes -o ConnectTimeout=8 \
       -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$user@$host" "$@"
 }
 
