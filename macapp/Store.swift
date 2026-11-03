@@ -146,8 +146,9 @@ final class AppStore: ObservableObject {
     }
     func saveSettings(_ body: [String: Any]) async {
         await post("/api/settings", body); await refresh()
-        // a new helper address, login or key: check the helper against what was just saved
-        if body.keys.contains(where: { ["helper_host", "helper_user", "helper_key"].contains($0) }) {
+        // a new helper address, login or key, or the Helper switch: check the helper against what
+        // was just saved (fresh: the engine's kept answer predates the save)
+        if !HelperSetupDTO.recheckKeys.isDisjoint(with: body.keys) {
             await fetchHelperSetup(fresh: true)
         }
     }
@@ -485,9 +486,10 @@ final class AppStore: ObservableObject {
     func fetchBordersStatus() async {
         if let b: BordersStatusDTO = await get("/api/borders/status") { bordersStatus = b }
     }
-    /// The helper's setup checks: signs in, Ethernet, worker, x265, status. Asked for only when
-    /// Setup opens, on Test, after a save and after a helper job, never on the poll. The engine
-    /// keeps an answer 30 s; `fresh` checks again now, an ssh round trip of a few seconds.
+    /// The helper's setup checks: signs in, Ethernet, worker, x265, sleep, status. Asked for only
+    /// when Setup opens or the helper becomes set up, on Test, after a save and after a helper
+    /// job, never on the poll. The engine keeps an answer 30 s; `fresh` checks again now, an ssh
+    /// round trip of a few seconds. While one is in flight Setup's job buttons wait for it.
     func fetchHelperSetup(fresh: Bool) async {
         helperChecks += 1
         defer { helperChecks -= 1 }
@@ -561,10 +563,12 @@ final class AppStore: ObservableObject {
             if installStatus?.active == nil { break }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
+        // a new key, worker or x265 changes what the helper's checks find: check it again first,
+        // before the slower preflight. Its in-flight count starts in the same main-actor turn as
+        // the job's end, so the row's button never shows live beside the old verdict.
+        if helperJob { await fetchHelperSetup(fresh: true) }
         await recheckSetup()
         await fetchBordersStatus()      // a finished borders_* download flips its row
-        // a new key, worker or x265 changes what the helper's checks find: check it again now
-        if helperJob { await fetchHelperSetup(fresh: true) }
     }
     func uploadDvProbe() async -> DvProbeDTO? {
         let (_, data) = await postResult("/api/setup/install-dv-probe", [:])
