@@ -72,4 +72,5 @@ With `helper_host` or `helper_user` empty the helper is *not set up*: it stays o
 status reads *off · not set up*. An address or login may hold letters, digits, `.`, `_` and
 `-`, starting with a letter or digit; a key path must be one line and not start with `-`. A
 value that breaks those rules is kept exactly as typed, never swapped for a default, and the
-helper stays off with *settings: bad host* (or user, or key) until it is fixed.
+helper stays off with *settings: bad host* (or user, or key) until it is fixed. Setup's
+*Signs in* row shows the same reason.

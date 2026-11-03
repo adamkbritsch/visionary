@@ -95,7 +95,8 @@ file-services panel); everything else there is optional.
 - **[Known limitations](docs/LIMITATIONS.md)**: scratch space, the AI border extension's cost,
   an overloaded NAS, and source replacement.
 - **[Helper](docs/HELPER.md)**: optional. A Linux machine on Ethernet encodes some of the
-  remux's segments alongside the Mac: what it needs, setup in the app, and when it steps aside.
+  remux's segments alongside the Mac: what it needs, setup in the app, and when it steps aside
+  (as soon as a game starts on it, or after about 10 seconds of anything heavy).
 
 Setting it up with [Claude Code](https://claude.com/claude-code)? It follows
 [CLAUDE.md](CLAUDE.md) and [docs/SETUP-CLAUDE.md](docs/SETUP-CLAUDE.md).
