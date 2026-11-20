@@ -2765,7 +2765,7 @@ class NativeRenderFitSpec(_DvRenderItem):
                     "color_range": None}
         self.assertIn("matrixin=170m:rangein=limited:transferin=709:primariesin=170m:",
                       self._spec(width=640, height=480, **untagged).pre_vf)        # NTSC SD
-        self.assertIn("matrixin=470bg:rangein=limited:transferin=709:primariesin=470bg:",
+        self.assertIn("matrixin=470bg:rangein=limited:transferin=709:primariesin=bt470bg:",
                       self._spec(width=720, height=576, **untagged).pre_vf)        # PAL SD
         self.assertNotIn("matrixin", self._spec(width=1280, height=720, **untagged).pre_vf)   # HD
         self.assertTrue(self._spec("yt_1080", width=1920, height=1080, color_range="pc").pre_vf

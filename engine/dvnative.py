@@ -423,6 +423,9 @@ def colour_front(info: dict) -> tuple:
     return m, p, rng == "pc"
 
 
+_ZSCALE_PRIMARIES = {"709": "709", "170m": "170m", "470bg": "bt470bg"}   # colour_front's names
+
+
 def colour_vf(matrix: str, primaries: str, full: bool = False) -> str:
     """PURE. The colour step: '' when the source already is the LUT's BT.709 limited Y'CbCr, else
     one zscale to BT.709 limited 16-bit 4:4:4 at the source's size — the matrix and range always,
@@ -436,7 +439,10 @@ def colour_vf(matrix: str, primaries: str, full: bool = False) -> str:
         return ""
     vf = f"zscale=matrixin={matrix}:rangein={'full' if full else 'limited'}"
     if primaries != "709":
-        vf += f":transferin=709:primariesin={primaries}:transfer=709:primaries=709"
+        # zscale names EBU's primaries "bt470bg": a bare "470bg" is a MATRIX name only, and as
+        # primaries it fails to parse ("Invalid chars 'bg'") — every untagged PAL source died here
+        vf += (f":transferin=709:primariesin={_ZSCALE_PRIMARIES[primaries]}"
+               f":transfer=709:primaries=709")
     return vf + ":matrix=709:range=limited,format=yuv444p16le"
 
 

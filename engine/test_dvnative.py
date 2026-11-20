@@ -1159,11 +1159,25 @@ class FitFrontEnd(unittest.TestCase):
         self.assertEqual(dvnative.colour_vf("709", "709", full=True),
                          "zscale=matrixin=709:rangein=full:matrix=709:range=limited,format=yuv444p16le")
         self.assertEqual(dvnative.colour_vf("470bg", "470bg"),
-                         "zscale=matrixin=470bg:rangein=limited:transferin=709:primariesin=470bg:"
+                         "zscale=matrixin=470bg:rangein=limited:transferin=709:primariesin=bt470bg:"
                          "transfer=709:primaries=709:matrix=709:range=limited,format=yuv444p16le")
         for bad in (("2020_ncl", "709"), ("709", "2020"), (None, "709")):
             with self.assertRaises(ValueError):
                 dvnative.colour_vf(*bad)
+
+    @unittest.skipUnless(os.path.exists(dvnative.FFMPEG), "the pinned ffmpeg is not installed")
+    def test_every_colour_vf_parses_in_the_pinned_ffmpeg(self):
+        # The strings above were once asserted while ffmpeg itself refused one of them (zscale
+        # has no primaries named "470bg"): run every front end the rules can produce, for real.
+        for matrix in ("709", "170m", "470bg"):
+            for primaries in ("709", "170m", "470bg"):
+                for full in (False, True):
+                    vf = dvnative.colour_vf(matrix, primaries, full) or "null"
+                    r = subprocess.run([dvnative.FFMPEG, "-hide_banner", "-v", "error", "-f", "lavfi",
+                                        "-i", "color=gray:s=720x576:r=25,format=yuv420p10le",
+                                        "-frames:v", "1", "-vf", vf, "-f", "null", "-"],
+                                       capture_output=True, text=True, timeout=60)
+                    self.assertEqual((r.returncode, r.stderr.strip()), (0, ""), vf)
 
     def test_fit_pad_vf(self):
         self.assertEqual(dvnative.fit_pad_vf(1920, 1080),
