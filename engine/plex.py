@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -558,15 +559,88 @@ def _set_collection(base, token, rating_key, names, section=YOUTUBE_SECTION, tim
         return r.status in (200, 201, 204)
 
 
+def youtube_upload_date(ts) -> str:
+    """PURE. 'YYYY-MM-DD' of a YouTube publish time (unix seconds, the Data API's publishedAt as
+    youtube.video_published keeps it), read as a UTC date — the day yt-dlp's upload_date and
+    youtarr's .nfo <premiered> name. '' when unknown."""
+    try:
+        ts = int(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def _local_noon(date: str) -> int:
+    """Unix time of 12:00 local on `date` ('YYYY-MM-DD') — noon, so no time zone between this Mac
+    and the server moves it onto another day."""
+    return int(time.mktime(time.strptime(date + " 12:00", "%Y-%m-%d %H:%M")))
+
+
+def _dates_ok(video, date: str) -> bool:
+    """PURE. Does this item already carry `date` as both its release date and its date added
+    (the day, in local time)? Judged by the DAY, not the second, so a one-off repair that set
+    another hour of the same day is left alone instead of being rewritten every sweep."""
+    if video is None or (video.get("originallyAvailableAt") or "")[:10] != date:
+        return False
+    try:
+        added = int(video.get("addedAt") or 0)
+    except ValueError:
+        return False
+    return added > 0 and time.strftime("%Y-%m-%d", time.localtime(added)) == date
+
+
+def _set_dates(base, token, rating_key, date, section=YOUTUBE_SECTION, timeout=15) -> bool:
+    """Set the item's date added and release date to its YouTube upload `date`, both LOCKED —
+    unlocked, Plex puts them back on its next refresh."""
+    q = urllib.parse.urlencode({"type": 1, "id": rating_key,
+                                "addedAt.value": _local_noon(date), "addedAt.locked": 1,
+                                "originallyAvailableAt.value": date,
+                                "originallyAvailableAt.locked": 1})
+    req = urllib.request.Request("%s/library/sections/%s/all?%s" % (base, section, q),
+                                 method="PUT", headers={"X-Plex-Token": token})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status in (200, 201, 204)
+
+
+def _learn_upload_times(root) -> int:
+    """Ask YouTube, once, for the upload time of every video in this library listing that
+    Visionary never recorded one for (it came in before the publish book, or by hand) — the
+    same batched videos.list call the download refresh makes (1 quota unit per 50 ids) — and
+    keep the answers (youtube.remember_published is permanent). -> how many were asked for.
+    Never raises: without an answer those videos are simply left undated."""
+    try:
+        import youtube
+        import ytdata
+        missing = sorted({vid for part in root.iter("Part")
+                          for path in [part.get("file") or ""]
+                          for vid in [youtube_video_id(path)]
+                          if vid and channel_of(path) and not youtube.video_published(vid)})
+        if missing:
+            meta = ytdata.video_meta(missing) or {}
+            youtube.remember_published({k: m.get("pub") for k, m in meta.items()})
+        return len(missing)
+    except Exception:
+        return 0
+
+
 def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
     """Put every YouTube video in a collection named after its channel — and, when it came
-    in as an imported PLAYLIST, in one named after that playlist too.
+    in as an imported PLAYLIST, in one named after that playlist too. And date it: its date
+    added and release date become the day it was uploaded to YouTube (user-dictated
+    2026-11-22), not the day its upscaled master landed.
 
     A SWEEP rather than a per-publish call on purpose: Plex only creates the item some time
     after the file lands, so tagging at upload would race the scan and silently miss. This
     re-checks everything and is a no-op for items already tagged, so it is safe to run
-    whenever — after a publish, or to repair a library by hand.
-    Returns {tagged, already, skipped, failed} (or {error} when Plex can't be reached).
+    whenever — after a publish, or to repair a library by hand. The same goes for the dates: a
+    re-created item (a replaced master gets a new ratingKey and today's addedAt) is put back
+    on its upload day by the next sweep. A video whose upload time Visionary never recorded is
+    looked up from YouTube once (_learn_upload_times); one it still can't learn is left as it
+    is ("undated"), and so is anything outside the YouTube folder (YouTube-raw).
+    Returns {tagged, already, skipped, failed, dated, dated_already, undated} (or {error} when
+    Plex can't be reached).
     """
     token = plex_token()
     if not token:
@@ -583,7 +657,14 @@ def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
             playlists = youtube.playlist_title_by_vid()
         except Exception:
             playlists = {}                 # no imports book yet — channels only, as before
-        out = {"tagged": 0, "already": 0, "skipped": 0, "failed": 0}
+        _learn_upload_times(root)          # fill any gap in the publish book first
+        try:
+            import youtube
+            published = youtube.video_published
+        except Exception:
+            published = lambda _vid: 0     # no publish book — collections only
+        out = {"tagged": 0, "already": 0, "skipped": 0, "failed": 0,
+               "dated": 0, "dated_already": 0, "undated": 0}
         for v in root.findall(".//Video"):
             rk = v.get("ratingKey")
             try:
@@ -607,10 +688,24 @@ def sync_youtube_collections(*, section=YOUTUBE_SECTION, timeout=20) -> dict:
             have = {c.get("tag") for c in meta.findall(".//Collection")}
             if set(want) <= have:
                 out["already"] += 1
-                continue
+            else:
+                try:
+                    out["tagged" if _set_collection(base, token, rk, want, section) else "failed"] += 1
+                except Exception:
+                    out["failed"] += 1
+            # the upload day, as both "date added" and the release date
             try:
-                out["tagged" if _set_collection(base, token, rk, want, section) else "failed"] += 1
+                date = youtube_upload_date(published(youtube_video_id(path)))
             except Exception:
-                out["failed"] += 1
+                date = ""
+            if not date:
+                out["undated"] += 1
+            elif _dates_ok(meta.find(".//Video"), date):
+                out["dated_already"] += 1
+            else:
+                try:
+                    out["dated" if _set_dates(base, token, rk, date, section) else "failed"] += 1
+                except Exception:
+                    out["failed"] += 1
         return out
     return {"error": "plex unreachable"}

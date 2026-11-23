@@ -62,6 +62,14 @@ same way: an 88-minute 4K interview needs about 80 GB. A 4K fast-path movie meas
   alike, every other packet bit-exact), and the log says how many joins it took out. Only that
   pattern is touched — jitter in DVD or old AVI audio is left to mkvmerge, which gets it right.
 
+- **In Plex, videos sort by when they were uploaded.** Shortly after a master lands, Visionary
+  sets its Plex *date added* and *release date* to the day the video went up on YouTube (noon
+  that day), locked so Plex's own refreshes keep them, and puts it in a collection named after
+  its channel (and its playlist, for a playlist import). The same pass re-checks the whole
+  YouTube library each time, so a replaced master — which Plex re-creates with today's date —
+  goes back to its upload day. The upload time comes from the YouTube Data API; anything
+  outside the YouTube library is never touched.
+
 - **Channels.** Subscribe from your own YouTube subscriptions, or paste a channel link.
   Each channel has a **scope** (most popular or all), a **max age**, its own output mode,
   loudness setting and pause. Visionary reads a channel's whole back catalogue — videos and

@@ -1,3 +1,4 @@
+import time
 import unittest
 from unittest import mock
 
@@ -260,6 +261,7 @@ class APlaylistIsBothItsOwnCollectionAndItsChannels(unittest.TestCase):
              mock.patch.object(youtube, "playlist_title_by_vid",
                                return_value={"aaaaaaaaaaa": "Best Builds",
                                              "bbbbbbbbbbb": "Best Builds"}), \
+             mock.patch.object(youtube, "video_published", return_value=0), \
              mock.patch.object(plex.urllib.request, "urlopen", side_effect=urlopen):
             res = plex.sync_youtube_collections()
         return res, puts
@@ -292,3 +294,162 @@ class APlaylistIsBothItsOwnCollectionAndItsChannels(unittest.TestCase):
         res, _puts = self._sweep(already=("DIY Perks", "Veritasium", "Auto Focus"))
         self.assertEqual(res["tagged"], 2)      # the two playlist videos; the third is done
         self.assertEqual(res["already"], 1)
+
+
+class YouTubeUploadDates(unittest.TestCase):
+    """A video's Plex "date added" and release date are the day it was uploaded to YouTube, not
+    the day its upscaled master landed (user-dictated 2026-11-22). Set by the same delayed sweep
+    as the collections, so a re-created item (new ratingKey, today's addedAt) is put back on its
+    upload day by the next sweep."""
+
+    UP = "/Media/YouTube/DIY Perks/a [aaaaaaaaaaa]/a [aaaaaaaaaaa].mp4"
+    RAW = "/Media/YouTube-raw/DIY Perks/b [bbbbbbbbbbb].mp4"
+    NOID = "/Media/YouTube/DIY Perks/c [ccccccccccc]/c [ccccccccccc].mp4"
+    # 2024-03-01 03:00 UTC: still 29 February in Denver, so a local reading would be a day early
+    TS = 1709262000
+
+    def test_the_upload_day_is_the_utc_date(self):
+        self.assertEqual(plex.youtube_upload_date(self.TS), "2024-03-01")
+        self.assertEqual(plex.youtube_upload_date(0), "")
+        self.assertEqual(plex.youtube_upload_date(None), "")
+        self.assertEqual(plex.youtube_upload_date("junk"), "")
+
+    def test_noon_local_stays_on_the_day(self):
+        t = plex._local_noon("2024-03-01")
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.localtime(t)), "2024-03-01 12:00")
+
+    def _video(self, added=None, released=None):
+        import xml.etree.ElementTree as ET
+        attrs = ""
+        if added is not None:
+            attrs += ' addedAt="%d"' % added
+        if released is not None:
+            attrs += ' originallyAvailableAt="%s"' % released
+        return ET.fromstring("<Video%s/>" % attrs)
+
+    def test_already_on_the_day_is_judged_by_the_day_not_the_second(self):
+        noon = plex._local_noon("2024-03-01")
+        self.assertTrue(plex._dates_ok(self._video(noon, "2024-03-01"), "2024-03-01"))
+        self.assertTrue(plex._dates_ok(self._video(noon - 3 * 3600, "2024-03-01"), "2024-03-01"))
+        self.assertFalse(plex._dates_ok(self._video(int(time.time()), "2024-03-01"), "2024-03-01"))
+        self.assertFalse(plex._dates_ok(self._video(noon, None), "2024-03-01"))
+        self.assertFalse(plex._dates_ok(None, "2024-03-01"))
+
+    def _sweep(self, metas, published):
+        puts = []
+        lib = "<MediaContainer>%s</MediaContainer>" % "".join(
+            '<Video ratingKey="%s"/>' % rk for rk in metas)
+
+        def get(base, path, token, timeout=20):
+            if path.endswith("/all"):
+                return lib.encode()
+            return metas[path.rsplit("/", 1)[-1]].encode()
+
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def urlopen(req, timeout=None):
+            puts.append(req.full_url)
+            return Resp()
+
+        import youtube
+        with mock.patch.object(plex, "_get", side_effect=get), \
+             mock.patch.object(plex, "plex_token", return_value="tok"), \
+             mock.patch.object(plex, "plex_base_urls", return_value=["http://p:32400"]), \
+             mock.patch.object(youtube, "playlist_title_by_vid", return_value={}), \
+             mock.patch.object(youtube, "video_published",
+                               side_effect=lambda vid: published.get(vid, 0)), \
+             mock.patch.object(plex.urllib.request, "urlopen", side_effect=urlopen):
+            res = plex.sync_youtube_collections()
+        return res, puts
+
+    @staticmethod
+    def _meta(path, added, released=None, collections=("DIY Perks",)):
+        cols = "".join('<Collection tag="%s"/>' % c for c in collections)
+        rel = ' originallyAvailableAt="%s"' % released if released else ""
+        return ('<MediaContainer><Video addedAt="%d"%s>%s<Media><Part file="%s"/></Media></Video>'
+                '</MediaContainer>' % (added, rel, cols, path))
+
+    def test_a_fresh_master_gets_its_upload_day_locked(self):
+        res, puts = self._sweep({"7": self._meta(self.UP, int(time.time()))},
+                                {"aaaaaaaaaaa": self.TS})
+        self.assertEqual((res["dated"], res["already"]), (1, 1))
+        self.assertEqual(len(puts), 1)
+        q = puts[0]
+        self.assertIn("/library/sections/10/all?", q)
+        self.assertIn("id=7", q)
+        self.assertIn("addedAt.value=%d" % plex._local_noon("2024-03-01"), q)
+        self.assertIn("addedAt.locked=1", q)
+        self.assertIn("originallyAvailableAt.value=2024-03-01", q)
+        self.assertIn("originallyAvailableAt.locked=1", q)
+
+    def test_a_second_sweep_leaves_it_alone(self):
+        noon = plex._local_noon("2024-03-01")
+        res, puts = self._sweep({"7": self._meta(self.UP, noon, "2024-03-01")},
+                                {"aaaaaaaaaaa": self.TS})
+        self.assertEqual(res["dated_already"], 1)
+        self.assertEqual(puts, [])
+
+    def test_youtube_raw_is_never_touched(self):
+        res, puts = self._sweep({"8": self._meta(self.RAW, int(time.time()), collections=())},
+                                {"bbbbbbbbbbb": self.TS})
+        self.assertEqual((res["skipped"], res["dated"]), (1, 0))
+        self.assertEqual(puts, [])
+
+    def test_no_recorded_upload_time_leaves_the_dates_alone(self):
+        res, puts = self._sweep({"9": self._meta(self.NOID, int(time.time()))}, {})
+        self.assertEqual((res["undated"], res["dated"]), (1, 0))
+        self.assertEqual(puts, [])
+
+    def test_dates_are_set_even_when_the_collection_needs_tagging_too(self):
+        res, puts = self._sweep({"7": self._meta(self.UP, int(time.time()), collections=())},
+                                {"aaaaaaaaaaa": self.TS})
+        self.assertEqual((res["tagged"], res["dated"]), (1, 1))
+        self.assertEqual(len(puts), 2)
+        self.assertIn("collection", puts[0])
+        self.assertNotIn("collection", puts[1])
+
+
+class UnrecordedUploadTimesAreLookedUpOnce(unittest.TestCase):
+    """A video Visionary never recorded an upload time for (125 of the library's, live
+    2026-11-22) is asked of YouTube once per sweep, in the download refresh's own batched call,
+    and the answer kept — so a replaced master of it can still be put back on its upload day."""
+
+    LIST = ('<MediaContainer>'
+            '<Video ratingKey="1"><Media><Part file="/m/YouTube/Ch/a [aaaaaaaaaaa]/a [aaaaaaaaaaa].mp4"/></Media></Video>'
+            '<Video ratingKey="2"><Media><Part file="/m/YouTube/Ch/b [bbbbbbbbbbb]/b [bbbbbbbbbbb].mp4"/></Media></Video>'
+            '<Video ratingKey="3"><Media><Part file="/m/YouTube-raw/Ch/c [ccccccccccc].mp4"/></Media></Video>'
+            '</MediaContainer>')
+
+    def _learn(self, known, answer):
+        import xml.etree.ElementTree as ET
+        import youtube
+        import ytdata
+        asked, kept = [], {}
+        with mock.patch.object(youtube, "video_published", side_effect=lambda v: known.get(v, 0)), \
+             mock.patch.object(ytdata, "video_meta",
+                               side_effect=lambda ids: asked.append(list(ids)) or answer), \
+             mock.patch.object(youtube, "remember_published", side_effect=kept.update):
+            n = plex._learn_upload_times(ET.fromstring(self.LIST))
+        return n, asked, kept
+
+    def test_only_the_unrecorded_youtube_videos_are_asked_for_in_one_call(self):
+        n, asked, kept = self._learn({"aaaaaaaaaaa": 1709262000},
+                                     {"bbbbbbbbbbb": {"secs": 60, "pub": 1700000000}})
+        self.assertEqual(n, 1)
+        self.assertEqual(asked, [["bbbbbbbbbbb"]])          # never YouTube-raw's, never a known one
+        self.assertEqual(kept, {"bbbbbbbbbbb": 1700000000})
+
+    def test_nothing_missing_means_no_call(self):
+        n, asked, _kept = self._learn({"aaaaaaaaaaa": 1, "bbbbbbbbbbb": 2}, {})
+        self.assertEqual((n, asked), (0, []))
+
+    def test_a_failed_lookup_never_raises(self):
+        import xml.etree.ElementTree as ET
+        import youtube
+        import ytdata
+        with mock.patch.object(youtube, "video_published", return_value=0), \
+             mock.patch.object(ytdata, "video_meta", side_effect=RuntimeError("quota")):
+            self.assertEqual(plex._learn_upload_times(ET.fromstring(self.LIST)), 0)

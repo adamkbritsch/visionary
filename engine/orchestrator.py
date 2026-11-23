@@ -4639,7 +4639,8 @@ class Orchestrator:
         return self._dual_remux_live()
 
     def _sync_youtube_collections(self) -> None:
-        """Group published videos under their channel in Plex, on a delay.
+        """Group published videos under their channel in Plex, and put their date added and
+        release date on the YouTube upload day (plex.sync_youtube_collections), on a delay.
 
         Plex creates the item some time AFTER the file lands, so tagging the moment the
         upload verifies would race its scan and silently miss — which is how that library
@@ -5115,7 +5116,7 @@ class Orchestrator:
                         youtube.mark_done(vid)
                         youtube.clear_resume_first(p.series)  # completed → no longer 'first on resume'
                         youtube.refresh_videos(p.series)      # channel stays queued (standing sub)
-                        self._sync_youtube_collections()      # group it under its channel in Plex
+                        self._sync_youtube_collections()      # its channel collection + upload-day dates in Plex
                     elif p.movie:                             # a queued movie finished (keyed off the
                         movies.remove_selected(p.source_basename)   # ITEM, not queue membership — a movie
                         movies.refresh_library()                    # removed mid-pipeline is still a movie,
