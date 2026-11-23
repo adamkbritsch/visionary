@@ -4472,6 +4472,24 @@ struct NoticesCard: View {
                 }
             }
         }
+        // LOW DISK (user-dictated 2026-11-22: "an in app notification that says when it's in the
+        // 400 gb minimum (variable to what is decided in settings) ... when it's okay, don't add
+        // anything"). The same number the pipeline's own disk gate compares (scratch free_gb:
+        // free space plus the working files cleanup recycles) against the Settings minimum, so
+        // this card and a "paused — low disk" hold always agree. Absent when there is room.
+        if let free = store.state?.scratch?.free_gb {
+            let floor = store.state?.settings?.min_free_gb ?? 400
+            if free < Double(floor) {
+                Card(title: "Low on disk space", systemImage: "externaldrive.badge.exclamationmark") {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(Int(free.rounded(.down))) GB free, under the \(floor) GB minimum")
+                            .font(.system(size: 13, weight: .medium)).foregroundStyle(DS.steelBright)
+                        Text("Nothing new starts until there's room. The minimum is set in Settings.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
         // FIRST-RUN: everything else healthy but setup incomplete (no config yet, tools
         // missing) — point at the one place that finishes it.
         if let t, t.hard_ok != false, t.setup_complete == false {
