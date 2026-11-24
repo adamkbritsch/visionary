@@ -1261,7 +1261,8 @@ def scope_works(systemd_run):
 def scope_argv(cfg, job_id, b64, budget):
     """The re-exec of `vworker encode <job> <b64>` inside a transient user scope of its own,
     visionary-x265-<job>, capped at `budget` bytes (MemoryHigh; MemoryMax SCOPE_MAX_EXTRA
-    above)."""
+    above). systemd-run (254 and later) expands $VAR in the command it runs, so every argument
+    here must stay free of '$': the job id is hex, the payload base64, the two paths fixed."""
     return [cfg.systemd_run, "--user", "--scope", "--quiet", "--collect",
             "--unit=%s%s" % (SCOPE_UNIT_PREFIX, job_id),
             "-p", "MemoryHigh=%d" % budget, "-p", "MemoryMax=%d" % (budget + SCOPE_MAX_EXTRA),
