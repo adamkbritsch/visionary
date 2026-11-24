@@ -144,7 +144,7 @@ check beside it, and **Test** runs the checks again.
 |---|---|
 | Helper connected · on seg 9 · 7.9 fps · did 10–11 | It is encoding segment 9 of this item at 7.9 fps and has finished segments 10 and 11. The header reads *Helper working*. |
 | Helper ready · waiting for the next segment | Free and allowed: it takes the next segment from the back. |
-| Helper paused · a game is running on it | It stepped aside for a game: one running, just started, waking up, or resting for less than a minute. |
+| Helper paused · a game is running on it | It stepped aside for a game: one running, just started, waking up, resting for less than a minute, or (where a rest manager runs) frozen only behind its quick menu or home. |
 | Helper paused · it's busy | Something heavy is running on it, or it already has a job. |
 | Helper paused · it's low on memory | Less than about 3.5 GB of memory free, or less than 6.5 GB beside a resting game (a big game at rest can hold 9 GB). Also when a game rests and the helper can't fence off its own memory. |
 | Helper paused · it's low on disk space | Less than 5 GB free. |
@@ -198,13 +198,21 @@ The helper polices itself, whatever the Mac thinks.
   ssh, it doesn't work beside a resting game (*Helper paused · it's low on memory*). With no
   game resting it needs 3.5 GB to start and steps aside below 0.75 GB. If memory ever ran out,
   the helper's own processes are the first the kernel would stop, never the game.
-- **A rest manager.** On a machine whose rest manager leaves a wake marker (a small file in
-  your runtime folder that says when it began waking a game), the helper also refuses, or
-  steps aside, while that marker is fresh. It only ever reads it, and on such a machine it
-  takes no keep-awake hold at all (see [Keeping it awake](#keeping-it-awake)).
+- **A rest manager.** On a machine whose rest manager leaves a status file (in your runtime
+  folder), only a **real rest** counts: the console itself at rest and the game held at
+  *rest*. A game frozen only behind its quick menu or its home is the console in use, so the
+  helper doesn't start there, and a segment already running stops within a quarter of a second
+  when the game leaves the rest that way. It also refuses, or steps aside, while the file's
+  wake marker (when the manager began waking a game) is fresh. It only ever reads that file,
+  and on such a machine it takes no keep-awake hold at all (see
+  [Keeping it awake](#keeping-it-awake)).
 - **Its x265 runs at the lowest CPU priority** (SCHED_IDLE, or nice 19 where that is not
-  available) and the idle I/O priority (`ionice -c 3`, where that works), so the desktop
-  always comes first.
+  available) and the idle I/O priority (`ionice -c 3`, where that works). Where the helper's
+  systemd can start a scope of its own (a transient user scope), each segment also runs in one
+  at **idle CPU weight** (`CPUWeight=idle`): Linux shares the CPU between groups of programs
+  before it looks at their priorities, and this makes the whole group take only CPU nobody
+  else wants, so the desktop, a game and Steam's own updates and shader pre-caching always
+  come first.
 - **On every stop** it kills its zstd and x265 and deletes that job's folder. The Mac deletes
   the partial segment it received and encodes that segment itself.
 - After the helper steps aside for a game, a heavy program or low memory, Visionary **leaves it

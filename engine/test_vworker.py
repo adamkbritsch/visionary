@@ -668,6 +668,9 @@ STEAM_CGROUP = APP_SLICE + "/app-steam@autostart.service"
 GTA_SCOPE = APP_SLICE + "/app-steam-app3240220-1829784.scope"
 STEAMRT = STEAM_DIR + "/steamapps/common/SteamLinuxRuntime_4/steamrt64"
 GTA = "Steam app 3240220"                     # its label: the wrapper's, the first in pid order
+# its rest manager's file during a real rest: the console at rest, the game held at "rest"
+GTA_AT_REST = {"state": "rest", "game": [{"appid": "3240220", "frozen": True, "holds": ["rest"],
+                                          "suspended": False, "suspended_since": None}]}
 GTA_WRAPPER, GTA_REAPER, GTA_WINESERVER, GTA_EXE = 1829775, 1829784, 1831150, 1831209
 
 
@@ -3751,13 +3754,13 @@ class EncodeEndToEnd(EncodeBase):
 
     def test_a_game_waking_up_mid_job_yields_within_a_quarter_second(self):
         self.resting_gta()
-        write_rest_file(self.rest_file, state="resting")          # the rest manager, idle
+        write_rest_file(self.rest_file, **GTA_AT_REST)            # the rest manager: a real rest
         scope, _log = self.scope_env()
         run = self.start("seg_waking", 50, dv=False, VWORKER_WATCH_INTERVAL=30, **scope)
         pid = self.wait_started()
         time.sleep(0.5)
         self.assertIsNone(run.p.poll(), run.stderr[-800:])
-        write_rest_file(self.rest_file, state="resting", waking=local_time(time.time()))
+        write_rest_file(self.rest_file, waking=local_time(time.time()), **GTA_AT_REST)
         t0 = time.monotonic()
         rc = run.wait()
         elapsed = time.monotonic() - t0
@@ -3888,7 +3891,7 @@ class EncodeEndToEnd(EncodeBase):
         self.assertEqual(probe, vworker.SCOPE_PROBE_ARGS)        # can it start a scope at all?
         budget = (8 << 30) - int(3.5 * (1 << 30))                 # MemAvailable - 3.5 GiB
         self.assertEqual(rexec, ["--user", "--scope", "--quiet", "--collect",
-                                 "--unit=visionary-x265-seg_scope",
+                                 "--unit=visionary-x265-seg_scope", "-p", "CPUWeight=idle",
                                  "-p", "MemoryHigh=%d" % budget,
                                  "-p", "MemoryMax=%d" % (budget + (256 << 20)),
                                  "--", sys.executable, VWORKER, "encode", "seg_scope", spec])
@@ -3897,16 +3900,22 @@ class EncodeEndToEnd(EncodeBase):
             ppid, in_scope = f.read().split(" ")
         self.assertEqual((int(ppid), in_scope), (run.p.pid, "1"))   # the same process, in it
         self.assert_cleaned("seg_scope")
-        # with no game at rest it runs where it is: no scope
+        # with no game at rest it still goes on in a scope of its own, for its idle CPU
+        # weight (Steam's updates, a game, the desktop first), but with no memory cap
         shutil.rmtree(self.proc)
         os.makedirs(self.proc)
         scope2, log2 = self.scope_env()
         run = self.start("seg_noscope", 3, dv=False, **scope2)
         run.feed(zstd_compress(y4m(3)))
         self.assertEqual(run.wait(), 0, run.stderr[-800:])
-        self.assertEqual(self.calls(log2), [])
+        self.assertEqual(run.stdout, expected_hevc(3))
+        self.assertEqual(self.calls(log2), [
+            vworker.SCOPE_PROBE_ARGS,
+            ["--user", "--scope", "--quiet", "--collect", "--unit=visionary-x265-seg_noscope",
+             "-p", "CPUWeight=idle", "--", sys.executable, VWORKER, "encode", "seg_noscope",
+             b64spec(visionary_args(False), 3)]])
         with open(self.ran + ".ppid") as f:
-            self.assertEqual(f.read().split(" ")[1], "")
+            self.assertEqual(f.read().split(" ")[1], "1")
 
     def test_a_lost_connection_still_ends_the_job_inside_its_scope(self):
         # outside the ssh session's scope, logind no longer ends it with the session: it must
@@ -4482,6 +4491,107 @@ class Scripts(unittest.TestCase):
                             "u", "k"], capture_output=True, timeout=10)
         self.assertEqual(r.returncode, 2)
 
+
+
+class RealRestOnly(Tmp):
+    """With a rest manager on the machine (its file), only a REAL rest counts: the console
+    itself at rest (top-level "state" "rest", the TV dark) and the game held at "rest". A game
+    frozen only by its quick menu or behind its home is the console in use: an encode would lag
+    it. Without a rest manager the freezer alone decides, as before. And every encode runs at
+    idle CPU weight, so Steam's updates, a game and the desktop go first."""
+
+    HOME = {"state": "home", "game": [{"appid": "3240220", "frozen": True, "holds": ["home"]}]}
+
+    def test_the_holds_are_read_only_while_the_console_rests(self):
+        h = vworker.rest_holds
+        self.assertIsNone(h(self.rest_file))                         # no rest manager here
+        write(self.rest_file, '{"state": "re')                       # half written
+        self.assertIs(h(self.rest_file), False)
+        write(self.rest_file, "[1, 2]")
+        self.assertIs(h(self.rest_file), False)
+        write_rest_file(self.rest_file, **self.HOME)                 # the console in use
+        self.assertEqual(h(self.rest_file), {})
+        write_rest_file(self.rest_file, state="rest", game=[
+            {"appid": "3240220", "holds": ["rest", "home"]},
+            {"appid": "730", "holds": "rest"},                       # not a list: no holds
+            {"appid": "x1", "holds": ["rest"]},                      # no AppId: skipped
+            "junk"])
+        self.assertEqual(h(self.rest_file),
+                         {3240220: frozenset({"rest", "home"}), 730: frozenset()})
+
+    def test_only_a_steam_game_held_at_rest_is_a_real_rest(self):
+        r = vworker.real_rest
+        self.assertTrue(r(3240220, None))                            # no rest manager: the freezer
+        self.assertTrue(r(("pid", 5), None))
+        self.assertTrue(r(3240220, {3240220: frozenset({"rest"})}))
+        self.assertTrue(r(3240220, {3240220: frozenset({"rest", "home"})}))
+        for holds in ({3240220: frozenset({"home"})}, {3240220: frozenset({"menu"})},
+                      {3240220: frozenset()}, {}, False):
+            self.assertFalse(r(3240220, holds), holds)
+        self.assertFalse(r(("pid", 5), {3240220: frozenset({"rest"})}))   # not one it rests
+        self.assertFalse(r(True, {1: frozenset({"rest"})}))
+
+    def test_a_frozen_game_counts_as_resting_only_in_a_real_rest(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        ps = vworker.list_procs(self.proc)
+
+        def scan(holds):
+            s = vworker.scan_games(ps, (), self.proc, self.sys, holds=holds)
+            return s.running, s.resting
+
+        self.assertEqual(scan(None), (None, GTA))                    # no rest manager
+        self.assertEqual(scan({3240220: frozenset({"rest"})}), (None, GTA))
+        for holds in ({3240220: frozenset({"home"})}, {3240220: frozenset({"menu"})}, {},
+                      False):
+            self.assertEqual(scan(holds), (GTA, None), holds)
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_status_counts_only_a_real_rest(self):
+        write_meminfo(self.proc, 8.0)
+        cfg = self.cfg(rest_min_age=0)
+        add_gta(self.proc, self.sys, frozen=True)
+        write_rest_file(self.rest_file, **GTA_AT_REST)
+        st = self.status(cfg)
+        self.assertEqual((st["ok"], st["code"], st["game"], st["resting_game"]),
+                         (True, "ready", None, GTA))
+        write_rest_file(self.rest_file, **self.HOME)                 # back on its home
+        st = self.status(cfg)
+        self.assertEqual((st["ok"], st["code"], st["game"], st["resting_game"], st["why"]),
+                         (False, "game", GTA, None, "game running: %s" % GTA))
+
+    def test_a_job_stops_when_its_game_leaves_the_rest(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        write_rest_file(self.rest_file, **GTA_AT_REST)
+        rests = vworker.scan_games(vworker.list_procs(self.proc), (), self.proc, self.sys,
+                                   holds=vworker.rest_holds(self.rest_file)).rests
+        self.assertEqual(len(rests), 1)
+        rests[0].label = GTA
+        got, stop = [], threading.Event()
+        w = vworker.FastWatch(self.cfg(), stop, lambda why, code: got.append((why, code)),
+                              got.append, interval=0.05)
+        w.watch(rests)
+        w.cache = {}
+        self.assertIsNone(w.tick())                                  # a real rest: carry on
+        write_rest_file(self.rest_file, **self.HOME)                 # still frozen, console in use
+        self.assertEqual(w.tick(), (vworker.WHY_NOT_RESTING % GTA, "game"))
+        write(self.rest_file, '{"state": "re')                       # half written: next look
+        self.assertNotEqual((w.tick() or ("", ""))[0], vworker.WHY_NOT_RESTING % GTA)
+
+    def test_every_encode_scope_has_idle_cpu_weight(self):
+        cfg = self.cfg()
+        cfg.systemd_run = "/usr/bin/systemd-run"
+        plain = vworker.scope_argv(cfg, "abc123", "QkFTRTY0")
+        self.assertEqual(plain[:8], ["/usr/bin/systemd-run", "--user", "--scope", "--quiet",
+                                     "--collect", "--unit=visionary-x265-abc123", "-p",
+                                     "CPUWeight=idle"])
+        self.assertFalse(any(a.startswith("Memory") for a in plain))
+        capped = vworker.scope_argv(cfg, "abc123", "QkFTRTY0", budget=3 << 30)
+        self.assertIn("CPUWeight=idle", capped)
+        self.assertIn("MemoryHigh=%d" % (3 << 30), capped)
+        self.assertIn("MemoryMax=%d" % ((3 << 30) + (256 << 20)), capped)
+        self.assertIn("CPUWeight=idle", vworker.SCOPE_PROBE_ARGS)   # an old systemd says no
+        for argv in (plain, capped):
+            self.assertFalse(any("$" in a for a in argv))
 
 if __name__ == "__main__":
     unittest.main()

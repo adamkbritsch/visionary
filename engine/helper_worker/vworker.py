@@ -164,8 +164,15 @@ REST_RESERVE_GB = 3.5
 REST_MIN_BUDGET_GB = 3.0
 SCOPE_MAX_EXTRA = 256 << 20            # the scope's MemoryMax: this far above MemoryHigh
 SCOPE_UNIT_PREFIX = "visionary-x265-"  # never app-steam-app*: a rest mode freezes those
-# may this session start a transient scope? (asked once per process, before a re-exec)
-SCOPE_PROBE_ARGS = ["--user", "--scope", "--quiet", "--collect", "--", "true"]
+# Every encode runs in a scope of its own at idle CPU weight: SCHED_IDLE only orders x265
+# within its own cgroup, and a cgroup with default weight still gets an equal share against
+# its siblings (Steam's updates and shader pre-caching, the desktop) whenever both are busy;
+# cpu.idle (CPUWeight=idle) makes the whole scope take only CPU nobody else wants.
+SCOPE_CPU_PROPERTY = "CPUWeight=idle"
+# may this session start a transient scope at that weight? (asked once per process, before a
+# re-exec; a systemd too old for CPUWeight=idle answers no, so it is never asked to)
+SCOPE_PROBE_ARGS = ["--user", "--scope", "--quiet", "--collect", "-p", SCOPE_CPU_PROPERTY,
+                    "--", "true"]
 SCOPE_PROBE_TIMEOUT = 3.0
 # a rest manager's file, in $XDG_RUNTIME_DIR, only ever read: its top-level "waking" (a local
 # time, "YYYY-MM-DD HH:MM:SS", there only while it continues a game) no older than
@@ -180,6 +187,8 @@ WHY_WAKING = "a game is waking up"
 WHY_WOKE = "a game woke up: %s"
 WHY_STARTED = "a game started: %s"
 WHY_NO_CAP = "a game is resting and its memory can't be capped"
+WHY_NOT_RESTING = "a game is no longer resting: %s"
+WHY_NO_SCOPE = "could not start its own scope"
 PF_KTHREAD = 0x00200000
 PF_EXITING = 0x00000004                # /proc/<pid>/stat flags: the task is shutting down
 DEAD_STATES = ("Z", "X", "x")          # /proc/<pid>/stat states of a task that is gone
@@ -975,7 +984,7 @@ def _game_candidate(p, procs, children, appid_of):
 
 
 def scan_games(procs, exclude=(), proc_root=None, sys_root=None, ages=None, known=(),
-               min_age=REST_MIN_AGE_S):
+               min_age=REST_MIN_AGE_S, holds=None):
     """detect_game's whole answer -> GameScan: the running game, and the resting ones it
     skipped. A RESTING game does not count:
       - a Steam game whose AppId has its own scopes (cgroups app-steam-app<AppId>-<pid>.scope,
@@ -992,7 +1001,9 @@ def scan_games(procs, exclude=(), proc_root=None, sys_root=None, ages=None, know
     candidates; a scope that emptied, and -- `known`: the Rests a job saw -- launches met
     again with nothing else of their AppId left are an exit: no game. `ages(keys)` -> {key:
     seconds at rest} (RestSeen.update): a rest younger than `min_age` still counts as running
-    (a quick pause); without it every rest counts. Anything that can't be told counts as
+    (a quick pause); without it every rest counts. `holds` (rest_holds; None: no rest manager)
+    keeps only a real rest: with a rest manager, a game it doesn't hold at "rest" while the
+    console rests (real_rest) still counts as running. Anything that can't be told counts as
     running. Only candidates and the processes of a candidate's AppId have their cgroup read,
     and only that AppId's scopes."""
     children = {}
@@ -1109,7 +1120,7 @@ def scan_games(procs, exclude=(), proc_root=None, sys_root=None, ages=None, know
     young = set() if age is None else {k for k in keys if age.get(k, 0.0) < min_age}
     running, labels, out = None, {}, {}
     for label, key, rests in marks:
-        if rests is None or any(r.key in young for r in rests):
+        if rests is None or any(r.key in young for r in rests) or not real_rest(key, holds):
             running = running or label
         elif key not in runs:                        # a game with anything running: not resting
             labels.setdefault(key, label)            # one label per game: its first candidate's
@@ -1229,6 +1240,48 @@ def rest_marker(path, wall=time.time):
     return abs(now - t) <= WAKE_MAX_AGE_S
 
 
+def rest_holds(path):
+    """A rest manager's file (only ever read) -> None when there is none; False when its JSON
+    can't be read this time (half written, unreadable); else {AppId: frozenset of its holds}
+    for the games it lists -- but only while the console itself rests (top-level "state"
+    "rest": the TV dark), and {} otherwise."""
+    if not os.path.exists(path):
+        return None
+    raw = _read(path)
+    try:
+        data = json.loads(raw) if raw else None
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("state") != "rest":
+        return {}
+    out = {}
+    for g in data.get("game") or ():
+        if not isinstance(g, dict):
+            continue
+        try:
+            appid = int(str(g.get("appid")).strip())
+        except ValueError:
+            continue
+        holds = g.get("holds")
+        out[appid] = frozenset(h for h in holds if isinstance(h, str)) \
+            if isinstance(holds, list) else frozenset()
+    return out
+
+
+def real_rest(game, holds):
+    """Does a resting game count, given the rest manager's holds (rest_holds; None: no rest
+    manager here, so every rest the freezer shows counts)? With one, only a Steam game (`game`
+    its AppId) it holds at "rest" while the console rests: a game frozen only by its quick menu
+    or behind its home is a console in use, and an encode would lag it; a file that can't be
+    read (False) counts no rest."""
+    if holds is None:
+        return True
+    return isinstance(game, int) and not isinstance(game, bool) \
+        and "rest" in (holds or {}).get(game, ())
+
+
 def own_memory_max(proc_root, sys_root):
     """MemoryMax of this process's own cgroup (memory.max), in bytes, or None when it has none
     ("max") or it can't be told (no memory controller there, cgroup v1)."""
@@ -1258,15 +1311,17 @@ def scope_works(systemd_run):
     return _SCOPE_PROBE[systemd_run]
 
 
-def scope_argv(cfg, job_id, b64, budget):
+def scope_argv(cfg, job_id, b64, budget=None):
     """The re-exec of `vworker encode <job> <b64>` inside a transient user scope of its own,
-    visionary-x265-<job>, capped at `budget` bytes (MemoryHigh; MemoryMax SCOPE_MAX_EXTRA
-    above). systemd-run (254 and later) expands $VAR in the command it runs, so every argument
-    here must stay free of '$': the job id is hex, the payload base64, the two paths fixed."""
-    return [cfg.systemd_run, "--user", "--scope", "--quiet", "--collect",
-            "--unit=%s%s" % (SCOPE_UNIT_PREFIX, job_id),
-            "-p", "MemoryHigh=%d" % budget, "-p", "MemoryMax=%d" % (budget + SCOPE_MAX_EXTRA),
-            "--", sys.executable, os.path.abspath(__file__), "encode", job_id, b64]
+    visionary-x265-<job>, always at idle CPU weight (SCOPE_CPU_PROPERTY) and, beside a
+    resting game, capped at `budget` bytes (MemoryHigh; MemoryMax SCOPE_MAX_EXTRA above).
+    systemd-run (254 and later) expands $VAR in the command it runs, so every argument here
+    must stay free of '$': the job id is hex, the payload base64, the two paths fixed."""
+    argv = [cfg.systemd_run, "--user", "--scope", "--quiet", "--collect",
+            "--unit=%s%s" % (SCOPE_UNIT_PREFIX, job_id), "-p", SCOPE_CPU_PROPERTY]
+    if budget is not None:
+        argv += ["-p", "MemoryHigh=%d" % budget, "-p", "MemoryMax=%d" % (budget + SCOPE_MAX_EXTRA)]
+    return argv + ["--", sys.executable, os.path.abspath(__file__), "encode", job_id, b64]
 
 
 _IONICE_PROBE = {}                     # ionice path -> does `ionice -c 3` work here?
@@ -1730,7 +1785,9 @@ class FastWatch:
     """The quick half of "a game stops a job at once": ONE light thread for the whole encode,
     a look every `interval` s (the 2-s watchdog keeps the full checks as the backstop). Each
     look, in this order:
-      1. a rest manager's wake marker (rest_marker): a game waking up -> WHY_WAKING;
+      1. a rest manager's wake marker (rest_marker): a game waking up -> WHY_WAKING; and its
+         holds (rest_holds): a watched game it no longer holds at "rest" while the console
+         rests -- back on its home or its quick menu, the console in use -> WHY_NOT_RESTING;
       2. the resting games the job's game checks handed over (watch()), each read lightly --
          a scope's cgroup.events (and, only once it has thawed, its cgroup.freeze, its
          cgroup.procs and their stat), a process's cgroup and, only when that is not frozen,
@@ -1866,6 +1923,14 @@ class FastWatch:
             seen()
         if marker:
             return WHY_WAKING, "game"
+        if marker is not None:                # a rest manager runs: still a real rest?
+            holds = rest_holds(self.cfg.rest_file)
+            if holds is not False:            # half written this time: the next look decides
+                with self.lock:
+                    rests = self.rests
+                for r in rests:
+                    if not real_rest(r.game, holds):
+                        return WHY_NOT_RESTING % (r.label or "a game"), "game"
         label = self.check()
         if label is not None:
             return WHY_WOKE % label, "game"
@@ -2152,10 +2217,11 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
     rest_manager = os.path.exists(cfg.rest_file)
     sleep_answer = (lambda: None) if rest_manager else _start_sleep_probe(cfg.inhibit)
     seen = RestSeen(cfg.rest_seen, rest_clock or time.monotonic, _boot_id(cfg.proc))
+    holds = rest_holds(cfg.rest_file)       # None: no rest manager; False: unreadable -> no rest
 
     def games(procs, own):
         return scan_games(procs, own, cfg.proc, cfg.sys, ages=seen.update,
-                          min_age=cfg.rest_min_age)
+                          min_age=cfg.rest_min_age, holds=holds)
     ac = ac_online(cfg.sys)
     links = ethernet_links(cfg.sys)
     ethernet, eth_why = bool(links), "no Ethernet"
@@ -2459,6 +2525,7 @@ class EncodeJob:
         self.seen = RestSeen(cfg.rest_seen, boot=_boot_id(cfg.proc))
         self.known = {}
         self.scan_lock = threading.Lock()
+        self.holds = False                         # the rest manager's last readable holds
         # a new game, a resting game waking up, or a rest manager waking one: a stop within
         # THAW_INTERVAL s
         self.fast = FastWatch(
@@ -2612,8 +2679,14 @@ class EncodeJob:
         rests it finds go to the fast watch."""
         own = own_tree(procs, os.getpid(), self.ppid0, self._kids())
         with self.scan_lock:
+            holds = rest_holds(self.cfg.rest_file)
+            if holds is False:                # half written this time: its last readable holds
+                holds = self.holds
+            else:
+                self.holds = holds
             scan = scan_games(procs, own, self.cfg.proc, self.cfg.sys, ages=self.seen.update,
-                              known=list(self.known.values()), min_age=self.cfg.rest_min_age)
+                              known=list(self.known.values()), min_age=self.cfg.rest_min_age,
+                              holds=holds)
             for r in scan.rests:
                 old = self.known.get(r.key)
                 if old is not None:
@@ -2749,6 +2822,10 @@ class EncodeJob:
                     return ("refused", refused)
                 if self.scope_argv is not None:
                     return None               # cmd_encode re-execs: the scope claims it
+            elif not self.cfg.in_scope and scope_works(self.cfg.systemd_run):
+                # no game rests: a scope of its own all the same, for its idle CPU weight
+                self.scope_argv = scope_argv(self.cfg, self.job_id, b64)
+                return None                   # cmd_encode re-execs: the scope claims it
             os.makedirs(self.jobdir, mode=0o700, exist_ok=True)
             write_marker(self.jobdir, "encode", self.cfg.proc)
         if "{rpu}" in self.args and not os.path.isfile(self.rpu):
@@ -2778,18 +2855,23 @@ class EncodeJob:
         return None
 
     def reexec(self):
-        """Go on inside the memory-capped scope: exec systemd-run (self.scope_argv), which
-        moves this very process -- the same pid, with stdin, stdout and stderr untouched, the
-        stream included -- into its own transient scope and execs `vworker encode` again with
-        VWORKER_IN_SCOPE=1. Outside the ssh session's scope logind no longer ends it with the
-        session; it ends itself exactly as before when the Mac goes away (stdin ends, stdout
-        breaks, the parent goes, no data for STALL_SECS). Returns only when the exec failed:
-        the job is then refused ("low_memory", WHY_NO_CAP)."""
+        """Go on inside a scope of its own (idle CPU weight; memory-capped beside a resting
+        game): exec systemd-run (self.scope_argv), which moves this very process -- the same
+        pid, with stdin, stdout and stderr untouched, the stream included -- into its own
+        transient scope and execs `vworker encode` again with VWORKER_IN_SCOPE=1 (and
+        VWORKER_SCOPE_MAX, the MemoryMax it asked for, when it asked for one). Outside the ssh
+        session's scope logind no longer ends it with the session; it ends itself exactly as
+        before when the Mac goes away (stdin ends, stdout breaks, the parent goes, no data for
+        STALL_SECS). Returns only when the exec failed: the job is then refused -- beside a
+        resting game ("low_memory", WHY_NO_CAP), else ("busy", WHY_NO_SCOPE)."""
         if self.stop.is_set():
             return                            # a stop signal came first: finish as stopped
         argv = self.scope_argv
         if argv:
-            env = dict(os.environ, VWORKER_IN_SCOPE="1", VWORKER_SCOPE_MAX=str(self.scope_max))
+            env = dict(os.environ, VWORKER_IN_SCOPE="1")
+            env.pop("VWORKER_SCOPE_MAX", None)
+            if self.scope_max is not None:
+                env["VWORKER_SCOPE_MAX"] = str(self.scope_max)
             for f in (sys.stdout, sys.stderr):
                 try:
                     f.flush()
@@ -2799,7 +2881,10 @@ class EncodeJob:
                 os.execve(argv[0], argv, env)
             except (OSError, ValueError):
                 pass
-        self.abort("refused", WHY_NO_CAP, "low_memory")
+        if self.resting:
+            self.abort("refused", WHY_NO_CAP, "low_memory")
+        else:
+            self.abort("refused", WHY_NO_SCOPE, "busy")
 
     def _dir_is_unowned(self):
         m = read_marker(self.jobdir)
@@ -3007,7 +3092,8 @@ def cmd_encode(cfg, job_id, b64, runner=None):
         early = job.prepare(b64)
         if early is not None:
             return job.finish(early[0], early[1], 0)
-        if job.scope_argv is not None:        # a game rests: go on in a memory-capped scope
+        if job.scope_argv is not None:        # go on in a scope of its own (idle CPU weight;
+                                              # memory-capped beside a resting game)
             job.reexec()                      # returns only when it could not
             return job.finish(job.result, job.why, 0)
         return job.finish(*job.run())

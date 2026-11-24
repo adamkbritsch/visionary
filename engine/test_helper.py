@@ -1558,14 +1558,18 @@ class StatusSummaryPure(unittest.TestCase):
             self.assertTrue(detail, code)
 
     def test_the_workers_newer_reasons_need_no_codes_of_their_own(self):
-        # a game waking up, woken or started, and a resting game whose memory can't be capped:
-        # they come with "game" and "low_memory", and read as those lines (never their words)
+        # a game waking up, woken, started or no longer at rest, a resting game whose memory
+        # can't be capped, and a scope that would not start: they come with "game",
+        # "low_memory" and "busy", and read as those lines (never their words)
         whys = worker_whys()
-        self.assertEqual(sorted(whys), ["WHY_NO_CAP", "WHY_STARTED", "WHY_WAKING", "WHY_WOKE"])
+        self.assertEqual(sorted(whys), ["WHY_NOT_RESTING", "WHY_NO_CAP", "WHY_NO_SCOPE",
+                                        "WHY_STARTED", "WHY_WAKING", "WHY_WOKE"])
         for name, code, line in (("WHY_WAKING", "game", "Helper paused · a game is running on it"),
                                  ("WHY_WOKE", "game", "Helper paused · a game is running on it"),
                                  ("WHY_STARTED", "game", "Helper paused · a game is running on it"),
-                                 ("WHY_NO_CAP", "low_memory", "Helper paused · it's low on memory")):
+                                 ("WHY_NOT_RESTING", "game", "Helper paused · a game is running on it"),
+                                 ("WHY_NO_CAP", "low_memory", "Helper paused · it's low on memory"),
+                                 ("WHY_NO_SCOPE", "busy", "Helper paused · it's busy")):
             self.assertIn(code, helper.HELPER_CODES, name)
             state, detail = helper.summarize_verdict(False, code)
             self.assertEqual(ui_line({"state": state, "detail": detail}), line, name)
