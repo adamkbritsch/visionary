@@ -14,9 +14,10 @@ Wire protocol v1 (the Mac half lives in engine/helper.py):
                                    "sha256" is this script's own sha256 (the Mac compares it with
                                    its copy); "ipv4" lists the IPv4 addresses on the wired links;
                                    "sleep_block" says whether this session may hold off sleep
-                                   (true / false, null without systemd-inhibit); "game" names a
-                                   running game, "resting_game" a resting one (which does not
-                                   count); "mem_available_gb" is MemAvailable (null: unreadable)
+                                   (true / false; null without systemd-inhibit or where a rest
+                                   manager runs); "game" names a running game, "resting_game" a
+                                   resting one (which does not count); "mem_available_gb" is
+                                   MemAvailable (null: unreadable)
     vworker put <job> <name> <bytes>
                                    exactly <bytes> of stdin -> jobs/<job>/<name> (the RPU slice,
                                    "rpu.bin"); a short or long read, SIGHUP/SIGTERM/SIGINT, or
@@ -47,33 +48,49 @@ when every sample is heavy; a game, battery, no Ethernet, another job, low memor
 refuse at once. While encoding, a watchdog checks every 2 s and stops at once -- killing zstd
 and x265 and deleting the job dir -- when a game starts, when any other app uses a real share
 of CPU (> 1.5 cores) or GPU (> 30 %) for 10 s, when the machine leaves mains power or Ethernet,
-when MemAvailable stays under STOP_MEM_GB for two checks, when the stream turns out to arrive
+when MemAvailable stays under its floor for two checks, when the stream turns out to arrive
 over its Wi-Fi (WifiStream), or when the Mac goes away (parent gone, stdout broken, input
-truncated, no data for STALL_SECS). Ordinary apps (browser, file
-manager, Steam's own menus) are below those thresholds and do not stop it. A Steam launch is a
-game when its AppId is a real Steam app (< 2^31) or Wine/Proton runs under it; a non-Steam
-shortcut (AppId >= 2^31) running a native Linux program (Firefox, Dolphin, ...) is judged by the
-CPU/GPU rule only. The GPU share is counted per process (nvidia-smi pmon, or DRM fdinfo: engine
-time, or Intel xe's busy cycles) and leaves out the desktop's own drawing (compositor, Xwayland,
-shell) and the Steam client (GPU_EXCLUDED_NAMES): an idle desktop alone can keep a GPU 30-40 %
-busy. Where no per-process reading exists, the whole-device one stands in (amdgpu's
-gpu_busy_percent, nvidia-smi); nouveau has neither, so the GPU rule has no reading there.
-A RESTING game does not count (scan_games): one frozen by a rest mode (the cgroup v2 freezer:
-"frozen 1" in its cgroup's cgroup.events) or stopped by SIGSTOP (state "T"), and a Steam launch
-wrapper whose AppId rests (it lives in Steam's own cgroup, which nothing freezes); anything that
-cannot be told counts. While an encode runs beside one, RestWatch re-reads it every
-THAW_INTERVAL s and the job yields like a game start the moment it wakes (an exit is no
-wake-up). A resting game keeps its RAM, so status wants START_MEM_GB of MemAvailable, and the
-encode raises its own oom_score_adj to 1000 before it spawns zstd and x265: the kernel's OOM
-killer takes the encode before any game. A game's processes and cgroups are only ever read.
+truncated, no data for STALL_SECS). Beside it FastWatch looks every THAW_INTERVAL s (a quarter
+second) at what can't wait: a new process that is a game (only new pids are read), a
+resting game waking up, and a rest manager waking one (its wake marker). Ordinary apps
+(browser, file manager, Steam's own menus) are below those thresholds and do not stop it. A
+Steam launch is a game when its AppId is a real Steam app (< 2^31) or Wine/Proton runs under
+it; a non-Steam shortcut (AppId >= 2^31) running a native Linux program (Firefox, Dolphin, ...)
+is judged by the CPU/GPU rule only. The GPU share is counted per process (nvidia-smi pmon, or
+DRM fdinfo: engine time, or Intel xe's busy cycles) and leaves out the desktop's own drawing
+(compositor, Xwayland, shell) and the Steam client (GPU_EXCLUDED_NAMES): an idle desktop alone
+can keep a GPU 30-40 % busy. Where no per-process reading exists, the whole-device one stands
+in (amdgpu's gpu_busy_percent, nvidia-smi); nouveau has neither, so the GPU rule has no reading
+there.
+A RESTING game does not count (scan_games): one frozen by a rest mode (the cgroup v2 freezer)
+or stopped by SIGSTOP. A Steam game with its own scopes (app-steam-app<AppId>-<pid>.scope)
+rests when each populated one rests as a whole -- "frozen 1" in its cgroup.events, 1 in its
+own cgroup.freeze, or every live process in it stopped -- and then its launches rest too,
+Steam's launch wrapper in Steam's own cgroup included; one without a scope rests when every
+live process of its AppId but the launches rests. Wine, Proton, .exe, Lutris and Heroic
+processes rest only by themselves, and anything that can't be told runs: one stopped or
+frozen side process never puts a running game to rest. A game counts as resting only after
+REST_MIN_AGE_S at rest in a row (RestSeen keeps when each was first seen at rest), so a
+moment's pause in its menu is still a running game; an exit is no wake-up. The memory a
+resting game keeps is protected: status wants REST_RESERVE_GB + REST_MIN_BUDGET_GB of
+MemAvailable beside one (START_MEM_GB otherwise); the encode re-execs itself into a transient
+systemd --user scope of its own capped at its budget, MemAvailable - REST_RESERVE_GB
+(MemoryHigh; MemoryMax SCOPE_MAX_EXTRA above), and refuses when it can't; it yields when
+MemAvailable stays under REST_KEEP_GB (STOP_MEM_GB otherwise) for two checks; and it raises
+its own oom_score_adj to 1000 before it spawns zstd and x265, so the kernel's OOM killer takes
+the encode before any game. A rest manager's file (REST_FILE_NAME in $XDG_RUNTIME_DIR) is only
+read: its "waking" refuses or stops like a game, and its being there means no sleep block.
+A game's processes and cgroups are only ever read.
 On mains: a Mains supply online, or no system battery at all (a desktop, a mini PC, a VM); a
 laptop or handheld on battery is refused. Ethernet: any wired link that is up, told by /sys and
 not by its name (eth0, eno1, enp*, enx*, or a bridge or bond over one).
-zstd and x265 run under SCHED_IDLE (nice 19 where that is unavailable): most desktop distros
-turn sched_autogroup on, so nice alone would not let the desktop win. While they run, logind
-sleep and idle blocks are asked for (systemd-inhibit, where it exists). polkit decides: over ssh
-a stock setup usually refuses the sleep block (no seat, no agent), and then an idle helper on
-automatic suspend can still sleep mid-segment. Status reports which it is as "sleep_block".
+zstd and x265 run under SCHED_IDLE (nice 19 where that is unavailable) -- most desktop distros
+turn sched_autogroup on, so nice alone would not let the desktop win -- and at idle I/O
+priority (`ionice -c 3`, where it works). While they run, logind's sleep block is asked for
+(systemd-inhibit, where it exists), but never beside a resting game or where a rest manager
+runs: it decides about sleep itself. polkit decides: over ssh a stock setup usually refuses
+the sleep block (no seat, no agent), and then an idle helper on automatic suspend can still
+sleep mid-segment. Status reports which it is as "sleep_block".
 
 Stdlib only. Runs on Python 3.8 or newer (no annotations, nothing newer from the stdlib; the
 Mac's tests run it too). Paths and timings can be overridden through VWORKER_* environment
@@ -133,19 +150,47 @@ START_MEM_GB = ENCODE_MEM_GB + 1.0     # status refuses with less MemAvailable (
 STOP_MEM_GB = 0.75                     # an encode yields under this, LOW_MEM_TICKS checks in a row
 LOW_MEM_TICKS = 2
 OOM_SCORE_ADJ = 1000                   # the OOM killer's first pick: the encode, never a game
+GIB = 1 << 30                          # every GB here is 2^30 bytes (free disk, MemAvailable)
+# a resting game (scan_games) counts only after this long at rest in a row: a game frozen for a
+# moment while its quick menu is open is still a running game. RestSeen keeps when each was
+# first seen at rest in REST_SEEN_FILE, in the worker's own scratch dir
+REST_MIN_AGE_S = 60.0
+REST_SEEN_FILE = "rest-seen.json"
+# memory beside a resting game (the machine owner's rule): MemAvailable stays >= REST_KEEP_GB
+# the whole time; a job starts only when its budget, MemAvailable - REST_RESERVE_GB, is at
+# least REST_MIN_BUDGET_GB (so 6.5 GiB available), and runs in a scope capped at that budget
+REST_KEEP_GB = 3.0
+REST_RESERVE_GB = 3.5
+REST_MIN_BUDGET_GB = 3.0
+SCOPE_MAX_EXTRA = 256 << 20            # the scope's MemoryMax: this far above MemoryHigh
+SCOPE_UNIT_PREFIX = "visionary-x265-"  # never app-steam-app*: a rest mode freezes those
+# may this session start a transient scope? (asked once per process, before a re-exec)
+SCOPE_PROBE_ARGS = ["--user", "--scope", "--quiet", "--collect", "--", "true"]
+SCOPE_PROBE_TIMEOUT = 3.0
+# a rest manager's file, in $XDG_RUNTIME_DIR, only ever read: its top-level "waking" (a local
+# time, "YYYY-MM-DD HH:MM:SS", there only while it continues a game) no older than
+# WAKE_MAX_AGE_S says a game is waking up; the file being there at all says a rest manager
+# runs on this machine (then no sleep block is taken: it decides about sleep itself)
+REST_FILE_NAME = "ally-rest.json"
+WAKE_MAX_AGE_S = 120.0
+IONICE_ARGS = ["-c", "3"]              # zstd and x265 at idle I/O priority (where it works)
+LABEL_MAX = 64                         # a game's label in a why: one line, at most this long
+# the whys of a stop or a refusal for a game that is not (simply) running
+WHY_WAKING = "a game is waking up"
+WHY_WOKE = "a game woke up: %s"
+WHY_STARTED = "a game started: %s"
+WHY_NO_CAP = "a game is resting and its memory can't be capped"
 PF_KTHREAD = 0x00200000
 PF_EXITING = 0x00000004                # /proc/<pid>/stat flags: the task is shutting down
 DEAD_STATES = ("Z", "X", "x")          # /proc/<pid>/stat states of a task that is gone
 
 # where zstd lives when it is not on the login shell's PATH (the first is named when missing)
 ZSTD_PATHS = ("/usr/bin/zstd", "/usr/local/bin/zstd")
-# held while an encode runs: logind then blocks suspend (and, beside it, the idle action) until
-# they exit. Two blocks, not one "sleep:idle": polkit judges each kind on its own (older logind
-# checked a combined mask as the lid-switch action), and over ssh it often allows idle, not sleep
+# held while an encode runs (never beside a resting game, never where a rest manager runs):
+# logind then blocks suspend until it exits. Sleep only: an idle block would keep a rest
+# manager's own idle handling from acting
 INHIBIT_ARGS = ["--what=sleep", "--who=visionary-helper", "--why=encoding a segment",
                 "--mode=block", "sleep", "infinity"]
-IDLE_INHIBIT_ARGS = ["--what=idle", "--who=visionary-helper", "--why=encoding a segment",
-                     "--mode=block", "sleep", "infinity"]
 # status's probe: may this session take the sleep block? (taken and let go at once by `true`)
 SLEEP_PROBE_ARGS = ["--what=sleep", "--mode=block", "--who=visionary-helper", "--why=probe",
                     "true"]
@@ -166,7 +211,7 @@ SHORTCUT_APPID_MIN = 1 << 31
 GAME_LAUNCHERS = {"legendary", "gogdl", "nile"}
 _WIN_PATH = re.compile(r"[A-Za-z]:\\")
 _APPID = re.compile(r"AppId=(\d+)")
-THAW_INTERVAL = 0.25                   # RestWatch re-reads a resting game this often (seconds)
+THAW_INTERVAL = 0.25                   # FastWatch looks this often (seconds): a stop within it
 
 # the desktop's own drawing: compositors, window managers, shells and X servers keep a GPU busy
 # on an idle desktop, so their GPU use (and the Steam client's) is never "anything heavy".
@@ -209,12 +254,27 @@ def find_zstd(path=None):
     return ZSTD_PATHS[0]
 
 
-def find_inhibit(path=None):
-    """systemd-inhibit, or "" where there is none (then no sleep block is taken)."""
-    found = shutil.which("systemd-inhibit", path=path)
+def find_tool(name, path=None):
+    """`name` on PATH, else /usr/bin/<name>; "" when there is none."""
+    found = shutil.which(name, path=path)
     if found:
         return found
-    return "/usr/bin/systemd-inhibit" if _executable("/usr/bin/systemd-inhibit") else ""
+    usr = "/usr/bin/" + name
+    return usr if _executable(usr) else ""
+
+
+def find_inhibit(path=None):
+    """systemd-inhibit, or "" where there is none (then no sleep block is taken)."""
+    return find_tool("systemd-inhibit", path)
+
+
+def rest_file_path(env):
+    """Where a rest manager keeps its file: VWORKER_REST_FILE, else REST_FILE_NAME in
+    $XDG_RUNTIME_DIR, else in /run/user/<uid>."""
+    if env.get("VWORKER_REST_FILE"):
+        return env["VWORKER_REST_FILE"]
+    run = env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(run, REST_FILE_NAME)
 
 
 _SLEEP_PROBE = {}                      # systemd-inhibit path -> (monotonic time, answer)
@@ -260,15 +320,27 @@ def _start_sleep_probe(inhibit):
 
 
 class Config:
-    """Paths and timings. Everything is overridable from the environment (VWORKER_*)."""
+    """Paths and timings. Everything is overridable from the environment (VWORKER_*); a tool
+    set to "" there is taken as missing."""
 
     def __init__(self, env=None):
         env = os.environ if env is None else env
         home = os.path.expanduser("~")
+        path = env.get("PATH")
+
+        def tool(var, name):
+            return env[var] if var in env else find_tool(name, path)
         self.x265 = env.get("VWORKER_X265") or os.path.join(home, "visionary-worker", "bin", "x265")
-        self.zstd = env.get("VWORKER_ZSTD") or find_zstd(env.get("PATH"))
-        self.inhibit = env.get("VWORKER_INHIBIT") or find_inhibit(env.get("PATH"))
+        self.zstd = env.get("VWORKER_ZSTD") or find_zstd(path)
+        self.inhibit = env.get("VWORKER_INHIBIT") or find_inhibit(path)
+        self.systemd_run = tool("VWORKER_SYSTEMD_RUN", "systemd-run")
+        self.ionice = tool("VWORKER_IONICE", "ionice")
         self.jobs = env.get("VWORKER_JOBS") or os.path.join(home, "visionary-scratch", "jobs")
+        # the worker's own scratch dir (the jobs dir's parent) keeps when each resting game
+        # was first seen at rest
+        self.rest_seen = env.get("VWORKER_REST_SEEN") or os.path.join(
+            os.path.dirname(os.path.abspath(self.jobs)), REST_SEEN_FILE)
+        self.rest_file = rest_file_path(env)
         self.proc = env.get("VWORKER_PROC") or "/proc"
         self.sys = env.get("VWORKER_SYS") or "/sys"
         self.watch_interval = _env_float(env, "VWORKER_WATCH_INTERVAL", 2.0)
@@ -277,6 +349,16 @@ class Config:
         self.stall_secs = _env_float(env, "VWORKER_STALL_SECS", 300.0)
         self.min_free_gb = _env_float(env, "VWORKER_MIN_FREE_GB", MIN_FREE_GB)
         self.min_mem_gb = _env_float(env, "VWORKER_MIN_MEM_GB", START_MEM_GB)
+        self.stop_mem_gb = _env_float(env, "VWORKER_STOP_MEM_GB", STOP_MEM_GB)
+        self.rest_min_age = _env_float(env, "VWORKER_REST_MIN_AGE", REST_MIN_AGE_S)
+        self.rest_keep_gb = _env_float(env, "VWORKER_REST_KEEP_GB", REST_KEEP_GB)
+        self.rest_reserve_gb = _env_float(env, "VWORKER_REST_RESERVE_GB", REST_RESERVE_GB)
+        self.rest_budget_gb = _env_float(env, "VWORKER_REST_BUDGET_GB", REST_MIN_BUDGET_GB)
+        # set by the re-exec into a memory-capped scope (EncodeJob.reexec): it never nests, and
+        # VWORKER_SCOPE_MAX is the MemoryMax it asked for
+        self.in_scope = env.get("VWORKER_IN_SCOPE") == "1"
+        cap = env.get("VWORKER_SCOPE_MAX") or ""
+        self.scope_max = int(cap) if cap.isdigit() else None
         self.stage_ttl = _env_float(env, "VWORKER_STAGE_TTL", 60.0)     # put -> encode gap
         self.put_deadline = _env_float(env, "VWORKER_PUT_DEADLINE", 60.0)   # a whole put
         self.orphan_ttl = _env_float(env, "VWORKER_ORPHAN_TTL", 60.0)   # dir without marker
@@ -577,6 +659,21 @@ def parse_stat(pid, text):
                 int(rest[11]) + int(rest[12]), int(rest[19]), [])
 
 
+def read_proc(proc_root, pid):
+    """/proc/<pid>/stat and cmdline -> Proc, or None when it is gone or unreadable."""
+    n = str(pid)
+    stat = _read(os.path.join(proc_root, n, "stat"))
+    if not stat:
+        return None
+    try:
+        p = parse_stat(int(n), stat)
+    except (ValueError, IndexError):
+        return None
+    raw = _read_bytes(os.path.join(proc_root, n, "cmdline")) or b""
+    p.argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    return p
+
+
 def list_procs(proc_root):
     """{pid: Proc} for every readable /proc/<pid>. Vanishing processes are skipped."""
     out = {}
@@ -587,16 +684,9 @@ def list_procs(proc_root):
     for n in names:
         if not n.isdigit():
             continue
-        stat = _read(os.path.join(proc_root, n, "stat"))
-        if not stat:
-            continue
-        try:
-            p = parse_stat(int(n), stat)
-        except (ValueError, IndexError):
-            continue
-        raw = _read_bytes(os.path.join(proc_root, n, "cmdline")) or b""
-        p.argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
-        out[p.pid] = p
+        p = read_proc(proc_root, n)
+        if p is not None:
+            out[p.pid] = p
     return out
 
 
@@ -647,14 +737,22 @@ def own_tree(procs, self_pid, parent_pid=None, extra=()):
     return own
 
 
+def _plain(text, limit=LABEL_MAX):
+    """A label as one readable line for a why and the Mac's tooltip: control characters out,
+    spaces collapsed, at most `limit` characters ("..." where it was cut)."""
+    s = " ".join("".join(c if c >= " " and not "\x7f" <= c <= "\x9f" else " "
+                         for c in text).split())
+    return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+
+
 def _game_label(p):
     for a in reversed(p.argv):
         if a.lower().endswith(".exe"):
-            return os.path.basename(a.replace("\\", "/"))
+            return _plain(os.path.basename(a.replace("\\", "/")))
     m = _APPID.search(" ".join(p.argv))
     if m:
         return "Steam app %s" % m.group(1)
-    return p.comm or p.name
+    return _plain(p.comm or p.name)
 
 
 def _is_steam_launch(p):
@@ -702,16 +800,17 @@ def _shortcut_label(p, wine):
     for q in (p, wine):
         for a in reversed(q.argv):
             if a.lower().endswith(".exe"):
-                return os.path.basename(a.replace("\\", "/"))
-    return "non-Steam game (%s)" % (wine.comm or wine.name)
+                return _plain(os.path.basename(a.replace("\\", "/")))
+    return _plain("non-Steam game (%s)" % (wine.comm or wine.name))
 
 
 # ---- resting games: frozen by a rest mode, or stopped ---------------------------------------
-# A rest mode freezes a game with the cgroup v2 freezer: its app scope's cgroup.events then says
-# "frozen 1" (its /proc state stays "S") until a button press thaws it. Other tools SIGSTOP it
-# instead (state "T"; "t", traced, is not resting). All of it is only ever READ here
-# (/proc/<pid>/stat, /proc/<pid>/cgroup, /sys/fs/cgroup<path>/cgroup.events): nothing is sent
-# to a game's processes or written to a cgroup.
+# A rest mode freezes a game with the cgroup v2 freezer: it writes 1 to cgroup.freeze of the
+# game's app scope, whose cgroup.events then says "frozen 1" (the processes' /proc state stays
+# "S") until a button press thaws it. Other tools SIGSTOP it instead (state "T"; "t", traced,
+# is not resting). All of it is only ever READ here (/proc/<pid>/stat and cgroup, and a
+# cgroup's cgroup.events, cgroup.freeze and cgroup.procs under /sys/fs/cgroup): nothing is
+# sent to a game's processes or written to a cgroup.
 
 def cgroup_path(proc_root, pid):
     """The process's cgroup v2 path from /proc/<pid>/cgroup, its one line "0::<path>"; None
@@ -724,9 +823,19 @@ def cgroup_path(proc_root, pid):
     return None if ".." in path.split("/") else path
 
 
+def cgroup_dir(sys_root, path):
+    """<sys>/fs/cgroup<path> (the path is absolute, so no os.path.join)."""
+    return os.path.join(sys_root, "fs", "cgroup") + path.rstrip("/")
+
+
+def cgroup_file(sys_root, path, name):
+    """<sys>/fs/cgroup<path>/<name>."""
+    return cgroup_dir(sys_root, path) + "/" + name
+
+
 def cgroup_events_file(sys_root, path):
-    """<sys>/fs/cgroup<path>/cgroup.events (the path is absolute, so no os.path.join)."""
-    return os.path.join(sys_root, "fs", "cgroup") + path.rstrip("/") + "/cgroup.events"
+    """<sys>/fs/cgroup<path>/cgroup.events."""
+    return cgroup_file(sys_root, path, "cgroup.events")
 
 
 def cgroup_frozen(events):
@@ -739,50 +848,104 @@ def cgroup_frozen(events):
     return None
 
 
-class Rest:
-    """A resting process RestWatch re-reads: its pid and start time (a reused pid is another
-    process), its cgroup.events file (None when unknown) and the label of its game."""
-    __slots__ = ("pid", "start", "events", "label")
+_SCOPE_RE = re.compile(r"app-steam-app(\d+)-\d+\.scope")
 
-    def __init__(self, pid, start, events, label):
-        self.pid, self.start, self.events, self.label = pid, start, events, label
+
+def scope_appid(path):
+    """The AppId of a Steam game's own cgroup scope -- a path whose last component is
+    app-steam-app<AppId>-<pid>.scope, the cgroup a rest mode freezes -- else None."""
+    m = _SCOPE_RE.fullmatch((path or "").rstrip("/").rsplit("/", 1)[-1])
+    return int(m.group(1)) if m else None
+
+
+def _alive(p):
+    """Not a zombie, not dead and not shutting down (PF_EXITING: a frozen game being killed
+    leaves the freezer to die)."""
+    return p.state not in DEAD_STATES and not p.flags & PF_EXITING
+
+
+class _Cgroups:
+    """cgroup v2 reads for one look, each file read at most once: a process's cgroup path
+    (/proc/<pid>/cgroup) and a cgroup's cgroup.events, cgroup.freeze and cgroup.procs. Nothing
+    is ever written. Whatever can't be read is None, "can't tell", which never puts a game to
+    rest; without both roots nothing is read (only a stopped process can rest then)."""
+
+    def __init__(self, proc_root, sys_root):
+        self.proc_root, self.sys_root = proc_root, sys_root
+        self.on = bool(proc_root and sys_root)
+        self.paths, self.texts = {}, {}
+
+    def path(self, pid):
+        if pid not in self.paths:
+            self.paths[pid] = cgroup_path(self.proc_root, pid) if self.on else None
+        return self.paths[pid]
+
+    def _text(self, path, name):
+        key = (path, name)
+        if key not in self.texts:
+            self.texts[key] = _read(cgroup_file(self.sys_root, path, name)) if self.on else None
+        return self.texts[key]
+
+    def events(self, path):
+        """cgroup.events as {"populated": "1", "frozen": "0"}, or None."""
+        text = self._text(path, "cgroup.events")
+        if text is None:
+            return None
+        out = {}
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                out[parts[0]] = parts[1]
+        return out
+
+    def freeze(self, path):
+        """cgroup.freeze, the state asked for: True for 1, False for 0, None."""
+        return {"1": True, "0": False}.get(self._text(path, "cgroup.freeze"))
+
+    def frozen(self, path):
+        """Is this cgroup frozen, or being frozen? "frozen 1" in its cgroup.events, or 1 in its
+        own cgroup.freeze: a frozen game being killed or quit reads "frozen 0" while it dies,
+        and it is no wake-up. False when neither says so (or neither can be read)."""
+        ev = self.events(path)
+        if ev is not None and ev.get("frozen") == "1":
+            return True
+        return self.freeze(path) is True
+
+    def members(self, path):
+        """The pids in cgroup.procs, or None."""
+        text = self._text(path, "cgroup.procs")
+        if text is None:
+            return None
+        try:
+            return [int(x) for x in text.split()]
+        except ValueError:
+            return None
+
+
+class Rest:
+    """One resting game as FastWatch re-reads it, and the key RestSeen keeps its first-seen
+    time under: "scope:<cgroup path>" (a Steam game's own scope, read as a whole: `scope`),
+    "app:<AppId>" (a Steam game without one: `members`, its processes but the launches) or
+    "proc:<pid>:<start>" (a Wine, .exe, Lutris or Heroic process resting by itself: members,
+    that one). members are (pid, start time, cgroup path or None). `remnant` are processes of
+    its AppId that can outlive it (Steam's launch wrapper outside the scope; a scope-less
+    game's launches): met again with nothing else of their AppId left, they are what is left
+    of an exit, no game. `game` is its AppId (or ("pid", pid)), `label` its game's label."""
+    __slots__ = ("key", "game", "label", "scope", "members", "remnant")
+
+    def __init__(self, key, game, scope=None, members=(), remnant=(), label=None):
+        self.key, self.game, self.label = key, game, label
+        self.scope, self.members, self.remnant = scope, tuple(members), frozenset(remnant)
 
 
 class GameScan:
     """One game check: `running` is a running game's label (detect_game's answer) or None,
-    `resting` the first resting game's label or None, `rests` the resting processes RestWatch
-    re-reads (pid order)."""
+    `resting` the first resting game's label or None, `rests` the resting games FastWatch
+    re-reads (Rest, in key order)."""
     __slots__ = ("running", "resting", "rests")
 
     def __init__(self, running, resting, rests):
         self.running, self.resting, self.rests = running, resting, rests
-
-
-class _RestReader:
-    """Is a process resting: frozen ("frozen 1" in its cgroup's cgroup.events) or stopped (state
-    "T")? Whatever can't be told (no roots, an unreadable cgroup, cgroup v1) is NOT resting, so
-    the game counts. Each /proc/<pid>/cgroup and each cgroup.events is read at most once."""
-
-    def __init__(self, proc_root, sys_root):
-        self.proc_root, self.sys_root = proc_root, sys_root
-        self.files = {}                      # pid -> its cgroup.events file, or None
-        self.frozen = {}                     # cgroup.events file -> True / False / None
-
-    def events(self, p):
-        if p.pid not in self.files:
-            path = cgroup_path(self.proc_root, p.pid) if self.proc_root and self.sys_root else None
-            self.files[p.pid] = cgroup_events_file(self.sys_root, path) if path else None
-        return self.files[p.pid]
-
-    def resting(self, p):
-        if p.state == "T":
-            return True
-        f = self.events(p)
-        if f is None:
-            return False
-        if f not in self.frozen:
-            self.frozen[f] = cgroup_frozen(f)
-        return self.frozen[f] is True
 
 
 def _game_candidate(p, procs, children, appid_of):
@@ -811,56 +974,150 @@ def _game_candidate(p, procs, children, appid_of):
     return None
 
 
-def scan_games(procs, exclude=(), proc_root=None, sys_root=None):
+def scan_games(procs, exclude=(), proc_root=None, sys_root=None, ages=None, known=(),
+               min_age=REST_MIN_AGE_S):
     """detect_game's whole answer -> GameScan: the running game, and the resting ones it
-    skipped. A RESTING game does not count: a candidate that rests itself (frozen or stopped,
-    _RestReader; its cgroup read under proc_root and sys_root) is skipped, and so is a Steam
-    launch that does not rest itself when its AppId has a resting process -- the launch wrapper
-    in Steam's own cgroup, which no rest mode freezes, beside the reaper and the game frozen in
-    their app scope. A Wine, Proton, .exe, Lutris or Heroic candidate is skipped only when it
-    rests itself. Without the roots only a stopped process rests. Only candidates and the
-    processes of a candidate's AppId ever have their cgroup read."""
+    skipped. A RESTING game does not count:
+      - a Steam game whose AppId has its own scopes (cgroups app-steam-app<AppId>-<pid>.scope,
+        found from the cgroups of that AppId's processes) rests when every one of them that is
+        populated rests as a whole: "frozen 1" in its cgroup.events, 1 in its own
+        cgroup.freeze, or every live process in it (cgroup.procs) stopped. Then every Steam
+        launch of that AppId is skipped -- the launch wrapper in Steam's own cgroup, which
+        nothing freezes, included -- and otherwise they all count;
+      - a Steam game with no such scope (other distributions) rests when it has a live process
+        that is no Steam launch and every one of those rests (stopped, or its cgroup frozen);
+      - a Wine, Proton, .exe, Lutris or Heroic process is skipped only when it rests itself.
+    So one stopped or frozen side process never puts a running game to rest, and a game with
+    anything running is no resting game. Dead, zombie and exiting processes are never
+    candidates; a scope that emptied, and -- `known`: the Rests a job saw -- launches met
+    again with nothing else of their AppId left are an exit: no game. `ages(keys)` -> {key:
+    seconds at rest} (RestSeen.update): a rest younger than `min_age` still counts as running
+    (a quick pause); without it every rest counts. Anything that can't be told counts as
+    running. Only candidates and the processes of a candidate's AppId have their cgroup read,
+    and only that AppId's scopes."""
     children = {}
     for q in procs.values():
         children.setdefault(q.ppid, []).append(q.pid)
-    reader = _RestReader(proc_root, sys_root)
-    appids, resting_of = {}, {}
+    cg = _Cgroups(proc_root, sys_root)
+    appids, games = {}, {}
+    leftovers = set()
+    for r in known:
+        leftovers.update(r.remnant)
 
     def appid_of(q):
         if q.pid not in appids:
             appids[q.pid] = _steam_appid(q, procs)
         return appids[q.pid]
 
-    def appid_rests(appid):
-        """The first resting process of this AppId (pid order), or None."""
-        if appid not in resting_of:
-            resting_of[appid] = next(
-                (procs[pid] for pid in sorted(procs)
-                 if pid not in exclude and not procs[pid].kthread
-                 and appid_of(procs[pid]) == appid and reader.resting(procs[pid])), None)
-        return resting_of[appid]
+    def rests_itself(q):
+        """Stopped, or in a cgroup that is frozen or being frozen."""
+        if q.state == "T":
+            return True
+        path = cg.path(q.pid)
+        return path is not None and cg.frozen(path)
 
-    running, rests, labels = None, {}, {}
+    def member(pid):
+        q = procs.get(pid)
+        return q if q is not None or not proc_root else read_stat(proc_root, pid)
+
+    def scope_state(path):
+        """One scope of a Steam game: "rests", "runs" or "gone" (emptied or removed: an
+        exit)."""
+        ev = cg.events(path)
+        if ev is not None and ev.get("populated") == "0":
+            return "gone"
+        if ev is None and not os.path.isdir(cgroup_dir(sys_root, path)):
+            return "gone"
+        if cg.frozen(path):
+            return "rests"
+        pids = cg.members(path)
+        if pids is None:
+            return "runs"                            # can't tell
+        alive = [q for q in (member(pid) for pid in pids) if q is not None and _alive(q)]
+        if not alive:
+            return "gone"                            # only the dying are left
+        return "rests" if all(q.state == "T" for q in alive) else "runs"
+
+    def game(appid):
+        """(state, rests) of the Steam game with this AppId, judged from all of its processes:
+        "rests" (with its Rests), "runs" or "gone"."""
+        if appid in games:
+            return games[appid]
+        every = [procs[pid] for pid in sorted(procs)
+                 if pid not in exclude and not procs[pid].kthread
+                 and appid_of(procs[pid]) == appid]
+        mine = [q for q in every if _alive(q)]
+        # its scopes, from all of its processes: one being killed in its freezer still says
+        # which scope it was in (and that scope, still asked to freeze, rests)
+        scopes = sorted({path for path in (cg.path(q.pid) for q in every)
+                         if path is not None and scope_appid(path) == appid})
+        if scopes:
+            states = {s: scope_state(s) for s in scopes}
+            live = [s for s in scopes if states[s] != "gone"]
+            # its processes seen outside them (Steam's launch wrapper): one whose cgroup
+            # can't be read is not among them -- left alone later, it still counts
+            outside = [(q.pid, q.start) for q in mine
+                       if cg.path(q.pid) is not None and cg.path(q.pid) not in scopes]
+            if not live:
+                got = ("gone", [])
+            elif all(states[s] == "rests" for s in live):
+                got = ("rests", [Rest("scope:" + s, appid, scope=s, remnant=outside)
+                                 for s in live])
+            else:
+                got = ("runs", [])
+        else:
+            others = [q for q in mine if not _is_steam_launch(q)]
+            if others and all(rests_itself(q) for q in others):
+                members = [(q.pid, q.start, cg.path(q.pid)) for q in others]
+                launches = [(q.pid, q.start) for q in mine if _is_steam_launch(q)]
+                got = ("rests", [Rest("app:%d" % appid, appid, members=members,
+                                      remnant=launches)])
+            elif mine and all((q.pid, q.start) in leftovers for q in mine):
+                got = ("gone", [])                   # what is left of a resting game that exited
+            else:
+                got = ("runs", [])
+        games[appid] = got
+        return got
+
+    marks = []                       # (label, game, its Rests -- None: running), in pid order
     for pid in sorted(procs):
         p = procs[pid]
-        if pid in exclude or p.kthread:
+        if pid in exclude or p.kthread or not _alive(p):
             continue
         label = _game_candidate(p, procs, children, appid_of)
         if label is None:
             continue
-        rest = p if reader.resting(p) else None
-        if rest is None and _is_steam_launch(p) and appid_of(p) is not None:
-            rest = appid_rests(appid_of(p))
-        if rest is None:
-            running = running or label
-            continue
-        # one label per resting game: its first candidate's (a Steam game's, by its AppId)
         appid = appid_of(p)
-        label = labels.setdefault(("pid", pid) if appid is None else appid, label)
-        if rest.pid not in rests:
-            rests[rest.pid] = Rest(rest.pid, rest.start, reader.events(rest), label)
-    return GameScan(running, next(iter(labels.values()), None),
-                    [rests[pid] for pid in sorted(rests)])
+        key = ("pid", pid) if appid is None else appid
+        if _is_steam_launch(p) and appid is not None:
+            state, rests = game(appid)
+            if state == "gone":
+                continue
+            marks.append((label, key, rests if state == "rests" else None))
+        elif rests_itself(p):
+            state, rests = game(appid) if appid is not None else ("runs", [])
+            if state != "rests":
+                rests = [Rest("proc:%d:%d" % (pid, p.start), key,
+                              members=[(pid, p.start, cg.path(pid))])]
+            marks.append((label, key, rests))
+        else:
+            marks.append((label, key, None))
+    runs = {key for _label, key, rests in marks if rests is None}
+    keys = sorted({r.key for _label, key, rests in marks if rests is not None and key not in runs
+                   for r in rests})
+    age = ages(keys) if ages is not None else None
+    young = set() if age is None else {k for k in keys if age.get(k, 0.0) < min_age}
+    running, labels, out = None, {}, {}
+    for label, key, rests in marks:
+        if rests is None or any(r.key in young for r in rests):
+            running = running or label
+        elif key not in runs:                        # a game with anything running: not resting
+            labels.setdefault(key, label)            # one label per game: its first candidate's
+            for r in rests:
+                out.setdefault(r.key, r)
+    for r in out.values():
+        r.label = labels.get(r.game)
+    return GameScan(running, next(iter(labels.values()), None), [out[k] for k in sorted(out)])
 
 
 def detect_game(procs, exclude=(), proc_root=None, sys_root=None):
@@ -870,8 +1127,166 @@ def detect_game(procs, exclude=(), proc_root=None, sys_root=None):
     A non-Steam shortcut (AppId >= 2^31) is a game only when Wine/Proton runs in its process
     subtree; one running a native Linux program (Firefox, Dolphin, ...) is left to the CPU/GPU
     rule. Steam's own client and web helper never count, and neither does a resting game
-    (scan_games: frozen or stopped; cgroups are read under proc_root and sys_root)."""
+    (scan_games: frozen or stopped as a whole; cgroups are read under proc_root and sys_root).
+    No rest-age rule here: status and the encode pass scan_games their RestSeen."""
     return scan_games(procs, exclude, proc_root, sys_root).running
+
+
+def _boot_id(proc_root):
+    """This boot's id (/proc/sys/kernel/random/boot_id), "" when it can't be read."""
+    return _read(os.path.join(proc_root, "sys", "kernel", "random", "boot_id")) or ""
+
+
+class RestSeen:
+    """When each resting game (a Rest key) was first seen at rest, kept across vworker runs in
+    the worker's own scratch dir (cfg.rest_seen, replaced atomically) so that a quick pause --
+    a game frozen for a moment while its menu is open -- never counts: a game rests only after
+    REST_MIN_AGE_S of rest in a row (scan_games asks update()). The times are `clock`'s, this
+    boot's monotonic clock: a file written in another boot is dropped, and so is a time that
+    lies ahead (the clock went back). A file that can't be read is empty; one that can't be
+    written keeps nothing, so every rest reads as just begun (it never counts): never a
+    failure."""
+
+    def __init__(self, path, clock=time.monotonic, boot=""):
+        self.path, self.clock, self.boot = path, clock, boot or ""
+
+    def _load(self):
+        raw = _read(self.path)
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            return {}
+        seen = data.get("seen") if isinstance(data, dict) and data.get("boot") == self.boot \
+            else None
+        if not isinstance(seen, dict):
+            return {}
+        return {k: float(t) for k, t in seen.items()
+                if isinstance(t, (int, float)) and not isinstance(t, bool)}
+
+    def _save(self, seen):
+        tmp = "%s.%d.tmp" % (self.path, os.getpid())
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", mode=0o700, exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump({"boot": self.boot, "seen": seen}, f, sort_keys=True)
+            os.replace(tmp, self.path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def update(self, keys):
+        """The games resting now -> {key: seconds since it was first seen at rest}. A new key
+        starts at 0; every key not resting now is forgotten (a game that woke, even for a
+        moment, starts over)."""
+        now = self.clock()
+        old = self._load()
+        seen = {}
+        for k in keys:
+            t = old.get(k)
+            seen[k] = t if t is not None and t <= now else now
+        if seen != old and (seen or os.path.lexists(self.path)):
+            self._save(seen)
+        return {k: now - t for k, t in seen.items()}
+
+
+_LOCAL_TIME = re.compile(r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})")
+
+
+def _local_epoch(text):
+    """A local time "YYYY-MM-DD HH:MM:SS" -> seconds since the epoch, or None."""
+    m = _LOCAL_TIME.fullmatch(text) if isinstance(text, str) else None
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) for g in m.groups())
+    try:
+        return time.mktime((y, mo, d, h, mi, s, 0, 0, -1))      # -1: DST as it was then
+    except (OverflowError, ValueError):
+        return None
+
+
+def rest_marker(path, wall=time.time):
+    """A rest manager's file (only ever read): None when there is none -- no rest manager runs
+    here -- else whether a game is waking up: its top-level "waking", the local time it began
+    continuing a game, no more than WAKE_MAX_AGE_S away from now. When "waking" can't be
+    parsed (or lies further ahead than that) the file's own mtime stands in for it. JSON that
+    can't be read or is half written says nothing this time (False); so does a stale time."""
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return None
+    raw = _read(path)
+    try:
+        data = json.loads(raw) if raw else None
+    except ValueError:
+        return False
+    if not isinstance(data, dict) or data.get("waking") is None:
+        return False
+    now, t = wall(), _local_epoch(data.get("waking"))
+    if t is None or t - now > WAKE_MAX_AGE_S:
+        t = mtime
+    return abs(now - t) <= WAKE_MAX_AGE_S
+
+
+def own_memory_max(proc_root, sys_root):
+    """MemoryMax of this process's own cgroup (memory.max), in bytes, or None when it has none
+    ("max") or it can't be told (no memory controller there, cgroup v1)."""
+    path = cgroup_path(proc_root, "self")
+    v = _read(cgroup_file(sys_root, path, "memory.max")) if path else None
+    return int(v) if v and v.isdigit() else None
+
+
+_SCOPE_PROBE = {}                      # systemd-run path -> may this session start a scope?
+
+
+def scope_works(systemd_run):
+    """Can this session start a transient user scope (`systemd-run --user --scope --quiet
+    --collect -- true` within SCOPE_PROBE_TIMEOUT, its stdin, stdout and stderr on /dev/null:
+    the stream is never touched)? Asked once per process; no systemd-run: no."""
+    if not systemd_run:
+        return False
+    if systemd_run not in _SCOPE_PROBE:
+        try:
+            r = subprocess.run([systemd_run] + SCOPE_PROBE_ARGS, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=SCOPE_PROBE_TIMEOUT)
+            ok = r.returncode == 0
+        except (OSError, subprocess.SubprocessError, ValueError):     # a timeout included
+            ok = False
+        _SCOPE_PROBE[systemd_run] = ok
+    return _SCOPE_PROBE[systemd_run]
+
+
+def scope_argv(cfg, job_id, b64, budget):
+    """The re-exec of `vworker encode <job> <b64>` inside a transient user scope of its own,
+    visionary-x265-<job>, capped at `budget` bytes (MemoryHigh; MemoryMax SCOPE_MAX_EXTRA
+    above)."""
+    return [cfg.systemd_run, "--user", "--scope", "--quiet", "--collect",
+            "--unit=%s%s" % (SCOPE_UNIT_PREFIX, job_id),
+            "-p", "MemoryHigh=%d" % budget, "-p", "MemoryMax=%d" % (budget + SCOPE_MAX_EXTRA),
+            "--", sys.executable, os.path.abspath(__file__), "encode", job_id, b64]
+
+
+_IONICE_PROBE = {}                     # ionice path -> does `ionice -c 3` work here?
+
+
+def ionice_prefix(ionice):
+    """[ionice, "-c", "3"] -- zstd and x265 at idle I/O priority -- when `ionice -c 3 true`
+    works here (asked once per process, all of its stdio on /dev/null), else [] and they run
+    without it: an ionice that can't set the class would not run them at all."""
+    if not ionice:
+        return []
+    if ionice not in _IONICE_PROBE:
+        try:
+            r = subprocess.run([ionice] + IONICE_ARGS + ["true"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=2.0)
+            ok = r.returncode == 0
+        except (OSError, subprocess.SubprocessError, ValueError):
+            ok = False
+        _IONICE_PROBE[ionice] = ok
+    return [ionice] + IONICE_ARGS if _IONICE_PROBE[ionice] else []
 
 
 class CpuSampler:
@@ -1250,9 +1665,8 @@ class HeavyTracker:
         return None
 
 
-def mem_available_gb(proc_root):
-    """MemAvailable from <proc>/meminfo in GB (2^30 bytes, as free disk is counted), or None
-    when it can't be read (then memory refuses nothing)."""
+def mem_available_bytes(proc_root):
+    """MemAvailable from <proc>/meminfo in bytes, or None when it can't be read."""
     for line in (_read(os.path.join(proc_root, "meminfo")) or "").splitlines():
         parts = line.split()
         if parts[:1] == ["MemAvailable:"]:
@@ -1260,8 +1674,34 @@ def mem_available_gb(proc_root):
                 kb = int(parts[1])
             except (IndexError, ValueError):
                 return None
-            return kb / float(1 << 20) if kb >= 0 and parts[2:] in ([], ["kB"]) else None
+            return kb * 1024 if kb >= 0 and parts[2:] in ([], ["kB"]) else None
     return None
+
+
+def mem_available_gb(proc_root):
+    """MemAvailable from <proc>/meminfo in GB (2^30 bytes, as free disk is counted), or None
+    when it can't be read (then memory refuses nothing -- unless a game rests)."""
+    b = mem_available_bytes(proc_root)
+    return None if b is None else b / float(GIB)
+
+
+def memory_verdict(cfg, mem, resting):
+    """(ok, why) of MemAvailable `mem` (GB; None: unreadable) for a new job. With no game at
+    rest it needs cfg.min_mem_gb (unreadable: fine); beside a resting game it needs the
+    owner's reserve plus a budget, cfg.rest_reserve_gb + cfg.rest_budget_gb (unreadable:
+    refused, since the game's memory could not be kept)."""
+    if not resting:
+        if mem is None or mem >= cfg.min_mem_gb:
+            return True, ""
+        return False, ("low on memory: %.1f GB available, needs %.1f"
+                       % (_gb_down(mem), cfg.min_mem_gb))
+    need = cfg.rest_reserve_gb + cfg.rest_budget_gb
+    if mem is None:
+        return False, "low on memory: it can't be read while a game rests"
+    if mem >= need:
+        return True, ""
+    return False, ("low on memory: %.1f GB available, needs %.1f while a game rests"
+                   % (_gb_down(mem), need))
 
 
 def _gb_down(gb):
@@ -1285,32 +1725,55 @@ class MemoryWatch:
         return self.run >= self.ticks
 
 
-class RestWatch:
-    """The fast half of "a game stops a job at once" while a game rests beside an encode: a
-    light thread re-reads the resting processes (the rests of each watchdog game check, handed
-    over by watch()) every `interval` s -- each cgroup.events once, and the stat of a process
-    only when its cgroup is not frozen (a stopped one, or one that thawed) -- and calls
-    on_wake(label) the moment one is no longer resting while it still lives (thawed, or
-    continued after SIGSTOP). An exit is no wake-up: a process that is gone, a zombie, a
-    reused pid or one shutting down (PF_EXITING: a frozen game being killed leaves the freezer
-    to die) is skipped. The thread starts with the first rests and ends with the job's `stop`,
-    close(), a wake-up, or a failure (on_fail(exc): no fast protection -> the job stops)."""
+class FastWatch:
+    """The quick half of "a game stops a job at once": ONE light thread for the whole encode,
+    a look every `interval` s (the 2-s watchdog keeps the full checks as the backstop). Each
+    look, in this order:
+      1. a rest manager's wake marker (rest_marker): a game waking up -> WHY_WAKING;
+      2. the resting games the job's game checks handed over (watch()), each read lightly --
+         a scope's cgroup.events (and, only once it has thawed, its cgroup.freeze, its
+         cgroup.procs and their stat), a process's cgroup and, only when that is not frozen,
+         its stat: one that woke -- thawed, or continued after SIGSTOP -> WHY_WOKE. An exit is
+         no wake-up: an emptied or removed scope, still asked to freeze, or processes that are
+         gone, zombies, reused pids or shutting down (PF_EXITING);
+      3. the processes started since its last look: /proc is listed and only a NEW pid has its
+         stat and cmdline read (once more on the next look, in case it had not exec'd yet);
+         one that could be a game sends `scan` -- the job's whole game check, every rule
+         included -- over a fresh /proc, and a running game -> WHY_STARTED.
+    Any of them stops the job with code "game" (on_stop(why, code)). start(procs) starts the
+    thread -- procs: what the job's first game check saw -- and it ends with the job's
+    `stop`, close() or a stop it sends; a failure ends the job (on_fail(exc): no fast
+    protection, fail closed). on_rest_manager() is called once, the first time the rest
+    manager's file is seen."""
 
-    def __init__(self, proc_root, stop, on_wake, on_fail, interval=THAW_INTERVAL):
-        self.proc_root, self.stop, self.interval = proc_root, stop, interval
-        self.on_wake, self.on_fail = on_wake, on_fail
+    def __init__(self, cfg, stop, on_stop, on_fail, scan=None, interval=THAW_INTERVAL,
+                 wall=time.time, on_rest_manager=None):
+        self.cfg, self.proc_root, self.sys_root = cfg, cfg.proc, cfg.sys
+        self.stop, self.interval, self.wall = stop, interval, wall
+        self.on_stop, self.on_fail, self.scan = on_stop, on_fail, scan
+        self.on_rest_manager = on_rest_manager
         self.lock = threading.Lock()
         self.rests = ()
+        self.cache = None                    # pid -> Proc of every process looked at
+        self.fresh = set()                   # pids new at the last look: read again at the next
         self.done = threading.Event()
-        self.thread = None
+        self.thread = None                   # set only once it has started
 
     def watch(self, rests):
-        """Re-read these from now on (none: nothing rests)."""
+        """Re-read these resting games from now on (none: nothing rests)."""
         with self.lock:
             self.rests = tuple(rests)
-            if self.rests and self.thread is None and not self.done.is_set():
-                self.thread = threading.Thread(target=self._run, name="rest-watch", daemon=True)
-                self.thread.start()
+
+    def start(self, procs):
+        """Start the thread; `procs` are the processes already looked at. Raises when the
+        thread can't start (then none is kept, and close() has nothing to join)."""
+        with self.lock:
+            if self.thread is not None or self.done.is_set():
+                return
+            self.cache = dict(procs)
+            t = threading.Thread(target=self._run, name="fast-watch", daemon=True)
+            t.start()
+            self.thread = t
 
     def close(self):
         """The job is over: stop the thread and wait for it."""
@@ -1320,22 +1783,94 @@ class RestWatch:
         if t is not None and t is not threading.current_thread():
             t.join(2.0)
 
+    # -- 2: the resting games
     def check(self):
-        """One look -> the label of a resting game that woke up, else None."""
+        """One look at the rests -> the label of a resting game that woke up, else None."""
         with self.lock:
             rests = self.rests
-        frozen = {}
+        cg = _Cgroups(self.proc_root, self.sys_root)
         for r in rests:
-            if r.events is not None:
-                if r.events not in frozen:
-                    frozen[r.events] = cgroup_frozen(r.events)
-                if frozen[r.events] is True:
-                    continue                          # still frozen: resting, whatever its state
-            q = read_stat(self.proc_root, r.pid)     # after its cgroup: an exit in between is gone
-            if q is None or q.start != r.start or q.state in DEAD_STATES or q.flags & PF_EXITING:
+            if (self._scope_woke(cg, r.scope) if r.scope is not None
+                    else self._procs_woke(cg, r.members)):
+                return r.label
+        return None
+
+    def _scope_woke(self, cg, path):
+        ev = cg.events(path)
+        if ev is not None and ev.get("populated") == "0":
+            return False                     # emptied: an exit
+        if cg.frozen(path):
+            return False                     # frozen, or still asked to freeze
+        pids = cg.members(path)
+        if pids is None:                     # removed: an exit; there but unreadable: it counts
+            return os.path.isdir(cgroup_dir(self.sys_root, path))
+        alive = [q for q in (read_stat(self.proc_root, pid) for pid in pids)
+                 if q is not None and _alive(q)]
+        return bool(alive) and not all(q.state == "T" for q in alive)
+
+    def _procs_woke(self, cg, members):
+        for pid, start, path in members:
+            if path is not None and cg.frozen(path):
+                continue                     # still frozen: resting, whatever its state
+            q = read_stat(self.proc_root, pid)   # after its cgroup: an exit in between is gone
+            if q is None or q.start != start or not _alive(q):
                 continue
             if q.state != "T":
-                return r.label
+                return True
+        return False
+
+    # -- 3: new processes
+    def check_new(self):
+        """One look at the processes started since the last -> a running game's label (one
+        could be a game: the job's whole game check said so), else None."""
+        cache = self.cache
+        if cache is None:
+            return None                      # not started
+        try:
+            names = os.listdir(self.proc_root)
+        except OSError:
+            return None                      # can't tell this time: the next look, the watchdog
+        pids = {int(n) for n in names if n.isdigit()}
+        for pid in [pid for pid in cache if pid not in pids]:
+            del cache[pid]                   # gone
+        new = {pid for pid in pids if pid not in cache}
+        look, self.fresh = sorted(new | (self.fresh & pids)), new
+        found = []
+        for pid in look:
+            p = read_proc(self.proc_root, pid)
+            if p is None:
+                cache.pop(pid, None)
+                continue
+            cache[pid] = p
+            if not p.kthread and _alive(p):
+                found.append(p)
+        if not found or self.scan is None:
+            return None
+        children = {}
+        for q in cache.values():
+            children.setdefault(q.ppid, []).append(q.pid)
+        appid_of = lambda q: _steam_appid(q, cache)    # noqa: E731
+        if all(_game_candidate(p, cache, children, appid_of) is None for p in found):
+            return None
+        procs = list_procs(self.proc_root)
+        self.cache = dict(procs)
+        return self.scan(procs).running
+
+    # -- one look, the thread
+    def tick(self):
+        """One look -> (why, code) of a stop, else None."""
+        marker = rest_marker(self.cfg.rest_file, self.wall)
+        if marker is not None and self.on_rest_manager is not None:
+            seen, self.on_rest_manager = self.on_rest_manager, None
+            seen()
+        if marker:
+            return WHY_WAKING, "game"
+        label = self.check()
+        if label is not None:
+            return WHY_WOKE % label, "game"
+        label = self.check_new()
+        if label is not None:
+            return WHY_STARTED % label, "game"
         return None
 
     def _run(self):
@@ -1343,9 +1878,9 @@ class RestWatch:
             while not self.done.wait(self.interval):
                 if self.stop.is_set():
                     return
-                label = self.check()
-                if label is not None:
-                    self.on_wake(label)
+                got = self.tick()
+                if got is not None:
+                    self.on_stop(*got)
                     return
         except Exception as e:                # fail closed: no fast protection -> stop
             self.on_fail(e)
@@ -1585,31 +2120,41 @@ def self_sha256():
     return _SELF_SHA256[0]
 
 
-def _mem_ok(cfg):
-    mem = mem_available_gb(cfg.proc)
-    return mem is None or mem >= cfg.min_mem_gb
+def _mem_ok(cfg, resting=None):
+    return memory_verdict(cfg, mem_available_gb(cfg.proc), resting)[0]
 
 
 def heavy_only(st, cfg):
     """Is a heavy CPU/GPU reading the ONLY thing between this status and ok? (Then an encode
-    re-samples instead of refusing at once: one busy second is not "anything heavy".)"""
-    return bool(st.get("heavy") and st.get("ac") and st.get("ethernet") and not st.get("game")
-                and not st.get("busy") and st.get("x265") and _zstd_ok(cfg)
-                and free_gb(cfg.jobs) >= cfg.min_free_gb and _mem_ok(cfg))
+    re-samples instead of refusing at once: one busy second is not "anything heavy".) A game
+    waking up refuses as "game" with no "game" named: its code says so."""
+    return bool(st.get("heavy") and st.get("code") in (None, "heavy") and st.get("ac")
+                and st.get("ethernet") and not st.get("game") and not st.get("busy")
+                and st.get("x265") and _zstd_ok(cfg) and free_gb(cfg.jobs) >= cfg.min_free_gb
+                and _mem_ok(cfg, st.get("resting_game")))
 
 
 def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self_pid=None,
-                   parent_pid=None, clock=time.monotonic, sleep=time.sleep):
+                   parent_pid=None, clock=time.monotonic, sleep=time.sleep, rest_clock=None):
     """The status dict. `exclude_job` is the job an encode is about to claim (its own staged
-    dir must not read as busy). "sleep_block" is sleep_block()'s answer, for Setup only: it
-    never makes the status not ok. "game" is a running game; a resting one (scan_games) is only
-    named, as "resting_game". Low memory (MemAvailable under cfg.min_mem_gb) refuses as
-    "low_memory"; "mem_available_gb" is None when /proc/meminfo can't be read, which refuses
-    nothing."""
+    dir must not read as busy). "game" is a running game -- one at rest for less than
+    cfg.rest_min_age still counts as one (RestSeen, on `rest_clock`) --; a resting one
+    (scan_games) is only named, as "resting_game", and a game a rest manager is waking up
+    (rest_marker) refuses as "game" too. Low memory refuses as "low_memory" (memory_verdict:
+    beside a resting game it takes more, and an unreadable MemAvailable refuses then);
+    "mem_available_gb" is None when /proc/meminfo can't be read. "sleep_block" is
+    sleep_block()'s answer, for Setup only: it never makes the status not ok, and where a rest
+    manager runs (its file exists) it is not even asked: None."""
     runner = runner or default_runner
     self_pid = os.getpid() if self_pid is None else self_pid
     parent_pid = os.getppid() if parent_pid is None else parent_pid
-    sleep_answer = _start_sleep_probe(cfg.inhibit)
+    rest_manager = os.path.exists(cfg.rest_file)
+    sleep_answer = (lambda: None) if rest_manager else _start_sleep_probe(cfg.inhibit)
+    seen = RestSeen(cfg.rest_seen, rest_clock or time.monotonic, _boot_id(cfg.proc))
+
+    def games(procs, own):
+        return scan_games(procs, own, cfg.proc, cfg.sys, ages=seen.update,
+                          min_age=cfg.rest_min_age)
     ac = ac_online(cfg.sys)
     links = ethernet_links(cfg.sys)
     ethernet, eth_why = bool(links), "no Ethernet"
@@ -1619,7 +2164,7 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
             ethernet, eth_why = False, "no Ethernet: ssh arrives on %s" % via
     procs = list_procs(cfg.proc)
     own = own_tree(procs, self_pid, parent_pid)
-    scan = scan_games(procs, own, cfg.proc, cfg.sys)
+    scan = games(procs, own)
     game, resting = scan.running, scan.resting
     cpu = None
     gpus = GpuSampler(cfg.sys, cfg.proc, runner)
@@ -1632,19 +2177,20 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
         t1 = clock()
         procs = list_procs(cfg.proc)
         own = own_tree(procs, self_pid, parent_pid)
-        scan = scan_games(procs, own, cfg.proc, cfg.sys)
+        scan = games(procs, own)
         game, resting = game or scan.running, scan.resting
         cpu = sampler.sample(procs, own, t1)
         gpu = gpus.sample(procs, own, t1)
     else:
         gpu = gpus.sample(procs, own, clock())
+    waking = rest_marker(cfg.rest_file) is True
     heavy = None
     if cpu is not None and cpu[0] > CPU_CORES_LIMIT:
         heavy = cpu[1]
     elif gpu[0] > GPU_BUSY_LIMIT:
         heavy = gpu[1]
     mem = mem_available_gb(cfg.proc)
-    low_mem = mem is not None and mem < cfg.min_mem_gb
+    mem_ok, mem_why = memory_verdict(cfg, mem, resting)
     free = free_gb(cfg.jobs)
     busy_jobs = live_encode_jobs(cfg, exclude_job)
     ver = x265_version(cfg.x265, runner)
@@ -1655,13 +2201,14 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
         code, why = "no_ethernet", eth_why
     elif game:
         code, why = "game", "game running: %s" % game
+    elif waking:
+        code, why = "game", WHY_WAKING
     elif busy_jobs:
         code, why = "busy", "busy: encoding job %s" % busy_jobs[0]
     elif heavy:
         code, why = "heavy", "busy: %s" % heavy
-    elif low_mem:
-        code, why = "low_memory", ("low on memory: %.1f GB available, needs %.1f"
-                                   % (_gb_down(mem), cfg.min_mem_gb))
+    elif not mem_ok:
+        code, why = "low_memory", mem_why
     elif free < cfg.min_free_gb:
         code, why = "low_disk", "low disk: %.1f GB free, need %.0f" % (free, cfg.min_free_gb)
     elif not ver:
@@ -1670,7 +2217,7 @@ def compute_status(cfg, runner=None, exclude_job=None, ssh_connection=None, self
         code, why = "zstd_missing", "zstd missing: %s" % cfg.zstd
     else:
         code, why = "ready", "ready"
-    ok = bool(ac and ethernet and not game and not heavy and not low_mem
+    ok = bool(ac and ethernet and not game and not waking and not heavy and mem_ok
               and free >= cfg.min_free_gb and ver and zstd_ok and not busy_jobs)
     return {"ok": ok, "why": why, "code": code, "ac": ac, "ethernet": ethernet, "game": game,
             "resting_game": resting, "heavy": heavy, "free_gb": round(free, 1),
@@ -1888,7 +2435,8 @@ class EncodeJob:
         self.code = None                           # REASON_CODES word of a yield or a refusal
         self.owns_dir = False
         self.zstd = self.x265 = None
-        self.inhibitors = []                       # systemd-inhibits holding off sleep and idle
+        self.inhibitors = []                       # the systemd-inhibit holding off sleep
+        self.inhibit_lock = threading.Lock()
         self.zstd_killed = False
         self.rfd = self.dummy_w = None
         self.err_lock = threading.Lock()
@@ -1899,14 +2447,23 @@ class EncodeJob:
         self.copied = 0
         self.last_activity = time.monotonic()
         self.ppid0 = os.getppid()
-        self.threads = {}
+        self.threads = {}                          # name -> thread, once it has started
         self.summary_at = self.error_at = None     # when x265 printed its summary / an error
         self.hung = None                           # (what, output_closed) once we killed it
-        # a resting game waking up yields like a game start, within THAW_INTERVAL s
-        self.rest_watch = RestWatch(
-            cfg.proc, self.stop,
-            lambda label: self.abort("yielded", "a game woke up: %s" % label, "game"),
-            lambda e: self.abort("error", "rest watch failed: %s" % e))
+        self.resting = None                        # the label of a game resting as it started
+        self.scope_argv = None                     # set by prepare: go on in a capped scope
+        self.scope_max = None                      # and the MemoryMax it asks for (bytes)
+        # the game checks: rest ages (B3) and every resting game this job has seen (its
+        # leftovers after an exit are no game), one check at a time
+        self.seen = RestSeen(cfg.rest_seen, boot=_boot_id(cfg.proc))
+        self.known = {}
+        self.scan_lock = threading.Lock()
+        # a new game, a resting game waking up, or a rest manager waking one: a stop within
+        # THAW_INTERVAL s
+        self.fast = FastWatch(
+            cfg, self.stop, lambda why, code: self.abort("yielded", why, code),
+            lambda e: self.abort("error", "fast watch failed: %s" % e), self._scan,
+            on_rest_manager=self._stop_inhibitor)
 
     # -- state
     def abort(self, result, why, code=None):
@@ -1993,30 +2550,34 @@ class EncodeJob:
     def _watchdog(self):
         cfg, runner = self.cfg, self.runner
         me = os.getpid()
-        kids = lambda: [p.pid for p in (self.zstd, self.x265) if p is not None]
         try:
             sampler = CpuSampler(cfg.proc)
             gpus = GpuSampler(cfg.sys, cfg.proc, runner)
             heavy = HeavyTracker(cfg.heavy_secs)
-            memory = MemoryWatch()
+            # beside a resting game MemAvailable stays above the owner's floor the whole time
+            memory = MemoryWatch(cfg.rest_keep_gb if self.resting else cfg.stop_mem_gb)
             wifi = WifiStream(cfg.sys, cfg.proc)
             reader = self.zstd.pid if self.zstd is not None else None   # reads the ssh stdin
             procs = list_procs(cfg.proc)
-            own = own_tree(procs, me, self.ppid0, kids())
+            own = own_tree(procs, me, self.ppid0, self._kids())
             t0 = time.monotonic()
             sampler.sample(procs, own, t0)
             gpus.begin(procs, t0)
             wifi.update(reader, ethernet_links(cfg.sys))
-            if self._check_games(procs, own):     # from the start: a game resting already
+            if self._check_games(procs):          # from the start: a game resting already
                 return
+            try:
+                self.fast.start(procs)            # the quick looks take over from this one
+            except Exception as e:                # fail closed: no fast protection -> stop
+                return self.abort("error", "fast watch failed to start: %s" % e)
             last = time.monotonic()
             while not self.stop.wait(cfg.watch_interval):
                 now = time.monotonic()
                 if os.getppid() != self.ppid0:
                     return self.abort("disconnected", "parent process gone")
                 procs = list_procs(cfg.proc)
-                own = own_tree(procs, me, self.ppid0, kids())
-                if self._check_games(procs, own):
+                own = own_tree(procs, me, self.ppid0, self._kids())
+                if self._check_games(procs):
                     return
                 links = ethernet_links(cfg.sys)
                 if not links:
@@ -2028,8 +2589,9 @@ class EncodeJob:
                     return self.abort("yielded", "on battery", "battery")
                 mem = mem_available_gb(cfg.proc)
                 if memory.update(mem):
-                    return self.abort("yielded", "low on memory: %.1f GB available"
-                                      % _gb_down(mem), "low_memory")
+                    return self.abort("yielded", "low on memory: %.1f GB available%s"
+                                      % (_gb_down(mem), " while a game rests" if self.resting
+                                         else ""), "low_memory")
                 cpu = sampler.sample(procs, own, now)
                 what = heavy.update(now, last, cpu, gpus.sample(procs, own, now, prefetch=True))
                 if what:
@@ -2040,20 +2602,38 @@ class EncodeJob:
         except Exception as e:                # fail closed: no protection -> stop
             self.abort("error", "watchdog failed: %s" % e)
 
-    def _check_games(self, procs, own):
-        """One game check: a running game yields at once (-> True); resting ones go to the
-        rest watch, which yields the moment one wakes."""
-        scan = scan_games(procs, own, self.cfg.proc, self.cfg.sys)
+    def _kids(self):
+        return [p.pid for p in (self.zstd, self.x265) if p is not None]
+
+    def _scan(self, procs):
+        """The whole game check over `procs` (one at a time: the watchdog and the fast watch
+        share it): scan_games with this job's rest ages and the resting games it has seen; the
+        rests it finds go to the fast watch."""
+        own = own_tree(procs, os.getpid(), self.ppid0, self._kids())
+        with self.scan_lock:
+            scan = scan_games(procs, own, self.cfg.proc, self.cfg.sys, ages=self.seen.update,
+                              known=list(self.known.values()), min_age=self.cfg.rest_min_age)
+            for r in scan.rests:
+                old = self.known.get(r.key)
+                if old is not None:
+                    r.remnant = r.remnant | old.remnant
+                self.known[r.key] = r
+        self.fast.watch(scan.rests)
+        return scan
+
+    def _check_games(self, procs):
+        """One full game check: a running game yields at once (-> True); resting ones go to
+        the fast watch, which yields the moment one wakes."""
+        scan = self._scan(procs)
         if scan.running:
             self.abort("yielded", "game running: %s" % scan.running, "game")
             return True
-        self.rest_watch.watch(scan.rests)
         return False
 
     def _start_thread(self, name, target, *args):
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
+        t.start()                                  # raises when it can't: then nothing is kept
         self.threads[name] = t
-        t.start()
         return t
 
     # -- children
@@ -2076,28 +2656,28 @@ class EncodeJob:
         self._stop_inhibitor()
 
     def _start_inhibitor(self):
-        """Ask logind for a sleep block and, beside it, an idle block for the encode (each a
-        `systemd-inhibit ... sleep infinity` in its own process group), so the helper does not
-        suspend mid-segment. Two, because polkit judges each kind on its own: over ssh a stock
-        setup usually refuses sleep (status reports it as sleep_block) but allows idle, which
-        covers the desktops and logind's IdleAction that honour it. Only where systemd-inhibit
-        exists; one that cannot start, or exits at once (polkit said no), never fails the job.
-        They die with us (PDEATHSIG), and logind lifts a block the moment its systemd-inhibit
-        exits."""
+        """Ask logind for a sleep block for the encode (`systemd-inhibit ... sleep infinity` in
+        its own process group), so the helper does not suspend mid-segment. Only where
+        systemd-inhibit exists, and run() asks only when no game rests and no rest manager
+        runs here (it decides about sleep itself); one that cannot start, or exits at once
+        (polkit said no: status reports it as sleep_block), never fails the job. It dies with
+        us (PDEATHSIG), and logind lifts the block the moment its systemd-inhibit exits."""
         if not self.cfg.inhibit:
             return
-        for args in (INHIBIT_ARGS, IDLE_INHIBIT_ARGS):
+        with self.inhibit_lock:
             try:
                 self.inhibitors.append(subprocess.Popen(
-                    [self.cfg.inhibit] + args, stdin=subprocess.DEVNULL,
+                    [self.cfg.inhibit] + INHIBIT_ARGS, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     preexec_fn=_make_child_setup(os.getpid()), start_new_session=True))
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
 
     def _stop_inhibitor(self):
-        """Release the blocks: kill each systemd-inhibit and its sleep (their process group)."""
-        held, self.inhibitors = self.inhibitors, []
+        """Release the block: kill each systemd-inhibit and its sleep (their process group).
+        Also called by the fast watch when a rest manager's file appears mid-job."""
+        with self.inhibit_lock:
+            held, self.inhibitors = self.inhibitors, []
         for p in held:
             try:
                 os.killpg(p.pid, signal.SIGKILL)   # not reaped yet, so the group is still ours
@@ -2122,10 +2702,15 @@ class EncodeJob:
 
     # -- the job
     def prepare(self, b64):
-        """Validate and claim. -> None to go ahead, or (result, why) to finish now. A stop
-        signal at any point here finishes the job at once (its dir deleted when nobody else
-        owns it). A heavy reading alone is re-sampled up to HEAVY_SAMPLES times in all and
-        refuses only when every sample is heavy; anything else that is not ok refuses at once."""
+        """Validate and claim. -> None to go ahead (in a memory-capped scope first when
+        self.scope_argv is set), or (result, why) to finish now. A stop signal at any point
+        here finishes the job at once (its dir deleted when nobody else owns it). A heavy
+        reading alone is re-sampled up to HEAVY_SAMPLES times in all and refuses only when
+        every sample is heavy; anything else that is not ok refuses at once. Beside a resting
+        game the job runs only inside a scope of its own capped at its memory budget: outside
+        one, prepare asks for the re-exec (nothing claimed yet) or refuses ("low_memory",
+        WHY_NO_CAP) when this session can't start a scope; inside, it refuses when the cap is
+        not there."""
         if not JOB_ID_RE.fullmatch(self.job_id or ""):
             return ("error", "bad job id")
         if self.stop.is_set():
@@ -2155,11 +2740,65 @@ class EncodeJob:
             if not st["ok"]:
                 self.code = st.get("code")
                 return ("refused", st["why"])
+            self.resting = st.get("resting_game")
+            if self.resting:
+                refused = self._capped_scope(b64)
+                if refused is not None:
+                    self.code = "low_memory"
+                    return ("refused", refused)
+                if self.scope_argv is not None:
+                    return None               # cmd_encode re-execs: the scope claims it
             os.makedirs(self.jobdir, mode=0o700, exist_ok=True)
             write_marker(self.jobdir, "encode", self.cfg.proc)
         if "{rpu}" in self.args and not os.path.isfile(self.rpu):
             return ("error", "%s missing: put it before encode" % RPU_NAME)
         return None
+
+    def _capped_scope(self, b64):
+        """Beside a resting game. Outside a scope: set self.scope_argv to the re-exec into one
+        capped at the budget (MemAvailable - cfg.rest_reserve_gb) -> None, or the why of a
+        refusal. Inside one: None when this process's cgroup is capped (memory.max, no higher
+        than the MemoryMax asked for), else the why."""
+        cfg = self.cfg
+        if cfg.in_scope:
+            cap = own_memory_max(cfg.proc, cfg.sys)
+            if cap is None or (cfg.scope_max is not None and cap > cfg.scope_max):
+                return WHY_NO_CAP
+            return None
+        if not scope_works(cfg.systemd_run):
+            return WHY_NO_CAP
+        avail = mem_available_bytes(cfg.proc)
+        budget = None if avail is None else avail - int(cfg.rest_reserve_gb * GIB)
+        if budget is None or budget < cfg.rest_budget_gb * GIB:
+            return memory_verdict(cfg, None if avail is None else avail / float(GIB), True)[1] \
+                or WHY_NO_CAP
+        self.scope_argv = scope_argv(cfg, self.job_id, b64, budget)
+        self.scope_max = budget + SCOPE_MAX_EXTRA
+        return None
+
+    def reexec(self):
+        """Go on inside the memory-capped scope: exec systemd-run (self.scope_argv), which
+        moves this very process -- the same pid, with stdin, stdout and stderr untouched, the
+        stream included -- into its own transient scope and execs `vworker encode` again with
+        VWORKER_IN_SCOPE=1. Outside the ssh session's scope logind no longer ends it with the
+        session; it ends itself exactly as before when the Mac goes away (stdin ends, stdout
+        breaks, the parent goes, no data for STALL_SECS). Returns only when the exec failed:
+        the job is then refused ("low_memory", WHY_NO_CAP)."""
+        if self.stop.is_set():
+            return                            # a stop signal came first: finish as stopped
+        argv = self.scope_argv
+        if argv:
+            env = dict(os.environ, VWORKER_IN_SCOPE="1", VWORKER_SCOPE_MAX=str(self.scope_max))
+            for f in (sys.stdout, sys.stderr):
+                try:
+                    f.flush()
+                except (OSError, ValueError):
+                    pass
+            try:
+                os.execve(argv[0], argv, env)
+            except (OSError, ValueError):
+                pass
+        self.abort("refused", WHY_NO_CAP, "low_memory")
 
     def _dir_is_unowned(self):
         m = read_marker(self.jobdir)
@@ -2178,12 +2817,14 @@ class EncodeJob:
         self.rfd = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
         self.dummy_w = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
         os.set_blocking(self.rfd, True)
-        argv = [cfg.x265] + substitute(self.args, self.rpu, self.fifo)
+        io = ionice_prefix(cfg.ionice)        # idle I/O priority, where `ionice -c 3` works
+        argv = io + [cfg.x265] + substitute(self.args, self.rpu, self.fifo)
         setup = _make_child_setup(os.getpid())
         raise_oom_score(cfg.proc)             # before any child: they all inherit it
-        self._start_inhibitor()
+        if not self.resting and not os.path.exists(cfg.rest_file):
+            self._start_inhibitor()           # never beside a resting game or a rest manager
         try:
-            self.zstd = subprocess.Popen([cfg.zstd, "-d", "-q", "-c"], stdin=None,
+            self.zstd = subprocess.Popen(io + [cfg.zstd, "-d", "-q", "-c"], stdin=None,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          preexec_fn=setup)
             self.x265 = subprocess.Popen(argv, stdin=self.zstd.stdout, stdout=subprocess.DEVNULL,
@@ -2315,23 +2956,32 @@ class EncodeJob:
         return (self.result, self.why, self._encoded() or 0)
 
     def finish(self, result, why, frames):
-        """Cleanup common to every exit: children dead, the watchdog and the rest watch told to
-        stop, job dir gone, VWORKER line last."""
-        try:
-            self._kill_children()
-        except Exception:
-            pass
-        try:
-            self._stop_inhibitor()                # already gone unless _kill_children failed
-        except Exception:
-            pass
+        """Cleanup common to every exit, whatever failed before it (a watcher thread that
+        could not start included): children dead, the sleep block gone, the watchdog and the
+        fast watch told to stop and joined -- only threads that started are -- so none
+        outlives the job, the job dir gone, the VWORKER line last. Never raises."""
+        for step in (self._kill_children, self._stop_inhibitor):
+            try:
+                step()
+            except Exception:
+                pass
         self.stop.set()                           # the watchdog ends with the job
-        self.rest_watch.close()                   # and the rest watch is gone (joined)
-        t = self.threads.get("x265err")
-        if t is not None:
-            t.join(1)
-        if self.owns_dir and JOB_ID_RE.fullmatch(self.job_id or ""):
-            _rmtree(self.jobdir)
+        try:
+            self.fast.close()                     # and the fast watch (joined)
+        except Exception:
+            pass
+        for name, wait in (("watchdog", PMON_TIMEOUT + 0.5), ("x265err", 1.0)):
+            t = self.threads.get(name)
+            if t is not None and t is not threading.current_thread():
+                try:
+                    t.join(wait)
+                except Exception:
+                    pass
+        try:
+            if self.owns_dir and JOB_ID_RE.fullmatch(self.job_id or ""):
+                _rmtree(self.jobdir)
+        except Exception:
+            pass
         rec = {"result": result, "why": why, "frames": int(frames or 0)}
         if result in ("yielded", "refused") and self.code in REASON_CODES:
             rec["code"] = self.code           # the Mac's status line reads this, not the why
@@ -2356,6 +3006,9 @@ def cmd_encode(cfg, job_id, b64, runner=None):
         early = job.prepare(b64)
         if early is not None:
             return job.finish(early[0], early[1], 0)
+        if job.scope_argv is not None:        # a game rests: go on in a memory-capped scope
+            job.reexec()                      # returns only when it could not
+            return job.finish(job.result, job.why, 0)
         return job.finish(*job.run())
     except Exception as e:
         job.abort("error", "vworker: %s: %s" % (type(e).__name__, e))

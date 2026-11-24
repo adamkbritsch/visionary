@@ -25,12 +25,15 @@ User rules this side enforces (the helper polices itself too, independently):
     addresses (status "ipv4") only those are used — a name that also resolves to the helper's
     Wi-Fi address can no longer pick that one;
   - only when the helper's own `vworker status` says ok (mains, Ethernet, no running game (a
-    resting one does not count), nothing heavy, enough memory and disk, not busy), speaks
-    protocol PROTOCOL_VERSION and runs the SAME x265 build as this Mac;
+    game resting for a minute or more does not count; one waking up does), nothing heavy,
+    enough memory and disk, not busy), speaks protocol PROTOCOL_VERSION and runs the SAME x265
+    build as this Mac;
   - a segment the helper drops goes back to the Mac; the helper never parks or fails an item,
     and with it off, not set up or unreachable the pipeline behaves exactly as before;
-  - after the helper YIELDS or REFUSES (a game or a heavy app appeared, a resting game woke up,
-    memory ran low) it sits out for COOLDOWN seconds;
+  - after the helper YIELDS or REFUSES (a game started, woke up or is waking up, a heavy app
+    appeared, memory ran low or could not be protected for a resting game) it sits out for
+    COOLDOWN seconds. Those reasons need no codes of their own: "game" and "low_memory" read
+    as their lines, and the worker's words go to the logs and, without a route, the tooltip;
   - another stage taking the machine (dvcap.suspend_encoders: AI outpainting, a sibling app's
     lease) KILLS the in-flight remote segment — "suspended": requeued, not counted, no cooldown —
     instead of freezing it.
