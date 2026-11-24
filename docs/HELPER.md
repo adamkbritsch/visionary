@@ -56,6 +56,7 @@ It pays off best when the helper's x265 is at least about as fast as the Mac's. 
 | Network | **Ethernet** to the same network as the Mac's wired port |
 | Power | **Mains**: a laptop or handheld on its charger. A desktop with no battery counts as mains. |
 | Disk | At least **5 GB free** in your home folder, plus room for the x265 build |
+| Memory | About **3.5 GB free** to start a segment, or **6.5 GB** beside a game left resting: a resting game keeps its memory, and the helper leaves it 3 GB to spare. |
 | To build x265 | **Either** the build tools (git, cmake, make, a C++ compiler, nasm and static libstdc++) **or** distrobox with podman, and an internet connection |
 | A login | A user account on it whose password you know, for one command during setup |
 
@@ -123,7 +124,7 @@ check beside it, and **Test** runs the checks again.
 | **Ethernet** | The Mac reaches it over Ethernet, and names the port. | *the Mac reaches it over Wi-Fi*: plug both into Ethernet (see [Troubleshooting](#troubleshooting)). |
 | **Worker** | *installed*, and the same worker as this app's. | *not installed*, or *an older worker* after you update Visionary: press **Install**. |
 | **x265** | The same version as this Mac's. | *not built yet*, or two different versions named (after Homebrew upgrades the Mac's x265): press **Build**. *install the command-line tools first*: this Mac has no x265 yet. |
-| **Sleep** | *it stays awake while it encodes* | A gray dot: never a failure, and it never holds back *Ready*. *it can't keep itself awake over ssh · turn off automatic sleep while it's plugged in*: see [Keeping it awake](#keeping-it-awake). No words when it can't be told (no systemd-inhibit on the helper, no up-to-date worker yet, or no answer). |
+| **Sleep** | *it stays awake while it encodes* | A gray dot: never a failure, and it never holds back *Ready*. *it can't keep itself awake over ssh · turn off automatic sleep while it's plugged in*: see [Keeping it awake](#keeping-it-awake). No words when it can't be told (no systemd-inhibit on the helper, no up-to-date worker yet, or no answer) or when a rest manager runs there, which looks after sleep itself. |
 | **Status** | *ready · waiting for the next segment* | The same words as the status line below, for example *paused · a game is running on it*. Switched off, it reads *off · switched off* with a gray dot. |
 
 ## What the app shows
@@ -143,8 +144,9 @@ check beside it, and **Test** runs the checks again.
 |---|---|
 | Helper connected · on seg 9 · 7.9 fps · did 10–11 | It is encoding segment 9 of this item at 7.9 fps and has finished segments 10 and 11. The header reads *Helper working*. |
 | Helper ready · waiting for the next segment | Free and allowed: it takes the next segment from the back. |
-| Helper paused · a game is running on it | It stepped aside for a game. |
+| Helper paused · a game is running on it | It stepped aside for a game: one running, just started, waking up, or resting for less than a minute. |
 | Helper paused · it's busy | Something heavy is running on it, or it already has a job. |
+| Helper paused · it's low on memory | Less than about 3.5 GB of memory free, or less than 6.5 GB beside a resting game (a big game at rest can hold 9 GB). Also when a game rests and the helper can't fence off its own memory. |
 | Helper paused · it's low on disk space | Less than 5 GB free. |
 | Helper off · the Mac is on Wi-Fi | The Mac's route to it is Wi-Fi, not Ethernet. |
 | Helper off · it's not on Ethernet | The helper has no Ethernet link up, or its Wi-Fi is on the same network and the stream arrives over it (the tooltip then says *the stream is arriving over its Wi-Fi · turn its Wi-Fi off*). |
@@ -159,11 +161,17 @@ check beside it, and **Test** runs the checks again.
 The helper polices itself, whatever the Mac thinks.
 
 - **Before each segment** it refuses at once during a game, on battery, without Ethernet, with
-  less than 5 GB free, or while it already has a job. A heavy reading alone is sampled again
-  for a few seconds before it refuses, so one busy second doesn't count.
+  less than 5 GB of disk or too little memory free (see below), or while it already has a job.
+  A heavy reading alone is sampled again for a few seconds before it refuses, so one busy
+  second doesn't count.
 - **While encoding** it checks every 2 seconds, and stops **at once** when a game starts, when
   the charger is unplugged, when Ethernet goes down, or when the Mac goes away (the connection
-  breaks, or no data arrives for 5 minutes).
+  breaks, or no data arrives for 5 minutes). It also stops when free memory stays too low for
+  two checks in a row.
+- **A game that starts or wakes up is caught within a quarter of a second.** Four times a
+  second the helper looks at the programs started since its last look (only those), at a
+  resting game, and at a rest manager's wake marker, and steps aside the moment a game starts,
+  a resting game wakes up, or the rest manager begins waking one.
 - **It stops after about 10 seconds of anything heavy:** other programs using more than 1.5
   cores of CPU, or more than 30 % of the GPU. A browser, a file manager or Steam's menus stay
   below that.
@@ -177,13 +185,31 @@ The helper polices itself, whatever the Mac thinks.
 - **A game** is any Steam game (Proton included), any Windows program under Wine or Proton,
   and a launch from Lutris or Heroic. A non-Steam shortcut running a native Linux program is
   judged by the CPU and GPU rule only.
+- **A resting game doesn't count, once it has rested for a minute.** A game frozen by a rest
+  mode (with the cgroup freezer) or stopped with SIGSTOP isn't running, so the helper can work
+  while it rests. It counts as resting only after a minute of rest in a row, so a game paused
+  for a moment in its menu still counts as running. The whole game has to rest, not one of its
+  processes: a running game with one stopped helper process is a running game, and anything
+  that can't be told counts as running. A game quit or killed while it rests is no wake-up.
+- **Memory beside a resting game.** A resting game keeps all of its memory, so beside one the
+  helper keeps at least 3 GB free the whole time: it starts a segment only with 6.5 GB free,
+  runs it in a systemd scope of its own capped at what is left above 3.5 GB, and steps aside
+  when free memory stays below 3 GB for two checks. Where it can't start such a scope over
+  ssh, it doesn't work beside a resting game (*Helper paused · it's low on memory*). With no
+  game resting it needs 3.5 GB to start and steps aside below 0.75 GB. If memory ever ran out,
+  the helper's own processes are the first the kernel would stop, never the game.
+- **A rest manager.** On a machine whose rest manager leaves a wake marker (a small file in
+  your runtime folder that says when it began waking a game), the helper also refuses, or
+  steps aside, while that marker is fresh. It only ever reads it, and on such a machine it
+  takes no keep-awake hold at all (see [Keeping it awake](#keeping-it-awake)).
 - **Its x265 runs at the lowest CPU priority** (SCHED_IDLE, or nice 19 where that is not
-  available), so the desktop always comes first.
+  available) and the idle I/O priority (`ionice -c 3`, where that works), so the desktop
+  always comes first.
 - **On every stop** it kills its zstd and x265 and deletes that job's folder. The Mac deletes
   the partial segment it received and encodes that segment itself.
-- After the helper steps aside for a game or a heavy program, Visionary **leaves it alone for 5
-  minutes** before asking again. After two lost connections or errors in one item, it sits out
-  the rest of that item.
+- After the helper steps aside for a game, a heavy program or low memory, Visionary **leaves it
+  alone for 5 minutes** before asking again. After two lost connections or errors in one item,
+  it sits out the rest of that item.
 - When the AI border extension takes the Mac's whole machine, the Mac's own remux is frozen
   and loses nothing, but the helper's segment in flight is stopped and redone later, by either
   machine.
@@ -196,9 +222,10 @@ nothing on the helper but its worker.
 
 ### Keeping it awake
 
-While it encodes, the worker asks the system to hold off sleep (`systemd-inhibit`). Over ssh
-most desktops won't allow that, and Setup's *Sleep* row says so. Then turn off automatic sleep
-while it's plugged in:
+While it encodes, the worker asks the system to hold off sleep (`systemd-inhibit`). It never
+does beside a resting game, and takes no keep-awake hold at all on a machine with a rest
+manager, which decides about sleep itself. Over ssh most desktops won't allow it anyway, and
+Setup's *Sleep* row says so. Then turn off automatic sleep while it's plugged in:
 
 - **GNOME**: Settings → Power.
 - **KDE**: System Settings → Power Management.
@@ -239,6 +266,15 @@ press **Test**.
   NVIDIA, or `cat /sys/class/drm/card*/device/gpu_busy_percent` on AMD. Where the GPU has no
   per-program reading, the desktop's own drawing counts too (see
   [When it steps aside](#when-it-steps-aside-and-what-it-deletes)).
+- **Helper paused · it's low on memory**: less than about 3.5 GB of memory is free on the
+  helper, or less than 6.5 GB beside a game left resting there (a resting game keeps all of
+  its memory: a big one can hold 9 GB and leave under 3 GB). Close that game or other big
+  programs. Beside a resting game it also reads so when the helper can't start a
+  memory-capped scope of its own: `systemd-run --user --scope true` has to work over ssh. In
+  `vworker status`, `mem_available_gb` is the free memory and `resting_game` names a game that
+  rests.
+- **Helper paused · a game is running on it** right after you put a game to rest: the helper
+  waits until the game has rested for a minute, and Visionary asks it again every minute.
 - **It falls asleep overnight**, or the *Sleep* row says *it can't keep itself awake over
   ssh*: turn off its automatic sleep while it's plugged in (see
   [Keeping it awake](#keeping-it-awake)). In `vworker status`, `sleep_block` is then `false`.

@@ -24,13 +24,16 @@ User rules this side enforces (the helper polices itself too, independently):
     USB Ethernet adapter gives 777 Mbps). Once the helper has reported its own wired IPv4
     addresses (status "ipv4") only those are used — a name that also resolves to the helper's
     Wi-Fi address can no longer pick that one;
-  - only when the helper's own `vworker status` says ok (mains, Ethernet, no game, nothing
-    heavy, disk, not busy), speaks protocol PROTOCOL_VERSION and runs the SAME x265 build as
-    this Mac;
+  - only when the helper's own `vworker status` says ok (mains, Ethernet, no running game (a
+    game resting for a minute or more does not count; one waking up does), nothing heavy,
+    enough memory and disk, not busy), speaks protocol PROTOCOL_VERSION and runs the SAME x265
+    build as this Mac;
   - a segment the helper drops goes back to the Mac; the helper never parks or fails an item,
     and with it off, not set up or unreachable the pipeline behaves exactly as before;
-  - after the helper YIELDS or REFUSES (a game or a heavy app appeared) it sits out for COOLDOWN
-    seconds;
+  - after the helper YIELDS or REFUSES (a game started, woke up or is waking up, a heavy app
+    appeared, memory ran low or could not be protected for a resting game) it sits out for
+    COOLDOWN seconds. Those reasons need no codes of their own: "game" and "low_memory" read
+    as their lines, and the worker's words go to the logs and, without a route, the tooltip;
   - another stage taking the machine (dvcap.suspend_encoders: AI outpainting, a sibling app's
     lease) KILLS the in-flight remote segment — "suspended": requeued, not counted, no cooldown —
     instead of freezing it.
@@ -117,8 +120,8 @@ _FPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*fps")
 # "wifi" / "not_wired" / "unreachable" / "route_check" (wired_route_ok), "cooling", "mismatch"
 # (protocol or x265 build), "error", "not_ready". The helper's (vworker REASON_CODES, sent as
 # its status "code" and on a yield's or refusal's VWORKER line):
-HELPER_CODES = frozenset({"battery", "no_ethernet", "game", "busy", "heavy", "low_disk",
-                          "x265_missing", "zstd_missing", "error"})
+HELPER_CODES = frozenset({"battery", "no_ethernet", "game", "busy", "heavy", "low_memory",
+                          "low_disk", "x265_missing", "zstd_missing", "error"})
 
 
 # ---- ssh -------------------------------------------------------------------------------------
@@ -1355,6 +1358,7 @@ _LINES = {                       # reason code -> (state, the words after the do
     "game": ("paused", "a game is running on it"),
     "busy": ("paused", "it's busy"),
     "heavy": ("paused", "it's busy"),
+    "low_memory": ("paused", "it's low on memory"),
     "low_disk": ("paused", "it's low on disk space"),
     "wifi": ("off", "the Mac is on Wi-Fi"),
     "no_ethernet": ("off", "it's not on Ethernet"),

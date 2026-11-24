@@ -3,6 +3,7 @@ injected `argv` that runs a local FAKE vworker speaking the wire protocol (it de
 with the real zstd and stands in for x265) — optionally behind a fake login shell that prints junk
 first — every route check runs on mocked command output, and status_summary's refresher only ever
 asks injected fakes (setUpModule pins _summary_helper to one that refuses)."""
+import ast
 import json
 import os
 import shutil
@@ -786,6 +787,19 @@ class StatusAndAvailability(FakeRemoteCase):
             self.set_status()
             self.assertEqual(h.available(), (True, "ready"))
 
+    def test_low_memory_is_its_own_reason_and_cached_as_usual(self):
+        # a resting game keeps its RAM: a lasting state, not a 1-s sample
+        self.set_status(ok=False, why="low on memory: 2.0 GB available, needs 3.5",
+                        code="low_memory", mem_available_gb=2.0, resting_game="Steam app 7")
+        h = self.helper()
+        self.assertEqual(h.availability(),
+                         (False, "low on memory: 2.0 GB available, needs 3.5", "low_memory"))
+        self.assertFalse(h.available()[0])
+        self.assertEqual(len(self.calls()), 1)
+        helper.reset_state()
+        self.set_status(resting_game="Steam app 7", mem_available_gb=6.0)   # rests, room to spare
+        self.assertEqual(self.helper().available(), (True, "ready"))
+
     def test_heavy_with_anything_else_wrong_is_cached_as_usual(self):
         self.set_status(ok=False, why="on battery", ac=False, heavy="GPU card0 90% busy",
                         code="battery")
@@ -1438,6 +1452,15 @@ def ui_line(summary: dict) -> str:
     return head + (" · " + summary["detail"] if summary["detail"] else "")
 
 
+def worker_whys() -> dict:
+    """The worker's WHY_* words (helper_worker/vworker.py, read, never run): {name: text}."""
+    with open(os.path.join(helper.WORKER_DIR, "vworker.py")) as f:
+        tree = ast.parse(f.read())
+    return {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body
+            if isinstance(n, ast.Assign) and len(n.targets) == 1
+            and getattr(n.targets[0], "id", "").startswith("WHY_")}
+
+
 class FakeProbe:
     """A refresher Helper stand-in: `answers` is what available() says (a callable may block)."""
 
@@ -1469,6 +1492,8 @@ class StatusSummaryPure(unittest.TestCase):
             ((False, "game"), "Helper paused · a game is running on it"),
             ((False, "heavy"), "Helper paused · it's busy"),
             ((False, "busy"), "Helper paused · it's busy"),
+            ((False, "low_memory"), "Helper paused · it's low on memory"),
+            ((False, "low_disk"), "Helper paused · it's low on disk space"),
             ((False, "wifi"), "Helper off · the Mac is on Wi-Fi"),
             ((False, "no_ethernet"), "Helper off · it's not on Ethernet"),
             ((False, "battery"), "Helper off · it's on battery"),
@@ -1492,6 +1517,7 @@ class StatusSummaryPure(unittest.TestCase):
         v = helper.summarize_verdict
         self.assertEqual(v(False, "cooling", "game"), ("paused", "a game is running on it"))
         self.assertEqual(v(False, "cooling", "heavy"), ("paused", "it's busy"))
+        self.assertEqual(v(False, "cooling", "low_memory"), ("paused", "it's low on memory"))
         self.assertEqual(v(False, "cooling", "battery"), ("off", "it's on battery"))
         self.assertEqual(v(False, "cooling", "x265_missing"), ("paused", "it's busy"))
         self.assertEqual(v(False, "cooling"), ("paused", "it's busy"))
@@ -1501,6 +1527,7 @@ class StatusSummaryPure(unittest.TestCase):
         base = {"ok": False, "ac": True, "ethernet": True, "game": None, "heavy": None,
                 "busy": False}
         self.assertEqual(c(dict(base, code="low_disk")), "low_disk")       # vworker's own word
+        self.assertEqual(c(dict(base, code="low_memory", mem_available_gb=2.0)), "low_memory")
         self.assertEqual(c(dict(base, code="game", why="busy: wi-fi-tool")), "game")
         # an older vworker (no "code"): its structured fields, in vworker's own order
         self.assertEqual(c(dict(base, ac=False, game="Hades.exe")), "battery")
@@ -1513,8 +1540,40 @@ class StatusSummaryPure(unittest.TestCase):
         self.assertTrue(helper.heavy_only(dict(base, heavy="x")))
         self.assertTrue(helper.heavy_only(dict(base, heavy="x", code="heavy")))
         for other in (dict(ac=False), dict(ethernet=False), dict(game="g"), dict(busy=True),
-                      dict(code="low_disk"), dict(heavy=None), dict(ok=True)):
+                      dict(code="low_disk"), dict(code="low_memory"), dict(heavy=None),
+                      dict(ok=True)):
             self.assertFalse(helper.heavy_only(dict(dict(base, heavy="x"), **other)), other)
+        # a resting game is only named: the helper's own ok and code decide
+        self.assertTrue(helper.heavy_only(dict(base, heavy="x", resting_game="Steam app 7")))
+
+    def test_every_reason_the_worker_sends_is_known_here(self):
+        with open(os.path.join(helper.WORKER_DIR, "vworker.py")) as f:     # read, never run
+            tree = ast.parse(f.read())
+        codes = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                     and [getattr(t, "id", None) for t in n.targets] == ["REASON_CODES"])
+        self.assertEqual(set(codes) - {"ready"}, set(helper.HELPER_CODES))
+        for code in ("game", "busy", "heavy", "low_memory", "low_disk"):   # pauses, with words
+            state, detail = helper.summarize_verdict(False, code)
+            self.assertEqual(state, "paused", code)
+            self.assertTrue(detail, code)
+
+    def test_the_workers_newer_reasons_need_no_codes_of_their_own(self):
+        # a game waking up, woken or started, and a resting game whose memory can't be capped:
+        # they come with "game" and "low_memory", and read as those lines (never their words)
+        whys = worker_whys()
+        self.assertEqual(sorted(whys), ["WHY_NO_CAP", "WHY_STARTED", "WHY_WAKING", "WHY_WOKE"])
+        for name, code, line in (("WHY_WAKING", "game", "Helper paused · a game is running on it"),
+                                 ("WHY_WOKE", "game", "Helper paused · a game is running on it"),
+                                 ("WHY_STARTED", "game", "Helper paused · a game is running on it"),
+                                 ("WHY_NO_CAP", "low_memory", "Helper paused · it's low on memory")):
+            self.assertIn(code, helper.HELPER_CODES, name)
+            state, detail = helper.summarize_verdict(False, code)
+            self.assertEqual(ui_line({"state": state, "detail": detail}), line, name)
+            state, detail = helper.summarize_verdict(False, "cooling", code)   # after a stop
+            self.assertEqual(ui_line({"state": state, "detail": detail}), line, name)
+            why = whys[name].replace("%s", "GTA5_Enhanced.exe")
+            self.assertEqual(why, " ".join(why.split()), name)    # one plain line
+            self.assertNotIn("·", why, name)                      # no dot of its own in a tooltip
 
     def test_the_host_name_never_picks_the_line(self):
         # hosts whose names hold the words the old classifier matched on
@@ -1663,6 +1722,37 @@ class StatusSummary(FakeRemoteCase):
         self.settle(lambda s: s["state"] == "ready")
         self.helper()._note("yielded", "yielded (rc=75): game running: Hades.exe", "game")
         self.assertEqual(ui_line(helper.status_summary()), "Helper paused · a game is running on it")
+        self.helper()._note("yielded", "yielded (rc=75): a game woke up: Hades.exe", "game")
+        self.assertEqual(ui_line(helper.status_summary()), "Helper paused · a game is running on it")
+        self.helper()._note("yielded", "yielded (rc=75): low on memory: 0.6 GB available",
+                            "low_memory")
+        self.assertEqual(ui_line(helper.status_summary()), "Helper paused · it's low on memory")
+
+    def test_the_newer_reasons_stay_readable_in_the_line_and_the_tooltip(self):
+        # what the worker sends for a game waking up or started beside a job, and for a game
+        # resting with too little memory, or whose memory can't be capped: the line reads the
+        # code; the tooltip, while no wired route is known, the worker's own words in one line
+        whys = worker_whys()
+        game, memory = "Helper paused · a game is running on it", "Helper paused · it's low on memory"
+        self.probe()
+        self.settle(lambda s: s["state"] == "ready")
+        for kind, rc, why, code, want in (
+                ("yielded", 75, whys["WHY_STARTED"] % "GTA5_Enhanced.exe", "game", game),
+                ("yielded", 75, whys["WHY_WOKE"] % "Steam app 3240220", "game", game),
+                ("yielded", 75, whys["WHY_WAKING"], "game", game),
+                ("refused", 77, whys["WHY_WAKING"], "game", game),
+                ("refused", 77, "game running: Steam app 3240220", "game", game),   # under a minute
+                ("refused", 77, whys["WHY_NO_CAP"], "low_memory", memory),
+                ("refused", 77, "low on memory: 2.7 GB available, needs 6.5 while a game rests",
+                 "low_memory", memory),
+                ("yielded", 75, "low on memory: 2.5 GB available while a game rests",
+                 "low_memory", memory)):
+            reason = f"{kind} (rc={rc}): {why}"
+            self.helper()._note(kind, reason, code)
+            st = helper.status_summary()
+            self.assertEqual(ui_line(st), want, why)
+            self.assertEqual(st["tooltip"], "helper.test · " + reason, why)
+            self.assertEqual(st["tooltip"], " ".join(st["tooltip"].split()), why)
 
     def test_a_refusal_over_the_wire_reads_its_code_not_its_words(self):
         self.probe()
@@ -2348,6 +2438,25 @@ class SetupStatus(unittest.TestCase):
         _out, c = self.check()
         self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]),
                          (False, "paused · a game is running on it"))
+        helper.reset_state()
+        self.ready_probe().answer = (False, "low on memory: 2.0 GB available, needs 3.5",
+                                     "low_memory")
+        _out, c = self.check()
+        self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]),
+                         (False, "paused · it's low on memory"))
+
+    def test_the_helper_line_for_the_newer_reasons(self):
+        whys = worker_whys()
+        for why, code, words in (
+                (whys["WHY_WAKING"], "game", "paused · a game is running on it"),
+                ("game running: Steam app 3240220", "game", "paused · a game is running on it"),
+                (whys["WHY_NO_CAP"], "low_memory", "paused · it's low on memory"),
+                ("low on memory: 2.7 GB available, needs 6.5 while a game rests", "low_memory",
+                 "paused · it's low on memory")):
+            helper.reset_state()
+            self.ready_probe().answer = (False, why, code)
+            _out, c = self.check()
+            self.assertEqual((c["helper"]["ok"], c["helper"]["detail"]), (False, words), why)
 
     def test_the_wired_words(self):
         self.ready_probe()

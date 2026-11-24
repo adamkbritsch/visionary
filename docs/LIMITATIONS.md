@@ -58,6 +58,10 @@
   repair's re-encodes always run on the Mac, which also still decodes and colour-converts
   every segment the helper encodes. At the end of an item the Mac waits for the helper's last
   segment rather than redoing it, so a helper much slower than the Mac can cost time there.
+  A game left resting on the helper keeps it waiting only for its first minute of rest, but
+  it keeps its memory: beside it the helper needs 6.5 GB free (a big game at rest can leave
+  under 3 GB, and then it waits), and it steps aside within a quarter of a second when the
+  game wakes.
 
 - Replaces originals **by default**: once the uploaded 4K DV master size-verifies on the
   NAS, the superseded 1080p source is deleted — but the per-show/movie **"Replaces

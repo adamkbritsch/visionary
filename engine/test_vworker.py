@@ -50,14 +50,19 @@ def stat_line(pid, comm, ppid, ticks=0, start=1000, state="S", flags=0):
     return "%d (%s) %s\n" % (pid, comm, " ".join(str(x) for x in f))
 
 
-def add_proc(proc_root, pid, comm, argv, ppid=1, ticks=0, start=1000, flags=0):
-    """Create /proc/<pid> atomically (stat + cmdline appear together)."""
+def add_proc(proc_root, pid, comm, argv, ppid=1, ticks=0, start=1000, flags=0, state="S",
+             cgroup=None):
+    """Create /proc/<pid> atomically (stat + cmdline, and its cgroup v2 path when given, appear
+    together)."""
     tmp = os.path.join(proc_root, ".tmp-%d" % pid)
     os.makedirs(tmp, exist_ok=True)
     with open(os.path.join(tmp, "stat"), "w") as f:
-        f.write(stat_line(pid, comm, ppid, ticks, start, flags=flags))
+        f.write(stat_line(pid, comm, ppid, ticks, start, state=state, flags=flags))
     with open(os.path.join(tmp, "cmdline"), "wb") as f:
         f.write(b"".join(a.encode() + b"\0" for a in argv))
+    if cgroup is not None:
+        with open(os.path.join(tmp, "cgroup"), "w") as f:
+            f.write("0::%s\n" % cgroup)
     dest = os.path.join(proc_root, str(pid))
     shutil.rmtree(dest, ignore_errors=True)
     os.rename(tmp, dest)
@@ -192,6 +197,83 @@ def set_rchar(proc_root, pid, n):
     os.replace(os.path.join(d, "io.tmp"), os.path.join(d, "io"))
 
 
+def set_cgroup(sys_root, path, frozen, populated=1, freeze=None, procs=None):
+    """A cgroup v2 directory under <sys>/fs/cgroup as the kernel shows it, each file replaced
+    atomically and in the kernel's order: cgroup.freeze (the state asked for; as `frozen`
+    unless given -- a frozen game being killed reads freeze 1 while frozen is 0), then
+    cgroup.events, and cgroup.procs when given. -> its cgroup.events."""
+    d = os.path.join(sys_root, "fs", "cgroup") + path
+    os.makedirs(d, exist_ok=True)
+    freeze = frozen if freeze is None else freeze
+    files = [("cgroup.freeze", "%d\n" % (1 if freeze else 0)),
+             ("cgroup.events", "populated %d\nfrozen %d\n" % (populated, 1 if frozen else 0))]
+    if procs is not None:
+        files.append(("cgroup.procs", "".join("%d\n" % pid for pid in procs)))
+    for name, text in files:
+        with open(os.path.join(d, name + ".tmp"), "w") as f:
+            f.write(text)
+        os.replace(os.path.join(d, name + ".tmp"), os.path.join(d, name))
+    return os.path.join(d, "cgroup.events")
+
+
+def cgroup_file(sys_root, path, name):
+    return os.path.join(sys_root, "fs", "cgroup") + path + "/" + name
+
+
+def seed_rest(path, keys, age):
+    """The worker's rest-seen file as if these games had rested for `age` s by now (this
+    boot's monotonic clock, as the worker's own processes read it)."""
+    vworker.RestSeen(path, clock=lambda: time.monotonic() - age).update(keys)
+
+
+def local_time(t):
+    """A rest manager's "waking": the local time, "YYYY-MM-DD HH:MM:SS"."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+
+
+def write_rest_file(path, **data):
+    """A rest manager's file, replaced atomically (the worker only ever reads it)."""
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
+
+
+def remove_proc(proc_root, pid):
+    """The process exits: /proc/<pid> disappears in one step (renamed out, then deleted)."""
+    gone = os.path.join(os.path.dirname(proc_root.rstrip("/")), ".gone-%d" % pid)
+    os.rename(os.path.join(proc_root, str(pid)), gone)
+    shutil.rmtree(gone)
+
+
+def until(pred, timeout=5.0):
+    """Wait for pred() to be true -> True, or False after `timeout` s."""
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def note_latency(what, seconds):
+    """A measured stop latency, appended to $VWORKER_TEST_LATENCY_LOG when that is set (the
+    report's numbers); nothing otherwise."""
+    log = os.environ.get("VWORKER_TEST_LATENCY_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write("%s\t%.3f\n" % (what, seconds))
+
+
+def write_meminfo(proc_root, available_gb):
+    """/proc/meminfo with MemAvailable at `available_gb` (2^30 bytes), replaced atomically."""
+    path = os.path.join(proc_root, "meminfo")
+    with open(path + ".tmp", "w") as f:
+        f.write("MemTotal:       15523840 kB\nMemFree:          412044 kB\n"
+                "MemAvailable:   %8d kB\nBuffers:            4016 kB\n"
+                % int(round(available_gb * (1 << 20))))
+    os.replace(path + ".tmp", path)
+
+
 FAKE_X265 = r'''#!{python}
 import os, signal, sys, time
 args = sys.argv[1:]
@@ -222,6 +304,12 @@ if ran:
         policy = -1
     with open(ran + ".prio", "w") as f:
         f.write("%d %d" % (policy, os.getpriority(os.PRIO_PROCESS, 0)))
+    oom = os.environ.get("FAKE_X265_OOM")     # our oom_score_adj as x265 starts
+    if oom:
+        with open(oom) as src, open(ran + ".oom", "w") as f:
+            f.write(src.read())
+    with open(ran + ".ppid", "w") as f:       # who started it, and was that inside a scope?
+        f.write("%d %s" % (os.getppid(), os.environ.get("VWORKER_IN_SCOPE", "")))
     with open(ran + ".tmp", "w") as f:
         f.write(str(os.getpid()))
     os.rename(ran + ".tmp", ran)
@@ -270,10 +358,10 @@ sys.exit(int(os.environ.get("FAKE_X265_RC", "0")))
 '''
 
 
-# a stand-in for systemd-inhibit. An encode's block (--what=sleep / --what=idle) notes its pid
-# and arguments in <log>.<what>, then holds on like the real one (which runs `sleep infinity`
-# under its block); status's probe (`... true`) appends its arguments to <log>.probe and exits
-# like the real one would. FAKE_INHIBIT_FAIL: polkit says no to both
+# a stand-in for systemd-inhibit. An encode's block (--what=sleep) notes its pid and arguments
+# in <log>.<what>, then holds on like the real one (which runs `sleep infinity` under its
+# block); status's probe (`... true`) appends its arguments to <log>.probe and exits like the
+# real one would. FAKE_INHIBIT_FAIL: polkit says no to both
 FAKE_INHIBIT = r'''#!{python}
 import json, os, sys, time
 log = os.environ["FAKE_INHIBIT_LOG"]
@@ -303,6 +391,50 @@ with open({log!r}, "a") as f:
             + "\n")
 time.sleep({sleep})
 sys.exit({rc})
+'''
+
+# a stand-in for systemd-run: notes its arguments in FAKE_SYSTEMD_RUN_LOG (a JSON line each),
+# then -- as the real one does once it has moved itself into the new scope -- execs the command
+# after "--" in this very process (same pid, same stdin/stdout/stderr). The new scope is
+# written into the fake /proc (self/cgroup) and /sys (its memory.max: MemoryMax) the worker
+# reads. FAKE_SYSTEMD_RUN_FAIL: no scope can be started; FAKE_SYSTEMD_RUN_NOCAP: no memory cap
+FAKE_SYSTEMD_RUN = r'''#!{python}
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_SYSTEMD_RUN_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\n")
+if os.environ.get("FAKE_SYSTEMD_RUN_FAIL"):
+    sys.stderr.write("Failed to start transient scope unit: Access denied\n")
+    sys.exit(1)
+unit = [a[len("--unit="):] for a in args if a.startswith("--unit=")]
+if unit:
+    path = "/user.slice/user-1000.slice/user@1000.service/app.slice/%s.scope" % unit[0]
+    proc, sysfs = os.environ["VWORKER_PROC"], os.environ["VWORKER_SYS"]
+    os.makedirs(os.path.join(proc, "self"), exist_ok=True)
+    with open(os.path.join(proc, "self", "cgroup"), "w") as f:
+        f.write("0::%s\n" % path)
+    cap = [a.split("=", 1)[1] for a in args if a.startswith("MemoryMax=")]
+    d = os.path.join(sysfs, "fs", "cgroup") + path
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "memory.max"), "w") as f:
+        f.write(("max" if os.environ.get("FAKE_SYSTEMD_RUN_NOCAP") or not cap else cap[0])
+                + "\n")
+cmd = args[args.index("--") + 1:]
+os.execvp(cmd[0], cmd)
+'''
+
+# a stand-in for ionice: notes its arguments in FAKE_IONICE_LOG, then execs the command after
+# "-c 3" in this very process, as the real one does once it set the class; FAKE_IONICE_FAIL:
+# the class can't be set, and like the real one it then runs nothing
+FAKE_IONICE = r'''#!{python}
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_IONICE_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\n")
+if os.environ.get("FAKE_IONICE_FAIL") or args[:2] != ["-c", "3"]:
+    sys.stderr.write("ionice: ioprio_set failed: Operation not permitted\n")
+    sys.exit(1)
+os.execvp(args[2], args[2:])
 '''
 
 
@@ -362,14 +494,36 @@ class Tmp(unittest.TestCase):
         with open(self.x265, "w") as f:
             f.write(FAKE_X265.replace("{python}", sys.executable).replace("{frame}", str(FRAME)))
         os.chmod(self.x265, 0o755)
+        self.rest_file = os.path.join(self.tmp, "ally-rest.json")
+        self.rest_seen = os.path.join(self.tmp, "rest-seen.json")
+        vworker._SCOPE_PROBE.clear()
+        vworker._IONICE_PROBE.clear()
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    IP_OUT = ("1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
+              "2: enp4s0    inet 192.0.2.20/24 brd 192.0.2.255 scope global enp4s0\\  x\n"
+              "3: wlan0    inet 192.0.2.30/24 brd 192.0.2.255 scope global wlan0\\  x\n"
+              "3: wlan0    inet6 fe80::1234/64 scope link \\       valid_lft forever\n")
+
+    def status(self, cfg=None, sleep=None, **kw):
+        """compute_status over the fake trees: a counting clock, an instant sample."""
+        clock = iter(range(0, 1000, 1))
+        kw.setdefault("runner", FakeRunner(self.x265, self.IP_OUT))
+        kw.setdefault("self_pid", 4000)
+        kw.setdefault("parent_pid", 3999)
+        return vworker.compute_status(cfg or self.cfg(), clock=lambda: float(next(clock)),
+                                      sleep=sleep or (lambda s: None), **kw)
+
     def cfg(self, **over):
+        # a rest manager's file, the rest ages and the tools of a scope and of I/O priority are
+        # this test's own (none, unless a test makes them)
         env = {"VWORKER_X265": self.x265, "VWORKER_ZSTD": ZSTD or "/nonexistent",
                "VWORKER_JOBS": self.jobs, "VWORKER_PROC": self.proc, "VWORKER_SYS": self.sys,
-               "VWORKER_MIN_FREE_GB": "0", "VWORKER_STATUS_SAMPLE": "1"}
+               "VWORKER_MIN_FREE_GB": "0", "VWORKER_STATUS_SAMPLE": "1",
+               "VWORKER_REST_FILE": self.rest_file, "VWORKER_REST_SEEN": self.rest_seen,
+               "VWORKER_SYSTEMD_RUN": "", "VWORKER_IONICE": ""}
         env.update({("VWORKER_" + k.upper()): str(v) for k, v in over.items()})
         return vworker.Config(env)
 
@@ -505,6 +659,61 @@ def shortcut_tree(app, base=50):
     return tree
 
 
+# A Steam game as read on a handheld (GTA V Enhanced, AppId 3240220; argv shortened as read):
+# Steam's launch wrapper lives in Steam's OWN cgroup, which nothing freezes, with a lower pid
+# than the game; reaper, wineserver and the game (a Windows .exe under Proton, 5.2 GB) live in
+# the game's app scope, which a rest mode freezes.
+APP_SLICE = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+STEAM_CGROUP = APP_SLICE + "/app-steam@autostart.service"
+GTA_SCOPE = APP_SLICE + "/app-steam-app3240220-1829784.scope"
+STEAMRT = STEAM_DIR + "/steamapps/common/SteamLinuxRuntime_4/steamrt64"
+GTA = "Steam app 3240220"                     # its label: the wrapper's, the first in pid order
+GTA_WRAPPER, GTA_REAPER, GTA_WINESERVER, GTA_EXE = 1829775, 1829784, 1831150, 1831209
+
+
+def add_gta(proc_root, sys_root, frozen=True, state="S", flags=0, start=1000, freeze=None):
+    """The game above in a fake /proc and /sys. frozen: its scope's freezer (a rest mode);
+    freeze: its scope's cgroup.freeze when it differs (1 while it is killed); state, flags,
+    start: its scope's processes' /proc stat ("T": SIGSTOPped, "t": traced, "Z": a zombie;
+    PF_EXITING; another start time: the pid was reused)."""
+    launch = [STEAMRT + "/reaper", "SteamLaunch", "AppId=3240220", "--",
+              STEAMRT + "/pv-adverb", "--"]
+    add_proc(proc_root, 1828000, "steam", [STEAM_DIR + "/ubuntu12_32/steam", "-gamepadui"],
+             cgroup=STEAM_CGROUP)
+    add_proc(proc_root, GTA_WRAPPER, "steam-runtime-l",
+             ["steam-runtime-launch-client", "--alongside-steam", "--forward-fd=132", "--"]
+             + launch, ppid=1828000, cgroup=STEAM_CGROUP)
+    scope = dict(state=state, flags=flags, start=start, cgroup=GTA_SCOPE)
+    add_proc(proc_root, GTA_REAPER, "reaper", launch, ppid=1828000, **scope)
+    add_proc(proc_root, GTA_WINESERVER, "wineserver", [STEAM_DIR + "/files/bin/wineserver"],
+             ppid=GTA_REAPER, **scope)
+    add_proc(proc_root, GTA_EXE, "GTA5_Enhanced.e",
+             ["Z:\\home\\user\\Games\\GTAV Enhanced\\GTA5_Enhanced.exe"], ppid=GTA_REAPER,
+             **scope)
+    set_cgroup(sys_root, STEAM_CGROUP, frozen=False, procs=[1828000, GTA_WRAPPER])
+    return set_cgroup(sys_root, GTA_SCOPE, frozen=frozen, freeze=freeze,
+                      procs=[GTA_REAPER, GTA_WINESERVER, GTA_EXE])
+
+
+GTA_KEY = "scope:" + GTA_SCOPE                # its rest key: its scope, read as a whole
+GTA_SUPERVISOR = 1829780
+
+
+def add_supervisor(proc_root, sys_root, where, launch, state="S"):
+    """steam-runtime-supervisor beside the game above, in Steam's own cgroup or in the game's
+    scope (where; nobody knows which on a given system), itself a Steam launch (its argv runs
+    reaper) or not (it inherits the AppId from the wrapper above it)."""
+    argv = ["steam-runtime-supervisor", "--subreaper", "--terminate-timeout=10"]
+    if launch:
+        argv += ["--", STEAMRT + "/reaper", "SteamLaunch", "AppId=3240220", "--"]
+    add_proc(proc_root, GTA_SUPERVISOR, "steam-runtime-s", argv, ppid=GTA_WRAPPER, state=state,
+             cgroup=where)
+    path = os.path.join(sys_root, "fs", "cgroup") + where + "/cgroup.procs"
+    with open(path) as f:
+        pids = [int(x) for x in f.read().split()]
+    write(path, "".join("%d\n" % pid for pid in sorted(set(pids) | {GTA_SUPERVISOR})))
+
+
 class GameDetection(unittest.TestCase):
     def game(self, *ps, exclude=()):
         return vworker.detect_game(procs(*ps), exclude)
@@ -596,6 +805,778 @@ class GameDetection(unittest.TestCase):
                                                     "/s/steamapps/common/dota 2 beta/game/dota.sh"]),
                                    P(91, "dota2", ["./dota2"], ppid=90)),
                          "Steam app 570")
+
+
+# -- resting games: frozen by a rest mode (the cgroup v2 freezer) or stopped (SIGSTOP)
+
+class RestingGames(Tmp):
+    """The real topology of a Steam game on a handheld (add_gta) in a fake /proc and /sys, and
+    the rules that keep a running game from ever looking at rest (A1, A3)."""
+
+    def scan(self, exclude=(), **kw):
+        return vworker.scan_games(vworker.list_procs(self.proc), exclude, self.proc, self.sys,
+                                  **kw)
+
+    def cgroup_files(self, text):
+        """Every scope process's /proc/<pid>/cgroup as `text` (None: no such file)."""
+        for pid in (GTA_REAPER, GTA_WINESERVER, GTA_EXE):
+            path = os.path.join(self.proc, str(pid), "cgroup")
+            if text is None:
+                os.unlink(path)
+            else:
+                write(path, text)
+
+    def test_a_frozen_game_is_no_running_game(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        ps = vworker.list_procs(self.proc)
+        # the launch wrapper in Steam's own cgroup comes first and is never frozen: a freezer
+        # check of each process alone would always find a running game in it
+        self.assertEqual(vworker.detect_game(ps), GTA)          # without the roots: can't tell
+        self.assertIsNone(vworker.detect_game(ps, (), self.proc, self.sys))
+        s = self.scan()
+        self.assertEqual((s.running, s.resting), (None, GTA))
+        [r] = s.rests                                            # the game: its scope, whole
+        self.assertEqual((r.key, r.label, r.scope, r.game), (GTA_KEY, GTA, GTA_SCOPE, 3240220))
+        self.assertEqual(r.remnant, {(GTA_WRAPPER, 1000)})      # Steam's wrapper, outside it
+
+    def test_the_same_game_thawed_is_a_game(self):
+        add_gta(self.proc, self.sys, frozen=False)
+        s = self.scan()
+        self.assertEqual((s.running, s.resting, s.rests), (GTA, None, []))
+        self.assertEqual(vworker.detect_game(vworker.list_procs(self.proc), (), self.proc,
+                                             self.sys), GTA)
+
+    def test_a_sigstopped_game_rests_too(self):
+        add_gta(self.proc, self.sys, frozen=False, state="T")
+        s = self.scan()
+        self.assertEqual((s.running, s.resting), (None, GTA))
+        self.assertEqual([r.key for r in s.rests], [GTA_KEY])  # every process in the scope: T
+        self.assertIsNone(vworker.detect_game(vworker.list_procs(self.proc)))   # no roots needed
+
+    def test_a_traced_game_is_running(self):
+        add_gta(self.proc, self.sys, frozen=False, state="t")      # a debugger's stop is no rest
+        self.assertEqual(self.scan().running, GTA)
+
+    # -- A1: one side process at rest never puts a running game to rest
+    def native(self, scope=True, reaper="S", game="S", child=None):
+        """A native Linux Steam game (cs2-style, AppId 730): reaper -> cs2 (and a helper child
+        of it in state `child`), in the game's own scope, or (scope=False, as on other
+        distributions) in a session cgroup that no rest mode freezes."""
+        where = (APP_SLICE + "/app-steam-app730-1700000.scope" if scope
+                 else "/user.slice/user-1000.slice/session-2.scope")
+        common = STEAM_DIR + "/steamapps/common/Counter-Strike Global Offensive"
+        add_proc(self.proc, 1700000, "reaper", [STEAM_DIR + "/ubuntu12_32/reaper",
+                                                "SteamLaunch", "AppId=730", "--",
+                                                common + "/cs2.sh", "-steam"],
+                 ppid=1828000, state=reaper, cgroup=where)
+        add_proc(self.proc, 1700010, "cs2", [common + "/game/bin/linuxsteamrt64/cs2", "-steam"],
+                 ppid=1700000, state=game, cgroup=where)
+        pids = [1700000, 1700010]
+        if child is not None:
+            add_proc(self.proc, 1700020, "cs2", [common + "/game/bin/linuxsteamrt64/cs2",
+                                                 "-steam", "-crashhandler"],
+                     ppid=1700010, state=child, cgroup=where)
+            pids.append(1700020)
+        else:
+            shutil.rmtree(os.path.join(self.proc, "1700020"), ignore_errors=True)
+        set_cgroup(self.sys, where, frozen=False, procs=pids)
+        return where
+
+    def test_a_running_native_game_with_one_stopped_side_process_is_running(self):
+        for scope in (True, False):
+            self.native(scope=scope, child="T")               # its crash handler, stopped
+            s = self.scan()
+            self.assertEqual((s.running, s.resting, s.rests), ("Steam app 730", None, []), scope)
+        where = self.native(scope=True, child="S")           # frozen as a whole: it rests
+        set_cgroup(self.sys, where, frozen=True)
+        self.assertEqual(self.scan().resting, "Steam app 730")
+
+    def test_reaper_left_stopped_while_the_game_runs_is_running(self):
+        for scope in (True, False):
+            self.native(scope=scope, reaper="T")
+            self.assertEqual(self.scan().running, "Steam app 730", scope)
+
+    def test_a_whole_tree_stopped_without_a_scope_rests(self):
+        self.native(scope=False, reaper="T", game="T", child="T")
+        for roots in ((self.proc, self.sys), (None, None)):
+            s = vworker.scan_games(vworker.list_procs(self.proc), (), *roots)
+            self.assertEqual((s.running, s.resting), (None, "Steam app 730"), roots)
+            [r] = s.rests
+            self.assertEqual((r.key, r.scope), ("app:730", None))
+            self.assertEqual([m[:2] for m in r.members], [(1700010, 1000), (1700020, 1000)])
+            self.assertEqual(r.remnant, {(1700000, 1000)})     # reaper: a launch
+        self.native(scope=False, reaper="T", game="T", child="S")  # not all of it
+        self.assertEqual(self.scan().running, "Steam app 730")
+        self.native(scope=True, reaper="T", game="T", child="T")   # a whole scope stopped
+        self.assertEqual([r.key for r in self.scan().rests],
+                         ["scope:" + APP_SLICE + "/app-steam-app730-1700000.scope"])
+
+    def test_the_supervisor_anywhere_gives_the_same_verdicts(self):
+        for where in (STEAM_CGROUP, GTA_SCOPE):
+            for launch in (True, False):
+                case = (where, launch)
+                shutil.rmtree(self.proc)
+                shutil.rmtree(os.path.join(self.sys, "fs"), ignore_errors=True)
+                os.makedirs(self.proc)
+                add_gta(self.proc, self.sys, frozen=True)
+                add_supervisor(self.proc, self.sys, where, launch)
+                s = self.scan()
+                self.assertEqual((s.running, s.resting), (None, GTA), case)
+                self.assertEqual([r.key for r in s.rests], [GTA_KEY], case)
+                set_cgroup(self.sys, GTA_SCOPE, frozen=False)
+                self.assertEqual(self.scan().running, GTA, case)
+                # SIGSTOPped instead, everything in its scope: the supervisor too when it is
+                # there; in Steam's cgroup it runs on beside the game, and the scope decides
+                add_gta(self.proc, self.sys, frozen=False, state="T")
+                add_supervisor(self.proc, self.sys, where, launch,
+                               state="T" if where == GTA_SCOPE else "S")
+                s = self.scan()
+                self.assertEqual((s.running, s.resting), (None, GTA), case)
+                add_gta(self.proc, self.sys, frozen=False)           # continued
+                add_supervisor(self.proc, self.sys, where, launch)
+                self.assertEqual(self.scan().running, GTA, case)
+
+    # -- A3: a frozen game being killed or quit is no wake-up, and an exit is no game
+    def test_a_frozen_game_being_killed_still_rests(self):
+        add_gta(self.proc, self.sys, frozen=False, freeze=True)   # freeze 1, frozen 0: it dies
+        s = self.scan()
+        self.assertEqual((s.running, s.resting), (None, GTA))
+        add_gta(self.proc, self.sys, frozen=False, freeze=True, flags=vworker.PF_EXITING)
+        self.assertEqual(self.scan().running, None)
+
+    def test_dead_zombie_and_exiting_processes_are_no_candidates(self):
+        for left in (dict(state="Z"), dict(state="X"), dict(flags=vworker.PF_EXITING)):
+            add_proc(self.proc, 1900000, "wineserver", ["/usr/bin/wineserver"], **left)
+            self.assertIsNone(self.scan().running, left)
+        add_proc(self.proc, 1900000, "wineserver", ["/usr/bin/wineserver"])
+        self.assertEqual(self.scan().running, "wineserver")
+
+    def test_an_emptied_scope_is_an_exit(self):
+        # its processes are zombies now and the scope says it is empty: Steam's launch
+        # wrapper, still there, is no game
+        add_gta(self.proc, self.sys, frozen=False, freeze=True, state="Z")
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False, freeze=True, populated=0)
+        s = self.scan()
+        self.assertEqual((s.running, s.resting, s.rests), (None, None, []))
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False, populated=1)   # only zombies listed
+        s = self.scan()
+        self.assertEqual((s.running, s.resting, s.rests), (None, None, []))
+        shutil.rmtree(os.path.join(self.sys, "fs", "cgroup") + GTA_SCOPE)   # removed
+        s = self.scan()
+        self.assertEqual((s.running, s.resting, s.rests), (None, None, []))
+
+    def test_the_leftovers_of_an_exit_are_no_game(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        rests = self.scan().rests
+        # quit while it rested: the scope's processes and the scope are gone; Steam's launch
+        # wrapper is still there for a moment
+        for pid in (GTA_REAPER, GTA_WINESERVER, GTA_EXE):
+            remove_proc(self.proc, pid)
+        shutil.rmtree(os.path.join(self.sys, "fs", "cgroup") + GTA_SCOPE)
+        self.assertEqual(self.scan().running, GTA)                # on its own: a launch starting
+        s = self.scan(known=rests)                                # seen at rest: what's left
+        self.assertEqual((s.running, s.resting, s.rests), (None, None, []))
+        # a new launch of the same game is a game at once
+        add_proc(self.proc, 1950000, "steam-runtime-l",
+                 ["steam-runtime-launch-client", "--", "reaper", "SteamLaunch", "AppId=3240220"],
+                 ppid=1828000, cgroup=STEAM_CGROUP)
+        self.assertEqual(self.scan(known=rests).running, GTA)
+
+    def test_whatever_cannot_be_told_counts_as_running(self):
+        events = cgroup_file(self.sys, GTA_SCOPE, "cgroup.events")
+        freeze = cgroup_file(self.sys, GTA_SCOPE, "cgroup.freeze")
+        procs_file = cgroup_file(self.sys, GTA_SCOPE, "cgroup.procs")
+        spoil = {
+            "no cgroup file": lambda: self.cgroup_files(None),
+            "an empty cgroup file": lambda: self.cgroup_files(""),
+            "cgroup v1 only": lambda: self.cgroup_files("12:freezer:%s\n1:name=systemd:%s\n"
+                                                        % (GTA_SCOPE, GTA_SCOPE)),
+            "cgroup v1 beside v2": lambda: self.cgroup_files("12:freezer:%s\n0::%s\n"
+                                                             % (GTA_SCOPE, GTA_SCOPE)),
+            "no 0:: path": lambda: self.cgroup_files("0::\n"),
+            "neither cgroup.events nor cgroup.freeze": lambda: (os.unlink(events),
+                                                                os.unlink(freeze)),
+            "no frozen line, freeze 0": lambda: (write(events, "populated 1\n"),
+                                                 write(freeze, "0\n")),
+            "a frozen value it does not know": lambda: (write(events, "populated 1\nfrozen 2\n"),
+                                                        write(freeze, "0\n")),
+            "a freeze value it does not know": lambda: (write(events, "populated 1\nfrozen 0\n"),
+                                                        write(freeze, "2\n")),
+        }
+        for name, how in spoil.items():
+            add_gta(self.proc, self.sys, frozen=True)
+            self.assertIsNone(self.scan().running, name)
+            how()
+            self.assertEqual(self.scan().running, GTA, name)
+        # stopped, but who is in its scope can't be read
+        add_gta(self.proc, self.sys, frozen=False, state="T")
+        self.assertIsNone(self.scan().running)
+        os.unlink(procs_file)
+        self.assertEqual(self.scan().running, GTA)
+        # either freezer file alone saying so is enough
+        for gone in (events, freeze):
+            add_gta(self.proc, self.sys, frozen=True)
+            os.unlink(gone)
+            self.assertIsNone(self.scan().running, gone)
+
+    def test_two_games_one_resting_one_running(self):
+        lutris = APP_SLICE + "/app-lutris-game.scope"
+        add_gta(self.proc, self.sys, frozen=True)
+        add_proc(self.proc, 1900000, "wineserver", ["/usr/bin/wineserver"], cgroup=lutris)
+        set_cgroup(self.sys, lutris, frozen=False, procs=[1900000])
+        s = self.scan()
+        self.assertEqual((s.running, s.resting), ("wineserver", GTA))   # the running one
+        add_gta(self.proc, self.sys, frozen=False)
+        set_cgroup(self.sys, lutris, frozen=True)
+        s = self.scan()
+        self.assertEqual((s.running, s.resting), (GTA, "wineserver"))
+        self.assertEqual([(r.key, r.label) for r in s.rests],
+                         [("proc:1900000:1000", "wineserver")])
+
+    def test_wine_and_windows_programs_rest_only_by_themselves(self):
+        # only the game's .exe stopped: wineserver beside it still runs, so the game runs --
+        # and a game with anything running is no resting game
+        add_gta(self.proc, self.sys, frozen=False)
+        add_proc(self.proc, GTA_EXE, "GTA5_Enhanced.e", ["Z:\\Games\\GTA5_Enhanced.exe"],
+                 ppid=GTA_REAPER, state="T", cgroup=GTA_SCOPE)
+        s = self.scan()
+        self.assertEqual((s.running, s.resting, s.rests), (GTA, None, []))
+        # a Lutris game (no AppId): each Wine process is judged by itself
+        lutris = APP_SLICE + "/app-lutris-game.scope"
+        native = os.path.join(self.tmp, "lutris-proc")
+        add_proc(native, 90, "wineserver", ["/usr/bin/wineserver"], cgroup=lutris)
+        add_proc(native, 91, "Game.exe", ["C:\\games\\Game.exe"], ppid=1, state="T",
+                 cgroup=lutris)
+        s = vworker.scan_games(vworker.list_procs(native), (), native, self.sys)
+        self.assertEqual((s.running, s.resting), ("wineserver", "Game.exe"))
+        add_proc(native, 90, "wineserver", ["/usr/bin/wineserver"], state="T", cgroup=lutris)
+        s = vworker.scan_games(vworker.list_procs(native), (), native, self.sys)
+        self.assertEqual((s.running, s.resting), (None, "wineserver"))
+        self.assertEqual([r.key for r in s.rests], ["proc:90:1000", "proc:91:1000"])
+
+    def test_our_own_processes_are_left_out(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        s = self.scan(exclude={GTA_WRAPPER, GTA_REAPER})
+        self.assertEqual((s.running, s.resting), (None, "wineserver"))
+        self.assertEqual([r.key for r in s.rests], [GTA_KEY])
+        add_gta(self.proc, self.sys, frozen=False)
+        self.assertEqual(self.scan(exclude={GTA_WRAPPER, GTA_REAPER}).running, "wineserver")
+
+    def test_cgroups_are_read_once_and_only_for_candidates(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        konsole = APP_SLICE + "/app-org.kde.konsole.scope"
+        add_proc(self.proc, 1900001, "bash", ["/bin/bash"], cgroup=konsole)
+        set_cgroup(self.sys, konsole, frozen=True)          # frozen too, but no game: not read
+        ps = vworker.list_procs(self.proc)
+        seen, real = [], vworker._read
+
+        def spy(path):
+            seen.append(path)
+            return real(path)
+        with mock.patch.object(vworker, "_read", spy):
+            s = vworker.scan_games(ps, (), self.proc, self.sys)
+        self.assertEqual((s.running, s.resting), (None, GTA))
+        cgroups = sorted(int(p.split(os.sep)[-2]) for p in seen if p.endswith(os.sep + "cgroup"))
+        self.assertEqual(cgroups, [GTA_WRAPPER, GTA_REAPER, GTA_WINESERVER, GTA_EXE])  # its AppId's
+        files = [p[len(self.sys) + len("/fs/cgroup"):] for p in seen if "/fs/cgroup/" in p]
+        self.assertEqual(files, [GTA_SCOPE + "/cgroup.events"])  # frozen: nothing more to read
+
+    def test_cgroup_path_and_events(self):
+        f = os.path.join(self.proc, "77", "cgroup")
+        for text, want in (("0::/user.slice/app.scope\n", "/user.slice/app.scope"),
+                           ("0::/\n", "/"), ("0::/a/../../etc\n", None), ("0::\n", None),
+                           ("", None), ("12:freezer:/a\n0::/a\n", None),
+                           ("1:name=systemd:/a\n", None)):
+            write(f, text)
+            self.assertEqual(vworker.cgroup_path(self.proc, 77), want, text)
+        os.unlink(f)
+        self.assertIsNone(vworker.cgroup_path(self.proc, 77))
+        self.assertEqual(vworker.cgroup_events_file("/sys", "/a/b.scope"),
+                         "/sys/fs/cgroup/a/b.scope/cgroup.events")
+        self.assertEqual(vworker.cgroup_file("/sys", "/a/b.scope", "cgroup.freeze"),
+                         "/sys/fs/cgroup/a/b.scope/cgroup.freeze")
+        ev = set_cgroup(self.sys, "/a.scope", frozen=True)
+        self.assertIs(vworker.cgroup_frozen(ev), True)
+        set_cgroup(self.sys, "/a.scope", frozen=False)
+        self.assertIs(vworker.cgroup_frozen(ev), False)
+        for text in ("populated 1\n", "frozen yes\n", "", "frozen\n"):
+            write(ev, text)
+            self.assertIsNone(vworker.cgroup_frozen(ev), text)
+        self.assertIsNone(vworker.cgroup_frozen(ev + ".missing"))
+
+    def test_scope_appid(self):
+        self.assertEqual(vworker.scope_appid(GTA_SCOPE), 3240220)
+        self.assertEqual(vworker.scope_appid(GTA_SCOPE + "/"), 3240220)
+        for path in (STEAM_CGROUP, GTA_SCOPE + "/sub", APP_SLICE + "/app-steam-app-12.scope",
+                     APP_SLICE + "/app-steam-app12x-5.scope", APP_SLICE + "/app-steam-app12.scope",
+                     APP_SLICE + "/xapp-steam-app12-5.scope", "/", "", None):
+            self.assertIsNone(vworker.scope_appid(path), path)
+
+    def test_a_label_is_one_readable_line(self):
+        p = P(1, "Bad.exe", ["Z:\\games\\Bad\nName\t\x1b[31m\x85.exe"])
+        self.assertEqual(vworker.detect_game(procs(p)), "Bad Name [31m .exe")
+        long = "A" * 200 + ".exe"
+        label = vworker.detect_game(procs(P(3, "AAAA.exe", ["Z:\\" + long])))   # pid 2: kthreadd
+        self.assertEqual((len(label), label[-3:]), (vworker.LABEL_MAX, "..."))
+
+
+class FastWatchRests(Tmp):
+    """FastWatch's look at the resting games: a stop within a quarter second of one waking."""
+
+    def rests(self, **kw):
+        add_gta(self.proc, self.sys, **kw)
+        s = vworker.scan_games(vworker.list_procs(self.proc), (), self.proc, self.sys)
+        self.assertIsNone(s.running)
+        return s.rests
+
+    def looker(self, rests):
+        """A FastWatch for one look at a time: check() only, no thread."""
+        w = vworker.FastWatch(self.cfg(), threading.Event(), None, None)
+        w.watch(rests)
+        return w
+
+    def watcher(self, rests, interval=vworker.THAW_INTERVAL):
+        got = {"stops": [], "failed": []}
+        stop = threading.Event()
+        w = vworker.FastWatch(self.cfg(), stop, lambda why, code: got["stops"].append((why, code)),
+                              got["failed"].append, interval=interval)
+        self.addCleanup(w.close)
+        w.watch(rests)
+        return w, stop, got
+
+    def test_a_thaw_is_a_wake_up(self):
+        w = self.looker(self.rests(frozen=True))
+        self.assertIsNone(w.check())
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False)
+        self.assertEqual(w.check(), GTA)
+
+    def test_a_continued_sigstop_is_a_wake_up(self):
+        w = self.looker(self.rests(frozen=False, state="T"))
+        self.assertIsNone(w.check())
+        add_gta(self.proc, self.sys, frozen=False)               # SIGCONT: "S" again
+        self.assertEqual(w.check(), GTA)
+
+    def test_stopped_and_frozen_wakes_only_when_both_are_gone(self):
+        w = self.looker(self.rests(frozen=True, state="T"))
+        add_gta(self.proc, self.sys, frozen=False, state="T")     # thawed, still stopped
+        self.assertIsNone(w.check())
+        add_gta(self.proc, self.sys, frozen=True)                 # continued, still frozen
+        self.assertIsNone(w.check())
+        add_gta(self.proc, self.sys, frozen=False)
+        self.assertEqual(w.check(), GTA)
+
+    def test_a_frozen_game_being_killed_or_quit_is_no_wake_up(self):
+        rests = self.rests(frozen=True)
+        # killed while frozen: its tasks leave the freezer to die ("frozen 0"), but the scope
+        # is still asked to freeze -- whatever their state reads meanwhile
+        add_gta(self.proc, self.sys, frozen=False, freeze=True)
+        self.assertIsNone(self.looker(rests).check())
+        for left in (dict(state="Z"), dict(state="X"), dict(flags=vworker.PF_EXITING)):
+            add_gta(self.proc, self.sys, frozen=False, **left)    # thawed as it dies
+            self.assertIsNone(self.looker(rests).check(), left)
+        add_gta(self.proc, self.sys, frozen=False)
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False, populated=0)   # emptied: an exit
+        self.assertIsNone(self.looker(rests).check())
+        for pid in (GTA_REAPER, GTA_WINESERVER, GTA_EXE):
+            remove_proc(self.proc, pid)
+        shutil.rmtree(os.path.join(self.sys, "fs", "cgroup") + GTA_SCOPE)   # removed: an exit
+        self.assertIsNone(self.looker(rests).check())
+
+    def test_a_process_at_rest_by_itself_exits_or_wakes(self):
+        lutris = APP_SLICE + "/app-lutris-game.scope"
+        add_proc(self.proc, 1900000, "wineserver", ["/usr/bin/wineserver"], state="T",
+                 cgroup=lutris)
+        set_cgroup(self.sys, lutris, frozen=False, procs=[1900000])
+        [r] = vworker.scan_games(vworker.list_procs(self.proc), (), self.proc, self.sys).rests
+        self.assertEqual((r.key, r.scope), ("proc:1900000:1000", None))
+        for left in (dict(state="Z"), dict(state="X"), dict(flags=vworker.PF_EXITING),
+                     dict(start=2000)):                           # 2000: the pid was reused
+            add_proc(self.proc, 1900000, "wineserver", ["/usr/bin/wineserver"], cgroup=lutris,
+                     **left)
+            self.assertIsNone(self.looker([r]).check(), left)
+        remove_proc(self.proc, 1900000)
+        self.assertIsNone(self.looker([r]).check())               # gone
+        add_proc(self.proc, 1900000, "wineserver", ["/usr/bin/wineserver"], cgroup=lutris)
+        self.assertEqual(self.looker([r]).check(), "wineserver")  # continued
+
+    def test_a_live_scope_that_cannot_be_read_counts(self):
+        w = self.looker(self.rests(frozen=True))
+        for name in ("cgroup.events", "cgroup.freeze"):
+            os.unlink(cgroup_file(self.sys, GTA_SCOPE, name))
+        self.assertEqual(w.check(), GTA)                          # its live members: running
+        os.unlink(cgroup_file(self.sys, GTA_SCOPE, "cgroup.procs"))
+        self.assertEqual(w.check(), GTA)                          # there, but can't be read
+
+    def test_a_look_is_light(self):
+        def reads(w):
+            seen, real = [], vworker._read
+            with mock.patch.object(vworker, "_read", lambda p: seen.append(p) or real(p)):
+                self.assertIsNone(w.check())
+            return seen
+        files = [cgroup_file(self.sys, GTA_SCOPE, n)
+                 for n in ("cgroup.events", "cgroup.freeze", "cgroup.procs")]
+        # frozen: its scope's cgroup.events once, and nothing else
+        self.assertEqual(reads(self.looker(self.rests(frozen=True))), files[:1])
+        # stopped: cgroup.events and cgroup.freeze, who is in it, and each one's state
+        self.assertEqual(reads(self.looker(self.rests(frozen=False, state="T"))),
+                         files + [os.path.join(self.proc, str(pid), "stat")
+                                  for pid in (GTA_REAPER, GTA_WINESERVER, GTA_EXE)])
+
+    def test_the_thread_yields_within_a_quarter_second_and_ends(self):
+        self.assertEqual(vworker.THAW_INTERVAL, 0.25)
+        w, _stop, got = self.watcher(self.rests(frozen=True))
+        w.start(vworker.list_procs(self.proc))
+        time.sleep(0.6)                                            # two looks: still resting
+        self.assertEqual(got, {"stops": [], "failed": []})
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False)
+        t0 = time.monotonic()
+        self.assertTrue(until(lambda: got["stops"], 2.0))
+        elapsed = time.monotonic() - t0
+        note_latency("thaw, FastWatch alone", elapsed)
+        self.assertLess(elapsed, 0.45)
+        w.thread.join(2.0)
+        self.assertFalse(w.thread.is_alive())
+        self.assertEqual(got, {"stops": [("a game woke up: " + GTA, "game")], "failed": []})
+
+    def test_no_thread_outlives_its_job(self):
+        def alive():
+            return [t for t in threading.enumerate() if t.name == "fast-watch"]
+        w, stop, got = self.watcher([])
+        self.assertIsNone(w.thread)                               # not started: no thread
+        w.start({})
+        self.assertTrue(w.thread.is_alive())
+        stop.set()                                                # the job stopped
+        w.thread.join(2.0)
+        self.assertFalse(w.thread.is_alive())
+        w.close()
+        w2, _stop2, _got2 = self.watcher(self.rests(frozen=True))
+        w2.start({})
+        w2.close()                                                # the job finished
+        self.assertFalse(w2.thread.is_alive())
+        w3, _stop3, _got3 = self.watcher([])
+        w3.close()
+        w3.start({})                                              # a late start: none
+        self.assertIsNone(w3.thread)
+        self.assertEqual(alive(), [])
+        self.assertEqual(got, {"stops": [], "failed": []})
+
+    def test_a_thread_that_cannot_start_is_not_kept(self):
+        w, _stop, _got = self.watcher([])
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaises(RuntimeError):
+                w.start({})
+        self.assertIsNone(w.thread)
+        w.close()                                                 # nothing to join: no error
+
+    def test_a_failure_fails_closed(self):
+        rests = self.rests(frozen=False, state="T")              # stopped: its stat is read
+        w, _stop, got = self.watcher(rests, interval=0.02)
+        with mock.patch.object(vworker, "read_stat", side_effect=RuntimeError("boom")):
+            w.start({})
+            self.assertTrue(until(lambda: got["failed"], 2.0))
+        self.assertEqual([str(e) for e in got["failed"]], ["boom"])
+        w.thread.join(2.0)
+        self.assertFalse(w.thread.is_alive())
+
+
+class FastWatchNewGames(Tmp):
+    """FastWatch's look at new processes (B5): /proc is listed, only a new pid is read, and one
+    that could be a game sends the job's whole game check."""
+
+    def setUp(self):
+        super().setUp()
+        add_proc(self.proc, 1828000, "steam", [STEAM_DIR + "/ubuntu12_32/steam", "-gamepadui"])
+        add_proc(self.proc, 2000, "kwin_wayland", ["/usr/bin/kwin_wayland"])
+        self.scans = []
+
+    def looker(self):
+        def scan(procs):
+            self.scans.append(sorted(procs))
+            return vworker.scan_games(procs, (), self.proc, self.sys)
+        w = vworker.FastWatch(self.cfg(), threading.Event(), None, None, scan)
+        w.cache = dict(vworker.list_procs(self.proc))            # what start() hands it
+        return w
+
+    def reads(self, w):
+        seen, real, real_bytes = [], vworker._read, vworker._read_bytes
+        with mock.patch.object(vworker, "_read", lambda p: seen.append(p) or real(p)), \
+                mock.patch.object(vworker, "_read_bytes",
+                                  lambda p: seen.append(p) or real_bytes(p)):
+            got = w.check_new()
+        return got, sorted({int(p.split(os.sep)[-2]) for p in seen
+                            if p.startswith(self.proc + os.sep)})
+
+    def test_only_new_pids_are_read(self):
+        w = self.looker()
+        self.assertEqual(self.reads(w), (None, []))               # nothing new: nothing read
+        add_proc(self.proc, 3000, "firefox", ["/usr/lib64/firefox/firefox"])
+        self.assertEqual(self.reads(w), (None, [3000]))           # no game: no whole check
+        self.assertEqual(self.reads(w), (None, [3000]))           # once more, then never again
+        self.assertEqual(self.reads(w), (None, []))
+        self.assertEqual(self.scans, [])
+        add_proc(self.proc, 3001, "reaper", ["reaper", "SteamLaunch", "AppId=1145360", "--",
+                                             "proton", "waitforexitandrun", "Hades.exe"])
+        got, read = self.reads(w)
+        self.assertEqual(got, "Hades.exe")
+        self.assertIn(3001, read)
+        self.assertEqual(len(self.scans), 1)                      # one whole check, over all
+        self.assertEqual(self.scans[0], [2000, 3000, 3001, 1828000])
+
+    def test_a_pid_read_before_its_exec_is_read_again(self):
+        w = self.looker()
+        add_proc(self.proc, 3002, "steam", [STEAM_DIR + "/ubuntu12_32/steam", "-gamepadui"],
+                 ppid=1828000)                                    # forked, not exec'd yet
+        self.assertIsNone(w.check_new())
+        add_proc(self.proc, 3002, "reaper", ["reaper", "SteamLaunch", "AppId=570", "--",
+                                             "dota.sh"], ppid=1828000)
+        self.assertEqual(w.check_new(), "Steam app 570")
+
+    def test_gone_pids_are_dropped(self):
+        w = self.looker()
+        add_proc(self.proc, 3003, "bash", ["/bin/bash"])
+        w.check_new()
+        self.assertIn(3003, w.cache)
+        remove_proc(self.proc, 3003)
+        w.check_new()
+        self.assertNotIn(3003, w.cache)
+        self.assertEqual(w.cache.keys(), {2000, 1828000})
+
+    def test_a_new_process_of_a_resting_game_is_no_new_game(self):
+        add_gta(self.proc, self.sys, frozen=True)
+        w = self.looker()
+        add_proc(self.proc, 1831300, "wine64-preload", [STEAM_DIR + "/files/bin/wine64-preloader",
+                                                        "Z:\\GTA5_Enhanced.exe"],
+                 ppid=GTA_REAPER, cgroup=GTA_SCOPE)               # in its frozen scope
+        self.assertIsNone(w.check_new())
+        self.assertEqual(len(self.scans), 1)                      # judged by every rule
+        add_proc(self.proc, 3004, "reaper", ["reaper", "SteamLaunch", "AppId=1145360", "--",
+                                             "proton", "waitforexitandrun", "Hades.exe"])
+        self.assertEqual(w.check_new(), "Hades.exe")              # a new launch beside it
+
+    def test_kernel_threads_dead_and_unreadable_pids_are_no_candidates(self):
+        w = self.looker()
+        add_proc(self.proc, 3005, "wineserver", ["wineserver"], ppid=2)        # a kthread
+        add_proc(self.proc, 3006, "wineserver", ["wineserver"], state="Z")
+        os.makedirs(os.path.join(self.proc, "3007"))                           # no stat yet
+        self.assertIsNone(w.check_new())
+        self.assertEqual(self.scans, [])
+        self.assertNotIn(3007, w.cache)                           # read again as new next time
+
+
+class RestAges(Tmp):
+    """B3: a game rests only after a minute at rest in a row (RestSeen), so a quick pause in
+    its menu is still a running game."""
+
+    def store(self, now, path=None, boot=""):
+        return vworker.RestSeen(path or self.rest_seen, clock=lambda: now[0], boot=boot)
+
+    def test_first_seen_times_age_and_are_forgotten_once_awake(self):
+        now = [100.0]
+        s = self.store(now)
+        self.assertEqual(s.update(["a"]), {"a": 0.0})
+        now[0] = 130.0
+        self.assertEqual(s.update(["a", "b"]), {"a": 30.0, "b": 0.0})
+        now[0] = 160.0
+        self.assertEqual(s.update(["b"]), {"b": 30.0})            # "a" woke: forgotten
+        self.assertEqual(s.update(["a", "b"]), {"a": 0.0, "b": 30.0})   # at rest again: anew
+        self.assertEqual(self.store(now).update(["a", "b"]), {"a": 0.0, "b": 30.0})  # kept
+
+    def test_the_file(self):
+        now = [100.0]
+        self.assertEqual(self.store(now).update([]), {})
+        self.assertFalse(os.path.exists(self.rest_seen))          # nothing rests: nothing written
+        self.store(now).update([GTA_KEY])
+        with open(self.rest_seen) as f:
+            self.assertEqual(json.load(f), {"boot": "", "seen": {GTA_KEY: 100.0}})
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])  # atomic
+        now[0] = 50.0                                             # the clock went back
+        self.assertEqual(self.store(now).update([GTA_KEY]), {GTA_KEY: 0.0})
+        now[0] = 80.0
+        self.assertEqual(self.store(now, boot="other-boot").update([GTA_KEY]), {GTA_KEY: 0.0})
+        for junk in ("{", "[]", '{"boot": "", "seen": [1]}', '{"boot": "", "seen": {"a": true}}'):
+            write(self.rest_seen, junk)
+            self.assertEqual(self.store(now).update(["a"]), {"a": 0.0}, junk)
+        now[0] = 90.0
+        self.assertEqual(self.store(now).update(["a"]), {"a": 10.0})
+        self.store(now).update([])                                # every one awake: pruned
+        with open(self.rest_seen) as f:
+            self.assertEqual(json.load(f), {"boot": "", "seen": {}})
+        # a scratch dir that can't be written: every rest reads as just begun
+        if os.geteuid() == 0:
+            return                                                # root writes anywhere
+        ro = os.path.join(self.tmp, "ro")
+        os.makedirs(ro, mode=0o500)
+        try:
+            path = os.path.join(ro, "rest-seen.json")
+            self.assertEqual(self.store(now, path).update(["a"]), {"a": 0.0})
+            now[0] = 200.0
+            self.assertEqual(self.store(now, path).update(["a"]), {"a": 0.0})
+        finally:
+            os.chmod(ro, 0o700)
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_status_counts_a_rest_only_after_a_minute(self):
+        self.assertEqual(vworker.REST_MIN_AGE_S, 60.0)
+        self.assertEqual(vworker.Config({"VWORKER_REST_MIN_AGE": "5"}).rest_min_age, 5.0)
+        write_meminfo(self.proc, 8.0)
+        add_gta(self.proc, self.sys, frozen=True)
+        now = [1000.0]
+
+        def status():
+            st = self.status(rest_clock=lambda: now[0])
+            return st["ok"], st["code"], st["game"], st["resting_game"]
+        game = (False, "game", GTA, None)
+        self.assertEqual(status(), game)                          # frozen just now: a pause
+        self.assertEqual(self.status(rest_clock=lambda: now[0])["why"],
+                         "game running: " + GTA)
+        now[0] = 1059.9
+        self.assertEqual(status(), game)
+        now[0] = 1060.0
+        self.assertEqual(status(), (True, "ready", None, GTA))    # a minute at rest
+        # its menu opened for a moment: it woke, so the minute starts over
+        add_gta(self.proc, self.sys, frozen=False)
+        now[0] = 1070.0
+        self.assertEqual(status(), game)
+        add_gta(self.proc, self.sys, frozen=True)
+        now[0] = 1080.0
+        self.assertEqual(status(), game)
+        now[0] = 1139.0
+        self.assertEqual(status(), game)
+        now[0] = 1140.0
+        self.assertEqual(status(), (True, "ready", None, GTA))
+
+
+class WakeMarker(Tmp):
+    """B4: a rest manager's file says a game is waking up ("waking", fresh); it is only read."""
+
+    def marker(self, data=None, raw=None, mtime=None):
+        write(self.rest_file, raw if raw is not None else json.dumps(data))
+        if mtime is not None:
+            os.utime(self.rest_file, (mtime, mtime))
+        return self.rest_file
+
+    def test_the_marker(self):
+        now = time.time()
+        wall = lambda: now                                                    # noqa: E731
+        m = vworker.rest_marker
+        self.assertIsNone(m(self.rest_file, wall))                           # no rest manager
+        self.assertIs(m(self.marker({"waking": local_time(now - 5)}), wall), True)
+        self.assertIs(m(self.marker({"waking": local_time(now - 119)}), wall), True)
+        self.assertIs(m(self.marker({"waking": local_time(now - 125)}, mtime=now), wall),
+                      False)                                                 # stale
+        self.assertIs(m(self.marker({"state": "resting"}, mtime=now), wall), False)   # no wake
+        self.assertIs(m(self.marker({"waking": None}, mtime=now), wall), False)
+        # a "waking" that can't be read as a local time: the file's own time
+        self.assertIs(m(self.marker({"waking": "soon"}, mtime=now - 10), wall), True)
+        self.assertIs(m(self.marker({"waking": 12}, mtime=now - 200), wall), False)
+        self.assertIs(m(self.marker({"waking": local_time(now + 3600)}, mtime=now - 1), wall),
+                      True)                                                  # far ahead
+        self.assertIs(m(self.marker({"waking": local_time(now + 3600)}, mtime=now - 500), wall),
+                      False)
+        # half written, not JSON, not an object: nothing this time
+        for raw in ('{"waking": "20', "", "[1, 2]", "null", "\x00\x01"):
+            self.assertIs(m(self.marker(raw=raw, mtime=now), wall), False, raw)
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_status_refuses_while_a_game_wakes_and_never_writes_the_file(self):
+        write_rest_file(self.rest_file, state="resting", waking=local_time(time.time()))
+        before = (os.stat(self.rest_file).st_mtime_ns, open(self.rest_file).read())
+        st = self.status()
+        self.assertEqual((st["ok"], st["code"], st["why"], st["game"]),
+                         (False, "game", "a game is waking up", None))
+        self.assertFalse(vworker.heavy_only(dict(st, heavy="x 2.0 cores"), self.cfg()))
+        self.assertEqual((os.stat(self.rest_file).st_mtime_ns, open(self.rest_file).read()),
+                         before)
+        write_rest_file(self.rest_file, state="resting", waking=local_time(time.time() - 600))
+        self.assertEqual(self.status()["code"], "ready")   # stale: ignored
+        write_rest_file(self.rest_file, state="idle")
+        self.assertEqual(self.status()["code"], "ready")
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_where_a_rest_manager_runs_the_sleep_probe_is_not_even_asked(self):
+        with mock.patch.object(vworker, "_start_sleep_probe",
+                               return_value=lambda: True) as probe:
+            self.assertIs(self.status()["sleep_block"], True)
+            self.assertEqual(probe.call_count, 1)
+            write_rest_file(self.rest_file, state="idle")
+            st = self.status()
+            self.assertEqual((st["ok"], st["sleep_block"]), (True, None))
+            self.assertEqual(probe.call_count, 1)
+
+    def test_its_path(self):
+        p = vworker.rest_file_path
+        self.assertEqual(p({"VWORKER_REST_FILE": "/x/r.json", "XDG_RUNTIME_DIR": "/run/u"}),
+                         "/x/r.json")
+        self.assertEqual(p({"XDG_RUNTIME_DIR": "/run/user/1000"}),
+                         "/run/user/1000/ally-rest.json")
+        self.assertEqual(p({}), "/run/user/%d/ally-rest.json" % os.getuid())
+        self.assertEqual(vworker.Config({"XDG_RUNTIME_DIR": "/r"}).rest_file, "/r/ally-rest.json")
+
+
+class WatcherThreads(Tmp):
+    """A2: a watcher thread that can't start never keeps finish() from deleting the job's
+    files and printing its VWORKER line, and no watcher thread outlives finish()."""
+
+    def job(self, name):
+        job = vworker.EncodeJob(self.cfg(), name)
+        os.makedirs(job.jobdir)
+        write(os.path.join(job.jobdir, "rpu.bin"), "rpu")
+        job.owns_dir = True
+        return job
+
+    def finish(self, job, *args):
+        """job.finish(*args) with fd 2 caught -> (exit code, what it wrote there)."""
+        r, w = os.pipe()
+        saved = os.dup(2)
+        os.dup2(w, 2)
+        os.close(w)
+        try:
+            rc = job.finish(*args)
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+        out = os.read(r, 65536)
+        os.close(r)
+        return rc, out.decode()
+
+    def test_a_thread_that_cannot_start(self):
+        job = self.job("seg_nothread")
+        real = threading.Thread.start
+
+        def start(t):
+            if t.name in ("fast-watch", "watchdog"):
+                raise RuntimeError("can't start new thread")
+            return real(t)
+        with mock.patch.object(threading.Thread, "start", start):
+            with self.assertRaises(RuntimeError):
+                job._start_thread("watchdog", job._watchdog)
+            self.assertNotIn("watchdog", job.threads)
+            job._watchdog()                       # its first look done, the fast watch fails
+        self.assertIsNone(job.fast.thread)
+        self.assertEqual((job.result, job.why),
+                         ("error", "fast watch failed to start: can't start new thread"))
+        with mock.patch.object(job.fast, "close", side_effect=RuntimeError("boom")):
+            rc, err = self.finish(job, job.result, job.why, 0)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(job.jobdir))
+        self.assertEqual(json.loads(err.splitlines()[-1][len("VWORKER "):]),
+                         {"result": "error", "frames": 0,
+                          "why": "fast watch failed to start: can't start new thread"})
+
+    def test_no_watcher_thread_outlives_finish(self):
+        job = self.job("seg_threads")
+        job.fast.start(vworker.list_procs(self.proc))
+        job._start_thread("watchdog", job.stop.wait, 30)
+        self.assertTrue(job.fast.thread.is_alive() and job.threads["watchdog"].is_alive())
+        rc, err = self.finish(job, "ok", "", 0)
+        self.assertEqual(rc, 0)
+        self.assertFalse(job.fast.thread.is_alive())
+        self.assertFalse(job.threads["watchdog"].is_alive())
+        self.assertEqual([t.name for t in threading.enumerate()
+                          if t.name in ("fast-watch", "watchdog")], [])
+        self.assertFalse(os.path.exists(job.jobdir))
+        self.assertTrue(err.endswith('VWORKER {"result":"ok","why":"","frames":0}\n'), err)
 
 
 class OwnTree(unittest.TestCase):
@@ -1208,27 +2189,16 @@ class WifiStreamCheck(unittest.TestCase):
 # ---- status ---------------------------------------------------------------------------------
 
 class Status(Tmp):
-    IP_OUT = ("1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
-              "2: enp4s0    inet 192.0.2.20/24 brd 192.0.2.255 scope global enp4s0\\  x\n"
-              "3: wlan0    inet 192.0.2.30/24 brd 192.0.2.255 scope global wlan0\\  x\n"
-              "3: wlan0    inet6 fe80::1234/64 scope link \\       valid_lft forever\n")
-
-    def status(self, cfg=None, sleep=None, **kw):
-        clock = iter(range(0, 1000, 1))
-        kw.setdefault("runner", FakeRunner(self.x265, self.IP_OUT))
-        kw.setdefault("self_pid", 4000)
-        kw.setdefault("parent_pid", 3999)
-        return vworker.compute_status(cfg or self.cfg(), clock=lambda: float(next(clock)),
-                                      sleep=sleep or (lambda s: None), **kw)
 
     @unittest.skipUnless(ZSTD, "zstd not installed")
     def test_ready(self):
         st = self.status()
-        self.assertEqual(set(st), {"ok", "why", "code", "ac", "ethernet", "game", "heavy",
-                                   "free_gb", "busy", "x265", "version", "sha256", "ipv4",
-                                   "sleep_block"})
+        self.assertEqual(set(st), {"ok", "why", "code", "ac", "ethernet", "game", "resting_game",
+                                   "heavy", "free_gb", "mem_available_gb", "busy", "x265",
+                                   "version", "sha256", "ipv4", "sleep_block"})
         self.assertEqual(st, dict(st, ok=True, why="ready", code="ready", ac=True, ethernet=True,
-                                  game=None, heavy=None, busy=False, x265="4.1+1-1d117be",
+                                  game=None, resting_game=None, heavy=None,
+                                  mem_available_gb=None, busy=False, x265="4.1+1-1d117be",
                                   version=1))
         self.assertIsInstance(st["free_gb"], float)
         json.dumps(st)
@@ -1432,6 +2402,63 @@ class Status(Tmp):
         self.assertEqual((st["ok"], st["game"], st["why"], st["code"]),
                          (False, "Hades.exe", "game running: Hades.exe", "game"))
 
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_a_resting_game_is_named_and_does_not_count(self):
+        write_meminfo(self.proc, 8.0)                    # room beside it (MemoryAndOom)
+        cfg = self.cfg(rest_min_age=0)                   # at rest long enough (RestAges)
+        add_gta(self.proc, self.sys, frozen=True)
+        st = self.status(cfg)
+        self.assertEqual((st["ok"], st["code"], st["game"], st["resting_game"]),
+                         (True, "ready", None, GTA))
+        add_gta(self.proc, self.sys, frozen=True, state="T")        # SIGSTOPped as well
+        self.assertEqual(self.status(cfg)["resting_game"], GTA)
+        add_gta(self.proc, self.sys, frozen=False)
+        st = self.status(cfg)
+        self.assertEqual((st["ok"], st["code"], st["game"], st["resting_game"], st["why"]),
+                         (False, "game", GTA, None, "game running: %s" % GTA))
+
+    def test_a_game_waking_during_the_sample_counts(self):
+        cfg = self.cfg(rest_min_age=0)
+        add_gta(self.proc, self.sys, frozen=True)
+        st = self.status(cfg, sleep=lambda _: set_cgroup(self.sys, GTA_SCOPE, frozen=False))
+        self.assertEqual((st["ok"], st["code"], st["game"], st["resting_game"]),
+                         (False, "game", GTA, None))
+        add_gta(self.proc, self.sys, frozen=False)                  # and one that goes to rest
+        st = self.status(cfg, sleep=lambda _: set_cgroup(self.sys, GTA_SCOPE, frozen=True))
+        self.assertEqual((st["code"], st["game"], st["resting_game"]), ("game", GTA, GTA))
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_low_memory(self):
+        self.assertEqual((vworker.ENCODE_MEM_GB, vworker.START_MEM_GB), (2.5, 3.5))
+        self.assertEqual(vworker.Config({}).min_mem_gb, 3.5)
+        self.assertEqual(vworker.Config({"VWORKER_MIN_MEM_GB": "5"}).min_mem_gb, 5.0)
+        write_meminfo(self.proc, 2.0)                    # a big game resting on 14.8 GiB
+        st = self.status()
+        self.assertEqual((st["ok"], st["code"], st["why"], st["mem_available_gb"]),
+                         (False, "low_memory", "low on memory: 2.0 GB available, needs 3.5", 2.0))
+        write_meminfo(self.proc, 3.49)                   # rounded down: never more than there is
+        st = self.status()
+        self.assertEqual((st["ok"], st["why"], st["mem_available_gb"]),
+                         (False, "low on memory: 3.4 GB available, needs 3.5", 3.4))
+        write_meminfo(self.proc, 3.5)
+        st = self.status()
+        self.assertEqual((st["ok"], st["code"], st["mem_available_gb"]), (True, "ready", 3.5))
+        write_meminfo(self.proc, 2.0)
+        self.assertTrue(self.status(self.cfg(min_mem_gb=1.5))["ok"])
+        os.unlink(os.path.join(self.proc, "meminfo"))    # unreadable: refuses nothing
+        st = self.status()
+        self.assertEqual((st["ok"], st["mem_available_gb"]), (True, None))
+
+    def test_low_memory_in_the_order_of_reasons(self):
+        write_meminfo(self.proc, 1.0)
+        write(os.path.join(self.sys, "class/drm/card0/device/gpu_busy_percent"), "85\n")
+        self.assertEqual(self.status()["code"], "heavy")              # heavy names the app
+        write(os.path.join(self.sys, "class/drm/card0/device/gpu_busy_percent"), "3\n")
+        with mock.patch.object(vworker, "free_gb", return_value=1.0):
+            self.assertEqual(self.status(self.cfg(min_free_gb=5))["code"], "low_memory")
+        add_gta(self.proc, self.sys, frozen=False)
+        self.assertEqual(self.status()["code"], "game")
+
     def test_heavy_cpu_but_not_our_own(self):
         add_proc(self.proc, 4000, "python3", ["python3", "vworker", "status"], ppid=3999)
         add_proc(self.proc, 4001, "x265", ["x265"], ppid=4000)
@@ -1515,6 +2542,114 @@ class Status(Tmp):
         self.assertFalse(json.loads(r.stdout)["ok"])
 
 
+class MemoryAndOom(Tmp):
+    def test_mem_available(self):
+        self.assertIsNone(vworker.mem_available_gb(self.proc))      # no meminfo: not Linux
+        write_meminfo(self.proc, 2.0)
+        self.assertEqual(vworker.mem_available_gb(self.proc), 2.0)
+        path = os.path.join(self.proc, "meminfo")
+        for text in ("MemTotal: 15523840 kB\n",                    # a kernel before 3.14
+                     "MemAvailable: lots kB\n", "MemAvailable: 2097152 MB\n", "MemAvailable:\n",
+                     "MemAvailable: -5 kB\n"):
+            write(path, text)
+            self.assertIsNone(vworker.mem_available_gb(self.proc), text)
+        write(path, "MemAvailable: 786432\n")                     # no unit: kB, as always
+        self.assertEqual(vworker.mem_available_gb(self.proc), 0.75)
+
+    def test_low_memory_takes_two_checks_in_a_row(self):
+        self.assertEqual((vworker.STOP_MEM_GB, vworker.LOW_MEM_TICKS), (0.75, 2))
+        m = vworker.MemoryWatch()
+        self.assertEqual([m.update(gb) for gb in (0.5, 2.0, 0.5, None, 0.5, 0.75, 0.74, 0.5,
+                                                  0.1)],
+                         [False, False, False, False, False, False, False, True, True])
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_heavy_with_low_memory_is_not_resampled(self):
+        cfg = self.cfg()
+        heavy = {"heavy": "x 2.0 cores", "ac": True, "ethernet": True, "game": None,
+                 "busy": False, "x265": "4.1+1-1d117be"}
+        self.assertTrue(vworker.heavy_only(heavy, cfg))
+        write_meminfo(self.proc, 2.0)
+        self.assertFalse(vworker.heavy_only(heavy, cfg))
+        write_meminfo(self.proc, 8.0)
+        self.assertTrue(vworker.heavy_only(heavy, cfg))
+
+    @unittest.skipUnless(ZSTD, "zstd not installed")
+    def test_the_owners_rule_beside_a_resting_game(self):
+        # MemAvailable stays >= 3 GiB the whole time a game rests: a job starts only with a
+        # budget of MemAvailable - 3.5 GiB >= 3.0 GiB (so 6.5 GiB), and yields under 3.0 GiB
+        self.assertEqual((vworker.REST_KEEP_GB, vworker.REST_RESERVE_GB,
+                          vworker.REST_MIN_BUDGET_GB, vworker.GIB), (3.0, 3.5, 3.0, 1 << 30))
+        cfg = self.cfg(rest_min_age=0)
+        add_gta(self.proc, self.sys, frozen=True)
+        for gb, want in ((6.49, (False, "low_memory",
+                                 "low on memory: 6.4 GB available, needs 6.5 while a game rests")),
+                         (6.5, (True, "ready", "ready")), (16.0, (True, "ready", "ready"))):
+            write_meminfo(self.proc, gb)
+            st = self.status(cfg)
+            self.assertEqual((st["ok"], st["code"], st["why"]), want, gb)
+            self.assertEqual(st["resting_game"], GTA)
+        # measured: a big game's rest held 9.0 GiB and left 2.7-2.8 GiB available -- no job
+        write_meminfo(self.proc, 2.75)
+        st = self.status(cfg)
+        self.assertEqual((st["ok"], st["code"], st["why"]),
+                         (False, "low_memory",
+                          "low on memory: 2.7 GB available, needs 6.5 while a game rests"))
+        os.unlink(os.path.join(self.proc, "meminfo"))   # its memory can't be kept unseen
+        st = self.status(cfg)
+        self.assertEqual((st["ok"], st["code"], st["why"]),
+                         (False, "low_memory", "low on memory: it can't be read while a game rests"))
+        write_meminfo(self.proc, 4.0)                    # no game at rest: round 1's 3.5 GB
+        add_gta(self.proc, self.sys, frozen=False)
+        self.assertEqual(self.status(cfg)["code"], "game")
+        shutil.rmtree(self.proc)
+        os.makedirs(self.proc)
+        write_meminfo(self.proc, 4.0)
+        self.assertEqual(self.status(cfg)["code"], "ready")
+        # heavy beside a resting game is re-sampled only when its memory rule holds too
+        heavy = {"heavy": "x 2.0 cores", "code": "heavy", "ac": True, "ethernet": True,
+                 "game": None, "busy": False, "x265": "4.1+1-1d117be", "resting_game": GTA}
+        self.assertFalse(vworker.heavy_only(heavy, cfg))
+        write_meminfo(self.proc, 7.0)
+        self.assertTrue(vworker.heavy_only(heavy, cfg))
+
+    def test_the_memory_knobs(self):
+        c = vworker.Config({})
+        self.assertEqual((c.min_mem_gb, c.stop_mem_gb, c.rest_keep_gb, c.rest_reserve_gb,
+                          c.rest_budget_gb), (3.5, 0.75, 3.0, 3.5, 3.0))
+        c = vworker.Config({"VWORKER_STOP_MEM_GB": "0.5", "VWORKER_REST_KEEP_GB": "2",
+                            "VWORKER_REST_RESERVE_GB": "1.5", "VWORKER_REST_BUDGET_GB": "1"})
+        self.assertEqual((c.stop_mem_gb, c.rest_keep_gb, c.rest_reserve_gb, c.rest_budget_gb),
+                         (0.5, 2.0, 1.5, 1.0))
+        v = vworker.memory_verdict
+        self.assertEqual(v(c, 2.4, GTA), (False, "low on memory: 2.4 GB available, needs 2.5 "
+                                                 "while a game rests"))
+        self.assertEqual(v(c, 2.5, GTA), (True, ""))
+        self.assertEqual(v(c, None, None), (True, ""))
+        self.assertEqual(v(c, 3.4, None), (False, "low on memory: 3.4 GB available, needs 3.5"))
+        m = vworker.MemoryWatch(3.0)                     # the floor beside a resting game
+        self.assertEqual([m.update(gb) for gb in (2.9, 3.1, 2.9, 3.0, 2.99, 2.5)],
+                         [False, False, False, False, False, True])
+
+    def test_mem_available_bytes(self):
+        write_meminfo(self.proc, 8.0)
+        self.assertEqual(vworker.mem_available_bytes(self.proc), 8 << 30)
+        os.unlink(os.path.join(self.proc, "meminfo"))
+        self.assertIsNone(vworker.mem_available_bytes(self.proc))
+
+    def test_the_oom_killer_takes_the_encode_first(self):
+        adj = os.path.join(self.proc, "self", "oom_score_adj")
+        self.assertFalse(vworker.raise_oom_score(self.proc))       # none here: never an error
+        write(adj, "0\n")
+        self.assertTrue(vworker.raise_oom_score(self.proc))
+        with open(adj) as f:
+            self.assertEqual(f.read(), "1000\n")
+        os.unlink(adj)
+        os.makedirs(adj)                                          # a write that is refused
+        self.assertFalse(vworker.raise_oom_score(self.proc))
+        self.assertEqual(vworker.OOM_SCORE_ADJ, 1000)
+
+
 class ConfigLookup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="vworker-cfg-")
@@ -1547,16 +2682,29 @@ class ConfigLookup(unittest.TestCase):
         self.assertEqual(vworker.Config({"VWORKER_INHIBIT": "/x/inhibit"}).inhibit, "/x/inhibit")
         if not os.path.exists("/usr/bin/systemd-inhibit"):
             self.assertEqual(vworker.Config({"PATH": self.empty}).inhibit, "")
-        # sleep and idle as two blocks: polkit judges each kind on its own (VW-1)
+        # the sleep block alone: no idle block, which would keep a rest manager from acting
         self.assertEqual(vworker.INHIBIT_ARGS,
                          ["--what=sleep", "--who=visionary-helper",
                           "--why=encoding a segment", "--mode=block", "sleep", "infinity"])
-        self.assertEqual(vworker.IDLE_INHIBIT_ARGS,
-                         ["--what=idle", "--who=visionary-helper",
-                          "--why=encoding a segment", "--mode=block", "sleep", "infinity"])
+        self.assertFalse(hasattr(vworker, "IDLE_INHIBIT_ARGS"))
         self.assertEqual(vworker.SLEEP_PROBE_ARGS,
                          ["--what=sleep", "--mode=block", "--who=visionary-helper",
                           "--why=probe", "true"])
+
+    def test_systemd_run_and_ionice(self):
+        for var, name, attr in (("VWORKER_SYSTEMD_RUN", "systemd-run", "systemd_run"),
+                                ("VWORKER_IONICE", "ionice", "ionice")):
+            found = self.tool("bin", name)
+            self.assertEqual(getattr(vworker.Config({"PATH": self.bin}), attr), found, name)
+            self.assertEqual(getattr(vworker.Config({var: "/x/" + name}), attr), "/x/" + name)
+            self.assertEqual(getattr(vworker.Config({var: "", "PATH": self.bin}), attr), "")
+            if not os.path.exists("/usr/bin/" + name):
+                self.assertEqual(getattr(vworker.Config({"PATH": self.empty}), attr), "", name)
+        c = vworker.Config({"VWORKER_JOBS": "/home/u/visionary-scratch/jobs"})
+        self.assertEqual(c.rest_seen, "/home/u/visionary-scratch/rest-seen.json")   # its own
+        self.assertEqual((c.in_scope, c.scope_max), (False, None))
+        c = vworker.Config({"VWORKER_IN_SCOPE": "1", "VWORKER_SCOPE_MAX": "5100273664"})
+        self.assertEqual((c.in_scope, c.scope_max), (True, 5100273664))
 
 
 class SleepProbe(unittest.TestCase):
@@ -2079,10 +3227,40 @@ class EncodeBase(Tmp):
         env = dict(os.environ, VWORKER_X265=self.x265, VWORKER_ZSTD=ZSTD,
                    VWORKER_JOBS=self.jobs, VWORKER_PROC=self.proc, VWORKER_SYS=self.sys,
                    VWORKER_STATUS_SAMPLE="0.05", VWORKER_MIN_FREE_GB="0",
-                   FAKE_X265_RAN=self.ran)
-        env.pop("SSH_CONNECTION", None)
+                   VWORKER_REST_FILE=self.rest_file, VWORKER_REST_SEEN=self.rest_seen,
+                   VWORKER_SYSTEMD_RUN="", VWORKER_IONICE="", FAKE_X265_RAN=self.ran)
+        for k in ("SSH_CONNECTION", "VWORKER_IN_SCOPE", "VWORKER_SCOPE_MAX"):
+            env.pop(k, None)
         env.update({k: str(v) for k, v in over.items()})
         return env
+
+    def scope_env(self, **extra):
+        """The fake systemd-run (FAKE_SYSTEMD_RUN) -> (env, its log)."""
+        path = os.path.join(self.tmp, "systemd-run")
+        if not os.path.exists(path):
+            write(path, FAKE_SYSTEMD_RUN.replace("{python}", sys.executable))
+            os.chmod(path, 0o755)
+        log = os.path.join(self.tmp, "systemd-run-%d.log" % len(os.listdir(self.tmp)))
+        env = {"VWORKER_SYSTEMD_RUN": path, "FAKE_SYSTEMD_RUN_LOG": log}
+        env.update(extra)
+        return env, log
+
+    @staticmethod
+    def calls(log):
+        """Every invocation a fake tool logged (its arguments), in order."""
+        if not os.path.exists(log):
+            return []
+        with open(log) as f:
+            return [json.loads(line) for line in f]
+
+    def resting_gta(self, age=120, **kw):
+        """The handheld's game, resting for `age` s (two minutes) beside 8 GiB of
+        MemAvailable."""
+        write_meminfo(self.proc, 8.0)
+        add_gta(self.proc, self.sys, **dict(dict(frozen=True), **kw))
+        if os.path.exists(self.rest_seen):
+            os.unlink(self.rest_seen)
+        seed_rest(self.rest_seen, [GTA_KEY], age)
 
     def put_rpu(self, job, data=b"RPU-SLICE"):
         r = subprocess.run([sys.executable, VWORKER, "put", job, "rpu.bin", str(len(data))],
@@ -2189,44 +3367,37 @@ class EncodeEndToEnd(EncodeBase):
         env, log = self.inhibitor()
         run = self.start("seg_awake", 6, dv=False, **env)
         pid, argv = self.held(log, "sleep")
-        ipid, iargv = self.held(log, "idle")
-        self.assertEqual(argv, vworker.INHIBIT_ARGS)          # sleep alone, idle beside it
-        self.assertEqual(iargv, vworker.IDLE_INHIBIT_ARGS)
+        self.assertEqual(argv, vworker.INHIBIT_ARGS)          # sleep alone: no idle block
         os.kill(pid, 0)                                       # held while x265 waits for input
-        os.kill(ipid, 0)
         self.assertEqual(self.probes(log), [vworker.SLEEP_PROBE_ARGS])   # status asked once
         run.feed(zstd_compress(y4m(6)))
         self.assertEqual(run.wait(), 0, run.stderr[-800:])
         self.assertEqual(run.stdout, expected_hevc(6))
+        self.assertFalse(os.path.exists(log + ".idle"))
         self.assert_released(pid)
-        self.assert_released(ipid)
         self.assert_cleaned("seg_awake")
 
     def test_the_sleep_block_goes_on_a_yield_and_an_error(self):
         env, log = self.inhibitor()
         run = self.start("seg_awake_y", 50, dv=False, **env)
-        pids = [self.held(log, w)[0] for w in ("sleep", "idle")]
+        pid = self.held(log, "sleep")[0]
         self.wait_started()
         add_proc(self.proc, FAKE_PID, "reaper", ["reaper", "SteamLaunch", "AppId=1145360"])
         self.assertEqual(run.wait(), 75, run.stderr[-800:])
-        for pid in pids:
-            self.assert_released(pid)
+        self.assert_released(pid)
         shutil.rmtree(os.path.join(self.proc, str(FAKE_PID)))
-        for w in ("sleep", "idle"):
-            os.unlink("%s.%s" % (log, w))
+        os.unlink(log + ".sleep")
         run = self.start("seg_awake_e", 3, dv=False, FAKE_X265_RC=4, **env)
-        pids = [self.held(log, w)[0] for w in ("sleep", "idle")]
+        pid = self.held(log, "sleep")[0]
         run.feed(zstd_compress(y4m(3)))
         self.assertEqual(run.wait(), 1)
-        for pid in pids:
-            self.assert_released(pid)
+        self.assert_released(pid)
         self.assert_cleaned("seg_awake_e")
 
     def test_no_sleep_block_never_fails_a_job(self):
         env, log = self.inhibitor(fail=True)                  # polkit said no: it exits at once
         run = self.start("seg_noblock", 4, dv=False, **env)
-        self.held(log, "sleep")                               # they ran (and gave up) first
-        self.held(log, "idle")
+        self.held(log, "sleep")                               # it ran (and gave up) first
         run.feed(zstd_compress(y4m(4)))
         self.assertEqual(run.wait(), 0, run.stderr[-800:])    # status's probe said no, too
         self.assertEqual(run.stdout, expected_hevc(4))
@@ -2235,6 +3406,39 @@ class EncodeEndToEnd(EncodeBase):
                          VWORKER_INHIBIT=os.path.join(self.tmp, "no-such-inhibit"))
         run.feed(zstd_compress(y4m(4)))
         self.assertEqual(run.wait(), 0, run.stderr[-800:])
+
+    def test_no_sleep_block_beside_a_resting_game_or_a_rest_manager(self):
+        env, log = self.inhibitor()
+        # a game at rest: no block (its rest mode decides about sleep)
+        self.resting_gta()
+        scope, _calls = self.scope_env()
+        run = self.start("seg_rest_awake", 4, dv=False, **dict(env, **scope))
+        run.feed(zstd_compress(y4m(4)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertFalse(os.path.exists(log + ".sleep"))
+        # a rest manager here (its file), no game: no block, and status does not even probe
+        shutil.rmtree(self.proc)
+        os.makedirs(self.proc)
+        os.unlink(log + ".probe")
+        write_rest_file(self.rest_file, state="idle")
+        run = self.start("seg_manager", 4, dv=False, **env)
+        run.feed(zstd_compress(y4m(4)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(4))
+        self.assertFalse(os.path.exists(log + ".sleep"))
+        self.assertEqual(self.probes(log), [])
+        # one that appears mid-job: the block it took goes, and the job carries on
+        os.unlink(self.rest_file)
+        os.unlink(self.ran)
+        run = self.start("seg_manager_late", 4, dv=False, VWORKER_WATCH_INTERVAL=30, **env)
+        pid = self.held(log, "sleep")[0]
+        self.wait_started()
+        write_rest_file(self.rest_file, state="idle")
+        self.assert_released(pid)
+        self.assertIsNone(run.p.poll())
+        run.feed(zstd_compress(y4m(4)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(4))
 
     def test_a_refusal_takes_no_sleep_block(self):
         env, log = self.inhibitor()
@@ -2311,21 +3515,42 @@ class EncodeEndToEnd(EncodeBase):
         self.assertEqual(run.vline()["result"], "ok")
 
     # -- yields
-    def test_game_mid_encode_yields_within_3_seconds(self):
+    def test_a_game_started_mid_encode_yields_within_a_quarter_second(self):
         self.put_rpu("seg_game")
-        run = self.start("seg_game", 50)                      # default 2 s watchdog, stdin open
+        run = self.start("seg_game", 50, VWORKER_WATCH_INTERVAL=30)   # only the fast watch
         pid = self.wait_started()
         time.sleep(0.3)
         add_proc(self.proc, FAKE_PID, "reaper", ["reaper", "SteamLaunch", "AppId=1145360", "--",
                                                  "proton", "waitforexitandrun", "Hades.exe"])
         t0 = time.monotonic()
         rc = run.wait()
-        self.assertLess(time.monotonic() - t0, 3.0)
+        elapsed = time.monotonic() - t0
+        note_latency("new game, end to end", elapsed)
+        self.assertLess(elapsed, 0.75)
         self.assertEqual(rc, 75, run.stderr[-800:])
         v = run.vline()
         self.assertEqual(v["result"], "yielded")
-        self.assertEqual((v["why"], v["code"]), ("game running: Hades.exe", "game"))
+        self.assertEqual((v["why"], v["code"]), ("a game started: Hades.exe", "game"))
         self.assert_cleaned("seg_game", pid)
+
+    def test_the_watchdog_still_catches_what_the_fast_watch_does_not_read_again(self):
+        # the backstop: a process that was already there exec's a game later on. The fast
+        # watch reads a pid on its first two looks only, so the watchdog's full check finds it
+        add_proc(self.proc, FAKE_PID, "bash", ["/bin/bash", "./start.sh"])
+        run = self.start("seg_game_wd", 50, dv=False)        # the default 2 s watchdog
+        pid = self.wait_started()
+        time.sleep(0.8)                                       # its two quick looks are over
+        d = os.path.join(self.proc, str(FAKE_PID))
+        with open(os.path.join(d, "cmdline"), "wb") as f:     # exec'd in place: same pid
+            f.write(b"Z:\\games\\Hades.exe\0")
+        write(os.path.join(d, "stat"), stat_line(FAKE_PID, "Hades.exe", 1))
+        t0 = time.monotonic()
+        rc = run.wait()
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertEqual(rc, 75, run.stderr[-800:])
+        self.assertEqual((run.vline()["why"], run.vline()["code"]),
+                         ("game running: Hades.exe", "game"))
+        self.assert_cleaned("seg_game_wd", pid)
 
     def test_sustained_gpu_load_yields(self):
         run = self.start("seg_gpu", 50, dv=False, VWORKER_WATCH_INTERVAL=0.2, VWORKER_HEAVY_SECS=1.0)
@@ -2482,14 +3707,284 @@ class EncodeEndToEnd(EncodeBase):
         self.assertEqual(run.vline()["result"], "ok")
 
     def test_proton_shortcut_yields_at_once(self):
-        run = self.start("seg_proton", 50, dv=False, VWORKER_WATCH_INTERVAL=0.2)
+        run = self.start("seg_proton", 50, dv=False, VWORKER_WATCH_INTERVAL=30)
         pid = self.wait_started()
         self.add_tree(shortcut_tree("proton", base=FAKE_PID))
         t0 = time.monotonic()
         self.assertEqual(run.wait(), 75, run.stderr[-800:])
-        self.assertLess(time.monotonic() - t0, 3.0)
-        self.assertEqual(run.vline()["why"], "game running: Celeste.exe")
+        self.assertLess(time.monotonic() - t0, 0.75)
+        self.assertEqual(run.vline()["why"], "a game started: Celeste.exe")
         self.assert_cleaned("seg_proton", pid)
+
+    # -- a resting game: it encodes beside one, and steps aside the moment it wakes
+    def test_a_resting_game_lets_it_encode_and_a_thaw_yields_at_once(self):
+        self.resting_gta()
+        scope, _log = self.scope_env()
+        # a 30 s watchdog: only the fast watch can be this quick
+        run = self.start("seg_rest", 50, dv=False, VWORKER_WATCH_INTERVAL=30, **scope)
+        pid = self.wait_started()
+        time.sleep(0.5)
+        self.assertIsNone(run.p.poll(), run.stderr[-800:])        # resting: it encodes
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False)             # a button press: thawed
+        t0 = time.monotonic()
+        rc = run.wait()
+        elapsed = time.monotonic() - t0
+        note_latency("thaw, end to end", elapsed)
+        self.assertEqual(rc, 75, run.stderr[-800:])
+        v = run.vline()
+        self.assertEqual((v["result"], v["why"], v["code"]),
+                         ("yielded", "a game woke up: " + GTA, "game"))
+        self.assertLess(elapsed, 0.75)
+        self.assert_cleaned("seg_rest", pid)
+
+    def test_a_game_at_rest_for_less_than_a_minute_counts_as_running(self):
+        self.resting_gta(age=20)                                  # its quick menu, 20 s ago
+        scope, log = self.scope_env()
+        run = self.start("seg_young", 4, dv=False, **scope)
+        run.feed(b"")
+        self.assertEqual(run.wait(), 77, run.stderr[-800:])
+        self.assertEqual(run.vline(), {"result": "refused", "why": "game running: " + GTA,
+                                       "frames": 0, "code": "game"})
+        self.assertEqual(self.calls(log), [])                     # nothing started a scope
+        self.assertFalse(os.path.exists(self.ran))
+        self.assert_cleaned("seg_young")
+
+    def test_a_game_waking_up_mid_job_yields_within_a_quarter_second(self):
+        self.resting_gta()
+        write_rest_file(self.rest_file, state="resting")          # the rest manager, idle
+        scope, _log = self.scope_env()
+        run = self.start("seg_waking", 50, dv=False, VWORKER_WATCH_INTERVAL=30, **scope)
+        pid = self.wait_started()
+        time.sleep(0.5)
+        self.assertIsNone(run.p.poll(), run.stderr[-800:])
+        write_rest_file(self.rest_file, state="resting", waking=local_time(time.time()))
+        t0 = time.monotonic()
+        rc = run.wait()
+        elapsed = time.monotonic() - t0
+        note_latency("wake marker, end to end", elapsed)
+        self.assertEqual(rc, 75, run.stderr[-800:])
+        self.assertEqual(run.vline(), {"result": "yielded", "why": "a game is waking up",
+                                       "frames": 0, "code": "game"})
+        self.assertLess(elapsed, 0.75)
+        self.assert_cleaned("seg_waking", pid)
+        # and a job asked for meanwhile is refused as a game
+        run = self.start("seg_waking2", 4, dv=False, **scope)
+        run.feed(b"")
+        self.assertEqual(run.wait(), 77, run.stderr[-800:])
+        self.assertEqual((run.vline()["why"], run.vline()["code"]), ("a game is waking up", "game"))
+
+    def test_a_sigstopped_game_continued_mid_job_yields_at_once(self):
+        self.resting_gta(frozen=False, state="T")
+        scope, _log = self.scope_env()
+        run = self.start("seg_stopped", 50, dv=False, VWORKER_WATCH_INTERVAL=30, **scope)
+        pid = self.wait_started()
+        time.sleep(0.5)
+        add_gta(self.proc, self.sys, frozen=False)                # SIGCONT
+        t0 = time.monotonic()
+        self.assertEqual(run.wait(), 75, run.stderr[-800:])
+        elapsed = time.monotonic() - t0
+        note_latency("SIGCONT, end to end", elapsed)
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual((run.vline()["why"], run.vline()["code"]),
+                         ("a game woke up: " + GTA, "game"))
+        self.assert_cleaned("seg_stopped", pid)
+
+    def test_a_resting_game_that_exits_mid_job_is_no_wake_up(self):
+        self.resting_gta()
+        scope, _log = self.scope_env()
+        run = self.start("seg_rest_exit", 8, dv=False, VWORKER_WATCH_INTERVAL=0.2, **scope)
+        self.wait_started()
+        time.sleep(0.5)
+        # quit while it rests, in the order it really goes: killed in its freezer (its tasks
+        # leave it to die while the scope is still asked to freeze), its processes gone, the
+        # scope emptied and removed -- and Steam's launch wrapper outside it still there for
+        # a while, which on its own would read as a game being launched
+        add_gta(self.proc, self.sys, frozen=False, freeze=True, flags=vworker.PF_EXITING)
+        time.sleep(0.3)
+        for gone in (GTA_REAPER, GTA_WINESERVER, GTA_EXE):
+            remove_proc(self.proc, gone)
+        set_cgroup(self.sys, GTA_SCOPE, frozen=False, populated=0)
+        time.sleep(0.6)                                           # two looks, three checks
+        shutil.rmtree(os.path.join(self.sys, "fs", "cgroup") + GTA_SCOPE)
+        time.sleep(0.6)
+        remove_proc(self.proc, GTA_WRAPPER)
+        time.sleep(0.3)
+        self.assertIsNone(run.p.poll(), run.stderr[-800:])
+        run.feed(zstd_compress(y4m(8)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(8))
+        self.assertEqual(run.vline()["result"], "ok")
+
+    # -- memory: a resting game keeps its RAM
+    def test_low_memory_refuses_at_once(self):
+        log = os.path.join(self.tmp, "samples.log")
+        write_meminfo(self.proc, 2.0)
+        write(self.gpu_file(), "90\n")                 # heavy too: no re-sample with low memory
+        run = self.start("seg_mem_heavy", 4, dv=False, FAKE_X265_VERSION_LOG=log)
+        run.feed(b"")
+        self.assertEqual(run.wait(), 77, run.stderr[-800:])
+        self.assertEqual(run.vline()["code"], "heavy")
+        self.assertEqual(self.samples(log), 1)
+        write(self.gpu_file(), "3\n")
+        os.unlink(log)
+        run = self.start("seg_mem", 4, dv=False, FAKE_X265_VERSION_LOG=log)
+        run.feed(b"")
+        self.assertEqual(run.wait(), 77, run.stderr[-800:])
+        self.assertEqual(run.vline(), {"result": "refused", "frames": 0, "code": "low_memory",
+                                       "why": "low on memory: 2.0 GB available, needs 3.5"})
+        self.assertEqual(self.samples(log), 1)                   # at once
+        self.assertFalse(os.path.exists(self.ran))
+        self.assert_cleaned("seg_mem")
+
+    def test_low_memory_mid_job_yields_after_two_checks(self):
+        write_meminfo(self.proc, 8.0)
+        run = self.start("seg_lowmem", 50, dv=False, VWORKER_WATCH_INTERVAL=0.5)
+        pid = self.wait_started()
+        write_meminfo(self.proc, 0.5)
+        t0 = time.monotonic()
+        rc = run.wait()
+        self.assertGreater(time.monotonic() - t0, 0.45)          # not on the first low check
+        self.assertEqual(rc, 75, run.stderr[-800:])
+        v = run.vline()
+        self.assertEqual((v["result"], v["why"], v["code"]),
+                         ("yielded", "low on memory: 0.5 GB available", "low_memory"))
+        self.assert_cleaned("seg_lowmem", pid)
+
+    def test_beside_a_resting_game_it_keeps_three_gib_free(self):
+        self.resting_gta()
+        scope, _log = self.scope_env()
+        run = self.start("seg_rest_mem", 50, dv=False, VWORKER_WATCH_INTERVAL=0.3, **scope)
+        pid = self.wait_started()
+        write_meminfo(self.proc, 3.0)                             # at the floor: fine
+        time.sleep(1.0)
+        self.assertIsNone(run.p.poll(), run.stderr[-800:])
+        write_meminfo(self.proc, 2.5)
+        t0 = time.monotonic()
+        rc = run.wait()
+        self.assertGreater(time.monotonic() - t0, 0.25)           # not on the first low check
+        self.assertEqual(rc, 75, run.stderr[-800:])
+        self.assertEqual(run.vline(), {"result": "yielded", "frames": 0, "code": "low_memory",
+                                       "why": "low on memory: 2.5 GB available while a game rests"})
+        self.assert_cleaned("seg_rest_mem", pid)
+        write_meminfo(self.proc, 6.0)                             # and too little to start
+        run = self.start("seg_rest_mem2", 4, dv=False, **scope)
+        run.feed(b"")
+        self.assertEqual(run.wait(), 77)
+        self.assertEqual(run.vline()["why"],
+                         "low on memory: 6.0 GB available, needs 6.5 while a game rests")
+
+    # -- beside a resting game: inside a scope of its own, capped at its memory budget
+    def test_beside_a_resting_game_it_encodes_in_a_capped_scope(self):
+        self.resting_gta()
+        scope, log = self.scope_env()
+        self.put_rpu("seg_scope", b"RPU-IN-SCOPE")
+        spec = b64spec(visionary_args(True), 6)
+        run = Running([sys.executable, VWORKER, "encode", "seg_scope", spec], self.env(**scope))
+        run.feed(zstd_compress(y4m(6)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(6, b"RPU-IN-SCOPE"))   # the stream, untouched
+        self.assertEqual(run.vline(), {"result": "ok", "why": "", "frames": 6})
+        probe, rexec = self.calls(log)
+        self.assertEqual(probe, vworker.SCOPE_PROBE_ARGS)        # can it start a scope at all?
+        budget = (8 << 30) - int(3.5 * (1 << 30))                 # MemAvailable - 3.5 GiB
+        self.assertEqual(rexec, ["--user", "--scope", "--quiet", "--collect",
+                                 "--unit=visionary-x265-seg_scope",
+                                 "-p", "MemoryHigh=%d" % budget,
+                                 "-p", "MemoryMax=%d" % (budget + (256 << 20)),
+                                 "--", sys.executable, VWORKER, "encode", "seg_scope", spec])
+        self.assertFalse(any(a.startswith("--unit=app-steam-app") for a in rexec))
+        with open(self.ran + ".ppid") as f:
+            ppid, in_scope = f.read().split(" ")
+        self.assertEqual((int(ppid), in_scope), (run.p.pid, "1"))   # the same process, in it
+        self.assert_cleaned("seg_scope")
+        # with no game at rest it runs where it is: no scope
+        shutil.rmtree(self.proc)
+        os.makedirs(self.proc)
+        scope2, log2 = self.scope_env()
+        run = self.start("seg_noscope", 3, dv=False, **scope2)
+        run.feed(zstd_compress(y4m(3)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(self.calls(log2), [])
+        with open(self.ran + ".ppid") as f:
+            self.assertEqual(f.read().split(" ")[1], "")
+
+    def test_a_lost_connection_still_ends_the_job_inside_its_scope(self):
+        # outside the ssh session's scope, logind no longer ends it with the session: it must
+        # see the Mac go by itself -- its stdin ending, its stdout breaking
+        self.resting_gta()
+        scope, _log = self.scope_env()
+        blob = zstd_compress(y4m(30))
+        run = self.start("seg_scope_cut", 30, dv=False, **scope)
+        pid = self.wait_started()
+        run.feed(blob[:len(blob) // 2])                           # the link drops mid-stream
+        self.assertEqual(run.wait(), 76, run.stderr[-800:])
+        self.assertEqual(run.vline()["result"], "disconnected")
+        self.assert_cleaned("seg_scope_cut", pid)
+        os.unlink(self.ran)
+        run = self.start("seg_scope_pipe", 20, dv=False, close_stdout=True, **scope)
+        run.feed(zstd_compress(y4m(20)), close=False)
+        self.assertEqual(run.wait(), 76, run.stderr[-800:])
+        self.assertTrue(run.vline()["why"].startswith("stdout broken"), run.vline())
+        pid = None
+        if os.path.exists(self.ran):
+            with open(self.ran) as f:
+                pid = int(f.read())
+        self.assert_cleaned("seg_scope_pipe", pid)
+
+    def test_a_resting_game_without_a_capped_scope_refuses(self):
+        self.resting_gta()
+        for name, extra in (("no systemd-run", {}),
+                            ("it can't start a scope", self.scope_env(FAKE_SYSTEMD_RUN_FAIL=1)[0]),
+                            ("a scope without a cap", self.scope_env(FAKE_SYSTEMD_RUN_NOCAP=1)[0])):
+            run = self.start("seg_nocap", 4, dv=False, **extra)
+            run.feed(b"")
+            self.assertEqual(run.wait(), 77, name + ": " + run.stderr[-800:].decode())
+            self.assertEqual(run.vline(), {"result": "refused", "frames": 0, "code": "low_memory",
+                                           "why": "a game is resting and its memory can't be "
+                                                  "capped"}, name)
+            self.assertFalse(os.path.exists(self.ran), name)
+            self.assert_cleaned("seg_nocap")
+
+    # -- zstd and x265 at idle I/O priority
+    def test_zstd_and_x265_run_at_idle_io_priority(self):
+        path = os.path.join(self.tmp, "ionice")
+        write(path, FAKE_IONICE.replace("{python}", sys.executable))
+        os.chmod(path, 0o755)
+        log = os.path.join(self.tmp, "ionice.log")
+        run = self.start("seg_io", 3, dv=False, VWORKER_IONICE=path, FAKE_IONICE_LOG=log)
+        run.feed(zstd_compress(y4m(3)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(3))
+        calls = self.calls(log)
+        self.assertEqual(calls[0], ["-c", "3", "true"])          # does it work here?
+        by_tool = {c[2]: c for c in calls[1:]}                    # zstd's and x265's: either first
+        self.assertEqual(sorted(by_tool), sorted([ZSTD, self.x265]))
+        self.assertEqual(by_tool[ZSTD], ["-c", "3", ZSTD, "-d", "-q", "-c"])
+        self.assertEqual(len(calls), 3)
+        with open(self.ran + ".ppid") as f:                       # ionice exec'd: x265 is ours
+            self.assertEqual(int(f.read().split(" ")[0]), run.p.pid)
+        log2 = os.path.join(self.tmp, "ionice-fail.log")          # it can't: they run without
+        run = self.start("seg_io2", 3, dv=False, VWORKER_IONICE=path, FAKE_IONICE_LOG=log2,
+                         FAKE_IONICE_FAIL=1)
+        run.feed(zstd_compress(y4m(3)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(self.calls(log2), [["-c", "3", "true"]])
+        self.assertEqual(vworker.IONICE_ARGS, ["-c", "3"])
+
+    def test_the_encode_raises_its_oom_score_before_x265_starts(self):
+        adj = os.path.join(self.proc, "self", "oom_score_adj")
+        write(adj, "0\n")
+        run = self.start("seg_oom", 3, dv=False, FAKE_X265_OOM=adj)
+        run.feed(zstd_compress(y4m(3)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        with open(self.ran + ".oom") as f:
+            self.assertEqual(f.read(), "1000\n")                 # x265 started after the write
+        os.unlink(adj)
+        os.makedirs(adj)                                         # refused: the job runs anyway
+        run = self.start("seg_oom_refused", 3, dv=False)
+        run.feed(zstd_compress(y4m(3)))
+        self.assertEqual(run.wait(), 0, run.stderr[-800:])
+        self.assertEqual(run.stdout, expected_hevc(3))
 
     # -- zstd and x265 run at idle priority
     def read_prio(self):
