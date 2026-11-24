@@ -56,6 +56,7 @@ It pays off best when the helper's x265 is at least about as fast as the Mac's. 
 | Network | **Ethernet** to the same network as the Mac's wired port |
 | Power | **Mains**: a laptop or handheld on its charger. A desktop with no battery counts as mains. |
 | Disk | At least **5 GB free** in your home folder, plus room for the x265 build |
+| Memory | About **3.5 GB free** to start a segment. A game left resting keeps its memory. |
 | To build x265 | **Either** the build tools (git, cmake, make, a C++ compiler, nasm and static libstdc++) **or** distrobox with podman, and an internet connection |
 | A login | A user account on it whose password you know, for one command during setup |
 
@@ -145,6 +146,7 @@ check beside it, and **Test** runs the checks again.
 | Helper ready · waiting for the next segment | Free and allowed: it takes the next segment from the back. |
 | Helper paused · a game is running on it | It stepped aside for a game. |
 | Helper paused · it's busy | Something heavy is running on it, or it already has a job. |
+| Helper paused · it's low on memory | Less than about 3.5 GB of memory free, often because a big game is resting on it. |
 | Helper paused · it's low on disk space | Less than 5 GB free. |
 | Helper off · the Mac is on Wi-Fi | The Mac's route to it is Wi-Fi, not Ethernet. |
 | Helper off · it's not on Ethernet | The helper has no Ethernet link up, or its Wi-Fi is on the same network and the stream arrives over it (the tooltip then says *the stream is arriving over its Wi-Fi · turn its Wi-Fi off*). |
@@ -159,11 +161,13 @@ check beside it, and **Test** runs the checks again.
 The helper polices itself, whatever the Mac thinks.
 
 - **Before each segment** it refuses at once during a game, on battery, without Ethernet, with
-  less than 5 GB free, or while it already has a job. A heavy reading alone is sampled again
-  for a few seconds before it refuses, so one busy second doesn't count.
+  less than 5 GB of disk or about 3.5 GB of memory free, or while it already has a job. A heavy
+  reading alone is sampled again for a few seconds before it refuses, so one busy second
+  doesn't count.
 - **While encoding** it checks every 2 seconds, and stops **at once** when a game starts, when
   the charger is unplugged, when Ethernet goes down, or when the Mac goes away (the connection
-  breaks, or no data arrives for 5 minutes).
+  breaks, or no data arrives for 5 minutes). It also stops when free memory stays below
+  0.75 GB for two checks in a row.
 - **It stops after about 10 seconds of anything heavy:** other programs using more than 1.5
   cores of CPU, or more than 30 % of the GPU. A browser, a file manager or Steam's menus stay
   below that.
@@ -177,13 +181,19 @@ The helper polices itself, whatever the Mac thinks.
 - **A game** is any Steam game (Proton included), any Windows program under Wine or Proton,
   and a launch from Lutris or Heroic. A non-Steam shortcut running a native Linux program is
   judged by the CPU and GPU rule only.
+- **A resting game doesn't count.** A game frozen by a rest mode (with the cgroup freezer) or
+  stopped with SIGSTOP isn't running, so the helper can work while the game rests, and steps
+  aside within a quarter of a second of it waking. A resting game keeps its memory, though:
+  the helper needs about 3.5 GB free to start a segment, so a big game can leave too little
+  (*Helper paused · it's low on memory*), and it steps aside below 0.75 GB. If memory ever ran
+  out, the helper's own processes are the first the kernel would stop, never the game.
 - **Its x265 runs at the lowest CPU priority** (SCHED_IDLE, or nice 19 where that is not
   available), so the desktop always comes first.
 - **On every stop** it kills its zstd and x265 and deletes that job's folder. The Mac deletes
   the partial segment it received and encodes that segment itself.
-- After the helper steps aside for a game or a heavy program, Visionary **leaves it alone for 5
-  minutes** before asking again. After two lost connections or errors in one item, it sits out
-  the rest of that item.
+- After the helper steps aside for a game, a heavy program or low memory, Visionary **leaves it
+  alone for 5 minutes** before asking again. After two lost connections or errors in one item,
+  it sits out the rest of that item.
 - When the AI border extension takes the Mac's whole machine, the Mac's own remux is frozen
   and loses nothing, but the helper's segment in flight is stopped and redone later, by either
   machine.
@@ -239,6 +249,10 @@ press **Test**.
   NVIDIA, or `cat /sys/class/drm/card*/device/gpu_busy_percent` on AMD. Where the GPU has no
   per-program reading, the desktop's own drawing counts too (see
   [When it steps aside](#when-it-steps-aside-and-what-it-deletes)).
+- **Helper paused · it's low on memory**: less than about 3.5 GB of memory is free on the
+  helper, usually because a big game is left resting there (a resting game keeps all of its
+  memory). Close that game or other big programs. In `vworker status`, `mem_available_gb` is
+  the free memory and `resting_game` names a game that rests.
 - **It falls asleep overnight**, or the *Sleep* row says *it can't keep itself awake over
   ssh*: turn off its automatic sleep while it's plugged in (see
   [Keeping it awake](#keeping-it-awake)). In `vworker status`, `sleep_block` is then `false`.
